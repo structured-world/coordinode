@@ -14,10 +14,14 @@ fn failing_step(_: &Path) -> StorageResult<()> {
     Err(StorageError::Io("step failed".into()))
 }
 
+fn unchanged(_: &Path) -> StorageResult<()> {
+    Ok(())
+}
+
 static STEPS: &[MigrationStep] = &[
     MigrationStep {
         from: 0,
-        migrate: no_change,
+        migrate: unchanged,
     },
     MigrationStep {
         from: 4,
@@ -92,31 +96,40 @@ fn the_previous_format_migrates_through_its_step() {
     assert_eq!(read_marker(root.path()).expect("read"), Some(5));
 }
 
-/// Preparing a store of the previous format writes no marker; the engine's
-/// successful open does. A store the open refuses after the step (a released
-/// store whose journal coverage cannot be proven) therefore stays as its
-/// writer left it.
+/// The engine opens no directory of an earlier format: one from before the
+/// marker (format 0) and one of the format before this release's (whose
+/// index entries sit under generations, not installations) are both refused
+/// by name and left as their writer left them.
 #[test]
-fn a_migration_is_recorded_by_the_open_that_succeeds() {
+fn the_engine_refuses_a_directory_of_an_earlier_format() {
     use crate::engine::config::{EndpointConfig, Media, Tier};
     use crate::engine::core::StorageEngine;
-    let root = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        root.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
     let runs = coordinode_core::version::engine_format_version();
-    drop(StorageEngine::open(&config).expect("open"));
-    // A store with data and no marker: format 0.
-    std::fs::remove_file(root.path().join(MARKER_FILE)).expect("unmark");
-    let opened = prepare(&config).expect("prepare");
-    assert!(matches!(opened, FormatOpen::Migrated { from: 0, .. }));
-    assert_eq!(read_marker(root.path()).expect("read"), None);
-    drop(StorageEngine::open(&config).expect("reopen migrates"));
-    assert_eq!(read_marker(root.path()).expect("read"), Some(runs));
+    for earlier in [None, Some(runs - 1)] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            root.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        drop(StorageEngine::open(&config).expect("open"));
+        match earlier {
+            None => std::fs::remove_file(root.path().join(MARKER_FILE)).expect("unmark"),
+            Some(format) => write_marker(root.path(), format).expect("mark earlier"),
+        }
+        let err = StorageEngine::open(&config).err().expect("refused");
+        assert!(
+            matches!(err, StorageError::UnsupportedFormat { runs: r, .. } if r == runs),
+            "{err}"
+        );
+        assert_eq!(
+            read_marker(root.path()).expect("read"),
+            earlier,
+            "left untouched"
+        );
+    }
 }
 
 /// A directory two formats behind, or written by a newer release, is

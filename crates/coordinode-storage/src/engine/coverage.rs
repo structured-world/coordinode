@@ -29,7 +29,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 
-use crate::engine::StorageIter;
+use crate::engine::{StorageGuard, StorageIter};
 use crate::error::{StorageError, StorageResult};
 
 /// First key past the engine-reserved namespace. Every user key sorts at or
@@ -147,9 +147,12 @@ pub(crate) fn clamp_user_start(start: &[u8]) -> &[u8] {
 /// empty prefix means the user keyspace, not the whole tree.
 pub(crate) fn user_prefix(tree: &AnyTree, prefix: &[u8], seqno: SeqNo) -> StorageIter {
     match prefix.first() {
-        None => Box::new(tree.range(USER_KEYSPACE_START.., seqno, None)),
+        None => Box::new(
+            tree.range(USER_KEYSPACE_START.., seqno, None)
+                .map(StorageGuard::raw),
+        ),
         Some(0x00) => Box::new(std::iter::empty()),
-        Some(_) => Box::new(tree.prefix(prefix, seqno, None)),
+        Some(_) => Box::new(tree.prefix(prefix, seqno, None).map(StorageGuard::raw)),
     }
 }
 

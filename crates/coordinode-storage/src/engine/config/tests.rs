@@ -973,7 +973,6 @@ fn index_entry_scans_match_an_unfiltered_oracle() {
         entry_value_prefix, unique_entries_prefix,
     };
     use coordinode_core::index::identity::GenerationId;
-    use lsm_tree::Guard as _;
 
     use crate::engine::core::StorageEngine;
     use crate::engine::partition::Partition;

@@ -14,8 +14,6 @@
 
 use std::collections::HashMap;
 
-use lsm_tree::Guard;
-
 use coordinode_core::graph::edge::{AdjDirection, PostingList, decode_adj_key};
 use coordinode_core::graph::stats::{LABEL_KEY_PREFIX, NODES_TOTAL_KEY, StorageStats};
 

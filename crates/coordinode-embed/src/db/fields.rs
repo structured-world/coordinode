@@ -232,7 +232,6 @@ impl FieldRegistrar for FieldDictionary {
 /// records until the first one that has a property.
 fn refuse_unbound_properties(engine: &StorageEngine) -> Result<(), StorageError> {
     use coordinode_core::graph::node::NodeRecord;
-    use coordinode_storage::Guard as _;
     use coordinode_storage::engine::partition::Partition;
 
     for guard in engine.prefix_scan(Partition::Node, b"node:")? {

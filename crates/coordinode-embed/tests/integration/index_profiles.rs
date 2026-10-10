@@ -13,7 +13,6 @@ use coordinode_core::index::encoding::{
 use coordinode_core::index::identity::GenerationId;
 use coordinode_core::txn::proposal::DerivedIndexWork;
 use coordinode_embed::Database;
-use coordinode_storage::Guard as _;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::oplog::entry::OplogOp;
 

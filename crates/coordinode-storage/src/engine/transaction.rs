@@ -33,7 +33,6 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::{Journal, WriteConcern};
-use lsm_tree::Guard;
 
 use crate::cache::write_buffer::NvmeWriteBuffer;
 use crate::engine::StorageSnapshot;
@@ -1018,8 +1017,7 @@ impl<'a> Transaction<'a> {
     ) -> StorageResult<Option<Vec<u8>>> {
         Ok(self
             .engine
-            .coordinator()
-            .snapshot_get(&snapshot, part, key)?
+            .snapshot_get_unchecked(&snapshot, part, key)?
             .map(|b| b.to_vec()))
     }
 

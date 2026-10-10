@@ -9,7 +9,6 @@ mod raft_closed_bound;
 use std::path::Path;
 
 use anyhow::Context as _;
-use coordinode_storage::Guard as _;
 use coordinode_storage::engine::partition::Partition;
 
 use crate::{Finding, Migration, open_store, stores};

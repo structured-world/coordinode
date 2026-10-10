@@ -18,7 +18,6 @@ use coordinode_query::index::{
 use coordinode_query::planner::{build_logical_plan, estimate_cost};
 use coordinode_search::tantivy::TextIndex;
 use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
-use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 

@@ -41,7 +41,6 @@ use std::io::{self, BufRead, Read as IoRead, Seek, SeekFrom, Write};
 
 use serde::{Deserialize, Serialize};
 
-use coordinode_storage::Guard;
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::{ColumnarTable, StorageEngine};
 use coordinode_storage::engine::partition::Partition;

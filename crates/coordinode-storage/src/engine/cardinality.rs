@@ -29,7 +29,6 @@ use coordinode_core::graph::edge::{
 };
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, CountTrend, Direction};
-use lsm_tree::Guard;
 use rustc_hash::FxHashMap;
 
 use crate::engine::core::StorageEngine;

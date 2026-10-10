@@ -7,7 +7,6 @@ use std::path::Path;
 
 use anyhow::Context as _;
 use coordinode_core::graph::node::NodeRecord;
-use coordinode_storage::Guard as _;
 use coordinode_storage::engine::partition::Partition;
 
 /// Totals of one label's current records.

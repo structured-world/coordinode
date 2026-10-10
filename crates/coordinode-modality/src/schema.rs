@@ -20,7 +20,6 @@ use coordinode_core::schema::definition::{
     encode_constraint_name_key, encode_edge_type_current_revision_key, encode_edge_type_schema_key,
     encode_label_current_revision_key, encode_label_schema_key,
 };
-use coordinode_storage::Guard;
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;

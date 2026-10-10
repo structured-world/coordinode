@@ -9,7 +9,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use coordinode_storage::Guard as _;
 use coordinode_storage::engine::partition::Partition;
 use serde::de::DeserializeOwned;
 

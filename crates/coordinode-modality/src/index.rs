@@ -40,7 +40,6 @@ use coordinode_core::index::encoding::{
 };
 use coordinode_core::index::identity::IdentityAllocator;
 use coordinode_core::txn::proposal::Mutation;
-use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;

@@ -669,7 +669,6 @@ fn constraints_survive_a_restart() {
 /// duplicate the constraint forbids was then accepted.
 #[test]
 fn an_unreadable_index_definition_refuses_the_open() {
-    use coordinode_storage::Guard as _;
     use coordinode_storage::engine::partition::Partition;
     use coordinode_storage::error::StorageError;
 

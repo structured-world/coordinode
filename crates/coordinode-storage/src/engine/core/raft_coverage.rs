@@ -429,9 +429,21 @@ impl StorageEngine {
         for (key, value) in &keep {
             self.put(partition, key, value)?;
         }
+        // The rows are addressed as the application addresses them; in the
+        // index tree each generation's rows go to this member's installation.
+        let tree = self.tree(partition)?;
+        let mut addressing = crate::engine::installation::Addressing::new(
+            self.installations_of(partition),
+            tree,
+            self.next_seqno(),
+        );
         for (key, value) in rows {
-            self.coordinator
-                .put_at(partition, key, value, INSTALLED_ROW_SEQNO)?;
+            self.coordinator.put_at(
+                partition,
+                addressing.point(key)?,
+                value,
+                INSTALLED_ROW_SEQNO,
+            )?;
         }
         Ok(())
     }

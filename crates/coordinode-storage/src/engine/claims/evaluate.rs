@@ -22,8 +22,6 @@ use coordinode_core::txn::invariant::{
     Adjacency, Claim, ClaimPredicate, ClaimScope, Direction, UncoveredSource,
 };
 
-use lsm_tree::Guard;
-
 use crate::engine::core::StorageEngine;
 use crate::engine::partition::Partition;
 use crate::error::StorageResult;

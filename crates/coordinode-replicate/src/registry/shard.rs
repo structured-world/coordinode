@@ -33,7 +33,6 @@ use std::time::Duration;
 
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::write_concern::WriteConcern;
-use coordinode_storage::Guard;
 use coordinode_storage::engine::applied::AppliedStop;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;

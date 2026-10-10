@@ -15,7 +15,6 @@ use coordinode_embed::Database;
 use coordinode_embed::db::DatabaseError;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proposal::RaftProposalPipeline;
-use coordinode_storage::Guard as _;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;

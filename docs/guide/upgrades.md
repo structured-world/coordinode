@@ -58,11 +58,9 @@ it no longer shares with the group.
 ## Data directory format
 
 A data directory records the engine format that wrote it in an
-`ENGINE_FORMAT` file. A release opens a directory of its own format and
-migrates one written by the format just before it, once, on open. A directory
-two or more formats behind, or written by a newer release, is refused by name
-and left untouched: take it through the intermediate release first, or remove
-the member from its group and add it back empty.
+`ENGINE_FORMAT` file. A release opens only a directory of its own format; one
+written by any other format is refused by name and left untouched. A member
+whose directory is refused is removed from its group and added back empty.
 
 ## Watching a move
 

@@ -484,6 +484,53 @@ fn late_finalize_behind_a_flushed_newer_commit_survives_a_crash() {
     );
 }
 
+/// An index entry lost in a power cut together with its generation's first
+/// binding is replayed from the journal into a fresh installation of that
+/// generation, beside an earlier generation whose installation was already on
+/// disk; both read back by their logical keys, also after another reopen,
+/// and nothing is stored under a generation's own number.
+#[test]
+fn an_index_entry_and_its_new_binding_lost_to_a_crash_are_replayed() {
+    use coordinode_core::index::encoding::encode_unique_entry_key;
+    use coordinode_core::index::identity::GenerationId;
+    let rig = PowerRig::new();
+    let early = encode_unique_entry_key(GenerationId::from_raw(40), b"\x40a\x00");
+    let late = encode_unique_entry_key(GenerationId::from_raw(41), b"\x40b\x00");
+    let put = |key: &[u8], value: &[u8]| Mutation::Put {
+        partition: PartitionId::Idx,
+        key: key.to_vec(),
+        value: value.to_vec(),
+    };
+    {
+        let (engine, oracle) = rig.open();
+        write_batch_at(&engine, &[put(&early, b"n1")], oracle.next().as_raw());
+        engine.persist().expect("persist the first generation");
+        write_batch_at(&engine, &[put(&late, b"n2")], oracle.next().as_raw());
+        // Power loss: the second generation's binding and entry were only in
+        // the memtable; its commit is in the journal.
+        rig.cut(engine);
+    }
+    for round in ["replayed", "reopened"] {
+        let (engine, _) = rig.open();
+        for (key, value) in [(&early, b"n1"), (&late, b"n2")] {
+            assert_eq!(
+                engine.get(Partition::Idx, key).expect("get").as_deref(),
+                Some(value.as_slice()),
+                "{round}"
+            );
+        }
+        let installations = engine.installations.current();
+        let (Some(a), Some(b)) = (
+            installations.installation(40),
+            installations.installation(41),
+        ) else {
+            panic!("{round}: both generations bound");
+        };
+        assert_ne!(a, b, "{round}");
+        engine.persist().expect("persist");
+    }
+}
+
 #[test]
 fn late_finalized_merge_is_replayed_exactly_once() {
     // The same late-finalize order with a non-idempotent merge on the key the

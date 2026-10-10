@@ -1,5 +1,6 @@
-//! A store written by a released build (v0.6.0) predates apply coverage.
-//! This release refuses to open it, leaving it byte for byte as it was.
+//! A store written by a released build (v0.6.0) is in an earlier engine
+//! format. This release refuses to open it, leaving it byte for byte as it
+//! was.
 //!
 //! `tests/fixtures/v0.6.0/` holds what v0.6.0 itself wrote: `embedded/` (a
 //! journalled store: Alice-[:KNOWS]->Bob and Carol) and `raft/` (a
@@ -7,7 +8,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use coordinode_embed::Database;
 
@@ -60,9 +60,9 @@ fn a_released_embedded_store_is_refused_untouched() {
 
     let err = Database::open(&store)
         .err()
-        .expect("a store without a coverage record must be refused");
+        .expect("a released store must be refused");
     assert!(
-        err.to_string().contains("no apply-coverage record"),
+        err.to_string().contains("engine format 0"),
         "the refusal names the reason, got: {err}"
     );
     assert_eq!(
@@ -78,10 +78,12 @@ fn a_released_raft_store_is_refused_untouched() {
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
     use coordinode_storage::engine::core::StorageEngine;
+    use coordinode_storage::error::StorageError;
 
     let scratch = tempfile::tempdir().unwrap();
     let store = scratch.path().join("raft");
     copy_tree(&fixture("raft"), &store);
+    let before = snapshot_tree(&store);
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
         &store,
@@ -90,14 +92,16 @@ fn a_released_raft_store_is_refused_untouched() {
         Tier::Warm,
     )]);
 
-    let err = {
-        let engine = Arc::new(StorageEngine::open(&config).expect("the trees themselves open"));
-        coordinode_raft::storage::CoordinodeStateMachine::new(engine)
-            .err()
-            .expect("a Raft store without a coverage record must be refused")
-    };
+    let err = StorageEngine::open(&config)
+        .err()
+        .expect("a released Raft store must be refused");
     assert!(
-        err.to_string().contains("without an apply-coverage record"),
+        matches!(err, StorageError::UnsupportedFormat { found: 0, .. }),
         "the refusal names the reason, got: {err}"
+    );
+    assert_eq!(
+        snapshot_tree(&store),
+        before,
+        "the refused store is left exactly as the released build wrote it"
     );
 }

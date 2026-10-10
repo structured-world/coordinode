@@ -169,7 +169,6 @@ fn write_email(
 
 /// Every entry of the index a member holds.
 fn entries(engine: &StorageEngine) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use coordinode_storage::Guard as _;
     let prefix = unique_entries_prefix(EMAIL);
     engine
         .prefix_scan(Partition::Idx, &prefix)

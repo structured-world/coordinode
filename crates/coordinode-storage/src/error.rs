@@ -145,14 +145,10 @@ pub enum StorageError {
     },
 
     /// The data directory was written in an engine format this release
-    /// cannot open: newer than its own, or older than the one format before
-    /// it, which it migrates. Opening it changes nothing.
+    /// cannot open. Opening it changes nothing.
     #[error(
-        "data directory {path} is in engine format {found}; this release runs format {runs} \
-         and opens only format {runs} or {previous}{hint}",
-        // Format numbering starts at 1, so the one before always exists.
-        previous = runs - 1,
-        hint = if found < runs { "; open it with the release that runs the next format first" } else { "" }
+        "data directory {path} is in engine format {found}; this release opens only engine \
+         format {runs}"
     )]
     UnsupportedFormat {
         /// The directory refused.
@@ -178,6 +174,13 @@ pub enum StorageError {
         /// Why it does not decode.
         detail: String,
     },
+
+    /// The index partition's record of which local installation holds each
+    /// generation is missing, contradictory or malformed, or entries sit
+    /// under an installation it does not name. Nothing in the affected range
+    /// is read or written: its keys could belong to another generation.
+    #[error("index installation catalog: {0}")]
+    InstallationCatalog(String),
 
     /// The query reading or writing through the engine spent its budget:
     /// memory, deadline or cancellation. Nothing past the refusal was done.

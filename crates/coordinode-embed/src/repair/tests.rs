@@ -563,6 +563,48 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
+/// A full rebuild of the index partition reinstalls every family the
+/// checkpoint holds there (index generation entries, table keys, spatial
+/// points), not only keys spelled after the partition's name, and replays the
+/// entries the checkpoint lacks.
+#[test]
+fn a_rebuild_of_the_index_partition_keeps_every_family() {
+    use coordinode_core::index::encoding::encode_unique_entry_key;
+    use coordinode_core::index::identity::GenerationId;
+    let dir = TempDir::new().expect("tempdir");
+    let engine = open(&dir);
+    let root = checkpoint_root(dir.path());
+    let entry = encode_unique_entry_key(GenerationId::from_raw(7), b"\x40a\x00");
+    let late = encode_unique_entry_key(GenerationId::from_raw(7), b"\x40b\x00");
+    put(&engine, 1, PartitionId::Idx, &entry, b"holder");
+    put(&engine, 2, PartitionId::Idx, b"tkey:1", b"table");
+    put(&engine, 3, PartitionId::Idx, b"idx:spatial:1", b"point");
+    engine.persist().expect("persist");
+    let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
+    put(&engine, 50, PartitionId::Idx, &late, b"late");
+
+    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let since = engine
+        .oplog_read_since(from)
+        .expect("read")
+        .expect("journal");
+    engine
+        .repair_partition_from_checkpoint(&ckpt, &since, Partition::Idx)
+        .expect("rebuild");
+    for (key, value) in [
+        (entry.as_slice(), &b"holder"[..]),
+        (b"tkey:1", b"table"),
+        (b"idx:spatial:1", b"point"),
+        (late.as_slice(), b"late"),
+    ] {
+        assert_eq!(
+            engine.get(Partition::Idx, key).expect("get").as_deref(),
+            Some(value),
+            "{key:?}"
+        );
+    }
+}
+
 /// A commit that lands while a checkpoint is being taken can reach the
 /// checkpoint's journal copy without reaching its trees. The rebuild must
 /// replay what the checkpoint's tree lacks, not start after the last entry

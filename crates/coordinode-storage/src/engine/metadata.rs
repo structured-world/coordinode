@@ -26,7 +26,6 @@ use coordinode_core::version::{
     GROUP_PAIR_KEY_PREFIX, RecordedPair, VersionPair, decode_group_pair_key, decode_pair,
     encode_pair, group_pair_key,
 };
-use lsm_tree::Guard as _;
 
 use crate::engine::core::StorageEngine;
 use crate::engine::partition::Partition;

@@ -29,14 +29,10 @@ pub struct MigrationStep {
     pub migrate: fn(&Path) -> StorageResult<()>,
 }
 
-/// Every migration this release ships, at most one per source format.
-/// Format 0 (a directory from before the marker) holds nothing that format
-/// 1 reads differently, so its step only records the format.
+/// Every migration this release ships, at most one per source format. None
+/// leads into this release's format: the index partition's keys address
+/// member-local installations, which no earlier directory records.
 pub static MIGRATIONS: &[MigrationStep] = &[
-    MigrationStep {
-        from: 0,
-        migrate: no_change,
-    },
     // A test build runs up to two formats past this release's, so a suite
     // can take a directory through an intermediate version.
     #[cfg(feature = "test-format-bump")]
@@ -51,6 +47,7 @@ pub static MIGRATIONS: &[MigrationStep] = &[
     },
 ];
 
+#[cfg(feature = "test-format-bump")]
 fn no_change(_: &Path) -> StorageResult<()> {
     Ok(())
 }

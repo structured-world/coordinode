@@ -321,19 +321,25 @@ fn apply_group(
     cover: Option<coverage::Mark>,
 ) -> StorageResult<()> {
     let tree = engine.tree(part)?;
+    let mut addressing =
+        crate::engine::installation::Addressing::new(engine.installations_of(part), tree, seqno);
     let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 1);
     for mutation in group {
         match mutation {
-            Mutation::Put { key, value, .. } => batch.insert(key.as_slice(), value.as_slice()),
-            Mutation::Delete { key, .. } => batch.remove(key.as_slice()),
+            Mutation::Put { key, value, .. } => {
+                batch.insert(addressing.point(key)?, value.as_slice());
+            }
+            Mutation::Delete { key, .. } => batch.remove(addressing.point(key)?),
             Mutation::Merge { key, operand, .. } => {
-                batch.merge(key.as_slice(), operand.as_slice());
+                batch.merge(addressing.point(key)?, operand.as_slice());
             }
             Mutation::RemoveRange { start, end, .. } => {
                 let start = coverage::clamp_user_start(start);
-                if start < end.as_slice() {
-                    tree.remove_range(start.to_vec(), end.clone(), seqno);
-                    engine.coordinator().flush_trigger().wrote_unmeasured();
+                for (start, end) in addressing.range(start, end) {
+                    if start < end {
+                        tree.remove_range(start, end, seqno);
+                        engine.coordinator().flush_trigger().wrote_unmeasured();
+                    }
                 }
             }
         }

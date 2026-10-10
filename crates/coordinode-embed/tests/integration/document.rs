@@ -6,7 +6,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use coordinode_core::graph::node::{NodeId, NodeRecord, PropertyValue};
-use coordinode_storage::Guard;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;

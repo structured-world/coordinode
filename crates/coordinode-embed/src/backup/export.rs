@@ -11,7 +11,6 @@ use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{self, NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_modality::edge::{EdgeStore, LocalEdgeStore};
-use coordinode_storage::Guard;
 use coordinode_storage::engine::StorageSnapshot;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;

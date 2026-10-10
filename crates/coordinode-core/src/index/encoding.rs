@@ -35,6 +35,10 @@ const TAG_UNIQUE_ENTRIES: u8 = 0x02;
 const TUPLE_END: u8 = b':';
 /// Length of a generation prefix: the shape tag and the generation, u64 BE.
 pub const GENERATION_PREFIX_LEN: usize = 9;
+/// First bytes of the index partition keys that belong to a generation: a key
+/// starting with one of them is `tag / GenerationId:u64_BE / …`. No other
+/// family of the index partition starts with these bytes.
+pub const GENERATION_TAGS: [u8; 2] = [TAG_ENTRIES, TAG_UNIQUE_ENTRIES];
 
 /// A value that has no index key.
 ///

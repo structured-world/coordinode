@@ -34,7 +34,6 @@ use coordinode_core::graph::node::{
 };
 use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
-use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::{PagedScan, Transaction};

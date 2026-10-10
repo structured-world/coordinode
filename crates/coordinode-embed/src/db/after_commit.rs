@@ -38,7 +38,6 @@ use coordinode_core::schema::triggers::{
 };
 use coordinode_core::txn::proposal::{Mutation, PartitionId, RaftProposal};
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_storage::Guard;
 use coordinode_storage::engine::partition::Partition;
 
 use super::{Database, DatabaseError, QuerySession, TxnMode};

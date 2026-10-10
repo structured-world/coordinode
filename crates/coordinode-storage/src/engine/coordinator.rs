@@ -49,9 +49,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lsm_tree::{AbstractTree, Guard};
+use lsm_tree::AbstractTree;
 
-use super::{SeekableStorageIter, StorageIter};
+use super::{RawSeekableIter, StorageIter};
 use crate::engine::coverage;
 use crate::engine::partition::Partition;
 use crate::engine::pending::PendingCommits;
@@ -353,7 +353,7 @@ pub trait MultiModalCoordinator: Send + Sync {
         start: &[u8],
         end: &[u8],
         seqno: lsm_tree::SeqNo,
-    ) -> StorageResult<SeekableStorageIter>;
+    ) -> StorageResult<RawSeekableIter>;
 
     /// Snapshot-pinned prefix scan, materialised owned. Convenience
     /// over `prefix_scan_at` for callers that need eager collection.
@@ -992,26 +992,6 @@ impl LocalMultiModalCoordinator {
         Ok(seqno)
     }
 
-    /// Delete the half-open range `[start, end)` with one MVCC range tombstone,
-    /// stamped with the next seqno. This is the seqno'd, snapshot-aware,
-    /// replication/PITR-correct range delete, distinct from the eager,
-    /// non-MVCC `drop_range` table-drop.
-    pub(crate) fn remove_range(
-        &self,
-        part: Partition,
-        start: &[u8],
-        end: &[u8],
-    ) -> StorageResult<lsm_tree::SeqNo> {
-        let tree = self.tree(part)?;
-        let seqno = self.seqno.next();
-        let start = coverage::clamp_user_start(start);
-        if start < end {
-            tree.remove_range(start.to_vec(), end.to_vec(), seqno);
-            self.flush_trigger.wrote_unmeasured();
-        }
-        Ok(seqno)
-    }
-
     /// Single-key merge-operand append. Stamps with the next seqno.
     /// Capacity gating handled above.
     pub(crate) fn merge_no_capacity_check(
@@ -1098,7 +1078,10 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
             std::ops::Bound::Included(coverage::clamp_user_start(start).to_vec()),
             std::ops::Bound::Included(end.to_vec()),
         );
-        Ok(Box::new(tree.range(range, seqno, None)))
+        Ok(Box::new(
+            tree.range(range, seqno, None)
+                .map(crate::engine::StorageGuard::raw),
+        ))
     }
 
     fn range_seekable(
@@ -1107,7 +1090,7 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
         start: &[u8],
         end: &[u8],
         seqno: lsm_tree::SeqNo,
-    ) -> StorageResult<SeekableStorageIter> {
+    ) -> StorageResult<RawSeekableIter> {
         let tree = self.tree(part)?;
         // Owned bounds outlive the call (lsm-tree borrows internally). The
         // returned `SeekableGuardIter` is already boxed by `range_seekable`.

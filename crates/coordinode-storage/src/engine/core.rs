@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 use coordinode_core::txn::proposal::Mutation;
-use lsm_tree::{AbstractTree, Guard};
+use lsm_tree::AbstractTree;
 use tracing::info;
 
 use super::{MAX_DERIVED_EFFECTS, SeekableStorageIter, StorageIter};
@@ -230,6 +230,9 @@ pub struct StorageEngine {
     /// Partition captures taken for copies to other nodes, naming each
     /// one's directory.
     partition_captures: AtomicU64,
+    /// Which local installation holds each index generation in the index
+    /// tree; every read and write of a generation key goes through it.
+    pub(crate) installations: crate::engine::installation::Installations,
     /// Consumers watching the writes a partition receives (see
     /// [`Self::tap_writes`]).
     write_taps: Arc<crate::engine::tap::WriteTaps>,
@@ -596,6 +599,16 @@ impl StorageEngine {
             trees.insert(part, tree);
         }
 
+        // The index tree's installations are known before anything reads or
+        // replays into it: a generation key means nothing without them.
+        let installations = crate::engine::installation::Installations::load(
+            trees
+                .get(&Partition::Idx)
+                .ok_or_else(|| StorageError::PartitionNotFound {
+                    name: Partition::Idx.name().to_string(),
+                })?,
+        )?;
+
         // ── Embedded oplog journal: open + crash recovery ────────────────────
         // Oracle-backed standalone engines journal every proposal to a RETAINED
         // oplog. Each partition tree records, in-band, which journal indices it
@@ -691,7 +704,13 @@ impl StorageEngine {
                                     .get(&part)
                                     .is_some_and(|c| c.contains(entry.index, 0));
                             if !skip {
-                                apply_oplog_ops_at(tree, &ops, entry.ts, entry.index)?;
+                                apply_oplog_ops_at(
+                                    tree,
+                                    (part == Partition::Idx).then_some(&installations),
+                                    &ops,
+                                    entry.ts,
+                                    entry.index,
+                                )?;
                                 replayed += ops.len();
                             }
                         }
@@ -1042,6 +1061,7 @@ impl StorageEngine {
             raft_fence: parking_lot::RwLock::new(None),
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
+            installations,
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
             applied_feed: Arc::new(crate::engine::applied::AppliedFeed::default()),
             index_feed_capacity: config.index_feed_capacity.max(1),
@@ -1384,6 +1404,11 @@ impl StorageEngine {
     }
 
     /// Get a tree handle by logical partition.
+    ///
+    /// The tree holds keys as stored: in the index tree a generation key
+    /// sits under this member's installation of the generation, not under
+    /// the generation itself. Read and write through the engine's methods,
+    /// which translate.
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
         self.coordinator
             .trees()
@@ -1393,9 +1418,159 @@ impl StorageEngine {
             })
     }
 
+    /// The index tree's installation catalog, when `part` is the index
+    /// partition.
+    #[inline]
+    pub(crate) fn installations_of(
+        &self,
+        part: Partition,
+    ) -> Option<&crate::engine::installation::Installations> {
+        (part == Partition::Idx).then_some(&self.installations)
+    }
+
+    /// Where the logical `key` of `part` is stored, for a read: as written,
+    /// or under its generation's installation (written into `buf`). `None`
+    /// when its generation has no installation here: nothing is stored
+    /// under it.
+    #[inline]
+    fn stored_key<'a>(
+        &self,
+        part: Partition,
+        key: &'a [u8],
+        buf: &'a mut Vec<u8>,
+    ) -> Option<&'a [u8]> {
+        use crate::engine::installation::Located;
+        if part != Partition::Idx {
+            return Some(key);
+        }
+        match self.installations.current().locate(key, buf) {
+            Located::Raw(key) | Located::Bound(key) => Some(key),
+            Located::Unbound => None,
+        }
+    }
+
+    /// Scan the keys of `part` starting with the logical `prefix` at
+    /// `seqno`, giving keys back as addressed.
+    fn scan_prefix_at(
+        &self,
+        part: Partition,
+        prefix: &[u8],
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<StorageIter> {
+        let tree = self.tree(part)?;
+        Ok(match part {
+            Partition::Idx => crate::engine::installation::scan_prefix(
+                tree,
+                &self.installations.current(),
+                prefix,
+                seqno,
+            ),
+            _ => coverage::user_prefix(tree, prefix, seqno),
+        })
+    }
+
+    /// Scan the logical range `(lo, hi)` of `part` at `seqno`, never into
+    /// the reserved namespace, giving keys back as addressed.
+    fn scan_range_at(
+        &self,
+        part: Partition,
+        lo: std::ops::Bound<&[u8]>,
+        hi: std::ops::Bound<&[u8]>,
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<StorageIter> {
+        use std::ops::Bound;
+        let tree = self.tree(part)?;
+        let lo = match lo {
+            Bound::Included(k) => Bound::Included(coverage::clamp_user_start(k)),
+            Bound::Excluded(k) if k < coverage::USER_KEYSPACE_START => {
+                Bound::Included(coverage::USER_KEYSPACE_START)
+            }
+            Bound::Excluded(k) => Bound::Excluded(k),
+            Bound::Unbounded => Bound::Included(coverage::USER_KEYSPACE_START),
+        };
+        Ok(match part {
+            Partition::Idx => crate::engine::installation::scan(
+                tree,
+                &self.installations.current(),
+                lo,
+                hi,
+                seqno,
+            ),
+            _ => {
+                let owned = |b: Bound<&[u8]>| match b {
+                    Bound::Included(k) => Bound::Included(k.to_vec()),
+                    Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
+                    Bound::Unbounded => Bound::Unbounded,
+                };
+                Box::new(
+                    tree.range((owned(lo), owned(hi)), seqno, None)
+                        .map(crate::engine::StorageGuard::raw),
+                )
+            }
+        })
+    }
+
+    /// Point lookups of the logical `keys` of `part` at `seqno` through one
+    /// tree descent, one result per key. Index generation keys are
+    /// translated into one shared buffer; a key of a generation with no
+    /// installation here finds nothing.
+    fn stored_multi_get(
+        &self,
+        part: Partition,
+        keys: &[&[u8]],
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<Vec<Option<lsm_tree::UserValue>>> {
+        use crate::engine::installation::Located;
+        let tree = self.tree(part)?;
+        if part != Partition::Idx {
+            return Ok(tree.multi_get(keys.iter().copied(), seqno)?);
+        }
+        let bindings = self.installations.current();
+        let mut stored = Vec::with_capacity(keys.iter().map(|k| k.len()).sum());
+        // Per key: where its stored form sits in `stored`, or `None`.
+        let mut spans: Vec<Option<(usize, usize)>> = Vec::with_capacity(keys.len());
+        let mut buf = Vec::new();
+        for key in keys {
+            let at = stored.len();
+            match bindings.locate(key, &mut buf) {
+                Located::Raw(key) | Located::Bound(key) => {
+                    stored.extend_from_slice(key);
+                    spans.push(Some((at, stored.len())));
+                }
+                Located::Unbound => spans.push(None),
+            }
+        }
+        let present: Vec<&[u8]> = spans
+            .iter()
+            .flatten()
+            .map(|&(from, to)| &stored[from..to])
+            .collect();
+        let mut found = tree.multi_get(present, seqno)?.into_iter();
+        Ok(spans
+            .iter()
+            .map(|span| span.and_then(|_| found.next().flatten()))
+            .collect())
+    }
+
+    /// Addressing for one write to `part`: binds a new generation in the
+    /// index tree on its first write; as written in every other tree.
+    fn addressing(
+        &self,
+        part: Partition,
+    ) -> StorageResult<crate::engine::installation::Addressing<'_>> {
+        Ok(crate::engine::installation::Addressing::new(
+            self.installations_of(part),
+            self.tree(part)?,
+            self.coordinator.current_seqno(),
+        ))
+    }
+
     /// Borrow the Layer-3 coordinator. Replicated-writer and the
     /// seqno-consumer registry plug in at this seam — see
     /// [`LocalMultiModalCoordinator`] doc for the wire-in contract.
+    ///
+    /// Its key-addressed methods read keys as stored; an index generation
+    /// key is read through the engine's own methods, which translate it.
     pub fn coordinator(&self) -> &LocalMultiModalCoordinator {
         &self.coordinator
     }
@@ -1587,10 +1762,13 @@ impl StorageEngine {
         let (base, held): (Rows, TreeCoverage) = {
             let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
             let snapshot = ckpt.snapshot();
-            let prefix = format!("{}:", partition.name());
+            // Every key of the partition, whatever family wrote it; this
+            // node's own records (its consensus state) are newer in the live
+            // store than in any checkpoint and are not taken back from it.
             let rows = ckpt
-                .snapshot_prefix_scan(&snapshot, partition, prefix.as_bytes())?
+                .snapshot_prefix_scan(&snapshot, partition, &[])?
                 .into_iter()
+                .filter(|(k, _)| !raft_coverage::is_node_local(partition, k))
                 .map(|(k, v)| (k, v.to_vec()))
                 .collect();
             (
@@ -1752,17 +1930,32 @@ impl StorageEngine {
         partition: Partition,
         ranges: &[KeyRange],
     ) -> StorageResult<usize> {
-        // The exclusive upper bound one past an inclusive `max` key.
-        fn succ(max: &[u8]) -> Vec<u8> {
-            let mut s = Vec::with_capacity(max.len() + 1);
-            s.extend_from_slice(max);
-            s.push(0);
-            s
-        }
+        use std::ops::Bound;
+        // The lost ranges are ranges of the tree as stored; everything below
+        // works in the keys the application addresses, `[start, end)`. In the
+        // index tree a stored range maps to one logical range per installation
+        // it crosses.
+        let ranges: Vec<(Vec<u8>, Vec<u8>)> = match partition {
+            Partition::Idx => {
+                let bindings = self.installations.current();
+                ranges
+                    .iter()
+                    .flat_map(|(min, max)| bindings.logical_ranges(min, max))
+                    .collect()
+            }
+            _ => ranges
+                .iter()
+                .map(|(min, max)| {
+                    let mut end = max.to_vec();
+                    end.push(0);
+                    (min.to_vec(), end)
+                })
+                .collect(),
+        };
         let in_ranges = |key: &[u8]| {
             ranges
                 .iter()
-                .any(|(min, max)| key >= &min[..] && key <= &max[..])
+                .any(|(start, end)| key >= &start[..] && key < &end[..])
         };
 
         // 1. Open the checkpoint read-only and export the base rows inside
@@ -1772,10 +1965,15 @@ impl StorageEngine {
         let (base, held): (Rows, TreeCoverage) = {
             let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
             let mut rows = Vec::new();
-            for (min, max) in ranges {
-                for guard in ckpt.range_scan(partition, min, max)? {
-                    let (k, v) = guard.into_inner()?;
-                    rows.push((k.to_vec(), v.to_vec()));
+            for (start, end) in &ranges {
+                for guard in ckpt.scan_range_at(
+                    partition,
+                    Bound::Included(start),
+                    Bound::Excluded(end),
+                    ckpt.snapshot(),
+                )? {
+                    let (k, v) = guard.into_owned()?;
+                    rows.push((k, v.to_vec()));
                 }
             }
             (
@@ -1789,8 +1987,8 @@ impl StorageEngine {
         //    coverage record still claims the entries, so the intent turns
         //    the next open's repair into a full rebuild.
         self.begin_rebuild(partition)?;
-        for (min, max) in ranges {
-            self.remove_range(partition, min, &succ(max))?;
+        for (start, end) in &ranges {
+            self.remove_range(partition, start, end)?;
         }
         let base_len = base.len();
         for (key, value) in &base {
@@ -1817,20 +2015,11 @@ impl StorageEngine {
                         }
                     }
                     OplogOp::RemoveRange { start, end, .. } => {
-                        for (min, max) in ranges {
-                            let s = if start[..] > min[..] {
-                                start.clone()
-                            } else {
-                                min.clone()
-                            };
-                            let bound = succ(max);
-                            let e = if end[..] < bound[..] {
-                                end.clone()
-                            } else {
-                                bound
-                            };
+                        for (lost_start, lost_end) in &ranges {
+                            let s = start.max(lost_start);
+                            let e = end.min(lost_end);
                             if s < e {
-                                self.remove_range(partition, &s, &e)?;
+                                self.remove_range(partition, s, e)?;
                             }
                         }
                     }
@@ -2183,7 +2372,11 @@ impl StorageEngine {
 
         // Fall through to LSM storage.
         let tree = self.tree(part)?;
-        let value = tree.get(key, self.coordinator.current_seqno())?;
+        let mut buf = Vec::new();
+        let Some(stored) = self.stored_key(part, key, &mut buf) else {
+            return Ok(None);
+        };
+        let value = tree.get(stored, self.coordinator.current_seqno())?;
 
         match value {
             Some(v) => {
@@ -2239,9 +2432,7 @@ impl StorageEngine {
             return Ok(out);
         }
 
-        let tree = self.tree(part)?;
-        let seqno = self.coordinator.current_seqno();
-        let values = tree.multi_get(miss_keys.iter().copied(), seqno)?;
+        let values = self.stored_multi_get(part, &miss_keys, self.coordinator.current_seqno())?;
 
         for (n, (slot, value)) in miss_idx.into_iter().zip(values).enumerate() {
             if let Some(v) = value {
@@ -2269,7 +2460,9 @@ impl StorageEngine {
     /// or surface the error to the client.
     pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
-        self.coordinator.put_no_capacity_check(part, key, value)?;
+        let mut addressing = self.addressing(part)?;
+        self.coordinator
+            .put_no_capacity_check(part, addressing.point(key)?, value)?;
         self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
@@ -2342,7 +2535,11 @@ impl StorageEngine {
     /// not by stuffing more tombstones onto a Full endpoint.
     pub fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
-        self.coordinator.delete(part, key)?;
+        let mut buf = Vec::new();
+        // A generation with no installation here holds nothing to delete.
+        if let Some(stored) = self.stored_key(part, key, &mut buf) {
+            self.coordinator.delete(part, stored)?;
+        }
         self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
@@ -2360,7 +2557,17 @@ impl StorageEngine {
     ///
     /// Not capacity-gated — deleting frees space.
     pub fn remove_range(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<()> {
-        self.coordinator.remove_range(part, start, end)?;
+        // Every piece at one seqno: a snapshot sees the whole delete or none
+        // of it, however many installations it spans.
+        let addressing = self.addressing(part)?;
+        let tree = self.tree(part)?;
+        let seqno = self.next_seqno();
+        for (start, end) in addressing.range(coverage::clamp_user_start(start), end) {
+            if start < end {
+                tree.remove_range(start, end, seqno);
+            }
+        }
+        self.coordinator.flush_trigger().wrote_unmeasured();
         self.write_taps.replaced(part);
         if let Some(cache) = &self.tiered_cache {
             cache.clear_partition(part);
@@ -2379,8 +2586,9 @@ impl StorageEngine {
     /// Invalidates any cached entry for this key (stale after merge).
     pub fn merge(&self, part: Partition, key: &[u8], operand: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
+        let mut addressing = self.addressing(part)?;
         self.coordinator
-            .merge_no_capacity_check(part, key, operand)?;
+            .merge_no_capacity_check(part, addressing.point(key)?, operand)?;
         self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
@@ -2785,6 +2993,11 @@ impl StorageEngine {
     pub fn clear_partition(&self, part: Partition) -> StorageResult<()> {
         let tree = self.tree(part)?;
         tree.clear()?;
+        // The installations of the index tree outlive its entries: one handed
+        // out before the clear is never handed out again.
+        if let Some(installations) = self.installations_of(part) {
+            installations.rewrite(tree, self.next_seqno())?;
+        }
         self.write_taps.replaced(part);
         if let Some(cache) = &self.tiered_cache {
             cache.clear_partition(part);
@@ -2875,7 +3088,11 @@ impl StorageEngine {
     /// Check if a key exists in the given partition.
     pub fn contains_key(&self, part: Partition, key: &[u8]) -> StorageResult<bool> {
         let tree = self.tree(part)?;
-        let value = tree.get(key, self.coordinator.current_seqno())?;
+        let mut buf = Vec::new();
+        let Some(stored) = self.stored_key(part, key, &mut buf) else {
+            return Ok(false);
+        };
+        let value = tree.get(stored, self.coordinator.current_seqno())?;
         Ok(value.is_some())
     }
 
@@ -3117,12 +3334,10 @@ impl StorageEngine {
 
     /// Scan all key-value pairs in a partition whose keys start with the given prefix.
     ///
-    /// Returns an iterator of `IterGuardImpl` items. Use `guard.into_inner()`
-    /// to get `(UserKey, UserValue)`.
+    /// Returns an iterator of [`StorageGuard`](crate::engine::StorageGuard)
+    /// items. Use `guard.into_inner()` to get `(UserKey, UserValue)`.
     pub fn prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
-        let tree = self.tree(part)?;
-        let seqno = self.coordinator.current_seqno();
-        Ok(coverage::user_prefix(tree, prefix, seqno))
+        self.scan_prefix_at(part, prefix, self.coordinator.current_seqno())
     }
 
     /// Whether this store holds any data of its own: one live key under any
@@ -3152,9 +3367,10 @@ impl StorageEngine {
     /// consumer reads from the top and stops early instead of scanning the whole
     /// prefix and sorting.
     pub fn prefix_scan_rev(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
-        let tree = self.tree(part)?;
-        let seqno = self.coordinator.current_seqno();
-        Ok(Box::new(coverage::user_prefix(tree, prefix, seqno).rev()))
+        Ok(Box::new(
+            self.scan_prefix_at(part, prefix, self.coordinator.current_seqno())?
+                .rev(),
+        ))
     }
 
     /// Keys touched (written, merged, or deleted) at or after `since_seqno`
@@ -3179,6 +3395,8 @@ impl StorageEngine {
     ) -> StorageResult<Vec<Vec<u8>>> {
         use lsm_tree::{AnyTree, ScanSinceEvent};
 
+        // The index tree's keys go back in the form callers address them.
+        let bindings = (part == Partition::Idx).then(|| self.installations.current());
         let mut keys: Vec<Vec<u8>> = Vec::new();
         let mut collect = |ev: ScanSinceEvent| -> StorageResult<()> {
             match ev {
@@ -3191,7 +3409,13 @@ impl StorageEngine {
                 | ScanSinceEvent::PointTombstone { key, .. }
                 | ScanSinceEvent::WeakTombstone { key, .. } => {
                     if !coverage::is_reserved(&key) {
-                        keys.push(key.to_vec());
+                        let mut key = key.to_vec();
+                        if let Some(bindings) = &bindings {
+                            if let Some(generation) = bindings.logical(&key)? {
+                                crate::engine::installation::put_generation(&mut key, generation);
+                            }
+                        }
+                        keys.push(key);
                     }
                     Ok(())
                 }
@@ -3242,8 +3466,7 @@ impl StorageEngine {
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<StorageIter> {
         self.check_snapshot_retained(seqno)?;
-        let tree = self.tree(part)?;
-        Ok(coverage::user_prefix(tree, prefix, seqno))
+        self.scan_prefix_at(part, prefix, seqno)
     }
 
     /// Inclusive-bounded range scan: yields entries with keys `K` such
@@ -3257,7 +3480,13 @@ impl StorageEngine {
         start: &[u8],
         end: &[u8],
     ) -> StorageResult<StorageIter> {
-        self.coordinator.range_scan(part, start, end)
+        use std::ops::Bound;
+        self.scan_range_at(
+            part,
+            Bound::Included(start),
+            Bound::Included(end),
+            self.coordinator.current_seqno(),
+        )
     }
 
     /// Inclusive-bounded range scan in descending key order (high to low) — the
@@ -3271,7 +3500,16 @@ impl StorageEngine {
         start: &[u8],
         end: &[u8],
     ) -> StorageResult<StorageIter> {
-        self.coordinator.range_scan_rev(part, start, end)
+        use std::ops::Bound;
+        Ok(Box::new(
+            self.scan_range_at(
+                part,
+                Bound::Included(start),
+                Bound::Included(end),
+                self.coordinator.current_seqno(),
+            )?
+            .rev(),
+        ))
     }
 
     /// Seekable range scan over `[start, end]` at `seqno`. The returned iterator
@@ -3285,8 +3523,17 @@ impl StorageEngine {
         end: &[u8],
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<SeekableStorageIter> {
+        use std::ops::Bound;
         self.check_snapshot_retained(seqno)?;
-        self.coordinator.range_seekable(part, start, end, seqno)
+        let tree = self.tree(part)?;
+        let bindings = (part == Partition::Idx).then(|| self.installations.current());
+        Ok(Box::new(crate::engine::installation::Seekable::open(
+            tree,
+            bindings.as_deref(),
+            Bound::Included(coverage::clamp_user_start(start)),
+            Bound::Included(end),
+            seqno,
+        )))
     }
 
     /// Get the tiered cache, if enabled.
@@ -3571,7 +3818,11 @@ impl StorageEngine {
         inspect: impl FnOnce(Option<&[u8]>) -> R,
     ) -> StorageResult<R> {
         self.check_snapshot_retained(*snapshot)?;
-        let value = self.tree(part)?.get(key, *snapshot)?;
+        let mut buf = Vec::new();
+        let Some(stored) = self.stored_key(part, key, &mut buf) else {
+            return Ok(inspect(None));
+        };
+        let value = self.tree(part)?.get(stored, *snapshot)?;
         Ok(inspect(value.as_deref()))
     }
 
@@ -3586,8 +3837,23 @@ impl StorageEngine {
         key: &[u8],
     ) -> StorageResult<Option<bytes::Bytes>> {
         self.check_snapshot_retained(*snapshot)?;
+        self.snapshot_get_unchecked(snapshot, part, key)
+    }
+
+    /// [`Self::snapshot_get`] without the retention check, for a visibility
+    /// probe whose caller pinned or bounded the snapshot itself.
+    pub(crate) fn snapshot_get_unchecked(
+        &self,
+        snapshot: &lsm_tree::SeqNo,
+        part: Partition,
+        key: &[u8],
+    ) -> StorageResult<Option<bytes::Bytes>> {
         let tree = self.tree(part)?;
-        let value = tree.get(key, *snapshot)?;
+        let mut buf = Vec::new();
+        let Some(stored) = self.stored_key(part, key, &mut buf) else {
+            return Ok(None);
+        };
+        let value = tree.get(stored, *snapshot)?;
         Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
     }
 
@@ -3604,8 +3870,7 @@ impl StorageEngine {
         keys: &[&[u8]],
     ) -> StorageResult<Vec<Option<bytes::Bytes>>> {
         self.check_snapshot_retained(*snapshot)?;
-        let tree = self.tree(part)?;
-        let values = tree.multi_get(keys.iter().copied(), *snapshot)?;
+        let values = self.stored_multi_get(part, keys, *snapshot)?;
         Ok(values
             .into_iter()
             .map(|v| v.map(|b| bytes::Bytes::copy_from_slice(&b)))
@@ -3623,8 +3888,8 @@ impl StorageEngine {
     ) -> StorageResult<Vec<(Vec<u8>, bytes::Bytes)>> {
         let mut results = Vec::new();
         for guard in self.snapshot_prefix_iter(snapshot, part, prefix)? {
-            let (key, value) = guard.into_inner()?;
-            results.push((key.to_vec(), bytes::Bytes::copy_from_slice(&value)));
+            let (key, value) = guard.into_owned()?;
+            results.push((key, bytes::Bytes::copy_from_slice(&value)));
         }
         Ok(results)
     }
@@ -3639,8 +3904,7 @@ impl StorageEngine {
         prefix: &[u8],
     ) -> StorageResult<StorageIter> {
         self.check_snapshot_retained(*snapshot)?;
-        let tree = self.tree(part)?;
-        Ok(coverage::user_prefix(tree, prefix, *snapshot))
+        self.scan_prefix_at(part, prefix, *snapshot)
     }
 
     /// The version of a record: the timestamp of the commit that last wrote
@@ -3668,8 +3932,12 @@ impl StorageEngine {
             )));
         }
         let tree = self.tree(part)?;
+        let mut buf = Vec::new();
+        let Some(stored) = self.stored_key(part, key, &mut buf) else {
+            return Ok(None);
+        };
         Ok(tree
-            .get_internal_entry(key, lsm_tree::SeqNo::MAX)?
+            .get_internal_entry(stored, lsm_tree::SeqNo::MAX)?
             .map(|e| e.key.seqno))
     }
 
@@ -3694,11 +3962,15 @@ impl StorageEngine {
         // the latest state, and compaction may have settled its version to
         // zero, so a read at the version would be a refused read in the past.
         let tree = self.tree(part)?;
+        let mut buf = Vec::new();
+        let Some(stored) = self.stored_key(part, key, &mut buf) else {
+            return Ok(None);
+        };
         loop {
             let Some(version) = self.record_version(part, key)? else {
                 return Ok(None);
             };
-            let value = tree.get(key, lsm_tree::SeqNo::MAX)?;
+            let value = tree.get(stored, lsm_tree::SeqNo::MAX)?;
             if self.record_version(part, key)? != Some(version) {
                 continue;
             }
@@ -3722,7 +3994,11 @@ impl StorageEngine {
         snapshot: lsm_tree::SeqNo,
     ) -> StorageResult<bool> {
         let tree = self.tree(part)?;
-        match tree.get_internal_entry(key, lsm_tree::SeqNo::MAX)? {
+        let mut buf = Vec::new();
+        let Some(stored) = self.stored_key(part, key, &mut buf) else {
+            return Ok(false);
+        };
+        match tree.get_internal_entry(stored, lsm_tree::SeqNo::MAX)? {
             Some(e) if e.key.seqno >= snapshot => Ok(true),
             Some(_) => Ok(false),
             // Nothing live now: it was taken away since the view if the view
@@ -3747,7 +4023,11 @@ impl StorageEngine {
         after_seqno: lsm_tree::SeqNo,
     ) -> StorageResult<bool> {
         let tree = self.tree(part)?;
-        let entry = tree.get_internal_entry(key, lsm_tree::SeqNo::MAX)?;
+        let mut buf = Vec::new();
+        let Some(stored) = self.stored_key(part, key, &mut buf) else {
+            return Ok(false);
+        };
+        let entry = tree.get_internal_entry(stored, lsm_tree::SeqNo::MAX)?;
 
         match entry {
             // Live entry with newer seqno → write detected.

@@ -395,7 +395,6 @@ struct Survey {
 
 impl Survey {
     fn new(engine: &StorageEngine, ceiling: u64) -> Result<Self, RestoreError> {
-        use coordinode_storage::Guard as _;
         let storage = |e: &dyn std::fmt::Display| RestoreError::Storage(e.to_string());
         let holds_nodes = match engine
             .prefix_scan(Partition::Node, NODE_KEY_PREFIX)
@@ -471,7 +470,6 @@ impl<'t, 'a> Load<'t, 'a> {
         // probe finds a record of either kind.
         let holds_nodes = survey.holds_nodes;
         let recorded = || -> Result<bool, RestoreError> {
-            use coordinode_storage::Guard as _;
             if !holds_nodes {
                 return Ok(false);
             }
