@@ -14,6 +14,25 @@ fn config(metric: VectorMetric) -> HnswConfig {
     }
 }
 
+/// `registry`'s search of the index of `(label, property)`, under no query
+/// budget.
+fn search(
+    registry: &coordinode_query::index::VectorIndexRegistry,
+    label: &str,
+    property: &str,
+    query: &[f32],
+    k: usize,
+) -> Option<Vec<coordinode_vector::hnsw::SearchResult>> {
+    let Ok(found) = registry.search(
+        label,
+        property,
+        query,
+        k,
+        &mut coordinode_core::budget::Unmetered,
+    );
+    found
+}
+
 /// Wait until the vector worker has folded every applied commit into the
 /// graph. Tests that read the graph itself need this; a search does not wait,
 /// it answers the unfolded commits from the store.
@@ -1179,9 +1198,8 @@ fn vector_threshold_query_is_unaffected_by_index_presence() {
     await_folded(registry);
 
     // Verify HNSW index has 3 vectors.
-    let hnsw_results = registry
-        .search("Movie", "embedding", &[1.0, 0.0, 0.0], 3)
-        .expect("HNSW search");
+    let hnsw_results =
+        search(registry, "Movie", "embedding", &[1.0, 0.0, 0.0], 3).expect("HNSW search");
     assert_eq!(hnsw_results.len(), 3, "HNSW should have 3 vectors");
 
     // Run the threshold query through the full Cypher pipeline. The index is
@@ -1276,14 +1294,14 @@ fn hnsw_bulk_insert_and_search() {
     assert_eq!(count, 100);
 
     // Search should work
-    let results = reg
-        .search(
-            "Item",
-            "vec",
-            &[50.0, 50.0_f32.sin(), 50.0_f32.cos(), 0.0],
-            5,
-        )
-        .expect("search");
+    let results = search(
+        &reg,
+        "Item",
+        "vec",
+        &[50.0, 50.0_f32.sin(), 50.0_f32.cos(), 0.0],
+        5,
+    )
+    .expect("search");
     assert_eq!(results.len(), 5);
     assert_eq!(results[0].id, 50, "nearest should be exact match");
 }
@@ -1315,7 +1333,7 @@ fn create_node_auto_inserts_into_hnsw() {
     // HNSW should be empty before any writes
     let reg = db.vector_index_registry();
     assert!(reg.has_index("Movie", "embedding"));
-    let pre_results = reg.search("Movie", "embedding", &[1.0, 0.0, 0.0, 0.0], 10);
+    let pre_results = search(reg, "Movie", "embedding", &[1.0, 0.0, 0.0, 0.0], 10);
     assert!(
         pre_results.unwrap().is_empty(),
         "HNSW should be empty before CREATE"
@@ -1331,9 +1349,7 @@ fn create_node_auto_inserts_into_hnsw() {
     // worker has folded the commits.
     let reg = db.vector_index_registry();
     await_folded(reg);
-    let results = reg
-        .search("Movie", "embedding", &[0.9, 0.1, 0.0, 0.0], 10)
-        .expect("search");
+    let results = search(reg, "Movie", "embedding", &[0.9, 0.1, 0.0, 0.0], 10).expect("search");
     assert_eq!(
         results.len(),
         2,
@@ -1376,9 +1392,7 @@ fn set_vector_property_updates_hnsw() {
     // Verify it's in the index once the worker has folded the commit.
     let reg = db.vector_index_registry();
     await_folded(reg);
-    let results = reg
-        .search("Item", "v", &[0.0, 0.0, 0.0], 5)
-        .expect("search");
+    let results = search(reg, "Item", "v", &[0.0, 0.0, 0.0], 5).expect("search");
     assert_eq!(results.len(), 1, "HNSW should have 1 vector after CREATE");
     let original_id = results[0].id;
 
@@ -1391,9 +1405,7 @@ fn set_vector_property_updates_hnsw() {
     // The important thing is that searching near [10, 10, 10] finds the node.
     let reg = db.vector_index_registry();
     await_folded(reg);
-    let results = reg
-        .search("Item", "v", &[10.0, 10.0, 10.0], 5)
-        .expect("search near new vector");
+    let results = search(reg, "Item", "v", &[10.0, 10.0, 10.0], 5).expect("search near new vector");
     assert!(
         !results.is_empty(),
         "HNSW should find the node after SET update"
@@ -1430,9 +1442,7 @@ fn create_nonvector_node_does_not_affect_hnsw() {
 
     // HNSW should remain empty
     let reg = db.vector_index_registry();
-    let results = reg
-        .search("Item", "v", &[1.0, 1.0, 1.0], 10)
-        .expect("search");
+    let results = search(reg, "Item", "v", &[1.0, 1.0, 1.0], 10).expect("search");
     assert!(
         results.is_empty(),
         "HNSW should be empty when no vectors written"
@@ -1473,9 +1483,7 @@ fn hnsw_search_after_auto_inserts() {
     // HNSW should have all 10 vectors once the worker folded the commits.
     let reg = db.vector_index_registry();
     await_folded(reg);
-    let results = reg
-        .search("Point", "coords", &[5.0, (5.0_f32 * 0.5).sin()], 3)
-        .expect("search");
+    let results = search(reg, "Point", "coords", &[5.0, (5.0_f32 * 0.5).sin()], 3).expect("search");
     assert_eq!(
         results.len(),
         3,
@@ -1490,9 +1498,7 @@ fn hnsw_search_after_auto_inserts() {
 fn await_removed(db: &Database, label: &str, property: &str, query: &[f32]) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        let empty = db
-            .vector_index_registry()
-            .search(label, property, query, 5)
+        let empty = search(db.vector_index_registry(), label, property, query, 5)
             .is_some_and(|hits| hits.is_empty());
         if empty {
             return true;
@@ -1509,9 +1515,7 @@ fn await_removed(db: &Database, label: &str, property: &str, query: &[f32]) -> b
 fn await_present(db: &Database, label: &str, property: &str, query: &[f32], count: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let found = db
-            .vector_index_registry()
-            .search(label, property, query, 5)
+        let found = search(db.vector_index_registry(), label, property, query, 5)
             .map_or(0, |hits| hits.len());
         if found == count {
             return;
@@ -1669,10 +1673,8 @@ fn ttl_expiry_takes_the_node_out_of_the_graph() {
         1,
         "the reaped node is still in the HNSW graph"
     );
-    let hits = db
-        .vector_index_registry()
-        .search("Item", "v", &[1.0, 0.0, 0.0], 5)
-        .expect("search");
+    let hits =
+        search(db.vector_index_registry(), "Item", "v", &[1.0, 0.0, 0.0], 5).expect("search");
     assert_eq!(hits.len(), 1, "only the unexpired node is found");
 }
 
@@ -1713,9 +1715,8 @@ fn hnsw_persists_across_restart() {
         // Verify index works before close, once the worker caught up.
         let reg = db.vector_index_registry();
         await_folded(reg);
-        let results = reg
-            .search("Movie", "embedding", &[1.0, 0.0, 0.0, 0.0], 3)
-            .expect("search pre-close");
+        let results =
+            search(reg, "Movie", "embedding", &[1.0, 0.0, 0.0, 0.0], 3).expect("search pre-close");
         assert_eq!(results.len(), 3, "should find 3 vectors before close");
     } // db dropped here
 
@@ -1731,8 +1732,7 @@ fn hnsw_persists_across_restart() {
         );
 
         // Search should return all 3 vectors
-        let results = reg
-            .search("Movie", "embedding", &[1.0, 0.0, 0.0, 0.0], 3)
+        let results = search(reg, "Movie", "embedding", &[1.0, 0.0, 0.0, 0.0], 3)
             .expect("search post-reopen");
         assert_eq!(
             results.len(),
@@ -1793,14 +1793,10 @@ fn multiple_indexes_persist() {
             "User index should persist"
         );
 
-        let movie_results = reg
-            .search("Movie", "v", &[1.0, 2.0, 3.0], 5)
-            .expect("movie search");
+        let movie_results = search(reg, "Movie", "v", &[1.0, 2.0, 3.0], 5).expect("movie search");
         assert_eq!(movie_results.len(), 1, "Movie HNSW should have 1 vector");
 
-        let user_results = reg
-            .search("User", "profile_vec", &[0.5, 0.5], 5)
-            .expect("user search");
+        let user_results = search(reg, "User", "profile_vec", &[0.5, 0.5], 5).expect("user search");
         assert_eq!(user_results.len(), 1, "User HNSW should have 1 vector");
     }
 }
@@ -1857,9 +1853,7 @@ fn new_vectors_indexed_after_reopen() {
 
         // Original should be found
         let reg = db.vector_index_registry();
-        let results = reg
-            .search("Item", "v", &[1.0, 0.0, 0.0], 5)
-            .expect("search");
+        let results = search(reg, "Item", "v", &[1.0, 0.0, 0.0], 5).expect("search");
         assert_eq!(results.len(), 1, "rebuilt HNSW has 1 vector");
 
         // Add new node (write-path auto-maintenance should index it)
@@ -1868,9 +1862,7 @@ fn new_vectors_indexed_after_reopen() {
 
         let reg = db.vector_index_registry();
         await_folded(reg);
-        let results = reg
-            .search("Item", "v", &[0.0, 1.0, 0.0], 5)
-            .expect("search after insert");
+        let results = search(reg, "Item", "v", &[0.0, 1.0, 0.0], 5).expect("search after insert");
         assert_eq!(
             results.len(),
             2,
@@ -2101,9 +2093,15 @@ fn forced_offload_search_through_registry() {
         StorageVectorLoader::new(db.engine_shared(), db.interner().expect("dictionary"), 1);
 
     let reg = db.vector_index_registry();
-    let results = reg
-        .search_with_loader("Widget", "vec", &[0.0, 1.0, 0.5], 5, Some(&loader))
-        .expect("search should succeed");
+    let Ok(results) = reg.search_with_loader(
+        "Widget",
+        "vec",
+        &[0.0, 1.0, 0.5],
+        5,
+        Some(&loader),
+        &mut coordinode_core::budget::Unmetered,
+    );
+    let results = results.expect("search should succeed");
 
     assert_eq!(results.len(), 5, "should return 5 results");
 
@@ -2358,13 +2356,17 @@ fn threshold_vector_filter_returns_same_rows_with_and_without_index() {
 
     // Precondition that makes a global top-k pre-filter lossy: not one
     // candidate appears in the window the executor would intersect against.
-    let top_k: std::collections::HashSet<u64> = indexed
-        .vector_index_registry()
-        .search("Doc", "embedding", &THRESHOLD_PROBE, EXECUTOR_K)
-        .expect("index search")
-        .iter()
-        .map(|hit| hit.id)
-        .collect();
+    let top_k: std::collections::HashSet<u64> = search(
+        indexed.vector_index_registry(),
+        "Doc",
+        "embedding",
+        &THRESHOLD_PROBE,
+        EXECUTOR_K,
+    )
+    .expect("index search")
+    .iter()
+    .map(|hit| hit.id)
+    .collect();
     assert!(
         top_k.is_disjoint(&candidates),
         "fixture must place every candidate outside the executor's top-k window"

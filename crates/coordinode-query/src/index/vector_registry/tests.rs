@@ -48,6 +48,45 @@ fn test_config() -> VectorIndexConfig {
     }
 }
 
+/// `reg`'s search under no query budget.
+fn search(
+    reg: &VectorIndexRegistry,
+    label: &str,
+    property: &str,
+    query: &[f32],
+    k: usize,
+) -> Option<Vec<SearchResult>> {
+    let Ok(found) = reg.search(
+        label,
+        property,
+        query,
+        k,
+        &mut coordinode_core::budget::Unmetered,
+    );
+    found
+}
+
+/// `reg`'s filtered search with overfetch 2.0 and 4 rounds, under no query
+/// budget.
+fn search_visible(
+    reg: &VectorIndexRegistry,
+    query: &[f32],
+    k: usize,
+    is_visible: impl Fn(u64) -> bool,
+) -> Option<Vec<SearchResult>> {
+    let Ok(found) = reg.search_with_visibility(
+        "Doc",
+        "embedding",
+        query,
+        k,
+        2.0,
+        4,
+        is_visible,
+        &mut coordinode_core::budget::Unmetered,
+    );
+    found
+}
+
 /// The vector index `name` as the index numbered `raw`, serving from
 /// generation `raw`: the registry is driven without a catalog here.
 fn hnsw(raw: u64, name: &str, label: &str, property: &str) -> IndexDefinition {
@@ -125,7 +164,7 @@ fn search_empty_index_returns_empty() {
     let def = hnsw(1, "movie_embedding", "Movie", "embedding");
     reg.register(def);
 
-    let results = reg.search("Movie", "embedding", &[1.0, 0.0, 0.0], 10);
+    let results = search(&reg, "Movie", "embedding", &[1.0, 0.0, 0.0], 10);
     assert!(results.is_some());
     assert!(results.unwrap().is_empty());
 }
@@ -142,8 +181,7 @@ fn insert_and_search() {
     reg.on_vector_written("Movie", NodeId::from_raw(3), "embedding", &[0.9, 0.1, 0.0]);
 
     // Search for vector closest to [1.0, 0.0, 0.0]
-    let results = reg
-        .search("Movie", "embedding", &[1.0, 0.0, 0.0], 2)
+    let results = search(&reg, "Movie", "embedding", &[1.0, 0.0, 0.0], 2)
         .expect("search should return results");
 
     assert_eq!(results.len(), 2);
@@ -180,7 +218,7 @@ fn unregister() {
 #[test]
 fn no_index_search_returns_none() {
     let reg = VectorIndexRegistry::new();
-    let results = reg.search("Movie", "embedding", &[1.0, 0.0, 0.0], 10);
+    let results = search(&reg, "Movie", "embedding", &[1.0, 0.0, 0.0], 10);
     assert!(results.is_none());
 }
 
@@ -236,8 +274,8 @@ fn sharded_search_matches_single_index_top1() {
     sharded.bulk_insert("Doc", "embedding", vectors.iter().cloned());
 
     for q in [vec![-1.0, 0.0, 0.0], vec![1.0, 0.0, 0.0]] {
-        let base = single.search("Doc", "embedding", &q, 1).unwrap();
-        let sh = sharded.search("Doc", "embedding", &q, 1).unwrap();
+        let base = search(&single, "Doc", "embedding", &q, 1).unwrap();
+        let sh = search(&sharded, "Doc", "embedding", &q, 1).unwrap();
         assert_eq!(sh.len(), 1);
         assert_eq!(
             sh[0].id, base[0].id,
@@ -262,9 +300,7 @@ fn sharded_dedup_replicated_boundary_id() {
     );
     // The boundary query fans out to both partitions, so id 7 is found in
     // each; the merge must dedup it to a single result.
-    let results = reg
-        .search("Doc", "embedding", &[0.0, 1.0, 0.0], 10)
-        .unwrap();
+    let results = search(&reg, "Doc", "embedding", &[0.0, 1.0, 0.0], 10).unwrap();
     let sevens = results.iter().filter(|r| r.id == 7).count();
     assert_eq!(sevens, 1, "a replicated id must appear once after merge");
 }
@@ -289,11 +325,7 @@ fn sharded_search_with_visibility_filters_hidden_ids() {
 
     // The query routes to the negative partition {1, 2}. Hiding id 1 must
     // prune it from the scatter-gathered, merged result.
-    let filtered = reg
-        .search_with_visibility("Doc", "embedding", &[-1.0, 0.0, 0.0], 5, 2.0, 4, |id| {
-            id != 1
-        })
-        .unwrap();
+    let filtered = search_visible(&reg, &[-1.0, 0.0, 0.0], 5, |id| id != 1).unwrap();
     assert!(
         filtered.iter().all(|r| r.id != 1),
         "hidden id must not appear in sharded filtered search"
@@ -305,9 +337,7 @@ fn sharded_search_with_visibility_filters_hidden_ids() {
 
     // Unfiltered, the exact match (id 1) is the top hit through the
     // sharded visibility path.
-    let unfiltered = reg
-        .search_with_visibility("Doc", "embedding", &[-1.0, 0.0, 0.0], 5, 2.0, 4, |_| true)
-        .unwrap();
+    let unfiltered = search_visible(&reg, &[-1.0, 0.0, 0.0], 5, |_| true).unwrap();
     assert_eq!(
         unfiltered[0].id, 1,
         "unfiltered sharded top-1 is the exact match"

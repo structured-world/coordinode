@@ -315,6 +315,125 @@ impl Drop for QueryBudget {
     }
 }
 
+/// Work and scratch memory of a loop too hot for a shared counter update per
+/// item, such as a library's search: units are counted locally and handed to
+/// the budget [`CHECK_EVERY`] at a time, so the deadline and cancellation are
+/// still checked as the work accrues, and scratch memory reserved through it
+/// is held until it is dropped.
+#[derive(Debug)]
+pub struct BatchedWork<'b> {
+    budget: &'b QueryBudget,
+    pending: u64,
+    scratch: MemoryCharge<'b>,
+}
+
+impl<'b> BatchedWork<'b> {
+    /// A batch over `budget` with nothing counted or held yet.
+    pub fn new(budget: &'b QueryBudget) -> Self {
+        Self {
+            budget,
+            pending: 0,
+            scratch: budget.empty_charge(),
+        }
+    }
+
+    /// Count `units` of work.
+    ///
+    /// # Errors
+    ///
+    /// [`BudgetStop::Deadline`] or [`BudgetStop::Cancelled`], from the check
+    /// a full batch makes.
+    #[inline]
+    pub fn add(&mut self, units: u64) -> Result<(), BudgetStop> {
+        // Bounded by CHECK_EVERY plus one call's units before every flush.
+        self.pending += units;
+        if self.pending < CHECK_EVERY {
+            return Ok(());
+        }
+        self.budget.work(core::mem::take(&mut self.pending))
+    }
+
+    /// Reserve `bytes` of scratch memory, held until this batch is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`BudgetStop::Memory`].
+    pub fn reserve(&mut self, bytes: u64) -> Result<(), BudgetStop> {
+        self.scratch.grow(bytes)
+    }
+
+    /// Hand the work counted since the last full batch to the budget, and
+    /// check the deadline and cancellation once more as the loop ends.
+    ///
+    /// # Errors
+    ///
+    /// [`BudgetStop::Deadline`] or [`BudgetStop::Cancelled`].
+    pub fn finish(mut self) -> Result<(), BudgetStop> {
+        self.budget.work(core::mem::take(&mut self.pending))?;
+        self.budget.check()
+    }
+}
+
+/// The progress a library loop (an index search, a scorer) reports as it
+/// runs: the units of work it does and the scratch memory it is about to
+/// allocate. A report that returns an error stops the loop there.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot meter a search",
+    label = "this type does not implement `Meter`",
+    note = "pass `&mut Unmetered` to run without a budget, or a `BatchedWork` to charge one"
+)]
+pub trait Meter {
+    /// Why the loop was stopped.
+    type Stop;
+
+    /// `units` more units of work were done.
+    ///
+    /// # Errors
+    ///
+    /// The loop must stop.
+    fn work(&mut self, units: u64) -> Result<(), Self::Stop>;
+
+    /// The loop is about to allocate `bytes` of scratch it holds until it
+    /// returns.
+    ///
+    /// # Errors
+    ///
+    /// The loop must not allocate it.
+    fn scratch(&mut self, bytes: u64) -> Result<(), Self::Stop>;
+}
+
+/// A loop nobody stops: index construction, and callers that run under no
+/// query budget.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Unmetered;
+
+impl Meter for Unmetered {
+    type Stop = core::convert::Infallible;
+
+    #[inline(always)]
+    fn work(&mut self, _units: u64) -> Result<(), Self::Stop> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn scratch(&mut self, _bytes: u64) -> Result<(), Self::Stop> {
+        Ok(())
+    }
+}
+
+impl Meter for BatchedWork<'_> {
+    type Stop = BudgetStop;
+
+    #[inline]
+    fn work(&mut self, units: u64) -> Result<(), BudgetStop> {
+        self.add(units)
+    }
+
+    fn scratch(&mut self, bytes: u64) -> Result<(), BudgetStop> {
+        self.reserve(bytes)
+    }
+}
+
 /// Memory reserved from a [`QueryBudget`], returned when dropped.
 #[derive(Debug)]
 pub struct MemoryCharge<'b> {

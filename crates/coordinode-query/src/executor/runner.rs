@@ -3823,6 +3823,37 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         // The search holds its queue and predecessors per pair and expands
         // through the charged hop.
         LogicalOp::ShortestPath { input, .. } => first_unaccounted_operator(input),
+        // The index search reports its comparisons and scratch to the
+        // budget; scoring a row's vector is a unit of work.
+        LogicalOp::HnswScan { query_vector, .. } => expr_unaccounted(query_vector),
+        LogicalOp::VectorTopK {
+            input,
+            vector_expr,
+            query_vector,
+            ..
+        }
+        | LogicalOp::VectorFilter {
+            input,
+            vector_expr,
+            query_vector,
+            ..
+        }
+        | LogicalOp::EdgeVectorSearch {
+            input,
+            vector_expr,
+            query_vector,
+            ..
+        } => expr_unaccounted(vector_expr)
+            .or_else(|| expr_unaccounted(query_vector))
+            .or_else(|| first_unaccounted_operator(input)),
+        LogicalOp::MaxSimTopK {
+            input,
+            doc_expr,
+            query_expr,
+            ..
+        } => expr_unaccounted(doc_expr)
+            .or_else(|| expr_unaccounted(query_expr))
+            .or_else(|| first_unaccounted_operator(input)),
         LogicalOp::Unwind { input, expr, .. } => {
             expr_unaccounted(expr).or_else(|| first_unaccounted_operator(input))
         }
@@ -3959,17 +3990,20 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             function,
             distance_alias,
             index_name,
-        } => execute_hnsw_scan(
-            label,
-            property,
-            binding,
-            query_vector,
-            *k,
-            function,
-            distance_alias.as_deref(),
-            index_name,
-            ctx,
-        ),
+        } => {
+            let rows = execute_hnsw_scan(
+                label,
+                property,
+                binding,
+                query_vector,
+                *k,
+                function,
+                distance_alias.as_deref(),
+                index_name,
+                ctx,
+            )?;
+            charge_returned(ctx, 0, rows)
+        }
 
         // Index access path for text_match over one label: the index's
         // matches are the row source; only those nodes are fetched.
@@ -4547,7 +4581,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 candidates = rows.len(),
                 "vector_filter: exact evaluation over the materialised candidate set"
             );
-            let result = execute_vector_filter(&rows, vector_expr, query_vector, &score_params)?;
+            // One distance per row, and the rows it keeps.
+            ctx.budget.work(rows.len() as u64)?;
+            let result = charge_returned(
+                ctx,
+                0,
+                execute_vector_filter(&rows, vector_expr, query_vector, &score_params)?,
+            )?;
             // In snapshot/exact mode, apply MVCC visibility post-filter.
             // For brute-force path, rows are already MVCC-consistent from
             // upstream operators (NodeScan reads via mvcc_get). This check
@@ -4565,6 +4605,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     ..Default::default()
                 };
                 let mut visible = Vec::with_capacity(result.len());
+                // One visibility read per row; the rows kept were charged.
+                ctx.budget.work(result.len() as u64)?;
                 for row in &result {
                     // Extract node ID from the row to verify MVCC visibility.
                     // Check if the node key is visible at the snapshot timestamp.
@@ -4628,6 +4670,12 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             predicate,
         } => {
             let rows = execute_op(input, ctx)?;
+            // Every row is scored or looked up and takes part in the ranking,
+            // whose slots are held while it runs.
+            ctx.budget.work(2 * rows.len() as u64)?;
+            let budget = Arc::clone(&ctx.budget);
+            let _ranking =
+                budget.reserve((rows.len() * core::mem::size_of::<(f64, Row)>()) as u64)?;
 
             // Extract the index name from the planner annotation ("name, metric" → "name").
             // The annotation is set by `annotate_vector_top_k` during planning when an HNSW
@@ -4662,7 +4710,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     distance_alias.as_deref(),
                 )?
             };
-            Ok(result)
+            charge_returned(ctx, 0, result)
         }
 
         LogicalOp::TextFilter {
@@ -4737,7 +4785,10 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 threshold: *threshold,
                 decay_field: None,
             };
-            execute_vector_filter(&rows, vector_expr, query_vector, &edge_params)
+            // One distance per row, and the rows it keeps.
+            ctx.budget.work(rows.len() as u64)?;
+            let kept = execute_vector_filter(&rows, vector_expr, query_vector, &edge_params)?;
+            charge_returned(ctx, 0, kept)
         }
 
         LogicalOp::ProcedureCall {
@@ -4915,7 +4966,11 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             query_expr,
             k,
             score_alias,
-        } => execute_maxsim_top_k(input, doc_expr, query_expr, *k, score_alias.as_deref(), ctx),
+        } => {
+            let ranked =
+                execute_maxsim_top_k(input, doc_expr, query_expr, *k, score_alias.as_deref(), ctx)?;
+            charge_returned(ctx, 0, ranked)
+        }
 
         // Empty normally yields a single empty row (standalone CREATE source).
         // Inside a FOREACH body, the loop injects the per-iteration scope here
@@ -6316,13 +6371,19 @@ fn execute_hnsw_scan(
         let mut want = k.checked_add(superseded).ok_or_else(|| {
             ExecutionError::Unsupported(format!("HnswScan({index_name}): k={k} is too large"))
         })?;
+        // The search runs against the statement's budget, and the records
+        // of its hits are held while the rows are built.
+        let budget = Arc::clone(&ctx.budget);
+        let mut held = budget.empty_charge();
         loop {
-            let Some(hits) = registry.search(label, property, &qv, want) else {
+            let mut search = coordinode_core::budget::BatchedWork::new(&budget);
+            let Some(hits) = registry.search(label, property, &qv, want, &mut search)? else {
                 // Index disappeared between planning and execution (concurrent
                 // DROP). Empty result keeps the read path total; the planner
                 // will not pick HnswScan on the next statement.
                 return Ok(Vec::new());
             };
+            search.finish()?;
             let kept: Vec<_> = hits
                 .iter()
                 .filter(|h| !delta.contains(NodeId::from_raw(h.id)))
@@ -6331,6 +6392,7 @@ fn execute_hnsw_scan(
             // is preserved, so the rows stay in similarity order.
             let ids: Vec<NodeId> = kept.iter().map(|h| NodeId::from_raw(h.id)).collect();
             let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
+            budget.work(records.len() as u64)?;
             let found: Vec<_> = kept
                 .iter()
                 .zip(records)
@@ -6342,6 +6404,12 @@ fn execute_hnsw_scan(
                 })
                 .collect();
             if found.len() >= k || hits.len() < want {
+                held.grow(
+                    found
+                        .iter()
+                        .map(|(_, record, _, _)| record.held_bytes())
+                        .sum(),
+                )?;
                 candidates = found;
                 break;
             }
@@ -6526,20 +6594,27 @@ fn written_vector_nodes(
     };
     let nodes = coordinode_modality::LocalNodeStore;
     let mut written = Vec::new();
+    // Every record read is a unit of work; the ones kept are held for the
+    // rest of the statement, which ranks and builds rows from them.
+    let budget = &ctx.budget;
     match delta {
         IndexDelta::Nodes(ids) => {
             let mut ids: Vec<NodeId> = ids.iter().copied().collect();
             ids.sort_unstable();
+            budget.work(ids.len() as u64)?;
             let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
             for (id, record) in ids.into_iter().zip(records) {
                 if let Some(record) = record.filter(|r| indexed(r)) {
+                    ctx.hold(record.held_bytes())?;
                     written.push((id.as_raw(), record));
                 }
             }
         }
         IndexDelta::Unknown => {
             nodes.for_each_in_shard(&ctx.txn, ctx.shard_id, &mut |id, record| {
+                budget.work(1)?;
                 if indexed(&record) {
+                    budget.reserve(record.held_bytes())?.keep_until_query_ends();
                     written.push((id.as_raw(), record));
                 }
                 Ok(())
@@ -7953,6 +8028,9 @@ fn try_hnsw_vector_top_k(
     // ACORN-style filtered search: when the planner pushed a predicate down,
     // pass it as a visibility closure so the HNSW traversal prunes branches
     // that can't pass the filter. Otherwise fall back to the unfiltered path.
+    // Either runs against the statement's budget.
+    let budget = Arc::clone(&ctx.budget);
+    let mut search = coordinode_core::budget::BatchedWork::new(&budget);
     let search_results = if let Some(pred) = predicate {
         // Resolve property names referenced by the predicate once, outside
         // the closure, so the search hot path never re-enters the interner
@@ -7986,7 +8064,8 @@ fn try_hnsw_vector_top_k(
             2.0,
             3,
             is_visible,
-        ) {
+            &mut search,
+        )? {
             Some(r) => r,
             None => return Ok(None),
         }
@@ -7997,11 +8076,13 @@ fn try_hnsw_vector_top_k(
             &query_vec,
             overfetch,
             ctx.vector_loader,
-        ) {
+            &mut search,
+        )? {
             Some(r) => r,
             None => return Ok(None),
         }
     };
+    search.finish()?;
 
     // Build node_id → row map from input rows for intersection.
     let mut row_by_id: std::collections::HashMap<u64, &Row> = std::collections::HashMap::new();
@@ -9143,6 +9224,15 @@ fn execute_maxsim_top_k(
 
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
+
+    // A score per row, held in the score list and the bounded heap while
+    // the rows are ranked.
+    ctx.budget.work(rows.len() as u64)?;
+    let budget = Arc::clone(&ctx.budget);
+    let _ranking = budget.reserve(
+        (rows.len() * core::mem::size_of::<f32>()
+            + (k.saturating_add(1)) * core::mem::size_of::<(f32, usize)>()) as u64,
+    )?;
 
     // Wrap (score, row_index) so we can use the std BinaryHeap as a
     // bounded min-heap on score. The row index is the tie-breaker and

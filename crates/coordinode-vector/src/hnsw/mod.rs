@@ -71,6 +71,7 @@ pub const M_MAX0: usize = 64;
 
 use std::collections::BinaryHeap;
 
+use coordinode_core::budget::{Meter, Unmetered};
 use coordinode_core::graph::types::VectorMetric;
 use search_scratch::SearchScratchPool;
 use tracing::warn;
@@ -2074,6 +2075,22 @@ impl HnswIndex {
     /// (dequantized) distances for candidate generation. The final top-K
     /// results are reranked using exact f32 distances.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        let Ok(found) = self.search_metered(query, k, &mut Unmetered);
+        found
+    }
+
+    /// [`Self::search`] reporting its progress to `meter`, which can stop
+    /// it: the vectors it compares and the scratch it allocates.
+    ///
+    /// # Errors
+    ///
+    /// The stop `meter` returned.
+    pub fn search_metered<M: Meter>(
+        &self,
+        query: &[f32],
+        k: usize,
+        meter: &mut M,
+    ) -> Result<Vec<SearchResult>, M::Stop> {
         let _op = self.begin_operation();
         // Cache query-side state once per search — for Cosine the query norm
         // would otherwise be recomputed on every distance call (hundreds of
@@ -2092,13 +2109,13 @@ impl HnswIndex {
         // empty-index early-return (EntryPoint stays empty until
         // the first insert lands).
         let Some((start_idx, top_level)) = self.entry_point.for_search() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut current_ep = start_idx;
 
         // Traverse from top to layer 1 (greedy)
         for level in (1..=top_level).rev() {
-            current_ep = self.search_layer_greedy_query(query, current_ep, level);
+            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level, meter)?;
         }
 
         // Effective layer-0 beam must be at least `k`. Without this floor
@@ -2112,10 +2129,11 @@ impl HnswIndex {
         }
 
         // Search at layer 0 with ef candidates
-        let candidates = self.results_only(self.search_layer_query(query, current_ep, ef, 0));
+        let candidates = self.results_only(self.search_layer_ctx(&qctx, current_ep, ef, 0, meter)?);
 
         if self.is_quantized() {
             // Rerank candidates using exact f32 distance
+            meter.work(candidates.len() as u64)?;
             let mut reranked: Vec<SearchResult> = candidates
                 .into_iter()
                 .map(|c| {
@@ -2132,17 +2150,17 @@ impl HnswIndex {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             reranked.truncate(k);
-            reranked
+            Ok(reranked)
         } else {
             // No quantization — return candidates directly
-            candidates
+            Ok(candidates
                 .into_iter()
                 .take(k)
                 .map(|c| SearchResult {
                     id: self.node_id(c.idx as usize),
                     score: c.distance,
                 })
-                .collect()
+                .collect())
         }
     }
 
@@ -2250,6 +2268,42 @@ impl HnswIndex {
     where
         F: Fn(u64) -> bool,
     {
+        let Ok(found) = self.search_with_visibility_metered(
+            query,
+            k,
+            overfetch_factor,
+            max_expansion_rounds,
+            is_visible,
+            &mut Unmetered,
+        );
+        found
+    }
+
+    /// [`Self::search_with_visibility`] reporting its progress to `meter`,
+    /// which can stop it.
+    ///
+    /// # Errors
+    ///
+    /// The stop `meter` returned.
+    #[allow(clippy::type_complexity)]
+    pub fn search_with_visibility_metered<F, M: Meter>(
+        &self,
+        query: &[f32],
+        k: usize,
+        overfetch_factor: f64,
+        max_expansion_rounds: usize,
+        is_visible: F,
+        meter: &mut M,
+    ) -> Result<
+        (
+            Vec<SearchResult>,
+            coordinode_core::graph::types::VectorMvccStats,
+        ),
+        M::Stop,
+    >
+    where
+        F: Fn(u64) -> bool,
+    {
         let _op = self.begin_operation();
         let mut stats = coordinode_core::graph::types::VectorMvccStats {
             overfetch_factor,
@@ -2267,13 +2321,13 @@ impl HnswIndex {
         // Single-load entry-point snapshot doubles as the empty-index
         // guard — see `search` above for the consistency rationale.
         let Some((start_idx, top_level)) = self.entry_point.for_search() else {
-            return (Vec::new(), stats);
+            return Ok((Vec::new(), stats));
         };
         let mut current_ep = start_idx;
 
         // Traverse from top to layer 1 (greedy)
         for level in (1..=top_level).rev() {
-            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
+            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level, meter)?;
         }
 
         let mut visible_results: Vec<SearchResult> = Vec::new();
@@ -2289,7 +2343,9 @@ impl HnswIndex {
             stats.expansion_rounds = round;
 
             let candidates =
-                self.results_only(self.search_layer_ctx(&qctx, current_ep, current_ef, 0));
+                self.results_only(self.search_layer_ctx(&qctx, current_ep, current_ef, 0, meter)?);
+            // Each candidate is reranked or checked for visibility.
+            meter.work(candidates.len() as u64)?;
 
             // Convert to SearchResult with exact distances (rerank if quantized)
             let results: Vec<SearchResult> = if self.is_quantized() {
@@ -2338,7 +2394,7 @@ impl HnswIndex {
         }
 
         visible_results.truncate(k);
-        (visible_results, stats)
+        Ok((visible_results, stats))
     }
 
     /// Search with f32 vectors loaded from external storage for reranking.
@@ -2352,8 +2408,25 @@ impl HnswIndex {
         k: usize,
         loader: &dyn VectorLoader,
     ) -> Vec<SearchResult> {
+        let Ok(found) = self.search_with_loader_metered(query, k, loader, &mut Unmetered);
+        found
+    }
+
+    /// [`Self::search_with_loader`] reporting its progress to `meter`, which
+    /// can stop it; the f32 vectors loaded for the rerank count as scratch.
+    ///
+    /// # Errors
+    ///
+    /// The stop `meter` returned.
+    pub fn search_with_loader_metered<M: Meter>(
+        &self,
+        query: &[f32],
+        k: usize,
+        loader: &dyn VectorLoader,
+        meter: &mut M,
+    ) -> Result<Vec<SearchResult>, M::Stop> {
         if !self.is_offloaded() {
-            return self.search(query, k);
+            return self.search_metered(query, k, meter);
         }
         let _op = self.begin_operation();
 
@@ -2367,12 +2440,12 @@ impl HnswIndex {
         // Single-load entry-point snapshot doubles as the empty-index
         // guard — see `search` above for the consistency rationale.
         let Some((start_idx, top_level)) = self.entry_point.for_search() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut current_ep = start_idx;
 
         for level in (1..=top_level).rev() {
-            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
+            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level, meter)?;
         }
 
         // See `search()` for why the beam floor at `k` is mandatory.
@@ -2381,9 +2454,17 @@ impl HnswIndex {
             .ef_search
             .max(self.config.rerank_candidates)
             .max(k);
-        let candidates = self.results_only(self.search_layer_ctx(&qctx, current_ep, ef, 0));
+        let candidates = self.results_only(self.search_layer_ctx(&qctx, current_ep, ef, 0, meter)?);
 
-        // Batch-load f32 vectors from storage for reranking
+        // Batch-load f32 vectors from storage for reranking: one id and one
+        // full-width vector per candidate.
+        meter.work(candidates.len() as u64)?;
+        meter.scratch(
+            (candidates.len()
+                * (core::mem::size_of::<u64>()
+                    + core::mem::size_of::<Vec<f32>>()
+                    + core::mem::size_of_val(query))) as u64,
+        )?;
         let candidate_ids: Vec<u64> = candidates
             .iter()
             .map(|c| self.node_id(c.idx as usize))
@@ -2408,7 +2489,7 @@ impl HnswIndex {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         reranked.truncate(k);
-        reranked
+        Ok(reranked)
     }
 
     /// Search with MVCC visibility + external f32 loading (reserved for future use).
@@ -2467,7 +2548,8 @@ impl HnswIndex {
         let mut current_ep = start_idx;
 
         for level in (1..=top_level).rev() {
-            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
+            let Ok(next) = self.search_layer_greedy_ctx(&qctx, current_ep, level, &mut Unmetered);
+            current_ep = next;
         }
 
         let mut visible_results: Vec<SearchResult> = Vec::new();
@@ -2476,8 +2558,8 @@ impl HnswIndex {
 
         for round in 0..=max_expansion_rounds {
             stats.expansion_rounds = round;
-            let candidates =
-                self.results_only(self.search_layer_ctx(&qctx, current_ep, current_ef, 0));
+            let Ok(found) = self.search_layer_ctx(&qctx, current_ep, current_ef, 0, &mut Unmetered);
+            let candidates = self.results_only(found);
 
             // Batch-load f32 for reranking
             let candidate_ids: Vec<u64> = candidates
@@ -2541,25 +2623,22 @@ impl HnswIndex {
         (-uniform.ln() * self.level_mult).floor() as usize
     }
 
-    fn search_layer_greedy_query(&self, query: &[f32], ep: usize, level: usize) -> usize {
-        let ctx = QueryCtx::new(
-            query,
-            self.config.metric,
-            self.rabitq_params.as_ref(),
-            &self.config.quantization,
-        );
-        self.search_layer_greedy_ctx(&ctx, ep, level)
-    }
-
-    /// Build-path variant of [`Self::search_layer_greedy_query`] that
-    /// forces exact f32 distance for every comparison. See
-    /// [`QueryCtx::new_for_build`] for why build must not use RaBitQ.
+    /// Build-path variant of the greedy descent that forces exact f32
+    /// distance for every comparison. See [`QueryCtx::new_for_build`] for why
+    /// build must not use RaBitQ.
     fn search_layer_greedy_query_for_build(&self, query: &[f32], ep: usize, level: usize) -> usize {
         let ctx = QueryCtx::new_for_build(query, self.config.metric);
-        self.search_layer_greedy_ctx(&ctx, ep, level)
+        let Ok(found) = self.search_layer_greedy_ctx(&ctx, ep, level, &mut Unmetered);
+        found
     }
 
-    fn search_layer_greedy_ctx(&self, ctx: &QueryCtx<'_>, ep: usize, level: usize) -> usize {
+    fn search_layer_greedy_ctx<M: Meter>(
+        &self,
+        ctx: &QueryCtx<'_>,
+        ep: usize,
+        level: usize,
+        meter: &mut M,
+    ) -> Result<usize, M::Stop> {
         // One epoch pin for the descent; the list reads below nest in it.
         let _epoch = crossbeam_epoch::pin();
         let mut current = ep;
@@ -2569,6 +2648,7 @@ impl HnswIndex {
         // BFS reads at most one neighbour list per loop iteration, so we
         // recycle this single allocation across iterations rather than
         // pay per-level allocation cost.
+        meter.scratch((M_MAX0 * core::mem::size_of::<u64>()) as u64)?;
         let mut neighbours_scratch: Vec<u64> = Vec::with_capacity(M_MAX0);
 
         loop {
@@ -2593,34 +2673,19 @@ impl HnswIndex {
                         }
                     }
                 }
+                meter.work(neighbours_scratch.len() as u64)?;
             }
             if !changed {
                 break;
             }
         }
 
-        current
+        Ok(current)
     }
 
-    fn search_layer_query(
-        &self,
-        query: &[f32],
-        ep: usize,
-        ef: usize,
-        level: usize,
-    ) -> Vec<Candidate> {
-        let ctx = QueryCtx::new(
-            query,
-            self.config.metric,
-            self.rabitq_params.as_ref(),
-            &self.config.quantization,
-        );
-        self.search_layer_ctx(&ctx, ep, ef, level)
-    }
-
-    /// Build-path variant of [`Self::search_layer_query`] that forces
-    /// exact f32 distance. See [`QueryCtx::new_for_build`] for why
-    /// neighbour selection during construction must not use RaBitQ.
+    /// Build-path layer pass that forces exact f32 distance. See
+    /// [`QueryCtx::new_for_build`] for why neighbour selection during
+    /// construction must not use RaBitQ.
     fn search_layer_query_for_build(
         &self,
         query: &[f32],
@@ -2629,16 +2694,18 @@ impl HnswIndex {
         level: usize,
     ) -> Vec<Candidate> {
         let ctx = QueryCtx::new_for_build(query, self.config.metric);
-        self.search_layer_ctx(&ctx, ep, ef, level)
+        let Ok(found) = self.search_layer_ctx(&ctx, ep, ef, level, &mut Unmetered);
+        found
     }
 
-    fn search_layer_ctx(
+    fn search_layer_ctx<M: Meter>(
         &self,
         ctx: &QueryCtx<'_>,
         ep: usize,
         ef: usize,
         level: usize,
-    ) -> Vec<Candidate> {
+        meter: &mut M,
+    ) -> Result<Vec<Candidate>, M::Stop> {
         // One epoch pin for the whole layer pass, handed down to every
         // layer-0 list read and prefetch, so a visit pays no pin of its own.
         let guard = crossbeam_epoch::pin();
@@ -2648,26 +2715,37 @@ impl HnswIndex {
         // call and reach much higher QPS at the cost of using a noisy
         // cheap threshold during traversal; see [`RerankMode`].
         match self.config.rerank_mode {
-            RerankMode::Inline => self.search_layer_ctx_inline_rerank(ctx, ep, ef, level, &guard),
-            RerankMode::EndOfSearch => {
-                self.search_layer_ctx_end_of_search_rerank(ctx, ep, ef, level, &guard)
+            RerankMode::Inline => {
+                self.search_layer_ctx_inline_rerank(ctx, ep, ef, level, &guard, meter)
             }
-            RerankMode::None => self.search_layer_ctx_no_rerank(ctx, ep, ef, level, &guard),
+            RerankMode::EndOfSearch => {
+                self.search_layer_ctx_end_of_search_rerank(ctx, ep, ef, level, &guard, meter)
+            }
+            RerankMode::None => self.search_layer_ctx_no_rerank(ctx, ep, ef, level, &guard, meter),
         }
+    }
+
+    /// The scratch a layer pass of beam `ef` allocates: its two heaps and
+    /// its neighbour buffers.
+    fn layer_pass_scratch(ef: usize) -> u64 {
+        (2 * (ef + 16) * core::mem::size_of::<Candidate>()
+            + M_MAX0 * (core::mem::size_of::<u64>() + core::mem::size_of::<usize>())) as u64
     }
 
     /// Cheap-distance HNSW traversal with NO rerank. Returns whatever the
     /// configured `compute_distance` (RaBitQ popcount when active) ranks
     /// as top-ef. Lowest cost per visit (one distance call, one Vec
     /// lookup); recall is bounded by the cheap estimator's accuracy.
-    fn search_layer_ctx_no_rerank(
+    fn search_layer_ctx_no_rerank<M: Meter>(
         &self,
         ctx: &QueryCtx<'_>,
         ep: usize,
         ef: usize,
         level: usize,
         guard: &crossbeam_epoch::Guard,
-    ) -> Vec<Candidate> {
+        meter: &mut M,
+    ) -> Result<Vec<Candidate>, M::Stop> {
+        meter.scratch(Self::layer_pass_scratch(ef))?;
         let ep_dist = self.compute_distance(ctx, ep);
 
         let heap_cap = ef + 16;
@@ -2770,6 +2848,7 @@ impl HnswIndex {
                     }
                 }
             }
+            meter.work(unvisited_neighbors.len() as u64)?;
         }
 
         let mut result_vec: Vec<Candidate> = results
@@ -2784,7 +2863,7 @@ impl HnswIndex {
                 .partial_cmp(&b.distance)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        result_vec
+        Ok(result_vec)
     }
 
     /// Cheap-distance HNSW traversal followed by ONE exact f32 rerank
@@ -2793,14 +2872,15 @@ impl HnswIndex {
     /// §4). Per-visit cost during traversal drops to popcount + one Vec
     /// lookup; the exact-distance work is amortised to ef calls at the
     /// very end, instead of being paid per visit.
-    fn search_layer_ctx_end_of_search_rerank(
+    fn search_layer_ctx_end_of_search_rerank<M: Meter>(
         &self,
         ctx: &QueryCtx<'_>,
         ep: usize,
         ef: usize,
         level: usize,
         guard: &crossbeam_epoch::Guard,
-    ) -> Vec<Candidate> {
+        meter: &mut M,
+    ) -> Result<Vec<Candidate>, M::Stop> {
         // Oversample: traverse the graph with a larger cheap-distance
         // frontier so the rerank pool sees more candidates. qdrant's
         // `oversampling` parameter equivalent — `factor = 1.0` (default)
@@ -2808,7 +2888,8 @@ impl HnswIndex {
         let factor = self.config.rerank_oversample_factor.max(1.0);
         let frontier_ef = ((ef as f32) * factor).ceil() as usize;
 
-        let mut result_vec = self.search_layer_ctx_no_rerank(ctx, ep, frontier_ef, level, guard);
+        let mut result_vec =
+            self.search_layer_ctx_no_rerank(ctx, ep, frontier_ef, level, guard, meter)?;
 
         // End-of-search rerank: replace every candidate's distance with
         // the exact f32 value, then sort by it. This is the only place
@@ -2818,6 +2899,7 @@ impl HnswIndex {
         for c in result_vec.iter_mut() {
             c.distance = self.compute_exact_distance(ctx, c.idx as usize);
         }
+        meter.work(result_vec.len() as u64)?;
         result_vec.sort_by(|a, b| {
             a.distance
                 .partial_cmp(&b.distance)
@@ -2826,17 +2908,19 @@ impl HnswIndex {
         // Truncate to user-requested ef — the oversample factor inflated
         // the frontier only, the caller still wants `ef` results.
         result_vec.truncate(ef);
-        result_vec
+        Ok(result_vec)
     }
 
-    fn search_layer_ctx_inline_rerank(
+    fn search_layer_ctx_inline_rerank<M: Meter>(
         &self,
         ctx: &QueryCtx<'_>,
         ep: usize,
         ef: usize,
         level: usize,
         guard: &crossbeam_epoch::Guard,
-    ) -> Vec<Candidate> {
+        meter: &mut M,
+    ) -> Result<Vec<Candidate>, M::Stop> {
+        meter.scratch(Self::layer_pass_scratch(ef))?;
         // Two-heap pattern: cheap frontier vs accurate threshold.
         //
         // The `candidates` (frontier) heap is keyed on the cheap distance
@@ -3022,6 +3106,7 @@ impl HnswIndex {
                         }
                     }
                 }
+                meter.work(unvisited_neighbors.len() as u64)?;
             }
         }
 
@@ -3037,7 +3122,7 @@ impl HnswIndex {
                 .partial_cmp(&b.distance)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        result_vec
+        Ok(result_vec)
     }
 
     /// Compute distance between the search query and a node.

@@ -14,6 +14,56 @@ fn make_config(metric: VectorMetric) -> HnswConfig {
     }
 }
 
+/// A search under a query budget returns what the unmetered search returns,
+/// counts the vectors it compared and holds its scratch only while it runs;
+/// a cancelled budget stops it with that stop.
+#[test]
+fn a_metered_search_answers_alike_and_stops_with_its_budget() {
+    use coordinode_core::budget::{BatchedWork, BudgetStop, QueryBudget};
+    let mut index = HnswIndex::new(make_config(VectorMetric::L2));
+    for i in 0..300u64 {
+        index.insert(i, vec![i as f32, (i % 17) as f32, (i % 5) as f32]);
+    }
+    let query = [150.0, 3.0, 1.0];
+
+    let budget = QueryBudget::new(1 << 20);
+    let mut batch = BatchedWork::new(&budget);
+    let metered = index
+        .search_metered(&query, 5, &mut batch)
+        .expect("metered");
+    assert!(
+        budget.memory_used() > 0,
+        "the scratch is held while it runs"
+    );
+    batch.finish().expect("finish");
+    assert_eq!(budget.memory_used(), 0);
+    assert!(budget.work_done() > 5, "compared {}", budget.work_done());
+    let plain = index.search(&query, 5);
+    assert_eq!(
+        metered.iter().map(|r| r.id).collect::<Vec<_>>(),
+        plain.iter().map(|r| r.id).collect::<Vec<_>>()
+    );
+
+    let cancelled = QueryBudget::new(1 << 20);
+    cancelled.cancel();
+    let mut batch = BatchedWork::new(&cancelled);
+    let mut stopped = Ok(Vec::new());
+    for _ in 0..coordinode_core::budget::CHECK_EVERY {
+        stopped = index.search_metered(&query, 5, &mut batch);
+        if stopped.is_err() {
+            break;
+        }
+    }
+    assert_eq!(stopped.map(|_| ()), Err(BudgetStop::Cancelled));
+
+    let tight = QueryBudget::new(16);
+    let mut batch = BatchedWork::new(&tight);
+    assert!(matches!(
+        index.search_metered(&query, 5, &mut batch),
+        Err(BudgetStop::Memory { .. })
+    ));
+}
+
 #[test]
 fn effective_alpha_resolves_auto_and_explicit() {
     let mut cfg = make_config(VectorMetric::Cosine);

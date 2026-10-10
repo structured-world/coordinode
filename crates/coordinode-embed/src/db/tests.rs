@@ -757,6 +757,52 @@ fn a_subquery_run_per_row_does_not_accumulate_against_the_limit() {
     }
 }
 
+/// A vector top-k read through the index runs its search against the
+/// statement's budget: under a limit smaller than the search's scratch it is
+/// refused with the memory stop, and within the default it answers.
+#[test]
+fn a_vector_search_through_the_index_is_held_to_the_memory_limit() {
+    use coordinode_core::budget::BudgetStop;
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let run = |query: &str, options: &StatementOptions| {
+        db.execute_cypher_shared_with(query, None, None, options)
+    };
+    let default = StatementOptions::default();
+    run(
+        "CREATE VECTOR INDEX item_emb ON :Item(emb) OPTIONS {metric: \"l2\"}",
+        &default,
+    )
+    .expect("index");
+    run(
+        "UNWIND range(1, 200) AS i CREATE (:Item {i: i, emb: [toFloat(i), 0.0, 1.0]})",
+        &default,
+    )
+    .expect("items");
+    let query = "MATCH (n:Item) WITH n, vector_distance(n.emb, [7.0, 0.0, 1.0]) AS d \
+                 ORDER BY d LIMIT 3 RETURN n.i AS i";
+    let plan = db.explain_cypher(query).expect("explain");
+    assert!(plan.contains("HnswScan"), "{plan}");
+
+    let tiny = StatementOptions {
+        query_memory_limit: Some(512),
+        ..StatementOptions::default()
+    };
+    let refused = run(query, &tiny);
+    assert!(
+        matches!(
+            refused,
+            Err(DatabaseError::Execution(ExecutionError::Budget(
+                BudgetStop::Memory { .. }
+            )))
+        ),
+        "{refused:?}"
+    );
+    let rows = run(query, &default).expect("within the default").rows;
+    assert_eq!(rows[0].get("i"), Some(&Value::Int(7)));
+}
+
 /// In an interactive transaction, a statement whose writes did not fit its
 /// limit fails, and the transaction cannot then commit what was staged
 /// before the refusal: committing would apply part of that statement.

@@ -184,6 +184,32 @@ fn a_part_returns_what_it_kept_when_it_ends() {
     assert_eq!(whole.memory_peak(), 95);
 }
 
+/// A batch hands its work to the budget a full batch at a time, checking
+/// then, and the remainder when finished; its scratch is held until it is
+/// dropped.
+#[test]
+fn a_batch_counts_its_work_and_holds_its_scratch() {
+    let budget = QueryBudget::new(100);
+    let mut batch = BatchedWork::new(&budget);
+    batch.reserve(40).expect("scratch");
+    assert_eq!(budget.memory_used(), 40);
+    for _ in 0..CHECK_EVERY - 1 {
+        batch.add(1).expect("below a batch");
+    }
+    assert_eq!(budget.work_done(), 0, "nothing handed over yet");
+    budget.cancel();
+    assert_eq!(batch.add(1), Err(BudgetStop::Cancelled));
+    assert_eq!(budget.work_done(), CHECK_EVERY);
+    batch.add(3).expect("below a batch");
+    assert_eq!(batch.finish(), Err(BudgetStop::Cancelled));
+    assert_eq!(budget.work_done(), CHECK_EVERY + 3);
+    assert_eq!(
+        budget.memory_used(),
+        0,
+        "the scratch returns with the batch"
+    );
+}
+
 /// A part counts its work toward the whole's checks and stops for the
 /// whole's cancellation.
 #[test]
