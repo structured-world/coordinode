@@ -52,6 +52,18 @@ use crate::index_def::{
     IndexId, IndexIntegrityRecord, IndexProfile, NamespaceIndexPolicy,
 };
 
+/// Prefix of the marks of generations this member found its own copy of
+/// disagreeing with the records. Under `meta:`, the class of node-local
+/// records a snapshot or a partition copy neither carries nor replaces.
+const UNFIT_HERE_PREFIX: &[u8] = b"meta:idxunfit:";
+
+fn unfit_here_key(generation: GenerationId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(UNFIT_HERE_PREFIX.len() + 8);
+    key.extend_from_slice(UNFIT_HERE_PREFIX);
+    key.extend_from_slice(&generation.as_raw().to_be_bytes());
+    key
+}
+
 /// One page of an ordered read of index entries
 /// ([`IndexStore::scan_entries_in`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,6 +487,32 @@ pub trait IndexStore {
     ///
     /// A storage failure or an undecodable record.
     fn delete_integrity_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()>;
+
+    /// The generations this member found its own copy of disagreeing with
+    /// the records, as it stored them. Node-local: neither replicated nor
+    /// carried by a snapshot or a partition copy.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable key.
+    fn list_unfit_here(&self) -> StoreResult<Vec<GenerationId>>;
+
+    /// Store that this member's copy of `generation` disagrees with the
+    /// records, durably before returning: a restart keeps answering from the
+    /// records.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn mark_unfit_here(&self, generation: GenerationId) -> StoreResult<()>;
+
+    /// Remove the marks of `generations`, after a check verified this
+    /// member's copy or the generation left the catalog.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn clear_unfit_here(&self, generations: &[GenerationId]) -> StoreResult<()>;
 
     /// One page of the stored entries of `index`'s generation after the
     /// entry key `after`, at most `limit`, in key order, as `txn` sees them.
@@ -1145,6 +1183,51 @@ impl IndexStore for LocalIndexStore<'_> {
                     &IndexIntegrityRecord::key_of(record.generation),
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn list_unfit_here(&self) -> StoreResult<Vec<GenerationId>> {
+        let mut out = Vec::new();
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, UNFIT_HERE_PREFIX)?
+        {
+            let (key, _) = guard.into_inner()?;
+            let raw = key
+                .get(UNFIT_HERE_PREFIX.len()..)
+                .and_then(|tail| <[u8; 8]>::try_from(tail).ok())
+                .ok_or_else(|| StoreError::Decode {
+                    kind: "unfit-here mark",
+                    message: format!("malformed key {key:?}"),
+                })?;
+            out.push(GenerationId::from_raw(u64::from_be_bytes(raw)));
+        }
+        Ok(out)
+    }
+
+    fn mark_unfit_here(&self, generation: GenerationId) -> StoreResult<()> {
+        let key = unfit_here_key(generation);
+        if self.engine.get(Partition::Schema, &key)?.is_some() {
+            return Ok(());
+        }
+        // No journal carries a node-local record: the flush makes it durable.
+        self.engine.put(Partition::Schema, &key, &[])?;
+        self.engine.persist_partition(Partition::Schema)?;
+        Ok(())
+    }
+
+    fn clear_unfit_here(&self, generations: &[GenerationId]) -> StoreResult<()> {
+        let mut removed = false;
+        for generation in generations {
+            let key = unfit_here_key(*generation);
+            if self.engine.get(Partition::Schema, &key)?.is_some() {
+                self.engine.delete(Partition::Schema, &key)?;
+                removed = true;
+            }
+        }
+        if removed {
+            self.engine.persist_partition(Partition::Schema)?;
         }
         Ok(())
     }

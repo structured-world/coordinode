@@ -13,6 +13,7 @@ use coordinode_core::graph::node::{NodeId, NodeRecord, encode_node_key};
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::encoding::{encode_entry_key, encode_tuple, encode_unique_entry_key};
 use coordinode_embed::Database;
+use coordinode_modality::index::{IndexStore, LocalIndexStore};
 use coordinode_query::index::{CheckOutcome, CheckStatus, IndexSelector, Integrity};
 use coordinode_storage::engine::partition::Partition;
 
@@ -383,6 +384,59 @@ fn records_breaking_a_unique_index_are_reported_and_left_alone() {
     assert_eq!(found(&mut db, "c@x"), vec![c]);
 }
 
+/// A member that found its own copy of a generation disagreeing keeps
+/// answering from the records after a restart, though the catalog holds no
+/// suspicion: the mark is this member's, and only a check verified here or a
+/// replacement of the generation lifts it.
+#[test]
+fn a_copy_found_unfit_here_stays_unfit_across_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let generation;
+    let c;
+    {
+        let mut db = Database::open(dir.path()).expect("open db");
+        db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+            .expect("index");
+        db.execute_cypher("CREATE (:U {email: 'c@x'})").expect("c");
+        c = id_of(&mut db, "c@x");
+        generation = index_named(db.engine(), "u_email")
+            .expect("index")
+            .generation;
+        LocalIndexStore::new(db.engine())
+            .mark_unfit_here(generation)
+            .expect("mark this member's copy");
+    }
+    let mut db = Database::open(dir.path()).expect("reopen db");
+    assert!(
+        db.index_checks()
+            .expect("checks")
+            .iter()
+            .all(|s| s.record.integrity != Integrity::Suspect),
+        "the catalog holds no suspicion"
+    );
+    // c's entry lost: only the records still answer c.
+    let tuple = encode_tuple(&[Value::String("c@x".into())]).expect("tuple");
+    db.engine()
+        .delete(Partition::Idx, &encode_unique_entry_key(generation, &tuple))
+        .expect("lose c's entry");
+    assert_eq!(found(&mut db, "c@x"), vec![c], "answered from the records");
+
+    // A check run here verifies the copy (and repairs c's entry): the mark
+    // is gone, from memory and from storage.
+    let (_, outcome) = check(&db, "u_email");
+    assert!(
+        matches!(outcome, CheckOutcome::Verified { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        LocalIndexStore::new(db.engine())
+            .list_unfit_here()
+            .expect("marks")
+            .is_empty()
+    );
+    assert_eq!(found(&mut db, "c@x"), vec![c]);
+}
+
 /// Damage wider than a check may repair entry by entry rebuilds the index
 /// into a fresh generation, which answers every lookup.
 #[test]
@@ -540,6 +594,62 @@ fn maintenance_procedures() {
         .execute_cypher("CALL db.checkIndex('no_such')")
         .expect_err("no such index");
     assert!(err.to_string().contains("no_such"), "{err}");
+}
+
+/// A repair fixes the entries from its commit on; a snapshot older than the
+/// repair still holds the damaged entries. A read at that snapshot answers
+/// from the records, so it is complete for its time, while a current read
+/// uses the repaired index.
+#[test]
+fn a_snapshot_older_than_a_repair_answers_from_the_records() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE INDEX u_city ON :U(city)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {name: 'a', city: 'oslo'})")
+        .expect("a");
+    let a = scan_id(&mut db, "name", "a");
+    db.engine()
+        .delete(Partition::Idx, &entry_key(&db, "u_city", "oslo", a))
+        .expect("lose a's entry");
+    // b commits after the damage: its snapshot still lacks a's entry.
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "CREATE (:U {name: 'b', city: 'oslo'})", None)
+        .expect("b");
+    let at = db
+        .commit_transaction(tx)
+        .expect("commit")
+        .commit_ts
+        .as_raw();
+    let b = scan_id(&mut db, "name", "b");
+
+    let (status, outcome) = check(&db, "u_city");
+    assert!(
+        matches!(outcome, CheckOutcome::Verified { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        status.record.trusted_from.is_some_and(|from| from > at),
+        "verified from after the damaged snapshot: {:?}",
+        status.record.trusted_from
+    );
+
+    let mut expected = vec![a, b];
+    expected.sort_unstable();
+    let rows = db
+        .execute_cypher(&format!(
+            "MATCH (u:U {{city: 'oslo'}}) RETURN id(u) AS id AS OF TIMESTAMP {at}"
+        ))
+        .expect("read at the older snapshot");
+    let mut then: Vec<i64> = rows
+        .iter()
+        .map(|row| match row.get("id") {
+            Some(Value::Int(id)) => *id,
+            other => panic!("expected an id, got {other:?}"),
+        })
+        .collect();
+    then.sort_unstable();
+    assert_eq!(then, expected, "the older snapshot answers completely");
+    assert_eq!(found_by(&mut db, "city", "oslo"), expected);
 }
 
 /// Dropping an index removes its integrity records with it.

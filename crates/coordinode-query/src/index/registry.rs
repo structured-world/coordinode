@@ -48,6 +48,9 @@ struct IntegrityView {
     /// whose report cannot be recorded (one that takes no writes) keeps
     /// answering from the records.
     local: rustc_hash::FxHashSet<GenerationId>,
+    /// Verified generations that were once damaged, with the earliest
+    /// snapshot they answer for.
+    trusted_from: FxHashMap<GenerationId, u64>,
     /// Disagreements found here, waiting to be recorded.
     reports: Vec<IntegrityReport>,
 }
@@ -325,9 +328,9 @@ impl IndexRegistry {
 
     /// Bring the suspect set in line with the catalog's integrity
     /// `records`: a generation recorded suspect stays so until a check
-    /// verifies it, one recorded verified is no longer suspect, and a
-    /// suspicion found here stays until the catalog records the generation
-    /// suspect too (a verified record may predate it).
+    /// verifies it. A suspicion found here is about this member's copy and
+    /// is left alone: a verified record proves the copy of the member that
+    /// checked.
     pub fn apply_integrity(&self, records: &[IndexIntegrityRecord]) {
         let mut view = self.integrity.lock();
         view.recorded = records
@@ -335,13 +338,63 @@ impl IndexRegistry {
             .filter(|r| r.integrity == Integrity::Suspect)
             .map(|r| r.generation)
             .collect();
-        let recorded = view.recorded.clone();
-        // From here the catalog governs those.
-        view.local.retain(|g| !recorded.contains(g));
+        view.trusted_from = records
+            .iter()
+            .filter(|r| r.integrity == Integrity::Verified)
+            .filter_map(|r| r.trusted_from.map(|ts| (r.generation, ts)))
+            .collect();
+        self.refresh_any_suspect(&view);
+    }
+
+    /// Generations this member stored as found disagreeing in its own copy,
+    /// as a restart reads them back.
+    pub fn found_unfit_here(&self, generations: &[GenerationId]) {
+        if generations.is_empty() {
+            return;
+        }
+        let mut view = self.integrity.lock();
+        view.local.extend(generations.iter().copied());
+        self.refresh_any_suspect(&view);
+    }
+
+    /// A check that ran on this member verified `generation` here: the
+    /// suspicion this member found in its copy is lifted.
+    pub fn verified_here(&self, generation: GenerationId) {
+        let mut view = self.integrity.lock();
+        view.local.remove(&generation);
+        self.refresh_any_suspect(&view);
+    }
+
+    /// Forget suspicions found here in generations other than `live`: a
+    /// generation that left the catalog was replaced or dropped, and its
+    /// copy with it.
+    pub fn retain_generations(&self, live: &[GenerationId]) {
+        let mut view = self.integrity.lock();
+        view.local.retain(|g| live.contains(g));
+        self.refresh_any_suspect(&view);
+    }
+
+    fn refresh_any_suspect(&self, view: &IntegrityView) {
         self.any_suspect.store(
-            !view.recorded.is_empty() || !view.local.is_empty(),
+            !view.recorded.is_empty() || !view.local.is_empty() || !view.trusted_from.is_empty(),
             core::sync::atomic::Ordering::Release,
         );
+    }
+
+    /// Whether `generation` proves a lookup complete for a read at
+    /// `read_ts`: not suspect, and, when it was once damaged and verified
+    /// since, not read at a snapshot older than its verification.
+    pub fn answers_at(&self, generation: GenerationId, read_ts: u64) -> bool {
+        if !self.any_suspect.load(core::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        let view = self.integrity.lock();
+        if view.recorded.contains(&generation) || view.local.contains(&generation) {
+            return false;
+        }
+        view.trusted_from
+            .get(&generation)
+            .is_none_or(|from| read_ts >= *from)
     }
 
     /// Make `index` active in this process without a stored record to bind
@@ -389,14 +442,25 @@ impl IndexRegistry {
     /// planning and advice see every index; only B-tree indexes have entries
     /// maintained here.
     pub fn load_all(&self, engine: &StorageEngine) -> Result<(), StorageError> {
-        let records = LocalIndexStore::new(engine)
-            .list_integrity()
-            .map_err(|e| match e {
-                StoreError::Storage(e) => e,
-                other => StorageError::Serialization(other.to_string()),
-            })?;
+        let store = LocalIndexStore::new(engine);
+        let storage = |e| match e {
+            StoreError::Storage(e) => e,
+            other => StorageError::Serialization(other.to_string()),
+        };
+        let records = store.list_integrity().map_err(storage)?;
         self.apply_integrity(&records);
         let defs = super::ops::list_index_definitions(engine)?;
+        let live: Vec<GenerationId> = defs.iter().map(|d| d.generation).collect();
+        // This member's own marks survive a restart; those of generations
+        // that left the catalog went with their copies.
+        let (kept, gone): (Vec<_>, Vec<_>) = store
+            .list_unfit_here()
+            .map_err(storage)?
+            .into_iter()
+            .partition(|g| live.contains(g));
+        store.clear_unfit_here(&gone).map_err(storage)?;
+        self.found_unfit_here(&kept);
+        self.retain_generations(&live);
         let mut loaded = Catalog::default();
         for def in defs {
             let version = engine.record_version(

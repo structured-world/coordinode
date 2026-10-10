@@ -1776,10 +1776,16 @@ impl<'a> ExecutionContext<'a> {
         let Some(index) = registry.get_by_id(id) else {
             return Ok(None);
         };
+        // The snapshot this statement reads: a named timestamp, or its own.
+        // A timestamp before the epoch reads nothing an index could miss.
+        let read_ts = match self.snapshot_ts {
+            Some(at) => u64::try_from(at).unwrap_or(0),
+            None => self.mvcc_read_ts.as_raw(),
+        };
         if index.index_type != crate::index::IndexType::BTree
             || index.state != IndexState::Ready
             || index.layout != ENTRY_LAYOUT
-            || registry.is_suspect(index.generation)
+            || !registry.answers_at(index.generation, read_ts)
         {
             return Ok(None);
         }

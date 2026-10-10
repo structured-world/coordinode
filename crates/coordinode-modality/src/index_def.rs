@@ -849,6 +849,12 @@ pub struct IndexIntegrityRecord {
     pub evidence_revision: u64,
     /// The latest check, if one was admitted.
     pub check: Option<IndexCheck>,
+    /// The earliest snapshot a verified generation that was once damaged
+    /// answers for: a repair fixes the entries from its commit on, not the
+    /// entries an older snapshot reads, so a read at an earlier timestamp
+    /// answers from the records. `None` for a generation never found
+    /// damaged, which answers every snapshot it covers.
+    pub trusted_from: Option<u64>,
 }
 
 impl IndexIntegrityRecord {
@@ -868,6 +874,7 @@ impl IndexIntegrityRecord {
             evidence: Vec::new(),
             evidence_revision: 0,
             check: None,
+            trusted_from: None,
         }
     }
 

@@ -178,12 +178,12 @@ fn a_reported_generation_is_suspect_and_its_report_waits() {
     );
 }
 
-/// A verified record older than a suspicion found here does not clear it: a
-/// member whose report could not be recorded keeps answering from records.
-/// Once the catalog records the generation suspect, the catalog governs:
-/// a later verified record clears it.
+/// A suspicion found here is about this member's copy: a verified record in
+/// the catalog proves another member's copy, so neither an older one nor one
+/// written after the catalog recorded the suspicion clears it. Only a check
+/// verified on this member does.
 #[test]
-fn the_catalog_governs_a_suspicion_once_it_records_it() {
+fn a_catalog_verification_does_not_clear_a_suspicion_found_here() {
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
     reg.report_mismatch(&index, stray(7));
@@ -195,7 +195,26 @@ fn the_catalog_governs_a_suspicion_once_it_records_it() {
     reg.apply_integrity(&[integrity(&index, Integrity::Suspect)]);
     assert!(reg.is_suspect(index.generation));
     reg.apply_integrity(&[integrity(&index, Integrity::Verified)]);
-    assert!(!reg.is_suspect(index.generation), "verified after recorded");
+    assert!(
+        reg.is_suspect(index.generation),
+        "verified elsewhere after the catalog recorded it"
+    );
+    assert!(!reg.answers_at(index.generation, u64::MAX));
+    reg.verified_here(index.generation);
+    assert!(!reg.is_suspect(index.generation), "verified on this member");
+}
+
+/// A generation that leaves the catalog takes a suspicion found here with
+/// it: its replacement is a different copy.
+#[test]
+fn a_replaced_generation_takes_its_suspicion_with_it() {
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    let next = btree("user_email", "email", 2);
+    reg.report_mismatch(&index, stray(7));
+    reg.retain_generations(&[next.generation]);
+    assert!(!reg.is_suspect(index.generation));
+    assert!(!reg.is_suspect(next.generation));
 }
 
 /// A generation the catalog records suspect is suspect on a member that

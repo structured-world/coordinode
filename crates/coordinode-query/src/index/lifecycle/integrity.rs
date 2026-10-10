@@ -185,7 +185,15 @@ impl IndexBuildService {
                 .1
                 .push(report.found);
         }
+        let store = LocalIndexStore::new(self.shared.env.engine());
         for (generation, (index, found)) in by_generation {
+            // This member's copy stays unfit across a restart, whether or not
+            // the catalog can record the report.
+            if let Err(e) = store.mark_unfit_here(generation) {
+                tracing::warn!(generation = generation.as_raw(), error = %e,
+                    "could not store that this member's index copy disagrees; it answers \
+                     from the records until it restarts");
+            }
             match self.record(index, generation, found) {
                 Ok(true) => {
                     if let Err(e) = self.submit_check(generation) {
@@ -838,9 +846,18 @@ impl Shared {
             if pass.found == 0 && pass.conflicts.is_empty() {
                 let started = record.0.check.as_ref().map_or(0, |c| c.started_revision);
                 if record.0.evidence_revision == started {
-                    return self.conclude_check(generation, taken, |rec, check| {
+                    // A generation found damaged, or repaired by this check,
+                    // is proved from now on; an older snapshot still reads
+                    // the entries as they were then. A direct-mode engine
+                    // keeps no older snapshots to protect.
+                    let now = self.env.oracle().map(|oracle| oracle.current().as_raw());
+                    let once_damaged = record.0.evidence_revision > 0 || repaired_total > 0;
+                    return self.conclude_check(generation, taken, move |rec, check| {
                         rec.integrity = Integrity::Verified;
                         rec.evidence.clear();
+                        if once_damaged {
+                            rec.trusted_from = now.or(rec.trusted_from);
+                        }
                         check.state = CheckState::Done;
                     });
                 }
@@ -1290,6 +1307,14 @@ impl Shared {
             return self.lost_check(generation, taken);
         }
         let record = store.load_integrity(generation).map_err(text)?;
+        // The passes read this member's copy: a verification proves it here.
+        if record
+            .as_ref()
+            .is_some_and(|(r, _)| r.integrity == Integrity::Verified)
+        {
+            store.clear_unfit_here(&[generation]).map_err(text)?;
+            env.registry().verified_here(generation);
+        }
         Ok(Executed::Outcome(
             record
                 .and_then(|(record, _)| terminal_outcome(&record))
