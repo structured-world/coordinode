@@ -3801,17 +3801,19 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
             first_unaccounted_operator(left).or_else(|| first_unaccounted_operator(right))
         }
         LogicalOp::Union { inputs, .. } => inputs.iter().find_map(first_unaccounted_operator),
-        // A node MERGE matches through its scan; a relationship MERGE walks
-        // adjacency outside the budget.
+        // A node MERGE matches through its scan; a relationship MERGE matches
+        // through its traversal or, bound to its endpoints, walks the source's
+        // edges with the same charged hop. Both create into the transaction.
         LogicalOp::Merge {
             pattern,
             on_match,
             on_create,
-            multi: false,
-        } if matches!(
+            ..
+        } if (matches!(
             **pattern,
             LogicalOp::NodeScan { .. } | LogicalOp::IndexScan { .. }
-        ) && !set_items_read_storage(on_match)
+        ) || as_traverse_op(pattern).is_some())
+            && !set_items_read_storage(on_match)
             && !set_items_read_storage(on_create) =>
         {
             first_unaccounted_operator(pattern)

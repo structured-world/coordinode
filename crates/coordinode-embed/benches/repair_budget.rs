@@ -9,7 +9,12 @@
 //!
 //! Run: cargo bench -p coordinode-embed --bench repair_budget
 
-#![allow(clippy::expect_used, clippy::print_stdout, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::unwrap_used
+)]
 
 use std::time::{Duration, Instant};
 

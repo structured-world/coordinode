@@ -810,9 +810,10 @@ fn a_lookup_answered_by_the_records_stays_within_its_memory_limit() {
 /// when the rest of the statement runs work outside its budget (a filter
 /// with a pattern subquery, which reads storage): it names the index and
 /// the operator. Accounted operators over the same lookup (a traversal, an
-/// optional match, an aggregate, a detaching delete) answer from the
-/// records exactly as the sound index would, and the delete removes the
-/// node that holds the value, not the one the wrong entry named.
+/// optional match, an aggregate, a relationship MERGE, a detaching delete)
+/// answer from the records exactly as the sound index would, and the delete
+/// removes the node that holds the value, not the one the wrong entry
+/// named.
 #[test]
 fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     use coordinode_embed::db::DatabaseError;
@@ -850,14 +851,66 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     let counted = db.execute_cypher(count).expect("an aggregate is accounted");
     assert_eq!(counted[0].get("n"), Some(&Value::Int(1)));
 
-    db.execute_cypher("MATCH (u:U {email: 'a@x'}) DETACH DELETE u")
-        .expect("a detaching delete is accounted");
+    // A relationship MERGE walks the source's edges within the budget: the
+    // existing edge is matched, a new one is created once.
+    let merge = "MATCH (u:U {email: 'a@x'}), (t:T) MERGE (u)-[:R]->(t) RETURN t.n AS n";
+    for _ in 0..2 {
+        let rows = db
+            .execute_cypher(merge)
+            .expect("a relationship merge is accounted");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("n"), Some(&Value::Int(1)));
+    }
+    db.execute_cypher("CREATE (:T {n: 2})")
+        .expect("second target");
+    db.execute_cypher(merge)
+        .expect("merge creates the missing edge");
+    let edges = db
+        .execute_cypher("MATCH (u:U {email: 'a@x'})-[:R]->(t:T) RETURN count(t) AS n")
+        .expect("edges");
+    assert_eq!(edges[0].get("n"), Some(&Value::Int(2)));
+
+    // The lookups above found the entry wrong, and the check they started
+    // repairs it in the background, conditioned on the holder's record: a
+    // delete of that node committing while the repair is in flight is
+    // refused as a conflict. Retried once the check has finished, it
+    // commits.
+    let delete = "MATCH (u:U {email: 'a@x'}) DETACH DELETE u";
+    match db.execute_cypher(delete) {
+        Ok(_) => {}
+        Err(DatabaseError::Execution(ExecutionError::Conflict(_))) => {
+            check(&db, "u_email");
+            db.execute_cypher(delete)
+                .expect("a detaching delete is accounted");
+        }
+        Err(e) => panic!("a detaching delete is accounted: {e:?}"),
+    }
     assert_eq!(
         found(&mut db, "a@x"),
         Vec::<i64>::new(),
         "the holder is gone"
     );
     assert_eq!(id_of(&mut db, "z@x"), wrong, "the wrongly named node stays");
+}
+
+/// A detaching delete right after relationship MERGEs on the same node
+/// commits: the statements before it hold nothing it writes.
+#[test]
+fn a_detaching_delete_after_relationship_merges_commits() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {email: 'a@x'})-[:R]->(:T {n: 1})")
+        .expect("a");
+    let merge = "MATCH (u:U {email: 'a@x'}), (t:T) MERGE (u)-[:R]->(t) RETURN t.n AS n";
+    db.execute_cypher(merge).expect("merge");
+    db.execute_cypher("CREATE (:T {n: 2})")
+        .expect("second target");
+    db.execute_cypher(merge)
+        .expect("merge creates the missing edge");
+    db.execute_cypher("MATCH (u:U {email: 'a@x'}) DETACH DELETE u")
+        .expect("detaching delete");
+    assert_eq!(found(&mut db, "a@x"), Vec::<i64>::new());
 }
 
 /// Records and catalog rows last written before the retention horizon are
