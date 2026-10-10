@@ -34,10 +34,12 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
     sorted[rank]
 }
 
-/// p50 and p99 of `READS` runs of `query`, each expected to return one row.
-fn latency(db: &Database, query: &str) -> (Duration, Duration) {
+/// p50 and p99 of `READS` runs of `query`, each expected to return one row,
+/// each after an untimed `prepare`.
+fn latency(db: &Database, query: &str, prepare: &dyn Fn()) -> (Duration, Duration) {
     let mut samples: Vec<Duration> = (0..READS)
         .map(|_| {
+            prepare();
             let started = Instant::now();
             let rows = db
                 .execute_cypher_shared(query, None, None, None, None)
@@ -51,9 +53,11 @@ fn latency(db: &Database, query: &str) -> (Duration, Duration) {
     (percentile(&samples, 0.5), percentile(&samples, 0.99))
 }
 
-/// The smallest memory limit, in bytes, `query` completes within.
-fn peak(db: &Database, query: &str) -> u64 {
+/// The smallest memory limit, in bytes, `query` completes within, each probe
+/// after an untimed `prepare`.
+fn peak(db: &Database, query: &str, prepare: &dyn Fn()) -> u64 {
     let runs = |limit: u64| {
+        prepare();
         let options = StatementOptions {
             query_memory_limit: Some(limit),
             ..StatementOptions::default()
@@ -74,9 +78,9 @@ fn peak(db: &Database, query: &str) -> u64 {
     low
 }
 
-fn report(name: &str, db: &Database, query: &str) {
-    let (p50, p99) = latency(db, query);
-    let bytes = peak(db, query);
+fn report(name: &str, db: &Database, query: &str, prepare: &dyn Fn()) {
+    let (p50, p99) = latency(db, query, prepare);
+    let bytes = peak(db, query, prepare);
     println!(
         "{name:<28} p50={p50:>10.3?} p99={p99:>10.3?} peak={:>9.1} KiB",
         bytes as f64 / 1024.0
@@ -98,18 +102,20 @@ fn main() {
     .expect("others");
 
     let lookup = "MATCH (u:U {email: 'u7@x'}) RETURN u.n AS n";
-    report("index answers", &db, lookup);
+    let nothing = || {};
+    report("index answers", &db, lookup, &nothing);
     report(
         "label scan, no index",
         &db,
         "MATCH (u:U) WHERE u.email + '' = 'u7@x' RETURN u.n AS n",
+        &nothing,
     );
 
-    // The entry for 'u7@x' now names another node: the lookup finds the
-    // index wrong and answers from the records.
-    let store = LocalIndexStore::new(db.engine());
-    let id = store.resolve_name("u_email").unwrap().unwrap();
-    let index = store.load_definition(id).unwrap().unwrap();
+    // Before every run the entry for 'u7@x' names another node: the lookup
+    // finds the index wrong and answers from the records. A check started by
+    // an earlier run repairs the entry in the background, and may rebuild
+    // the index into a new generation, so the entry is written afresh into
+    // the generation serving now.
     let wrong = match db
         .execute_cypher("MATCH (u:U {email: 'u8@x'}) RETURN id(u) AS id")
         .expect("id")[0]
@@ -119,17 +125,23 @@ fn main() {
         other => panic!("id: {other:?}"),
     };
     let tuple = encode_tuple(&[Value::String("u7@x".into())]).expect("tuple");
-    db.engine()
-        .put(
-            Partition::Idx,
-            &encode_unique_entry_key(index.generation, &tuple),
-            &wrong.to_be_bytes(),
-        )
-        .expect("misattribute");
-    report("records answer (fallback)", &db, lookup);
+    let misattribute = || {
+        let store = LocalIndexStore::new(db.engine());
+        let id = store.resolve_name("u_email").unwrap().unwrap();
+        let index = store.load_definition(id).unwrap().unwrap();
+        db.engine()
+            .put(
+                Partition::Idx,
+                &encode_unique_entry_key(index.generation, &tuple),
+                &wrong.to_be_bytes(),
+            )
+            .expect("misattribute");
+    };
+    report("records answer (fallback)", &db, lookup, &misattribute);
     report(
         "fallback under aggregate",
         &db,
         "MATCH (u:U {email: 'u7@x'}) RETURN count(u) AS n",
+        &misattribute,
     );
 }
