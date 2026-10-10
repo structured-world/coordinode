@@ -804,6 +804,11 @@ pub struct IndexCheck {
     pub mismatches: u64,
     /// Disagreements repaired so far.
     pub repaired: u64,
+    /// Disagreements the running pass found so far, across restarts: a pass
+    /// is clean only when it found none over both halves.
+    pub pass_found: u64,
+    /// Of those, records breaking the constraint, which no entry can fix.
+    pub pass_conflicts: u64,
     /// The fresh generation a rebuild fills, when the damage was too wide
     /// to repair entry by entry; the checked generation is retired by it.
     pub rebuilt_into: Option<GenerationId>,
@@ -824,6 +829,8 @@ impl IndexCheck {
             checked: 0,
             mismatches: 0,
             repaired: 0,
+            pass_found: 0,
+            pass_conflicts: 0,
             rebuilt_into: None,
             finished_at_ms: None,
         }

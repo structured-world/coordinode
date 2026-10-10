@@ -437,6 +437,57 @@ fn a_copy_found_unfit_here_stays_unfit_across_a_restart() {
     assert_eq!(found(&mut db, "c@x"), vec![c]);
 }
 
+/// A check resumed after a restart half way through a pass counts what the
+/// pass found before the restart: a pass that found a disagreement is not
+/// clean, however clean its remainder, so only a later full pass verifies.
+#[test]
+fn a_pass_resumed_after_a_restart_counts_what_it_found_before() {
+    use coordinode_modality::index_def::{CheckPhase, IndexCheck, IndexIntegrityRecord};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let generation;
+    {
+        let mut db = Database::open(dir.path()).expect("open db");
+        db.execute_cypher("CREATE INDEX u_city ON :U(city)")
+            .expect("index");
+        db.execute_cypher("CREATE (:U {name: 'a', city: 'oslo'})")
+            .expect("a");
+        let index = index_named(db.engine(), "u_city").expect("index");
+        generation = index.generation;
+        // The records half ran before the restart and found one entry
+        // missing; the entries half is next.
+        let mut check = IndexCheck::accepted(0);
+        check.phase = CheckPhase::Entries;
+        check.pass_found = 1;
+        check.mismatches = 1;
+        check.repaired = 1;
+        let mut record = IndexIntegrityRecord::new(index.id, generation);
+        record.check = Some(check);
+        let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+            db.engine(),
+            None,
+            coordinode_core::txn::timestamp::Timestamp::ZERO,
+            None,
+        );
+        LocalIndexStore::new(db.engine())
+            .put_integrity_txn(&mut txn, &record, None)
+            .expect("store the interrupted check");
+    }
+    let db = Database::open(dir.path()).expect("reopen db");
+    let (status, outcome) = db
+        .index_check(generation, std::time::Duration::from_secs(30))
+        .expect("read the check")
+        .expect("the check exists");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { .. })),
+        "{outcome:?}"
+    );
+    let passes = status.record.check.as_ref().map_or(0, |c| c.passes);
+    assert!(
+        passes >= 2,
+        "the resumed pass found a disagreement, so a later pass verified: {passes}"
+    );
+}
+
 /// Damage wider than a check may repair entry by entry rebuilds the index
 /// into a fresh generation, which answers every lookup.
 #[test]

@@ -37,6 +37,9 @@ pub struct IndexRegistry {
     /// Signalled when a disagreement is found, for the maintenance that
     /// records it.
     reported: parking_lot::Condvar,
+    /// Orders the stored marks of this member's unfit copies: a mark written
+    /// for a new report never lands before the removal of an older one.
+    marks: parking_lot::Mutex<()>,
 }
 
 /// The suspect generations as this process knows them.
@@ -44,15 +47,28 @@ pub struct IndexRegistry {
 struct IntegrityView {
     /// Suspect per the catalog's integrity records.
     recorded: rustc_hash::FxHashSet<GenerationId>,
-    /// Found suspect here and not recorded in the catalog yet: a member
-    /// whose report cannot be recorded (one that takes no writes) keeps
-    /// answering from the records.
-    local: rustc_hash::FxHashSet<GenerationId>,
+    /// Generations whose copy on this member was found disagreeing with the
+    /// records: they answer from the records here until a check verifies
+    /// this copy, whatever the catalog says about another member's.
+    local: FxHashMap<GenerationId, LocalMark>,
+    /// Source of [`LocalMark::revision`].
+    last_revision: u64,
     /// Verified generations that were once damaged, with the earliest
     /// snapshot they answer for.
     trusted_from: FxHashMap<GenerationId, u64>,
     /// Disagreements found here, waiting to be recorded.
     reports: Vec<IntegrityReport>,
+}
+
+/// This member's own finding against one generation's copy.
+#[derive(Debug, Clone, Copy)]
+struct LocalMark {
+    /// Moves with every disagreement found here, from one counter for all
+    /// generations: a check proves the copy only if none arrived since the
+    /// revision its pass started at.
+    revision: u64,
+    /// Stored, so a restart still answers from the records.
+    stored: bool,
 }
 
 /// A disagreement between an entry and a record, found by a read or a write
@@ -267,37 +283,113 @@ impl IndexRegistry {
             integrity: parking_lot::Mutex::new(IntegrityView::default()),
             any_suspect: core::sync::atomic::AtomicBool::new(false),
             reported: parking_lot::Condvar::new(),
+            marks: parking_lot::Mutex::new(()),
         }
     }
 
     /// Record that an entry of `index` was found disagreeing with the record
     /// it names, as `found` says: from now on its generation proves no
-    /// lookup complete and no unique value free in this process, and the
+    /// lookup complete and no unique value free on this member, and the
     /// report waits for the maintenance that records it in the catalog and
     /// checks the generation. A read or a write that finds one reports it;
     /// neither changes an entry or a record for it.
-    pub fn report_mismatch(&self, index: &IndexDefinition, found: Mismatch) {
-        let mut view = self.integrity.lock();
-        if view.local.insert(index.generation) {
-            tracing::warn!(
-                index = %index,
-                generation = index.generation.as_raw(),
-                ?found,
-                "an index entry disagrees with the record it names; lookups in this \
-                 index generation answer from the stored records until it is checked"
-            );
-        }
-        let report = IntegrityReport {
-            index: index.id,
-            generation: index.generation,
-            found,
+    ///
+    /// The first finding against a generation is stored in `engine` before
+    /// this returns, so a restart keeps answering from the records. If the
+    /// store refuses it, the mark stays in memory and the maintenance
+    /// stores it on its next round ([`Self::store_pending_marks`]).
+    pub fn report_mismatch(
+        &self,
+        engine: &StorageEngine,
+        index: &IndexDefinition,
+        found: Mismatch,
+    ) {
+        let unstored = {
+            let mut view = self.integrity.lock();
+            view.last_revision += 1;
+            let revision = view.last_revision;
+            let mark = view.local.entry(index.generation).or_insert(LocalMark {
+                revision,
+                stored: false,
+            });
+            mark.revision = revision;
+            let unstored = !mark.stored;
+            if unstored {
+                tracing::warn!(
+                    index = %index,
+                    generation = index.generation.as_raw(),
+                    ?found,
+                    "an index entry disagrees with the record it names; lookups in this \
+                     index generation answer from the stored records until it is checked"
+                );
+            }
+            let report = IntegrityReport {
+                index: index.id,
+                generation: index.generation,
+                found,
+            };
+            // Past the bound, a generation with no report queued still gets
+            // one: its check finds the rest.
+            let queued = view
+                .reports
+                .iter()
+                .any(|r| r.generation == index.generation);
+            if (view.reports.len() < MAX_PENDING_REPORTS || !queued)
+                && !view.reports.contains(&report)
+            {
+                view.reports.push(report);
+            }
+            self.any_suspect
+                .store(true, core::sync::atomic::Ordering::Release);
+            self.reported.notify_all();
+            unstored
         };
-        if view.reports.len() < MAX_PENDING_REPORTS && !view.reports.contains(&report) {
-            view.reports.push(report);
+        if unstored {
+            self.store_mark(engine, index.generation);
         }
-        self.any_suspect
-            .store(true, core::sync::atomic::Ordering::Release);
-        self.reported.notify_all();
+    }
+
+    /// Store the mark of `generation` unless it is stored already or was
+    /// lifted meanwhile. A failure leaves it for the next round.
+    fn store_mark(&self, engine: &StorageEngine, generation: GenerationId) {
+        let _order = self.marks.lock();
+        let wanted = self
+            .integrity
+            .lock()
+            .local
+            .get(&generation)
+            .is_some_and(|m| !m.stored);
+        if !wanted {
+            return;
+        }
+        match LocalIndexStore::new(engine).mark_unfit_here(generation) {
+            Ok(()) => {
+                if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
+                    mark.stored = true;
+                }
+            }
+            Err(e) => tracing::warn!(
+                generation = generation.as_raw(),
+                error = %e,
+                "could not store that this member's index copy disagrees with the records; \
+                 retrying, and a restart before it lands forgets it"
+            ),
+        }
+    }
+
+    /// Store every mark a failure left in memory only.
+    pub fn store_pending_marks(&self, engine: &StorageEngine) {
+        let pending: Vec<GenerationId> = self
+            .integrity
+            .lock()
+            .local
+            .iter()
+            .filter(|(_, m)| !m.stored)
+            .map(|(g, _)| *g)
+            .collect();
+        for generation in pending {
+            self.store_mark(engine, generation);
+        }
     }
 
     /// Whether an entry of `generation` is known to disagree with its record,
@@ -307,7 +399,17 @@ impl IndexRegistry {
             return false;
         }
         let view = self.integrity.lock();
-        view.recorded.contains(&generation) || view.local.contains(&generation)
+        view.recorded.contains(&generation) || view.local.contains_key(&generation)
+    }
+
+    /// The revision of this member's latest finding against `generation`, or
+    /// `0` when it has none: what a check's pass takes before it reads.
+    pub fn local_revision(&self, generation: GenerationId) -> u64 {
+        self.integrity
+            .lock()
+            .local
+            .get(&generation)
+            .map_or(0, |m| m.revision)
     }
 
     /// The reports waiting to be recorded, taken from the queue, waiting up
@@ -353,25 +455,67 @@ impl IndexRegistry {
             return;
         }
         let mut view = self.integrity.lock();
-        view.local.extend(generations.iter().copied());
+        for generation in generations {
+            view.last_revision += 1;
+            let revision = view.last_revision;
+            view.local.entry(*generation).or_insert(LocalMark {
+                revision,
+                stored: true,
+            });
+        }
         self.refresh_any_suspect(&view);
     }
 
-    /// A check that ran on this member verified `generation` here: the
-    /// suspicion this member found in its copy is lifted.
-    pub fn verified_here(&self, generation: GenerationId) {
+    /// A check's pass read this member's copy of `generation` from its start
+    /// and found it agreeing with the records, after taking `revision`: the
+    /// mark is lifted, in memory and in `engine`, unless a disagreement was
+    /// found here since. Returns whether it was lifted.
+    ///
+    /// # Errors
+    ///
+    /// The stored mark could not be removed; the copy stays unfit here.
+    pub fn verified_here(
+        &self,
+        engine: &StorageEngine,
+        generation: GenerationId,
+        revision: u64,
+    ) -> Result<bool, StoreError> {
+        let _order = self.marks.lock();
+        {
+            let view = self.integrity.lock();
+            if view
+                .local
+                .get(&generation)
+                .is_some_and(|m| m.revision != revision)
+            {
+                return Ok(false);
+            }
+        }
+        // Removed from storage first: a failure leaves the copy unfit.
+        LocalIndexStore::new(engine).clear_unfit_here(&[generation])?;
         let mut view = self.integrity.lock();
-        view.local.remove(&generation);
-        self.refresh_any_suspect(&view);
-    }
-
-    /// Forget suspicions found here in generations other than `live`: a
-    /// generation that left the catalog was replaced or dropped, and its
-    /// copy with it.
-    pub fn retain_generations(&self, live: &[GenerationId]) {
-        let mut view = self.integrity.lock();
-        view.local.retain(|g| live.contains(g));
-        self.refresh_any_suspect(&view);
+        match view.local.get_mut(&generation) {
+            Some(mark) if mark.revision != revision => {
+                // A finding arrived during the removal: its mark is stored
+                // again, by this round or, on failure, the next.
+                mark.stored = false;
+                drop(view);
+                if LocalIndexStore::new(engine)
+                    .mark_unfit_here(generation)
+                    .is_ok()
+                {
+                    if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
+                        mark.stored = true;
+                    }
+                }
+                Ok(false)
+            }
+            _ => {
+                view.local.remove(&generation);
+                self.refresh_any_suspect(&view);
+                Ok(true)
+            }
+        }
     }
 
     fn refresh_any_suspect(&self, view: &IntegrityView) {
@@ -389,7 +533,7 @@ impl IndexRegistry {
             return true;
         }
         let view = self.integrity.lock();
-        if view.recorded.contains(&generation) || view.local.contains(&generation) {
+        if view.recorded.contains(&generation) || view.local.contains_key(&generation) {
             return false;
         }
         view.trusted_from
@@ -450,17 +594,11 @@ impl IndexRegistry {
         let records = store.list_integrity().map_err(storage)?;
         self.apply_integrity(&records);
         let defs = super::ops::list_index_definitions(engine)?;
-        let live: Vec<GenerationId> = defs.iter().map(|d| d.generation).collect();
-        // This member's own marks survive a restart; those of generations
-        // that left the catalog went with their copies.
-        let (kept, gone): (Vec<_>, Vec<_>) = store
-            .list_unfit_here()
-            .map_err(storage)?
-            .into_iter()
-            .partition(|g| live.contains(g));
-        store.clear_unfit_here(&gone).map_err(storage)?;
-        self.found_unfit_here(&kept);
-        self.retain_generations(&live);
+        // This member's own marks survive a restart. A generation that left
+        // the catalog keeps its mark: a reader pinned to an older snapshot,
+        // plan or cursor may still reach its entries, and nothing records
+        // when the last such reader is gone.
+        self.found_unfit_here(&store.list_unfit_here().map_err(storage)?);
         let mut loaded = Catalog::default();
         for def in defs {
             let version = engine.record_version(
@@ -795,6 +933,7 @@ fn stage(
                 if let Some(registry) = staging.registry {
                     for tuple in held_tuples(&store, txn, index, values, holder)? {
                         registry.report_mismatch(
+                            staging.engine,
                             index,
                             Mismatch::Extra {
                                 node: holder.as_raw(),

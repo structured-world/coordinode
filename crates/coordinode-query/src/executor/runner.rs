@@ -1847,6 +1847,7 @@ impl<'a> ExecutionContext<'a> {
         }
         for tuple in wanted {
             registry.report_mismatch(
+                self.engine,
                 &index,
                 crate::index::Mismatch::Extra {
                     node: node.as_raw(),

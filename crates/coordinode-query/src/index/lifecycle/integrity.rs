@@ -135,9 +135,18 @@ struct Found {
 #[derive(Default)]
 struct Pass {
     checked: u64,
+    /// Disagreements the whole pass found, including pages read before a
+    /// restart.
     found: u64,
+    /// Of those, records breaking the constraint.
+    conflict_count: u64,
     repaired: u64,
+    /// The conflicts the pages read in this process found, to report.
     conflicts: Vec<Mismatch>,
+    /// This member's own evidence revision when the pass started from its
+    /// beginning in this process; `None` for a pass resumed from a cursor,
+    /// which proves nothing about this member's copy before the resume.
+    local_revision: Option<u64>,
 }
 
 impl IndexBuildService {
@@ -160,7 +169,10 @@ impl IndexBuildService {
                     .stopping
                     .load(core::sync::atomic::Ordering::Acquire)
                 {
-                    let reports = service.shared.env.registry().take_reports(MAINTENANCE_TICK);
+                    let env = service.shared.env.as_ref();
+                    let reports = env.registry().take_reports(MAINTENANCE_TICK);
+                    // A mark the finding could not store is retried here.
+                    env.registry().store_pending_marks(env.engine());
                     if !reports.is_empty() {
                         service.record_reports(reports);
                     }
@@ -185,15 +197,7 @@ impl IndexBuildService {
                 .1
                 .push(report.found);
         }
-        let store = LocalIndexStore::new(self.shared.env.engine());
         for (generation, (index, found)) in by_generation {
-            // This member's copy stays unfit across a restart, whether or not
-            // the catalog can record the report.
-            if let Err(e) = store.mark_unfit_here(generation) {
-                tracing::warn!(generation = generation.as_raw(), error = %e,
-                    "could not store that this member's index copy disagrees; it answers \
-                     from the records until it restarts");
-            }
             match self.record(index, generation, found) {
                 Ok(true) => {
                     if let Err(e) = self.submit_check(generation) {
@@ -843,7 +847,7 @@ impl Shared {
             // Every disagreement repaired, none left: the generation agrees
             // with its records, unless a report arrived meanwhile, which the
             // next pass looks for.
-            if pass.found == 0 && pass.conflicts.is_empty() {
+            if pass.found == 0 {
                 let started = record.0.check.as_ref().map_or(0, |c| c.started_revision);
                 if record.0.evidence_revision == started {
                     // A generation found damaged, or repaired by this check,
@@ -852,19 +856,31 @@ impl Shared {
                     // keeps no older snapshots to protect.
                     let now = self.env.oracle().map(|oracle| oracle.current().as_raw());
                     let once_damaged = record.0.evidence_revision > 0 || repaired_total > 0;
-                    return self.conclude_check(generation, taken, move |rec, check| {
+                    let outcome = self.conclude_check(generation, taken, move |rec, check| {
                         rec.integrity = Integrity::Verified;
                         rec.evidence.clear();
                         if once_damaged {
                             rec.trusted_from = now.or(rec.trusted_from);
                         }
                         check.state = CheckState::Done;
-                    });
+                    })?;
+                    // The pass read this member's copy from its start, after
+                    // the revision it took: that copy is proved, unless a
+                    // report found it disagreeing since.
+                    if let (Executed::Outcome(CheckOutcome::Verified { .. }), Some(revision)) =
+                        (&outcome, pass.local_revision)
+                    {
+                        self.env
+                            .registry()
+                            .verified_here(self.env.engine(), generation, revision)
+                            .map_err(text)?;
+                    }
+                    return Ok(outcome);
                 }
                 self.checkpoint(generation, taken, |rec, check| {
                     check.started_revision = rec.evidence_revision;
                 })?;
-            } else if pass.found == pass.conflicts.len() as u64 {
+            } else if pass.found == pass.conflict_count {
                 // Only records breaking the constraint remain: no entry can
                 // fix them.
                 let conflicts = pass.conflicts.clone();
@@ -898,6 +914,7 @@ impl Shared {
         let field_of = |name: &str| field_of_fields.lookup(name);
         let interpretation = taken.def.interpretation(&field_of);
         let mut pass = Pass::default();
+        let mut first_page = true;
         loop {
             if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
                 return Ok(None);
@@ -908,6 +925,14 @@ impl Shared {
             let Some(check) = record.check.clone() else {
                 return Ok(None);
             };
+            if first_page {
+                first_page = false;
+                // Taken before the pass reads anything: a report after it
+                // keeps this member's copy unfit whatever the pass finds.
+                if check.phase == CheckPhase::Records && check.cursor.is_none() {
+                    pass.local_revision = Some(env.registry().local_revision(generation));
+                }
+            }
             let (found, next, exhausted) = match check.phase {
                 CheckPhase::Records => {
                     self.records_page(taken, &interpretation, check.cursor.as_deref(), page)?
@@ -936,10 +961,17 @@ impl Shared {
             }
             pass.conflicts.extend(conflicts.iter().cloned());
             let phase_done = exhausted;
+            let page_found = (repairable.len() + conflicts.len()) as u64;
+            let page_conflicts = conflicts.len() as u64;
+            // The whole pass's counts, as the stored check holds them across
+            // a restart, read when this page completes the pass.
+            let mut totals = None;
             let moved = self.checkpoint(generation, taken, |rec, check| {
                 check.checked += found.checked;
-                check.mismatches += (repairable.len() + conflicts.len()) as u64;
+                check.mismatches += page_found;
                 check.repaired += repaired;
+                check.pass_found += page_found;
+                check.pass_conflicts += page_conflicts;
                 for conflict in &conflicts {
                     rec.report(conflict.clone());
                 }
@@ -950,6 +982,9 @@ impl Shared {
                         CheckPhase::Entries => {
                             check.phase = CheckPhase::Records;
                             check.passes += 1;
+                            totals = Some((check.pass_found, check.pass_conflicts));
+                            check.pass_found = 0;
+                            check.pass_conflicts = 0;
                         }
                     }
                 } else {
@@ -960,6 +995,10 @@ impl Shared {
                 return Ok(None);
             }
             if phase_done && check.phase == CheckPhase::Entries {
+                let (found, conflicts) =
+                    totals.unwrap_or((pass.found, pass.conflicts.len() as u64));
+                pass.found = found;
+                pass.conflict_count = conflicts;
                 return Ok(Some(pass));
             }
         }
@@ -1307,14 +1346,6 @@ impl Shared {
             return self.lost_check(generation, taken);
         }
         let record = store.load_integrity(generation).map_err(text)?;
-        // The passes read this member's copy: a verification proves it here.
-        if record
-            .as_ref()
-            .is_some_and(|(r, _)| r.integrity == Integrity::Verified)
-        {
-            store.clear_unfit_here(&[generation]).map_err(text)?;
-            env.registry().verified_here(generation);
-        }
         Ok(Executed::Outcome(
             record
                 .and_then(|(record, _)| terminal_outcome(&record))

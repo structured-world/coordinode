@@ -160,12 +160,14 @@ fn stray(node: u64) -> Mismatch {
 /// to be recorded; nothing else is suspect.
 #[test]
 fn a_reported_generation_is_suspect_and_its_report_waits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
     let other = btree("user_name", "name", 2);
     assert!(!reg.is_suspect(index.generation));
-    reg.report_mismatch(&index, stray(7));
-    reg.report_mismatch(&index, stray(7));
+    reg.report_mismatch(&engine, &index, stray(7));
+    reg.report_mismatch(&engine, &index, stray(7));
     assert!(reg.is_suspect(index.generation));
     assert!(!reg.is_suspect(other.generation));
     let reports = reg.take_reports(core::time::Duration::ZERO);
@@ -184,9 +186,12 @@ fn a_reported_generation_is_suspect_and_its_report_waits() {
 /// verified on this member does.
 #[test]
 fn a_catalog_verification_does_not_clear_a_suspicion_found_here() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
-    reg.report_mismatch(&index, stray(7));
+    reg.report_mismatch(&engine, &index, stray(7));
+    let revision = reg.local_revision(index.generation);
     reg.apply_integrity(&[integrity(&index, Integrity::Verified)]);
     assert!(
         reg.is_suspect(index.generation),
@@ -200,21 +205,112 @@ fn a_catalog_verification_does_not_clear_a_suspicion_found_here() {
         "verified elsewhere after the catalog recorded it"
     );
     assert!(!reg.answers_at(index.generation, u64::MAX));
-    reg.verified_here(index.generation);
+    assert!(
+        reg.verified_here(&engine, index.generation, revision)
+            .expect("lift")
+    );
     assert!(!reg.is_suspect(index.generation), "verified on this member");
+    assert!(
+        LocalIndexStore::new(&engine)
+            .list_unfit_here()
+            .expect("marks")
+            .is_empty(),
+        "and its stored mark is gone"
+    );
 }
 
-/// A generation that leaves the catalog takes a suspicion found here with
-/// it: its replacement is a different copy.
+/// A check proves this member's copy only as it stood when its pass
+/// started: a disagreement found here after that keeps the copy unfit,
+/// in memory and in storage, whatever the pass then concluded.
 #[test]
-fn a_replaced_generation_takes_its_suspicion_with_it() {
+fn a_finding_after_the_pass_started_survives_its_verification() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
-    let next = btree("user_email", "email", 2);
-    reg.report_mismatch(&index, stray(7));
-    reg.retain_generations(&[next.generation]);
-    assert!(!reg.is_suspect(index.generation));
-    assert!(!reg.is_suspect(next.generation));
+    reg.report_mismatch(&engine, &index, stray(7));
+    let started = reg.local_revision(index.generation);
+    reg.report_mismatch(&engine, &index, stray(8));
+    assert!(
+        !reg.verified_here(&engine, index.generation, started)
+            .expect("lift")
+    );
+    assert!(reg.is_suspect(index.generation));
+    assert_eq!(
+        LocalIndexStore::new(&engine)
+            .list_unfit_here()
+            .expect("marks"),
+        vec![index.generation]
+    );
+    // A pass that started with no finding here at all does not lift a
+    // finding that came after it either.
+    let fresh = btree("user_name", "name", 2);
+    let before = reg.local_revision(fresh.generation);
+    reg.report_mismatch(&engine, &fresh, stray(9));
+    assert!(
+        !reg.verified_here(&engine, fresh.generation, before)
+            .expect("lift")
+    );
+    assert!(reg.is_suspect(fresh.generation));
+}
+
+/// A finding is stored before the statement that made it goes on: a power
+/// cut right after it, before any maintenance ran, still finds the copy
+/// unfit when the member opens again.
+#[test]
+fn a_finding_survives_power_loss_before_any_maintenance() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let index = btree("user_email", "email", 1);
+    {
+        let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+        let reg = IndexRegistry::new();
+        reg.report_mismatch(&engine, &index, stray(7));
+        rig.cut(engine);
+    }
+    let engine = StorageEngine::open(&rig.config()).expect("reopen");
+    let reg = IndexRegistry::new();
+    reg.load_all(&engine).expect("load");
+    assert!(reg.is_suspect(index.generation));
+}
+
+/// A mark whose flush failed is not taken as stored because its key is in
+/// memory: the next round writes and flushes it again, and a power cut
+/// after that finds it.
+#[test]
+fn a_mark_whose_flush_failed_is_stored_on_the_next_round() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let index = btree("user_email", "email", 1);
+    {
+        let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+        let reg = IndexRegistry::new();
+        rig.fail_next(coordinode_test_fixtures::FaultOp::Open, 1);
+        reg.report_mismatch(&engine, &index, stray(7));
+        assert!(reg.is_suspect(index.generation), "unfit here regardless");
+        reg.store_pending_marks(&engine);
+        rig.cut(engine);
+    }
+    let engine = StorageEngine::open(&rig.config()).expect("reopen");
+    let reg = IndexRegistry::new();
+    reg.load_all(&engine).expect("load");
+    assert!(reg.is_suspect(index.generation));
+}
+
+/// A generation that left the catalog keeps a mark found here: a reader
+/// pinned to an older snapshot, plan or cursor may still reach its
+/// entries, and nothing says when the last one is gone.
+#[test]
+fn a_replaced_generation_keeps_its_mark() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    reg.report_mismatch(&engine, &index, stray(7));
+    reg.load_all(&engine).expect("load without the generation");
+    assert!(reg.is_suspect(index.generation));
+    assert!(!reg.answers_at(index.generation, u64::MAX));
+    let restarted = IndexRegistry::new();
+    restarted.load_all(&engine).expect("load after a restart");
+    assert!(restarted.is_suspect(index.generation));
 }
 
 /// A generation the catalog records suspect is suspect on a member that

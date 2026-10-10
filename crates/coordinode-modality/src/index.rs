@@ -1207,28 +1207,24 @@ impl IndexStore for LocalIndexStore<'_> {
     }
 
     fn mark_unfit_here(&self, generation: GenerationId) -> StoreResult<()> {
-        let key = unfit_here_key(generation);
-        if self.engine.get(Partition::Schema, &key)?.is_some() {
-            return Ok(());
-        }
         // No journal carries a node-local record: the flush makes it durable.
-        self.engine.put(Partition::Schema, &key, &[])?;
+        // Written and flushed every time: a key present in memory proves
+        // nothing about an earlier flush that failed.
+        self.engine
+            .put(Partition::Schema, &unfit_here_key(generation), &[])?;
         self.engine.persist_partition(Partition::Schema)?;
         Ok(())
     }
 
     fn clear_unfit_here(&self, generations: &[GenerationId]) -> StoreResult<()> {
-        let mut removed = false;
+        if generations.is_empty() {
+            return Ok(());
+        }
         for generation in generations {
-            let key = unfit_here_key(*generation);
-            if self.engine.get(Partition::Schema, &key)?.is_some() {
-                self.engine.delete(Partition::Schema, &key)?;
-                removed = true;
-            }
+            self.engine
+                .delete(Partition::Schema, &unfit_here_key(*generation))?;
         }
-        if removed {
-            self.engine.persist_partition(Partition::Schema)?;
-        }
+        self.engine.persist_partition(Partition::Schema)?;
         Ok(())
     }
 

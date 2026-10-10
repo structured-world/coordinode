@@ -65,6 +65,10 @@ use std::sync::Arc;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 
+/// The filesystem operations [`PowerRig`] can fail, for crates that do not
+/// depend on the storage engine's tree crate.
+pub use lsm_tree::fs::FaultOp;
+
 /// Owned engine fixture — drops in the right order on test exit.
 /// The lifetime-binding state (`TempDir` for disk, `MemFs` Arc for
 /// memory) is held alongside the engine so the engine has somewhere
@@ -266,6 +270,14 @@ impl PowerRig {
         use lsm_tree::fs::{Fault, FaultRule};
         self.faults
             .arm(FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other)).skip(skip));
+    }
+
+    /// Make the next `times` operations of `op` fail, then let them through
+    /// again: a transient disk error.
+    pub fn fail_next(&self, op: lsm_tree::fs::FaultOp, times: u64) {
+        use lsm_tree::fs::{Fault, FaultRule};
+        self.faults
+            .arm(FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other)).times(times));
     }
 
     /// Lose power under `engine`, which must be its last owner: nothing
