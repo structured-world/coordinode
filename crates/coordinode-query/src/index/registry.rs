@@ -44,6 +44,11 @@ pub struct IndexRegistry {
     /// removed, so a test can make a finding at that point.
     #[cfg(test)]
     after_mark_removed: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Writes and removals of stored marks this registry has asked for, so
+    /// a test can tell that a path made none (the engine's own background
+    /// work makes a filesystem count unusable for that).
+    #[cfg(test)]
+    mark_io: core::sync::atomic::AtomicUsize,
 }
 
 /// The suspect generations as this process knows them.
@@ -326,6 +331,8 @@ impl IndexRegistry {
             marks: parking_lot::Mutex::new(()),
             #[cfg(test)]
             after_mark_removed: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            mark_io: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -429,6 +436,9 @@ impl IndexRegistry {
         if engine.space().is_paused() {
             return Ok(());
         }
+        #[cfg(test)]
+        self.mark_io
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let result = LocalIndexStore::new(engine).mark_unfit_here(generation);
         let state = if result.is_ok() {
             MarkState::Stored
@@ -605,6 +615,9 @@ impl IndexRegistry {
         // the stored mark of unknown state: the removal may have reached the
         // disk, so the mark no longer counts as stored and is never written
         // again.
+        #[cfg(test)]
+        self.mark_io
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if let Err(source) = LocalIndexStore::new(engine).clear_unfit_here(&[generation]) {
             if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
                 mark.state = MarkState::Failed;

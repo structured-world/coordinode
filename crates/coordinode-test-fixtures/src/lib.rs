@@ -273,11 +273,19 @@ impl PowerRig {
     }
 
     /// Make the next `times` operations of `op` fail, then let them through
-    /// again: a transient disk error.
+    /// again: a transient disk error. The spent rule keeps owning `op`, so a
+    /// later [`Self::fail_from`] on the same `op` does not fire.
     pub fn fail_next(&self, op: lsm_tree::fs::FaultOp, times: u64) {
         use lsm_tree::fs::{Fault, FaultRule};
         self.faults
             .arm(FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other)).times(times));
+    }
+
+    /// Files opened through the rig so far: a write that reaches the disk
+    /// opens one (a flushed table), so an unchanged count shows a step did
+    /// not touch the disk.
+    pub fn open_count(&self) -> usize {
+        self.faults.open_count()
     }
 
     /// Lose power under `engine`, which must be its last owner: nothing
@@ -292,6 +300,9 @@ impl PowerRig {
         use lsm_tree::fs::{Fault, FaultOp, FaultRule};
         let engine = Arc::into_inner(engine).expect("the cut engine must have no other owner");
         let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
+        // The first rule matching an operation owns it even once exhausted,
+        // so a spent rule from the test would let that operation through.
+        self.faults.clear();
         for op in [
             FaultOp::Open,
             FaultOp::Write,

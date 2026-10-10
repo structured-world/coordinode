@@ -1532,6 +1532,102 @@ fn a_fresh_store_holds_no_user_data() {
 
 /// A table flushed before its oplog entries are purged must be as durable as
 /// those entries: the partition trees sync every file at the mode the oplog's
+/// `persist_partition` promises that every write to the partition before the
+/// call is durable when it returns. A sync failing inside one call fails it;
+/// the next call on a healthy disk writes what the failed one did not, and a
+/// power cut after it keeps the write. Swept over every sync a persist makes,
+/// for the node-local partition the Raft vote uses and for the schema
+/// partition.
+#[test]
+fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
+    use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs};
+    let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
+    let mut reached_by = Vec::new();
+    for (partition, failed) in [Partition::Raft, Partition::Schema]
+        .into_iter()
+        .flat_map(|p| {
+            [
+                FaultOp::SyncAll,
+                FaultOp::Open,
+                FaultOp::Write,
+                FaultOp::Rename,
+            ]
+            .map(|op| (p, op))
+        })
+    {
+        let mut reached = 0;
+        for k in 0.. {
+            let dir = TempDir::new().expect("temp dir");
+            let crash = Arc::new(CrashFs::new(StdFs));
+            let faults = Arc::new(FaultInjector::new());
+            let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
+            config.fs = Some(Arc::new(FaultFs::with_injector(
+                CrashFs::clone(&crash),
+                Arc::clone(&faults),
+            )));
+            let engine = StorageEngine::open(&config).expect("open");
+            let key = b"meta:probe";
+            engine.put(partition, key, b"v").expect("put");
+
+            faults.arm(FaultRule::new(failed, refuse).skip(k).once());
+            let first = engine.persist_partition(partition);
+            if first.is_ok() {
+                // The operation to fail lies past the last one a persist makes.
+                break;
+            }
+            reached += 1;
+            // A healthy disk from here; the second call must write again.
+            faults.clear();
+            let retry = engine.persist_partition(partition);
+            assert!(
+                retry.is_ok(),
+                "{partition:?} {failed:?} {k}: retry: {retry:?}"
+            );
+            assert!(
+                faults.open_count() > 0,
+                "{partition:?} {failed:?} {k}: the retry opened no file, so it wrote nothing"
+            );
+
+            // Power cut: nothing written from here on is durable, and every
+            // file falls back to its last sync.
+            for op in [
+                FaultOp::Open,
+                FaultOp::Write,
+                FaultOp::SyncAll,
+                FaultOp::SyncData,
+                FaultOp::Rename,
+            ] {
+                faults.arm(FaultRule::new(op, refuse));
+            }
+            drop(engine);
+            faults.clear();
+            crash.crash();
+
+            let engine = StorageEngine::open(&config).expect("reopen");
+            assert_eq!(
+                engine.get(partition, key).expect("read").as_deref(),
+                Some(&b"v"[..]),
+                "{partition:?} {failed:?} {k}: the write acknowledged by the retry was lost"
+            );
+        }
+        reached_by.push((partition, failed, reached));
+    }
+    // Every partition's persist opens, writes and syncs a table; it need not
+    // rename one.
+    for (partition, failed, reached) in &reached_by {
+        assert!(
+            *reached > 0 || *failed == FaultOp::Rename,
+            "{partition:?}: no {failed:?} of a persist was failed: {reached_by:?}"
+        );
+    }
+}
+
 /// sync method calls for. They synced at the engine default (plain fsync)
 /// under a full-flush oplog, so on macOS a power cut after a purge could lose
 /// acknowledged writes.
