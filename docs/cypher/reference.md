@@ -534,6 +534,21 @@ CALL db.reindex('user_email', waitMs)      -- REINDEX as a procedure, by name or
   that would read more than `index_build_unique_read_limit` records is
   refused as unresolved, to be retried. An entry naming a node that does not
   hold its value never makes the value free nor counts as a duplicate.
+- **Each member's own copy.** Every member keeps its own copy of an index,
+  and a finding is about that copy. A member uses a copy as evidence only
+  after it has durably recorded that the copy is in use; it does this once
+  per copy per run, and lookups after that write nothing. A clean stop
+  clears these records. A member that stops without one (a crash, a kill,
+  a power loss) may have found damage it never recorded, so when it opens
+  again every copy it was using answers from the records until a check
+  verifies it. Copies it was not using serve at once. A member that takes no
+  writes checks its own copy against its own records and writes nothing
+  shared. A copy that agrees serves again. A copy damaged on that member
+  alone is replaced from a peer's copy of the same generation, then checked
+  again before it serves. A standalone member answers from its records until
+  its copy is checked or rebuilt. These records are written even when the
+  disk is below its free-space reserve. A member that cannot write one keeps
+  the copy out of use and answers from its records.
 - **Records breaking a unique index.** Two records holding one value cannot
   be represented by any entry: a check reports them (`conflicts`), changes
   neither, and the generation stays `SUSPECT` until the records are fixed.

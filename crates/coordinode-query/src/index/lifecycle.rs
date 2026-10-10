@@ -184,10 +184,35 @@ struct Shared {
     check_done: parking_lot::Condvar,
     /// When this process last asked for the periodic check of every index.
     last_sweep: parking_lot::Mutex<Option<Instant>>,
+    /// Generations whose copy on this member a local check reads now.
+    local_checks: parking_lot::Mutex<rustc_hash::FxHashSet<GenerationId>>,
+    /// Where a replacement of a copy of this member is filled from, when
+    /// the member has peers to fill it from.
+    copy_source: parking_lot::RwLock<Option<Arc<dyn IndexCopySource>>>,
 }
 
 mod integrity;
 pub use integrity::{CheckOutcome, CheckRequestError, CheckStatus};
+
+/// Fills the replacement of one of this member's index copies from a peer's
+/// copy of the same generation: registers it beside the published copy,
+/// imports the peer's history of the generation, and records it complete.
+/// The caller guards, publishes and verifies it.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot fill a replacement of an index copy",
+    label = "not an index copy source",
+    note = "a server provides one over its segment transfer to its peers"
+)]
+pub trait IndexCopySource: Send + Sync {
+    /// Prepare the replacement of this member's copy of `generation`, ready
+    /// to publish; on failure no replacement is left in preparation.
+    ///
+    /// # Errors
+    ///
+    /// No peer could serve the generation's history, or it could not be
+    /// imported.
+    fn prepare(&self, generation: GenerationId) -> Result<(), String>;
+}
 
 /// How the engine runs its index builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,6 +441,8 @@ impl IndexBuildService {
                 checks: parking_lot::Mutex::new(FxHashMap::default()),
                 check_done: parking_lot::Condvar::new(),
                 last_sweep: parking_lot::Mutex::new(None),
+                local_checks: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
+                copy_source: parking_lot::RwLock::new(None),
             }),
         }
     }

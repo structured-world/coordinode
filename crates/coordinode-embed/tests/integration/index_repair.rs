@@ -413,8 +413,10 @@ fn a_copy_found_unfit_here_stays_unfit_across_a_restart() {
         db.engine()
             .delete(Partition::Idx, &encode_unique_entry_key(generation, &tuple))
             .expect("lose c's entry");
-        LocalIndexStore::new(db.engine())
-            .mark_unfit_here(generation)
+        let store = LocalIndexStore::new(db.engine());
+        let copy = store.local_copy(generation).expect("c's copy is here");
+        store
+            .mark_unfit_here(copy)
             .expect("mark this member's copy");
     }
     let mut db = Database::open(dir.path()).expect("reopen db");
@@ -1311,5 +1313,121 @@ fn a_lookup_answered_by_the_records_past_its_memory_limit_is_refused() {
             )))
         ),
         "{refused:?}"
+    );
+}
+
+/// The generations of this member's stored marks.
+fn marked(db: &Database) -> Vec<u64> {
+    let mut out: Vec<u64> = LocalIndexStore::new(db.engine())
+        .list_unfit_here()
+        .expect("marks")
+        .into_iter()
+        .map(|copy| copy.generation.as_raw())
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Set by the parent of the guard test; the child does nothing without it.
+const GUARD_CHILD_DIR: &str = "COORDINODE_GUARD_CHILD_DIR";
+
+/// Child half of `a_copy_in_use_when_the_process_died_is_checked_before_it_serves`:
+/// an index, a node, a lookup that uses the index's copy, then death without
+/// destructors, as under SIGKILL. Run on its own it has no directory and
+/// returns.
+#[test]
+fn guard_child_uses_an_index_then_aborts() {
+    let Some(dir) = std::env::var_os(GUARD_CHILD_DIR) else {
+        return;
+    };
+    let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index in child");
+    db.execute_cypher("CREATE (:U {email: 'c@x'})")
+        .expect("node in child");
+    assert_eq!(found(&mut db, "c@x").len(), 1, "the lookup used the index");
+    std::process::abort();
+}
+
+/// A process that dies while an index copy is in use may have found damage
+/// in it that it never stored. The next open takes the copy as unfit: it
+/// answers from the records, and the check the open admits verifies it
+/// before it serves again. A clean close leaves nothing to check.
+#[test]
+fn a_copy_in_use_when_the_process_died_is_checked_before_it_serves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "integration::index_repair::guard_child_uses_an_index_then_aborts",
+            "--nocapture",
+        ])
+        .env(GUARD_CHILD_DIR, dir.path())
+        .status()
+        .expect("run the child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "the child must die by abort after its lookup, got {status:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    assert!(!status.success(), "the child must die, got {status:?}");
+
+    let generation;
+    {
+        let mut db = Database::open(dir.path()).expect("reopen after the kill");
+        generation = index_named(db.engine(), "u_email")
+            .expect("index")
+            .generation;
+        let c = id_of(&mut db, "c@x");
+        assert_eq!(found(&mut db, "c@x"), vec![c]);
+        let (_, outcome) = db
+            .index_check(generation, std::time::Duration::from_secs(30))
+            .expect("read the check")
+            .expect("the copy left in use admitted a check");
+        assert!(
+            matches!(outcome, Some(CheckOutcome::Verified { .. })),
+            "{outcome:?}"
+        );
+        assert!(marked(&db).is_empty(), "the check lifted the mark");
+        assert_eq!(found(&mut db, "c@x"), vec![c]);
+    }
+    // Closed cleanly this time: the next open finds no copy to check.
+    let db = Database::open(dir.path()).expect("reopen after a clean close");
+    assert!(marked(&db).is_empty(), "a clean close leaves no mark");
+    assert!(
+        LocalIndexStore::new(db.engine())
+            .list_armed_here()
+            .expect("guards")
+            .is_empty(),
+        "and no guard"
+    );
+}
+
+/// A copy is guarded once per run: its first lookup stores the guard, and
+/// no later lookup or write through it touches the recovery state.
+#[test]
+fn lookups_through_a_guarded_copy_store_nothing() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {email: 'c@x'})").expect("c");
+    let c = id_of(&mut db, "c@x");
+    assert_eq!(found(&mut db, "c@x"), vec![c]);
+    let after_first = db.index_recovery_flushes();
+    assert!(after_first >= 1, "the first use stored the guard");
+    for i in 0..50 {
+        assert_eq!(found(&mut db, "c@x"), vec![c]);
+        db.execute_cypher(&format!("CREATE (:U {{email: 'n{i}@x'}})"))
+            .expect("write through the unique index");
+    }
+    assert_eq!(
+        db.index_recovery_flushes(),
+        after_first,
+        "no guard I/O after the first use"
     );
 }

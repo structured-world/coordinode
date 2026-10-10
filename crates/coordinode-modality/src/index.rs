@@ -52,15 +52,40 @@ use crate::index_def::{
 };
 
 /// Prefix of the marks of generations this member found its own copy of
-/// disagreeing with the records. Under `meta:`, the class of node-local
-/// records a snapshot or a partition copy neither carries nor replaces.
+/// disagreeing with the records, one per generation, holding the copy's
+/// installation. Under `meta:`, the class of node-local records a snapshot
+/// or a partition copy neither carries nor replaces.
 const UNFIT_HERE_PREFIX: &[u8] = b"meta:idxunfit:";
+
+/// Prefix of the use guards of this member's local copies: one per copy
+/// used as evidence since this member opened, removed when it closes
+/// cleanly. Node-local like the marks.
+const ARMED_HERE_PREFIX: &[u8] = b"meta:idxarmed:";
 
 fn unfit_here_key(generation: GenerationId) -> Vec<u8> {
     let mut key = Vec::with_capacity(UNFIT_HERE_PREFIX.len() + 8);
     key.extend_from_slice(UNFIT_HERE_PREFIX);
     key.extend_from_slice(&generation.as_raw().to_be_bytes());
     key
+}
+
+fn armed_here_key(copy: LocalCopy) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ARMED_HERE_PREFIX.len() + 16);
+    key.extend_from_slice(ARMED_HERE_PREFIX);
+    key.extend_from_slice(&copy.generation.as_raw().to_be_bytes());
+    key.extend_from_slice(&copy.installation.to_be_bytes());
+    key
+}
+
+/// One member's local copy of an index generation: the generation and the
+/// installation that holds it here. A replacement of the copy is another
+/// installation of the same generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocalCopy {
+    /// The generation the copy holds.
+    pub generation: GenerationId,
+    /// This member's installation holding it.
+    pub installation: u64,
 }
 
 /// One page of an ordered read of index entries
@@ -492,23 +517,36 @@ pub trait IndexStore {
     /// A storage failure or an undecodable record.
     fn delete_integrity_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()>;
 
-    /// The generations this member found its own copy of disagreeing with
-    /// the records, as it stored them. Node-local: neither replicated nor
-    /// carried by a snapshot or a partition copy.
-    ///
-    /// # Errors
-    ///
-    /// A storage failure or an undecodable key.
-    fn list_unfit_here(&self) -> StoreResult<Vec<GenerationId>>;
+    /// This member's copy of `generation` as reads resolve it now, `None`
+    /// when it holds none.
+    fn local_copy(&self, generation: GenerationId) -> Option<LocalCopy>;
 
-    /// Store that this member's copy of `generation` disagrees with the
-    /// records, durably before returning: a restart keeps answering from the
-    /// records.
+    /// This member's copy of `generation`, its installation bound now when
+    /// the generation has none yet (nothing written to it so far).
     ///
     /// # Errors
     ///
-    /// A storage failure.
-    fn mark_unfit_here(&self, generation: GenerationId) -> StoreResult<()>;
+    /// The installation could not be bound.
+    fn bind_local_copy(&self, generation: GenerationId) -> StoreResult<LocalCopy>;
+
+    /// The copies this member found disagreeing with the records, as it
+    /// stored them. Node-local: neither replicated nor carried by a snapshot
+    /// or a partition copy.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable mark.
+    fn list_unfit_here(&self) -> StoreResult<Vec<LocalCopy>>;
+
+    /// Store that this member's copy `copy` disagrees with the records,
+    /// durably before returning: a restart keeps answering from the records.
+    /// Written whatever the free-space reserve says, which exists for this
+    /// recovery state; one mark per generation bounds it.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure: whether the mark reached the disk is unknown.
+    fn mark_unfit_here(&self, copy: LocalCopy) -> StoreResult<()>;
 
     /// Remove the marks of `generations`, after a check verified this
     /// member's copy or the generation left the catalog.
@@ -517,6 +555,45 @@ pub trait IndexStore {
     ///
     /// A storage failure.
     fn clear_unfit_here(&self, generations: &[GenerationId]) -> StoreResult<()>;
+
+    /// The use guards stored here: the copies used as evidence since this
+    /// member last opened, or never closed by an earlier run.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable guard.
+    fn list_armed_here(&self) -> StoreResult<Vec<LocalCopy>>;
+
+    /// Store the use guards of `copies` in one flush, durably before
+    /// returning. A copy is used as evidence only once its guard is stored:
+    /// a run that ends without closing it leaves the copy to be verified
+    /// before it is used again. Written whatever the free-space reserve
+    /// says; one guard per copy per run bounds it.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure: none of `copies` may be used.
+    fn arm_here(&self, copies: &[LocalCopy]) -> StoreResult<()>;
+
+    /// Remove the use guards of `copies` in one flush, once nothing uses
+    /// them and every finding against them is stored.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure: the guards may stand, and the next open verifies
+    /// their copies.
+    fn disarm_here(&self, copies: &[LocalCopy]) -> StoreResult<()>;
+
+    /// At open, before any copy is used: every guard an earlier run left
+    /// standing turns into a mark of its copy, as that run may have found
+    /// damage it never stored; a guard or mark of a copy no longer installed
+    /// here goes, as nothing reads that copy any more. One flush, the marks
+    /// written before the guards are removed. Returns the copies marked.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable guard: the guards stand.
+    fn recover_armed_here(&self) -> StoreResult<Vec<LocalCopy>>;
 
     /// One page of the stored entries of `index`'s generation after the
     /// entry key `after`, at most `limit`, in key order, as `txn` sees them.
@@ -1211,31 +1288,56 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(())
     }
 
-    fn list_unfit_here(&self) -> StoreResult<Vec<GenerationId>> {
+    fn local_copy(&self, generation: GenerationId) -> Option<LocalCopy> {
+        self.engine
+            .installation_of(generation)
+            .map(|installation| LocalCopy {
+                generation,
+                installation,
+            })
+    }
+
+    fn bind_local_copy(&self, generation: GenerationId) -> StoreResult<LocalCopy> {
+        Ok(LocalCopy {
+            generation,
+            installation: self.engine.bind_installation(generation)?,
+        })
+    }
+
+    fn list_unfit_here(&self) -> StoreResult<Vec<LocalCopy>> {
         let mut out = Vec::new();
         for guard in self
             .engine
             .prefix_scan(Partition::Schema, UNFIT_HERE_PREFIX)?
         {
-            let (key, _) = guard.into_inner()?;
-            let raw = key
+            let (key, value) = guard.into_inner()?;
+            let generation = key
                 .get(UNFIT_HERE_PREFIX.len()..)
-                .and_then(|tail| <[u8; 8]>::try_from(tail).ok())
-                .ok_or_else(|| StoreError::Decode {
+                .and_then(|tail| <[u8; 8]>::try_from(tail).ok());
+            let installation = <[u8; 8]>::try_from(&value[..]).ok();
+            let (Some(generation), Some(installation)) = (generation, installation) else {
+                return Err(StoreError::Decode {
                     kind: "unfit-here mark",
-                    message: format!("malformed key {key:?}"),
-                })?;
-            out.push(GenerationId::from_raw(u64::from_be_bytes(raw)));
+                    message: format!("malformed mark {key:?} = {value:?}"),
+                });
+            };
+            out.push(LocalCopy {
+                generation: GenerationId::from_raw(u64::from_be_bytes(generation)),
+                installation: u64::from_be_bytes(installation),
+            });
         }
         Ok(out)
     }
 
-    fn mark_unfit_here(&self, generation: GenerationId) -> StoreResult<()> {
+    fn mark_unfit_here(&self, copy: LocalCopy) -> StoreResult<()> {
         // No journal carries a node-local record: the flush makes it durable.
         // Written and flushed every time: a key present in memory proves
         // nothing about an earlier flush that failed.
-        self.engine
-            .put(Partition::Schema, &unfit_here_key(generation), &[])?;
+        self.engine.put(
+            Partition::Schema,
+            &unfit_here_key(copy.generation),
+            &copy.installation.to_be_bytes(),
+        )?;
         self.engine.persist_partition(Partition::Schema)?;
         Ok(())
     }
@@ -1250,6 +1352,90 @@ impl IndexStore for LocalIndexStore<'_> {
         }
         self.engine.persist_partition(Partition::Schema)?;
         Ok(())
+    }
+
+    fn list_armed_here(&self) -> StoreResult<Vec<LocalCopy>> {
+        let mut out = Vec::new();
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, ARMED_HERE_PREFIX)?
+        {
+            let (key, _) = guard.into_inner()?;
+            let tail = key
+                .get(ARMED_HERE_PREFIX.len()..)
+                .and_then(|tail| <[u8; 16]>::try_from(tail).ok())
+                .ok_or_else(|| StoreError::Decode {
+                    kind: "use guard",
+                    message: format!("malformed key {key:?}"),
+                })?;
+            let mut generation = [0u8; 8];
+            let mut installation = [0u8; 8];
+            generation.copy_from_slice(&tail[..8]);
+            installation.copy_from_slice(&tail[8..]);
+            out.push(LocalCopy {
+                generation: GenerationId::from_raw(u64::from_be_bytes(generation)),
+                installation: u64::from_be_bytes(installation),
+            });
+        }
+        Ok(out)
+    }
+
+    fn arm_here(&self, copies: &[LocalCopy]) -> StoreResult<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        for copy in copies {
+            self.engine
+                .put(Partition::Schema, &armed_here_key(*copy), &[])?;
+        }
+        self.engine.persist_partition(Partition::Schema)?;
+        Ok(())
+    }
+
+    fn disarm_here(&self, copies: &[LocalCopy]) -> StoreResult<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        for copy in copies {
+            self.engine
+                .delete(Partition::Schema, &armed_here_key(*copy))?;
+        }
+        self.engine.persist_partition(Partition::Schema)?;
+        Ok(())
+    }
+
+    fn recover_armed_here(&self) -> StoreResult<Vec<LocalCopy>> {
+        let armed = self.list_armed_here()?;
+        let unfit = self.list_unfit_here()?;
+        let installed = |copy: &LocalCopy| self.local_copy(copy.generation) == Some(*copy);
+        let stale_marks: Vec<GenerationId> = unfit
+            .iter()
+            .filter(|copy| !installed(copy))
+            .map(|copy| copy.generation)
+            .collect();
+        if armed.is_empty() && stale_marks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marked: Vec<LocalCopy> = armed.iter().copied().filter(installed).collect();
+        // A flush persists the tree's writes as a prefix: the guards' removal,
+        // written after the marks, reaches the disk no earlier than they do.
+        for generation in &stale_marks {
+            self.engine
+                .delete(Partition::Schema, &unfit_here_key(*generation))?;
+        }
+        for copy in &marked {
+            self.engine.put(
+                Partition::Schema,
+                &unfit_here_key(copy.generation),
+                &copy.installation.to_be_bytes(),
+            )?;
+        }
+        for copy in &armed {
+            self.engine
+                .delete(Partition::Schema, &armed_here_key(*copy))?;
+        }
+        self.engine.persist_partition(Partition::Schema)?;
+        Ok(marked)
     }
 
     fn entries_page(

@@ -124,6 +124,20 @@ enum Executed {
     Lost,
 }
 
+/// How a check of this member's own copy ended.
+enum LocalOutcome {
+    /// Every entry agrees with this member's records: the mark is lifted.
+    Verified,
+    /// The copy disagreed, a replacement filled from a peer was published,
+    /// and it agrees: the mark is lifted.
+    Replaced,
+    /// Entries missing or wrong: the copy stays unfit here.
+    Disagrees { found: u64 },
+    /// The process is stopping, the generation stopped serving, or a finding
+    /// arrived during the pass; nothing is concluded.
+    Stopped,
+}
+
 /// What one page of a check found.
 #[derive(Default)]
 struct Found {
@@ -171,11 +185,6 @@ impl IndexBuildService {
                 {
                     let env = service.shared.env.as_ref();
                     let reports = env.registry().take_reports(MAINTENANCE_TICK);
-                    // Marks the free-space reserve kept off the disk; a mark
-                    // whose write failed is not among them.
-                    if let Err(e) = env.registry().store_pending_marks(env.engine()) {
-                        tracing::error!(error = %e, "index maintenance could not store a mark");
-                    }
                     if !reports.is_empty() {
                         service.record_reports(reports);
                     }
@@ -211,7 +220,8 @@ impl IndexBuildService {
                             "could not start the check of a reported index generation");
                     }
                 }
-                Ok(false) => {}
+                // Not recorded here: this member's own copy is checked here.
+                Ok(false) => self.submit_local_check(generation),
                 Err(e) => tracing::warn!(generation = generation.as_raw(), error = %e,
                     "could not record an index disagreement; this member answers from the \
                      records until a check runs"),
@@ -237,7 +247,10 @@ impl IndexBuildService {
                             "could not start the check of an index generation found unfit");
                     }
                 }
-                Ok(false) => {}
+                // A member that takes no writes checks its own copy itself:
+                // the shared check another member runs proves only that
+                // member's copy.
+                Ok(false) => self.submit_local_check(generation),
                 Err(e) => tracing::warn!(generation = generation.as_raw(), error = %e,
                     "could not record an index generation found unfit"),
             }
@@ -479,6 +492,80 @@ impl IndexBuildService {
                 Err(format!("start the check executor: {e}"))
             }
         }
+    }
+
+    /// Check this member's own copy of `generation` against this member's
+    /// records, on an executor of this process, unless one already does: a
+    /// read-only pass both ways that writes nothing shared. A copy that
+    /// agrees has its local mark lifted; one that disagrees stays unfit here
+    /// and answers from the records.
+    pub fn submit_local_check(&self, generation: GenerationId) {
+        if self
+            .shared
+            .stopping
+            .load(core::sync::atomic::Ordering::Acquire)
+            || !self.shared.local_checks.lock().insert(generation)
+        {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        let spawned = std::thread::Builder::new()
+            .name(format!("index-local-check-{}", generation.as_raw()))
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    shared.run_local_check(generation)
+                }))
+                .unwrap_or_else(|panic| Err(panic_message(&*panic)));
+                shared.local_checks.lock().remove(&generation);
+                match outcome {
+                    Ok(LocalOutcome::Verified) => tracing::info!(
+                        generation = generation.as_raw(),
+                        "this member's index copy agrees with its records; it serves again"
+                    ),
+                    Ok(LocalOutcome::Replaced) => tracing::info!(
+                        generation = generation.as_raw(),
+                        "this member's index copy was replaced from a peer and agrees with its \
+                         records; it serves again"
+                    ),
+                    Ok(LocalOutcome::Disagrees { found }) => tracing::warn!(
+                        generation = generation.as_raw(),
+                        found,
+                        "this member's index copy disagrees with its records; it answers from \
+                         the records until it is replaced"
+                    ),
+                    Ok(LocalOutcome::Stopped) => {}
+                    Err(e) => tracing::warn!(
+                        generation = generation.as_raw(),
+                        error = %e,
+                        "the check of this member's index copy failed"
+                    ),
+                }
+            });
+        match spawned {
+            Ok(executor) => {
+                let mut executors = self.shared.executors.lock();
+                executors.retain(|e| !e.is_finished());
+                executors.push(executor);
+            }
+            Err(e) => {
+                self.shared.local_checks.lock().remove(&generation);
+                tracing::warn!(generation = generation.as_raw(), error = %e,
+                    "could not start the check of this member's index copy");
+            }
+        }
+    }
+
+    /// Whether a local check of `generation` runs on this member now.
+    pub fn local_check_running(&self, generation: GenerationId) -> bool {
+        self.shared.local_checks.lock().contains(&generation)
+    }
+
+    /// Fill replacements of this member's copies from `source`: a local
+    /// check that finds a copy disagreeing with this member's records then
+    /// replaces it, guarded before it serves and checked again before its
+    /// mark is lifted. Without a source such a copy stays unfit here.
+    pub fn set_copy_source(&self, source: Arc<dyn super::IndexCopySource>) {
+        *self.shared.copy_source.write() = Some(source);
     }
 
     /// The outcome of the check of `generation`, waiting up to `timeout`
@@ -783,6 +870,142 @@ fn owner_of(node: u64, valid_from: Option<i64>) -> EntryOwner {
 }
 
 impl Shared {
+    /// Read this member's copy of `generation` both ways against this
+    /// member's records, writing nothing shared, and lift its local mark
+    /// when it agrees. Records breaking a unique constraint are the records'
+    /// disagreement, not the copy's: the catalog keeps such a generation
+    /// suspect on every member.
+    fn run_local_check(&self, generation: GenerationId) -> Result<LocalOutcome, String> {
+        let env = self.env.as_ref();
+        let registry = env.registry();
+        let Some(def) = registry
+            .index_of_generation(generation)
+            .and_then(|id| registry.get_by_id(id))
+            .filter(|d| {
+                d.generation == generation
+                    && d.index_type == IndexType::BTree
+                    && d.state == IndexState::Ready
+            })
+        else {
+            return Ok(LocalOutcome::Stopped);
+        };
+        let taken = Taken {
+            def,
+            def_version: None,
+            token: 0,
+        };
+        let fields = env.fields()?;
+        let field_of = |name: &str| fields.lookup(name);
+        let interpretation = taken.def.interpretation(&field_of);
+        // Taken before anything is read: a finding after it keeps the copy
+        // unfit whatever the pass concludes.
+        let revision = registry.local_revision(generation);
+        let Some(found) = self.local_pass(&taken, &interpretation)? else {
+            return Ok(LocalOutcome::Stopped);
+        };
+        if found == 0 {
+            let lifted = registry
+                .verified_here(env.engine(), generation, revision)
+                .map_err(|e| e.to_string())?;
+            return Ok(if lifted {
+                LocalOutcome::Verified
+            } else {
+                LocalOutcome::Stopped
+            });
+        }
+        let source = self.copy_source.read().clone();
+        let Some(source) = source else {
+            return Ok(LocalOutcome::Disagrees { found });
+        };
+        self.replace_copy(generation, source.as_ref())?;
+        // The replacement serves only once a pass reads it agreeing: a
+        // finding after this revision, or a disagreement in the pass, keeps
+        // the mark.
+        let revision = registry.local_revision(generation);
+        let Some(found) = self.local_pass(&taken, &interpretation)? else {
+            return Ok(LocalOutcome::Stopped);
+        };
+        if found > 0 {
+            return Ok(LocalOutcome::Disagrees { found });
+        }
+        let lifted = registry
+            .verified_here(env.engine(), generation, revision)
+            .map_err(|e| e.to_string())?;
+        Ok(if lifted {
+            LocalOutcome::Replaced
+        } else {
+            LocalOutcome::Stopped
+        })
+    }
+
+    /// Replace this member's copy of `generation` with one `source` fills
+    /// from a peer: guarded before it is published, so it never serves
+    /// unguarded. The generation stays unfit here until its copy is checked.
+    fn replace_copy(
+        &self,
+        generation: GenerationId,
+        source: &dyn super::IndexCopySource,
+    ) -> Result<(), String> {
+        let env = self.env.as_ref();
+        let engine = env.engine();
+        source.prepare(generation)?;
+        let copy = match env.registry().arm_replacement(engine, generation) {
+            Ok(copy) => copy,
+            Err(e) => {
+                if let Err(dropped) = engine.abandon_generation(generation) {
+                    tracing::warn!(generation = generation.as_raw(), error = %dropped,
+                        "an unguarded replacement was not dropped; the next open drops it");
+                }
+                return Err(format!("guard the replacement: {e}"));
+            }
+        };
+        engine
+            .publish_generation(generation)
+            .map_err(|e| format!("publish the replacement: {e}"))?;
+        env.registry().replacement_published(copy);
+        Ok(())
+    }
+
+    /// One pass both ways over this member's copy of `taken`'s generation
+    /// and this member's records, writing nothing: the entries missing or
+    /// wrong. Records breaking a unique constraint are not counted. `None`
+    /// when the process is stopping.
+    fn local_pass(
+        &self,
+        taken: &Taken,
+        interpretation: &IndexInterpretation,
+    ) -> Result<Option<u64>, String> {
+        let page = self.config.read().check_page;
+        let mut found = 0u64;
+        for phase in [CheckPhase::Records, CheckPhase::Entries] {
+            let mut cursor: Option<Vec<u8>> = None;
+            loop {
+                if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
+                    return Ok(None);
+                }
+                let (page_found, next, exhausted) = match phase {
+                    CheckPhase::Records => {
+                        self.records_page(taken, interpretation, cursor.as_deref(), page)?
+                    }
+                    CheckPhase::Entries => {
+                        self.entries_page(taken, interpretation, cursor.as_deref(), page)?
+                    }
+                };
+                // Counts of entries a page holds, far below the type's range.
+                found += page_found
+                    .mismatches
+                    .iter()
+                    .filter(|m| !matches!(m, Mismatch::SourceDuplicate { .. }))
+                    .count() as u64;
+                if exhausted {
+                    break;
+                }
+                cursor = next;
+            }
+        }
+        Ok(Some(found))
+    }
+
     /// Take the check of `generation`, run it to its outcome and record it.
     fn execute_check(self: &Arc<Self>, generation: GenerationId) -> Executed {
         let _seat = self.quiet_seat();

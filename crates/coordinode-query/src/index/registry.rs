@@ -7,14 +7,16 @@
 
 use std::sync::Arc;
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::EntryOwner;
-use coordinode_modality::{IndexStore as _, LocalIndexStore, StoreError};
+use coordinode_modality::{IndexStore as _, LocalCopy, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::error::StorageError;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::definition::{
     GenerationId, IndexDefinition, IndexId, IndexIntegrityRecord, IndexType, Integrity, Mismatch,
@@ -33,29 +35,31 @@ pub struct IndexRegistry {
     integrity: parking_lot::Mutex<IntegrityView>,
     /// Whether any generation is suspect: the one check a healthy lookup
     /// pays.
-    any_suspect: core::sync::atomic::AtomicBool,
+    any_suspect: AtomicBool,
     /// Signalled when a disagreement is found, for the maintenance that
     /// records it.
     reported: parking_lot::Condvar,
     /// Orders the stored marks of this member's unfit copies: a mark written
     /// for a new report never lands before the removal of an older one.
     marks: parking_lot::Mutex<()>,
+    /// Held while use guards are stored, so the generations waiting at the
+    /// same time share one flush.
+    arming: parking_lot::Mutex<()>,
+    /// Flushes of this member's recovery state (use guards and marks) this
+    /// registry has made.
+    recovery_flushes: AtomicU64,
     /// Runs inside [`Self::verified_here`] right after the stored mark is
     /// removed, so a test can make a finding at that point.
     #[cfg(test)]
     after_mark_removed: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// Writes and removals of stored marks this registry has asked for, so
-    /// a test can tell that a path made none (the engine's own background
-    /// work makes a filesystem count unusable for that).
-    #[cfg(test)]
-    mark_io: core::sync::atomic::AtomicUsize,
 }
 
-/// The suspect generations as this process knows them.
+/// The suspect generations as this process knows them, and the local copies
+/// it uses.
 #[derive(Default)]
 struct IntegrityView {
     /// Suspect per the catalog's integrity records.
-    recorded: rustc_hash::FxHashSet<GenerationId>,
+    recorded: FxHashSet<GenerationId>,
     /// Generations whose copy on this member was found disagreeing with the
     /// records: they answer from the records here until a check verifies
     /// this copy, whatever the catalog says about another member's.
@@ -70,6 +74,17 @@ struct IntegrityView {
     /// A report was dropped at the bound: the maintenance finds the
     /// generations it would have named from the marks instead.
     overflowed: bool,
+    /// Copies whose use guard is stored in this run.
+    armed: FxHashSet<LocalCopy>,
+    /// Generations whose copy reads resolve to now is among `armed`.
+    armed_generations: FxHashSet<GenerationId>,
+    /// Generations waiting for their guard, for the next flush to take.
+    to_arm: FxHashSet<GenerationId>,
+    /// Generations whose guard could not be stored: their copy is not used
+    /// as evidence in this run, and the write is not tried again.
+    unarmable: FxHashSet<GenerationId>,
+    /// The guards are being closed: no copy is armed or used any more.
+    closing: bool,
 }
 
 /// This member's own finding against one generation's copy.
@@ -83,34 +98,20 @@ struct LocalMark {
     state: MarkState,
 }
 
-/// Whether a mark survives a restart.
+/// Whether a mark survives a restart on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MarkState {
-    /// Not written: the disk was below its free-space reserve, so nothing
-    /// reached it, and the write is safe to make once there is room.
-    Pending,
+    /// Found, its write not yet made: decided under the order lock right
+    /// after the finding.
+    Unwritten,
     /// Written and flushed.
     Stored,
     /// A write or flush of it failed: whether anything reached the disk is
     /// unknown, and a retry proves nothing (a failed fsync may have dropped
     /// the pages it reports clean afterwards). Never retried; the generation
-    /// stays unfit in this process.
-    Failed,
-}
-
-/// A mark could not be made durable: the statement that found the
-/// disagreement fails with it rather than report it kept.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "the finding that index generation {generation} disagrees with its records could not be \
-     stored durably on this member: {source}"
-)]
-pub struct MarkNotDurable {
-    /// The generation found disagreeing.
-    pub generation: u64,
-    /// The write or flush that failed.
-    #[source]
-    pub source: StoreError,
+    /// stays unfit in this process, and its use guard is never closed, so a
+    /// restart verifies the copy before using it.
+    Unknown,
 }
 
 /// A disagreement between an entry and a record, found by a read or a write
@@ -172,6 +173,9 @@ impl Catalog {
 struct Registered {
     def: Arc<IndexDefinition>,
     version: Option<u64>,
+    /// Whether the use guard of the generation's local copy is stored in
+    /// this run: the one load a use pays once it is.
+    armed: Arc<AtomicBool>,
 }
 
 /// A unique value a statement claimed. Kept until the statement commits, so
@@ -262,9 +266,6 @@ pub enum IndexWriteError {
     /// The index store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// A disagreement found during the write could not be stored durably.
-    #[error(transparent)]
-    MarkNotDurable(#[from] MarkNotDurable),
 }
 
 impl UniqueViolation {
@@ -326,13 +327,13 @@ impl IndexRegistry {
         Self {
             indexes: parking_lot::RwLock::new(Catalog::default()),
             integrity: parking_lot::Mutex::new(IntegrityView::default()),
-            any_suspect: core::sync::atomic::AtomicBool::new(false),
+            any_suspect: AtomicBool::new(false),
             reported: parking_lot::Condvar::new(),
             marks: parking_lot::Mutex::new(()),
+            arming: parking_lot::Mutex::new(()),
+            recovery_flushes: AtomicU64::new(0),
             #[cfg(test)]
             after_mark_removed: parking_lot::Mutex::new(None),
-            #[cfg(test)]
-            mark_io: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -343,35 +344,30 @@ impl IndexRegistry {
     /// checks the generation. A read or a write that finds one reports it;
     /// neither changes an entry or a record for it.
     ///
-    /// When this returns `Ok`, the finding is stored in `engine`, so a
-    /// restart keeps answering from the records; or the disk is below its
-    /// free-space reserve, nothing was written, and the maintenance stores it
-    /// once there is room ([`Self::store_pending_marks`]). The decision that
-    /// a mark is stored is taken in the same order as a check lifting it, so
-    /// a finding made while a check removes the mark returns only after the
-    /// mark is stored again.
-    ///
-    /// # Errors
-    ///
-    /// [`MarkNotDurable`] when the write or flush of the mark failed: its
-    /// durability is unknown and it is not retried. The generation stays
-    /// unfit in this process; the statement that found it fails.
+    /// The finding is stored in `engine` before this returns, whatever the
+    /// free-space reserve says, so a restart keeps answering from the
+    /// records. A copy is used only under its stored use guard, so a finding
+    /// whose mark cannot be written is covered by that guard: the copy stays
+    /// unfit in this process and the guard is never closed, which makes the
+    /// next open verify the copy. The decision that a mark is stored is taken
+    /// in the same order as a check lifting it, so a finding made while a
+    /// check removes the mark returns only after the mark is stored again.
     pub fn report_mismatch(
         &self,
         engine: &StorageEngine,
         index: &IndexDefinition,
         found: Mismatch,
-    ) -> Result<(), MarkNotDurable> {
+    ) {
         {
             let mut view = self.integrity.lock();
             view.last_revision += 1;
             let revision = view.last_revision;
             let mark = view.local.entry(index.generation).or_insert(LocalMark {
                 revision,
-                state: MarkState::Pending,
+                state: MarkState::Unwritten,
             });
             mark.revision = revision;
-            if mark.state == MarkState::Pending {
+            if mark.state == MarkState::Unwritten {
                 tracing::warn!(
                     index = %index,
                     generation = index.generation.as_raw(),
@@ -392,20 +388,15 @@ impl IndexRegistry {
             } else {
                 view.overflowed = true;
             }
-            self.any_suspect
-                .store(true, core::sync::atomic::Ordering::Release);
+            self.any_suspect.store(true, Ordering::Release);
             self.reported.notify_all();
         }
-        self.store_mark(engine, index.generation)
+        self.store_mark(engine, index.generation);
     }
 
     /// Store the mark of `generation` if it waits to be. Taken in the order
     /// of [`Self::verified_here`]: what it finds is what a lift left.
-    fn store_mark(
-        &self,
-        engine: &StorageEngine,
-        generation: GenerationId,
-    ) -> Result<(), MarkNotDurable> {
+    fn store_mark(&self, engine: &StorageEngine, generation: GenerationId) {
         let _order = self.marks.lock();
         let state = self
             .integrity
@@ -413,74 +404,36 @@ impl IndexRegistry {
             .local
             .get(&generation)
             .map(|m| m.state);
-        match state {
-            Some(MarkState::Pending) => self.write_mark(engine, generation),
-            Some(MarkState::Failed) => Err(MarkNotDurable {
-                generation: generation.as_raw(),
-                source: StoreError::Storage(StorageError::Io(
-                    "an earlier write of this mark failed; its durability is unknown".into(),
-                )),
-            }),
-            Some(MarkState::Stored) | None => Ok(()),
+        if state == Some(MarkState::Unwritten) {
+            self.write_mark(engine, generation);
         }
     }
 
-    /// Write and flush the mark of `generation`, under the order lock. A disk
-    /// below its free-space reserve is not written to at all and the mark
-    /// stays pending; any failure after that leaves it failed.
-    fn write_mark(
-        &self,
-        engine: &StorageEngine,
-        generation: GenerationId,
-    ) -> Result<(), MarkNotDurable> {
-        if engine.space().is_paused() {
-            return Ok(());
-        }
-        #[cfg(test)]
-        self.mark_io
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let result = LocalIndexStore::new(engine).mark_unfit_here(generation);
-        let state = if result.is_ok() {
-            MarkState::Stored
-        } else {
-            MarkState::Failed
+    /// Write and flush the mark of `generation`'s copy, under the order
+    /// lock. Recovery state, written below the free-space reserve too; a
+    /// failure leaves its durability unknown, never retried.
+    fn write_mark(&self, engine: &StorageEngine, generation: GenerationId) {
+        let store = LocalIndexStore::new(engine);
+        self.recovery_flushes.fetch_add(1, Ordering::Relaxed);
+        let result = store
+            .bind_local_copy(generation)
+            .and_then(|copy| store.mark_unfit_here(copy));
+        let state = match &result {
+            Ok(()) => MarkState::Stored,
+            Err(_) => MarkState::Unknown,
         };
         if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
             mark.state = state;
         }
-        result.map_err(|source| {
+        if let Err(error) = result {
             tracing::error!(
                 generation = generation.as_raw(),
-                error = %source,
+                %error,
                 "could not store that this member's index copy disagrees with the records; \
-                 its durability is unknown and it is not retried"
+                 it stays unfit in this process, and its use guard stays open so the next \
+                 open verifies it"
             );
-            MarkNotDurable {
-                generation: generation.as_raw(),
-                source,
-            }
-        })
-    }
-
-    /// Store the marks the free-space reserve kept from being written, now
-    /// that there may be room. A mark whose write failed is not retried.
-    ///
-    /// # Errors
-    ///
-    /// The first mark whose write or flush failed.
-    pub fn store_pending_marks(&self, engine: &StorageEngine) -> Result<(), MarkNotDurable> {
-        let pending: Vec<GenerationId> = self
-            .integrity
-            .lock()
-            .local
-            .iter()
-            .filter(|(_, m)| m.state == MarkState::Pending)
-            .map(|(g, _)| *g)
-            .collect();
-        for generation in pending {
-            self.store_mark(engine, generation)?;
         }
-        Ok(())
     }
 
     /// The generations this member found its copy of unfit, for the
@@ -561,17 +514,17 @@ impl IndexRegistry {
         self.refresh_any_suspect(&view);
     }
 
-    /// Generations this member stored as found disagreeing in its own copy,
-    /// as a restart reads them back.
-    pub fn found_unfit_here(&self, generations: &[GenerationId]) {
-        if generations.is_empty() {
+    /// Copies this member stored as found disagreeing with the records, as
+    /// an open reads them back.
+    pub fn found_unfit_here(&self, copies: &[LocalCopy]) {
+        if copies.is_empty() {
             return;
         }
         let mut view = self.integrity.lock();
-        for generation in generations {
+        for copy in copies {
             view.last_revision += 1;
             let revision = view.last_revision;
-            view.local.entry(*generation).or_insert(LocalMark {
+            view.local.entry(copy.generation).or_insert(LocalMark {
                 revision,
                 state: MarkState::Stored,
             });
@@ -590,23 +543,22 @@ impl IndexRegistry {
     ///
     /// # Errors
     ///
-    /// The stored mark could not be removed (the copy stays unfit here), or a
-    /// finding made during the removal could not be stored again.
+    /// The stored mark could not be removed: the copy stays unfit here.
     pub fn verified_here(
         &self,
         engine: &StorageEngine,
         generation: GenerationId,
         revision: u64,
-    ) -> Result<bool, MarkNotDurable> {
+    ) -> Result<bool, StoreError> {
         let _order = self.marks.lock();
         {
             let view = self.integrity.lock();
-            // A failed mark's stored state is unknown: nothing about this copy
-            // is proved by touching the disk again, so it stays unfit here.
+            // A mark of unknown stored state proves nothing by touching the
+            // disk again: the copy stays unfit here, under its open guard.
             if view
                 .local
                 .get(&generation)
-                .is_some_and(|m| m.revision != revision || m.state == MarkState::Failed)
+                .is_some_and(|m| m.revision != revision || m.state == MarkState::Unknown)
             {
                 return Ok(false);
             }
@@ -615,12 +567,10 @@ impl IndexRegistry {
         // the stored mark of unknown state: the removal may have reached the
         // disk, so the mark no longer counts as stored and is never written
         // again.
-        #[cfg(test)]
-        self.mark_io
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.recovery_flushes.fetch_add(1, Ordering::Relaxed);
         if let Err(source) = LocalIndexStore::new(engine).clear_unfit_here(&[generation]) {
             if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
-                mark.state = MarkState::Failed;
+                mark.state = MarkState::Unknown;
             }
             tracing::error!(
                 generation = generation.as_raw(),
@@ -628,10 +578,7 @@ impl IndexRegistry {
                 "could not remove the mark of a verified index copy; its stored state is \
                  unknown and the copy stays unfit here"
             );
-            return Err(MarkNotDurable {
-                generation: generation.as_raw(),
-                source,
-            });
+            return Err(source);
         }
         #[cfg(test)]
         if let Some(hook) = self.after_mark_removed.lock().as_ref() {
@@ -643,9 +590,9 @@ impl IndexRegistry {
                 // A finding arrived during the removal: the stored copy it
                 // relied on is gone, so it is written again while the finding
                 // still waits on the order lock.
-                mark.state = MarkState::Pending;
+                mark.state = MarkState::Unwritten;
                 drop(view);
-                self.write_mark(engine, generation)?;
+                self.write_mark(engine, generation);
                 Ok(false)
             }
             _ => {
@@ -659,7 +606,7 @@ impl IndexRegistry {
     fn refresh_any_suspect(&self, view: &IntegrityView) {
         self.any_suspect.store(
             !view.recorded.is_empty() || !view.local.is_empty() || !view.trusted_from.is_empty(),
-            core::sync::atomic::Ordering::Release,
+            Ordering::Release,
         );
     }
 
@@ -667,7 +614,7 @@ impl IndexRegistry {
     /// `read_ts`: not suspect, and, when it was once damaged and verified
     /// since, not read at a snapshot older than its verification.
     pub fn answers_at(&self, generation: GenerationId, read_ts: u64) -> bool {
-        if !self.any_suspect.load(core::sync::atomic::Ordering::Acquire) {
+        if !self.any_suspect.load(Ordering::Acquire) {
             return true;
         }
         let view = self.integrity.lock();
@@ -677,6 +624,255 @@ impl IndexRegistry {
         view.trusted_from
             .get(&generation)
             .is_none_or(|from| read_ts >= *from)
+    }
+
+    /// Flushes of this member's recovery state (use guards and marks) made
+    /// so far: one per guard batch, mark and mark removal. Lookups that use
+    /// an armed copy make none.
+    pub fn recovery_flushes(&self) -> u64 {
+        self.recovery_flushes.load(Ordering::Relaxed)
+    }
+
+    /// At open, before the registry is loaded or any copy used: every use
+    /// guard an earlier run left standing turns its copy unfit here, since
+    /// that run may have found damage it never stored; the copy answers from
+    /// the records until a check verifies it. Guards and marks of copies no
+    /// longer installed go. A guard that cannot be turned into a mark stays
+    /// on disk and its copy is unfit in this process all the same.
+    ///
+    /// # Errors
+    ///
+    /// The guards could not be read or decoded: no copy is known to be safe.
+    pub fn recover_local_guards(&self, engine: &StorageEngine) -> Result<(), StoreError> {
+        let store = LocalIndexStore::new(engine);
+        match store.recover_armed_here() {
+            Ok(marked) => {
+                if !marked.is_empty() {
+                    self.recovery_flushes.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        copies = marked.len(),
+                        "index copies in use when this member last stopped without closing \
+                         them answer from the records until they are checked"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let armed = store.list_armed_here()?;
+                tracing::error!(
+                    %error,
+                    copies = armed.len(),
+                    "could not store the marks of index copies an earlier run left in use; \
+                     they answer from the records in this process and stay guarded on disk"
+                );
+                let mut view = self.integrity.lock();
+                for copy in armed {
+                    view.last_revision += 1;
+                    let revision = view.last_revision;
+                    view.local.insert(
+                        copy.generation,
+                        LocalMark {
+                            revision,
+                            state: MarkState::Unknown,
+                        },
+                    );
+                }
+                self.refresh_any_suspect(&view);
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether this member's copy of `generation` may serve as evidence: its
+    /// use guard is stored in this run, stored now if it was not. `armed` is
+    /// the flag of the definition the caller holds; a set flag is the whole
+    /// cost of a use after the first.
+    ///
+    /// The generations waiting at the same time are armed in one flush. A
+    /// guard whose write fails leaves the copy unused for the rest of the
+    /// run, without trying the write again.
+    fn use_copy(
+        &self,
+        engine: &StorageEngine,
+        generation: GenerationId,
+        armed: &AtomicBool,
+    ) -> bool {
+        if armed.load(Ordering::Acquire) {
+            return true;
+        }
+        self.arm(engine, generation)
+    }
+
+    /// Store the use guard of `generation`'s copy, with those of every other
+    /// generation waiting for theirs. Whether the copy is armed.
+    fn arm(&self, engine: &StorageEngine, generation: GenerationId) -> bool {
+        {
+            let mut view = self.integrity.lock();
+            if view.armed_generations.contains(&generation) {
+                drop(view);
+                self.set_armed_flags(&[generation]);
+                return true;
+            }
+            if view.closing || view.unarmable.contains(&generation) {
+                return false;
+            }
+            view.to_arm.insert(generation);
+        }
+        let _arming = self.arming.lock();
+        let wanted: Vec<GenerationId> = {
+            let mut view = self.integrity.lock();
+            if view.armed_generations.contains(&generation) {
+                drop(view);
+                self.set_armed_flags(&[generation]);
+                return true;
+            }
+            if view.closing {
+                return false;
+            }
+            view.to_arm.drain().collect()
+        };
+        let store = LocalIndexStore::new(engine);
+        let copies: Result<Vec<LocalCopy>, StoreError> =
+            wanted.iter().map(|g| store.bind_local_copy(*g)).collect();
+        let (copies, stored) = match copies {
+            Ok(copies) => {
+                self.recovery_flushes.fetch_add(1, Ordering::Relaxed);
+                let stored = store.arm_here(&copies);
+                (copies, stored)
+            }
+            Err(e) => (Vec::new(), Err(e)),
+        };
+        let armed: Vec<GenerationId> = {
+            let mut view = self.integrity.lock();
+            match &stored {
+                Ok(()) => {
+                    for copy in &copies {
+                        view.armed.insert(*copy);
+                        view.armed_generations.insert(copy.generation);
+                    }
+                }
+                Err(_) => view.unarmable.extend(wanted.iter().copied()),
+            }
+            wanted
+                .iter()
+                .copied()
+                .filter(|g| view.armed_generations.contains(g))
+                .collect()
+        };
+        if let Err(error) = stored {
+            tracing::error!(
+                %error,
+                generations = ?wanted.iter().map(|g| g.as_raw()).collect::<Vec<_>>(),
+                "could not store the use guards of index copies; they answer from the \
+                 records for the rest of this run"
+            );
+        }
+        self.set_armed_flags(&armed);
+        armed.contains(&generation)
+    }
+
+    /// Set the armed flag of every definition serving from `generations`.
+    fn set_armed_flags(&self, generations: &[GenerationId]) {
+        if generations.is_empty() {
+            return;
+        }
+        for registered in self.indexes.read().by_id.values() {
+            if generations.contains(&registered.def.generation) {
+                registered.armed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Store the use guard of the replacement being prepared for
+    /// `generation`'s copy, before it is published: once it serves, it serves
+    /// guarded. Its flag is set by the publication's next use.
+    ///
+    /// # Errors
+    ///
+    /// No replacement is being prepared, the guards are closing, or the
+    /// guard could not be stored: the replacement must not be published.
+    pub fn arm_replacement(
+        &self,
+        engine: &StorageEngine,
+        generation: GenerationId,
+    ) -> Result<LocalCopy, StoreError> {
+        let copy = engine
+            .staging_installation_of(generation)
+            .map(|installation| LocalCopy {
+                generation,
+                installation,
+            })
+            .ok_or_else(|| {
+                StoreError::Storage(StorageError::InstallationCatalog(format!(
+                    "generation {} has no replacement in preparation to guard",
+                    generation.as_raw()
+                )))
+            })?;
+        let _arming = self.arming.lock();
+        if self.integrity.lock().closing {
+            return Err(StoreError::Storage(StorageError::Io(
+                "the index copies' guards are closing".into(),
+            )));
+        }
+        self.recovery_flushes.fetch_add(1, Ordering::Relaxed);
+        LocalIndexStore::new(engine).arm_here(&[copy])?;
+        self.integrity.lock().armed.insert(copy);
+        Ok(copy)
+    }
+
+    /// The replacement `copy`, guarded with [`Self::arm_replacement`], is
+    /// published: reads of its generation resolve to it now.
+    pub fn replacement_published(&self, copy: LocalCopy) {
+        let mut view = self.integrity.lock();
+        if view.armed.contains(&copy) {
+            view.armed_generations.insert(copy.generation);
+        }
+    }
+
+    /// Close the use guards of this run, as a clean stop does once nothing
+    /// uses a copy: from this call on no copy is armed or used as evidence.
+    /// A copy whose finding could not be stored keeps its guard, so the next
+    /// open verifies it; every other finding is already in its stored mark.
+    /// A guard whose removal fails stands, with the same effect.
+    ///
+    /// Call after every statement, check and build of this run has ended.
+    pub fn close_local_guards(&self, engine: &StorageEngine) {
+        let _arming = self.arming.lock();
+        let closable: Vec<LocalCopy> = {
+            let mut view = self.integrity.lock();
+            view.closing = true;
+            view.armed_generations.clear();
+            let open: FxHashSet<GenerationId> = view
+                .local
+                .iter()
+                .filter(|(_, m)| m.state != MarkState::Stored)
+                .map(|(g, _)| *g)
+                .collect();
+            view.armed
+                .iter()
+                .copied()
+                .filter(|copy| !open.contains(&copy.generation))
+                .collect()
+        };
+        for registered in self.indexes.read().by_id.values() {
+            registered.armed.store(false, Ordering::Release);
+        }
+        if closable.is_empty() {
+            return;
+        }
+        self.recovery_flushes.fetch_add(1, Ordering::Relaxed);
+        match LocalIndexStore::new(engine).disarm_here(&closable) {
+            Ok(()) => {
+                let mut view = self.integrity.lock();
+                for copy in &closable {
+                    view.armed.remove(copy);
+                }
+            }
+            Err(error) => tracing::error!(
+                %error,
+                "could not close the use guards of index copies; the next open verifies them"
+            ),
+        }
     }
 
     /// Make `index` active in this process without a stored record to bind
@@ -706,10 +902,22 @@ impl IndexRegistry {
     }
 
     fn insert(&self, def: IndexDefinition, version: Option<u64>) {
-        self.indexes.write().insert(Registered {
+        let registered = self.registered(def, version);
+        self.indexes.write().insert(registered);
+    }
+
+    /// `def` as registered, armed when its generation's copy is.
+    fn registered(&self, def: IndexDefinition, version: Option<u64>) -> Registered {
+        let armed = self
+            .integrity
+            .lock()
+            .armed_generations
+            .contains(&def.generation);
+        Registered {
             def: Arc::new(def),
             version,
-        });
+            armed: Arc::new(AtomicBool::new(armed)),
+        }
     }
 
     /// Stop maintaining the index `id` in this process.
@@ -743,10 +951,7 @@ impl IndexRegistry {
                 coordinode_storage::engine::partition::Partition::Schema,
                 &def.schema_key(),
             )?;
-            loaded.insert(Registered {
-                def: Arc::new(def),
-                version,
-            });
+            loaded.insert(self.registered(def, version));
         }
         *self.indexes.write() = loaded;
         Ok(())
@@ -802,6 +1007,27 @@ impl IndexRegistry {
             .by_id
             .get(&id)
             .map(|r| IndexDefinition::clone(&r.def))
+    }
+
+    /// The index `id` (owned clone), with whether the use guard of this
+    /// member's copy of its generation is stored in this run. A copy is used
+    /// as evidence only once it is: see [`Self::arm_copy`].
+    pub fn get_guarded(&self, id: IndexId) -> Option<(IndexDefinition, bool)> {
+        let catalog = self.indexes.read();
+        let registered = catalog.by_id.get(&id)?;
+        Some((
+            IndexDefinition::clone(&registered.def),
+            registered.armed.load(Ordering::Acquire),
+        ))
+    }
+
+    /// Store the use guard of this member's copy of `generation`, together
+    /// with those of every generation waiting at the same time, before the
+    /// copy is first used as evidence in this run. Whether it is armed: a
+    /// copy whose guard cannot be stored never serves, and the write is not
+    /// tried again in this run.
+    pub fn arm_copy(&self, engine: &StorageEngine, generation: GenerationId) -> bool {
+        self.arm(engine, generation)
     }
 
     /// Every active index (owned clones).
@@ -865,6 +1091,7 @@ impl IndexRegistry {
         for Registered {
             def: index,
             version,
+            armed,
         } in self.btree_for_label(node.label)
         {
             let Some(values) = entry_values(&index, node.value_of) else {
@@ -875,7 +1102,7 @@ impl IndexRegistry {
                 engine,
                 shard_id,
                 field_of,
-                registry: Some(self),
+                registry: Some((self, &*armed)),
             };
             stage(
                 &staging,
@@ -904,6 +1131,7 @@ impl IndexRegistry {
         for Registered {
             def: index,
             version,
+            armed,
         } in self.btree_for_label(change.label)
         {
             let changed = |p: &str| change.properties.contains(&p);
@@ -926,7 +1154,7 @@ impl IndexRegistry {
                 engine,
                 shard_id,
                 field_of,
-                registry: Some(self),
+                registry: Some((self, &*armed)),
             };
             stage(&staging, txn, &index, owner, old, new, claims)?;
         }
@@ -945,6 +1173,7 @@ impl IndexRegistry {
         for Registered {
             def: index,
             version,
+            ..
         } in self.btree_for_label(node.label)
         {
             if let Some(values) = entry_values(&index, node.value_of) {
@@ -1074,13 +1303,13 @@ pub fn record_lookup<'r>(
 
 /// What staging an entry reads besides the entry: the store, the shard its
 /// nodes live in, the field dictionary, and the registry that keeps which
-/// generations are suspect (`None` for a build filling a generation no
-/// reader uses yet).
+/// generations are suspect with the definition's armed flag (`None` for a
+/// build filling a generation no reader uses yet).
 struct Staging<'a> {
     engine: &'a StorageEngine,
     shard_id: u16,
     field_of: FieldOf<'a>,
-    registry: Option<&'a IndexRegistry>,
+    registry: Option<(&'a IndexRegistry, &'a AtomicBool)>,
 }
 
 /// Stage `owner`'s membership in `index` moving from `old` to `new`,
@@ -1107,9 +1336,13 @@ fn stage(
     let mut needs_source_proof = false;
     if index.unique {
         if let Some(values) = &new {
-            needs_source_proof = staging
-                .registry
-                .is_some_and(|r| r.is_suspect(index.generation));
+            // The entries prove a value free only from a copy armed for use
+            // and not suspect. A holder they name is checked against its own
+            // record either way, so it is positive evidence from any copy.
+            needs_source_proof = staging.registry.is_some_and(|(r, armed)| {
+                !r.use_copy(staging.engine, index.generation, armed)
+                    || r.is_suspect(index.generation)
+            });
             if let Some(holder) = store.unique_conflict(txn, index, values, node_id)? {
                 if holds_values(
                     txn,
@@ -1121,7 +1354,7 @@ fn stage(
                 )? {
                     return Err(UniqueViolation::new(index, values, holder).into());
                 }
-                if let Some(registry) = staging.registry {
+                if let Some((registry, _)) = staging.registry {
                     for tuple in held_tuples(&store, txn, index, values, holder)? {
                         registry.report_mismatch(
                             staging.engine,
@@ -1131,7 +1364,7 @@ fn stage(
                                 valid_from: None,
                                 tuple,
                             },
-                        )?;
+                        );
                     }
                 }
                 needs_source_proof = true;

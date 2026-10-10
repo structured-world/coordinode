@@ -350,6 +350,189 @@ fn a_build_a_member_cannot_take_is_left_for_the_next_take() {
     );
 }
 
+/// Mark this member's copy of `generation` unfit, as a guard an earlier run
+/// left open does at the next open, and admit what the mark asks for.
+fn mark_and_admit(env: &TestEnv, builds: &IndexBuildService, generation: GenerationId) {
+    let store = LocalIndexStore::new(&env.engine);
+    let copy = store.local_copy(generation).expect("a copy here");
+    store.mark_unfit_here(copy).expect("mark");
+    env.registry.load_all(&env.engine).expect("load");
+    assert!(env.registry.is_suspect(generation));
+    builds.resume_checks().expect("admit");
+}
+
+/// Wait for the local check of `generation` to end.
+fn await_local_check(builds: &IndexBuildService, generation: GenerationId) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while builds.local_check_running(generation) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the local check never ended"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A member that takes no writes cannot run the shared check, which proves
+/// only the copy of the member running it; it checks its own copy against
+/// its own records, writing nothing shared. A copy that agrees serves
+/// again; one missing an entry stays unfit here and answers from the
+/// records.
+#[test]
+fn a_member_that_takes_no_writes_checks_its_own_copy() {
+    let env = env();
+    env.put_user(1, "a@x");
+    env.put_user(2, "b@x");
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email"),
+        BuildFailure::Withdraw,
+    );
+    let builds = service(&env);
+    builds.submit(def.generation).expect("submit");
+    assert!(matches!(
+        builds.wait_here(def.generation),
+        Some(IndexBuildOutcome::Published { .. })
+    ));
+    env.inject(Some(Fault::NotLeader));
+
+    mark_and_admit(&env, &builds, def.generation);
+    assert!(builds.local_check_running(def.generation), "checked here");
+    await_local_check(&builds, def.generation);
+    assert!(
+        !env.registry.is_suspect(def.generation),
+        "agrees: serves again"
+    );
+    assert!(
+        LocalIndexStore::new(&env.engine)
+            .list_unfit_here()
+            .expect("marks")
+            .is_empty()
+    );
+
+    // b's entry lost on this member alone: its copy disagrees.
+    let tuple = coordinode_core::index::encoding::encode_tuple(&[Value::String("b@x".into())])
+        .expect("tuple");
+    env.engine
+        .delete(
+            coordinode_storage::engine::partition::Partition::Idx,
+            &coordinode_core::index::encoding::encode_entry_key(def.generation, &tuple, 2),
+        )
+        .expect("lose b's entry");
+    mark_and_admit(&env, &builds, def.generation);
+    await_local_check(&builds, def.generation);
+    assert!(
+        env.registry.is_suspect(def.generation),
+        "a copy missing an entry stays unfit here"
+    );
+    assert!(
+        LocalIndexStore::new(&env.engine)
+            .load_integrity(def.generation)
+            .expect("read")
+            .is_none(),
+        "nothing shared was written: no integrity record"
+    );
+}
+
+/// Fills a replacement from a peer's copy of the generation, as segment
+/// transfer does between members: the peer's history imported at its own
+/// seqnos.
+struct PeerCopy {
+    local: Arc<TestEnv>,
+    peer: Arc<TestEnv>,
+    prepared: core::sync::atomic::AtomicUsize,
+}
+
+impl IndexCopySource for PeerCopy {
+    fn prepare(&self, generation: GenerationId) -> Result<(), String> {
+        self.prepared
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let local = &self.local.engine;
+        local
+            .stage_generation(generation)
+            .map_err(|e| e.to_string())?;
+        let history = self
+            .peer
+            .engine
+            .export_generation_history(generation)
+            .map_err(|e| e.to_string())?;
+        local
+            .import_generation_history(generation, &history.entries)
+            .map_err(|e| e.to_string())?;
+        local
+            .finish_generation_import(generation, history.covers_through, history.history_from)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// A member with users and a ready `email` index over them.
+fn member_with_users() -> (Arc<TestEnv>, IndexBuildService, IndexDefinition) {
+    let env = env();
+    env.put_user(1, "a@x");
+    env.put_user(2, "b@x");
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email"),
+        BuildFailure::Withdraw,
+    );
+    let builds = service(&env);
+    builds.submit(def.generation).expect("submit");
+    assert!(matches!(
+        builds.wait_here(def.generation),
+        Some(IndexBuildOutcome::Published { .. })
+    ));
+    (env, builds, def)
+}
+
+/// A copy damaged on this member alone is replaced from a peer's copy of
+/// the same generation: the replacement is guarded before it is published,
+/// checked against this member's records, and only then serves; the
+/// generation, its identity and every other copy stay as they were.
+#[test]
+fn a_copy_damaged_here_is_replaced_from_a_peer() {
+    let (env, builds, def) = member_with_users();
+    let (peer, _peer_builds, peer_def) = member_with_users();
+    assert_eq!(peer_def.generation, def.generation, "one generation");
+    let source = Arc::new(PeerCopy {
+        local: Arc::clone(&env),
+        peer: Arc::clone(&peer),
+        prepared: core::sync::atomic::AtomicUsize::new(0),
+    });
+    builds.set_copy_source(Arc::clone(&source) as Arc<dyn IndexCopySource>);
+    env.inject(Some(Fault::NotLeader));
+    let store = LocalIndexStore::new(&env.engine);
+    let damaged = store.local_copy(def.generation).expect("a copy here");
+
+    let tuple = coordinode_core::index::encoding::encode_tuple(&[Value::String("b@x".into())])
+        .expect("tuple");
+    env.engine
+        .delete(
+            coordinode_storage::engine::partition::Partition::Idx,
+            &coordinode_core::index::encoding::encode_entry_key(def.generation, &tuple, 2),
+        )
+        .expect("lose b's entry here");
+    mark_and_admit(&env, &builds, def.generation);
+    await_local_check(&builds, def.generation);
+
+    assert_eq!(
+        source.prepared.load(core::sync::atomic::Ordering::Relaxed),
+        1,
+        "filled once from the peer"
+    );
+    let replaced = store.local_copy(def.generation).expect("a copy here");
+    assert_eq!(replaced.generation, damaged.generation);
+    assert_ne!(replaced.installation, damaged.installation, "a new copy");
+    assert!(
+        store.list_armed_here().expect("guards").contains(&replaced),
+        "guarded before it serves"
+    );
+    assert!(
+        !env.registry.is_suspect(def.generation),
+        "checked: it serves"
+    );
+    assert!(store.list_unfit_here().expect("marks").is_empty());
+    assert_eq!(env.holders(&def, "b@x"), vec![2], "b's entry is back");
+    assert_eq!(env.holders(&def, "a@x"), vec![1]);
+}
+
 /// A shutdown stops a build waiting for older transactions without waiting
 /// them out and returns once its executor has ended: the build keeps its
 /// running record, nothing new starts on the stopped service, and a service

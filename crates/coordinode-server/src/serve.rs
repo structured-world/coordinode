@@ -47,6 +47,44 @@ fn set_nofile_limit(_target: Option<u64>) -> Option<(u64, u64)> {
     None
 }
 
+/// The configured peers as URIs a segment pull dials; empty when standalone.
+fn peer_uris(peers: Option<&[String]>) -> Vec<String> {
+    peers
+        .unwrap_or_default()
+        .iter()
+        .map(|p| {
+            if p.contains("://") {
+                p.clone()
+            } else {
+                format!("http://{p}")
+            }
+        })
+        .collect()
+}
+
+/// Fills a replacement of one of this member's index copies from its peers'
+/// copies over the segment transfer.
+struct PeerIndexCopy {
+    installer: Arc<coordinode_replicate::SegmentInstaller>,
+    peers: Vec<String>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl coordinode_query::index::IndexCopySource for PeerIndexCopy {
+    fn prepare(&self, generation: coordinode_query::index::GenerationId) -> Result<(), String> {
+        // Called from an index-check thread, outside the runtime.
+        self.runtime
+            .block_on(self.installer.prepare_generation(
+                &self.peers,
+                generation,
+                1 << 20,
+                coordinode_replicate::PieceEncoding::None,
+            ))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Delay before a periodic task's first run: `node_id mod 16` sixteenths of
 /// its interval, so a fleet does not run it in lockstep. The product is at
 /// most the interval itself, so it cannot overflow.
@@ -379,20 +417,7 @@ pub(crate) async fn serve(
             // (CE basic replica-fetch repair). Normalised to URIs; empty
             // when standalone (nothing to repair from). Each node repairs
             // its own corruption independently.
-            let repair_peers: Vec<String> = peers
-                .as_ref()
-                .map(|ps| {
-                    ps.iter()
-                        .map(|p| {
-                            if p.contains("://") {
-                                p.clone()
-                            } else {
-                                format!("http://{p}")
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let repair_peers = peer_uris(peers.as_deref());
             let repair_installer = Arc::new(coordinode_replicate::SegmentInstaller::new(
                 Arc::clone(&engine),
             ));
@@ -764,6 +789,19 @@ pub(crate) async fn serve(
             Some(secs) => Some(std::time::Duration::from_secs(secs)),
         },
     });
+    // A copy of an index found damaged on this member alone is replaced from
+    // a peer's copy; a standalone member has no peer and answers from its
+    // records instead.
+    let index_copy_peers = peer_uris(peers.as_deref());
+    if !index_copy_peers.is_empty() {
+        database.set_index_copy_source(Arc::new(PeerIndexCopy {
+            installer: Arc::new(coordinode_replicate::SegmentInstaller::new(Arc::clone(
+                &engine,
+            ))),
+            peers: index_copy_peers,
+            runtime: tokio::runtime::Handle::current(),
+        }));
+    }
     // What a statement executes under when neither it nor its session names a
     // concern.
     database.set_read_concern(statement_defaults.read_concern);

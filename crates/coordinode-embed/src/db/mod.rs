@@ -842,6 +842,9 @@ impl Drop for Database {
         // and the next opening finishes it.
         self.vector_index_registry.cancel_all_builds();
         self.index_builds.shutdown();
+        // Nothing uses an index copy any more: no statement outlives the
+        // database, and the builds and checks are joined above.
+        self.index_registry.close_local_guards(&self.engine);
     }
 }
 
@@ -1049,7 +1052,10 @@ impl Database {
         // The index catalog, before anything in this open writes: a definition
         // this build cannot read refuses the open, rather than serving the
         // database without that index and the uniqueness it enforces.
+        // Copies an earlier run left in use without closing their guards are
+        // unfit until checked, from before the registry serves anything.
         let index_registry = Arc::new(coordinode_query::index::IndexRegistry::new());
+        index_registry.recover_local_guards(&engine)?;
         index_registry.load_all(&engine)?;
 
         let proposal_id_gen = Arc::new(ProposalIdGenerator::with_base(fresh_proposal_id_base()));

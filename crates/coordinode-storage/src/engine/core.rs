@@ -1441,6 +1441,46 @@ impl StorageEngine {
         (part == Partition::Idx).then_some(&self.installations)
     }
 
+    /// This member's published installation of `generation` in the index
+    /// partition: the identity of the local copy reads of the generation
+    /// resolve to now. `None` when the generation has no copy here.
+    pub fn installation_of(
+        &self,
+        generation: coordinode_core::index::identity::GenerationId,
+    ) -> Option<u64> {
+        self.installations
+            .current()
+            .installation(generation.as_raw())
+    }
+
+    /// This member's installation of `generation`, bound now when it has
+    /// none yet: the copy a guard taken before the generation's first write
+    /// protects is the one that write lands in.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InstallationCatalog`] when the installation ids are
+    /// exhausted; a write failure.
+    pub fn bind_installation(
+        &self,
+        generation: coordinode_core::index::identity::GenerationId,
+    ) -> StorageResult<u64> {
+        self.installations.bind(
+            self.tree(Partition::Idx)?,
+            generation.as_raw(),
+            self.next_seqno(),
+        )
+    }
+
+    /// The installation being prepared to replace this member's copy of
+    /// `generation` ([`Self::stage_generation`]), if one is.
+    pub fn staging_installation_of(
+        &self,
+        generation: coordinode_core::index::identity::GenerationId,
+    ) -> Option<u64> {
+        self.installations.current().staging(generation.as_raw())
+    }
+
     /// Begin replacing this member's copy of `generation` in the index
     /// partition: a new installation is registered beside the published one,
     /// and from this call on every write of the generation reaches both. A

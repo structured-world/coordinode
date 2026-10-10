@@ -88,7 +88,7 @@ pub use encrypted_index::{
 };
 pub use error::{StoreError, StoreResult};
 pub use index::{
-    EntryPage, IndexStore, LatestEntry, LocalIndexStore, StoredEntry, StoredEntryPage,
+    EntryPage, IndexStore, LatestEntry, LocalCopy, LocalIndexStore, StoredEntry, StoredEntryPage,
 };
 pub use index_def::{
     BuildFailure, BuildState, CheckPhase, CheckState, DuplicateRepair, DuplicateRepairRecord,

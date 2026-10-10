@@ -29,7 +29,7 @@ pub use lifecycle::{
     BuildEnvironment, BuildError, BuildIndex, BuildPhase, BuildStatus, CheckOutcome,
     CheckRequestError, CheckStatus, DEFAULT_CHECK_INTERVAL, DEFAULT_CHECK_MAX_REPAIRS,
     DEFAULT_CHECK_PAGE, DEFAULT_STATEMENT_WAIT, DEFAULT_UNIQUE_ADMISSION_READ_LIMIT,
-    IndexBuildConfig, IndexBuildOutcome, IndexBuildService,
+    IndexBuildConfig, IndexBuildOutcome, IndexBuildService, IndexCopySource,
 };
 
 /// How a maintenance operation names the index it acts on: by its stable
@@ -89,8 +89,7 @@ pub enum IndexSelectorError {
     Storage(String),
 }
 pub use registry::{
-    IndexRegistry, IndexWriteError, MarkNotDurable, PropertyChange, UniqueClaim, UniqueViolation,
-    props_lookup,
+    IndexRegistry, IndexWriteError, PropertyChange, UniqueClaim, UniqueViolation, props_lookup,
 };
 pub use text_registry::TextIndexRegistry;
 pub use vector_build::{BuildOutcome, BuildTarget, VectorBuild};

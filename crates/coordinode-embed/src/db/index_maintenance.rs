@@ -10,8 +10,8 @@ use core::time::Duration;
 
 use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
 use coordinode_query::index::{
-    CheckOutcome, CheckRequestError, CheckStatus, GenerationId, IndexSelector, IndexSelectorError,
-    IndexType,
+    CheckOutcome, CheckRequestError, CheckStatus, GenerationId, IndexCopySource, IndexSelector,
+    IndexSelectorError, IndexType,
 };
 
 use super::{Database, DatabaseError};
@@ -66,6 +66,22 @@ impl Database {
     /// The records could not be read.
     pub fn index_checks(&self) -> Result<Vec<CheckStatus>, DatabaseError> {
         Ok(self.index_builds.checks()?)
+    }
+
+    /// Fill replacements of this member's index copies from `source`, its
+    /// peers' copies: a copy found disagreeing with this member's records is
+    /// replaced, guarded, checked and then serves again. A member without a
+    /// source keeps such a copy out of use and answers from its records.
+    pub fn set_index_copy_source(&self, source: std::sync::Arc<dyn IndexCopySource>) {
+        self.index_builds.set_copy_source(source);
+    }
+
+    /// Flushes of this member's index recovery state made since it opened:
+    /// use guards stored before a copy's first use, and marks of copies
+    /// found disagreeing with their records. A lookup through a copy already
+    /// in use makes none.
+    pub fn index_recovery_flushes(&self) -> u64 {
+        self.index_registry.recovery_flushes()
     }
 
     /// Cancel the check `operation`. Returns whether a check was stopped;

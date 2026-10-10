@@ -82,11 +82,6 @@ pub enum ExecutionError {
     #[error("modality store error: {0}")]
     Modality(coordinode_modality::StoreError),
 
-    /// The statement found an index entry disagreeing with its record and
-    /// could not store that finding durably on this member.
-    #[error(transparent)]
-    IndexMarkNotDurable(#[from] crate::index::MarkNotDurable),
-
     /// The query spent its execution budget: its memory limit, its deadline,
     /// or it was cancelled. Nothing it produced so far is a complete answer.
     #[error("{0}")]
@@ -509,7 +504,6 @@ fn index_write_error(e: crate::index::IndexWriteError) -> ExecutionError {
     match e {
         crate::index::IndexWriteError::Unique(v) => unique_violation(v),
         crate::index::IndexWriteError::Store(e) => e.into(),
-        crate::index::IndexWriteError::MarkNotDurable(e) => e.into(),
     }
 }
 
@@ -1878,7 +1872,7 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(Err(IndexUnanswered::NotServing));
         };
-        let Some(index) = registry.get_by_id(id) else {
+        let Some((index, armed)) = registry.get_guarded(id) else {
             return Ok(Err(IndexUnanswered::NotServing));
         };
         // The snapshot this statement reads: a named timestamp, or its own.
@@ -1893,7 +1887,11 @@ impl<'a> ExecutionContext<'a> {
         {
             return Ok(Err(IndexUnanswered::NotServing));
         }
-        if !registry.answers_at(index.generation, read_ts) {
+        // A copy is evidence only under its stored use guard: one that cannot
+        // be guarded answers from the records, as an unproved one does.
+        if (!armed && !registry.arm_copy(self.engine, index.generation))
+            || !registry.answers_at(index.generation, read_ts)
+        {
             return Ok(Err(IndexUnanswered::Unproved));
         }
         self.sync_txn_state();
@@ -1975,7 +1973,7 @@ impl<'a> ExecutionContext<'a> {
                     valid_from: None,
                     tuple,
                 },
-            )?;
+            );
         }
         Ok(true)
     }

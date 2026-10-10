@@ -159,11 +159,52 @@ fn stray(node: u64) -> Mismatch {
     }
 }
 
-/// Report that node `node` holds a stray entry of `index`; the mark must
-/// be stored.
+/// Report that node `node` holds a stray entry of `index`.
 fn report(reg: &IndexRegistry, engine: &StorageEngine, index: &IndexDefinition, node: u64) {
-    reg.report_mismatch(engine, index, stray(node))
-        .expect("the finding is stored");
+    reg.report_mismatch(engine, index, stray(node));
+}
+
+/// The generations of this member's stored marks, ascending.
+fn marked(engine: &StorageEngine) -> Vec<GenerationId> {
+    let mut out: Vec<GenerationId> = LocalIndexStore::new(engine)
+        .list_unfit_here()
+        .expect("marks")
+        .into_iter()
+        .map(|copy| copy.generation)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// The generations of this member's stored use guards, ascending.
+fn guarded(engine: &StorageEngine) -> Vec<GenerationId> {
+    let mut out: Vec<GenerationId> = LocalIndexStore::new(engine)
+        .list_armed_here()
+        .expect("guards")
+        .into_iter()
+        .map(|copy| copy.generation)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Give `generation` a copy on disk, as an earlier write leaves it: its
+/// installation bound and flushed.
+fn existing_copy(engine: &StorageEngine, generation: GenerationId) {
+    LocalIndexStore::new(engine)
+        .bind_local_copy(generation)
+        .expect("bind");
+    engine
+        .persist_partition(coordinode_storage::engine::partition::Partition::Idx)
+        .expect("persist the copy's installation");
+}
+
+/// A process opening the member: guards recovered, then the catalog loaded.
+fn reopened(engine: &StorageEngine) -> IndexRegistry {
+    let reg = IndexRegistry::new();
+    reg.recover_local_guards(engine).expect("recover guards");
+    reg.load_all(engine).expect("load");
+    reg
 }
 
 /// A disagreement found here makes the generation suspect at once and waits
@@ -246,12 +287,7 @@ fn a_finding_after_the_pass_started_survives_its_verification() {
             .expect("lift")
     );
     assert!(reg.is_suspect(index.generation));
-    assert_eq!(
-        LocalIndexStore::new(&engine)
-            .list_unfit_here()
-            .expect("marks"),
-        vec![index.generation]
-    );
+    assert_eq!(marked(&engine), vec![index.generation]);
     // A pass that started with no finding here at all does not lift a
     // finding that came after it either.
     let fresh = btree("user_name", "name", 2);
@@ -283,58 +319,58 @@ fn a_finding_survives_power_loss_before_any_maintenance() {
     assert!(reg.is_suspect(index.generation));
 }
 
-/// A mark whose write or flush failed has unknown durability: the finding
-/// fails rather than report it kept, every later finding against the
-/// generation fails the same way, the copy stays unfit here, and nothing
-/// writes the mark again (a retry after a failed flush proves nothing).
+/// A mark whose write or flush failed has unknown durability: the statement
+/// that found it goes on (it answers from the records), the copy stays unfit
+/// here, nothing writes the mark again (a retry after a failed flush proves
+/// nothing), and the copy's use guard is not closed, so the next open still
+/// finds the copy unfit.
 #[test]
-fn a_mark_whose_flush_failed_fails_the_finding_and_is_not_retried() {
+fn a_mark_whose_flush_failed_is_not_retried_and_keeps_the_guard() {
     let rig = coordinode_test_fixtures::PowerRig::new();
-    let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
-    let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
-    // Every open fails from here: a single failure could be taken by the
-    // engine's own background work instead of the mark's flush.
-    rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
-    let first = reg.report_mismatch(&engine, &index, stray(7));
+    {
+        let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+        let reg = IndexRegistry::new();
+        existing_copy(&engine, index.generation);
+        assert!(reg.arm_copy(&engine, index.generation), "armed before use");
+        // Every open fails from here: a single failure could be taken by the
+        // engine's own background work instead of the mark's flush.
+        rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
+        report(&reg, &engine, &index, 7);
+        assert!(reg.is_suspect(index.generation), "unfit here regardless");
+        // Whatever follows must not ask for the mark to be written, removed
+        // or the guard closed.
+        let flushes = reg.recovery_flushes();
+        report(&reg, &engine, &index, 8);
+        let now = reg.local_revision(index.generation);
+        assert!(
+            !reg.verified_here(&engine, index.generation, now)
+                .expect("refused without I/O"),
+            "a mark of unknown state is not lifted"
+        );
+        reg.close_local_guards(&engine);
+        assert_eq!(reg.recovery_flushes(), flushes, "no I/O for a failed mark");
+        assert!(reg.is_suspect(index.generation));
+        rig.cut(engine);
+    }
+    let engine = StorageEngine::open(&rig.config()).expect("reopen");
+    let reg = reopened(&engine);
     assert!(
-        matches!(&first, Err(e) if e.generation == index.generation.as_raw()),
-        "{first:?}"
+        reg.is_suspect(index.generation),
+        "the guard left open makes the copy unfit after the restart"
     );
-    assert!(reg.is_suspect(index.generation), "unfit here regardless");
-    // Whatever follows must not ask for the mark to be written or removed.
-    let opens = mark_io(&reg);
-    let again = reg.report_mismatch(&engine, &index, stray(8));
-    assert!(
-        matches!(
-            &again,
-            Err(MarkNotDurable {
-                source: StoreError::Storage(StorageError::Io(why)),
-                ..
-            }) if why.contains("earlier write")
-        ),
-        "a later finding is refused: {again:?}"
-    );
-    reg.store_pending_marks(&engine)
-        .expect("a failed mark is not pending, so nothing is written");
-    assert_eq!(mark_io(&reg), opens, "no I/O for a failed mark");
-    assert!(reg.is_suspect(index.generation));
-}
-
-/// Writes and removals of stored marks `reg` has asked for so far.
-fn mark_io(reg: &IndexRegistry) -> usize {
-    reg.mark_io.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// A removal whose flush failed may or may not have reached the disk: the
-/// mark is no longer taken as stored, so a later finding fails rather than
-/// report a mark that a restart may not find, and nothing writes it again.
+/// mark is no longer taken as stored, nothing writes or removes it again,
+/// and the copy stays unfit here under its open guard.
 #[test]
 fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
     let rig = coordinode_test_fixtures::PowerRig::new();
     let index = btree("user_email", "email", 1);
     let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
     let reg = IndexRegistry::new();
+    assert!(reg.arm_copy(&engine, index.generation));
     report(&reg, &engine, &index, 7);
     let started = reg.local_revision(index.generation);
     // Every open fails from here: a single failure could be taken by the
@@ -347,113 +383,242 @@ fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
     );
     assert!(reg.is_suspect(index.generation), "unfit here regardless");
     // Whatever follows must not ask for the mark to be written or removed.
-    let opens = mark_io(&reg);
-    let after = reg.report_mismatch(&engine, &index, stray(8));
-    assert!(
-        matches!(
-            &after,
-            Err(MarkNotDurable {
-                source: StoreError::Storage(StorageError::Io(why)),
-                ..
-            }) if why.contains("earlier write")
-        ),
-        "a finding after the failed removal is refused: {after:?}"
-    );
-    reg.store_pending_marks(&engine)
-        .expect("a failed mark is not pending");
+    let flushes = reg.recovery_flushes();
+    report(&reg, &engine, &index, 8);
     // A later check verifying the copy does not touch the disk either: the
     // mark's stored state stays unknown, so the copy stays unfit here.
     let now = reg.local_revision(index.generation);
     assert!(
         !reg.verified_here(&engine, index.generation, now)
             .expect("refused"),
-        "a failed mark is not lifted"
+        "a mark of unknown state is not lifted"
     );
-    assert_eq!(mark_io(&reg), opens, "no I/O for a failed mark");
+    reg.close_local_guards(&engine);
+    assert_eq!(reg.recovery_flushes(), flushes, "no I/O for a failed mark");
     assert!(reg.is_suspect(index.generation));
 }
 
 /// The same holds when the flush itself is refused at its sync, not at
-/// opening its file: a finding whose mark's sync failed fails, and a removal
-/// whose sync failed leaves the mark failed, with no further I/O for it.
-/// A memtable flush syncs its table with `sync_all`, so that is the sync
-/// failed here, for the mark's write and for the removal. Every sync fails
-/// from that point: a single failure could be taken by the engine's own
-/// background flush or compaction instead of the step under test, and
-/// nothing after it may touch the disk anyway.
+/// opening its file: a mark whose sync failed, or a removal whose sync
+/// failed, leaves the mark of unknown state, with no further I/O for it and
+/// the guard left open. A memtable flush syncs its table with `sync_all`,
+/// so that is the sync failed here. Every sync fails from that point: a
+/// single failure could be taken by the engine's own background flush or
+/// compaction instead of the step under test, and nothing after it may
+/// touch the disk anyway.
 #[test]
 fn a_failed_sync_leaves_the_mark_of_unknown_durability() {
     use coordinode_test_fixtures::FaultOp;
     let index = btree("user_email", "email", 1);
     for removal in [false, true] {
         let rig = coordinode_test_fixtures::PowerRig::new();
-        let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
-        let reg = IndexRegistry::new();
-        if removal {
-            report(&reg, &engine, &index, 7);
-            let started = reg.local_revision(index.generation);
-            rig.fail_from(FaultOp::SyncAll, 0);
+        {
+            let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+            let reg = IndexRegistry::new();
+            existing_copy(&engine, index.generation);
+            assert!(reg.arm_copy(&engine, index.generation));
+            if removal {
+                report(&reg, &engine, &index, 7);
+                let started = reg.local_revision(index.generation);
+                rig.fail_from(FaultOp::SyncAll, 0);
+                assert!(
+                    reg.verified_here(&engine, index.generation, started)
+                        .is_err(),
+                    "the removal's sync failed"
+                );
+            } else {
+                rig.fail_from(FaultOp::SyncAll, 0);
+                report(&reg, &engine, &index, 7);
+            }
+            assert!(reg.is_suspect(index.generation));
+            // Whatever follows must not ask for the mark to be written or
+            // removed, or the guard closed.
+            let before = reg.recovery_flushes();
+            report(&reg, &engine, &index, 9);
+            let now = reg.local_revision(index.generation);
             assert!(
-                reg.verified_here(&engine, index.generation, started)
-                    .is_err(),
-                "the removal's sync failed"
+                !reg.verified_here(&engine, index.generation, now)
+                    .expect("refused")
             );
-        } else {
-            rig.fail_from(FaultOp::SyncAll, 0);
-            let found = reg.report_mismatch(&engine, &index, stray(7));
-            assert!(found.is_err(), "the mark's sync failed: {found:?}");
+            reg.close_local_guards(&engine);
+            assert_eq!(
+                reg.recovery_flushes(),
+                before,
+                "removal {removal}: no I/O for a mark of unknown state"
+            );
+            assert!(reg.is_suspect(index.generation));
+            rig.cut(engine);
         }
-        assert!(reg.is_suspect(index.generation));
-        // Whatever follows must not ask for the mark to be written or
-        // removed.
-        let before = mark_io(&reg);
-        let again = reg.report_mismatch(&engine, &index, stray(9));
+        let engine = StorageEngine::open(&rig.config()).expect("reopen");
         assert!(
-            matches!(
-                &again,
-                Err(MarkNotDurable {
-                    source: StoreError::Storage(StorageError::Io(why)),
-                    ..
-                }) if why.contains("earlier write")
-            ),
-            "removal {removal}: refused: {again:?}"
+            reopened(&engine).is_suspect(index.generation),
+            "removal {removal}: unfit after the restart"
         );
-        let now = reg.local_revision(index.generation);
-        assert!(
-            !reg.verified_here(&engine, index.generation, now)
-                .expect("refused")
-        );
-        reg.store_pending_marks(&engine)
-            .expect("nothing is pending");
-        assert_eq!(
-            mark_io(&reg),
-            before,
-            "removal {removal}: no I/O for a failed mark"
-        );
-        assert!(reg.is_suspect(index.generation));
     }
 }
 
-/// A disk below its free-space reserve is not written to: the finding goes
-/// on with its mark pending, and the mark is written once there is room.
+/// Marks are recovery state the free-space reserve exists for: a disk below
+/// the reserve, where client writes are refused, still takes the mark, so
+/// a restart finds the copy unfit whatever space is free then.
 #[test]
-fn a_mark_waits_for_room_when_the_disk_is_below_its_reserve() {
+fn a_mark_is_written_below_the_free_space_reserve() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let index = btree("user_email", "email", 1);
+    {
+        let engine = test_engine(dir.path());
+        let reg = IndexRegistry::new();
+        engine.space().set_reserve(u64::MAX, u64::MAX);
+        assert!(engine.space().is_paused(), "client writes are refused");
+        assert!(reg.arm_copy(&engine, index.generation), "the guard too");
+        report(&reg, &engine, &index, 7);
+        assert_eq!(marked(&engine), vec![index.generation]);
+        engine.space().set_reserve(0, 0);
+        reg.close_local_guards(&engine);
+    }
+    let engine = test_engine(dir.path());
+    assert!(
+        reopened(&engine).is_suspect(index.generation),
+        "the stored mark, not the space freed since, decides"
+    );
+}
+
+/// A copy is guarded once per run: the first use stores the guard, every
+/// later use reads one flag and makes no I/O.
+#[test]
+fn a_copy_is_armed_once_per_run() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
-    engine.space().set_reserve(u64::MAX, u64::MAX);
-    report(&reg, &engine, &index, 7);
-    let store = LocalIndexStore::new(&engine);
-    assert!(store.list_unfit_here().expect("marks").is_empty());
-    reg.store_pending_marks(&engine).expect("still no room");
-    assert!(store.list_unfit_here().expect("marks").is_empty());
-    engine.space().set_reserve(0, 0);
-    reg.store_pending_marks(&engine).expect("room again");
+    reg.register_in_memory(index.clone());
+    let (_, armed) = reg.get_guarded(index.id).expect("registered");
+    assert!(!armed, "not armed before its first use");
+    assert!(reg.arm_copy(&engine, index.generation));
+    assert_eq!(reg.recovery_flushes(), 1);
+    for _ in 0..1000 {
+        let (_, armed) = reg.get_guarded(index.id).expect("registered");
+        assert!(armed);
+    }
+    assert!(reg.arm_copy(&engine, index.generation));
     assert_eq!(
-        store.list_unfit_here().expect("marks"),
-        vec![index.generation]
+        reg.recovery_flushes(),
+        1,
+        "no guard I/O after the first use"
     );
+    assert_eq!(guarded(&engine), vec![index.generation]);
+    // A catalog refresh keeps the flag: the guard is this run's, not the
+    // definition's.
+    reg.load_all(&engine).expect("load");
+    reg.register_in_memory(index.clone());
+    assert!(reg.get_guarded(index.id).expect("registered").1);
+}
+
+/// Copies first used at the same time share one flush: each waits for its
+/// guard behind the one being stored, and the next flush takes them all.
+#[test]
+fn copies_waiting_together_are_armed_in_one_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = Arc::new(test_engine(dir.path()));
+    let reg = Arc::new(IndexRegistry::new());
+    let generations: Vec<GenerationId> = (1..=3).map(GenerationId::from_raw).collect();
+    let held = reg.arming.lock();
+    let threads: Vec<_> = generations
+        .iter()
+        .map(|g| {
+            let (reg, engine, g) = (Arc::clone(&reg), Arc::clone(&engine), *g);
+            std::thread::spawn(move || reg.arm_copy(&engine, g))
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while reg.integrity.lock().to_arm.len() < generations.len() {
+        assert!(std::time::Instant::now() < deadline, "the uses never came");
+        std::thread::yield_now();
+    }
+    drop(held);
+    for thread in threads {
+        assert!(thread.join().expect("arming thread"));
+    }
+    assert_eq!(reg.recovery_flushes(), 1, "one flush for the three guards");
+    assert_eq!(guarded(&engine), generations);
+}
+
+/// A run that stops without closing its guards, at any point after a guard
+/// is stored (before the copy's first use, or after uses that found
+/// nothing), leaves its copies unfit at the next open, until a check
+/// verifies them; a copy the run never used stays fit, so the open checks
+/// only what was in use.
+#[test]
+fn an_unclosed_guard_makes_its_copy_unfit_at_the_next_open() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let used = btree("user_email", "email", 1);
+    let unused = btree("user_name", "name", 2);
+    {
+        let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+        let reg = IndexRegistry::new();
+        // Both copies exist on disk from an earlier write; only one is used.
+        existing_copy(&engine, used.generation);
+        existing_copy(&engine, unused.generation);
+        assert!(reg.arm_copy(&engine, used.generation));
+        rig.cut(engine);
+    }
+    let engine = StorageEngine::open(&rig.config()).expect("reopen");
+    let reg = reopened(&engine);
+    assert!(reg.is_suspect(used.generation), "in use when the run ended");
+    assert!(!reg.answers_at(used.generation, u64::MAX));
+    assert!(!reg.is_suspect(unused.generation), "never used: still fit");
+    assert_eq!(marked(&engine), vec![used.generation], "stored as a mark");
+    assert!(guarded(&engine).is_empty(), "the guard became the mark");
+    // The mark, unlike a guard, outlives a clean run of its own.
+    reg.close_local_guards(&engine);
+    drop(reg);
+    assert!(reopened(&engine).is_suspect(used.generation));
+}
+
+/// A clean stop closes the guards of copies with nothing outstanding, so the
+/// next open uses them without a check; a copy with a stored finding is
+/// closed too, its mark keeping it unfit.
+#[test]
+fn a_clean_stop_closes_the_guards() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fit = btree("user_email", "email", 1);
+    let found = btree("user_name", "name", 2);
+    {
+        let engine = test_engine(dir.path());
+        let reg = IndexRegistry::new();
+        assert!(reg.arm_copy(&engine, fit.generation));
+        assert!(reg.arm_copy(&engine, found.generation));
+        report(&reg, &engine, &found, 7);
+        reg.close_local_guards(&engine);
+        assert!(guarded(&engine).is_empty(), "every guard closed");
+        assert!(
+            !reg.arm_copy(&engine, fit.generation),
+            "nothing is armed once the guards close"
+        );
+    }
+    let engine = test_engine(dir.path());
+    let reg = reopened(&engine);
+    assert!(!reg.is_suspect(fit.generation), "closed cleanly: fit");
+    assert!(reg.is_suspect(found.generation), "its stored mark stands");
+}
+
+/// A guard that cannot be stored keeps its copy out of use for the rest of
+/// the run, without trying the write again on every use.
+#[test]
+fn a_copy_whose_guard_cannot_be_stored_never_serves() {
+    use coordinode_test_fixtures::FaultOp;
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    reg.register_in_memory(index.clone());
+    rig.fail_from(FaultOp::SyncAll, 0);
+    assert!(!reg.arm_copy(&engine, index.generation), "not armed");
+    let flushes = reg.recovery_flushes();
+    for _ in 0..10 {
+        assert!(!reg.arm_copy(&engine, index.generation));
+        assert!(!reg.get_guarded(index.id).expect("registered").1);
+    }
+    assert_eq!(reg.recovery_flushes(), flushes, "the write is not retried");
 }
 
 /// A finding made while a check removes the mark does not return until the
@@ -509,10 +674,7 @@ fn a_finding_during_the_removal_returns_only_once_stored_again() {
         );
         *reg.after_mark_removed.lock() = None;
         let handle = reporter.lock().take().expect("the finding ran");
-        handle
-            .join()
-            .expect("reporter thread")
-            .expect("the finding is stored");
+        handle.join().expect("reporter thread");
         drop(reg);
         rig.cut(engine);
     }
@@ -544,11 +706,7 @@ fn a_full_report_queue_drops_reports_but_keeps_marks() {
         reg.take_reports(core::time::Duration::ZERO).len(),
         MAX_PENDING_REPORTS
     );
-    let mut stored = LocalIndexStore::new(&engine)
-        .list_unfit_here()
-        .expect("marks");
-    stored.sort_unstable();
-    assert_eq!(stored, vec![index.generation, other.generation]);
+    assert_eq!(marked(&engine), vec![index.generation, other.generation]);
 }
 
 /// A generation that left the catalog keeps a mark found here: a reader
