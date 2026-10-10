@@ -467,7 +467,9 @@ impl Installations {
     }
 
     /// The history of `generation`'s published installation, in logical
-    /// keys, as far as `tree` still holds it, in seqno order.
+    /// keys, as far as `tree` still holds it, in seqno order. `position`
+    /// reads, with no batch applying, the log position every effect below
+    /// which the tree holds.
     ///
     /// # Errors
     ///
@@ -477,7 +479,7 @@ impl Installations {
     pub(crate) fn export(
         &self,
         tree: &AnyTree,
-        domain: Domain,
+        position: impl FnOnce(&AnyTree) -> StorageResult<u64>,
         generation: u64,
         oldest_readable: SeqNo,
     ) -> StorageResult<GenerationHistory> {
@@ -490,11 +492,11 @@ impl Installations {
         })?;
         let history_from = oldest_readable.max(current.history_from(installation));
         drop(current);
-        // Read with no batch applying, so every effect below the prefix is in
-        // the tree in full when the scan starts.
+        // Read with no batch applying, so every effect below the position is
+        // in the tree in full when the scan starts.
         let covers_through = {
             let _quiet = self.fence.write();
-            TreeCoverage::read(tree, domain)?.covered_prefix()
+            position(tree)?
         };
         let ranges = installation_ranges(installation);
         let inside = |key: &[u8]| {

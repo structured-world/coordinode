@@ -1464,6 +1464,20 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// A log position every effect below which the index tree `idx` holds,
+    /// read while no batch applies. The embedded journal applies proposals
+    /// concurrently, so its applied prefix is the bound. A Raft state machine
+    /// applies its entries in order, and an entry with no index effects
+    /// leaves no marker in the tree, so one past the highest marker is.
+    fn applied_position(&self, idx: &lsm_tree::AnyTree) -> StorageResult<u64> {
+        match &self.coverage {
+            Some(coverage) if self.coverage_domain() == Domain::Journal => {
+                Ok(coverage.applied_prefix())
+            }
+            _ => Ok(TreeCoverage::read(idx, self.coverage_domain())?.next_uncovered()),
+        }
+    }
+
     /// The log whose positions this engine's applies are recorded in: the
     /// Raft log when a state machine runs over the engine, the embedded
     /// journal otherwise.
@@ -1589,7 +1603,7 @@ impl StorageEngine {
     ) -> StorageResult<crate::engine::installation::GenerationHistory> {
         self.installations.export(
             self.tree(Partition::Idx)?,
-            self.coverage_domain(),
+            |idx| self.applied_position(idx),
             generation.as_raw(),
             self.oldest_readable_seqno(),
         )

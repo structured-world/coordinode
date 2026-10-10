@@ -1131,6 +1131,113 @@ fn node_key_entry(index: u64, ts: u64, key: &[u8], value: &[u8]) -> Entry {
     )
 }
 
+/// An entry putting `value` under the index entry `rest` of generation 40 at
+/// `ts`.
+fn index_entry(index: u64, ts: u64, rest: &[u8], value: &[u8]) -> Entry {
+    use openraft::entry::RaftEntry;
+    Entry::new_normal(
+        log_id(1, index),
+        Request::single(RaftProposal {
+            id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Idx,
+                key: generation_key(rest),
+                value: value.to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(ts),
+            start_ts: Timestamp::from_raw(ts - 1),
+            bypass_rate_limiter: false,
+        }),
+    )
+}
+
+/// The logical key of entry `rest` of generation 40.
+fn generation_key(rest: &[u8]) -> Vec<u8> {
+    let mut key = vec![coordinode_core::index::encoding::GENERATION_TAGS[0]];
+    key.extend_from_slice(&40u64.to_be_bytes());
+    key.extend_from_slice(rest);
+    key
+}
+
+/// Two replicas applying one Raft log: one replaces its copy of an index
+/// generation with the other's history. A history taken before the replica
+/// registered its replacement stands behind it in the Raft log and is
+/// refused; one taken after completes it, and the published copy answers the
+/// latest value, an earlier snapshot, and an entry applied while it was
+/// prepared.
+#[tokio::test]
+async fn a_replica_replaces_a_generation_from_another_replicas_raft_history() {
+    use coordinode_core::index::identity::GenerationId;
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    let generation = GenerationId::from_raw(40);
+    // Each replica applies an entry at its commit timestamp, as a cluster
+    // node does: the histories line up version for version.
+    let replica = |dir: &std::path::Path| {
+        let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
+        let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle))
+            .expect("open state machine");
+        (engine, sm)
+    };
+    let a_dir = tempfile::tempdir().expect("tempdir");
+    let b_dir = tempfile::tempdir().expect("tempdir");
+    let (a, mut sm_a) = replica(a_dir.path());
+    let (b, mut sm_b) = replica(b_dir.path());
+    // Commit timestamps inside the retention window, which runs back from now.
+    let now = TimestampOracle::new().next().as_raw();
+    let log = [
+        index_entry(1, now + 1000, b"k", b"v1"),
+        index_entry(2, now + 2000, b"k", b"v2"),
+        index_entry(3, now + 3000, b"j", b"j1"),
+        index_entry(4, now + 4000, b"m", b"m1"),
+    ];
+    apply_entries(&mut sm_a, log[..2].to_vec()).await;
+    let early = a.export_generation_history(generation).expect("export");
+    apply_entries(&mut sm_a, log[2..3].to_vec()).await;
+    apply_entries(&mut sm_b, log[..3].to_vec()).await;
+
+    b.stage_generation(generation).expect("stage");
+    b.import_generation_history(generation, &early.entries)
+        .expect("import");
+    assert!(
+        matches!(
+            b.finish_generation_import(generation, early.covers_through, early.history_from),
+            Err(coordinode_storage::error::StorageError::PositionBehind { .. })
+        ),
+        "a history short of entry 3 cannot complete the replacement"
+    );
+
+    let current = a.export_generation_history(generation).expect("export");
+    apply_entries(&mut sm_b, log[3..].to_vec()).await;
+    b.import_generation_history(generation, &current.entries)
+        .expect("import");
+    b.finish_generation_import(generation, current.covers_through, current.history_from)
+        .expect("finish");
+    b.publish_generation(generation).expect("publish");
+
+    let get = |key: &[u8]| {
+        b.get(Partition::Idx, &generation_key(key))
+            .expect("get")
+            .map(|v| v.to_vec())
+    };
+    assert_eq!(get(b"k"), Some(b"v2".to_vec()));
+    assert_eq!(get(b"j"), Some(b"j1".to_vec()));
+    assert_eq!(get(b"m"), Some(b"m1".to_vec()), "applied while prepared");
+    assert_eq!(
+        b.snapshot_get(&(now + 1500), Partition::Idx, &generation_key(b"k"))
+            .expect("historical read")
+            .map(|v| v.to_vec()),
+        Some(b"v1".to_vec())
+    );
+}
+
 /// A state machine reopened after a snapshot was built stands at or past the
 /// snapshot: every tree held its entries when it was captured. Standing
 /// below it makes openraft install the snapshot over a store that already
