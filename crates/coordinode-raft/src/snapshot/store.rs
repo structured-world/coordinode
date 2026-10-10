@@ -32,6 +32,8 @@ const CAPTURED: &str = "capt";
 const STAGED: &str = "part";
 /// A reader's private hard-linked copy of a published capture.
 const READING: &str = "read";
+/// The capture's index inventory sealed for one reader, in its private copy.
+const SEALED_INVENTORY_FILE: &str = "index-copies.sealed";
 
 /// The directory holding `engine`'s snapshot files.
 pub fn snapshot_dir(engine: &StorageEngine) -> PathBuf {
@@ -114,6 +116,11 @@ impl SnapshotFile {
             .capture
             .clone()
             .ok_or_else(|| io::Error::other("a snapshot with neither bytes nor a capture"))?;
+        let inventory = match fs::read(capture.join(SEALED_INVENTORY_FILE)) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
         let captured = StorageEngine::open_checkpoint(&capture)
             .map_err(|e| io::Error::other(format!("open the snapshot capture: {e}")))?;
         let mut file = File::options()
@@ -121,7 +128,7 @@ impl SnapshotFile {
             .write(true)
             .create_new(true)
             .open(&self.path)?;
-        crate::snapshot::write_full_snapshot(&captured, &mut file)?;
+        crate::snapshot::write_full_snapshot(&captured, inventory.as_deref(), &mut file)?;
         // The captured engine holds the copy's files open until dropped.
         drop(captured);
         file.seek(SeekFrom::Start(0))?;
@@ -265,7 +272,13 @@ impl SnapshotStore {
         }
         let copy = self.dir.join(format!("{}.{READING}", unique_stem()));
         match link_tree(&path, &copy) {
-            Ok(()) => Ok(Some((meta, SnapshotFile::from_capture(copy, &self.dir)))),
+            Ok(()) => {
+                if let Err(e) = self.seal_inventory(&copy) {
+                    remove_dir_quietly(&copy);
+                    return Err(e);
+                }
+                Ok(Some((meta, SnapshotFile::from_capture(copy, &self.dir))))
+            }
             // A crash lost the capture the record names. Without a snapshot,
             // openraft builds a new one from the state machine, which holds
             // everything the lost one did.
@@ -279,6 +292,28 @@ impl SnapshotStore {
                 Err(e)
             }
         }
+    }
+
+    /// Seal the index inventory of the capture copied to `copy` against what
+    /// this member found since the capture, for the reader the copy is for.
+    /// A capture without an inventory, or a member without the index layer,
+    /// leaves the snapshot without one: its receiver checks every copy.
+    fn seal_inventory(&self, copy: &Path) -> io::Result<()> {
+        let captured = match fs::read(
+            copy.join(coordinode_storage::engine::index_copies::CAPTURED_INVENTORY_FILE),
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let Some(sealed) = self
+            .engine
+            .seal_index_inventory(&captured)
+            .map_err(|e| io::Error::other(format!("seal the index inventory: {e}")))?
+        else {
+            return Ok(());
+        };
+        fs::write(copy.join(SEALED_INVENTORY_FILE), sealed)
     }
 
     /// Make the store capture at `capture` the current snapshot, described

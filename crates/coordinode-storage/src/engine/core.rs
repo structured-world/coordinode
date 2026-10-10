@@ -233,6 +233,11 @@ pub struct StorageEngine {
     /// Which local installation holds each index generation in the index
     /// tree; every read and write of a generation key goes through it.
     pub(crate) installations: crate::engine::installation::Installations,
+    /// The index layer's handling of transferred index copies, once it
+    /// registers it. no-std: spin::RwLock.
+    pub(crate) index_copy_qualifier: parking_lot::RwLock<
+        Option<std::sync::Arc<dyn crate::engine::index_copies::IndexCopyQualifier>>,
+    >,
     /// Consumers watching the writes a partition receives (see
     /// [`Self::tap_writes`]).
     write_taps: Arc<crate::engine::tap::WriteTaps>,
@@ -1075,6 +1080,7 @@ impl StorageEngine {
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
             installations,
+            index_copy_qualifier: parking_lot::RwLock::new(None),
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
             applied_feed: Arc::new(crate::engine::applied::AppliedFeed::default()),
             index_feed_capacity: config.index_feed_capacity.max(1),
@@ -1899,6 +1905,12 @@ impl StorageEngine {
         claim_checkpoint_dir(target)?;
         let mut summary = CheckpointSummary::default();
         self.checkpoint_trees(target, &mut summary)?;
+        // Taken at the same moment as the trees: what the index layer knows
+        // about its copies then, including findings no tree holds.
+        if let Some(inventory) = self.capture_index_inventory()? {
+            let path = target.join(crate::engine::index_copies::CAPTURED_INVENTORY_FILE);
+            write_synced(&path, &inventory)?;
+        }
         Ok(summary)
     }
 
@@ -4795,6 +4807,15 @@ fn claim_checkpoint_dir(target: &Path) -> StorageResult<()> {
     }
     std::fs::create_dir_all(target)
         .map_err(|e| StorageError::Io(format!("create checkpoint dir {target:?}: {e}")))
+}
+
+/// Write `bytes` to a new file at `path` and sync it.
+fn write_synced(path: &Path, bytes: &[u8]) -> StorageResult<()> {
+    use std::io::Write as _;
+    let io = |e: std::io::Error| StorageError::Io(format!("write {path:?}: {e}"));
+    let mut file = std::fs::File::create_new(path).map_err(io)?;
+    file.write_all(bytes).map_err(io)?;
+    file.sync_all().map_err(io)
 }
 
 /// Directory under the data dir holding one empty file per partition whose

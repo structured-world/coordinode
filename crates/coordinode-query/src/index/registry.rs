@@ -544,21 +544,37 @@ impl IndexRegistry {
             return;
         }
         let mut view = self.integrity.lock();
+        let mut new = false;
         for copy in copies {
+            if view.local.contains_key(&copy.generation) {
+                continue;
+            }
             view.last_revision += 1;
             let revision = view.last_revision;
-            view.local.entry(copy.generation).or_insert(LocalMark {
-                revision,
-                state: MarkState::Stored,
-            });
+            view.local.insert(
+                copy.generation,
+                LocalMark {
+                    revision,
+                    state: MarkState::Stored,
+                },
+            );
+            new = true;
+        }
+        if new {
+            // No report names these (a transfer or an earlier run stored
+            // them): the maintenance admits their checks from the marks.
+            view.overflowed = true;
+            self.reported.notify_all();
         }
         self.refresh_any_suspect(&view);
     }
 
-    /// A check's pass read this member's copy of `generation` from its start
-    /// and found it agreeing with the records, after taking `revision`: the
-    /// mark is lifted, in memory and in `engine`, unless a disagreement was
-    /// found here since. Returns whether it was lifted.
+    /// A check's pass read this member's copy of `def`'s generation from its
+    /// start, at the snapshot `verified_at`, and found it agreeing with the
+    /// records both ways, after taking `revision`: the mark, if any, is
+    /// lifted, in memory and in `engine`, and the proof is kept in its place
+    /// for a later transfer of the copy to carry, unless a disagreement was
+    /// found here since. Returns whether the copy was proved.
     ///
     /// A finding made while the mark is being removed waits for this to
     /// finish (the same order lock decides whether a mark is stored), and
@@ -570,9 +586,11 @@ impl IndexRegistry {
     pub fn verified_here(
         &self,
         engine: &StorageEngine,
-        generation: GenerationId,
+        def: &IndexDefinition,
         revision: u64,
+        verified_at: u64,
     ) -> Result<bool, StoreError> {
+        let generation = def.generation;
         let _order = self.marks.lock();
         {
             let view = self.integrity.lock();
@@ -591,7 +609,19 @@ impl IndexRegistry {
         // disk, so the mark no longer counts as stored and is never written
         // again.
         self.recovery_flushes.fetch_add(1, Ordering::Relaxed);
-        if let Err(source) = LocalIndexStore::new(engine).clear_unfit_here(&[generation]) {
+        let store = LocalIndexStore::new(engine);
+        let recorded = store.bind_local_copy(generation).and_then(|copy| {
+            store.record_verified_here(
+                generation,
+                coordinode_modality::CopyQualification {
+                    installation: copy.installation,
+                    layout: def.layout,
+                    maintenance: def.maintenance,
+                    verified_at,
+                },
+            )
+        });
+        if let Err(source) = recorded {
             if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
                 mark.state = MarkState::Unknown;
             }
@@ -691,6 +721,18 @@ impl IndexRegistry {
             .collect()
     }
 
+    /// This member's findings against its copies as they stand in this
+    /// process, stored or not, each with its revision: what a capture of
+    /// the store cannot read from the store itself.
+    pub fn findings(&self) -> Vec<(GenerationId, u64)> {
+        self.integrity
+            .lock()
+            .local
+            .iter()
+            .map(|(generation, mark)| (*generation, mark.revision))
+            .collect()
+    }
+
     /// Flushes of this member's recovery state (use guards and marks) made
     /// so far: one per guard batch, mark and mark removal. Lookups that use
     /// an armed copy make none.
@@ -709,6 +751,12 @@ impl IndexRegistry {
     ///
     /// The guards could not be read or decoded: no copy is known to be safe.
     pub fn recover_local_guards(&self, engine: &StorageEngine) -> Result<(), StoreError> {
+        // A transfer installed without its inventory being taken: no copy it
+        // brought counts as proved.
+        if engine.index_transfer_pending()? {
+            super::transfer::take_inventory(engine, None)?;
+            self.recovery_flushes.fetch_add(1, Ordering::Relaxed);
+        }
         let store = LocalIndexStore::new(engine);
         match store.recover_armed_here() {
             Ok(marked) => {

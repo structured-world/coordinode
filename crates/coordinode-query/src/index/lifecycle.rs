@@ -1047,6 +1047,18 @@ impl Shared {
         })?;
         match concluded {
             Concluded::Landed => {
+                // A completed build proves this member's copy: built from the
+                // records, with every write since maintaining it. A transfer
+                // of the copy carries the proof; without it the copy is only
+                // unknown to a receiver.
+                let revision = env.registry().local_revision(generation);
+                if let Err(e) =
+                    env.registry()
+                        .verified_here(env.engine(), &def, revision, self.read_time())
+                {
+                    tracing::warn!(generation = generation.as_raw(), error = %e,
+                        "could not keep the proof of a built index copy");
+                }
                 env.registry()
                     .register_published(env.engine(), def)
                     .map_err(|e| e.to_string())?;

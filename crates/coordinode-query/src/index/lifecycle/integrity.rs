@@ -917,7 +917,7 @@ impl Shared {
         };
         if found == 0 {
             let lifted = registry
-                .verified_here(env.engine(), generation, revision)
+                .verified_here(env.engine(), &taken.def, revision, self.read_time())
                 .map_err(|e| e.to_string())?;
             return Ok(if lifted {
                 LocalOutcome::Verified
@@ -941,13 +941,21 @@ impl Shared {
             return Ok(LocalOutcome::Disagrees { found });
         }
         let lifted = registry
-            .verified_here(env.engine(), generation, revision)
+            .verified_here(env.engine(), &taken.def, revision, self.read_time())
             .map_err(|e| e.to_string())?;
         Ok(if lifted {
             LocalOutcome::Replaced
         } else {
             LocalOutcome::Stopped
         })
+    }
+
+    /// The snapshot a pass ending now has read up to: the oracle's time, or
+    /// 0 on an engine without one.
+    pub(super) fn read_time(&self) -> u64 {
+        self.env
+            .oracle()
+            .map_or(0, |oracle| oracle.current().as_raw())
     }
 
     /// Replace this member's copy of `generation` with one `source` fills
@@ -1151,7 +1159,12 @@ impl Shared {
                     {
                         self.env
                             .registry()
-                            .verified_here(self.env.engine(), generation, revision)
+                            .verified_here(
+                                self.env.engine(),
+                                &taken.def,
+                                revision,
+                                now.unwrap_or(0),
+                            )
                             .map_err(|e| e.to_string())?;
                     }
                     return Ok(outcome);

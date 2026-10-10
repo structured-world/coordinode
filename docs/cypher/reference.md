@@ -550,6 +550,15 @@ CALL db.reindex('user_email', waitMs)      -- REINDEX as a procedure, by name or
   disk is below its free-space reserve. A member that cannot write one keeps
   the copy out of use and answers from its records. `CALL db.indexCopies()`
   shows the state of each copy on the member that runs it.
+- **Copies a member receives.** A checksum proves the bytes of a snapshot
+  and its log position proves the entries applied, but neither proves an
+  index. A member keeps the proof of each copy that a check or a completed
+  build verified. A snapshot carries those proofs for the copies it holds,
+  minus any copy the sender found wrong, including after the snapshot was
+  taken. The receiver uses a proved copy at once and checks every other
+  copy, an empty index's too, before using it. A copy of the index
+  partition taken from a peer, and a restore from a backup, carry no proofs,
+  so every copy they bring is checked first.
 - **Records breaking a unique index.** Two records holding one value cannot
   be represented by any entry: a check reports them (`conflicts`), changes
   neither, and the generation stays `SUSPECT` until the records are fixed.

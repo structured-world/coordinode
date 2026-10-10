@@ -8,6 +8,7 @@ pub mod lifecycle;
 pub mod ops;
 pub mod registry;
 mod repair;
+pub mod transfer;
 pub mod ttl_reaper;
 
 pub mod vector_build;

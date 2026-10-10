@@ -1057,6 +1057,11 @@ impl Database {
         let index_registry = Arc::new(coordinode_query::index::IndexRegistry::new());
         index_registry.recover_local_guards(&engine)?;
         index_registry.load_all(&engine)?;
+        // A capture of the store says what this member proved of its index
+        // copies, and a transfer received says what the sender proved.
+        engine.set_index_copy_qualifier(Arc::new(
+            coordinode_query::index::transfer::CopyQualifier::new(Arc::clone(&index_registry)),
+        ));
 
         let proposal_id_gen = Arc::new(ProposalIdGenerator::with_base(fresh_proposal_id_base()));
 

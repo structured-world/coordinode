@@ -418,6 +418,11 @@ impl StorageEngine {
                     .into(),
             ));
         }
+        // The copies the index tree receives are qualified only by the
+        // inventory the transfer brings, taken once they are in place.
+        if partition == Partition::Idx {
+            self.begin_index_transfer()?;
+        }
         // Read before anything is cleared: a failure leaves the tree as it was.
         let snapshot = self.snapshot();
         let keep: Rows = self
@@ -466,6 +471,7 @@ impl StorageEngine {
         partitions: &[(Partition, Rows)],
         next: u64,
         payload: &[u8],
+        index_inventory: Option<&[u8]>,
     ) -> StorageResult<()> {
         for (partition, rows) in partitions {
             self.begin_partition_rebuild(*partition, rows)?;
@@ -473,6 +479,9 @@ impl StorageEngine {
         self.reset_raft_coverage(next, payload)?;
         for (partition, _) in partitions {
             self.finish_rebuild(*partition)?;
+        }
+        if partitions.iter().any(|(p, _)| *p == Partition::Idx) {
+            self.index_transfer_installed(index_inventory)?;
         }
         Ok(())
     }
@@ -495,6 +504,11 @@ impl StorageEngine {
         // data it covers is persisted.
         coverage::write_fold(tree, Domain::Raft, 0, next, payload, self.next_seqno());
         self.finish_rebuild(partition)?;
+        // A partition copy carries no inventory: every index copy in it is
+        // unknown until checked here.
+        if partition == Partition::Idx {
+            self.index_transfer_installed(None)?;
+        }
         // The partition was replaced wholesale, from a peer's copy or a
         // checkpoint: followers of the applies read it afresh.
         self.applied_feed.replaced(Some(partition));
@@ -579,7 +593,11 @@ impl StorageEngine {
         let Some(fence) = self.raft_fence() else {
             if whole {
                 self.begin_partition_rebuild(partition, &copy.rows)?;
-                return self.finish_rebuild(partition);
+                self.finish_rebuild(partition)?;
+                if partition == Partition::Idx {
+                    self.index_transfer_installed(None)?;
+                }
+                return Ok(());
             }
             for (key, value) in &copy.rows {
                 self.put(partition, key, value)?;

@@ -17,7 +17,7 @@ fn open_engine(dir: &std::path::Path) -> StorageEngine {
 /// `engine`'s full snapshot, in memory.
 fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
     let mut buf = io::Cursor::new(Vec::new());
-    write_full_snapshot(engine, &mut buf)?;
+    write_full_snapshot(engine, None, &mut buf)?;
     Ok(buf.into_inner())
 }
 
@@ -371,7 +371,7 @@ fn a_snapshot_written_past_a_prefix_installs() {
 
     let mut buf = io::Cursor::new(b"frame".to_vec());
     buf.seek(SeekFrom::End(0)).unwrap();
-    let written = write_full_snapshot(&engine, &mut buf).unwrap();
+    let written = write_full_snapshot(&engine, None, &mut buf).unwrap();
     let buf = buf.into_inner();
     assert_eq!(buf.len() as u64, 5 + written);
     assert_eq!(&buf[..5], b"frame", "the prefix is left as it was");

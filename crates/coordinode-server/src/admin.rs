@@ -157,7 +157,10 @@ pub(crate) fn run_backup(
                 .and_then(|()| file.write_all(&interner_bytes))
                 .map_err(|e| format!("backup write failed: {e}"))?;
             let snapshot_bytes =
-                coordinode_raft::snapshot::write_full_snapshot(db.engine(), &mut file)
+                // Read from the live store while writes go on, so no
+                // inventory matches it exactly: a restore checks every index
+                // copy before using it.
+                coordinode_raft::snapshot::write_full_snapshot(db.engine(), None, &mut file)
                     .map_err(|e| format!("backup failed: {e}"))?;
             info!(
                 interner_bytes = interner_bytes.len(),

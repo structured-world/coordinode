@@ -165,6 +165,31 @@ pub struct IndexDescriptor {
     pub owner: Option<String>,
 }
 
+/// What a successful check, build or qualified import proved about one
+/// member's copy of an index generation: the copy agreed with its records,
+/// both ways, under the generation's interpretation, at `verified_at`. Kept
+/// by the member, node-local, and carried by a transfer of the copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyQualification {
+    /// The installation holding the proved copy on the member keeping this.
+    pub installation: u64,
+    /// The key layout the copy's entries were proved in.
+    pub layout: u32,
+    /// The maintenance binding the copy's entries were proved under.
+    pub maintenance: IndexMaintenance,
+    /// The snapshot the proof read at: an MVCC timestamp, or 0 on an engine
+    /// without one.
+    pub verified_at: u64,
+}
+
+impl CopyQualification {
+    /// Whether this proves entries of `def`'s interpretation: the same key
+    /// layout and maintenance binding.
+    pub fn interprets(&self, def: &IndexDefinition) -> bool {
+        self.layout == def.layout && self.maintenance == def.maintenance
+    }
+}
+
 /// How a key-shaped index's entry effects travel with the data they index.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexProfile {

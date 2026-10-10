@@ -7,12 +7,19 @@
 //!
 //! ```text
 //! [magic: 4 bytes "CNSN"]
-//! [version: 1 byte (currently 2; 1 is still read)]
+//! [version: 1 byte (currently 3; 1 and 2 are still read)]
 //! [partition_count: 1 byte]
 //! [partition_block]*
 //! [table_section]          (version 2 and later)
+//! [index_inventory]        (version 3 and later)
 //! [checksum: 8 bytes (FNV-1a 64 of all preceding bytes, little-endian)]
 //! ```
+//!
+//! The `index_inventory` is `[present: 1 byte][len: u32][bytes]`: what the
+//! sender proved about each index copy it carries, opaque to this format
+//! (see [`coordinode_storage::engine::index_copies`]). A snapshot without one
+//! leaves every index copy unknown to the receiver, which checks them before
+//! it uses them.
 //!
 //! The `table_section` carries every `STORAGE COLUMNAR` table, whole:
 //! ```text
@@ -60,10 +67,13 @@ const MAGIC: &[u8; 4] = b"CNSN";
 /// Snapshot format version written. Version 2 added the columnar table
 /// section; version 1 files, as released builds wrote them, still install,
 /// since a dump taken with a released build is how a store moves to this one.
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 
 /// The version that introduced the columnar table section.
 const TABLES_SINCE: u8 = 2;
+
+/// The version that introduced the index inventory section.
+const INVENTORY_SINCE: u8 = 3;
 
 /// Partition tag values. Must be stable across versions.
 ///
@@ -115,8 +125,10 @@ fn snapshot_partitions() -> impl Iterator<Item = Partition> {
 }
 
 /// Write a full snapshot of every user-data partition (all but
-/// `Partition::Raft`, which openraft manages) and every `STORAGE COLUMNAR`
-/// table to `out`, from its current position, and return the bytes written.
+/// `Partition::Raft`, which openraft manages), every `STORAGE COLUMNAR`
+/// table and `index_inventory`, the sender's inventory of the index copies
+/// the snapshot carries (`None`: the receiver takes them all as unknown), to
+/// `out`, from its current position, and return the bytes written.
 ///
 /// Entries stream to `out` as they are scanned, so memory does not grow with
 /// the store: each partition's entry count is written as a placeholder and
@@ -127,7 +139,11 @@ fn snapshot_partitions() -> impl Iterator<Item = Partition> {
 ///
 /// A storage scan or an I/O operation on `out` fails, or a field exceeds the
 /// format's u32 lengths.
-pub fn write_full_snapshot<F>(engine: &StorageEngine, out: &mut F) -> io::Result<u64>
+pub fn write_full_snapshot<F>(
+    engine: &StorageEngine,
+    index_inventory: Option<&[u8]>,
+    out: &mut F,
+) -> io::Result<u64>
 where
     F: IoRead + Write + Seek,
 {
@@ -175,6 +191,13 @@ where
         .columnar_tables_at(engine.snapshot())
         .map_err(|e| io::Error::other(format!("snapshot columnar tables: {e}")))?;
     put_tables(&mut w, &tables)?;
+    match index_inventory {
+        Some(inventory) => {
+            w.write_all(&[1])?;
+            put_bytes(&mut w, inventory)?;
+        }
+        None => w.write_all(&[0])?,
+    }
     w.flush()?;
     drop(w);
     let end = out.stream_position()?;
@@ -246,6 +269,9 @@ struct ParsedSnapshot {
     partitions: Vec<(Partition, PartitionEntries)>,
     /// `None` for a version 1 snapshot, which says nothing about tables.
     tables: Option<Vec<ColumnarTable>>,
+    /// The sender's inventory of the index copies; `None` when it sent
+    /// none, which leaves every copy unknown.
+    index_inventory: Option<Vec<u8>>,
 }
 
 /// Whether a receiver installs `key` of `partition` from a snapshot. Raft
@@ -345,7 +371,26 @@ fn parse_body(reader: &mut impl IoRead) -> io::Result<ParsedSnapshot> {
     } else {
         None
     };
-    Ok(ParsedSnapshot { partitions, tables })
+    let index_inventory = if version >= INVENTORY_SINCE {
+        let mut present = [0u8; 1];
+        reader.read_exact(&mut present)?;
+        match present[0] {
+            0 => None,
+            1 => Some(read_bytes(reader)?),
+            other => {
+                return Err(io::Error::other(format!(
+                    "snapshot index inventory flag {other}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    Ok(ParsedSnapshot {
+        partitions,
+        tables,
+        index_inventory,
+    })
 }
 
 fn read_u32(reader: &mut impl IoRead) -> io::Result<u32> {
@@ -445,6 +490,16 @@ fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> 
 }
 
 fn install_verified(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
+    let transfer = |e| io::Error::other(format!("snapshot index copies: {e}"));
+    // The index copies the snapshot brings are qualified only by its
+    // inventory, taken once they are in place.
+    let replaces_index = parsed
+        .partitions
+        .iter()
+        .any(|(partition, _)| *partition == Partition::Idx);
+    if replaces_index {
+        engine.begin_index_transfer().map_err(transfer)?;
+    }
     let mut batch = WriteBatch::new(engine);
     let mut total_written = 0usize;
     // Values move into the batch; only the keys are kept, for the cleanup.
@@ -485,6 +540,11 @@ fn install_verified(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Resul
     }
 
     let tables = install_tables(engine, parsed.tables)?;
+    if replaces_index {
+        engine
+            .index_transfer_installed(parsed.index_inventory.as_deref())
+            .map_err(transfer)?;
+    }
     // Views of the dictionary taken before the install reread it.
     engine.note_field_dictionary_change();
     tracing::info!(
@@ -624,7 +684,12 @@ pub fn install_raft_snapshot_from_reader(
     engine.with_metadata_exclusive(|| {
         let total_written: usize = parsed.partitions.iter().map(|(_, rows)| rows.len()).sum();
         engine
-            .install_raft_image(&parsed.partitions, next, payload)
+            .install_raft_image(
+                &parsed.partitions,
+                next,
+                payload,
+                parsed.index_inventory.as_deref(),
+            )
             .map_err(|e| io::Error::other(format!("install the snapshot's partitions: {e}")))?;
         let tables = install_tables(engine, parsed.tables)?;
         engine.note_field_dictionary_change();

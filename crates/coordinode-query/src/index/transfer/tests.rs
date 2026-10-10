@@ -1,0 +1,293 @@
+use std::sync::Arc;
+
+use coordinode_core::graph::intern::FieldInterner;
+use coordinode_core::graph::node::{NodeId, NodeRecord};
+use coordinode_core::graph::types::Value;
+use coordinode_modality::{LocalNodeStore, NodeStore as _};
+
+use super::*;
+use crate::index::lifecycle::test_env::{TestEnv, commit};
+use crate::index::{BuildFailure, IndexBuildOutcome, IndexDescriptor, Mismatch};
+
+/// A member with two users and a built `email` index, its findings kept by
+/// `registry`, and a built index over a label with no nodes.
+struct Member {
+    env: Arc<TestEnv>,
+    email: IndexDefinition,
+    empty: IndexDefinition,
+}
+
+fn member() -> Member {
+    let env = TestEnv::open();
+    let mut fields = FieldInterner::new();
+    fields.intern("email");
+    env.set_fields(&fields);
+    for (id, email) in [(1, "a@x"), (2, "b@x")] {
+        let mut record = NodeRecord::new("User");
+        let field = env.fields_now().lookup("email").expect("email field");
+        record.set(field, Value::String(email.into()));
+        let mut txn = env.begin();
+        LocalNodeStore
+            .put(&mut txn, 1, NodeId::from_raw(id), &record)
+            .expect("put");
+        commit(&mut txn).expect("commit node");
+    }
+    let builds = env.service(1);
+    let mut built = Vec::new();
+    for (name, label) in [("user_email", "User"), ("ghost_email", "Ghost")] {
+        let def = admit(&env, IndexDescriptor::btree(name, label, "email"));
+        builds.submit(def.generation).expect("submit");
+        assert!(matches!(
+            builds.wait_here(def.generation),
+            Some(IndexBuildOutcome::Published { .. })
+        ));
+        built.push(
+            LocalIndexStore::new(&env.engine)
+                .load_definition(def.id)
+                .expect("load")
+                .expect("published"),
+        );
+    }
+    builds.shutdown();
+    let empty = built.pop().expect("empty index");
+    let email = built.pop().expect("email index");
+    Member { env, email, empty }
+}
+
+/// Publish `descriptor` building with its build admitted, as CREATE INDEX
+/// does.
+fn admit(env: &TestEnv, descriptor: IndexDescriptor) -> IndexDefinition {
+    let store = LocalIndexStore::new(&env.engine);
+    let mut descriptor = descriptor;
+    descriptor.state = IndexState::Building {
+        written: 0,
+        estimated_total: 0,
+    };
+    let mut txn = env.begin();
+    let def = store
+        .publish_definition_txn(&mut txn, descriptor)
+        .expect("publish");
+    store
+        .put_build_txn(
+            &mut txn,
+            &crate::index::IndexBuildRecord::accepted(
+                def.id,
+                def.generation,
+                BuildFailure::Withdraw,
+            ),
+            None,
+        )
+        .expect("admit build");
+    commit(&mut txn).expect("commit publication");
+    env.registry
+        .register_published(&env.engine, def.clone())
+        .expect("register");
+    def
+}
+
+/// A qualifier over `member`'s findings. The test environment's registry is
+/// not shared, so its findings are copied into one that is.
+fn qualifier(member: &Member) -> (CopyQualifier, Arc<IndexRegistry>) {
+    let registry = Arc::new(IndexRegistry::new());
+    registry.load_all(&member.env.engine).expect("load");
+    (CopyQualifier::new(Arc::clone(&registry)), registry)
+}
+
+/// The states `inventory` (as sealed) gives each generation.
+fn states(inventory: &[u8]) -> FxHashMap<u64, CopyState> {
+    rmp_serde::from_slice::<Vec<Entry>>(inventory)
+        .expect("decode")
+        .into_iter()
+        .map(|e| (e.generation, e.state))
+        .collect()
+}
+
+fn stray() -> Mismatch {
+    Mismatch::Extra {
+        node: 7,
+        valid_from: None,
+        tuple: vec![1],
+    }
+}
+
+/// A built copy is qualified by its build's proof, an empty index's too;
+/// the inventory lists both.
+#[test]
+fn a_built_copy_is_qualified_and_an_empty_index_is_listed() {
+    let member = member();
+    let (qualifier, _) = qualifier(&member);
+    let engine = &member.env.engine;
+    let sealed = qualifier
+        .seal(engine, &qualifier.capture(engine).expect("capture"))
+        .expect("seal");
+    let states = states(&sealed);
+    assert_eq!(states.len(), 2, "every B-tree generation: {states:?}");
+    for def in [&member.email, &member.empty] {
+        assert!(
+            matches!(
+                states.get(&def.generation.as_raw()),
+                Some(CopyState::Qualified(_))
+            ),
+            "{def}: {states:?}"
+        );
+    }
+}
+
+/// A copy found disagreeing is excluded, whether its finding is stored or
+/// held only in memory; one found after the capture is excluded when the
+/// capture is sealed; a copy with no proof is unknown.
+#[test]
+fn findings_exclude_and_missing_proof_is_unknown() {
+    let before = member();
+    let (before_qualifier, registry) = qualifier(&before);
+    let engine = &before.env.engine;
+    registry.report_mismatch(engine, &before.email, stray());
+    let sealed = before_qualifier
+        .seal(engine, &before_qualifier.capture(engine).expect("capture"))
+        .expect("seal");
+    assert_eq!(
+        states(&sealed).get(&before.email.generation.as_raw()),
+        Some(&CopyState::Excluded),
+        "found before the capture"
+    );
+
+    let after = member();
+    let (after_qualifier, registry) = qualifier(&after);
+    let engine = &after.env.engine;
+    let captured = after_qualifier.capture(engine).expect("capture");
+    registry.report_mismatch(engine, &after.email, stray());
+    assert_eq!(
+        states(&after_qualifier.seal(engine, &captured).expect("seal"))
+            .get(&after.email.generation.as_raw()),
+        Some(&CopyState::Excluded),
+        "found after the capture, before the transfer sent it"
+    );
+
+    // No proof kept: a copy whose evidence went is unknown, not healthy.
+    let unproved = member();
+    let store = LocalIndexStore::new(&unproved.env.engine);
+    store.record_transfer(&[], &[]).expect("drop every proof");
+    let (unproved_qualifier, _) = self::qualifier(&unproved);
+    let engine = &unproved.env.engine;
+    let sealed = unproved_qualifier
+        .seal(
+            engine,
+            &unproved_qualifier.capture(engine).expect("capture"),
+        )
+        .expect("seal");
+    assert_eq!(
+        states(&sealed).get(&unproved.email.generation.as_raw()),
+        Some(&CopyState::Unknown)
+    );
+}
+
+/// The records, catalog and index copies of `sender` installed on
+/// `receiver` as a Raft snapshot with `inventory`.
+fn install(receiver: &StorageEngine, sender: &StorageEngine, inventory: Option<&[u8]>) {
+    use coordinode_storage::engine::partition::Partition::{Idx, Node, Schema};
+    let partitions: Vec<_> = [Node, Schema, Idx]
+        .into_iter()
+        .map(|p| (p, sender.replicated_rows(p).expect("rows")))
+        .collect();
+    receiver
+        .install_raft_image(&partitions, 10, b"payload", inventory)
+        .expect("install");
+}
+
+/// The generations `engine` keeps a mark of, and a proof of.
+fn marked_and_proved(engine: &StorageEngine) -> (Vec<u64>, Vec<u64>) {
+    let store = LocalIndexStore::new(engine);
+    let mut marked: Vec<u64> = store
+        .list_unfit_here()
+        .expect("marks")
+        .into_iter()
+        .map(|c| c.generation.as_raw())
+        .collect();
+    let mut proved: Vec<u64> = store
+        .list_qualified_here()
+        .expect("proofs")
+        .into_iter()
+        .map(|(g, _)| g.as_raw())
+        .collect();
+    marked.sort_unstable();
+    proved.sort_unstable();
+    (marked, proved)
+}
+
+/// A receiver keeps the proof of each copy the inventory qualifies, rebound
+/// to its own installation, and marks the copy the sender excluded; nothing
+/// is pending afterwards. Without an inventory every copy is marked.
+#[test]
+fn a_receiver_keeps_qualified_proofs_and_marks_the_rest() {
+    let sender = member();
+    let (qualifier, registry) = qualifier(&sender);
+    registry.report_mismatch(&sender.env.engine, &sender.email, stray());
+    let sealed = qualifier
+        .seal(
+            &sender.env.engine,
+            &qualifier.capture(&sender.env.engine).expect("capture"),
+        )
+        .expect("seal");
+
+    let receiver = TestEnv::open();
+    let receiver_registry = Arc::new(IndexRegistry::new());
+    receiver
+        .engine
+        .set_index_copy_qualifier(Arc::new(CopyQualifier::new(Arc::clone(&receiver_registry))));
+    install(&receiver.engine, &sender.env.engine, Some(&sealed));
+    let (marked, proved) = marked_and_proved(&receiver.engine);
+    assert_eq!(
+        marked,
+        vec![sender.email.generation.as_raw()],
+        "excluded there"
+    );
+    assert_eq!(
+        proved,
+        vec![sender.empty.generation.as_raw()],
+        "qualified there"
+    );
+    let proof = LocalIndexStore::new(&receiver.engine)
+        .list_qualified_here()
+        .expect("proofs")[0]
+        .1;
+    assert_eq!(
+        Some(proof.installation),
+        receiver.engine.installation_of(sender.empty.generation),
+        "rebound to the receiver's installation"
+    );
+    assert!(!receiver.engine.index_transfer_pending().expect("read"));
+
+    let bare = TestEnv::open();
+    bare.engine
+        .set_index_copy_qualifier(Arc::new(CopyQualifier::new(Arc::new(IndexRegistry::new()))));
+    install(&bare.engine, &sender.env.engine, None);
+    let (marked, proved) = marked_and_proved(&bare.engine);
+    let mut both = vec![
+        sender.email.generation.as_raw(),
+        sender.empty.generation.as_raw(),
+    ];
+    both.sort_unstable();
+    assert_eq!(marked, both, "no inventory: every copy is checked here");
+    assert!(proved.is_empty());
+}
+
+/// An install interrupted before its inventory was taken leaves the
+/// transfer pending: the next open marks every copy, and a copy the
+/// receiver had a stale proof of is not taken as proved by it.
+#[test]
+fn an_interrupted_transfer_marks_every_copy_at_the_next_open() {
+    let sender = member();
+    let receiver = TestEnv::open();
+    // No qualifier registered: the install leaves the transfer pending, as
+    // a crash before the inventory is taken does.
+    install(&receiver.engine, &sender.env.engine, None);
+    assert!(receiver.engine.index_transfer_pending().expect("read"));
+    let reopened = IndexRegistry::new();
+    reopened
+        .recover_local_guards(&receiver.engine)
+        .expect("recover");
+    reopened.load_all(&receiver.engine).expect("load");
+    assert!(reopened.is_suspect(sender.email.generation));
+    assert!(reopened.is_suspect(sender.empty.generation));
+    assert!(!receiver.engine.index_transfer_pending().expect("read"));
+}

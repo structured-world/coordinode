@@ -91,11 +91,12 @@ pub use index::{
     EntryPage, IndexStore, LatestEntry, LocalCopy, LocalIndexStore, StoredEntry, StoredEntryPage,
 };
 pub use index_def::{
-    BuildFailure, BuildState, CheckPhase, CheckState, DuplicateRepair, DuplicateRepairRecord,
-    ENTRY_LAYOUT, GenerationId, IndexBuildRecord, IndexCheck, IndexDefinition, IndexDescriptor,
-    IndexId, IndexIntegrityRecord, IndexMaintenance, IndexProfile, IndexState, IndexType,
-    Integrity, Mismatch, NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter, ProfileSource,
-    TextFieldConfig, TextIndexConfig, VectorIndexConfig,
+    BuildFailure, BuildState, CheckPhase, CheckState, CopyQualification, DuplicateRepair,
+    DuplicateRepairRecord, ENTRY_LAYOUT, GenerationId, IndexBuildRecord, IndexCheck,
+    IndexDefinition, IndexDescriptor, IndexId, IndexIntegrityRecord, IndexMaintenance,
+    IndexProfile, IndexState, IndexType, Integrity, Mismatch, NamespaceIndexPolicy,
+    OnlineDuringBuild, PartialFilter, ProfileSource, TextFieldConfig, TextIndexConfig,
+    VectorIndexConfig,
 };
 pub use node::{LocalNodeStore, NodeStore, RowPage};
 pub use schema::{LocalSchemaStore, SchemaStore};

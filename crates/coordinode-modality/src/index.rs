@@ -47,8 +47,8 @@ use coordinode_storage::error::StorageError;
 
 use crate::error::{StoreError, StoreResult};
 use crate::index_def::{
-    DuplicateRepairRecord, GenerationId, IndexBuildRecord, IndexDefinition, IndexDescriptor,
-    IndexId, IndexIntegrityRecord, IndexProfile, NamespaceIndexPolicy,
+    CopyQualification, DuplicateRepairRecord, GenerationId, IndexBuildRecord, IndexDefinition,
+    IndexDescriptor, IndexId, IndexIntegrityRecord, IndexProfile, NamespaceIndexPolicy,
 };
 
 /// Prefix of the marks of generations this member found its own copy of
@@ -61,6 +61,17 @@ const UNFIT_HERE_PREFIX: &[u8] = b"meta:idxunfit:";
 /// used as evidence since this member opened, removed when it closes
 /// cleanly. Node-local like the marks.
 const ARMED_HERE_PREFIX: &[u8] = b"meta:idxarmed:";
+
+/// Prefix of the evidence this member keeps of its proved copies, one
+/// [`CopyQualification`] per generation. Node-local like the marks.
+const QUALIFIED_HERE_PREFIX: &[u8] = b"meta:idxqual:";
+
+fn qualified_here_key(generation: GenerationId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(QUALIFIED_HERE_PREFIX.len() + 8);
+    key.extend_from_slice(QUALIFIED_HERE_PREFIX);
+    key.extend_from_slice(&generation.as_raw().to_be_bytes());
+    key
+}
 
 fn unfit_here_key(generation: GenerationId) -> Vec<u8> {
     let mut key = Vec::with_capacity(UNFIT_HERE_PREFIX.len() + 8);
@@ -555,6 +566,41 @@ pub trait IndexStore {
     ///
     /// A storage failure.
     fn clear_unfit_here(&self, generations: &[GenerationId]) -> StoreResult<()>;
+
+    /// The evidence this member keeps of its proved copies, by generation.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn list_qualified_here(&self) -> StoreResult<Vec<(GenerationId, CopyQualification)>>;
+
+    /// A check proved this member's copy of `generation`: its mark, if it
+    /// has one, is removed and `qualification` kept in its place, in one
+    /// flush, durably before returning.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure: the mark's state is unknown.
+    fn record_verified_here(
+        &self,
+        generation: GenerationId,
+        qualification: CopyQualification,
+    ) -> StoreResult<()>;
+
+    /// A transfer replaced this member's copies: keep the evidence of
+    /// `qualified`, rebound to this member's installations, mark the copies
+    /// `unfit`, drop every other evidence this member kept, and clear the
+    /// transfer record, in one flush with the record removed last.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure: the transfer record may stand, and the next open
+    /// marks every copy.
+    fn record_transfer(
+        &self,
+        qualified: &[(GenerationId, CopyQualification)],
+        unfit: &[LocalCopy],
+    ) -> StoreResult<()>;
 
     /// The use guards stored here: the copies used as evidence since this
     /// member last opened, or never closed by an earlier run.
@@ -1350,6 +1396,81 @@ impl IndexStore for LocalIndexStore<'_> {
             self.engine
                 .delete(Partition::Schema, &unfit_here_key(*generation))?;
         }
+        self.engine.persist_partition(Partition::Schema)?;
+        Ok(())
+    }
+
+    fn list_qualified_here(&self) -> StoreResult<Vec<(GenerationId, CopyQualification)>> {
+        let mut out = Vec::new();
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, QUALIFIED_HERE_PREFIX)?
+        {
+            let (key, value) = guard.into_inner()?;
+            let generation = key
+                .get(QUALIFIED_HERE_PREFIX.len()..)
+                .and_then(|tail| <[u8; 8]>::try_from(tail).ok())
+                .ok_or_else(|| StoreError::Decode {
+                    kind: "copy qualification",
+                    message: format!("malformed key {key:?}"),
+                })?;
+            out.push((
+                GenerationId::from_raw(u64::from_be_bytes(generation)),
+                decode("copy qualification", &value)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    fn record_verified_here(
+        &self,
+        generation: GenerationId,
+        qualification: CopyQualification,
+    ) -> StoreResult<()> {
+        self.engine
+            .delete(Partition::Schema, &unfit_here_key(generation))?;
+        self.engine.put(
+            Partition::Schema,
+            &qualified_here_key(generation),
+            &encode("copy qualification", &qualification)?,
+        )?;
+        self.engine.persist_partition(Partition::Schema)?;
+        Ok(())
+    }
+
+    fn record_transfer(
+        &self,
+        qualified: &[(GenerationId, CopyQualification)],
+        unfit: &[LocalCopy],
+    ) -> StoreResult<()> {
+        for (generation, _) in self.list_qualified_here()? {
+            if !qualified.iter().any(|(g, _)| *g == generation) {
+                self.engine
+                    .delete(Partition::Schema, &qualified_here_key(generation))?;
+            }
+        }
+        for (generation, qualification) in qualified {
+            self.engine.put(
+                Partition::Schema,
+                &qualified_here_key(*generation),
+                &encode("copy qualification", qualification)?,
+            )?;
+        }
+        for copy in unfit {
+            self.engine
+                .delete(Partition::Schema, &qualified_here_key(copy.generation))?;
+            self.engine.put(
+                Partition::Schema,
+                &unfit_here_key(copy.generation),
+                &copy.installation.to_be_bytes(),
+            )?;
+        }
+        // A flush persists the tree's writes as a prefix: the record's
+        // removal, written last, reaches the disk no earlier than the rest.
+        self.engine.delete(
+            Partition::Schema,
+            coordinode_storage::engine::index_copies::INDEX_TRANSFER_KEY,
+        )?;
         self.engine.persist_partition(Partition::Schema)?;
         Ok(())
     }

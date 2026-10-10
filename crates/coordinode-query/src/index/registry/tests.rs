@@ -257,7 +257,7 @@ fn a_catalog_verification_does_not_clear_a_suspicion_found_here() {
     );
     assert!(!reg.answers_at(index.generation, u64::MAX));
     assert!(
-        reg.verified_here(&engine, index.generation, revision)
+        reg.verified_here(&engine, &index, revision, 0)
             .expect("lift")
     );
     assert!(!reg.is_suspect(index.generation), "verified on this member");
@@ -283,7 +283,7 @@ fn a_finding_after_the_pass_started_survives_its_verification() {
     let started = reg.local_revision(index.generation);
     report(&reg, &engine, &index, 8);
     assert!(
-        !reg.verified_here(&engine, index.generation, started)
+        !reg.verified_here(&engine, &index, started, 0)
             .expect("lift")
     );
     assert!(reg.is_suspect(index.generation));
@@ -293,10 +293,7 @@ fn a_finding_after_the_pass_started_survives_its_verification() {
     let fresh = btree("user_name", "name", 2);
     let before = reg.local_revision(fresh.generation);
     report(&reg, &engine, &fresh, 9);
-    assert!(
-        !reg.verified_here(&engine, fresh.generation, before)
-            .expect("lift")
-    );
+    assert!(!reg.verified_here(&engine, &fresh, before, 0).expect("lift"));
     assert!(reg.is_suspect(fresh.generation));
 }
 
@@ -344,7 +341,7 @@ fn a_mark_whose_flush_failed_is_not_retried_and_keeps_the_guard() {
         report(&reg, &engine, &index, 8);
         let now = reg.local_revision(index.generation);
         assert!(
-            !reg.verified_here(&engine, index.generation, now)
+            !reg.verified_here(&engine, &index, now, 0)
                 .expect("refused without I/O"),
             "a mark of unknown state is not lifted"
         );
@@ -359,6 +356,24 @@ fn a_mark_whose_flush_failed_is_not_retried_and_keeps_the_guard() {
         reg.is_suspect(index.generation),
         "the guard left open makes the copy unfit after the restart"
     );
+}
+
+/// A finding whose mark could not be written is still among the findings a
+/// capture of the store reads from the registry: a transfer taken now
+/// excludes that copy although no stored mark names it.
+#[test]
+fn a_finding_whose_mark_failed_is_among_the_findings() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    existing_copy(&engine, index.generation);
+    assert!(reg.findings().is_empty());
+    rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
+    report(&reg, &engine, &index, 7);
+    let findings = reg.findings();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].0, index.generation);
 }
 
 /// A removal whose flush failed may or may not have reached the disk: the
@@ -377,8 +392,7 @@ fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
     // engine's own background work instead of the removal's flush.
     rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
     assert!(
-        reg.verified_here(&engine, index.generation, started)
-            .is_err(),
+        reg.verified_here(&engine, &index, started, 0).is_err(),
         "the removal's flush failed"
     );
     assert!(reg.is_suspect(index.generation), "unfit here regardless");
@@ -389,8 +403,7 @@ fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
     // mark's stored state stays unknown, so the copy stays unfit here.
     let now = reg.local_revision(index.generation);
     assert!(
-        !reg.verified_here(&engine, index.generation, now)
-            .expect("refused"),
+        !reg.verified_here(&engine, &index, now, 0).expect("refused"),
         "a mark of unknown state is not lifted"
     );
     reg.close_local_guards(&engine);
@@ -422,8 +435,7 @@ fn a_failed_sync_leaves_the_mark_of_unknown_durability() {
                 let started = reg.local_revision(index.generation);
                 rig.fail_from(FaultOp::SyncAll, 0);
                 assert!(
-                    reg.verified_here(&engine, index.generation, started)
-                        .is_err(),
+                    reg.verified_here(&engine, &index, started, 0).is_err(),
                     "the removal's sync failed"
                 );
             } else {
@@ -436,10 +448,7 @@ fn a_failed_sync_leaves_the_mark_of_unknown_durability() {
             let before = reg.recovery_flushes();
             report(&reg, &engine, &index, 9);
             let now = reg.local_revision(index.generation);
-            assert!(
-                !reg.verified_here(&engine, index.generation, now)
-                    .expect("refused")
-            );
+            assert!(!reg.verified_here(&engine, &index, now, 0).expect("refused"));
             reg.close_local_guards(&engine);
             assert_eq!(
                 reg.recovery_flushes(),
@@ -669,7 +678,7 @@ fn a_finding_during_the_removal_returns_only_once_stored_again() {
             }));
         }
         assert!(
-            !reg.verified_here(&engine, index.generation, started)
+            !reg.verified_here(&engine, &index, started, 0)
                 .expect("lift")
         );
         *reg.after_mark_removed.lock() = None;

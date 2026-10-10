@@ -2032,17 +2032,40 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             meta.last_membership.clone();
         self.save_membership(&meta.last_membership)?;
 
-        // The installed file becomes the current snapshot, moved in place;
-        // get_current_snapshot() serves it from now on.
+        // The store as installed becomes the current snapshot, captured while
+        // no entry applies (the gate is still held), as a build captures it:
+        // get_current_snapshot() serves it from now on, its index inventory
+        // sealed against what this member finds, not the leader's account of
+        // its own copies. An empty snapshot is kept as it arrived.
         // Counted as work holding the engine: openraft may stop waiting on
         // the task at a shutdown, and the task runs on regardless.
+        self.captures += 1;
+        let capture = snapshot_capture_root(&self.engine).join(format!("{:020}", self.captures));
+        let engine = Arc::clone(&self.engine);
         let work = self.engine_work.start();
         let snapshots = Arc::clone(&self.snapshots);
         let published_meta = meta.clone();
         let published = tokio::task::spawn_blocking(move || {
             let _work = work;
             let snapshots = snapshots;
-            snapshots.publish(&published_meta, &mut snapshot)
+            if snapshot.size()? == 0 {
+                return snapshots.publish(&published_meta, &mut snapshot);
+            }
+            drop(snapshot);
+            if let Some(parent) = capture.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            engine
+                .capture(&capture)
+                .map_err(|e| io::Error::other(format!("capture the installed store: {e}")))?;
+            drop(engine);
+            let published = snapshots.publish_capture(&published_meta, &capture)?;
+            if !published {
+                if let Err(e) = std::fs::remove_dir_all(&capture) {
+                    tracing::warn!(?capture, %e, "could not remove an unpublished capture");
+                }
+            }
+            Ok(published)
         })
         .await
         .map_err(|e| io::Error::other(format!("snapshot publish task: {e}")))??;

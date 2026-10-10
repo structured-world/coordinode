@@ -1365,7 +1365,7 @@ async fn cluster_snapshot_install_restores_data() {
 
         // Build a snapshot from leader state
         let mut snap_data = std::io::Cursor::new(Vec::new());
-        coordinode_raft::snapshot::write_full_snapshot(&n1.engine, &mut snap_data)
+        coordinode_raft::snapshot::write_full_snapshot(&n1.engine, None, &mut snap_data)
             .expect("build snapshot from leader");
         let snap_data = snap_data.into_inner();
 
@@ -1881,6 +1881,174 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
     );
 }
 
+/// Stands in for the index layer: captures a fixed inventory, seals it by
+/// appending a marker, and records every inventory a transfer hands it.
+struct InventoryRecorder {
+    captured: &'static [u8],
+    captures: std::sync::atomic::AtomicUsize,
+    received: std::sync::Mutex<Vec<Option<Vec<u8>>>>,
+}
+
+impl InventoryRecorder {
+    fn new(captured: &'static [u8]) -> Arc<Self> {
+        Arc::new(Self {
+            captured,
+            captures: std::sync::atomic::AtomicUsize::new(0),
+            received: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl coordinode_storage::engine::index_copies::IndexCopyQualifier for InventoryRecorder {
+    fn capture(
+        &self,
+        _engine: &StorageEngine,
+    ) -> coordinode_storage::error::StorageResult<Vec<u8>> {
+        self.captures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.captured.to_vec())
+    }
+
+    fn seal(
+        &self,
+        _engine: &StorageEngine,
+        captured: &[u8],
+    ) -> coordinode_storage::error::StorageResult<Vec<u8>> {
+        Ok([captured, b"+sealed"].concat())
+    }
+
+    fn installed(
+        &self,
+        engine: &StorageEngine,
+        inventory: Option<&[u8]>,
+    ) -> coordinode_storage::error::StorageResult<()> {
+        self.received
+            .lock()
+            .expect("recorder lock")
+            .push(inventory.map(<[u8]>::to_vec));
+        engine.delete(
+            Partition::Schema,
+            coordinode_storage::engine::index_copies::INDEX_TRANSFER_KEY,
+        )
+    }
+}
+
+/// A snapshot carries the index inventory the leader captured with it,
+/// sealed when it is sent, to the new member's index layer; the new member
+/// keeps a capture of its own installed store as its snapshot, with its own
+/// inventory, rather than serving the leader's account of its copies.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_carries_the_sealed_index_inventory() {
+    let result = tokio::time::timeout(Duration::from_secs(45), async {
+        let (p1, p2) = (alloc_port(), alloc_port());
+        let open = |dir: &std::path::Path| {
+            Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    dir,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("open"),
+            )
+        };
+        let (dir1, dir2) = (
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+        );
+        let (e1, e2) = (open(dir1.path()), open(dir2.path()));
+        let leader_layer = InventoryRecorder::new(b"leader inventory");
+        let member_layer = InventoryRecorder::new(b"member inventory");
+        e1.set_index_copy_qualifier(Arc::clone(&leader_layer) as _);
+        e2.set_index_copy_qualifier(Arc::clone(&member_layer) as _);
+
+        let n1 = RaftNode::open_cluster_with_options(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+            NodeOptions {
+                snapshots: coordinode_raft::cluster::SnapshotTriggerConfig {
+                    min_interval: Duration::from_secs(3600),
+                    log_bytes: u64::MAX,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("leader");
+        await_leadership(&n1).await;
+        let pipeline = n1.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        for i in 1..=3u64 {
+            pipeline
+                .propose_and_wait(&RaftProposal {
+                    id: id_gen.next(),
+                    mutations: vec![Mutation::Put {
+                        partition: PartitionId::Node,
+                        key: format!("node:1:inv-{i}").into_bytes(),
+                        value: b"v".to_vec(),
+                    }],
+                    commit_ts: Timestamp::from_raw(100 + i),
+                    start_ts: Timestamp::from_raw(99 + i),
+                    bypass_rate_limiter: false,
+                })
+                .expect("propose");
+        }
+        n1.raft().trigger().snapshot().await.expect("snapshot");
+        let applied = n1.applied_index();
+        await_snapshot_covering(&n1, applied).await;
+        n1.raft().trigger().purge_log(applied).await.expect("purge");
+        assert!(
+            leader_layer
+                .captures
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1,
+            "the snapshot's capture took the inventory"
+        );
+
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+        )
+        .await
+        .expect("joining node");
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        await_condition(
+            Duration::from_secs(20),
+            "the snapshot never reached node 2",
+            || !member_layer.received.lock().expect("lock").is_empty(),
+        )
+        .await;
+        assert_eq!(
+            member_layer.received.lock().expect("lock")[0].as_deref(),
+            Some(&b"leader inventory+sealed"[..]),
+            "the inventory captured with the snapshot, sealed when sent"
+        );
+        await_condition(
+            Duration::from_secs(20),
+            "the new member never captured its installed store with its own inventory",
+            || {
+                member_layer
+                    .captures
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    >= 1
+            },
+        )
+        .await;
+
+        n1.shutdown().await.expect("shutdown 1");
+        n2.shutdown().await.expect("shutdown 2");
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// Poll `cond` every 100ms for up to `within`; panic naming `what` if it never holds.
 async fn await_condition(within: Duration, what: &str, cond: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + within;
@@ -2338,6 +2506,7 @@ async fn cluster_snapshot_multi_chunk_transfer() {
         // Verify snapshot is large enough to produce multiple chunks
         let data_bytes = coordinode_raft::snapshot::write_full_snapshot(
             &e1,
+            None,
             &mut tempfile::tempfile().expect("scratch file"),
         )
         .expect("build snapshot");
