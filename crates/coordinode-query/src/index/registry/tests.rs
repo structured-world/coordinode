@@ -290,15 +290,16 @@ fn a_mark_whose_flush_failed_fails_the_finding_and_is_not_retried() {
     let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
-    rig.fail_next(coordinode_test_fixtures::FaultOp::Open, 1);
+    // Every open fails from here: a single failure could be taken by the
+    // engine's own background work instead of the mark's flush.
+    rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
     let first = reg.report_mismatch(&engine, &index, stray(7));
     assert!(
         matches!(&first, Err(e) if e.generation == index.generation.as_raw()),
         "{first:?}"
     );
     assert!(reg.is_suspect(index.generation), "unfit here regardless");
-    // The disk is healthy again: whatever follows must not ask for the mark
-    // to be written or removed.
+    // Whatever follows must not ask for the mark to be written or removed.
     let opens = mark_io(&reg);
     let again = reg.report_mismatch(&engine, &index, stray(8));
     assert!(
@@ -333,15 +334,16 @@ fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
     let reg = IndexRegistry::new();
     report(&reg, &engine, &index, 7);
     let started = reg.local_revision(index.generation);
-    rig.fail_next(coordinode_test_fixtures::FaultOp::Open, 1);
+    // Every open fails from here: a single failure could be taken by the
+    // engine's own background work instead of the removal's flush.
+    rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
     assert!(
         reg.verified_here(&engine, index.generation, started)
             .is_err(),
         "the removal's flush failed"
     );
     assert!(reg.is_suspect(index.generation), "unfit here regardless");
-    // The disk is healthy again: whatever follows must not ask for the mark
-    // to be written or removed.
+    // Whatever follows must not ask for the mark to be written or removed.
     let opens = mark_io(&reg);
     let after = reg.report_mismatch(&engine, &index, stray(8));
     assert!(
@@ -372,7 +374,10 @@ fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
 /// opening its file: a finding whose mark's sync failed fails, and a removal
 /// whose sync failed leaves the mark failed, with no further I/O for it.
 /// A memtable flush syncs its table with `sync_all`, so that is the sync
-/// failed here, once for the mark's write and once for the removal.
+/// failed here, for the mark's write and for the removal. Every sync fails
+/// from that point: a single failure could be taken by the engine's own
+/// background flush or compaction instead of the step under test, and
+/// nothing after it may touch the disk anyway.
 #[test]
 fn a_failed_sync_leaves_the_mark_of_unknown_durability() {
     use coordinode_test_fixtures::FaultOp;
@@ -384,14 +389,14 @@ fn a_failed_sync_leaves_the_mark_of_unknown_durability() {
         if removal {
             report(&reg, &engine, &index, 7);
             let started = reg.local_revision(index.generation);
-            rig.fail_next(FaultOp::SyncAll, 1);
+            rig.fail_from(FaultOp::SyncAll, 0);
             assert!(
                 reg.verified_here(&engine, index.generation, started)
                     .is_err(),
                 "the removal's sync failed"
             );
         } else {
-            rig.fail_next(FaultOp::SyncAll, 1);
+            rig.fail_from(FaultOp::SyncAll, 0);
             let found = reg.report_mismatch(&engine, &index, stray(7));
             assert!(found.is_err(), "the mark's sync failed: {found:?}");
         }
