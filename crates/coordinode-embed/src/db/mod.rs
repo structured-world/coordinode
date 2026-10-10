@@ -159,6 +159,17 @@ const STATS_CACHE_TTL_SECS: u64 = 60;
 /// missing a write its own timestamp covers.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
+/// Runs of an auto-commit statement refused at commit for contention before
+/// the refusal is returned. A refused attempt applied nothing, so running it
+/// again from a fresh snapshot is safe; the bound keeps a statement that keeps
+/// losing from waiting without end.
+const AUTOCOMMIT_ATTEMPTS: u32 = 6;
+
+/// Wait before the second run, doubled for each later one: the commits that
+/// refused it hold their keys from validation to apply, and the runs together
+/// wait about 60 ms, past a slow disk's flush.
+const AUTOCOMMIT_REEXECUTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// How long a query waits for a vector index still being built, under the
 /// `block` policy, when neither the query nor the session names a bound.
 pub const DEFAULT_VECTOR_BUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2864,211 +2875,264 @@ impl Database {
             plan.substitute_params(p);
         }
 
-        // MVCC enabled: all reads use snapshot isolation at start_ts,
-        // all writes are buffered and flushed atomically through the
-        // ProposalPipeline at commit_ts.
-        //
-        // Read concern affects snapshot selection:
-        // - Local/Majority/Linearizable: use oracle.next() (latest applied)
-        //   In embedded single-node mode, these are equivalent since there's
-        //   no replication lag. In cluster mode (coordinode-server), Majority
-        //   and Linearizable use Raft commit_index / lease check.
-        // - Snapshot with at_timestamp: pin to explicit MVCC timestamp.
-        use coordinode_core::txn::read_concern::ReadConcernLevel;
-        // GC-watermark pin for an explicit historical snapshot, held for the
-        // statement so compaction cannot collect the history it reads.
-        let mut retention_pin = None;
-        // The timestamp a snapshot read concern names, which the executor
-        // treats like `AS OF TIMESTAMP`.
-        let mut named_read_ts: Option<i64> = None;
-        let read_ts = match &txn_mode {
-            // Interactive transaction: every statement reuses the pinned
-            // start_ts so all reads resolve against the same snapshot
-            // (repeatable read across the transaction).
-            TxnMode::Interactive(state) => state.read_ts(),
-            TxnMode::AutoCommit if session.read_concern == ReadConcernLevel::Snapshot => {
-                // One-shot snapshot read; already captured into the
-                // session (Database.snapshot_read_ts was taken when
-                // the session was built).
-                if let Some(ts) = session.snapshot_read_ts {
-                    // `at_timestamp = T` is inclusive, like `AS OF TIMESTAMP
-                    // T`: it sees every commit with commit_ts <= T, so a
-                    // commit receipt's commit_ts pins its own write. A storage
-                    // snapshot at S sees seqnos strictly below S, hence T + 1.
-                    // Saturating by design: at u64::MAX there is nothing above
-                    // to include, so the top snapshot is the right bound, not
-                    // an overflow.
-                    let seqno = ts.saturating_add(1);
-                    // A named timestamp is preserved, not lowered, so the
-                    // only way to make it complete is to let the commits
-                    // under it land. Answering before they do would read a
-                    // state missing a write the caller's own timestamp
-                    // covers; answering at another timestamp would silently
-                    // give them a different read than the one they asked for.
-                    if let Err(blocking) = self
-                        .engine
-                        .pending_commits()
-                        .await_complete_at(ts, READ_TIMEOUT)
-                    {
-                        return Err(DatabaseError::Other(format!(
-                            "read at timestamp {ts} timed out waiting for the commit at \
+        // An auto-commit statement refused at commit for contention applied
+        // nothing, so it runs again from a fresh snapshot, a bounded number
+        // of times. Not a statement pinned to a named snapshot, which would
+        // read the same state and be refused again, nor a cursor page, whose
+        // resume state the attempt advances.
+        let reexecutable = matches!(txn_mode, TxnMode::AutoCommit)
+            && session.snapshot_read_ts.is_none()
+            && scan_paging.is_none();
+        let interactive = matches!(txn_mode, TxnMode::Interactive(_));
+        let mut txn_mode = Some(txn_mode);
+        let mut attempt_once = |txn_mode: TxnMode| -> Result<
+            (
+                Vec<Row>,
+                WriteStats,
+                Option<coordinode_storage::engine::transaction::TransactionState>,
+                u64,
+            ),
+            DatabaseError,
+        > {
+            // MVCC enabled: all reads use snapshot isolation at start_ts,
+            // all writes are buffered and flushed atomically through the
+            // ProposalPipeline at commit_ts.
+            //
+            // Read concern affects snapshot selection:
+            // - Local/Majority/Linearizable: use oracle.next() (latest applied)
+            //   In embedded single-node mode, these are equivalent since there's
+            //   no replication lag. In cluster mode (coordinode-server), Majority
+            //   and Linearizable use Raft commit_index / lease check.
+            // - Snapshot with at_timestamp: pin to explicit MVCC timestamp.
+            use coordinode_core::txn::read_concern::ReadConcernLevel;
+            // GC-watermark pin for an explicit historical snapshot, held for the
+            // statement so compaction cannot collect the history it reads.
+            let mut retention_pin = None;
+            // The timestamp a snapshot read concern names, which the executor
+            // treats like `AS OF TIMESTAMP`.
+            let mut named_read_ts: Option<i64> = None;
+            let read_ts = match &txn_mode {
+                // Interactive transaction: every statement reuses the pinned
+                // start_ts so all reads resolve against the same snapshot
+                // (repeatable read across the transaction).
+                TxnMode::Interactive(state) => state.read_ts(),
+                TxnMode::AutoCommit if session.read_concern == ReadConcernLevel::Snapshot => {
+                    // One-shot snapshot read; already captured into the
+                    // session (Database.snapshot_read_ts was taken when
+                    // the session was built).
+                    if let Some(ts) = session.snapshot_read_ts {
+                        // `at_timestamp = T` is inclusive, like `AS OF TIMESTAMP
+                        // T`: it sees every commit with commit_ts <= T, so a
+                        // commit receipt's commit_ts pins its own write. A storage
+                        // snapshot at S sees seqnos strictly below S, hence T + 1.
+                        // Saturating by design: at u64::MAX there is nothing above
+                        // to include, so the top snapshot is the right bound, not
+                        // an overflow.
+                        let seqno = ts.saturating_add(1);
+                        // A named timestamp is preserved, not lowered, so the
+                        // only way to make it complete is to let the commits
+                        // under it land. Answering before they do would read a
+                        // state missing a write the caller's own timestamp
+                        // covers; answering at another timestamp would silently
+                        // give them a different read than the one they asked for.
+                        if let Err(blocking) = self
+                            .engine
+                            .pending_commits()
+                            .await_complete_at(ts, READ_TIMEOUT)
+                        {
+                            return Err(DatabaseError::Other(format!(
+                                "read at timestamp {ts} timed out waiting for the commit at \
                              {blocking} to land; it is covered by this timestamp and the \
                              read cannot be answered without it"
-                        )));
+                            )));
+                        }
+                        // Refused when the seqno is already below the GC
+                        // watermark: that history may be collected, and a read
+                        // there would answer from whatever survived.
+                        let Some(pin) = self.engine.pin_snapshot_at(seqno) else {
+                            return Err(DatabaseError::OutsideRetention {
+                                requested: ts,
+                                // One below the first readable seqno, since a read
+                                // at T is served from snapshot T + 1. Clamped at
+                                // the bottom of the timestamp domain, not against
+                                // overflow: horizon zero means nothing collected.
+                                oldest_readable: self
+                                    .engine
+                                    .oldest_readable_seqno()
+                                    .saturating_sub(1),
+                            });
+                        };
+                        retention_pin = Some(pin);
+                        // A timestamp past i64::MAX is later than every commit, and
+                        // so is i64::MAX itself: both name the read of everything
+                        // committed, so the executor gets the largest value it holds.
+                        named_read_ts = Some(i64::try_from(ts).unwrap_or(i64::MAX));
+                        Timestamp::from_raw(seqno)
+                    } else {
+                        self.fresh_pinned_read_ts(&mut retention_pin)
                     }
-                    // Refused when the seqno is already below the GC
-                    // watermark: that history may be collected, and a read
-                    // there would answer from whatever survived.
-                    let Some(pin) = self.engine.pin_snapshot_at(seqno) else {
-                        return Err(DatabaseError::OutsideRetention {
-                            requested: ts,
-                            // One below the first readable seqno, since a read
-                            // at T is served from snapshot T + 1. Clamped at
-                            // the bottom of the timestamp domain, not against
-                            // overflow: horizon zero means nothing collected.
-                            oldest_readable: self.engine.oldest_readable_seqno().saturating_sub(1),
-                        });
-                    };
-                    retention_pin = Some(pin);
-                    // A timestamp past i64::MAX is later than every commit, and
-                    // so is i64::MAX itself: both name the read of everything
-                    // committed, so the executor gets the largest value it holds.
-                    named_read_ts = Some(i64::try_from(ts).unwrap_or(i64::MAX));
-                    Timestamp::from_raw(seqno)
-                } else {
-                    self.fresh_pinned_read_ts(&mut retention_pin)
                 }
-            }
-            TxnMode::AutoCommit => self.fresh_pinned_read_ts(&mut retention_pin),
-        };
-        let _retention_pin = retention_pin.take();
-        // Build the transaction up front: a fresh one for auto-commit, or
-        // the resumed parked state for an interactive statement. `interactive`
-        // drives the no-commit execution + state extraction below.
-        let interactive = matches!(txn_mode, TxnMode::Interactive(_));
-        let txn = match txn_mode {
-            TxnMode::Interactive(state) => {
-                coordinode_storage::engine::transaction::Transaction::resume(
+                TxnMode::AutoCommit => self.fresh_pinned_read_ts(&mut retention_pin),
+            };
+            let _retention_pin = retention_pin.take();
+            // Build the transaction up front: a fresh one for auto-commit, or
+            // the resumed parked state for an interactive statement. `interactive`
+            // drives the no-commit execution + state extraction below.
+            let interactive = matches!(txn_mode, TxnMode::Interactive(_));
+            let txn = match txn_mode {
+                TxnMode::Interactive(state) => {
+                    coordinode_storage::engine::transaction::Transaction::resume(
+                        &self.engine,
+                        Some(&self.oracle),
+                        *state,
+                    )
+                }
+                TxnMode::AutoCommit => coordinode_storage::engine::transaction::Transaction::new(
                     &self.engine,
                     Some(&self.oracle),
-                    *state,
-                )
-            }
-            TxnMode::AutoCommit => coordinode_storage::engine::transaction::Transaction::new(
-                &self.engine,
-                Some(&self.oracle),
-                read_ts,
-                None,
-            ),
-        };
-        // The statement's view of the field dictionary: every binding
-        // applied before it started, refreshed here when one has landed
-        // since (a registration, a replica apply, a replay, a snapshot).
-        // Names the statement introduces are registered through the
-        // pipeline and join this view only; no lock is held while it runs.
-        let mut fields_view = self.fields.current()?;
-        let vector_loader =
-            StorageVectorLoader::new(Arc::clone(&self.engine), fields_view.clone(), self.shard_id);
-        // The statement's valid-time NOW. A cursor page keeps the instant of
-        // the cursor's first page, the time its snapshot was pinned at, so
-        // pages read one timeline projection however long the client takes.
-        let valid_now = match (scan_paging.as_ref(), session.snapshot_read_ts) {
-            (Some(_), Some(pinned)) => i64::try_from(pinned).unwrap_or(i64::MAX),
-            _ => coordinode_query::executor::runner::wall_clock_us(),
-        };
-        let mut ctx = ExecutionContext {
-            engine: &self.engine,
-            interner: &mut fields_view,
-            field_registrar: Some(self.fields.as_ref()),
-            id_allocator: &self.allocator,
-            shard_id: self.shard_id,
-            scan_paging: scan_paging.clone(),
-            operations: self.operations.as_deref(),
-            adaptive: self.adaptive_config.clone(),
-            dedup_varlen_targets: false,
-            snapshot_ts: named_read_ts,
-            valid_now,
-            temporal_instants: Vec::new(),
-            snapshot_pin: None,
-            warnings: Vec::new(),
-            write_stats: WriteStats::default(),
-            key_claims: Default::default(),
-            text_index: None,
-            text_index_registry: Some(&self.text_index_registry),
-            vector_indexes: Some(coordinode_query::executor::runner::VectorIndexes {
-                registry: &self.vector_index_registry,
+                    read_ts,
+                    None,
+                ),
+            };
+            // The statement's view of the field dictionary: every binding
+            // applied before it started, refreshed here when one has landed
+            // since (a registration, a replica apply, a replay, a snapshot).
+            // Names the statement introduces are registered through the
+            // pipeline and join this view only; no lock is held while it runs.
+            let mut fields_view = self.fields.current()?;
+            let vector_loader = StorageVectorLoader::new(
+                Arc::clone(&self.engine),
+                fields_view.clone(),
+                self.shard_id,
+            );
+            // The statement's valid-time NOW. A cursor page keeps the instant of
+            // the cursor's first page, the time its snapshot was pinned at, so
+            // pages read one timeline projection however long the client takes.
+            let valid_now = match (scan_paging.as_ref(), session.snapshot_read_ts) {
+                (Some(_), Some(pinned)) => i64::try_from(pinned).unwrap_or(i64::MAX),
+                _ => coordinode_query::executor::runner::wall_clock_us(),
+            };
+            let mut ctx = ExecutionContext {
                 engine: &self.engine,
-                // The query's own bound wins over the session's.
-                build_wait: hinted_build_wait.unwrap_or(session.vector_build_wait),
-            }),
-            btree_index_registry: Some(self.index_registry.as_ref()),
-            index_builds: Some(&self.index_builds),
-            // Extension-op handlers for this Database (empty by default). An
-            // enterprise layer / integration test populates it via
-            // Database::register_extension so SHARDED-BY-style extension ops
-            // dispatch; an empty registry means none are dispatchable.
-            extensions: Some(&self.extension_registry),
-            vector_loader: Some(&vector_loader),
-            mvcc_oracle: Some(&self.oracle),
-            mvcc_read_ts: read_ts,
-            procedures: Some(&self.procedure_registry),
-            advisor: Some(AdvisorContext {
-                registry: Arc::clone(&self.query_registry),
-                nplus1: Arc::clone(&self.nplus1_detector),
-                dismissed: Arc::clone(&self.dismissed),
-            }),
-            budget: Arc::clone(&session.budget),
-            // Set from the plan when it starts.
-            unaccounted_operator: None,
-            txn,
-            vector_consistency: plan.vector_consistency,
-            vector_overfetch_factor: 1.2,
-            vector_mvcc_stats: None,
-            // The injected pipeline (Raft in cluster mode) — NOT a local
-            // engine-applying one. Writing past it breaks replication.
-            proposal_pipeline: Some(self.pipeline.as_ref()),
-            proposal_id_gen: Some(&self.proposal_id_gen),
-            read_concern: session.read_concern,
-            write_concern: session.write_concern,
-            drain_buffer: Some(&self.drain_buffer),
-            nvme_write_buffer: self.nvme_write_buffer.as_deref(),
-            mvcc_snapshot: None,
-            // Cascade tracking — cluster defaults for trigger cycle protection.
-            cascade_depth: 0,
-            cascade_depth_limit: 10,
-            cascade_fire_counts: std::collections::HashMap::new(),
-            cascade_fanout_limit: 100,
-            cascade_chain: Vec::new(),
-            after_commit_generation: session.after_commit_generation,
-            correlated_row: None,
-            foreach_scope: None,
-            feedback_cache: Some(self.feedback_cache.clone()),
-            schema_label_cache: std::collections::HashMap::new(),
-            label_schema_cache: std::collections::HashMap::new(),
-            applied_watermark: None,
-            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
-            ),
-            read_timeout: READ_TIMEOUT,
-            params: std::collections::HashMap::new(),
+                interner: &mut fields_view,
+                field_registrar: Some(self.fields.as_ref()),
+                id_allocator: &self.allocator,
+                shard_id: self.shard_id,
+                scan_paging: scan_paging.clone(),
+                operations: self.operations.as_deref(),
+                adaptive: self.adaptive_config.clone(),
+                dedup_varlen_targets: false,
+                snapshot_ts: named_read_ts,
+                valid_now,
+                temporal_instants: Vec::new(),
+                snapshot_pin: None,
+                warnings: Vec::new(),
+                write_stats: WriteStats::default(),
+                key_claims: Default::default(),
+                text_index: None,
+                text_index_registry: Some(&self.text_index_registry),
+                vector_indexes: Some(coordinode_query::executor::runner::VectorIndexes {
+                    registry: &self.vector_index_registry,
+                    engine: &self.engine,
+                    // The query's own bound wins over the session's.
+                    build_wait: hinted_build_wait.unwrap_or(session.vector_build_wait),
+                }),
+                btree_index_registry: Some(self.index_registry.as_ref()),
+                index_builds: Some(&self.index_builds),
+                // Extension-op handlers for this Database (empty by default). An
+                // enterprise layer / integration test populates it via
+                // Database::register_extension so SHARDED-BY-style extension ops
+                // dispatch; an empty registry means none are dispatchable.
+                extensions: Some(&self.extension_registry),
+                vector_loader: Some(&vector_loader),
+                mvcc_oracle: Some(&self.oracle),
+                mvcc_read_ts: read_ts,
+                procedures: Some(&self.procedure_registry),
+                advisor: Some(AdvisorContext {
+                    registry: Arc::clone(&self.query_registry),
+                    nplus1: Arc::clone(&self.nplus1_detector),
+                    dismissed: Arc::clone(&self.dismissed),
+                }),
+                budget: Arc::clone(&session.budget),
+                // Set from the plan when it starts.
+                unaccounted_operator: None,
+                txn,
+                vector_consistency: plan.vector_consistency,
+                vector_overfetch_factor: 1.2,
+                vector_mvcc_stats: None,
+                // The injected pipeline (Raft in cluster mode) — NOT a local
+                // engine-applying one. Writing past it breaks replication.
+                proposal_pipeline: Some(self.pipeline.as_ref()),
+                proposal_id_gen: Some(&self.proposal_id_gen),
+                read_concern: session.read_concern,
+                write_concern: session.write_concern,
+                drain_buffer: Some(&self.drain_buffer),
+                nvme_write_buffer: self.nvme_write_buffer.as_deref(),
+                mvcc_snapshot: None,
+                // Cascade tracking — cluster defaults for trigger cycle protection.
+                cascade_depth: 0,
+                cascade_depth_limit: 10,
+                cascade_fire_counts: std::collections::HashMap::new(),
+                cascade_fanout_limit: 100,
+                cascade_chain: Vec::new(),
+                after_commit_generation: session.after_commit_generation,
+                correlated_row: None,
+                foreach_scope: None,
+                feedback_cache: Some(self.feedback_cache.clone()),
+                schema_label_cache: std::collections::HashMap::new(),
+                label_schema_cache: std::collections::HashMap::new(),
+                applied_watermark: None,
+                read_consistency:
+                    coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
+                read_timeout: READ_TIMEOUT,
+                params: std::collections::HashMap::new(),
+            };
+
+            let start = Instant::now();
+            // Auto-commit flushes the statement's writes; an interactive statement
+            // leaves them buffered on the transaction for COMMIT to flush later.
+            let results = if interactive {
+                execute_no_commit(&plan, &mut ctx)?
+            } else {
+                execute(&plan, &mut ctx)?
+            };
+            // Park the (uncommitted) transaction state so the caller can re-hold it
+            // for the next statement of an interactive transaction. `take_state`
+            // drains the buffers without consuming `ctx`, leaving it droppable.
+            let out_state = if interactive {
+                Some(ctx.txn.take_state())
+            } else {
+                None
+            };
+            let duration_us = start.elapsed().as_micros() as u64;
+
+            let write_stats = ctx.write_stats.clone();
+            // Hand the executor-updated keyset state (last_key + exhausted) back to
+            // the caller through the in/out channel. `None` stays `None` for a
+            // non-paged execution; the cursor path reads this to build the next
+            // page's resume token.
+            *scan_paging = ctx.scan_paging.clone();
+            drop(ctx);
+            Ok((results, write_stats, out_state, duration_us))
         };
 
-        let start = Instant::now();
-        // Auto-commit flushes the statement's writes; an interactive statement
-        // leaves them buffered on the transaction for COMMIT to flush later.
-        let results = if interactive {
-            execute_no_commit(&plan, &mut ctx)?
-        } else {
-            execute(&plan, &mut ctx)?
+        let mut attempt = 1;
+        let mut backoff = AUTOCOMMIT_REEXECUTION_BACKOFF;
+        let (results, write_stats, out_state, duration_us) = loop {
+            let mode = txn_mode.take().unwrap_or(TxnMode::AutoCommit);
+            match attempt_once(mode) {
+                Err(DatabaseError::Execution(
+                    coordinode_query::executor::runner::ExecutionError::Conflict(reason),
+                )) if reexecutable && attempt < AUTOCOMMIT_ATTEMPTS => {
+                    tracing::debug!(attempt, %reason, "auto-commit statement refused at commit; running it again");
+                    std::thread::sleep(backoff);
+                    backoff *= 2;
+                    attempt += 1;
+                }
+                outcome => break outcome?,
+            }
         };
-        // Park the (uncommitted) transaction state so the caller can re-hold it
-        // for the next statement of an interactive transaction. `take_state`
-        // drains the buffers without consuming `ctx`, leaving it droppable.
-        let out_state = if interactive {
-            Some(ctx.txn.take_state())
-        } else {
-            None
-        };
-        let duration_us = start.elapsed().as_micros() as u64;
+        let had_mutations = write_stats.has_mutations();
 
         // Record execution in advisor registry with plan + optional source
         let plan_str = plan.explain();
@@ -3087,15 +3151,6 @@ impl Database {
                 );
             }
         }
-
-        let write_stats = ctx.write_stats.clone();
-        let had_mutations = write_stats.has_mutations();
-        // Hand the executor-updated keyset state (last_key + exhausted) back to
-        // the caller through the in/out channel. `None` stays `None` for a
-        // non-paged execution; the cursor path reads this to build the next
-        // page's resume token.
-        *scan_paging = ctx.scan_paging.clone();
-        drop(ctx);
 
         // Invalidate cached storage statistics after any mutation so that
         // the next EXPLAIN reflects the current state of the database.
