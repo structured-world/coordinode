@@ -159,3 +159,40 @@ fn cancellation_stops_at_the_next_check() {
     assert_eq!(budget.check(), Err(BudgetStop::Cancelled));
     assert_eq!(budget.work(CHECK_EVERY), Err(BudgetStop::Cancelled));
 }
+
+/// A part spends from the whole's limit while it lives, and what it kept
+/// for the rest of its evaluation returns to the whole when it is dropped;
+/// what the whole kept itself stays.
+#[test]
+fn a_part_returns_what_it_kept_when_it_ends() {
+    let whole = Arc::new(QueryBudget::new(100));
+    whole.reserve(30).expect("whole").keep_until_query_ends();
+    for _ in 0..10 {
+        let part = whole.part();
+        part.reserve(60).expect("part").keep_until_query_ends();
+        assert_eq!(whole.memory_used(), 90);
+        assert!(
+            matches!(part.reserve(20), Err(BudgetStop::Memory { limit: 100, .. })),
+            "the part is held to the whole's limit"
+        );
+        let mut charge = part.empty_charge();
+        charge.grow(5).expect("within");
+        charge.shrink(5);
+        assert_eq!(whole.memory_used(), 90);
+    }
+    assert_eq!(whole.memory_used(), 30);
+    assert_eq!(whole.memory_peak(), 95);
+}
+
+/// A part counts its work toward the whole's checks and stops for the
+/// whole's cancellation.
+#[test]
+fn a_part_works_and_stops_with_the_whole() {
+    let whole = Arc::new(QueryBudget::new(100));
+    let part = whole.part();
+    part.work(CHECK_EVERY - 1).expect("no check yet");
+    whole.cancel();
+    assert_eq!(part.check(), Err(BudgetStop::Cancelled));
+    assert_eq!(part.work(1), Err(BudgetStop::Cancelled));
+    assert_eq!(whole.work_done(), CHECK_EVERY);
+}

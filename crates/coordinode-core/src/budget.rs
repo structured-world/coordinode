@@ -12,7 +12,11 @@
 //!
 //! The budget is bound when a request is admitted and is never replaced while
 //! it runs: an alternative path after damage is found, a retry or a parallel
-//! operator spends from the same one.
+//! operator spends from the same one. An evaluation that ends before the
+//! query does (a subquery run once per row) spends through a [part] of it,
+//! which returns what that evaluation kept when it ends.
+//!
+//! [part]: QueryBudget::part
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,6 +109,10 @@ pub struct QueryBudget {
     cancelled: CancelFlag,
     /// The deadline on `clock`, or `None` without one.
     deadline: Option<(u64, MonotonicNanos)>,
+    /// The budget this one is a part of: every reservation is made there
+    /// too, work is counted and checked there, and what this part still
+    /// holds returns there when it is dropped.
+    whole: Option<Arc<QueryBudget>>,
 }
 
 impl QueryBudget {
@@ -118,6 +126,25 @@ impl QueryBudget {
             checked_at: AtomicU64::new(0),
             cancelled: CancelFlag::new(),
             deadline: None,
+            whole: None,
+        }
+    }
+
+    /// A part of this budget for an evaluation that ends before the query
+    /// does, such as a subquery run once per row. It spends from this
+    /// budget's limit, deadline and cancellation; memory kept in it "until
+    /// the query ends" is kept until the part is dropped, which is when that
+    /// evaluation ends, and returns to this budget then.
+    pub fn part(self: &Arc<Self>) -> Self {
+        Self {
+            limit: self.limit,
+            used: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            work: AtomicU64::new(0),
+            checked_at: AtomicU64::new(0),
+            cancelled: self.cancelled.clone(),
+            deadline: self.deadline,
+            whole: Some(Arc::clone(self)),
         }
     }
 
@@ -191,6 +218,10 @@ impl QueryBudget {
     ///
     /// [`BudgetStop::Deadline`] or [`BudgetStop::Cancelled`].
     pub fn work(&self, units: u64) -> Result<(), BudgetStop> {
+        if let Some(whole) = &self.whole {
+            self.work.fetch_add(units, Ordering::AcqRel);
+            return whole.work(units);
+        }
         let done = self
             .work
             .fetch_add(units, Ordering::AcqRel)
@@ -221,6 +252,14 @@ impl QueryBudget {
     }
 
     fn take(&self, bytes: u64) -> Result<(), BudgetStop> {
+        // The whole decides against the query's limit; the part only counts
+        // what it holds of it, which the whole's admission bounds.
+        if let Some(whole) = &self.whole {
+            whole.take(bytes)?;
+            let after = self.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.peak.fetch_max(after, Ordering::AcqRel);
+            return Ok(());
+        }
         // Compare-and-swap, not add-then-undo: a refused reservation never
         // shows in `used`, so a concurrent one is not refused for it, and a
         // request near u64::MAX is refused rather than wrapping the counter.
@@ -257,6 +296,22 @@ impl QueryBudget {
             before >= bytes,
             "returned {bytes} bytes with {before} reserved"
         );
+        if let Some(whole) = &self.whole {
+            whole.give(bytes);
+        }
+    }
+}
+
+impl Drop for QueryBudget {
+    fn drop(&mut self) {
+        // Every charge borrows the budget, so none is left: what is still
+        // held was kept for the evaluation this part served, which is over.
+        if let Some(whole) = &self.whole {
+            let held = *self.used.get_mut();
+            if held > 0 {
+                whole.give(held);
+            }
+        }
     }
 }
 

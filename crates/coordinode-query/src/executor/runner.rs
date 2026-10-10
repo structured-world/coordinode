@@ -1413,6 +1413,26 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
+    /// Run `evaluate`, an evaluation that ends before the statement does (a
+    /// subquery run once per row), under a part of the statement's budget,
+    /// then `finish` with its result under the statement's budget. What the
+    /// evaluation kept stays reserved through `finish`, which still owns it,
+    /// and returns when both are done, so repeated evaluations do not
+    /// accumulate against the limit.
+    pub fn in_budget_part<T, U>(
+        &mut self,
+        evaluate: impl FnOnce(&mut Self) -> Result<T, ExecutionError>,
+        finish: impl FnOnce(&mut Self, T) -> Result<U, ExecutionError>,
+    ) -> Result<U, ExecutionError> {
+        let part = Arc::new(self.budget.part());
+        let whole = core::mem::replace(&mut self.budget, Arc::clone(&part));
+        let evaluated = evaluate(self);
+        self.budget = whole;
+        let finished = evaluated.and_then(|value| finish(self, value));
+        drop(part);
+        finished
+    }
+
     /// Read the current label schema by name. Returns `None` if the label
     /// has no schema declared.
     ///
@@ -3729,70 +3749,89 @@ fn charge_returned(
     Ok(rows)
 }
 
-/// Whether evaluating one of `items` reads storage (a subquery or pattern
-/// expression), which works outside the statement's budget.
-fn set_items_read_storage(items: &[crate::plan::SetItem]) -> bool {
+/// The first operator outside the statement's budget among the subqueries
+/// `expr` evaluates, or `None` when it evaluates none or each is accounted.
+/// Only the positions the storage-aware evaluator reaches are looked at: a
+/// subquery elsewhere is evaluated by the pure path, which reads nothing.
+fn expr_unaccounted(expr: &crate::plan::expr::Expr) -> Option<&'static str> {
+    use crate::plan::expr::Expr as PExpr;
+    match expr {
+        PExpr::ExistsSubplan(subplan) | PExpr::CountSubplan(subplan) => {
+            first_unaccounted_operator(&subplan.root)
+        }
+        PExpr::CollectSubplan { subplan, .. } | PExpr::PatternComprehension { subplan, .. } => {
+            first_unaccounted_operator(&subplan.root)
+        }
+        PExpr::ListComprehension {
+            list, filter, map, ..
+        } => expr_unaccounted(list)
+            .or_else(|| filter.as_deref().and_then(expr_unaccounted))
+            .or_else(|| map.as_deref().and_then(expr_unaccounted)),
+        PExpr::ListQuantifier {
+            list, predicate, ..
+        } => expr_unaccounted(list).or_else(|| expr_unaccounted(predicate)),
+        PExpr::Unary { operand, .. } => expr_unaccounted(operand),
+        PExpr::Binary { left, right, .. } => {
+            expr_unaccounted(left).or_else(|| expr_unaccounted(right))
+        }
+        _ => None,
+    }
+}
+
+/// [`expr_unaccounted`] over the expressions of `items`.
+fn set_items_unaccounted(items: &[crate::plan::SetItem]) -> Option<&'static str> {
     use crate::plan::SetItem;
-    items.iter().any(|item| match item {
+    items.iter().find_map(|item| match item {
         SetItem::Property { expr, .. }
         | SetItem::PropertyPath { expr, .. }
         | SetItem::ReplaceProperties { expr, .. }
-        | SetItem::MergeProperties { expr, .. } => neutral_contains_subplan(expr),
-        SetItem::DocFunction { value_expr, .. } => neutral_contains_subplan(value_expr),
-        SetItem::AddLabel { .. } => false,
+        | SetItem::MergeProperties { expr, .. } => expr_unaccounted(expr),
+        SetItem::DocFunction { value_expr, .. } => expr_unaccounted(value_expr),
+        SetItem::AddLabel { .. } => None,
     })
 }
 
 /// The first operator of `op`'s tree whose work is not charged to the
 /// statement's budget, or `None` when every operator's is. An operator is
 /// accounted when it counts its work and reserves what it keeps, and every
-/// expression it evaluates stays out of storage (a subquery or pattern
-/// expression reads unaccounted).
+/// subquery its expressions evaluate is accounted in turn.
 fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
+    let filters = |filters: &[(String, crate::plan::expr::Expr)]| {
+        filters.iter().find_map(|(_, e)| expr_unaccounted(e))
+    };
     match op {
         LogicalOp::NodeScan {
             property_filters, ..
-        } if !property_filters
-            .iter()
-            .any(|(_, e)| neutral_contains_subplan(e)) =>
-        {
-            None
-        }
-        LogicalOp::IndexScan { value_expr, .. } if !neutral_contains_subplan(value_expr) => None,
+        } => filters(property_filters),
+        LogicalOp::IndexScan { value_expr, .. } => expr_unaccounted(value_expr),
         LogicalOp::Empty => None,
-        LogicalOp::Filter { input, predicate } if !neutral_contains_subplan(predicate) => {
-            first_unaccounted_operator(input)
+        LogicalOp::Filter { input, predicate } => {
+            expr_unaccounted(predicate).or_else(|| first_unaccounted_operator(input))
         }
-        LogicalOp::Project { input, items, .. }
-            if !items.iter().any(|i| neutral_contains_subplan(&i.expr)) =>
-        {
-            first_unaccounted_operator(input)
-        }
-        LogicalOp::Sort { input, items }
-            if !items.iter().any(|i| neutral_contains_subplan(&i.expr)) =>
-        {
-            first_unaccounted_operator(input)
-        }
+        LogicalOp::Project { input, items, .. } => items
+            .iter()
+            .find_map(|i| expr_unaccounted(&i.expr))
+            .or_else(|| first_unaccounted_operator(input)),
+        LogicalOp::Sort { input, items } => items
+            .iter()
+            .find_map(|i| expr_unaccounted(&i.expr))
+            .or_else(|| first_unaccounted_operator(input)),
         LogicalOp::Limit { input, .. } | LogicalOp::Skip { input, .. } => {
             first_unaccounted_operator(input)
         }
-        LogicalOp::Unwind { input, expr, .. } if !neutral_contains_subplan(expr) => {
-            first_unaccounted_operator(input)
+        LogicalOp::Unwind { input, expr, .. } => {
+            expr_unaccounted(expr).or_else(|| first_unaccounted_operator(input))
         }
         // Writes stage into the transaction, which charges what it stages;
         // their own rows are charged as they return them.
         LogicalOp::CreateNode {
             input, properties, ..
-        } if !properties.iter().any(|(_, e)| neutral_contains_subplan(e)) => {
-            input.as_deref().and_then(first_unaccounted_operator)
-        }
+        } => filters(properties).or_else(|| input.as_deref().and_then(first_unaccounted_operator)),
         LogicalOp::CreateEdge {
             input, properties, ..
-        } if !properties.iter().any(|(_, e)| neutral_contains_subplan(e)) => {
-            first_unaccounted_operator(input)
-        }
-        LogicalOp::Update { input, items, .. } if !set_items_read_storage(items) => {
-            first_unaccounted_operator(input)
+        } => filters(properties).or_else(|| first_unaccounted_operator(input)),
+        LogicalOp::Update { input, items, .. } => {
+            set_items_unaccounted(items).or_else(|| first_unaccounted_operator(input))
         }
         LogicalOp::RemoveOp { input, .. } | LogicalOp::Delete { input, .. } => {
             first_unaccounted_operator(input)
@@ -3801,6 +3840,11 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
             first_unaccounted_operator(left).or_else(|| first_unaccounted_operator(right))
         }
         LogicalOp::Union { inputs, .. } => inputs.iter().find_map(first_unaccounted_operator),
+        // A body run once per row or element spends through a part of the
+        // budget; its list is evaluated without storage.
+        LogicalOp::Foreach { input, body, .. } | LogicalOp::CallSubquery { input, body, .. } => {
+            first_unaccounted_operator(body).or_else(|| first_unaccounted_operator(input))
+        }
         // A node MERGE matches through its scan; a relationship MERGE matches
         // through its traversal or, bound to its endpoints, walks the source's
         // edges with the same charged hop. Both create into the transaction.
@@ -3809,36 +3853,32 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
             on_match,
             on_create,
             ..
-        } if (matches!(
+        } if matches!(
             **pattern,
             LogicalOp::NodeScan { .. } | LogicalOp::IndexScan { .. }
-        ) || as_traverse_op(pattern).is_some())
-            && !set_items_read_storage(on_match)
-            && !set_items_read_storage(on_create) =>
+        ) || as_traverse_op(pattern).is_some() =>
         {
-            first_unaccounted_operator(pattern)
+            set_items_unaccounted(on_match)
+                .or_else(|| set_items_unaccounted(on_create))
+                .or_else(|| first_unaccounted_operator(pattern))
         }
         LogicalOp::Traverse {
             input,
             target_filters,
             edge_filters,
             ..
-        } if !target_filters
-            .iter()
-            .chain(edge_filters)
-            .any(|(_, e)| neutral_contains_subplan(e)) =>
-        {
-            first_unaccounted_operator(input)
-        }
+        } => filters(target_filters)
+            .or_else(|| filters(edge_filters))
+            .or_else(|| first_unaccounted_operator(input)),
         LogicalOp::Aggregate {
             input,
             group_by,
             aggregates,
-        } if !group_by.iter().any(neutral_contains_subplan)
-            && !aggregates.iter().any(|a| neutral_contains_subplan(&a.arg)) =>
-        {
-            first_unaccounted_operator(input)
-        }
+        } => group_by
+            .iter()
+            .find_map(expr_unaccounted)
+            .or_else(|| aggregates.iter().find_map(|a| expr_unaccounted(&a.arg)))
+            .or_else(|| first_unaccounted_operator(input)),
         other => Some(other.operator_name()),
     }
 }
@@ -4368,26 +4408,28 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             if is_relationship_merge(right) || right_has_correlated_filter(right) {
                 let prev_corr = ctx.correlated_row.take();
                 let mut result = Vec::new();
+                // Each left row's right side holds its rows only until they
+                // are joined; the joined rows are the statement's.
+                let mut joined = Ok(());
                 for lr in &left_rows {
                     ctx.correlated_row = Some(lr.clone());
-                    let rr = match execute_op(right, ctx) {
-                        Ok(rr) => rr,
-                        Err(e) => {
-                            ctx.correlated_row = prev_corr;
-                            return Err(e);
-                        }
-                    };
-                    for r in rr {
-                        let mut merged = lr.clone();
-                        merged.extend(r);
-                        if let Err(e) = keep_joined(ctx, merged, &mut result) {
-                            ctx.correlated_row = prev_corr;
-                            return Err(e);
-                        }
+                    joined = ctx.in_budget_part(
+                        |ctx| execute_op(right, ctx),
+                        |ctx, rr| {
+                            for r in rr {
+                                let mut merged = lr.clone();
+                                merged.extend(r);
+                                keep_joined(ctx, merged, &mut result)?;
+                            }
+                            Ok(())
+                        },
+                    );
+                    if joined.is_err() {
+                        break;
                     }
                 }
                 ctx.correlated_row = prev_corr;
-                return Ok(result);
+                return joined.map(|()| result);
             }
 
             let right_rows = execute_op(right, ctx)?;
@@ -4890,8 +4932,21 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     let mut scoped = row.clone();
                     scoped.insert(variable.clone(), elem);
                     ctx.foreach_scope = Some(scoped);
-                    // Body is run for its side effects; FOREACH is pass-through.
-                    execute_op(body, ctx)?;
+                    // Body is run for its side effects; FOREACH is
+                    // pass-through, so the rows the body returns are held
+                    // for this iteration only. Its writes are staged on the
+                    // transaction, which charges them to the statement.
+                    let ran = ctx
+                        .budget
+                        .work(1)
+                        .map_err(ExecutionError::from)
+                        .and_then(|()| {
+                            ctx.in_budget_part(|ctx| execute_op(body, ctx), |_, _| Ok(()))
+                        });
+                    if let Err(e) = ran {
+                        ctx.foreach_scope = prev_scope;
+                        return Err(e);
+                    }
                 }
             }
             ctx.foreach_scope = prev_scope;
@@ -4906,26 +4961,36 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             let input_rows = execute_op(input, ctx)?;
             let prev_scope = ctx.foreach_scope.take();
             let mut result = Vec::new();
+            let mut called = Ok(());
             for row in &input_rows {
                 // Inject the outer row at the body's Empty leaf so a leading
                 // importing WITH can project the correlated variables. An
                 // uncorrelated body (its own scan leaf) ignores this.
                 ctx.foreach_scope = Some(row.clone());
-                let sub_rows = execute_op(body, ctx)?;
-                if sub_rows.is_empty() && *optional {
-                    // OPTIONAL CALL: keep the outer row; subquery columns read
-                    // as NULL since they are absent.
-                    result.push(row.clone());
-                } else {
-                    for sr in sub_rows {
-                        let mut merged = row.clone();
-                        merged.extend(sr);
-                        result.push(merged);
-                    }
+                // The body's rows are held only until they are joined to
+                // the outer row; the joined rows are the statement's.
+                called = ctx.in_budget_part(
+                    |ctx| execute_op(body, ctx),
+                    |ctx, sub_rows| {
+                        if sub_rows.is_empty() && *optional {
+                            // OPTIONAL CALL: keep the outer row; subquery
+                            // columns read as NULL since they are absent.
+                            return keep_joined(ctx, row.clone(), &mut result);
+                        }
+                        for sr in sub_rows {
+                            let mut merged = row.clone();
+                            merged.extend(sr);
+                            keep_joined(ctx, merged, &mut result)?;
+                        }
+                        Ok(())
+                    },
+                );
+                if called.is_err() {
+                    break;
                 }
             }
             ctx.foreach_scope = prev_scope;
-            Ok(result)
+            called.map(|()| result)
         }
 
         LogicalOp::CreateNode {
@@ -9711,31 +9776,36 @@ fn join_correlated(
     for left_row in left_rows {
         ctx.correlated_row = Some(left_row.clone());
 
-        let right_rows = execute_op(right_op, ctx)?;
+        // The right side's rows are held only until they are joined.
+        ctx.in_budget_part(
+            |ctx| execute_op(right_op, ctx),
+            |ctx, right_rows| {
+                let mut matched = false;
+                ctx.budget.work(right_rows.len() as u64)?;
+                for rr in right_rows {
+                    let shared_match = rr.iter().all(|(key, rval)| match left_row.get(key) {
+                        Some(lval) => lval == rval,
+                        None => true,
+                    });
 
-        let mut matched = false;
-        ctx.budget.work(right_rows.len() as u64)?;
-        for rr in &right_rows {
-            let shared_match = rr.iter().all(|(key, rval)| match left_row.get(key) {
-                Some(lval) => lval == rval,
-                None => true,
-            });
+                    if shared_match {
+                        let mut merged = left_row.clone();
+                        merged.extend(rr);
+                        keep_joined(ctx, merged, &mut results)?;
+                        matched = true;
+                    }
+                }
 
-            if shared_match {
-                let mut merged = left_row.clone();
-                merged.extend(rr.clone());
-                keep_joined(ctx, merged, &mut results)?;
-                matched = true;
-            }
-        }
-
-        if !matched {
-            let mut out = left_row.clone();
-            for var in right_vars {
-                out.entry(var.clone()).or_insert(Value::Null);
-            }
-            keep_joined(ctx, out, &mut results)?;
-        }
+                if !matched {
+                    let mut out = left_row.clone();
+                    for var in right_vars {
+                        out.entry(var.clone()).or_insert(Value::Null);
+                    }
+                    keep_joined(ctx, out, &mut results)?;
+                }
+                Ok(())
+            },
+        )?;
     }
 
     Ok(results)
@@ -9772,6 +9842,16 @@ fn collect_filter_variables(op: &LogicalOp, vars: &mut Vec<String>) {
             }
             collect_filter_variables(input, vars);
         }
+        // A pattern's inline properties (`(q:Q {i: p.i})`) and the key of
+        // the point lookup they become read outer variables the same way.
+        LogicalOp::NodeScan {
+            property_filters, ..
+        } => {
+            for (_, expr) in property_filters {
+                collect_expr_vars(expr, vars);
+            }
+        }
+        LogicalOp::IndexScan { value_expr, .. } => collect_expr_vars(value_expr, vars),
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             collect_filter_variables(left, vars);
             collect_filter_variables(right, vars);
@@ -10953,31 +11033,46 @@ fn eval_neutral_with_storage(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Value, ExecutionError> {
     use crate::plan::expr::{BinOp, Expr as PExpr};
+    // A subquery runs once per row: what it holds is held for that
+    // evaluation only. The value it yields joins the row, which the
+    // operator evaluating this expression charges with its output.
     match expr {
-        PExpr::ExistsSubplan(subplan) => exists_subplan_matches(subplan, row, ctx),
-        PExpr::CountSubplan(subplan) => {
-            let rows = correlated_subplan_rows(subplan, row, ctx)?;
-            Ok(Value::Int(i64::try_from(rows.len()).unwrap_or(i64::MAX)))
-        }
+        PExpr::ExistsSubplan(subplan) => ctx.in_budget_part(
+            |ctx| exists_subplan_matches(subplan, row, ctx),
+            |_, value| Ok(value),
+        ),
+        PExpr::CountSubplan(subplan) => ctx.in_budget_part(
+            |ctx| {
+                let rows = correlated_subplan_rows(subplan, row, ctx)?;
+                Ok(Value::Int(i64::try_from(rows.len()).unwrap_or(i64::MAX)))
+            },
+            |_, value| Ok(value),
+        ),
         PExpr::CollectSubplan {
             subplan,
             projection,
-        } => {
-            let rows = correlated_subplan_rows(subplan, row, ctx)?;
-            Ok(Value::Array(
-                rows.iter()
-                    .map(|er| eval_neutral(projection, er))
-                    .collect::<Result<_, _>>()?,
-            ))
-        }
-        PExpr::PatternComprehension { subplan, map } => {
-            let rows = correlated_subplan_rows(subplan, row, ctx)?;
-            Ok(Value::Array(
-                rows.iter()
-                    .map(|er| eval_neutral(map, er))
-                    .collect::<Result<_, _>>()?,
-            ))
-        }
+        } => ctx.in_budget_part(
+            |ctx| {
+                let rows = correlated_subplan_rows(subplan, row, ctx)?;
+                Ok(Value::Array(
+                    rows.iter()
+                        .map(|er| eval_neutral(projection, er))
+                        .collect::<Result<_, _>>()?,
+                ))
+            },
+            |_, value| Ok(value),
+        ),
+        PExpr::PatternComprehension { subplan, map } => ctx.in_budget_part(
+            |ctx| {
+                let rows = correlated_subplan_rows(subplan, row, ctx)?;
+                Ok(Value::Array(
+                    rows.iter()
+                        .map(|er| eval_neutral(map, er))
+                        .collect::<Result<_, _>>()?,
+                ))
+            },
+            |_, value| Ok(value),
+        ),
         PExpr::ListComprehension {
             var,
             list,
@@ -10990,6 +11085,8 @@ fn eval_neutral_with_storage(
             let mut scratch = row.clone();
             let mut out = Vec::with_capacity(items.len());
             for item in items {
+                // A storage read per element.
+                ctx.budget.work(1)?;
                 bind_path_element(&mut scratch, var, &item, ctx)?;
                 let keep = match filter {
                     Some(p) => matches!(
@@ -11020,6 +11117,8 @@ fn eval_neutral_with_storage(
             let mut scratch = row.clone();
             let mut true_count = 0usize;
             for item in items {
+                // A storage read per element.
+                ctx.budget.work(1)?;
                 bind_path_element(&mut scratch, var, &item, ctx)?;
                 if matches!(
                     eval_neutral_with_storage(predicate, &scratch, ctx)?,
@@ -11062,6 +11161,7 @@ fn exists_subplan_matches(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Value, ExecutionError> {
     let rows = execute_op(&subplan.root, ctx)?;
+    ctx.budget.work(rows.len() as u64)?;
     let any = rows
         .iter()
         .any(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)));
@@ -11077,15 +11177,17 @@ fn correlated_subplan_rows(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let rows = execute_op(&subplan.root, ctx)?;
-    Ok(rows
-        .into_iter()
-        .filter(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)))
-        .map(|rr| {
+    let mut merged_rows = Vec::new();
+    for rr in rows {
+        if rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)) {
             let mut merged = row.clone();
             merged.extend(rr);
-            merged
-        })
-        .collect())
+            keep_joined(ctx, merged, &mut merged_rows)?;
+        } else {
+            ctx.budget.work(1)?;
+        }
+    }
+    Ok(merged_rows)
 }
 
 /// Create a relationship edge described by `traverse` between the source and target

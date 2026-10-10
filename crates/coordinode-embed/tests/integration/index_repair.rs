@@ -807,13 +807,12 @@ fn a_lookup_answered_by_the_records_stays_within_its_memory_limit() {
 }
 
 /// A lookup the index cannot answer is refused before reading the records
-/// when the rest of the statement runs work outside its budget (a filter
-/// with a pattern subquery, which reads storage): it names the index and
-/// the operator. Accounted operators over the same lookup (a traversal, an
-/// optional match, an aggregate, a relationship MERGE, a detaching delete)
-/// answer from the records exactly as the sound index would, and the delete
-/// removes the node that holds the value, not the one the wrong entry
-/// named.
+/// when the rest of the statement runs work outside its budget (a procedure
+/// call): it names the index and the operator. Accounted operators over the
+/// same lookup (a traversal, an optional match, a pattern subquery, an
+/// aggregate, a relationship MERGE, a detaching delete) answer from the
+/// records exactly as the sound index would, and the delete removes the
+/// node that holds the value, not the one the wrong entry named.
 #[test]
 fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     use coordinode_embed::db::DatabaseError;
@@ -826,24 +825,26 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     db.execute_cypher("CREATE (:U {email: 'z@x'})").expect("z");
     let optional = "MATCH (u:U {email: 'a@x'}) OPTIONAL MATCH (u)-[:R]->(t:T) RETURN t.n AS n";
     let traverse = "MATCH (u:U {email: 'a@x'})-[:R]->(t:T) RETURN t.n AS n";
+    let exists = "MATCH (u:U {email: 'a@x'}) WHERE EXISTS { MATCH (u)-[:R]->(:T) } \
+                  RETURN count { MATCH (u)-[:R]->(:T) } AS n";
     let count = "MATCH (u:U {email: 'a@x'}) RETURN count(u) AS n";
 
     let wrong = id_of(&mut db, "z@x");
     misattribute(&db, "u_email", "a@x", wrong);
     let refused = db
-        .execute_cypher("MATCH (u:U {email: 'a@x'}) WHERE EXISTS { MATCH (u)-[:R]->() } RETURN u");
+        .execute_cypher("MATCH (u:U {email: 'a@x'}) CALL dbms.procedures() YIELD name RETURN name");
     assert!(
         matches!(
             &refused,
             Err(DatabaseError::Execution(ExecutionError::IndexUnresolved {
                 label,
                 property,
-                operator: "Filter",
+                operator: "ProcedureCall",
             })) if label == "U" && property == "email"
         ),
         "{refused:?}"
     );
-    for query in [optional, traverse] {
+    for query in [optional, traverse, exists] {
         let rows = db.execute_cypher(query).expect("accounted");
         assert_eq!(rows.len(), 1, "{query}");
         assert_eq!(rows[0].get("n"), Some(&Value::Int(1)), "{query}");

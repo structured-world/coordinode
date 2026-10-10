@@ -6660,6 +6660,43 @@ fn optional_match_correlated_no_match_returns_null() {
 }
 
 #[test]
+fn optional_match_inline_property_from_outer_scope_resolves_per_row() {
+    // The pattern's inline property is the only reference to the outer row:
+    // run once without it, `a.age` is Null and the optional side never
+    // matches, leaving every row NULL. Alice(30) and Charlie(30) share an
+    // age; Bob(25) matches only himself.
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "MATCH (a:Person) WHERE a.name IN ['Alice', 'Bob'] \
+         OPTIONAL MATCH (b:Person {age: a.age}) \
+         RETURN a.name AS self_name, b.name AS peer",
+        engine,
+        &mut interner,
+    );
+
+    let peers_of = |name: &str| {
+        let mut peers: Vec<Value> = results
+            .iter()
+            .filter(|r| r.get("self_name") == Some(&Value::String(name.into())))
+            .map(|r| r.get("peer").cloned().unwrap_or(Value::Null))
+            .collect();
+        peers.sort_by_key(|v| format!("{v:?}"));
+        peers
+    };
+    assert_eq!(
+        peers_of("Alice"),
+        vec![
+            Value::String("Alice".into()),
+            Value::String("Charlie".into())
+        ],
+        "{results:?}"
+    );
+    assert_eq!(peers_of("Bob"), vec![Value::String("Bob".into())]);
+}
+
+#[test]
 fn optional_match_correlated_traversal_with_cross_scope() {
     // More realistic pattern: MATCH (a) OPTIONAL MATCH (b)-[:R]->(c) WHERE c.x = f(a.y)
     // Here "a" is only in left scope, "b" and "c" are in right scope.

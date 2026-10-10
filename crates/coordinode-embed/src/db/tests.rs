@@ -718,6 +718,45 @@ fn writes_past_the_statement_memory_limit_are_refused_and_leave_nothing() {
     assert_eq!(count(&db), Some(Value::Int(2000)));
 }
 
+/// A pattern subquery evaluated once per row holds its rows only while it is
+/// evaluated: a statement whose every row runs one stays within a limit that
+/// holds the result and one evaluation, however many rows run it.
+#[test]
+fn a_subquery_run_per_row_does_not_accumulate_against_the_limit() {
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    db.execute_cypher_shared(
+        "UNWIND range(1, 100) AS i CREATE (:P {i: i})-[:R]->(:Q {i: i})",
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("data");
+    // Every evaluation holds about 10 KiB; a hundred of them kept would be
+    // four times this limit.
+    let limit = StatementOptions {
+        query_memory_limit: Some(256 << 10),
+        ..StatementOptions::default()
+    };
+    for query in [
+        "MATCH (p:P) WHERE EXISTS { MATCH (p)-[:R]->(:Q) } RETURN count(p) AS n",
+        "MATCH (p:P) RETURN count { MATCH (p)-[:R]->(:Q) } AS n ORDER BY n LIMIT 1",
+        "MATCH (p:P) MATCH (q:Q {i: p.i}) RETURN count(q) AS n",
+        "MATCH (p:P) OPTIONAL MATCH (q:Q {i: p.i}) RETURN count(q) AS n",
+        "MATCH (p:P) CALL { WITH p MATCH (q:Q {i: p.i}) RETURN q } RETURN count(q) AS n",
+        "MATCH (p:P) FOREACH (x IN range(1, 10) | SET p.k = x) RETURN count(p) AS n",
+    ] {
+        let rows = db
+            .execute_cypher_shared_with(query, None, None, &limit)
+            .unwrap_or_else(|e| panic!("{query}: {e:?}"))
+            .rows;
+        let expected = if query.contains("count {") { 1 } else { 100 };
+        assert_eq!(rows[0].get("n"), Some(&Value::Int(expected)), "{query}");
+    }
+}
+
 /// In an interactive transaction, a statement whose writes did not fit its
 /// limit fails, and the transaction cannot then commit what was staged
 /// before the refusal: committing would apply part of that statement.
