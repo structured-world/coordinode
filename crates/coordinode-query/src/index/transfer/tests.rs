@@ -271,6 +271,117 @@ fn a_receiver_keeps_qualified_proofs_and_marks_the_rest() {
     assert!(proved.is_empty());
 }
 
+/// A receiver with its qualifier registered over a fresh registry.
+fn receiver() -> Arc<TestEnv> {
+    let receiver = TestEnv::open();
+    receiver
+        .engine
+        .set_index_copy_qualifier(Arc::new(CopyQualifier::new(Arc::new(IndexRegistry::new()))));
+    receiver
+}
+
+/// The sender's inventory, captured and sealed, with nothing found.
+fn sealed_inventory(sender: &Member) -> Vec<u8> {
+    let (qualifier, _) = qualifier(sender);
+    let engine = &sender.env.engine;
+    qualifier
+        .seal(engine, &qualifier.capture(engine).expect("capture"))
+        .expect("seal")
+}
+
+/// A proof of another interpretation (another key layout here) does not
+/// qualify the receiver's copy: the evidence must describe the definition
+/// installed with it.
+#[test]
+fn a_proof_of_another_interpretation_does_not_qualify() {
+    let sender = member();
+    let mut entries: Vec<Entry> =
+        rmp_serde::from_slice(&sealed_inventory(&sender)).expect("decode");
+    for entry in &mut entries {
+        if let CopyState::Qualified(proof) = &mut entry.state {
+            proof.layout += 1;
+        }
+    }
+    let altered = rmp_serde::to_vec(&entries).expect("encode");
+    let receiver = receiver();
+    install(&receiver.engine, &sender.env.engine, Some(&altered));
+    let (marked, proved) = marked_and_proved(&receiver.engine);
+    assert_eq!(marked.len(), 2, "both copies are checked here: {marked:?}");
+    assert!(proved.is_empty());
+}
+
+/// A finding the receiver stored against its own copy before the transfer
+/// is not discharged by the sender's proof: the copy stays unfit here.
+#[test]
+fn a_receivers_own_finding_outlives_the_senders_proof() {
+    let sender = member();
+    let inventory = sealed_inventory(&sender);
+    let receiver = receiver();
+    let store = LocalIndexStore::new(&receiver.engine);
+    let copy = store
+        .bind_local_copy(sender.email.generation)
+        .expect("bind");
+    store.mark_unfit_here(copy).expect("the receiver's finding");
+    install(&receiver.engine, &sender.env.engine, Some(&inventory));
+    let (marked, proved) = marked_and_proved(&receiver.engine);
+    assert_eq!(
+        marked,
+        vec![sender.email.generation.as_raw()],
+        "its own finding stands"
+    );
+    assert_eq!(
+        proved.len(),
+        2,
+        "the proofs are kept for when it is checked"
+    );
+    let reopened = IndexRegistry::new();
+    reopened.load_all(&receiver.engine).expect("load");
+    assert!(reopened.is_suspect(sender.email.generation));
+    assert!(!reopened.is_suspect(sender.empty.generation));
+}
+
+/// A receiver that checked a copy it received unproved keeps the proof of
+/// its own check, and a transfer it sends later carries that proof.
+#[test]
+fn a_receivers_own_proof_travels_with_its_next_transfer() {
+    let sender = member();
+    let receiver = receiver();
+    install(&receiver.engine, &sender.env.engine, None);
+    let registry = Arc::new(IndexRegistry::new());
+    registry
+        .recover_local_guards(&receiver.engine)
+        .expect("recover");
+    registry.load_all(&receiver.engine).expect("load");
+    let def = LocalIndexStore::new(&receiver.engine)
+        .load_definition(sender.email.id)
+        .expect("load")
+        .expect("installed definition");
+    let revision = registry.local_revision(def.generation);
+    assert!(
+        registry
+            .verified_here(&receiver.engine, &def, revision, 7)
+            .expect("a check here proves it"),
+        "lifted"
+    );
+    let qualifier = CopyQualifier::new(Arc::clone(&registry));
+    let engine = &receiver.engine;
+    let sealed = qualifier
+        .seal(engine, &qualifier.capture(engine).expect("capture"))
+        .expect("seal");
+    assert!(
+        matches!(
+            states(&sealed).get(&def.generation.as_raw()),
+            Some(CopyState::Qualified(proof)) if proof.verified_at == 7
+        ),
+        "its own check's proof"
+    );
+    assert_eq!(
+        states(&sealed).get(&sender.empty.generation.as_raw()),
+        Some(&CopyState::Excluded),
+        "the copy it has not checked yet stays excluded"
+    );
+}
+
 /// An install interrupted before its inventory was taken leaves the
 /// transfer pending: the next open marks every copy, and a copy the
 /// receiver had a stale proof of is not taken as proved by it.
