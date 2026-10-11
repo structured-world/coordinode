@@ -480,8 +480,11 @@ ALTER NAMESPACE SET INDEX MAINTENANCE DERIVED     -- default for new indexes
   an index to the current default.
 - `ALTER INDEX` changes the profile under a new maintenance epoch without
   rewriting any entry. A transaction that staged index changes under the
-  previous epoch is refused at commit with `record version mismatch`, and
-  succeeds when retried. Only a built B-tree index can be altered.
+  previous epoch is refused at commit as a write conflict (retryable, like
+  any conflict), and succeeds when retried; a single statement outside a
+  transaction is retried by the engine itself. The same holds for a write
+  that meets a build publishing, a rebuild or a drop of an index it writes.
+  Only a built B-tree index can be altered.
 - `CREATE INDEX` and `ALTER INDEX` return `maintenance` (`RESOLVED` or
   `DERIVED`), `maintenance_source` (`OVERRIDE`, or `NAMESPACE@<revision>`
   for an index bound to the namespace default) and `maintenance_epoch`;

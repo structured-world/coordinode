@@ -1370,6 +1370,16 @@ impl<'a> Transaction<'a> {
         for (part, key, expected) in &self.expected_versions {
             let current = self.engine.record_version(*part, key)?;
             if current != *expected {
+                // An index definition the effects were bound to moved under
+                // them (a build published, a rebuild or a drop): the write
+                // lost to that change and runs again under the one in force.
+                if *part == Partition::Schema && self.derived.binds(key) {
+                    return Err(CommitError::Conflict(
+                        "an index this transaction writes changed before it committed; \
+                         run it again"
+                            .into(),
+                    ));
+                }
                 return Err(CommitError::RevisionMismatch {
                     expected: *expected,
                     current,

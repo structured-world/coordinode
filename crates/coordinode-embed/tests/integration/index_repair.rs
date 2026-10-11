@@ -532,6 +532,64 @@ fn wide_damage_rebuilds_the_index() {
     assert_eq!(found_by(&mut db, "city", "oslo"), ids);
 }
 
+/// While a unique index is rebuilt, and after, every lookup answers what a
+/// scan of the records answers, a value a node holds is refused to another
+/// node naming the holder, and a free value is taken: exact reads and
+/// admission follow the records, not the state of the build.
+#[test]
+fn reads_and_admission_follow_the_records_through_a_rebuild() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("UNWIND range(1, 300) AS i CREATE (:U {email: 'u' + toString(i) + '@x'})")
+        .expect("users");
+    let generation = db
+        .reindex(
+            &IndexSelector::Name("u_email".into()),
+            std::time::Duration::ZERO,
+        )
+        .expect("start the rebuild");
+
+    let agree = |db: &mut Database, round: &str| {
+        for i in [1, 77, 150, 299] {
+            let email = format!("u{i}@x");
+            let holder = id_of(db, &email);
+            assert_eq!(
+                found(db, &email),
+                vec![holder],
+                "{round}: lookup of {email}"
+            );
+            let refused = db
+                .execute_cypher(&format!("CREATE (:U {{email: '{email}'}})"))
+                .expect_err("a held value is refused");
+            assert!(
+                refused.to_string().contains(&format!("{holder}"))
+                    || refused.to_string().contains("unique"),
+                "{round}: the refusal of {email}: {refused}"
+            );
+        }
+        assert!(
+            found(db, "nobody@x").is_empty(),
+            "{round}: nothing holds it"
+        );
+    };
+    agree(&mut db, "during the rebuild");
+    db.execute_cypher("CREATE (:U {email: 'new1@x'})")
+        .expect("a free value is taken during the rebuild");
+
+    db.index_build(generation, WAIT)
+        .expect("wait for the build");
+    agree(&mut db, "after the rebuild");
+    let new1 = id_of(&mut db, "new1@x");
+    assert_eq!(
+        found(&mut db, "new1@x"),
+        vec![new1],
+        "the value taken during it"
+    );
+    db.execute_cypher("CREATE (:U {email: 'new2@x'})")
+        .expect("a free value is taken after it");
+}
+
 /// REINDEX by name and by identity rebuilds into a fresh generation each
 /// time, and lookups answer throughout.
 #[test]

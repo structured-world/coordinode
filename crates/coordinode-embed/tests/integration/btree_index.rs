@@ -343,7 +343,8 @@ fn writes_bind_an_index_whose_definition_has_settled() {
 
 /// A definition that changed and then settled is not the one registered:
 /// version zero on both does not make them one, and a write bound to the
-/// registered definition is refused.
+/// registered definition is refused as a conflict with that change, every
+/// time it runs again while the registry still holds the old one.
 #[test]
 fn a_settled_change_of_the_definition_refuses_the_writes_bound_before_it() {
     use coordinode_storage::engine::partition::Partition;
@@ -383,7 +384,7 @@ fn a_settled_change_of_the_definition_refuses_the_writes_bound_before_it() {
         matches!(
             refused,
             Err(coordinode_embed::db::DatabaseError::Execution(
-                coordinode_query::executor::runner::ExecutionError::RevisionMismatch { .. }
+                coordinode_query::executor::runner::ExecutionError::Conflict(_)
             ))
         ),
         "{refused:?}"

@@ -464,7 +464,13 @@ fn a_transaction_staged_before_a_transition_is_refused_at_commit() {
     let err = db
         .commit_transaction(txn)
         .expect_err("the staged binding is stale");
-    assert!(err.to_string().contains("version mismatch"), "{err}");
+    assert!(
+        matches!(
+            err,
+            coordinode_embed::db::DatabaseError::TransactionConflict { .. }
+        ),
+        "a conflict the writer retries: {err}"
+    );
 
     assert!(entries(&db, "d_name").is_empty());
     db.execute_cypher("CREATE (:U {name: 'ann'})")

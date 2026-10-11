@@ -84,6 +84,12 @@ impl DerivedLedger {
         self.bound.insert(key.to_vec())
     }
 
+    /// Whether this transaction's effects are bound to the definition stored
+    /// at `key`.
+    pub(crate) fn binds(&self, key: &[u8]) -> bool {
+        self.bound.contains(key)
+    }
+
     /// Whether `key` is an index entry of a DERIVED index, logged as work
     /// rather than as a mutation.
     pub(crate) fn owns(&self, key: &[u8]) -> bool {
