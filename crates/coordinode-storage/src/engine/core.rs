@@ -466,6 +466,7 @@ impl StorageEngine {
             seqno.clone(),
             Arc::clone(&pending_commits),
             oracle.is_some(),
+            retention_window_to_us(std::time::Duration::from_secs(config.retention_window_secs)),
         );
 
         // When built with `--features io-uring` on Linux and no explicit
@@ -1039,9 +1040,8 @@ impl StorageEngine {
             gc_controller,
             flush_trigger,
         );
-        coordinator.set_retention_window_us(retention_window_to_us(
-            std::time::Duration::from_secs(config.retention_window_secs),
-        ));
+        // Brought up to the clock the open moved, the window held all along.
+        coordinator.advance_gc_watermark();
         // The open succeeded: a migrated directory now records its format.
         // An open refused above leaves the old marker, so the store it
         // refused stays as its writer left it.

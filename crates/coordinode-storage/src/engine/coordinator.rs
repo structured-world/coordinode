@@ -488,7 +488,7 @@ pub struct GcWatermarkController {
     /// the watermark is held back to at least `current_seqno - window` so every
     /// `AS OF TIMESTAMP` inside the window resolves, registry or not. Applied
     /// only when `seqno_is_clock` (the seqno generator is the timestamp
-    /// oracle); `u64::MAX` disables it.
+    /// oracle); `u64::MAX` retains everything.
     retention_window_us: AtomicU64,
     /// Whether seqnos are HLC timestamps (oracle-backed engine). A plain
     /// counter is not a clock, so a time window has no meaning there.
@@ -496,11 +496,15 @@ pub struct GcWatermarkController {
 }
 
 impl GcWatermarkController {
+    /// A controller holding the watermark `retention_window_us` back from
+    /// its first published value: the flush and compaction services read it
+    /// as soon as the trees open.
     fn new(
         gc_watermark: Arc<AtomicU64>,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         pending: Arc<PendingCommits>,
         seqno_is_clock: bool,
+        retention_window_us: u64,
     ) -> Self {
         let controller = Self {
             pins: parking_lot::Mutex::new(BTreeMap::new()),
@@ -509,7 +513,7 @@ impl GcWatermarkController {
             seqno,
             pending,
             external_floor: AtomicU64::new(u64::MAX),
-            retention_window_us: AtomicU64::new(u64::MAX),
+            retention_window_us: AtomicU64::new(retention_window_us),
             seqno_is_clock,
         };
         controller.tick();
@@ -531,7 +535,7 @@ impl GcWatermarkController {
         self.system_watermark.store(pin_floor, Ordering::Release);
         let mut watermark = pin_floor.min(self.external_floor.load(Ordering::Acquire));
         let window = self.retention_window_us.load(Ordering::Acquire);
-        if self.seqno_is_clock && window != u64::MAX {
+        if self.seqno_is_clock {
             // saturating_sub is the business rule here: a window reaching
             // past the first timestamp means "retain everything", i.e. a
             // floor of 0, not a wrapped seqno.
@@ -806,12 +810,14 @@ impl LocalMultiModalCoordinator {
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         pending: Arc<PendingCommits>,
         seqno_is_clock: bool,
+        retention_window_us: u64,
     ) -> Arc<GcWatermarkController> {
         Arc::new(GcWatermarkController::new(
             gc_watermark,
             seqno,
             pending,
             seqno_is_clock,
+            retention_window_us,
         ))
     }
 

@@ -333,6 +333,44 @@ fn coordinator_set_gc_watermark_observable() {
     assert_eq!(v.as_deref(), Some(b"v".as_slice()));
 }
 
+/// The watermark holds the retention window back from the controller's
+/// first value: the flush and compaction services read it from the moment
+/// the trees open, so a controller that published the bare clock until the
+/// window was set let them collect the whole history an open was about to
+/// serve, and every time-travel read across a restart was refused.
+#[test]
+fn the_watermark_keeps_the_window_from_the_first_value() {
+    let seqno: lsm_tree::SharedSequenceNumberGenerator =
+        Arc::new(lsm_tree::SequenceNumberCounter::new(50_000_000));
+    let pending = Arc::new(crate::engine::pending::PendingCommits::new(16));
+    let window_us = 10_000_000;
+    let controller = LocalMultiModalCoordinator::build_gc_controller(
+        Arc::new(AtomicU64::new(0)),
+        seqno.clone(),
+        pending,
+        true,
+        window_us,
+    );
+    assert_eq!(controller.watermark(), seqno.get() - window_us);
+}
+
+/// A window too long to express in seqno units keeps everything, as its
+/// conversion promises: it never turns into no window at all.
+#[test]
+fn an_unbounded_window_keeps_all_history() {
+    let seqno: lsm_tree::SharedSequenceNumberGenerator =
+        Arc::new(lsm_tree::SequenceNumberCounter::new(50_000_000));
+    let pending = Arc::new(crate::engine::pending::PendingCommits::new(16));
+    let controller = LocalMultiModalCoordinator::build_gc_controller(
+        Arc::new(AtomicU64::new(0)),
+        seqno,
+        pending,
+        true,
+        u64::MAX,
+    );
+    assert_eq!(controller.watermark(), 0);
+}
+
 #[test]
 fn coordinator_concurrent_reads_under_arc_share() {
     // The coordinator's read methods take &self only — Arc-share
