@@ -542,6 +542,100 @@ fn a_repair_of_a_cancelled_check_commits_nothing() {
     );
 }
 
+/// A record deleted while the repair of its missing entry waits to commit
+/// takes no entry: the repair is bound to the record as it read it, and the
+/// next pass finds nothing left to repair.
+#[test]
+fn a_repair_raced_by_a_delete_writes_no_entry() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    env.hold_pages_after(0);
+    let operation = builds.request_check(def.id).expect("check");
+    env.await_held_page();
+    let mut txn = env.begin();
+    LocalNodeStore
+        .delete(&mut txn, 1, NodeId::from_raw(2))
+        .expect("stage the delete");
+    commit(&mut txn).expect("delete b");
+    env.release_pages();
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { .. })),
+        "{outcome:?}"
+    );
+    assert!(
+        env.holders(&def, "b@x").is_empty(),
+        "no entry for a deleted record"
+    );
+    assert_eq!(env.holders(&def, "a@x"), vec![1], "the rest untouched");
+}
+
+/// A check taken over by another executor (a second service resuming it, as
+/// a new leader does) is that executor's alone: the first executor's repair,
+/// held at its commit across the takeover, commits nothing, and the check
+/// ends once, repaired by the executor that holds it.
+#[test]
+fn a_check_taken_over_is_repaired_by_its_new_executor_only() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    env.hold_pages_after(0);
+    let operation = builds.request_check(def.id).expect("check");
+    env.await_held_page();
+    let store = LocalIndexStore::new(&env.engine);
+    let first = store
+        .load_integrity(def.generation)
+        .expect("read")
+        .and_then(|(record, _)| record.check)
+        .map(|check| check.state)
+        .expect("the first executor's check");
+    let successor = service(&env);
+    let resumed = successor.resume_checks().expect("take it over");
+    assert_eq!(resumed, vec![def.generation]);
+    // The successor's take lands before its own first page, which the hold
+    // keeps from committing too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let state = store
+            .load_integrity(def.generation)
+            .expect("read")
+            .and_then(|(record, _)| record.check)
+            .map(|check| check.state);
+        if state.as_ref().is_some_and(|s| *s != first) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never taken over");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    env.release_pages();
+    let outcome = successor
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { .. })),
+        "{outcome:?}"
+    );
+    let record = store
+        .load_integrity(def.generation)
+        .expect("read")
+        .expect("record")
+        .0;
+    assert_eq!(
+        record.check.as_ref().map(|c| c.repaired),
+        Some(1),
+        "repaired once, by the executor that held the check"
+    );
+    assert_eq!(env.holders(&def, "b@x"), vec![2]);
+    assert_eq!(
+        builds
+            .wait_check(operation, Some(Duration::from_secs(30)))
+            .expect("wait"),
+        outcome,
+        "both services report the one outcome"
+    );
+}
+
 /// A write to the integrity record that leaves the check with its executor
 /// (a report recorded against the generation, say) refuses the repair held
 /// over it, but not the check: the next pass, still this executor's,

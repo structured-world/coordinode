@@ -1577,6 +1577,71 @@ fn a_check_repairs_partial_sparse_and_derived_indexes_by_their_rules() {
     assert_eq!(found_by(&mut db, "city", "rome"), vec![c]);
 }
 
+/// A compound unique index is checked by its combinations: an entry lost
+/// for one combination and one naming the wrong holder for another are both
+/// repaired, and afterwards a combination is held by its record alone.
+#[test]
+fn a_check_repairs_a_compound_unique_index_by_its_combinations() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT u_key FOR (n:U) REQUIRE (n.a, n.b) IS UNIQUE")
+        .expect("compound constraint");
+    for (a, b, name) in [("x", "y", "p"), ("x", "z", "q"), ("w", "y", "r")] {
+        db.execute_cypher(&format!(
+            "CREATE (:U {{a: '{a}', b: '{b}', name: '{name}'}})"
+        ))
+        .expect("node");
+    }
+    let p = scan_id(&mut db, "name", "p");
+    let q = scan_id(&mut db, "name", "q");
+    let r = scan_id(&mut db, "name", "r");
+    let index = index_named(db.engine(), "u_key").expect("the constraint's index");
+    let key = |a: &str, b: &str| {
+        let tuple =
+            encode_tuple(&[Value::String(a.into()), Value::String(b.into())]).expect("tuple");
+        encode_unique_entry_key(index.generation, &tuple)
+    };
+    let holder = |db: &Database, a: &str, b: &str| {
+        db.engine()
+            .get(Partition::Idx, &key(a, b))
+            .expect("read")
+            .map(|bytes| u64::from_be_bytes(bytes[..].try_into().expect("8 bytes")))
+    };
+    assert_eq!(
+        holder(&db, "x", "z"),
+        Some(u64::try_from(q).expect("id")),
+        "precondition: the entry is keyed by the combination"
+    );
+    db.engine()
+        .delete(Partition::Idx, &key("x", "y"))
+        .expect("lose p's combination");
+    db.engine()
+        .put(
+            Partition::Idx,
+            &key("w", "y"),
+            &u64::try_from(q).expect("id").to_be_bytes(),
+        )
+        .expect("name q for r's combination");
+
+    let (status, outcome) = check(&db, "u_key");
+    assert!(
+        matches!(outcome, CheckOutcome::Verified { repaired: 2, .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(status.record.integrity, Integrity::Verified);
+    for (a, b, node) in [("x", "y", p), ("x", "z", q), ("w", "y", r)] {
+        assert_eq!(
+            holder(&db, a, b),
+            Some(u64::try_from(node).expect("id")),
+            "({a}, {b}) is held by its record"
+        );
+    }
+    let err = db
+        .execute_cypher("CREATE (:U {a: 'w', b: 'y'})")
+        .expect_err("held by r");
+    let r_element = NodeId::from_raw(u64::try_from(r).expect("id")).to_element_id();
+    assert!(err.to_string().contains(&r_element), "{err}");
+}
+
 /// A temporal node keeps an entry per version: entries a check finds for
 /// an earlier version's value are the index's, not damage, and a check of a
 /// temporal index with nothing wrong repairs nothing. An entry no version
