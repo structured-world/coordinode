@@ -3313,6 +3313,29 @@ impl Database {
             explain.push_str("\n\nVector index health:\n");
             explain.push_str(&health_lines.join("\n"));
         }
+        // A scan of a label reads the built-in label lookup when it is ready,
+        // and every node of the shard until then.
+        if explain.contains("NodeScan(") && explain.contains(':') {
+            explain.push_str("\n\nLabel scans: ");
+            explain.push_str(&match self.index_registry.label_lookup() {
+                Some((def, _)) if def.state == coordinode_query::index::IndexState::Ready => {
+                    format!(
+                        "read the label's members from the built-in label lookup (generation {})",
+                        def.generation.as_raw()
+                    )
+                }
+                Some((def, _)) => format!(
+                    "read every node of the shard: the built-in label lookup (generation {}) \
+                     is {}",
+                    def.generation.as_raw(),
+                    match def.state {
+                        coordinode_query::index::IndexState::Failed { .. } => "failed",
+                        _ => "being built",
+                    }
+                ),
+                None => "read every node of the shard: the store has no label lookup yet".into(),
+            });
+        }
         Ok(explain)
     }
 

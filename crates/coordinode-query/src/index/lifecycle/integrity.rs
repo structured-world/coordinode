@@ -34,7 +34,7 @@ use coordinode_storage::engine::transaction::Transaction;
 use rustc_hash::FxHashMap;
 
 use super::{
-    IndexBuildService, MOVE_ATTEMPTS, Shared, begin, cannot_move_here, is_contention, next_token,
+    IndexBuildService, Shared, begin, cannot_move_here, is_contention, move_attempts, next_token,
     panic_message, text,
 };
 use crate::index::definition::{
@@ -276,7 +276,7 @@ impl IndexBuildService {
         if !serving {
             return Ok(false);
         }
-        for _ in 0..MOVE_ATTEMPTS {
+        for () in move_attempts() {
             let (mut record, version) = match store.load_integrity(generation).map_err(text)? {
                 Some((record, version)) => (record, Some(version)),
                 None => (IndexIntegrityRecord::new(index, generation), None),
@@ -402,7 +402,7 @@ impl IndexBuildService {
             return Err(CheckRequestError::NotReady(def.to_string()));
         }
         let generation = def.generation;
-        for _ in 0..MOVE_ATTEMPTS {
+        for () in move_attempts() {
             let (mut record, version) = match store
                 .load_integrity(generation)
                 .map_err(|e| CheckRequestError::Other(e.to_string()))?
@@ -631,11 +631,11 @@ impl IndexBuildService {
     /// # Errors
     ///
     /// A storage failure, a commit failure other than a conflict, or moves
-    /// kept winning [`MOVE_ATTEMPTS`] times in a row.
+    /// kept winning for [`super::MOVE_PATIENCE`].
     pub fn cancel_check(&self, generation: GenerationId) -> Result<bool, String> {
         let env = self.shared.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
-        for _ in 0..MOVE_ATTEMPTS {
+        for () in move_attempts() {
             let Some((mut record, version)) = store.load_integrity(generation).map_err(text)?
             else {
                 return Ok(false);
@@ -1049,7 +1049,7 @@ impl Shared {
     fn take_check(&self, generation: GenerationId) -> Result<Result<Taken, Executed>, String> {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
-        for _ in 0..MOVE_ATTEMPTS {
+        for () in move_attempts() {
             let Some((mut record, version)) = store.load_integrity(generation).map_err(text)?
             else {
                 return Ok(Err(Executed::Outcome(CheckOutcome::Cancelled)));
@@ -1630,7 +1630,7 @@ impl Shared {
     ) -> Result<bool, String> {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
-        for _ in 0..MOVE_ATTEMPTS {
+        for () in move_attempts() {
             let Some((mut record, version)) = self.held_record(generation, taken)? else {
                 return Ok(false);
             };

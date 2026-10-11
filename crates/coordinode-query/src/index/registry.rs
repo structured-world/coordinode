@@ -1324,6 +1324,20 @@ impl IndexRegistry {
         ))
     }
 
+    /// [`Self::label_lookup`] with the version of its stored record as this
+    /// member registered it: the commit that published it ready, so a
+    /// snapshot before it may read a generation not filled yet. `None` for
+    /// one registered without a stored record.
+    pub fn label_lookup_published(&self) -> Option<(IndexDefinition, bool, Option<u64>)> {
+        let catalog = self.indexes.read();
+        let registered = catalog.label_lookup()?;
+        Some((
+            IndexDefinition::clone(&registered.def),
+            registered.armed.load(Ordering::Acquire),
+            registered.version,
+        ))
+    }
+
     /// Stage node `node` of shard `shard` leaving the labels `removed` and
     /// joining the labels `added` (dictionary ids) in the namespace's label
     /// lookup, bound to its definition as this member read it: a building

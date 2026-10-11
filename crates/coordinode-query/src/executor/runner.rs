@@ -5562,7 +5562,14 @@ fn execute_node_scan(
         .scan_paging
         .as_ref()
         .map(|p| (p.resume.clone(), p.limit));
-    if let Some(label) = columnar_label {
+    let lookup = if columnar_label.is_none() {
+        label_lookup_scan(labels, ctx)?
+    } else {
+        None
+    };
+    if let Some(scan) = lookup {
+        scan_label_members(&scan, paging, &mut fold, &budget, ctx)?;
+    } else if let Some(label) = columnar_label {
         let env = NodeRowEnv::of(ctx);
         ctx.engine.columnar_for_each(
             &label,
@@ -5623,6 +5630,197 @@ fn execute_node_scan(
         })?;
     }
     fold.finish(ctx)
+}
+
+/// A label scan answered from the namespace's label lookup: the generation
+/// read and the label whose members drive the scan.
+struct LabelLookupScan {
+    lookup: crate::index::IndexDefinition,
+    /// The dictionary id of the driving label; `None` when the name has no
+    /// binding at the statement's snapshot, so no node holds it.
+    label: Option<u32>,
+}
+
+/// The label lookup scan of `labels`, when the lookup answers this
+/// statement: ready, its copy guarded and fit here, and published by the
+/// statement's snapshot. `None` reads the shard instead. Of several labels
+/// the one with the fewest nodes drives the scan; the others are checked on
+/// each candidate.
+fn label_lookup_scan(
+    labels: &[String],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Option<LabelLookupScan>, ExecutionError> {
+    use coordinode_modality::ENTRY_LAYOUT;
+    if labels.is_empty() {
+        return Ok(None);
+    }
+    let Some(registry) = ctx.btree_index_registry else {
+        return Ok(None);
+    };
+    let Some((lookup, armed, published)) = registry.label_lookup_published() else {
+        return Ok(None);
+    };
+    if lookup.state != IndexState::Ready || lookup.layout != ENTRY_LAYOUT {
+        return Ok(None);
+    }
+    let read_ts = match ctx.snapshot_ts {
+        Some(at) => u64::try_from(at).unwrap_or(0),
+        None => ctx.mvcc_read_ts.as_raw(),
+    };
+    // A snapshot before the lookup was published may read a generation its
+    // build had not filled yet.
+    if published.is_some_and(|at| read_ts < at) {
+        return Ok(None);
+    }
+    if (!armed && !registry.arm_copy(ctx.engine, lookup.generation))
+        || !registry.answers_at(lookup.generation, read_ts)
+    {
+        return Ok(None);
+    }
+    let mut driving: Option<(u64, Option<u32>)> = None;
+    for name in labels {
+        let id = label_id_at_snapshot(name, ctx)?;
+        // A label no node can hold makes the conjunction empty.
+        let Some(id) = id else {
+            return Ok(Some(LabelLookupScan {
+                lookup,
+                label: None,
+            }));
+        };
+        // One label drives itself; only a conjunction compares counts.
+        let count = if labels.len() == 1 {
+            0
+        } else {
+            counted_nodes(name, ctx)?.map_or(u64::MAX, |n| n.unsigned_abs())
+        };
+        if driving.is_none_or(|(fewest, _)| count < fewest) {
+            driving = Some((count, Some(id)));
+        }
+    }
+    Ok(driving.map(|(_, label)| LabelLookupScan { lookup, label }))
+}
+
+/// The dictionary id of `name` as the statement's snapshot binds it: the
+/// statement's dictionary view first, then the stored binding, which a
+/// name registered after the view was taken has. Read only: a scan creates
+/// no binding.
+fn label_id_at_snapshot(
+    name: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Option<u32>, ExecutionError> {
+    use coordinode_core::graph::intern::{decode_field_id, field_name_key};
+    if let Some(id) = ctx.interner.lookup(name) {
+        return Ok(Some(id));
+    }
+    ctx.sync_txn_state();
+    Ok(ctx
+        .txn
+        .get(Partition::Schema, &field_name_key(name))?
+        .and_then(|bytes| decode_field_id(&bytes)))
+}
+
+/// Candidates read per batch of a label lookup scan.
+const LABEL_SCAN_BATCH: usize = 256;
+
+/// Fold into `fold` the nodes holding `scan`'s driving label, read in
+/// batches in NodeId order: each candidate's record, or the versions of a
+/// temporal node, which keeps no plain record. With `paging`, one page of
+/// candidates after the resume key, and the page's end recorded.
+fn scan_label_members(
+    scan: &LabelLookupScan,
+    paging: Option<(Option<Vec<u8>>, usize)>,
+    fold: &mut NodeScanFold<'_, '_>,
+    budget: &coordinode_core::budget::QueryBudget,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use coordinode_core::graph::node::{decode_node_key, encode_node_key};
+    use coordinode_modality::{
+        IndexStore as _, LabelScope, LocalIndexStore, LocalNodeStore, NodeStore as _,
+    };
+    use core::ops::ControlFlow;
+    let Some(label) = scan.label else {
+        if let Some(p) = ctx.scan_paging.as_mut() {
+            p.last_key = None;
+            p.exhausted = true;
+        }
+        return Ok(());
+    };
+    let shard = ctx.shard_id;
+    let (mut after, limit) = match paging {
+        Some((resume, limit)) => (
+            resume.as_deref().and_then(|key| {
+                decode_node_key(key)
+                    .map(|(_, id)| id)
+                    .or_else(|| decode_temporal_node_key(key).map(|(_, id, _)| id))
+            }),
+            Some(limit),
+        ),
+        None => (None, None),
+    };
+    let store = LocalIndexStore::new(ctx.engine);
+    let mut taken = 0usize;
+    let mut last_key = None;
+    loop {
+        // One batch of candidates, and whether the label has more.
+        let want = limit.map_or(LABEL_SCAN_BATCH, |l| (l - taken).min(LABEL_SCAN_BATCH));
+        let mut batch: Vec<NodeId> = Vec::with_capacity(want);
+        let mut more = false;
+        store.label_members(
+            &ctx.txn,
+            LabelScope {
+                lookup: &scan.lookup,
+                shard,
+                label,
+            },
+            after,
+            budget,
+            |node| {
+                if batch.len() == want {
+                    more = true;
+                    return Ok::<_, ExecutionError>(ControlFlow::Break(()));
+                }
+                batch.push(node);
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        let keys: Vec<Vec<u8>> = batch.iter().map(|id| encode_node_key(shard, *id)).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let records = ctx.txn.multi_read_untracked(Partition::Node, &key_refs)?;
+        let env = NodeRowEnv::of(ctx);
+        for ((node, key), record) in batch.iter().zip(&keys).zip(records) {
+            match record {
+                Some(value) => {
+                    let _row = budget.reserve(kv_bytes(key, &value))?;
+                    fold.row(key, &value, &env)?;
+                    last_key = Some(key.clone());
+                }
+                // No plain record: a temporal node's versions, or a node
+                // deleted since its posting was read.
+                None => {
+                    LocalNodeStore.prefix_for_each(
+                        &ctx.txn,
+                        &LocalNodeStore.version_prefix(shard, *node),
+                        budget,
+                        |key, value| {
+                            last_key = Some(key.to_vec());
+                            fold.row(key, value, &env)
+                        },
+                    )?;
+                }
+            }
+        }
+        taken += batch.len();
+        after = batch.last().copied();
+        let page_full = limit.is_some_and(|l| taken >= l);
+        if !more || page_full {
+            if let Some(p) = ctx.scan_paging.as_mut() {
+                p.last_key =
+                    last_key.or_else(|| batch.last().map(|id| encode_node_key(shard, *id)));
+                p.exhausted = !more;
+            }
+            return Ok(());
+        }
+    }
 }
 
 /// Bytes a scanned `(key, value)` pair holds.
@@ -20076,7 +20274,7 @@ fn execute_procedure_call(
 /// keys. They hold their registration from validation to apply, including a
 /// majority write, so this covers a slow replica rather than a stuck one; past
 /// it the change is refused as before.
-const CATALOG_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const CATALOG_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The error a catalog change fails with when its commit is refused: a record
 /// it was conditioned on, or a key it wrote, changed concurrently, which a

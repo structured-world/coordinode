@@ -240,6 +240,243 @@ fn a_store_without_a_lookup_has_it_built_from_its_nodes() {
     assert_eq!(members(&db, "Item").len(), 301);
 }
 
+// ── Scans ───────────────────────────────────────────────────────────────
+
+/// Names returned by a query, sorted.
+fn names(db: &mut Database, query: &str) -> Vec<String> {
+    let mut out: Vec<String> = db
+        .execute_cypher(query)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .iter()
+        .map(|row| match row.get("name") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("expected a name, got {other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A store whose shard is mostly one node far larger than a statement may
+/// hold, beside a few small labelled ones.
+fn store_with_a_large_unrelated_node() -> (Database, tempfile::TempDir) {
+    let (mut db, dir) = open_db();
+    db.execute_cypher(
+        "CREATE (:Small {name: 's1'}), (:Small:Tagged {name: 's2'}), (:Tagged {name: 't'})",
+    )
+    .expect("small nodes");
+    let blob = "x".repeat(4 << 20);
+    db.execute_cypher(&format!("CREATE (:Big {{name: 'big', payload: '{blob}'}})"))
+        .expect("large node");
+    db.set_query_memory_limit(1 << 20).expect("limit");
+    (db, dir)
+}
+
+/// A label scan reads the label's members and nothing else: the large node
+/// of another label is never read, so a statement whose memory limit it
+/// would break answers, an empty label too. The full scan the lookup
+/// replaced read every node of the shard and was refused.
+#[test]
+fn a_label_scan_reads_none_of_the_other_labels_nodes() {
+    let (mut db, _dir) = store_with_a_large_unrelated_node();
+    assert_eq!(
+        names(&mut db, "MATCH (n:Small) RETURN n.name AS name"),
+        vec!["s1", "s2"]
+    );
+    assert!(names(&mut db, "MATCH (n:Missing) RETURN n.name AS name").is_empty());
+    assert_eq!(
+        names(&mut db, "MATCH (n:Small:Tagged) RETURN n.name AS name"),
+        vec!["s2"],
+        "a conjunction, each node once"
+    );
+    assert_eq!(
+        names(&mut db, "MATCH (n:Tagged:Small) RETURN n.name AS name"),
+        vec!["s2"]
+    );
+    // The large node is still found by its own label.
+    db.set_query_memory_limit(64 << 20).expect("limit");
+    assert_eq!(
+        names(&mut db, "MATCH (n:Big) RETURN n.name AS name"),
+        vec!["big"]
+    );
+}
+
+/// A server-side cursor pages a label's members after the last node it
+/// returned: every member once, in order, none of another label, and the
+/// last page says it is the last.
+#[test]
+fn a_cursor_pages_a_labels_members() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "UNWIND range(1, 250) AS i \
+         CREATE (:A {name: 'a' + toString(i)}), (:B {name: 'b' + toString(i)})",
+    )
+    .expect("nodes");
+    let mut seen = Vec::new();
+    let (mut resume, mut read_ts) = (None, None);
+    let mut pages = 0;
+    loop {
+        let page = db
+            .execute_cypher_paged(
+                "MATCH (n:A) RETURN n.name AS name",
+                None,
+                read_ts,
+                resume,
+                64,
+            )
+            .expect("page");
+        pages += 1;
+        assert!(pages < 20, "pages never ended");
+        read_ts = Some(page.read_ts);
+        seen.extend(page.rows.iter().map(|row| match row.get("name") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("expected a name, got {other:?}"),
+        }));
+        if page.exhausted {
+            break;
+        }
+        resume = page.last_key;
+    }
+    assert_eq!(seen.len(), 250, "every member once");
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 250, "no member twice");
+    assert!(
+        seen.iter().all(|n| n.starts_with('a')),
+        "none of another label"
+    );
+    assert!(pages >= 4, "paged, not read whole: {pages}");
+}
+
+/// A temporal label is scanned through the lookup too: each member's
+/// timeline is resolved, so the scan returns the state valid now, once per
+/// node, however many versions it has.
+#[test]
+fn a_temporal_labels_scan_returns_each_members_current_state() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal label");
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros() as i64
+        - 1_000_000;
+    for name in ["e", "f"] {
+        db.execute_cypher(&format!(
+            "CREATE (:Emp {{name: '{name}', valid_from: {since}}})"
+        ))
+        .expect("create");
+    }
+    db.execute_cypher("MATCH (n:Emp {name: 'e'}) SET n.name = 'e2'")
+        .expect("new version");
+    assert_eq!(
+        names(&mut db, "MATCH (n:Emp) RETURN n.name AS name"),
+        vec!["e2", "f"]
+    );
+}
+
+/// A scan reads the lookup at the statement's snapshot: a snapshot taken
+/// before a node left the label still finds it there, and one taken before
+/// it joined does not.
+#[test]
+fn a_scan_at_an_older_snapshot_sees_the_members_of_then() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:X {name: 'x1'})").expect("x1");
+    let before = db.engine().current_seqno();
+    db.execute_cypher("CREATE (:X {name: 'x2'})").expect("x2");
+    db.execute_cypher("MATCH (n:X {name: 'x1'}) DELETE n")
+        .expect("delete");
+    let at_before = format!("MATCH (n:X) RETURN n.name AS name AS OF TIMESTAMP {before}");
+    assert_eq!(names(&mut db, &at_before), vec!["x1"]);
+    assert_eq!(
+        names(&mut db, "MATCH (n:X) RETURN n.name AS name"),
+        vec!["x2"]
+    );
+}
+
+/// A transaction sees its own label changes in its label scans: a node it
+/// created, and not one it took the label from.
+#[test]
+fn a_transaction_scans_its_own_label_changes() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:Y {name: 'old'})").expect("old");
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "CREATE (:Y {name: 'new'})", None)
+        .expect("create");
+    db.execute_in_transaction(tx, "MATCH (n:Y {name: 'old'}) REMOVE n:Y", None)
+        .expect("remove");
+    let rows = db
+        .execute_in_transaction(tx, "MATCH (n:Y) RETURN n.name AS name", None)
+        .expect("scan");
+    let seen: Vec<String> = rows
+        .iter()
+        .map(|row| match row.get("name") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("expected a name, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(seen, vec!["new"]);
+    db.rollback_transaction(tx).expect("rollback");
+    assert_eq!(
+        names(&mut db, "MATCH (n:Y) RETURN n.name AS name"),
+        vec!["old"]
+    );
+}
+
+/// A lookup being built answers no scan: until it is ready, and for a
+/// snapshot older than the commit that made it ready, a scan reads the
+/// records, so no member is missed.
+#[test]
+fn a_scan_before_the_lookup_is_ready_reads_the_records() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("UNWIND range(1, 4000) AS i CREATE (:Z {name: 'z' + toString(i)})")
+        .expect("nodes");
+    forget_label_lookup(&db);
+    db.refresh_btree_indexes().expect("refresh");
+    // Provisioned again and filled in the background.
+    db.resume_interrupted_index_builds().expect("provision");
+    // Most likely before the lookup is ready; whichever it is, the scan at
+    // this snapshot finds every node.
+    let before = db.engine().current_seqno();
+    let while_building = names(&mut db, "MATCH (n:Z) RETURN n.name AS name").len();
+    assert_eq!(while_building, 4000);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while LocalIndexStore::new(db.engine())
+        .label_lookup()
+        .expect("read")
+        .is_none_or(|d| d.state != IndexState::Ready)
+    {
+        assert!(std::time::Instant::now() < deadline, "never built");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        names(&mut db, "MATCH (n:Z) RETURN n.name AS name").len(),
+        4000
+    );
+    let at_before = format!("MATCH (n:Z) RETURN n.name AS name AS OF TIMESTAMP {before}");
+    assert_eq!(
+        names(&mut db, &at_before).len(),
+        4000,
+        "a snapshot before the lookup was ready reads the records"
+    );
+}
+
+/// EXPLAIN names the lookup a label scan reads.
+#[test]
+fn explain_names_the_label_lookup() {
+    let (db, _dir) = open_db();
+    let plan = db
+        .explain_cypher("MATCH (n:Small) RETURN n")
+        .expect("explain");
+    assert!(
+        plan.contains("read the label's members from the built-in label lookup"),
+        "{plan}"
+    );
+}
+
 /// Remove every trace of the label lookup from `db`'s storage, as a store
 /// written before it existed has none.
 fn forget_label_lookup(db: &Database) {

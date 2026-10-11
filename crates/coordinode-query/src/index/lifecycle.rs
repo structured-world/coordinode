@@ -412,11 +412,58 @@ pub fn text_build(label: String, properties: Vec<String>) -> LocalBuild {
     })
 }
 
-/// Attempts one move of a build makes against other moves of the same
-/// build. A build moves a few times in its life (taken, published or
-/// failed, cancelled), so a mover that loses this many races in a row faces
+/// How long one move of a build or check record keeps retrying against
+/// other commits on the record. A catalog change waiting for its turn
+/// reserves the keys it writes for as long as it may wait, and refuses every
+/// other commit on them meanwhile, so a mover retries for that long: it then
+/// lands after the change. A record moves a few times in its life (taken,
+/// published or failed, cancelled), so a mover still losing past this faces
 /// a fault, not contention.
-pub const MOVE_ATTEMPTS: usize = 16;
+pub const MOVE_PATIENCE: Duration = crate::executor::runner::CATALOG_ADMISSION_WAIT;
+
+/// The pause before the first retry of a move, doubled before each later
+/// one up to [`MOVE_PAUSE_MAX`]: a commit that moved the record is usually
+/// applied within a log write, and the doubling stops a mover from spinning
+/// through a longer wait.
+const MOVE_PAUSE: Duration = Duration::from_millis(1);
+
+/// The longest pause between two retries of a move.
+const MOVE_PAUSE_MAX: Duration = Duration::from_millis(50);
+
+/// The attempts of one move: the first at once, each later one after a
+/// pause, until [`MOVE_PATIENCE`] has passed since the first.
+pub(crate) fn move_attempts() -> MoveAttempts {
+    MoveAttempts {
+        deadline: Instant::now() + MOVE_PATIENCE,
+        pause: None,
+    }
+}
+
+/// The iterator [`move_attempts`] returns.
+pub(crate) struct MoveAttempts {
+    deadline: Instant,
+    /// The pause before the next retry; `None` before the first attempt.
+    pause: Option<Duration>,
+}
+
+impl Iterator for MoveAttempts {
+    type Item = ();
+
+    fn next(&mut self) -> Option<()> {
+        let Some(pause) = self.pause else {
+            self.pause = Some(MOVE_PAUSE);
+            return Some(());
+        };
+        let now = Instant::now();
+        if now >= self.deadline {
+            return None;
+        }
+        std::thread::sleep(pause.min(self.deadline - now));
+        // Bounded by MOVE_PAUSE_MAX, far from Duration's range.
+        self.pause = Some((pause * 2).min(MOVE_PAUSE_MAX));
+        Some(())
+    }
+}
 
 /// The message a panic carried, as a build failure states it.
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
@@ -713,11 +760,11 @@ impl IndexBuildService {
     /// # Errors
     ///
     /// A storage failure, a commit failure other than a conflict, or moves
-    /// kept winning [`MOVE_ATTEMPTS`] times in a row.
+    /// kept winning for [`MOVE_PATIENCE`].
     pub fn cancel(&self, generation: GenerationId) -> Result<bool, String> {
         let env = self.shared.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
-        for _ in 0..MOVE_ATTEMPTS {
+        for () in move_attempts() {
             let Some((mut record, version)) = store.load_build(generation).map_err(text)? else {
                 return Ok(false);
             };
@@ -1105,7 +1152,7 @@ impl Shared {
     fn take(&self, generation: GenerationId) -> Result<Result<Taken, Executed>, String> {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
-        for _ in 0..MOVE_ATTEMPTS {
+        for () in move_attempts() {
             let Some((mut record, version)) = store.load_build(generation).map_err(text)? else {
                 return Ok(Err(Executed::Outcome(IndexBuildOutcome::Cancelled)));
             };
@@ -1264,7 +1311,7 @@ impl Shared {
     ) -> Result<Concluded, String> {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
-        for _ in 0..MOVE_ATTEMPTS {
+        for () in move_attempts() {
             let Some((mut record, version)) = store.load_build(generation).map_err(text)? else {
                 return Ok(Concluded::Ended(IndexBuildOutcome::Cancelled));
             };
@@ -1318,7 +1365,7 @@ impl Shared {
     fn lost_to_mover(&self, generation: GenerationId, token: u64) -> Result<Executed, String> {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
-        for _ in 0..MOVE_ATTEMPTS {
+        for () in move_attempts() {
             let Some((record, version)) = store.load_build(generation).map_err(text)? else {
                 return Ok(Executed::Outcome(IndexBuildOutcome::Cancelled));
             };
