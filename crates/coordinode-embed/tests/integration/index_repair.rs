@@ -590,6 +590,70 @@ fn reads_and_admission_follow_the_records_through_a_rebuild() {
         .expect("a free value is taken after it");
 }
 
+/// Two writers race for one value of a unique index whose entries are
+/// suspect, so the value's freedom is proved from the records at each
+/// commit: exactly one of them commits, whatever the order, and the other is
+/// refused naming a holder or as a conflict to run again.
+#[test]
+fn writers_racing_for_a_value_of_a_suspect_unique_index_leave_one_holder() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {email: 'a@x'})").expect("a");
+    db.execute_cypher("CREATE (:U {email: 'z@x'})").expect("z");
+    let owner = id_of(&mut db, "a@x");
+    let wrong = id_of(&mut db, "z@x");
+    misattribute(&db, "u_email", "a@x", wrong);
+    assert_eq!(
+        found(&mut db, "a@x"),
+        vec![owner],
+        "the index is now suspect"
+    );
+
+    for round in 0..10 {
+        let email = format!("race{round}@x");
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes: Vec<bool> = std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        db.execute_cypher_shared(
+                            &format!("CREATE (:U {{email: '{email}'}})"),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .is_ok()
+                    })
+                })
+                .collect();
+            writers
+                .into_iter()
+                .map(|w| w.join().expect("writer"))
+                .collect()
+        });
+        assert_eq!(
+            outcomes.iter().filter(|ok| **ok).count(),
+            1,
+            "round {round}: exactly one writer commits {email}: {outcomes:?}"
+        );
+        let holders = db
+            .execute_cypher(&format!(
+                "MATCH (u:U) WHERE u.email + '' = '{email}' RETURN id(u) AS id"
+            ))
+            .expect("scan")
+            .len();
+        assert!(holders <= 1, "round {round}: {holders} nodes hold {email}");
+        assert_eq!(
+            holders,
+            outcomes.iter().filter(|ok| **ok).count(),
+            "round {round}: every acknowledged write holds it"
+        );
+    }
+}
+
 /// REINDEX by name and by identity rebuilds into a fresh generation each
 /// time, and lookups answer throughout.
 #[test]
