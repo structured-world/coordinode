@@ -617,6 +617,162 @@ fn concurrent_publications_never_share_a_number_or_a_name() {
     }
 }
 
+/// The namespace has one label lookup: a second publication finds it and
+/// stages nothing, and two racing ones commit one, the other refused by
+/// the marker's condition rather than publishing a second lookup.
+#[test]
+fn the_label_lookup_is_published_once() {
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(engine);
+    assert!(store.label_lookup().unwrap().is_none(), "none before");
+
+    let mut a = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let mut b = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let published = store
+        .publish_label_lookup_txn(&mut a, IndexDescriptor::label_lookup())
+        .unwrap()
+        .expect("the first publishes");
+    store
+        .publish_label_lookup_txn(&mut b, IndexDescriptor::label_lookup())
+        .unwrap()
+        .expect("a racer read it absent too");
+    commit(&mut a).unwrap();
+    assert!(commit(&mut b).is_err(), "the second lookup must not commit");
+
+    let found = store.label_lookup().unwrap().expect("published");
+    assert_eq!(found, published);
+    assert_eq!(found.index_type, crate::IndexType::Labels);
+    assert!(found.name.is_none());
+    let mut c = Transaction::begin(engine, Some(&oracle), oracle.next());
+    assert!(
+        store
+            .publish_label_lookup_txn(&mut c, IndexDescriptor::label_lookup())
+            .unwrap()
+            .is_none(),
+        "one is published: nothing staged"
+    );
+}
+
+/// The nodes holding a label, as a transaction sees them: postings move only
+/// for labels that change, the transaction's own staged postings are seen,
+/// other labels, shards and generations are not, and a walk resumes after a
+/// node without reading what came before it.
+#[test]
+fn label_members_follow_staged_postings() {
+    use core::ops::ControlFlow;
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(engine);
+    let lookup =
+        IndexDescriptor::label_lookup().bind(IndexId::from_raw(1), GenerationId::from_raw(4));
+    let other_generation =
+        IndexDescriptor::label_lookup().bind(IndexId::from_raw(1), GenerationId::from_raw(5));
+    let (user, admin) = (10u32, 11u32);
+
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    for n in [3, 1, 2] {
+        store
+            .stage_label_postings_txn(&mut t, &lookup, 0, id(n), &[], &[user])
+            .unwrap();
+    }
+    store
+        .stage_label_postings_txn(&mut t, &lookup, 0, id(2), &[], &[admin])
+        .unwrap();
+    store
+        .stage_label_postings_txn(&mut t, &lookup, 1, id(9), &[], &[user])
+        .unwrap();
+    store
+        .stage_label_postings_txn(&mut t, &other_generation, 0, id(7), &[], &[user])
+        .unwrap();
+    commit(&mut t).unwrap();
+
+    let members = |txn: &Transaction, label: u32, after: Option<u64>, stop: usize| {
+        let mut out = Vec::new();
+        store
+            .label_members(
+                txn,
+                LabelScope {
+                    lookup: &lookup,
+                    shard: 0,
+                    label,
+                },
+                after.map(id),
+                &budget(),
+                |node| {
+                    out.push(node.as_raw());
+                    Ok::<_, StoreError>(if out.len() == stop {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    })
+                },
+            )
+            .unwrap();
+        out
+    };
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    assert_eq!(
+        members(&t, user, None, usize::MAX),
+        vec![1, 2, 3],
+        "NodeId order"
+    );
+    assert_eq!(members(&t, admin, None, usize::MAX), vec![2]);
+    assert_eq!(
+        members(&t, 99, None, usize::MAX),
+        Vec::<u64>::new(),
+        "an empty label"
+    );
+    assert_eq!(
+        members(&t, user, Some(1), usize::MAX),
+        vec![2, 3],
+        "resumed after 1"
+    );
+    assert_eq!(
+        members(&t, user, Some(u64::MAX), usize::MAX),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        members(&t, user, None, 2),
+        vec![1, 2],
+        "a break stops the walk"
+    );
+
+    // Node 2 moves from Admin and User to User alone; node 4 joins User;
+    // node 1 leaves it. A label held before and after writes nothing.
+    store
+        .stage_label_postings_txn(&mut t, &lookup, 0, id(2), &[user, admin], &[user])
+        .unwrap();
+    store
+        .stage_label_postings_txn(&mut t, &lookup, 0, id(4), &[], &[user])
+        .unwrap();
+    store
+        .stage_label_postings_txn(&mut t, &lookup, 0, id(1), &[user], &[])
+        .unwrap();
+    assert_eq!(
+        members(&t, user, None, usize::MAX),
+        vec![2, 3, 4],
+        "own writes seen"
+    );
+    assert!(members(&t, admin, None, usize::MAX).is_empty());
+    let other = Transaction::begin(engine, Some(&oracle), oracle.next());
+    assert_eq!(
+        members(&other, user, None, usize::MAX),
+        vec![1, 2, 3],
+        "not outside the transaction"
+    );
+    assert!(
+        t.buffered(
+            Partition::Idx,
+            &coordinode_core::index::encoding::encode_label_posting(lookup.generation, 0, user, 2)
+        )
+        .is_none(),
+        "a label kept writes no posting"
+    );
+}
+
 /// A description is catalog metadata: editing it rewrites the definition
 /// record only, never the generation or an entry.
 #[test]

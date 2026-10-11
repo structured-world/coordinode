@@ -1341,6 +1341,78 @@ fn prefix_for_each_sees_what_prefix_scan_returns() {
     assert!(budget.work_done() >= 65);
 }
 
+/// A range walk sees, for its range, what the prefix view sees: own rows
+/// between, on and after stored ones, own deletes hiding stored rows, rows
+/// outside the range left out, the end excluded; started mid-range it reads
+/// from there, and a break stops it at once.
+#[test]
+fn range_for_each_sees_the_transactions_view_of_its_range() {
+    use coordinode_core::budget::{DEFAULT_QUERY_MEMORY_LIMIT, QueryBudget};
+    use core::ops::ControlFlow;
+    let (engine, oracle, _d) = test_engine();
+    for i in (0..64u32).step_by(2) {
+        engine
+            .put(Partition::Node, format!("p:{i:03}").as_bytes(), b"stored")
+            .unwrap();
+    }
+    let mut txn = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    for i in (1..64u32).step_by(2).chain([10, 20]) {
+        txn.put(Partition::Node, format!("p:{i:03}").as_bytes(), b"own")
+            .unwrap();
+    }
+    txn.delete(Partition::Node, b"p:004").unwrap();
+    let budget = QueryBudget::new(DEFAULT_QUERY_MEMORY_LIMIT);
+    let walk = |start: &[u8], end: &[u8], stop_after: usize| {
+        let mut seen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        txn.range_for_each(Partition::Node, start, end, &budget, |k, v| {
+            seen.push((k.to_vec(), v.to_vec()));
+            Ok::<_, StorageScanError>(if seen.len() == stop_after {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            })
+        })
+        .unwrap();
+        seen
+    };
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = txn
+        .prefix_scan(Partition::Node, b"p:")
+        .unwrap()
+        .into_iter()
+        .filter(|(k, _)| k.as_slice() >= b"p:003".as_slice() && k.as_slice() < b"p:021".as_slice())
+        .collect();
+    assert_eq!(walk(b"p:003", b"p:021", usize::MAX), expected);
+    assert!(
+        expected.iter().all(|(k, _)| k.as_slice() != b"p:004"),
+        "an own delete hides the stored row"
+    );
+    assert_eq!(
+        expected
+            .iter()
+            .find(|(k, _)| k.as_slice() == b"p:010")
+            .map(|(_, v)| v.as_slice()),
+        Some(b"own".as_slice()),
+        "an own write replaces the stored row"
+    );
+    assert_eq!(
+        walk(b"p:003", b"p:021", 3),
+        expected[..3].to_vec(),
+        "a break stops it"
+    );
+    assert!(
+        walk(b"p:021", b"p:003", usize::MAX).is_empty(),
+        "an empty range"
+    );
+    assert!(
+        walk(b"q:", b"r:", usize::MAX).is_empty(),
+        "outside every row"
+    );
+}
+
 /// A row larger than what is left of the budget stops the scan before it is
 /// handed on, with the memory refusal, and leaves nothing held: the scan does
 /// not return the rows it reached as if they were all.

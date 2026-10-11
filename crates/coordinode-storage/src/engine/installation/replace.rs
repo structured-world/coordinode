@@ -159,7 +159,7 @@ impl Staged {
 }
 
 /// The stored ranges, `[start, end)`, of every entry of `installation`.
-fn installation_ranges(installation: u64) -> [(Vec<u8>, Vec<u8>); 2] {
+fn installation_ranges(installation: u64) -> [(Vec<u8>, Vec<u8>); GENERATION_TAGS.len()] {
     GENERATION_TAGS.map(|tag| (prefix(tag, installation), prefix_end(tag, installation)))
 }
 

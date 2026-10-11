@@ -140,8 +140,18 @@ fn a_range_over_the_partition_comes_apart_in_logical_order() {
             lo: Bound::Included(prefix(0x02, 2)),
             hi: Bound::Excluded(prefix(0x02, 3)),
         },
+        Piece::Domain {
+            generation: 5,
+            lo: Bound::Included(prefix(0x03, 30)),
+            hi: Bound::Excluded(prefix(0x03, 31)),
+        },
+        Piece::Domain {
+            generation: 9,
+            lo: Bound::Included(prefix(0x03, 2)),
+            hi: Bound::Excluded(prefix(0x03, 3)),
+        },
         Piece::Raw {
-            lo: Bound::Included(vec![0x03]),
+            lo: Bound::Included(vec![0x04]),
             hi: Bound::Unbounded,
         },
     ];
@@ -164,7 +174,7 @@ fn a_range_inside_one_generation_keeps_its_bounds() {
             hi: Bound::Included(key(0x01, 30, b"m")),
         }]
     );
-    let [(start, end), _] = coordinode_core::index::encoding::generation_ranges(
+    let [(start, end), _, _] = coordinode_core::index::encoding::generation_ranges(
         coordinode_core::index::identity::GenerationId::from_raw(5),
     );
     assert_eq!(

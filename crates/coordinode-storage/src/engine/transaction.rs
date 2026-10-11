@@ -2491,6 +2491,96 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
+    /// The rows of `part` with keys in `[start, end)`, in key order, as this
+    /// transaction sees them (its snapshot overlaid with its own writes,
+    /// which [`Self::prefix_for_each`] gives for a prefix), handed to `visit`
+    /// until it breaks. Each row counts one unit of `budget`'s work and holds
+    /// its bytes while `visit` sees it. Starting at an arbitrary key, a
+    /// caller resumes a long range page by page without reading what it has
+    /// passed.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, the budget's refusal, or the first error of `visit`.
+    pub fn range_for_each<E>(
+        &self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+        budget: &coordinode_core::budget::QueryBudget,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<core::ops::ControlFlow<()>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError> + From<coordinode_core::budget::BudgetStop>,
+    {
+        use core::ops::ControlFlow;
+        if start >= end {
+            return Ok(());
+        }
+        let in_range = |k: &[u8]| k >= start && k < end;
+        let own = self
+            .write_buffer
+            .keys()
+            .filter(|(p, k)| *p == part && in_range(k))
+            .count();
+        // A size past u64 asks for more than any limit, and is refused as such.
+        let _own_index = budget.reserve(
+            own.checked_mul(core::mem::size_of::<(&[u8], Option<&[u8]>)>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX),
+        )?;
+        let mut overlay: Vec<(&[u8], Option<&[u8]>)> = Vec::with_capacity(own);
+        overlay.extend(
+            self.write_buffer
+                .iter()
+                .filter(|((p, k), _)| *p == part && in_range(k))
+                .map(|((_, k), v)| (k.as_slice(), v.as_deref())),
+        );
+        overlay.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut overlay = overlay.into_iter().peekable();
+
+        let mut emit = |key: &[u8], value: &[u8]| -> Result<ControlFlow<()>, E> {
+            budget.work(1)?;
+            let _row = budget.reserve(row_bytes(key, value))?;
+            visit(key, value)
+        };
+        // The engine's range bound is inclusive; `end` is not.
+        for guard in self.base_range_seekable(part, start, end)? {
+            let (key, value) = guard.into_inner().map_err(StorageError::from)?;
+            if key.as_ref() >= end {
+                break;
+            }
+            // Own writes before this key come first, in order.
+            while let Some((own_key, own_value)) = overlay.next_if(|(k, _)| *k < key.as_ref()) {
+                if let Some(own_value) = own_value {
+                    if emit(own_key, own_value)?.is_break() {
+                        return Ok(());
+                    }
+                }
+            }
+            // An own write of the same key replaces this row, or removes it.
+            let flow = match overlay.next_if(|(k, _)| *k == key.as_ref()) {
+                Some((own_key, Some(own_value))) => emit(own_key, own_value)?,
+                Some((_, None)) => {
+                    budget.work(1)?;
+                    ControlFlow::Continue(())
+                }
+                None => emit(&key, &value)?,
+            };
+            if flow.is_break() {
+                return Ok(());
+            }
+        }
+        for (own_key, own_value) in overlay {
+            if let Some(own_value) = own_value {
+                if emit(own_key, own_value)?.is_break() {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Keyset-resumed page of a prefix scan, reading the transaction's pinned
     /// snapshot. Returns up to `limit` rows whose key carries `prefix`, starting
     /// strictly after `start_after` (or at the prefix start when `None`), plus

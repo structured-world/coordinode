@@ -72,6 +72,10 @@ pub enum IndexType {
     Flat,
     /// Full-text search index backed by tantivy.
     Text,
+    /// The namespace's built-in label lookup: one posting per node and label
+    /// it holds, maintained by every write. Never declared by DDL; one per
+    /// namespace, with no label or properties of its own.
+    Labels,
 }
 
 pub use coordinode_core::index::filter::PartialFilter;
@@ -422,6 +426,19 @@ impl IndexDescriptor {
             sparse: true,
             text_config: Some(config),
             ..Self::new(name, label, properties, IndexType::Text)
+        }
+    }
+
+    /// The namespace's built-in label lookup, published building: no name,
+    /// label or properties of its own, written in the entry layout.
+    pub fn label_lookup() -> Self {
+        Self {
+            name: None,
+            state: IndexState::Building {
+                written: 0,
+                estimated_total: 0,
+            },
+            ..Self::new("", "", Vec::new(), IndexType::Labels)
         }
     }
 

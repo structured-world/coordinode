@@ -171,16 +171,63 @@ fn generations_are_disjoint() {
     let g = generation(5);
     let unique = encode_unique_entry_key(g, &value);
     assert!(!unique.starts_with(&entries_prefix(g)));
-    let [(start, end), (ustart, uend)] = generation_ranges(g);
+    let [(start, end), (ustart, uend), (lstart, lend)] = generation_ranges(g);
     let entry = encode_entry_key(g, &value, 1);
     assert!(start <= entry && entry < end);
     assert!(ustart <= unique && unique < uend);
+    let posting = encode_label_posting(g, 1, 2, 3);
+    assert!(lstart.as_slice() <= posting.as_slice() && posting.as_slice() < lend.as_slice());
+    assert!(!(start.as_slice() <= posting.as_slice() && posting.as_slice() < end.as_slice()));
+    assert!(!(ustart.as_slice() <= posting.as_slice() && posting.as_slice() < uend.as_slice()));
+}
+
+/// A label posting names its shard, label and node, decodes back to them in
+/// its own generation only, and sorts by shard, then label, then node: one
+/// label's postings in one shard are one contiguous NodeId-ordered range.
+#[test]
+fn label_postings_round_trip_and_sort_by_label_then_node() {
+    let g = generation(0x3A00_0000_0000_00FF);
+    for (shard, label, node) in [(0, 0, 0), (1, 7, 42), (u16::MAX, u32::MAX, u64::MAX)] {
+        let key = encode_label_posting(g, shard, label, node);
+        assert_eq!(key.len(), LABEL_POSTING_LEN);
+        assert_eq!(decode_label_posting(g, &key), Some((shard, label, node)));
+        assert_eq!(
+            decode_label_posting(generation(7), &key),
+            None,
+            "another generation"
+        );
+        assert!(key.starts_with(&label_range_prefix(g, shard, label)));
+    }
+    assert_eq!(
+        decode_label_posting(g, &label_range_prefix(g, 1, 7)),
+        None,
+        "a prefix"
+    );
+    let mut long = encode_label_posting(g, 1, 7, 42).to_vec();
+    long.push(0);
+    assert_eq!(decode_label_posting(g, &long), None, "a longer key");
+
+    let ordered = [
+        encode_label_posting(g, 0, u32::MAX, u64::MAX),
+        encode_label_posting(g, 1, 0, u64::MAX),
+        encode_label_posting(g, 1, 1, 0),
+        encode_label_posting(g, 1, 1, 0x100),
+        encode_label_posting(g, 1, 0x100, 0),
+    ];
+    assert!(ordered.windows(2).all(|w| w[0] < w[1]));
+    let range = label_range_prefix(g, 1, 1);
+    assert_eq!(
+        ordered.iter().filter(|k| k.starts_with(&range)).count(),
+        2,
+        "only the label's own postings in the shard"
+    );
 }
 
 /// The last generation's ranges still end: the range end steps the tag.
 #[test]
 fn the_last_generation_has_a_range_end() {
-    let [(start, end), _] = generation_ranges(generation(u64::MAX));
+    let [(start, end), _, (lstart, lend)] = generation_ranges(generation(u64::MAX));
+    assert!(lstart < lend, "the last generation's postings too");
     assert!(start < end);
     let key = encode_entry_key(generation(u64::MAX), &enc(Value::Int(1)), 1);
     assert!(start <= key && key < end);
@@ -210,6 +257,16 @@ fn scan_prefixes_follow_the_structure() {
     let unique = encode_unique_entry_key(g, &tuple);
     let prefixes: Vec<&[u8]> = entry_scan_prefixes(&unique).expect("an entry").collect();
     assert_eq!(prefixes, vec![&unique_entries_prefix(g)[..]]);
+
+    let posting = encode_label_posting(g, 0x3A00, 0x003A_3A00, 0x3A);
+    let prefixes: Vec<&[u8]> = entry_scan_prefixes(&posting).expect("a posting").collect();
+    assert_eq!(
+        prefixes,
+        vec![
+            &label_postings_prefix(g)[..],
+            &label_range_prefix(g, 0x3A00, 0x003A_3A00)[..]
+        ]
+    );
 
     assert!(entry_scan_prefixes(b"idx:\0\0\0\x01a:x").is_none());
     assert!(entry_scan_prefixes(&[0x00, 1, 2]).is_none());

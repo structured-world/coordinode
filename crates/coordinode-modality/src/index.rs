@@ -51,6 +51,23 @@ use crate::index_def::{
     IndexDescriptor, IndexId, IndexIntegrityRecord, IndexProfile, NamespaceIndexPolicy,
 };
 
+/// One label's members in one shard of a label lookup: what
+/// [`IndexStore::label_members`] reads.
+#[derive(Debug, Clone, Copy)]
+pub struct LabelScope<'a> {
+    /// The label lookup.
+    pub lookup: &'a IndexDefinition,
+    /// The shard whose nodes are read.
+    pub shard: u16,
+    /// The label, as the field dictionary binds its name.
+    pub label: u32,
+}
+
+/// Catalog key naming the namespace's label lookup: the identity of its
+/// definition, written once, by the publication that creates it. Outside the
+/// definition and name prefixes, and replicated with the catalog.
+const LABEL_LOOKUP_KEY: &[u8] = b"schema:idx_labels";
+
 /// Prefix of the marks of generations this member found its own copy of
 /// disagreeing with the records, one per generation, holding the copy's
 /// installation. Under `meta:`, the class of node-local records a snapshot
@@ -314,6 +331,65 @@ pub trait IndexStore {
         txn: &mut Transaction,
         descriptor: IndexDescriptor,
     ) -> StoreResult<IndexDefinition>;
+
+    /// The namespace's label lookup, when one was published.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn label_lookup(&self) -> StoreResult<Option<IndexDefinition>>;
+
+    /// Publish the namespace's label lookup through a statement
+    /// [`Transaction`] as `descriptor` says, unless one is published: the
+    /// marker naming it is written only while absent at the commit, so two
+    /// members provisioning it at once publish one. `None` when one is.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_definition_txn`].
+    fn publish_label_lookup_txn(
+        &self,
+        txn: &mut Transaction,
+        descriptor: IndexDescriptor,
+    ) -> StoreResult<Option<IndexDefinition>>;
+
+    /// Stage node `node` of shard `shard` leaving the labels `removed` and
+    /// joining the labels `added` (dictionary ids) in the label lookup
+    /// `def`: one posting removed or put per label, nothing for a label in
+    /// both.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn stage_label_postings_txn(
+        &self,
+        txn: &mut Transaction,
+        def: &IndexDefinition,
+        shard: u16,
+        node: NodeId,
+        removed: &[u32],
+        added: &[u32],
+    ) -> StoreResult<()>;
+
+    /// The nodes `scope` names, as `txn` sees them, in NodeId order after
+    /// `after`, handed to `visit` until it breaks. Each posting costs one
+    /// unit of `budget`'s work.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, the budget's refusal, or the first error of
+    /// `visit`.
+    fn label_members<E>(
+        &self,
+        txn: &Transaction,
+        scope: LabelScope<'_>,
+        after: Option<NodeId>,
+        budget: &coordinode_core::budget::QueryBudget,
+        visit: impl FnMut(NodeId) -> Result<core::ops::ControlFlow<()>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<coordinode_storage::error::StorageError>
+            + From<coordinode_core::budget::BudgetStop>;
 
     /// Allocate a new generation for `def` through a statement
     /// [`Transaction`], for a rebuild that writes a new representation. The
@@ -1131,6 +1207,94 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(def)
     }
 
+    fn label_lookup(&self) -> StoreResult<Option<IndexDefinition>> {
+        let Some(bytes) = self.engine.get(Partition::Schema, LABEL_LOOKUP_KEY)? else {
+            return Ok(None);
+        };
+        self.load_definition(decode_index_id(&bytes)?)
+    }
+
+    fn publish_label_lookup_txn(
+        &self,
+        txn: &mut Transaction,
+        descriptor: IndexDescriptor,
+    ) -> StoreResult<Option<IndexDefinition>> {
+        if txn.get(Partition::Schema, LABEL_LOOKUP_KEY)?.is_some() {
+            return Ok(None);
+        }
+        txn.expect_version(Partition::Schema, LABEL_LOOKUP_KEY, None)?;
+        let def = self.publish_definition_txn(txn, descriptor)?;
+        txn.put(
+            Partition::Schema,
+            LABEL_LOOKUP_KEY,
+            &def.id.as_raw().to_be_bytes(),
+        )?;
+        Ok(Some(def))
+    }
+
+    fn stage_label_postings_txn(
+        &self,
+        txn: &mut Transaction,
+        def: &IndexDefinition,
+        shard: u16,
+        node: NodeId,
+        removed: &[u32],
+        added: &[u32],
+    ) -> StoreResult<()> {
+        use coordinode_core::index::encoding::encode_label_posting;
+        for &label in removed.iter().filter(|l| !added.contains(l)) {
+            txn.delete(
+                Partition::Idx,
+                &encode_label_posting(def.generation, shard, label, node.as_raw()),
+            )?;
+        }
+        for &label in added.iter().filter(|l| !removed.contains(l)) {
+            txn.put(
+                Partition::Idx,
+                &encode_label_posting(def.generation, shard, label, node.as_raw()),
+                &[],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn label_members<E>(
+        &self,
+        txn: &Transaction,
+        LabelScope {
+            lookup: def,
+            shard,
+            label,
+        }: LabelScope<'_>,
+        after: Option<NodeId>,
+        budget: &coordinode_core::budget::QueryBudget,
+        mut visit: impl FnMut(NodeId) -> Result<core::ops::ControlFlow<()>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<coordinode_storage::error::StorageError>
+            + From<coordinode_core::budget::BudgetStop>,
+    {
+        use coordinode_core::index::encoding::{
+            decode_label_posting, encode_label_posting, label_range_prefix,
+        };
+        let range = label_range_prefix(def.generation, shard, label);
+        let start = match after.map(NodeId::as_raw) {
+            // The first posting after `after`: a resume past the last NodeId
+            // has nothing left to read.
+            Some(u64::MAX) => return Ok(()),
+            Some(node) => encode_label_posting(def.generation, shard, label, node + 1).to_vec(),
+            None => range.to_vec(),
+        };
+        let end = coordinode_core::index::encoding::prefix_end(&range);
+        txn.range_for_each(Partition::Idx, &start, &end, budget, |key, _| {
+            match decode_label_posting(def.generation, key) {
+                Some((_, _, node)) => visit(NodeId::from_raw(node)),
+                // A key of another shape inside the range is no posting.
+                None => Ok(core::ops::ControlFlow::Continue(())),
+            }
+        })
+    }
+
     fn allocate_generation_txn(&self, txn: &mut Transaction) -> StoreResult<GenerationId> {
         let mut allocator = self.allocator_txn(txn)?;
         let generation = allocator.allocate_generation()?;
@@ -1618,7 +1782,7 @@ impl IndexStore for LocalIndexStore<'_> {
         after: Option<&[u8]>,
         limit: usize,
     ) -> StoreResult<StoredEntryPage> {
-        let [plain, unique] = generation_ranges(index.generation);
+        let [plain, unique, _] = generation_ranges(index.generation);
         let (start, end) = if index.unique { unique } else { plain };
         let page = txn.range_scan_paged(Partition::Idx, &start, &end, after, limit)?;
         let mut entries = Vec::with_capacity(page.rows.len());

@@ -30,6 +30,8 @@ const TAG_BINARY: u8 = 0x60;
 const TAG_ENTRIES: u8 = 0x01;
 /// First byte of an entry of a unique index: one entry per value.
 const TAG_UNIQUE_ENTRIES: u8 = 0x02;
+/// First byte of a label membership posting: one per node and label.
+const TAG_LABEL_POSTINGS: u8 = 0x03;
 /// Ends the tuple of a non-unique entry. No element starts with it, so it
 /// marks where the tuple ends and the owner begins.
 const TUPLE_END: u8 = b':';
@@ -37,8 +39,17 @@ const TUPLE_END: u8 = b':';
 pub const GENERATION_PREFIX_LEN: usize = 9;
 /// First bytes of the index partition keys that belong to a generation: a key
 /// starting with one of them is `tag / GenerationId:u64_BE / …`. No other
-/// family of the index partition starts with these bytes.
-pub const GENERATION_TAGS: [u8; 2] = [TAG_ENTRIES, TAG_UNIQUE_ENTRIES];
+/// family of the index partition starts with these bytes. Contiguous and
+/// ascending, so the keys of every generation lie between the first tag and
+/// the one past the last.
+pub const GENERATION_TAGS: [u8; 3] = [TAG_ENTRIES, TAG_UNIQUE_ENTRIES, TAG_LABEL_POSTINGS];
+
+/// Length of a label posting key: the generation prefix, the shard (u16 BE),
+/// the label (u32 BE) and the node (u64 BE).
+pub const LABEL_POSTING_LEN: usize = GENERATION_PREFIX_LEN + 2 + 4 + 8;
+
+/// Length of the prefix of one label's postings in one shard.
+pub const LABEL_RANGE_PREFIX_LEN: usize = GENERATION_PREFIX_LEN + 2 + 4;
 
 /// A value that has no index key.
 ///
@@ -201,19 +212,69 @@ pub fn encode_unique_entry_key(generation: GenerationId, tuple: &[u8]) -> Vec<u8
     out
 }
 
-/// The key ranges, `[start, end)`, holding every entry of `generation` in
-/// either shape: what removing a generation's entries removes.
-pub fn generation_ranges(generation: GenerationId) -> [(Vec<u8>, Vec<u8>); 2] {
+/// Prefix of every label posting of the lookup generation `generation`.
+pub fn label_postings_prefix(generation: GenerationId) -> [u8; GENERATION_PREFIX_LEN] {
+    generation_prefix(TAG_LABEL_POSTINGS, generation)
+}
+
+/// Prefix of the postings of label `label` in shard `shard` of the lookup
+/// generation `generation`: every node holding the label there, in NodeId
+/// order.
+pub fn label_range_prefix(
+    generation: GenerationId,
+    shard: u16,
+    label: u32,
+) -> [u8; LABEL_RANGE_PREFIX_LEN] {
+    let mut out = [0u8; LABEL_RANGE_PREFIX_LEN];
+    out[..GENERATION_PREFIX_LEN].copy_from_slice(&label_postings_prefix(generation));
+    out[GENERATION_PREFIX_LEN..GENERATION_PREFIX_LEN + 2].copy_from_slice(&shard.to_be_bytes());
+    out[GENERATION_PREFIX_LEN + 2..].copy_from_slice(&label.to_be_bytes());
+    out
+}
+
+/// The posting saying node `node_id` of shard `shard` holds label `label`,
+/// in the lookup generation `generation`. Its value is empty: the key is the
+/// membership.
+pub fn encode_label_posting(
+    generation: GenerationId,
+    shard: u16,
+    label: u32,
+    node_id: u64,
+) -> [u8; LABEL_POSTING_LEN] {
+    let mut out = [0u8; LABEL_POSTING_LEN];
+    out[..LABEL_RANGE_PREFIX_LEN].copy_from_slice(&label_range_prefix(generation, shard, label));
+    out[LABEL_RANGE_PREFIX_LEN..].copy_from_slice(&node_id.to_be_bytes());
+    out
+}
+
+/// The shard, label and node a label posting key of `generation` names.
+/// `None` for a key that is no posting of that generation.
+pub fn decode_label_posting(generation: GenerationId, key: &[u8]) -> Option<(u16, u32, u64)> {
+    let rest = key.strip_prefix(label_postings_prefix(generation).as_slice())?;
+    if rest.len() != LABEL_POSTING_LEN - GENERATION_PREFIX_LEN {
+        return None;
+    }
+    let shard = u16::from_be_bytes(rest[..2].try_into().ok()?);
+    let label = u32::from_be_bytes(rest[2..6].try_into().ok()?);
+    let node_id = u64::from_be_bytes(rest[6..].try_into().ok()?);
+    Some((shard, label, node_id))
+}
+
+/// The key ranges, `[start, end)`, holding every key of `generation` in any
+/// shape: what removing a generation's entries removes.
+pub fn generation_ranges(generation: GenerationId) -> [(Vec<u8>, Vec<u8>); 3] {
     [
         entries_prefix(generation),
         unique_entries_prefix(generation),
+        label_postings_prefix(generation),
     ]
     .map(|prefix| (prefix.to_vec(), prefix_end(&prefix)))
 }
 
-/// Smallest key strictly greater than every key starting with `prefix`. The
-/// prefixes here start with a tag below `0xFF`, so an end always exists.
-fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+/// Smallest key strictly greater than every key starting with `prefix`: the
+/// exclusive end of the range the prefix covers. The prefixes of this
+/// partition start with a tag below `0xFF`, so an end always exists.
+pub fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
         if last < 0xFF {
@@ -226,19 +287,22 @@ fn prefix_end(prefix: &[u8]) -> Vec<u8> {
 
 /// The scan prefixes of an index partition key a prefix filter records:
 /// its generation prefix and, for a non-unique entry, the prefix through its
-/// tuple. Both are structural boundaries, found by decoding the shape and
-/// the tuple, never by searching for a separator byte, which a value or a
-/// generation number may contain. `None` for a key of no entry shape.
+/// tuple, for a label posting the prefix of its label in its shard. All are
+/// structural boundaries, found by decoding the shape and the tuple, never
+/// by searching for a separator byte, which a value or a generation number
+/// may contain. `None` for a key of no entry shape.
 pub fn entry_scan_prefixes(key: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
     let tag = *key.first()?;
-    if (tag != TAG_ENTRIES && tag != TAG_UNIQUE_ENTRIES) || key.len() < GENERATION_PREFIX_LEN {
+    if !GENERATION_TAGS.contains(&tag) || key.len() < GENERATION_PREFIX_LEN {
         return None;
     }
-    let value = (tag == TAG_ENTRIES)
-        .then(|| tuple_len(&key[GENERATION_PREFIX_LEN..]))
-        .flatten()
-        .map(|len| &key[..GENERATION_PREFIX_LEN + len + 1]);
-    Some(core::iter::once(&key[..GENERATION_PREFIX_LEN]).chain(value))
+    let inner = match tag {
+        TAG_ENTRIES => tuple_len(&key[GENERATION_PREFIX_LEN..])
+            .map(|len| &key[..GENERATION_PREFIX_LEN + len + 1]),
+        TAG_LABEL_POSTINGS => key.get(..LABEL_RANGE_PREFIX_LEN),
+        _ => None,
+    };
+    Some(core::iter::once(&key[..GENERATION_PREFIX_LEN]).chain(inner))
 }
 
 /// The owner a non-unique entry key of `generation` names: the node id, and
