@@ -181,6 +181,41 @@ fn findings_exclude_and_missing_proof_is_unknown() {
     );
 }
 
+/// A copy whose use guard a previous run left open is excluded from the
+/// next capture, its proof notwithstanding: the guard says the copy served
+/// while its process died, which nothing since has checked.
+#[test]
+fn a_copy_left_guarded_by_a_dead_run_is_excluded() {
+    let member = member();
+    let engine = &member.env.engine;
+    let store = LocalIndexStore::new(engine);
+    let copy = store
+        .local_copy(member.email.generation)
+        .expect("a copy here");
+    store.arm_here(&[copy]).expect("in use when the run died");
+    let reopened = Arc::new(IndexRegistry::new());
+    reopened.recover_local_guards(engine).expect("recover");
+    reopened.load_all(engine).expect("load");
+    let qualifier = CopyQualifier::new(reopened);
+    let states = states(
+        &qualifier
+            .seal(engine, &qualifier.capture(engine).expect("capture"))
+            .expect("seal"),
+    );
+    assert_eq!(
+        states.get(&member.email.generation.as_raw()),
+        Some(&CopyState::Excluded),
+        "the guarded copy: {states:?}"
+    );
+    assert!(
+        matches!(
+            states.get(&member.empty.generation.as_raw()),
+            Some(CopyState::Qualified(_))
+        ),
+        "the copy no run used keeps its proof: {states:?}"
+    );
+}
+
 /// The records, catalog and index copies of `sender` installed on
 /// `receiver` as a Raft snapshot with `inventory`.
 fn install(receiver: &StorageEngine, sender: &StorageEngine, inventory: Option<&[u8]>) {
