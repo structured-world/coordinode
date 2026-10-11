@@ -520,6 +520,20 @@ pub trait IndexStore {
         version: Option<u64>,
     ) -> StoreResult<()>;
 
+    /// Commit `txn` only while the integrity record of `generation` is still
+    /// at `version`: a check's repair is bound to the check its executor
+    /// still holds, so one another executor took over commits nothing.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn expect_integrity_txn(
+        &self,
+        txn: &mut Transaction,
+        generation: GenerationId,
+        version: u64,
+    ) -> StoreResult<()>;
+
     /// Stage the removal of the integrity records of the index `index`, in
     /// the commit that drops it.
     ///
@@ -1318,6 +1332,20 @@ impl IndexStore for LocalIndexStore<'_> {
             Partition::Schema,
             &key,
             &encode("index integrity record", record)?,
+        )?;
+        Ok(())
+    }
+
+    fn expect_integrity_txn(
+        &self,
+        txn: &mut Transaction,
+        generation: GenerationId,
+        version: u64,
+    ) -> StoreResult<()> {
+        txn.expect_version(
+            Partition::Schema,
+            &IndexIntegrityRecord::key_of(generation),
+            Some(version),
         )?;
         Ok(())
     }

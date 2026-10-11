@@ -519,6 +519,29 @@ fn a_repair_raced_by_a_rebuild_is_refused() {
     assert_eq!(env.holders(&rebuilt, "b@x"), vec![2], "the rebuild has b");
 }
 
+/// A repair is bound to the check its executor holds: one held at its
+/// commit while the check is cancelled (or taken over by another executor,
+/// which moves the same record) commits nothing, and the check ends
+/// cancelled with the damage left for the next one.
+#[test]
+fn a_repair_of_a_cancelled_check_commits_nothing() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    env.hold_pages_after(0);
+    let operation = builds.request_check(def.id).expect("check");
+    env.await_held_page();
+    assert!(builds.cancel_check(operation).expect("cancel"), "cancelled");
+    env.release_pages();
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert_eq!(outcome, Some(CheckOutcome::Cancelled));
+    assert!(
+        env.holders(&def, "b@x").is_empty(),
+        "the cancelled check's repair did not commit"
+    );
+}
+
 /// Fills a replacement from a peer's copy of the generation, as segment
 /// transfer does between members: the peer's history imported at its own
 /// seqnos.

@@ -1223,7 +1223,7 @@ impl Shared {
             if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
                 return Ok(None);
             }
-            let Some((record, _)) = self.held_record(generation, taken)? else {
+            let Some((record, held_version)) = self.held_record(generation, taken)? else {
                 return Ok(None);
             };
             let Some(check) = record.check.clone() else {
@@ -1264,7 +1264,13 @@ impl Shared {
             pass.checked += found.checked;
             pass.found += (repairable.len() + conflicts.len()) as u64;
             if !repairable.is_empty() && *repaired_total <= max_repairs {
-                repaired = self.repair(taken, &interpretation, &repairable, &mut conflicts)?;
+                repaired = self.repair(
+                    taken,
+                    held_version,
+                    &interpretation,
+                    &repairable,
+                    &mut conflicts,
+                )?;
                 *repaired_total += repaired;
                 pass.repaired += repaired;
             }
@@ -1436,14 +1442,17 @@ impl Shared {
     }
 
     /// Repair `mismatches` in one commit, each only while its record and its
-    /// entry are still as found and the index still serves from the checked
-    /// generation. A missing unique entry whose value another record holds
-    /// is a conflict, appended to `conflicts`. Returns how many were
-    /// repaired; a repair that met a concurrent change is left for the next
-    /// pass.
+    /// entry are still as found, the index still serves from the checked
+    /// generation and the check is still this executor's (its record at
+    /// `held_version`, as the page read it). A missing unique entry whose
+    /// value another record holds is a conflict, appended to `conflicts`.
+    /// Returns how many were repaired; a repair that met a concurrent change
+    /// is left for the next pass, and one whose check another executor took
+    /// over or a cancellation ended commits nothing.
     fn repair(
         &self,
         taken: &Taken,
+        held_version: u64,
         interpretation: &IndexInterpretation,
         mismatches: &[Mismatch],
         conflicts: &mut Vec<Mismatch>,
@@ -1464,6 +1473,9 @@ impl Shared {
         // decides a condition when it is stated.
         store
             .expect_definition_txn(&mut txn, def.id, taken.def_version)
+            .map_err(text)?;
+        store
+            .expect_integrity_txn(&mut txn, def.generation, held_version)
             .map_err(text)?;
         let mut repaired = 0u64;
         for mismatch in mismatches {
