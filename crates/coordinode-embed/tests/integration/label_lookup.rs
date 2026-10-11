@@ -537,6 +537,70 @@ fn a_scan_before_the_lookup_is_ready_reads_the_records() {
     );
 }
 
+/// A context broker's mount lookup, as it issues it: the few mounts of one
+/// machine among a store whose bulk is indexed file segments. It reads the
+/// mounts alone, so a statement whose memory limit the segments would break
+/// answers.
+#[test]
+fn a_mount_lookup_beside_large_segments_reads_only_mounts() {
+    let (mut db, _dir) = open_db();
+    for (project, machine) in [("p1", "m1"), ("p2", "m1"), ("p1", "m2")] {
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "mount_id".to_string(),
+            Value::String(format!("{project}:{machine}")),
+        );
+        params.insert("project_id".to_string(), Value::String(project.into()));
+        params.insert("machine_id".to_string(), Value::String(machine.into()));
+        params.insert(
+            "local_path".to_string(),
+            Value::String(format!("/src/{project}")),
+        );
+        db.execute_cypher_with_params(
+            "MERGE (m:ProjectMount {mount_id: $mount_id}) \
+             SET m.project_id  = $project_id, \
+                 m.machine_id  = $machine_id, \
+                 m.local_path  = $local_path",
+            params,
+        )
+        .expect("mount");
+    }
+    // Each segment alone is past the statement's limit: a scan that read one
+    // would be refused.
+    let text = "fn segment() {} ".repeat(128 << 10);
+    for i in 0..4 {
+        db.execute_cypher(&format!("CREATE (:Segment {{i: {i}, text: '{text}'}})"))
+            .expect("segment");
+    }
+    db.set_query_memory_limit(1 << 20).expect("limit");
+    let mut params = std::collections::HashMap::new();
+    params.insert("machine_id".to_string(), Value::String("m1".into()));
+    let rows = db
+        .execute_cypher_with_params(
+            "MATCH (m:ProjectMount {machine_id: $machine_id}) \
+             RETURN m.project_id AS project_id, m.local_path AS local_path",
+            params,
+        )
+        .expect("mount lookup");
+    let mut projects: Vec<String> = rows
+        .iter()
+        .map(|row| match row.get("project_id") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("expected a project, got {other:?}"),
+        })
+        .collect();
+    projects.sort();
+    assert_eq!(projects, ["p1", "p2"]);
+    // The same rows found by reading every node are refused.
+    assert!(
+        db.execute_cypher(
+            "MATCH (m) WHERE 'ProjectMount' IN labels(m) AND m.machine_id = 'm1' \
+             RETURN m.project_id AS project_id"
+        )
+        .is_err()
+    );
+}
+
 /// EXPLAIN names the lookup a label scan reads.
 #[test]
 fn explain_names_the_label_lookup() {
