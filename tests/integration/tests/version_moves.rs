@@ -629,7 +629,7 @@ async fn a_directory_two_formats_behind_goes_through_the_intermediate_one() {
     assert!(!status.success(), "two formats ahead refuses: {printed}");
     assert!(
         printed.contains(&format!("engine format {base}"))
-            && printed.contains(&format!("runs format {}", base + 2)),
+            && printed.contains(&format!("opens only engine format {}", base + 2)),
         "the refusal names both formats: {printed}"
     );
 
