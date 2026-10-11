@@ -176,7 +176,10 @@ fn a_rename_the_build_cannot_make_is_refused_up_front() {
 
     assert!(db.constraints().expect("constraints").is_empty());
     assert!(
-        db.index_build_status().expect("builds").is_empty(),
-        "no build was admitted"
+        db.index_build_status()
+            .expect("builds")
+            .iter()
+            .all(|b| b.index.as_ref().is_some_and(|i| i.builtin)),
+        "no build was admitted besides the label lookup's"
     );
 }

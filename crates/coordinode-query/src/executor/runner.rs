@@ -2356,7 +2356,52 @@ impl<'a> ExecutionContext<'a> {
                 ));
         }
         self.sync_txn_state();
+        self.stage_label_membership(shard_id, node_id, Some(&record.labels))?;
         Ok(LocalNodeStore.put(&mut self.txn, shard_id, node_id, record)?)
+    }
+
+    /// Stage the label lookup postings of node `node_id` moving from the
+    /// labels it holds as this transaction sees it to `labels` (`None`: the
+    /// node is deleted). A write that keeps the node's labels stages nothing.
+    ///
+    /// Both sides are resolved through the authoritative dictionary, not
+    /// this statement's view of it: a label the lookup's build registered
+    /// after the view was taken still has its posting found and removed.
+    fn stage_label_membership(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+        labels: Option<&[String]>,
+    ) -> Result<(), ExecutionError> {
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(());
+        };
+        if registry.label_lookup().is_none() {
+            return Ok(());
+        }
+        let key = coordinode_core::graph::node::encode_node_key(shard_id, node_id);
+        let before = match self.txn.get(Partition::Node, &key)? {
+            Some(bytes) => NodeRecord::labels_from_msgpack(&bytes).map_err(|e| {
+                ExecutionError::Serialization(format!("labels of node {}: {e}", node_id.as_raw()))
+            })?,
+            None => Vec::new(),
+        };
+        let after = labels.unwrap_or_default();
+        if before.len() == after.len() && before.iter().all(|l| after.contains(l)) {
+            return Ok(());
+        }
+        let names: Vec<&str> = before.iter().chain(after).map(String::as_str).collect();
+        let ids = self.field_ids(&names)?;
+        let (removed, added) = ids.split_at(before.len());
+        registry.on_labels_changed(
+            self.engine,
+            &mut self.txn,
+            shard_id,
+            node_id,
+            removed,
+            added,
+        )?;
+        Ok(())
     }
 
     /// Whether `label` has a presence or type constraint, which every node
@@ -2534,6 +2579,13 @@ impl<'a> ExecutionContext<'a> {
             );
         }
         self.sync_txn_state();
+        if let Some(registry) = self.btree_index_registry {
+            if registry.label_lookup().is_some() && !record.labels.is_empty() {
+                let names: Vec<&str> = record.labels.iter().map(String::as_str).collect();
+                let held = self.field_ids(&names)?;
+                registry.on_labels_held(self.engine, &mut self.txn, shard_id, node_id, &held)?;
+            }
+        }
         Ok(LocalNodeStore.put_temporal(&mut self.txn, shard_id, node_id, valid_from_ms, record)?)
     }
 
@@ -3038,6 +3090,7 @@ impl<'a> ExecutionContext<'a> {
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
         self.sync_txn_state();
+        self.stage_label_membership(shard_id, node_id, None)?;
         Ok(LocalNodeStore.delete(&mut self.txn, shard_id, node_id)?)
     }
 

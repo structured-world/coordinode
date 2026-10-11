@@ -63,10 +63,7 @@ pub struct LabelScope<'a> {
     pub label: u32,
 }
 
-/// Catalog key naming the namespace's label lookup: the identity of its
-/// definition, written once, by the publication that creates it. Outside the
-/// definition and name prefixes, and replicated with the catalog.
-const LABEL_LOOKUP_KEY: &[u8] = b"schema:idx_labels";
+const LABEL_LOOKUP_KEY: &[u8] = IndexDefinition::LABEL_LOOKUP_KEY;
 
 /// Prefix of the marks of generations this member found its own copy of
 /// disagreeing with the records, one per generation, holding the copy's
@@ -369,6 +366,23 @@ pub trait IndexStore {
         node: NodeId,
         removed: &[u32],
         added: &[u32],
+    ) -> StoreResult<()>;
+
+    /// Stage the postings of node `node` of shard `shard` for the labels
+    /// `held` (dictionary ids) in the label lookup `def` that it does not
+    /// have yet, as `txn` sees it: what a version of a temporal node adds,
+    /// whose earlier versions keep their labels in its history.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn stage_label_presence_txn(
+        &self,
+        txn: &mut Transaction,
+        def: &IndexDefinition,
+        shard: u16,
+        node: NodeId,
+        held: &[u32],
     ) -> StoreResult<()>;
 
     /// The nodes `scope` names, as `txn` sees them, in NodeId order after
@@ -1254,6 +1268,24 @@ impl IndexStore for LocalIndexStore<'_> {
                 &encode_label_posting(def.generation, shard, label, node.as_raw()),
                 &[],
             )?;
+        }
+        Ok(())
+    }
+
+    fn stage_label_presence_txn(
+        &self,
+        txn: &mut Transaction,
+        def: &IndexDefinition,
+        shard: u16,
+        node: NodeId,
+        held: &[u32],
+    ) -> StoreResult<()> {
+        use coordinode_core::index::encoding::encode_label_posting;
+        for &label in held {
+            let key = encode_label_posting(def.generation, shard, label, node.as_raw());
+            if txn.get(Partition::Idx, &key)?.is_none() {
+                txn.put(Partition::Idx, &key, &[])?;
+            }
         }
         Ok(())
     }

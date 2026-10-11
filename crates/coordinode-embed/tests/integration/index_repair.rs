@@ -1742,6 +1742,10 @@ fn guard_child_uses_an_index_then_aborts() {
         .expect("index in child");
     db.execute_cypher("CREATE (:U {email: 'c@x'})")
         .expect("node in child");
+    // The copy on disk, as one that has served for a while is: a copy whose
+    // installation never reached the disk is rebuilt whole from the log at
+    // the next open, and its guard names an installation that is gone.
+    db.engine().persist().expect("the copy on disk");
     assert_eq!(found(&mut db, "c@x").len(), 1, "the lookup used the index");
     std::process::abort();
 }

@@ -3584,9 +3584,23 @@ impl Database {
     /// The build records could not be read, or an executor could not start.
     pub fn resume_interrupted_index_builds(&self) -> Result<ResumedIndexBuilds, DatabaseError> {
         use coordinode_query::index::IndexBuildOutcome;
+        // The namespace's label lookup is filled in the background: label
+        // scans read the records until it is ready, so nobody waits for it.
+        let provisioned = self
+            .index_builds
+            .provision_label_lookup()
+            .map_err(DatabaseError::Other)?;
+        let label_lookup = provisioned.or_else(|| {
+            self.index_registry
+                .label_lookup()
+                .map(|(def, _)| def.generation)
+        });
         let resumed = self.index_builds.resume().map_err(DatabaseError::Other)?;
         let mut out = ResumedIndexBuilds::default();
         for generation in resumed {
+            if Some(generation) == label_lookup {
+                continue;
+            }
             match self.index_builds.wait_here(generation) {
                 Some(IndexBuildOutcome::Published { .. }) => {
                     out.published += 1;
@@ -3820,7 +3834,11 @@ impl Database {
         let defs = coordinode_query::index::ops::list_index_definitions(&self.engine)
             .map_err(|e| format!("read the index definitions: {e}"))?;
         self.refresh_btree_indexes().map_err(|e| e.to_string())?;
-        for def in defs.iter().filter(|d| d.index_type == IndexType::BTree) {
+        // The label lookup too: the loaded nodes reached none of its postings.
+        for def in defs
+            .iter()
+            .filter(|d| matches!(d.index_type, IndexType::BTree | IndexType::Labels))
+        {
             self.build_btree_index(def.clone())
                 .map_err(|e| format!("build index '{def}': {e}"))?;
         }

@@ -56,6 +56,11 @@ impl BuildEnvironment for DatabaseBuilds {
         self.fields.current().map_err(|e| e.to_string())
     }
 
+    fn register_names(&self, names: &[&str]) -> Result<Vec<u32>, String> {
+        use coordinode_core::graph::intern::FieldRegistrar as _;
+        self.fields.register(names).map_err(|e| e.to_string())
+    }
+
     fn shard_id(&self) -> u16 {
         self.shard_id
     }

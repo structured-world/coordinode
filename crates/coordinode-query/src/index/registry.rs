@@ -159,11 +159,17 @@ const MAX_PENDING_REPORTS: usize = 1024;
 struct Catalog {
     by_id: FxHashMap<IndexId, Registered>,
     by_name: FxHashMap<String, IndexId>,
+    /// The namespace's label lookup, which every node write maintains: found
+    /// without walking the other indexes.
+    labels: Option<IndexId>,
 }
 
 impl Catalog {
     fn insert(&mut self, registered: Registered) {
         let id = registered.def.id;
+        if registered.def.index_type == IndexType::Labels {
+            self.labels = Some(id);
+        }
         if let Some(old) = self.by_id.insert(id, registered) {
             self.unbind(&old.def);
         }
@@ -176,6 +182,14 @@ impl Catalog {
         if let Some(old) = self.by_id.remove(&id) {
             self.unbind(&old.def);
         }
+        if self.labels == Some(id) {
+            self.labels = None;
+        }
+    }
+
+    /// The label lookup, as registered.
+    fn label_lookup(&self) -> Option<&Registered> {
+        self.by_id.get(&self.labels?)
     }
 
     /// Drop `def`'s name binding while it is still `def`'s.
@@ -1299,6 +1313,75 @@ impl IndexRegistry {
 }
 
 impl IndexRegistry {
+    /// The namespace's label lookup (owned clone), with whether the use
+    /// guard of this member's copy of its generation is stored in this run.
+    pub fn label_lookup(&self) -> Option<(IndexDefinition, bool)> {
+        let catalog = self.indexes.read();
+        let registered = catalog.label_lookup()?;
+        Some((
+            IndexDefinition::clone(&registered.def),
+            registered.armed.load(Ordering::Acquire),
+        ))
+    }
+
+    /// Stage node `node` of shard `shard` leaving the labels `removed` and
+    /// joining the labels `added` (dictionary ids) in the namespace's label
+    /// lookup, bound to its definition as this member read it: a building
+    /// lookup is maintained as a ready one is, so its build misses no write.
+    /// Nothing while the namespace has none.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    pub fn on_labels_changed(
+        &self,
+        engine: &StorageEngine,
+        txn: &mut Transaction,
+        shard: u16,
+        node: NodeId,
+        removed: &[u32],
+        added: &[u32],
+    ) -> Result<(), StoreError> {
+        let Some(Registered { def, version, .. }) = self.indexes.read().label_lookup().cloned()
+        else {
+            return Ok(());
+        };
+        if matches!(def.state, super::IndexState::Failed { .. }) {
+            return Ok(());
+        }
+        self.bind(engine, txn, &def, version)?;
+        LocalIndexStore::new(engine)
+            .stage_label_postings_txn(txn, &def, shard, node, removed, added)
+    }
+
+    /// Stage the postings node `node` of shard `shard` does not have yet for
+    /// the labels `held` (dictionary ids), bound to the label lookup as this
+    /// member read it: a version of a temporal node, whose earlier versions
+    /// keep their labels in its history. Nothing while the namespace has no
+    /// lookup.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    pub fn on_labels_held(
+        &self,
+        engine: &StorageEngine,
+        txn: &mut Transaction,
+        shard: u16,
+        node: NodeId,
+        held: &[u32],
+    ) -> Result<(), StoreError> {
+        let Some(Registered { def, version, .. }) = self.indexes.read().label_lookup().cloned()
+        else {
+            return Ok(());
+        };
+        if matches!(def.state, super::IndexState::Failed { .. }) {
+            return Ok(());
+        }
+        self.bind(engine, txn, &def, version)?;
+        LocalIndexStore::new(engine).stage_label_presence_txn(txn, &def, shard, node, held)
+    }
+
     /// Bind the writing transaction's effects in `index` to the definition
     /// record this member read, when it read one: a transition, drop or
     /// rebuild of the index before the commit refuses the write, to be

@@ -680,10 +680,7 @@ impl IndexBuildService {
         for record in records {
             let index = store
                 .load_definition(record.index)?
-                .map(|d| super::BuildIndex {
-                    name: d.name.clone(),
-                    label: d.label.clone(),
-                });
+                .map(|d| super::BuildIndex::of(&d));
             let running_here = matches!(
                 self.shared.checks.lock().get(&record.generation),
                 Some(CheckSlot::Running)

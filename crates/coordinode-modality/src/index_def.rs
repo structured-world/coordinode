@@ -564,6 +564,11 @@ impl IndexDefinition {
     /// index and generation numbers. Outside both prefixes above.
     pub const ALLOCATOR_KEY: &'static [u8] = b"schema:idx_alloc";
 
+    /// Schema catalog key naming the namespace's label lookup: the identity
+    /// of its definition, written once, by the publication that creates it.
+    /// Outside the definition and name prefixes.
+    pub const LABEL_LOOKUP_KEY: &'static [u8] = b"schema:idx_labels";
+
     /// The catalog key of the definition of the index `id`.
     pub fn schema_key_of(id: IndexId) -> Vec<u8> {
         let mut key = Vec::with_capacity(Self::SCHEMA_PREFIX.len() + 8);

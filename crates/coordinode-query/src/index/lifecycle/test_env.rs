@@ -187,6 +187,12 @@ impl BuildEnvironment for TestEnv {
         Ok(self.fields_now())
     }
 
+    fn register_names(&self, names: &[&str]) -> Result<Vec<u32>, String> {
+        // A member without a deployment dictionary: names bind in its own.
+        let mut fields = self.fields.lock();
+        Ok(names.iter().map(|name| fields.intern(name)).collect())
+    }
+
     fn shard_id(&self) -> u16 {
         1
     }

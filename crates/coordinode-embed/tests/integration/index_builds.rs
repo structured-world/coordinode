@@ -577,7 +577,11 @@ fn a_constraint_that_outwaits_its_call_validates_on_as_an_operation() {
     assert_eq!(retried.operation, Some(operation), "the same build");
     assert_eq!(retried.constraint.state, ConstraintState::Validating);
     assert_eq!(
-        db.index_build_status().expect("inspect").len(),
+        db.index_build_status()
+            .expect("inspect")
+            .iter()
+            .filter(|b| !b.index.as_ref().is_some_and(|i| i.builtin))
+            .count(),
         1,
         "no second build"
     );

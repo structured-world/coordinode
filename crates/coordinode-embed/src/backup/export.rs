@@ -45,6 +45,9 @@ pub fn producer_tag() -> String {
 /// fingerprint differs risks merging incompatible type definitions, so
 /// `restore_binary` rejects that mismatch unless forced.
 pub fn schema_fingerprint(engine: &StorageEngine) -> Result<u64, ExportError> {
+    use coordinode_modality::{
+        DuplicateRepairRecord, IndexBuildRecord, IndexDefinition, IndexIntegrityRecord,
+    };
     let iter = engine
         .prefix_scan(Partition::Schema, b"schema:")
         .map_err(|e| ExportError::Storage(e.to_string()))?;
@@ -56,6 +59,26 @@ pub fn schema_fingerprint(engine: &StorageEngine) -> Result<u64, ExportError> {
             .map_err(|e| ExportError::Storage(e.to_string()))?;
         pairs.push((k.to_vec(), v.to_vec()));
     }
+    // The contract, not the catalog's bookkeeping: identity allocation,
+    // builds, checks and repairs, and the built-in label lookup every store
+    // provisions for itself, differ between two stores holding one schema.
+    let lookup = pairs
+        .iter()
+        .find(|(k, _)| k.as_slice() == IndexDefinition::LABEL_LOOKUP_KEY)
+        .and_then(|(_, v)| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map(|raw| {
+            IndexDefinition::schema_key_of(coordinode_modality::IndexId::from_raw(
+                u64::from_be_bytes(raw),
+            ))
+        });
+    pairs.retain(|(k, _)| {
+        k.as_slice() != IndexDefinition::ALLOCATOR_KEY
+            && k.as_slice() != IndexDefinition::LABEL_LOOKUP_KEY
+            && !k.starts_with(IndexBuildRecord::PREFIX)
+            && !k.starts_with(IndexIntegrityRecord::PREFIX)
+            && !k.starts_with(DuplicateRepairRecord::PREFIX)
+            && lookup.as_deref() != Some(k.as_slice())
+    });
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     // FNV-1a 64-bit: deterministic, no random seed, dependency-free.
@@ -188,9 +211,14 @@ fn json_schema_lines(engine: &StorageEngine) -> Result<Vec<serde_json::Value>, E
     labels.sort_by(|a, b| a.name.cmp(&b.name));
     let mut edge_types = schemas.list_edge_types().map_err(storage)?;
     edge_types.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut indexes = LocalIndexStore::new(engine)
+    // The built-in label lookup is not declared: every store provisions its
+    // own, and a restore rebuilds it over the nodes it loads.
+    let mut indexes: Vec<_> = LocalIndexStore::new(engine)
         .list_definitions()
-        .map_err(storage)?;
+        .map_err(storage)?
+        .into_iter()
+        .filter(|def| def.index_type != coordinode_modality::IndexType::Labels)
+        .collect();
     indexes.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut lines = Vec::with_capacity(labels.len() + edge_types.len() + indexes.len());

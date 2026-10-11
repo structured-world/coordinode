@@ -70,6 +70,15 @@ pub trait BuildEnvironment: Send + Sync {
     /// The dictionary could not be read.
     fn fields(&self) -> Result<FieldInterner, String>;
 
+    /// The dictionary ids of `names`, in order, each registered through the
+    /// deployment's ordered registration first if it has none: what a label
+    /// lookup build keys the labels of stored nodes by.
+    ///
+    /// # Errors
+    ///
+    /// The registration was refused or could not be published.
+    fn register_names(&self, names: &[&str]) -> Result<Vec<u32>, String>;
+
     /// The shard whose nodes are indexed.
     fn shard_id(&self) -> u16;
 
@@ -172,6 +181,11 @@ struct Shared {
     /// through. Kept in memory: a build no executor here holds is taken as
     /// covering nothing, which only makes a write read more.
     covered: parking_lot::Mutex<FxHashMap<GenerationId, Vec<u8>>>,
+    /// For a build registered while no transaction was open, the seqno past
+    /// which every node row was written by a writer that maintained the
+    /// index: its backfill passes those rows over without waiting to learn
+    /// it. Kept in memory; a build without one learns it by waiting.
+    maintained_after: parking_lot::Mutex<FxHashMap<GenerationId, u64>>,
     /// Set by [`IndexBuildService::shutdown`]: executors stop between pages
     /// and no new one starts.
     stopping: core::sync::atomic::AtomicBool,
@@ -347,8 +361,23 @@ impl BuildStatus {
 pub struct BuildIndex {
     /// The index's name; `None` for an unnamed index.
     pub name: Option<String>,
-    /// The label whose nodes it covers.
+    /// The label whose nodes it covers; empty for the built-in label lookup,
+    /// which covers every label.
     pub label: String,
+    /// Whether it is the namespace's built-in label lookup, which no DDL
+    /// declares and every store keeps.
+    pub builtin: bool,
+}
+
+impl BuildIndex {
+    /// How inspection names the index `def`.
+    pub fn of(def: &IndexDefinition) -> Self {
+        Self {
+            name: def.name.clone(),
+            label: def.label.clone(),
+            builtin: def.index_type == super::IndexType::Labels,
+        }
+    }
 }
 
 /// The build of a full-text index over `properties` of `label`: each
@@ -438,6 +467,7 @@ impl IndexBuildService {
                 vacancy: parking_lot::Condvar::new(),
                 phases: parking_lot::Mutex::new(FxHashMap::default()),
                 covered: parking_lot::Mutex::new(FxHashMap::default()),
+                maintained_after: parking_lot::Mutex::new(FxHashMap::default()),
                 stopping: core::sync::atomic::AtomicBool::new(false),
                 executors: parking_lot::Mutex::new(Vec::new()),
                 checks: parking_lot::Mutex::new(FxHashMap::default()),
@@ -758,6 +788,105 @@ impl IndexBuildService {
         Ok(resumed)
     }
 
+    /// Make sure the namespace has its label lookup, maintained by every
+    /// write and filled from the stored nodes by a build of its own: one is
+    /// published building with that build admitted when the catalog has
+    /// none, and one a build left failed is rebuilt into a fresh generation.
+    /// The build runs on this process's executor; nothing waits for it, and
+    /// label scans read the records until it publishes the lookup ready.
+    /// Returns the generation being built, `None` when nothing was to do or
+    /// this member takes no writes.
+    ///
+    /// # Errors
+    ///
+    /// The catalog could not be read or written, or the executor could not
+    /// start.
+    pub fn provision_label_lookup(&self) -> Result<Option<GenerationId>, String> {
+        let env = self.shared.env.as_ref();
+        let store = LocalIndexStore::new(env.engine());
+        match store.label_lookup().map_err(text)? {
+            Some(def) if matches!(def.state, IndexState::Failed { .. }) => {
+                let rebuilt = self.rebuild(def)?;
+                Ok(Some(rebuilt.generation))
+            }
+            Some(_) => Ok(None),
+            None => {
+                let mut descriptor = crate::index::IndexDescriptor::label_lookup();
+                // Every member keys the postings the executing member staged;
+                // the lookup interprets nothing a member would derive.
+                descriptor.maintenance = coordinode_modality::IndexMaintenance {
+                    profile: coordinode_modality::IndexProfile::Resolved,
+                    source: coordinode_modality::ProfileSource::Override,
+                    epoch: 1,
+                };
+                let mut published = None;
+                let committed = {
+                    let mut txn = begin(env);
+                    match store
+                        .publish_label_lookup_txn(&mut txn, descriptor)
+                        .map_err(text)?
+                    {
+                        Some(def) => {
+                            store
+                                .put_build_txn(
+                                    &mut txn,
+                                    &IndexBuildRecord::accepted(
+                                        def.id,
+                                        def.generation,
+                                        BuildFailure::Keep,
+                                    ),
+                                    None,
+                                )
+                                .map_err(text)?;
+                            published = Some(def);
+                            env.commit_catalog(&mut txn)
+                        }
+                        None => Ok(()),
+                    }
+                };
+                match (committed, published) {
+                    (Ok(()), Some(def)) => {
+                        env.registry()
+                            .register_published(env.engine(), def.clone())
+                            .map_err(|e| e.to_string())?;
+                        // Registered before this boundary: a transaction
+                        // opened after it maintains the lookup. With none
+                        // opened before it still open, every row written past
+                        // it is maintained already.
+                        let engine = env.engine();
+                        let boundary = engine.snapshot_boundary();
+                        let quiet = engine
+                            .await_transactions_through(
+                                boundary,
+                                std::time::Duration::ZERO,
+                                std::time::Duration::ZERO,
+                            )
+                            .is_ok();
+                        if quiet {
+                            self.shared
+                                .maintained_after
+                                .lock()
+                                .insert(def.generation, boundary);
+                        }
+                        self.submit(def.generation)?;
+                        // Nothing stored for the build to read: it publishes
+                        // at once, so wait for it here rather than let the
+                        // first writes of a new store meet its publication.
+                        if quiet && !holds_nodes_at(env, boundary).map_err(text)? {
+                            self.wait_here(def.generation);
+                        }
+                        Ok(Some(def.generation))
+                    }
+                    (Ok(()), None) => Ok(None),
+                    // Another member published it first, or this one takes
+                    // no writes: the catalog's lookup is the one in force.
+                    (Err(e), _) if is_contention(&e) || cannot_move_here(&e) => Ok(None),
+                    (Err(e), _) => Err(e.to_string()),
+                }
+            }
+        }
+    }
+
     /// Every build the catalog records, and every build an executor of this
     /// process holds, each with its record and where it stands here.
     ///
@@ -827,10 +956,9 @@ fn index_of(
     store: &LocalIndexStore<'_>,
     record: &IndexBuildRecord,
 ) -> Result<Option<BuildIndex>, StoreError> {
-    Ok(store.load_definition(record.index)?.map(|d| BuildIndex {
-        name: d.name.clone(),
-        label: d.label.clone(),
-    }))
+    Ok(store
+        .load_definition(record.index)?
+        .map(|d| BuildIndex::of(&d)))
 }
 
 /// What an executor took: the definition it fills, which every page and the
@@ -950,6 +1078,8 @@ impl Shared {
         // below would live as long as the whole build, and a retune waiting
         // for it would hold up every reader of the configuration.
         let older_transactions_wait = self.config.read().older_transactions_wait;
+        let resolve_labels = |names: &[&str]| env.register_names(names);
+        let maintained_after = self.maintained_after.lock().get(&generation).copied();
         Ok(Backfill {
             engine: env.engine(),
             oracle: env.oracle(),
@@ -961,6 +1091,8 @@ impl Shared {
             covered: Some(&covered),
             repair,
             stop: Some(&self.stopping),
+            labels: Some(&resolve_labels),
+            maintained_after,
         }
         .run(&taken.def, &mut |txn| env.commit_page(txn)))
     }
@@ -1054,11 +1186,17 @@ impl Shared {
         })?;
         match concluded {
             Concluded::Landed => {
+                // Writers bind to the definition as registered: the published
+                // one is registered first, so no writer is refused for binding
+                // to the building one while the proof below is flushed.
+                let revision = env.registry().local_revision(generation);
+                env.registry()
+                    .register_published(env.engine(), def.clone())
+                    .map_err(|e| e.to_string())?;
                 // A completed build proves this member's copy: built from the
                 // records, with every write since maintaining it. A transfer
                 // of the copy carries the proof; without it the copy is only
                 // unknown to a receiver.
-                let revision = env.registry().local_revision(generation);
                 if let Err(e) =
                     env.registry()
                         .verified_here(env.engine(), &def, revision, self.read_time())
@@ -1066,9 +1204,6 @@ impl Shared {
                     tracing::warn!(generation = generation.as_raw(), error = %e,
                         "could not keep the proof of a built index copy");
                 }
-                env.registry()
-                    .register_published(env.engine(), def)
-                    .map_err(|e| e.to_string())?;
                 Ok(Executed::Outcome(IndexBuildOutcome::Published {
                     indexed: Some(indexed),
                 }))
@@ -1372,6 +1507,25 @@ fn begin(env: &dyn BuildEnvironment) -> Transaction<'_> {
 
 fn text(e: StoreError) -> String {
     e.to_string()
+}
+
+/// Whether the shard `env` indexes stores any node row at seqno `at`.
+fn holds_nodes_at(env: &dyn BuildEnvironment, at: u64) -> Result<bool, StoreError> {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let prefix = LocalNodeStore.shard_scan_prefix(env.shard_id());
+    let mut rows = env.engine().snapshot_prefix_iter(
+        &at,
+        coordinode_storage::engine::partition::Partition::Node,
+        &prefix,
+    )?;
+    match rows.next() {
+        Some(row) => {
+            row.into_inner()
+                .map_err(coordinode_storage::error::StorageError::from)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 #[cfg(test)]

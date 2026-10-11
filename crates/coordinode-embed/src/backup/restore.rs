@@ -648,6 +648,31 @@ fn restore_binary<R: Read>(
                 }
             }
             BackupEntry::Schema { key, value } => {
+                use coordinode_modality::{
+                    DuplicateRepairRecord, IndexBuildRecord, IndexDefinition, IndexIntegrityRecord,
+                    IndexType,
+                };
+                // The source catalog's bookkeeping names its own identities,
+                // builds and checks: an index is recreated in the target's
+                // catalog instead, and the built-in label lookup is the
+                // target's own.
+                let bookkeeping = key.as_slice() == IndexDefinition::ALLOCATOR_KEY
+                    || key.as_slice() == IndexDefinition::LABEL_LOOKUP_KEY
+                    || key.starts_with(IndexDefinition::NAME_PREFIX)
+                    || key.starts_with(IndexBuildRecord::PREFIX)
+                    || key.starts_with(IndexIntegrityRecord::PREFIX)
+                    || key.starts_with(DuplicateRepairRecord::PREFIX);
+                if bookkeeping {
+                    continue;
+                }
+                if key.starts_with(IndexDefinition::SCHEMA_PREFIX) {
+                    let def: IndexDefinition = rmp_serde::from_slice(&value)
+                        .map_err(|e| RestoreError::Deserialization(format!("index: {e}")))?;
+                    if def.index_type != IndexType::Labels && restore_index(load, def.descriptor)? {
+                        load.stats.schema_entries += 1;
+                    }
+                    continue;
+                }
                 if load.writes() {
                     // Schema is not MVCC-versioned — write directly.
                     engine
@@ -842,9 +867,7 @@ fn json_schema(
     only_labels: Option<&HashSet<String>>,
 ) -> Result<(), RestoreError> {
     use coordinode_core::schema::definition::{EdgeTypeSchema, LabelSchema};
-    use coordinode_modality::{
-        IndexStore as _, LocalIndexStore, LocalSchemaStore, SchemaStore as _,
-    };
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
     use coordinode_query::index::IndexDescriptor;
 
     let engine = load.target.engine;
@@ -866,7 +889,6 @@ fn json_schema(
     };
     let kept = |label: &str| only_labels.is_none_or(|filter| filter.contains(label));
     let schemas = LocalSchemaStore::new(engine);
-    let indexes = LocalIndexStore::new(engine);
 
     let written = match kind {
         "label_schema" => {
@@ -901,52 +923,67 @@ fn json_schema(
             if !kept(&dumped.label) {
                 return Ok(());
             }
-            // The index the target already has under the dumped one's name,
-            // or, for an index without a name, one that declares the same.
-            let current = match &dumped.name {
-                Some(name) => match indexes.resolve_name(name).map_err(storage)? {
-                    Some(id) => indexes.load_definition(id).map_err(storage)?,
-                    None => None,
-                },
-                None => indexes
-                    .list_definitions()
-                    .map_err(storage)?
-                    .into_iter()
-                    .find(|current| same_index(current, &dumped)),
-            };
-            let shown = dumped.name.clone().unwrap_or_else(|| "(unnamed)".into());
-            match current {
-                Some(current) if same_index(&current, &dumped) => false,
-                Some(_) => return Err(differs("index", &shown)),
-                None if load.writes() => {
-                    // An index resolves its label and properties through the
-                    // field dictionary, as its DDL registered them; the
-                    // entries are built from the loaded nodes once they are in.
-                    let mut names: Vec<&str> = vec![dumped.label.as_str()];
-                    names.extend(dumped.properties.iter().map(String::as_str));
-                    field_ids(load.target.fields, &names)?;
-                    // Recreated in the target catalog, which gives it
-                    // identities of its own; the restore writes straight to
-                    // storage, so the publication applies at once.
-                    let mut txn = coordinode_storage::engine::transaction::Transaction::new(
-                        engine,
-                        None,
-                        coordinode_core::txn::timestamp::Timestamp::ZERO,
-                        None,
-                    );
-                    indexes
-                        .publish_definition_txn(&mut txn, dumped)
-                        .map_err(storage)?;
-                    true
-                }
-                None => false,
-            }
+            restore_index(load, dumped)?
         }
     };
     if written {
         load.stats.schema_entries += 1;
     }
     Ok(())
+}
+
+/// One index declaration of a dump: a target that declares the same index
+/// otherwise is refused; one that lacks it has it recreated in its own
+/// catalog, which gives it identities of its own, its entries built from the
+/// loaded nodes once they are in. Whether it was written.
+fn restore_index(
+    load: &mut Load<'_, '_>,
+    dumped: coordinode_query::index::IndexDescriptor,
+) -> Result<bool, RestoreError> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let engine = load.target.engine;
+    let storage = |e: coordinode_modality::StoreError| RestoreError::Storage(e.to_string());
+    let indexes = LocalIndexStore::new(engine);
+    // The index the target already has under the dumped one's name, or, for
+    // an index without a name, one that declares the same.
+    let current = match &dumped.name {
+        Some(name) => match indexes.resolve_name(name).map_err(storage)? {
+            Some(id) => indexes.load_definition(id).map_err(storage)?,
+            None => None,
+        },
+        None => indexes
+            .list_definitions()
+            .map_err(storage)?
+            .into_iter()
+            .find(|current| same_index(current, &dumped)),
+    };
+    let shown = dumped.name.clone().unwrap_or_else(|| "(unnamed)".into());
+    match current {
+        Some(current) if same_index(&current, &dumped) => Ok(false),
+        Some(_) => Err(RestoreError::SchemaMismatch(format!(
+            "index '{shown}' is declared differently in the target"
+        ))),
+        None if load.writes() => {
+            // An index resolves its label and properties through the field
+            // dictionary, as its DDL registered them.
+            let mut names: Vec<&str> = vec![dumped.label.as_str()];
+            names.extend(dumped.properties.iter().map(String::as_str));
+            field_ids(load.target.fields, &names)?;
+            // The restore writes straight to storage, so the publication
+            // applies at once.
+            let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+                engine,
+                None,
+                coordinode_core::txn::timestamp::Timestamp::ZERO,
+                None,
+            );
+            indexes
+                .publish_definition_txn(&mut txn, dumped)
+                .map_err(storage)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// Whether an index of the target and a dumped one declare the same index:
