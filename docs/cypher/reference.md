@@ -882,6 +882,27 @@ the counter counts), for a read at a past timestamp, and for a columnar
 label. Any other shape, such as `count(n.prop)` or a filtered match, counts
 by scan as before.
 
+#### Scanning the nodes of a label ✅
+
+Every database keeps a built-in label lookup: one entry per node and label
+it holds, written in the same transaction as the node. `MATCH (n:Label)`
+reads the label's members from it, so the scan's cost follows the number of
+nodes with the label, however much other data the database holds. With
+several labels (`MATCH (n:A:B)`), the label with the fewest nodes drives the
+scan and each node is checked for the others. Under a `LIMIT` (with or
+without `SKIP` and `WHERE`), the scan stops once it has the rows the
+`LIMIT` keeps, in node order, instead of reading the whole label. A
+transaction's label scans
+include its own uncommitted label changes; temporal nodes and server-side
+cursors are served the same way. A columnar label is scanned from its own
+column store, as before.
+
+A database written by an earlier version gets its lookup when it is opened,
+built in the background from the stored nodes. Until the lookup is ready,
+and for a read at a timestamp older than the moment it became ready, a label
+scan reads every node instead, with the same result. EXPLAIN ends with a
+`Label scans:` line saying which of the two a label scan does, and why.
+
 ---
 
 ### CALL (Procedures) ✅

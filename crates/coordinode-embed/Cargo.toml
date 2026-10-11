@@ -66,6 +66,10 @@ name = "snapshot_scan"
 harness = false
 
 [[bench]]
+name = "label_scan"
+harness = false
+
+[[bench]]
 name = "borrowed_point"
 harness = false
 
