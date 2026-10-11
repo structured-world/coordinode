@@ -739,9 +739,11 @@ async fn a_follower_checks_its_own_index_copy_after_a_crash() {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    let checks = cypher_on(&n1, "CALL db.indexChecks()")
+    // Read where the checks are replicated to rather than at the leader:
+    // the follower's kill may have moved leadership off n1.
+    let checks = local_read(&n1, "CALL db.indexChecks()")
         .await
-        .expect("the leader's checks");
+        .expect("the recorded checks");
     assert!(
         checks.is_empty(),
         "the follower checked its own copy; the leader recorded no check: {checks:?}"
