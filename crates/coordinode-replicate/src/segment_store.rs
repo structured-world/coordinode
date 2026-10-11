@@ -241,13 +241,43 @@ pub fn export_range(
 /// The generation has no copy here or holds a version a history cannot
 /// carry; a read failure; an entry exceeding the `u32` length bound.
 pub fn export_generation(engine: &StorageEngine, generation: u64) -> StorageResult<Vec<u8>> {
+    Ok(export_generation_proved(engine, generation)?.0)
+}
+
+/// [`export_generation`], with this member's proof of its copy when it has
+/// one that held from before the export to after it: then the blob carries
+/// it (`FLAG_PROOF`, `[u32 LE len][proof]` after the header) and the
+/// receiver need not check the copy it fills from the history. Returns the
+/// blob and the proof it carries.
+fn export_generation_proved(
+    engine: &StorageEngine,
+    generation: u64,
+) -> StorageResult<(Vec<u8>, Option<Vec<u8>>)> {
+    let before = engine.index_copy_proof(generation)?;
     let history = engine.export_generation_history(GenerationId::from_raw(generation))?;
-    let mut blob = vec![partition_wire_tag(Partition::Idx), FLAG_HISTORY];
+    let after = engine.index_copy_proof(generation)?;
+    // A finding during the export may concern what it read.
+    let proof = match (before, after) {
+        (Some(before), Some(after)) if before == after => Some(before.0),
+        _ => None,
+    };
+    let flags = if proof.is_some() {
+        FLAG_HISTORY | FLAG_PROOF
+    } else {
+        FLAG_HISTORY
+    };
+    let mut blob = vec![partition_wire_tag(Partition::Idx), flags];
     blob.extend_from_slice(&generation.to_be_bytes());
     blob.extend_from_slice(&history.covers_through.to_be_bytes());
     blob.extend_from_slice(&history.history_from.to_be_bytes());
+    if let Some(proof) = &proof {
+        let len = u32::try_from(proof.len())
+            .map_err(|_| StorageError::Serialization("copy proof exceeds u32".into()))?;
+        blob.extend_from_slice(&len.to_le_bytes());
+        blob.extend_from_slice(proof);
+    }
     encode_history(&mut blob, &history.entries)?;
-    Ok(blob)
+    Ok((blob, proof))
 }
 
 /// Segment header flag: a Raft log position follows the flags.
@@ -257,6 +287,9 @@ const FLAG_WHOLE: u8 = 2;
 /// Segment header flag: the segment is an index generation's history
 /// ([`export_generation`]), alone among the flags.
 const FLAG_HISTORY: u8 = 4;
+/// Segment header flag, with [`FLAG_HISTORY`] only: the sender's proof of
+/// its copy of the generation follows the history header.
+const FLAG_PROOF: u8 = 8;
 
 /// A received segment, decoded.
 enum Segment {
@@ -266,10 +299,12 @@ enum Segment {
         whole: bool,
         copy: PartitionCopy,
     },
-    /// The history of an index generation.
+    /// The history of an index generation, with the sender's proof of its
+    /// copy when it carried one.
     History {
         generation: u64,
         history: GenerationHistory,
+        proof: Option<Vec<u8>>,
     },
 }
 
@@ -283,12 +318,19 @@ fn decode_segment(data: &[u8]) -> Result<Segment, String> {
     let (&flags, mut rest) = rest
         .split_first()
         .ok_or_else(|| "segment blob truncated in its flags".to_string())?;
-    if flags == FLAG_HISTORY && partition == Partition::Idx {
+    if (flags == FLAG_HISTORY || flags == FLAG_HISTORY | FLAG_PROOF) && partition == Partition::Idx
+    {
         let generation = read_u64(rest, 0, "generation")?;
         let covers_through = read_u64(rest, 8, "history position")?;
         let history_from = read_u64(rest, 16, "history floor")?;
         // The reads above proved the 24 header bytes are there.
-        let entries = decode_history(&rest[24..])?;
+        let mut pos = 24;
+        let proof = if flags & FLAG_PROOF == 0 {
+            None
+        } else {
+            Some(read_chunk(rest, &mut pos)?)
+        };
+        let entries = decode_history(&rest[pos..])?;
         return Ok(Segment::History {
             generation,
             history: GenerationHistory {
@@ -296,6 +338,7 @@ fn decode_segment(data: &[u8]) -> Result<Segment, String> {
                 history_from,
                 entries,
             },
+            proof,
         });
     }
     if flags & !(FLAG_POSITION | FLAG_WHOLE) != 0 {
@@ -427,8 +470,11 @@ pub struct SegmentInstaller {
     // re-export the partition per piece. Bounded crudely (cleared past a cap) —
     // repair/migration serving is a cold path, an LRU is a future refinement.
     // no-std: parking_lot::Mutex
-    build_cache: Mutex<HashMap<BuildKey, Arc<BuiltSegment>>>,
+    build_cache: Mutex<HashMap<BuildKey, Built>>,
 }
+
+/// A built segment, with the copy proof a history in it carries.
+type Built = (Arc<BuiltSegment>, Option<Vec<u8>>);
 
 /// Cache key for [`SegmentInstaller`]'s serve-side build cache: the subject,
 /// piece size, and encoding discriminant, everything that makes the split
@@ -476,20 +522,36 @@ impl SegmentSource for SegmentInstaller {
         // Tolerate a poisoned lock: a panic in a prior holder left the cache
         // readable; the data is a rebuildable cache, never corrupt-on-panic.
         if !fresh {
-            let cache = self
+            let hit = self
                 .build_cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(hit) = cache.get(&key) {
-                return Ok(Arc::clone(hit));
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .cloned();
+            if let Some((built, proof)) = hit {
+                // A history built with this member's proof is served only
+                // while the proof stands: a finding since disqualifies it.
+                let stands = match (&proof, subject) {
+                    (Some(proof), SegmentSubject::History { generation }) => self
+                        .engine
+                        .index_copy_proof(*generation)
+                        .map_err(|e| e.to_string())?
+                        .is_some_and(|(now, _)| now == *proof),
+                    _ => true,
+                };
+                if stands {
+                    return Ok(built);
+                }
             }
         }
 
-        let blob = match subject {
+        let (blob, proof) = match subject {
             SegmentSubject::Range { partition, range } => {
-                export_range(&self.engine, *partition, range)
+                export_range(&self.engine, *partition, range).map(|blob| (blob, None))
             }
-            SegmentSubject::History { generation } => export_generation(&self.engine, *generation),
+            SegmentSubject::History { generation } => {
+                export_generation_proved(&self.engine, *generation)
+            }
         }
         .map_err(|e| e.to_string())?;
         let (manifest, wire) =
@@ -503,7 +565,7 @@ impl SegmentSource for SegmentInstaller {
         if cache.len() >= BUILD_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, Arc::clone(&built));
+        cache.insert(key, (Arc::clone(&built), proof));
         Ok(built)
     }
 }
@@ -514,7 +576,7 @@ impl SegmentSink for SegmentInstaller {
         _segment: coordinode_swarm::SegmentId,
         data: &[u8],
     ) -> Result<(), String> {
-        self.install(data).map_err(|e| e.to_string())
+        self.install(data).map(|_| ()).map_err(|e| e.to_string())
     }
 }
 
@@ -522,8 +584,9 @@ impl SegmentInstaller {
     /// Install a received segment: rows through
     /// [`StorageEngine::install_partition`]; a generation's history into the
     /// replacement of it this node has staged, recorded complete when it
-    /// reaches the replacement's registration.
-    fn install(&self, data: &[u8]) -> Result<(), RepairError> {
+    /// reaches the replacement's registration. Returns the sender's proof of
+    /// its copy a history carried.
+    fn install(&self, data: &[u8]) -> Result<Option<Vec<u8>>, RepairError> {
         let behind_or_install = |e: StorageError| match e {
             StorageError::PositionBehind { .. } => RepairError::Behind(e.to_string()),
             e => RepairError::Install(e.to_string()),
@@ -536,10 +599,12 @@ impl SegmentInstaller {
             } => self
                 .engine
                 .install_partition(partition, &copy, whole)
+                .map(|()| None)
                 .map_err(behind_or_install),
             Segment::History {
                 generation,
                 history,
+                proof,
             } => {
                 let generation = GenerationId::from_raw(generation);
                 self.engine
@@ -551,7 +616,8 @@ impl SegmentInstaller {
                         history.covers_through,
                         history.history_from,
                     )
-                    .map_err(behind_or_install)
+                    .map_err(behind_or_install)?;
+                Ok(proof)
             }
         }
     }
@@ -643,7 +709,7 @@ impl SegmentInstaller {
             zstd_level,
             generation: None,
         };
-        self.pull_until_current(peers, &descriptor).await
+        Ok(self.pull_until_current(peers, &descriptor).await?.0)
     }
 
     /// Fill a local replacement of index `generation` from `peers`: register
@@ -651,7 +717,9 @@ impl SegmentInstaller {
     /// over the swarm transport and import it, recorded complete once it
     /// reaches the registration. The replacement is then ready for
     /// [`StorageEngine::publish_generation`]; on failure it is dropped and
-    /// the published copy stays. Returns the number of bytes imported.
+    /// the published copy stays. Returns the number of bytes imported, and
+    /// the proof the sender kept of its copy when the history carried one:
+    /// with it, the replacement needs no check of its own.
     ///
     /// A peer's history standing behind this node's applies at registration
     /// is refused and the pull retried, up to `REPAIR_ATTEMPTS` (5) times.
@@ -668,7 +736,7 @@ impl SegmentInstaller {
         generation: GenerationId,
         piece_size: usize,
         encoding: PieceEncoding,
-    ) -> Result<usize, RepairError> {
+    ) -> Result<(usize, Option<Vec<u8>>), RepairError> {
         let engine = Arc::clone(&self.engine);
         tokio::task::spawn_blocking(move || engine.stage_generation(generation))
             .await
@@ -701,12 +769,13 @@ impl SegmentInstaller {
     }
 
     /// Pull the segment `descriptor` names from `peers` and install it,
-    /// pulling again while every copy stands behind this node.
+    /// pulling again while every copy stands behind this node. Returns the
+    /// bytes installed and the proof a history carried.
     async fn pull_until_current(
         self: &Arc<Self>,
         peers: &[String],
         descriptor: &SegmentDescriptorRef,
-    ) -> Result<usize, RepairError> {
+    ) -> Result<(usize, Option<Vec<u8>>), RepairError> {
         let mut backoff = REPAIR_BACKOFF;
         let mut attempt = 1;
         loop {
@@ -728,7 +797,7 @@ impl SegmentInstaller {
         self: &Arc<Self>,
         peers: &[String],
         descriptor: &SegmentDescriptorRef,
-    ) -> Result<usize, RepairError> {
+    ) -> Result<(usize, Option<Vec<u8>>), RepairError> {
         let mut sources: Vec<GrpcPieceSource> = Vec::new();
         let mut manifest = None;
         for (i, endpoint) in peers.iter().enumerate() {
@@ -780,10 +849,10 @@ impl SegmentInstaller {
         // tables without reading their blocks, so the corrupt SST goes
         // rather than being shadowed by newer versions.
         let installer = Arc::clone(self);
-        tokio::task::spawn_blocking(move || installer.install(&assembled))
+        let proof = tokio::task::spawn_blocking(move || installer.install(&assembled))
             .await
             .map_err(|e| RepairError::Install(e.to_string()))??;
-        Ok(bytes)
+        Ok((bytes, proof))
     }
 }
 

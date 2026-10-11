@@ -544,8 +544,9 @@ CALL db.reindex('user_email', waitMs)      -- REINDEX as a procedure, by name or
   verifies it. Copies it was not using serve at once. A member that takes no
   writes checks its own copy against its own records and writes nothing
   shared. A copy that agrees serves again. A copy damaged on that member
-  alone is replaced from a peer's copy of the same generation, then checked
-  again before it serves. A standalone member answers from its records until
+  alone is replaced from a peer's copy of the same generation. If the peer
+  sends the proof it keeps of its own copy, the replacement serves at once;
+  otherwise it is checked before it serves. A standalone member answers from its records until
   its copy is checked or rebuilt. These records are written even when the
   disk is below its free-space reserve. A member that cannot write one keeps
   the copy out of use and answers from its records. `CALL db.indexCopies()`

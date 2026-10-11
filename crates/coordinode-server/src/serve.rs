@@ -71,7 +71,10 @@ struct PeerIndexCopy {
 }
 
 impl coordinode_query::index::IndexCopySource for PeerIndexCopy {
-    fn prepare(&self, generation: coordinode_query::index::GenerationId) -> Result<(), String> {
+    fn prepare(
+        &self,
+        generation: coordinode_query::index::GenerationId,
+    ) -> Result<Option<Vec<u8>>, String> {
         // Called from an index-check thread, outside the runtime.
         self.runtime
             .block_on(self.installer.prepare_generation(
@@ -80,7 +83,7 @@ impl coordinode_query::index::IndexCopySource for PeerIndexCopy {
                 1 << 20,
                 coordinode_replicate::PieceEncoding::None,
             ))
-            .map(|_| ())
+            .map(|(_, proof)| proof)
             .map_err(|e| e.to_string())
     }
 }

@@ -205,13 +205,15 @@ pub use integrity::{CheckOutcome, CheckRequestError, CheckStatus};
 )]
 pub trait IndexCopySource: Send + Sync {
     /// Prepare the replacement of this member's copy of `generation`, ready
-    /// to publish; on failure no replacement is left in preparation.
+    /// to publish; on failure no replacement is left in preparation. Returns
+    /// the proof the sending peer kept of its copy when the history carried
+    /// one (see [`crate::index::transfer::import_proves`]).
     ///
     /// # Errors
     ///
     /// No peer could serve the generation's history, or it could not be
     /// imported.
-    fn prepare(&self, generation: GenerationId) -> Result<(), String>;
+    fn prepare(&self, generation: GenerationId) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// How the engine runs its index builds.

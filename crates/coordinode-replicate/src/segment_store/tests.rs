@@ -925,7 +925,7 @@ async fn a_generation_replaced_from_a_peer_drops_local_damage_and_keeps_history(
 
     let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
     let generation = GenerationId::from_raw(GEN);
-    let bytes = installer
+    let (bytes, proof) = installer
         .prepare_generation(
             &[format!("http://{addr}")],
             generation,
@@ -935,6 +935,7 @@ async fn a_generation_replaced_from_a_peer_drops_local_damage_and_keeps_history(
         .await
         .expect("prepare");
     assert!(bytes > 0, "nothing imported");
+    assert_eq!(proof, None, "a peer that proved nothing carries no proof");
     // Logged after the replacement was registered: it reaches it too.
     commit(&c, b"c1");
     local.publish_generation(generation).expect("publish");
@@ -1012,6 +1013,119 @@ async fn a_failed_generation_pull_drops_the_replacement() {
     local
         .stage_generation(generation)
         .expect("a new replacement can be registered");
+}
+
+/// Stands in for a peer's index layer: proves its copy while `proved` holds.
+struct PeerProof {
+    proved: std::sync::atomic::AtomicBool,
+}
+
+impl coordinode_storage::engine::index_copies::IndexCopyQualifier for PeerProof {
+    fn capture(&self, _: &StorageEngine) -> coordinode_storage::error::StorageResult<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn seal(
+        &self,
+        _: &StorageEngine,
+        captured: &[u8],
+    ) -> coordinode_storage::error::StorageResult<Vec<u8>> {
+        Ok(captured.to_vec())
+    }
+
+    fn installed(
+        &self,
+        _: &StorageEngine,
+        _: Option<&[u8]>,
+    ) -> coordinode_storage::error::StorageResult<()> {
+        Ok(())
+    }
+
+    fn copy_proof(
+        &self,
+        _: &StorageEngine,
+        _: u64,
+    ) -> coordinode_storage::error::StorageResult<Option<(Vec<u8>, u64)>> {
+        Ok(self
+            .proved
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| (b"proof".to_vec(), 0)))
+    }
+}
+
+/// A peer that proved its copy sends the proof with the history, so the
+/// receiver need not check the copy it fills; once the peer's proof is gone
+/// (a finding against its copy), a later pull carries none, even though the
+/// segment it built with the proof is still cached.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_generation_pull_carries_the_peers_standing_proof() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::TimestampOracle;
+
+    use crate::transfer::SegmentTransferHandler;
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    const GEN: u64 = 40;
+    let config = |dir: &std::path::Path| {
+        StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )])
+    };
+    let oracle = std::sync::Arc::new(TimestampOracle::new());
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let peer = std::sync::Arc::new(
+        StorageEngine::open_embedded(&config(peer_dir.path()), oracle.clone()).expect("open"),
+    );
+    let local = std::sync::Arc::new(
+        StorageEngine::open_embedded(&config(local_dir.path()), oracle.clone()).expect("open"),
+    );
+    let ts = oracle.next().as_raw();
+    for engine in [&peer, &local] {
+        let mutation = Mutation::Put {
+            partition: PartitionId::Idx,
+            key: index_entry(GEN, b"a"),
+            value: b"a1".to_vec(),
+        };
+        engine.commit_journaled(&[mutation], ts).expect("commit");
+    }
+    let layer = std::sync::Arc::new(PeerProof {
+        proved: std::sync::atomic::AtomicBool::new(true),
+    });
+    peer.set_index_copy_qualifier(std::sync::Arc::clone(&layer) as _);
+
+    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
+        std::sync::Arc::clone(&peer),
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SegmentTransferServiceServer::new(handler))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+
+    let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
+    let generation = GenerationId::from_raw(GEN);
+    let peers = [format!("http://{addr}")];
+    let pull = || installer.prepare_generation(&peers, generation, 128, PieceEncoding::None);
+    let (_, proof) = pull().await.expect("prepare");
+    assert_eq!(proof.as_deref(), Some(&b"proof"[..]), "the peer's proof");
+    local.publish_generation(generation).expect("publish");
+
+    layer
+        .proved
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let (_, proof) = pull().await.expect("prepare again");
+    assert_eq!(proof, None, "a proof gone since the segment was built");
 }
 
 #[test]

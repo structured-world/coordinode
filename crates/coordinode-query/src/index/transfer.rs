@@ -144,6 +144,69 @@ impl IndexCopyQualifier for CopyQualifier {
     fn installed(&self, engine: &StorageEngine, inventory: Option<&[u8]>) -> StorageResult<()> {
         take_inventory(engine, inventory)
     }
+
+    fn copy_proof(
+        &self,
+        engine: &StorageEngine,
+        generation: u64,
+    ) -> StorageResult<Option<(Vec<u8>, u64)>> {
+        let generation = GenerationId::from_raw(generation);
+        let revision = self.registry.local_revision(generation);
+        if revision != 0 {
+            return Ok(None);
+        }
+        let store = LocalIndexStore::new(engine);
+        if store
+            .list_unfit_here()
+            .map_err(storage)?
+            .iter()
+            .any(|copy| copy.generation == generation)
+        {
+            return Ok(None);
+        }
+        let Some(def) = btree_generations(engine)?
+            .into_iter()
+            .find(|d| d.generation == generation && d.state == IndexState::Ready)
+        else {
+            return Ok(None);
+        };
+        let proved = store
+            .list_qualified_here()
+            .map_err(storage)?
+            .into_iter()
+            .find(|(g, _)| *g == generation)
+            .map(|(_, proof)| proof)
+            .filter(|proof| {
+                proof.interprets(&def)
+                    && engine.installation_of(generation) == Some(proof.installation)
+            });
+        let Some(proof) = proved else {
+            return Ok(None);
+        };
+        let carried = ImportProof {
+            layout: proof.layout,
+            maintenance: proof.maintenance,
+        };
+        let bytes = rmp_serde::to_vec(&carried).map_err(|e| encoding("encode", e))?;
+        Ok(Some((bytes, revision)))
+    }
+}
+
+/// What a history export carries of the sender's proof of its copy: the
+/// interpretation the copy was proved under, alike on every member that
+/// proved the same generation, so pieces from several of them still match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ImportProof {
+    layout: u32,
+    maintenance: coordinode_modality::IndexMaintenance,
+}
+
+/// Whether `proof`, as a history export carried it, proves a copy of `def`:
+/// the sender proved its copy under `def`'s interpretation, with nothing
+/// found against it during the export.
+pub fn import_proves(proof: &[u8], def: &IndexDefinition) -> bool {
+    rmp_serde::from_slice::<ImportProof>(proof)
+        .is_ok_and(|p| p.layout == def.layout && p.maintenance == def.maintenance)
 }
 
 /// A transfer replaced `engine`'s index copies, carrying `inventory`

@@ -1931,6 +1931,14 @@ impl coordinode_storage::engine::index_copies::IndexCopyQualifier for InventoryR
             coordinode_storage::engine::index_copies::INDEX_TRANSFER_KEY,
         )
     }
+
+    fn copy_proof(
+        &self,
+        _engine: &StorageEngine,
+        _generation: u64,
+    ) -> coordinode_storage::error::StorageResult<Option<(Vec<u8>, u64)>> {
+        Ok(None)
+    }
 }
 
 /// A snapshot carries the index inventory the leader captured with it,

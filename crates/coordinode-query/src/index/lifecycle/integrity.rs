@@ -929,16 +929,22 @@ impl Shared {
         let Some(source) = source else {
             return Ok(LocalOutcome::Disagrees { found });
         };
-        self.replace_copy(generation, source.as_ref())?;
-        // The replacement serves only once a pass reads it agreeing: a
-        // finding after this revision, or a disagreement in the pass, keeps
-        // the mark.
+        let proof = self.replace_copy(generation, source.as_ref())?;
+        // The replacement serves once proved: by the peer's proof of the copy
+        // its history came from, under this generation's interpretation, or
+        // else by a pass reading it agreeing. A finding after this revision,
+        // or a disagreement in the pass, keeps the mark.
         let revision = registry.local_revision(generation);
-        let Some(found) = self.local_pass(&taken, &interpretation)? else {
-            return Ok(LocalOutcome::Stopped);
-        };
-        if found > 0 {
-            return Ok(LocalOutcome::Disagrees { found });
+        let proved_by_peer = proof
+            .as_deref()
+            .is_some_and(|proof| crate::index::transfer::import_proves(proof, &taken.def));
+        if !proved_by_peer {
+            let Some(found) = self.local_pass(&taken, &interpretation)? else {
+                return Ok(LocalOutcome::Stopped);
+            };
+            if found > 0 {
+                return Ok(LocalOutcome::Disagrees { found });
+            }
         }
         let lifted = registry
             .verified_here(env.engine(), &taken.def, revision, self.read_time())
@@ -960,15 +966,16 @@ impl Shared {
 
     /// Replace this member's copy of `generation` with one `source` fills
     /// from a peer: guarded before it is published, so it never serves
-    /// unguarded. The generation stays unfit here until its copy is checked.
+    /// unguarded. The generation stays unfit here until its copy is proved.
+    /// Returns the peer's proof of its copy, when its history carried one.
     fn replace_copy(
         &self,
         generation: GenerationId,
         source: &dyn super::IndexCopySource,
-    ) -> Result<(), String> {
+    ) -> Result<Option<Vec<u8>>, String> {
         let env = self.env.as_ref();
         let engine = env.engine();
-        source.prepare(generation)?;
+        let proof = source.prepare(generation)?;
         let copy = match env.registry().arm_replacement(engine, generation) {
             Ok(copy) => copy,
             Err(e) => {
@@ -983,7 +990,7 @@ impl Shared {
             .publish_generation(generation)
             .map_err(|e| format!("publish the replacement: {e}"))?;
         env.registry().replacement_published(copy);
-        Ok(())
+        Ok(proof)
     }
 
     /// One pass both ways over this member's copy of `taken`'s generation

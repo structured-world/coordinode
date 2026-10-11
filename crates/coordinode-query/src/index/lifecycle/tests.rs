@@ -526,10 +526,12 @@ struct PeerCopy {
     local: Arc<TestEnv>,
     peer: Arc<TestEnv>,
     prepared: core::sync::atomic::AtomicUsize,
+    /// The peer's proof of its copy, as its history export carries it.
+    proof: Option<Vec<u8>>,
 }
 
 impl IndexCopySource for PeerCopy {
-    fn prepare(&self, generation: GenerationId) -> Result<(), String> {
+    fn prepare(&self, generation: GenerationId) -> Result<Option<Vec<u8>>, String> {
         self.prepared
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let local = &self.local.engine;
@@ -546,7 +548,8 @@ impl IndexCopySource for PeerCopy {
             .map_err(|e| e.to_string())?;
         local
             .finish_generation_import(generation, history.covers_through, history.history_from)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(self.proof.clone())
     }
 }
 
@@ -581,6 +584,7 @@ fn a_copy_damaged_here_is_replaced_from_a_peer() {
         local: Arc::clone(&env),
         peer: Arc::clone(&peer),
         prepared: core::sync::atomic::AtomicUsize::new(0),
+        proof: None,
     });
     builds.set_copy_source(Arc::clone(&source) as Arc<dyn IndexCopySource>);
     env.inject(Some(Fault::NotLeader));
@@ -617,6 +621,54 @@ fn a_copy_damaged_here_is_replaced_from_a_peer() {
     assert!(store.list_unfit_here().expect("marks").is_empty());
     assert_eq!(env.holders(&def, "b@x"), vec![2], "b's entry is back");
     assert_eq!(env.holders(&def, "a@x"), vec![1]);
+}
+
+/// A replacement filled from a peer whose history carried the peer's proof
+/// of its copy serves without a pass of its own over this member's records:
+/// the proof qualifies it. The peer here holds a copy missing an entry that
+/// nothing found, so the replacement is missing it too, which only a pass
+/// would have shown; without the proof the pass shows it and the copy stays
+/// unfit.
+#[test]
+fn a_replacement_proved_by_its_peer_needs_no_pass() {
+    use coordinode_storage::engine::index_copies::IndexCopyQualifier as _;
+    for proved in [true, false] {
+        let (env, builds, def) = member_with_users();
+        let (peer, _peer_builds, _) = member_with_users();
+        lose_entry(&peer, &def, "b@x", 2);
+        let peer_registry = Arc::new(crate::index::IndexRegistry::new());
+        peer_registry.load_all(&peer.engine).expect("load");
+        let proof = crate::index::transfer::CopyQualifier::new(peer_registry)
+            .copy_proof(&peer.engine, def.generation.as_raw())
+            .expect("proof")
+            .map(|(bytes, _)| bytes);
+        assert!(proof.is_some(), "the peer's build proved its copy");
+        builds.set_copy_source(Arc::new(PeerCopy {
+            local: Arc::clone(&env),
+            peer: Arc::clone(&peer),
+            prepared: core::sync::atomic::AtomicUsize::new(0),
+            proof: proved.then_some(proof).flatten(),
+        }) as Arc<dyn IndexCopySource>);
+        env.inject(Some(Fault::NotLeader));
+        lose_entry(&env, &def, "a@x", 1);
+        mark_and_admit(&env, &builds, def.generation);
+        await_local_check(&builds, def.generation);
+        if proved {
+            assert!(
+                !env.registry.is_suspect(def.generation),
+                "the peer's proof qualifies the replacement"
+            );
+            assert!(
+                env.holders(&def, "b@x").is_empty(),
+                "no pass read it: the peer's undetected loss came along"
+            );
+        } else {
+            assert!(
+                env.registry.is_suspect(def.generation),
+                "without a proof the pass finds the loss and the copy stays unfit"
+            );
+        }
+    }
 }
 
 /// A shutdown stops a build waiting for older transactions without waiting

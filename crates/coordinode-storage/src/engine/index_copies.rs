@@ -65,6 +65,22 @@ pub trait IndexCopyQualifier: Send + Sync {
     /// The records could not be written: the key stays, and the next open
     /// takes every copy as unknown.
     fn installed(&self, engine: &StorageEngine, inventory: Option<&[u8]>) -> StorageResult<()>;
+
+    /// The proof this member keeps of its copy of `generation`, in the form
+    /// every member that proved the same generation encodes it alike, with
+    /// the revision of its latest finding against the copy; `None` when the
+    /// copy is not proved or was found disagreeing. A history export reads
+    /// it before and after the export and carries it only when the two
+    /// agree.
+    ///
+    /// # Errors
+    ///
+    /// The catalog or the records of the copy could not be read.
+    fn copy_proof(
+        &self,
+        engine: &StorageEngine,
+        generation: u64,
+    ) -> StorageResult<Option<(Vec<u8>, u64)>>;
 }
 
 impl StorageEngine {
@@ -124,6 +140,20 @@ impl StorageEngine {
         self.index_copy_qualifier()
             .map(|qualifier| qualifier.capture(self))
             .transpose()
+    }
+
+    /// The proof of this member's copy of `generation`, with the revision of
+    /// its latest finding; `None` without one or without a registered
+    /// qualifier.
+    ///
+    /// # Errors
+    ///
+    /// The qualifier's errors.
+    pub fn index_copy_proof(&self, generation: u64) -> StorageResult<Option<(Vec<u8>, u64)>> {
+        match self.index_copy_qualifier() {
+            Some(qualifier) => qualifier.copy_proof(self, generation),
+            None => Ok(None),
+        }
     }
 
     /// `captured`, an inventory taken at a capture of this engine, sealed
