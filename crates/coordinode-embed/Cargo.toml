@@ -73,5 +73,9 @@ harness = false
 name = "repair_budget"
 harness = false
 
+[[bench]]
+name = "index_check"
+harness = false
+
 [lints]
 workspace = true
