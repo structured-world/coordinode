@@ -677,6 +677,62 @@ fn label_scans_after_a_crash_match_the_records() {
     );
 }
 
+/// Set by the parent of the scan-then-kill test.
+const SCANNED_CHILD_DIR: &str = "COORDINODE_LABEL_LOOKUP_SCANNED_DIR";
+
+/// Child half of `a_lookup_in_use_at_a_kill_serves_after_the_restart`:
+/// label scans, the lookup's copy on disk, then death without destructors.
+#[test]
+fn crash_child_scans_labels_then_aborts() {
+    let Some(dir) = std::env::var_os(SCANNED_CHILD_DIR) else {
+        return;
+    };
+    let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
+    db.execute_cypher("CREATE (:Q {name: 'q1'}), (:Q {name: 'q2'})")
+        .expect("create");
+    assert_eq!(names(&mut db, "MATCH (n:Q) RETURN n.name AS name").len(), 2);
+    db.engine().persist().expect("persist");
+    std::process::abort();
+}
+
+/// A process killed while its label scans read the lookup leaves a copy
+/// that serves at once after the restart: nothing marks it unfit, since a
+/// label scan records no findings a later check would have to recover.
+#[test]
+fn a_lookup_in_use_at_a_kill_serves_after_the_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "integration::label_lookup::crash_child_scans_labels_then_aborts",
+            "--nocapture",
+        ])
+        .env(SCANNED_CHILD_DIR, dir.path())
+        .status()
+        .expect("run the child");
+    assert!(!status.success(), "the child must die, got {status:?}");
+
+    let mut db = Database::open(dir.path()).expect("reopen after the kill");
+    let unfit = db
+        .execute_cypher("CALL db.indexCopies() YIELD unfit RETURN unfit")
+        .expect("copies");
+    assert!(
+        unfit
+            .iter()
+            .all(|row| row.get("unfit") == Some(&Value::Bool(false))),
+        "{unfit:?}"
+    );
+    assert!(
+        db.explain_cypher("MATCH (n:Q) RETURN n")
+            .expect("explain")
+            .contains("read the label's members from the built-in label lookup")
+    );
+    assert_eq!(
+        names(&mut db, "MATCH (n:Q) RETURN n.name AS name"),
+        vec!["q1", "q2"]
+    );
+}
+
 /// Remove every trace of the label lookup from `db`'s storage, as a store
 /// written before it existed has none.
 fn forget_label_lookup(db: &Database) {

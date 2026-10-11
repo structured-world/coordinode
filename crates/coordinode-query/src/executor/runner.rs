@@ -5725,7 +5725,7 @@ fn label_lookup_scan(
     let Some(registry) = ctx.btree_index_registry else {
         return Ok(None);
     };
-    let Some((lookup, armed, published)) = registry.label_lookup_published() else {
+    let Some((lookup, published)) = registry.label_lookup_published() else {
         return Ok(None);
     };
     if lookup.state != IndexState::Ready || lookup.layout != ENTRY_LAYOUT {
@@ -5740,9 +5740,11 @@ fn label_lookup_scan(
     if published.is_some_and(|at| read_ts < at) {
         return Ok(None);
     }
-    if (!armed && !registry.arm_copy(ctx.engine, lookup.generation))
-        || !registry.answers_at(lookup.generation, read_ts)
-    {
+    // No use guard: a guard left by a run that ended uncleanly marks the
+    // copy unfit until a check proves it, for findings that run may never
+    // have stored. A label scan stores no findings and draws no conclusion
+    // a guard would have to cover, so it arms none.
+    if !registry.answers_at(lookup.generation, read_ts) {
         return Ok(None);
     }
     let mut driving: Option<(u64, Option<u32>)> = None;
