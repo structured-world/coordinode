@@ -48,6 +48,13 @@ proptest! {
         // Skip Raft partition — it's reserved for openraft framework
         // bytes, not arbitrary user payloads.
         prop_assume!(part != Partition::Raft);
+        // An index entry key under a generation tag is addressed through
+        // its generation's installation and must carry the whole prefix;
+        // the engine refuses a shorter one rather than store it.
+        prop_assume!(
+            part != Partition::Idx
+                || !coordinode_core::index::encoding::GENERATION_TAGS.contains(&key[0])
+        );
         let (_dir, engine) = open_engine();
         engine.put(part, &key, &value).unwrap();
         let via_engine = engine.get(part, &key).unwrap();
