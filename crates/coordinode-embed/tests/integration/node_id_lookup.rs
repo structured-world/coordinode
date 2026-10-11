@@ -92,8 +92,10 @@ fn a_node_id_pin_reads_no_other_node() {
     let ada = id_of(&mut db, "CREATE (n:User {name: 'ada'}) RETURN n");
     plant_undecodable_node(&db, 999_999);
 
+    // A scan of every node reads it; a scan of the label reads its
+    // members only, which the planted record is not among.
     assert!(
-        db.execute_cypher("MATCH (n:User) RETURN n.name AS name")
+        db.execute_cypher("MATCH (n) RETURN n.name AS name")
             .is_err(),
         "a scan reads the planted record"
     );

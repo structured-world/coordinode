@@ -947,7 +947,7 @@ Built-in procedures:
 | `db.indexCheck(operation, waitMs = 0)` | READ | the check columns |
 | `db.cancelIndexCheck(operation)` | SCHEMA | the check columns |
 | `db.reindex(index, waitMs = 0)` | SCHEMA | `operation`, `state` |
-| `db.indexCopies()` | READ | `generation`, `indexId`, `installation`, `inUse`, `unfit`, `findingStored`, `checking`: this member's own copy of each B-tree generation |
+| `db.indexCopies()` | READ | `generation`, `indexId`, `builtin`, `installation`, `inUse`, `unfit`, `findingStored`, `checking`: this member's own copy of each B-tree generation and of the built-in label lookup (`builtin`) |
 
 `dbms.procedures()` lists every procedure the server answers, with its full
 signature, for example

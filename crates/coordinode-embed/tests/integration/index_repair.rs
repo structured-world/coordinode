@@ -1821,8 +1821,14 @@ fn index_copies_show_this_members_copy() {
     db.execute_cypher("CREATE (:U {email: 'z@x'})").expect("z");
     let owner = id_of(&mut db, "a@x");
     let wrong = id_of(&mut db, "z@x");
+    // The index's copy, beside the built-in label lookup's.
     let copy = |db: &mut Database| {
-        let rows = db.execute_cypher("CALL db.indexCopies()").expect("copies");
+        let rows: Vec<_> = db
+            .execute_cypher("CALL db.indexCopies()")
+            .expect("copies")
+            .into_iter()
+            .filter(|row| row.get("builtin") == Some(&Value::Bool(false)))
+            .collect();
         assert_eq!(rows.len(), 1, "one copy: {rows:?}");
         rows[0].clone()
     };

@@ -126,9 +126,9 @@ pub struct IntegrityReport {
     pub found: Mismatch,
 }
 
-/// This member's copy of one B-tree index generation, as diagnostics show
-/// it: the logical generation, the local installation holding it, and how
-/// this member may use it.
+/// This member's copy of one B-tree index generation or of the label
+/// lookup, as diagnostics show it: the logical generation, the local
+/// installation holding it, and how this member may use it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalCopyStatus {
     /// The generation the copy holds.
@@ -136,6 +136,8 @@ pub struct LocalCopyStatus {
     /// The index serving from the generation now; `None` once it left the
     /// catalog.
     pub index: Option<IndexId>,
+    /// The generation is the namespace's built-in label lookup's.
+    pub builtin: bool,
     /// This member's installation holding the copy; `None` before anything
     /// was written to or read from it here.
     pub installation: Option<u64>,
@@ -693,16 +695,21 @@ impl IndexRegistry {
             .is_none_or(|from| read_ts >= *from)
     }
 
-    /// This member's copies of the B-tree generations it serves, uses or
-    /// found unfit, in generation order.
+    /// This member's copies of the B-tree and label lookup generations it
+    /// serves, uses or found unfit, in generation order.
     pub fn local_copies(&self, engine: &StorageEngine) -> Vec<LocalCopyStatus> {
-        let serving: FxHashMap<GenerationId, IndexId> = self
+        let serving: FxHashMap<GenerationId, (IndexId, bool)> = self
             .indexes
             .read()
             .by_id
             .values()
-            .filter(|r| r.def.index_type == IndexType::BTree)
-            .map(|r| (r.def.generation, r.def.id))
+            .filter(|r| matches!(r.def.index_type, IndexType::BTree | IndexType::Labels))
+            .map(|r| {
+                (
+                    r.def.generation,
+                    (r.def.id, r.def.index_type == IndexType::Labels),
+                )
+            })
             .collect();
         let view = self.integrity.lock();
         let mut generations: Vec<GenerationId> = serving
@@ -720,7 +727,10 @@ impl IndexRegistry {
                 let mark = view.local.get(&generation);
                 LocalCopyStatus {
                     generation,
-                    index: serving.get(&generation).copied(),
+                    index: serving.get(&generation).map(|(id, _)| *id),
+                    builtin: serving
+                        .get(&generation)
+                        .is_some_and(|(_, builtin)| *builtin),
                     installation,
                     guarded: installation.is_some_and(|installation| {
                         view.armed.contains(&LocalCopy {

@@ -119,12 +119,14 @@ impl IndexCheckProcedure {
             Kind::Copies => ProcedureSignature::new(
                 "db.indexCopies",
                 ProcedureMode::Read,
-                "This member's own copies of the B-tree index generations: the local \
-                 installation holding each, whether it is in use, and whether it was found \
-                 disagreeing with this member's records and is being checked.",
+                "This member's own copies of the B-tree index generations and the built-in \
+                 label lookup: the local installation holding each, whether it is in use, and \
+                 whether it was found disagreeing with this member's records and is being \
+                 checked.",
             )
             .output("generation", ValueType::Integer)
             .output("indexId", ValueType::Integer)
+            .output("builtin", ValueType::Boolean)
             .output("installation", ValueType::Integer)
             .output("inUse", ValueType::Boolean)
             .output("unfit", ValueType::Boolean)
@@ -229,6 +231,7 @@ impl Procedure for IndexCheckProcedure {
                             Value::Int(operation_value(copy.generation)),
                             copy.index
                                 .map_or(Value::Null, |id| Value::Int(index_value(id))),
+                            Value::Bool(copy.builtin),
                             copy.installation.map_or(Value::Null, int),
                             Value::Bool(copy.guarded),
                             Value::Bool(copy.unfit),
