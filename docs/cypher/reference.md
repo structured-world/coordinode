@@ -893,9 +893,9 @@ scan and each node is checked for the others. Under a `LIMIT` (with or
 without `SKIP` and `WHERE`), the scan stops once it has the rows the
 `LIMIT` keeps, in node order, instead of reading the whole label. A
 transaction's label scans
-include its own uncommitted label changes; temporal nodes and server-side
-cursors are served the same way. A columnar label is scanned from its own
-column store, as before.
+include its own uncommitted label changes, and server-side cursors page
+through the members. A columnar label is scanned from its own column
+store, as before.
 
 A database written by an earlier version gets its lookup when it is opened,
 built in the background from the stored nodes. Until the lookup is ready,

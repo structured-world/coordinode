@@ -424,6 +424,33 @@ fn a_temporal_labels_scan_returns_each_members_current_state() {
     );
 }
 
+/// A node of a temporal label is found by a scan of an ordinary label it
+/// also holds: the ordinary label's members include it, read through its
+/// versions.
+#[test]
+fn an_ordinary_label_scan_finds_its_temporal_holders() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal label");
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros() as i64
+        - 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (:Emp:Person {{name: 'e', valid_from: {since}}})"
+    ))
+    .expect("temporal holder");
+    db.execute_cypher("CREATE (:Person {name: 'p'})")
+        .expect("ordinary holder");
+    assert_eq!(
+        names(&mut db, "MATCH (n:Person) RETURN n.name AS name"),
+        vec!["e", "p"]
+    );
+}
+
 /// A scan reads the lookup at the statement's snapshot: a snapshot taken
 /// before a node left the label still finds it there, and one taken before
 /// it joined does not.
@@ -520,6 +547,69 @@ fn explain_names_the_label_lookup() {
     assert!(
         plan.contains("read the label's members from the built-in label lookup"),
         "{plan}"
+    );
+}
+
+/// Set by the parent of the crash test; the child does nothing without it.
+const CRASH_CHILD_DIR: &str = "COORDINODE_LABEL_LOOKUP_CRASH_DIR";
+
+/// Child half of `label_scans_after_a_crash_match_the_records`: label
+/// changes of every kind, then death without destructors.
+#[test]
+fn crash_child_changes_labels_then_aborts() {
+    let Some(dir) = std::env::var_os(CRASH_CHILD_DIR) else {
+        return;
+    };
+    let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
+    db.execute_cypher("UNWIND range(1, 50) AS i CREATE (:K {name: 'k' + toString(i)})")
+        .expect("create");
+    db.execute_cypher("MATCH (n:K) WHERE n.name IN ['k1', 'k2', 'k3'] SET n:J")
+        .expect("label added");
+    db.execute_cypher("MATCH (n:K) WHERE n.name IN ['k4', 'k5'] REMOVE n:K")
+        .expect("label removed");
+    db.execute_cypher("MATCH (n:K {name: 'k6'}) DELETE n")
+        .expect("delete");
+    std::process::abort();
+}
+
+/// After a kill and the journal replay that follows it, every label's
+/// members are exactly the nodes the records give it: the postings are
+/// replayed with the writes that staged them.
+#[test]
+fn label_scans_after_a_crash_match_the_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "integration::label_lookup::crash_child_changes_labels_then_aborts",
+            "--nocapture",
+        ])
+        .env(CRASH_CHILD_DIR, dir.path())
+        .status()
+        .expect("run the child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "the child must die by abort after its writes, got {status:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    assert!(!status.success(), "the child must die, got {status:?}");
+
+    let mut db = Database::open(dir.path()).expect("reopen after the kill");
+    for label in ["K", "J"] {
+        assert_eq!(members(&db, label), holders(&mut db, label), "{label}");
+    }
+    assert_eq!(
+        names(&mut db, "MATCH (n:K) RETURN n.name AS name").len(),
+        47
+    );
+    assert_eq!(
+        names(&mut db, "MATCH (n:J) RETURN n.name AS name"),
+        vec!["k1", "k2", "k3"]
     );
 }
 
