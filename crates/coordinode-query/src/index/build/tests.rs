@@ -63,7 +63,7 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
         oracle: Some(&fx.oracle),
         interner: &fx.interner,
         shard_id: 1,
-        definition_version: None,
+        bind_definition: false,
         older_transactions_wait: super::DEFAULT_OLDER_TRANSACTIONS_WAIT,
         progress: None,
         covered: None,
@@ -330,11 +330,15 @@ fn a_page_of_a_replaced_definition_writes_nothing() {
         "email",
     ));
     put(&index);
-    let published = store.definition_version(index.id).expect("version");
-    assert!(published.is_some());
+    assert!(
+        store
+            .definition_version(index.id)
+            .expect("version")
+            .is_some()
+    );
 
     let mut build = backfill(&fx);
-    build.definition_version = published;
+    build.bind_definition = true;
     let mut first = true;
     let err = build
         .run(&index, &mut |txn| {

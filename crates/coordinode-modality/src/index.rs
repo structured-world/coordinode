@@ -376,6 +376,19 @@ pub trait IndexStore {
     /// A storage failure.
     fn definition_version(&self, id: IndexId) -> StoreResult<Option<u64>>;
 
+    /// The version of the stored definition of `def.id` while it is still
+    /// exactly `def`, read with it in one step; `None` when it moved or is
+    /// gone. What an executor holding a definition across many commits binds
+    /// each of them to: storage may renumber a record it keeps no older
+    /// version of without writing it, so a version read once can stop
+    /// matching a definition that never changed, while a definition never
+    /// returns to an earlier value once it moves (its generation only grows).
+    ///
+    /// # Errors
+    ///
+    /// A storage or decoding failure.
+    fn definition_version_as(&self, def: &IndexDefinition) -> StoreResult<Option<u64>>;
+
     /// Write the transaction only while the definition record of `id` is at
     /// `version` when it commits, so DDL and builds act on the definition
     /// they inspected.
@@ -1179,6 +1192,17 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(self
             .engine
             .record_version(Partition::Schema, &IndexDefinition::schema_key_of(id))?)
+    }
+
+    fn definition_version_as(&self, def: &IndexDefinition) -> StoreResult<Option<u64>> {
+        let Some((bytes, version)) = self
+            .engine
+            .get_versioned(Partition::Schema, &IndexDefinition::schema_key_of(def.id))?
+        else {
+            return Ok(None);
+        };
+        let stored: IndexDefinition = decode("index definition", &bytes)?;
+        Ok((stored == *def).then_some(version))
     }
 
     fn expect_definition_txn(

@@ -698,7 +698,15 @@ impl IndexBuildService {
                 .load_definition(record.index)
                 .map_err(text)?
                 .filter(|d| d.generation == generation);
-            let def_version = store.definition_version(record.index).map_err(text)?;
+            // Read with the definition it conditions on, so a change between
+            // the two reads cannot pair a newer version with the older one.
+            let def_version = match &def {
+                Some(def) => match store.definition_version_as(def).map_err(text)? {
+                    Some(version) => Some(version),
+                    None => continue,
+                },
+                None => None,
+            };
             record.state = BuildState::Cancelled;
             let committed = {
                 let mut txn = begin(env);
@@ -825,12 +833,11 @@ fn index_of(
     }))
 }
 
-/// What an executor took: the definition it fills, the version of its
-/// record every page is bound to, the token the build record holds, and
+/// What an executor took: the definition it fills, which every page and the
+/// publication are bound to as stored, the token the build record holds, and
 /// whether the build repairs the duplicates it meets.
 struct Taken {
     def: IndexDefinition,
-    def_version: Option<u64>,
     token: u64,
     repair: Option<DuplicateRepair>,
 }
@@ -948,7 +955,7 @@ impl Shared {
             oracle: env.oracle(),
             interner: &fields,
             shard_id: env.shard_id(),
-            definition_version: taken.def_version,
+            bind_definition: true,
             older_transactions_wait,
             progress: Some(&progress),
             covered: Some(&covered),
@@ -977,7 +984,6 @@ impl Shared {
                 .load_definition(record.index)
                 .map_err(text)?
                 .filter(|d| d.generation == generation);
-            let def_version = store.definition_version(record.index).map_err(text)?;
             let token = next_token();
             // Ended before the backfill starts, which waits for every
             // transaction older than its boundary to end.
@@ -1002,7 +1008,6 @@ impl Shared {
                 (Ok(()), Some(def)) => {
                     return Ok(Ok(Taken {
                         def,
-                        def_version,
                         token,
                         repair: record.on_duplicate,
                     }));
@@ -1138,13 +1143,18 @@ impl Shared {
                     None => Concluded::Lost,
                 });
             }
+            // The definition as it stands, still the one taken: one that
+            // moved meanwhile takes no conclusion from this executor.
+            let Some(def_version) = store.definition_version_as(&taken.def).map_err(text)? else {
+                continue;
+            };
             let committed = {
                 let mut txn = begin(env);
                 // Conditions before the writes they guard: a direct-mode
                 // engine decides a condition when it is stated and applies
                 // each write as it is staged.
                 store
-                    .expect_definition_txn(&mut txn, taken.def.id, taken.def_version)
+                    .expect_definition_txn(&mut txn, taken.def.id, Some(def_version))
                     .map_err(text)?;
                 stage(&mut txn, &mut record).map_err(text)?;
                 store

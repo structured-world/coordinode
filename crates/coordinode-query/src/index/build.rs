@@ -101,11 +101,11 @@ pub struct Backfill<'a> {
     pub interner: &'a FieldInterner,
     /// The shard whose nodes are indexed.
     pub shard_id: u16,
-    /// The version of the definition record the builder published. Each
-    /// page commits only while the record is still at it, so a page of a
-    /// build whose index was dropped or recreated meanwhile writes nothing.
-    /// `None` for a definition without a stored record.
-    pub definition_version: Option<u64>,
+    /// Whether the definition built has a stored record each page is bound
+    /// to: a page commits only while that record is still the definition
+    /// built, so a page of a build whose index was dropped or recreated
+    /// meanwhile writes nothing. `false` for a definition without one.
+    pub bind_definition: bool,
     /// How long the backfill waits for the transactions opened before the
     /// index was registered.
     pub older_transactions_wait: std::time::Duration,
@@ -224,8 +224,15 @@ impl<'a> Backfill<'a> {
                 Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
                 None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
             };
-            if self.definition_version.is_some() {
-                txn.bind_index_definition(&index.schema_key(), self.definition_version)
+            if self.bind_definition {
+                // Read for each page: a version held across the build could
+                // stop matching a record storage renumbered without a write.
+                let Some(version) = coordinode_modality::LocalIndexStore::new(self.engine)
+                    .definition_version_as(index)?
+                else {
+                    return Err(BackfillError::Superseded);
+                };
+                txn.bind_index_definition(&index.schema_key(), Some(version))
                     .map_err(StoreError::from)?;
             }
             let page =
@@ -287,10 +294,10 @@ impl<'a> Backfill<'a> {
                     Err(CommitError::Conflict(_) | CommitError::RevisionMismatch { .. }) => {
                         // A conflict over the page's nodes is read again; a
                         // definition that moved is not this build's any more.
-                        if self.definition_version.is_some()
+                        if self.bind_definition
                             && coordinode_modality::LocalIndexStore::new(self.engine)
-                                .definition_version(index.id)?
-                                != self.definition_version
+                                .definition_version_as(index)?
+                                .is_none()
                         {
                             return Err(BackfillError::Superseded);
                         }

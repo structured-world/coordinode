@@ -542,6 +542,113 @@ fn a_repair_of_a_cancelled_check_commits_nothing() {
     );
 }
 
+/// A write to the integrity record that leaves the check with its executor
+/// (a report recorded against the generation, say) refuses the repair held
+/// over it, but not the check: the next pass, still this executor's,
+/// repairs the damage and the check verifies.
+#[test]
+fn a_record_write_that_keeps_the_check_does_not_cost_the_check() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    env.hold_pages_after(0);
+    let operation = builds.request_check(def.id).expect("check");
+    env.await_held_page();
+    let store = LocalIndexStore::new(&env.engine);
+    let (record, version) = store
+        .load_integrity(def.generation)
+        .expect("read")
+        .expect("the check's record");
+    let mut txn = env.begin();
+    store
+        .put_integrity_txn(&mut txn, &record, Some(version))
+        .expect("stage");
+    commit(&mut txn).expect("rewrite the record, the check still held");
+    env.release_pages();
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(env.holders(&def, "b@x"), vec![2], "repaired by this check");
+}
+
+/// Settle the catalog's versions as a bottommost compaction does to records
+/// it keeps no older version of: renumbered to zero, unwritten. Returns the
+/// version `def`'s record is left at.
+fn settle_catalog(env: &TestEnv, def: &IndexDefinition) -> Option<u64> {
+    use coordinode_storage::engine::partition::Partition::Schema;
+    env.engine.persist().expect("persist");
+    // No time-travel window: only live snapshots hold versions back.
+    env.engine.set_retention_window(Duration::ZERO);
+    env.engine
+        .major_compact(Schema)
+        .expect("compact the catalog");
+    LocalIndexStore::new(&env.engine)
+        .definition_version(def.id)
+        .expect("version")
+}
+
+/// A check binds each repair to its index's definition as stored when the
+/// repair commits, not to a version read when the check was taken: storage
+/// renumbering the unchanged definition meanwhile costs neither the repair
+/// nor the check.
+#[test]
+fn a_check_repairs_across_a_settled_definition_version() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    env.hold_pages_after(0);
+    let operation = builds.request_check(def.id).expect("check");
+    env.await_held_page();
+    assert_eq!(
+        settle_catalog(&env, &def),
+        Some(0),
+        "precondition: the definition's version settled without a write"
+    );
+    env.release_pages();
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { repaired: 1, .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(env.holders(&def, "b@x"), vec![2], "repaired");
+}
+
+/// A build binds each page and its publication to its definition as stored
+/// at that commit: storage renumbering the unchanged definition during the
+/// build neither supersedes the build nor refuses its publication.
+#[test]
+fn a_build_publishes_across_a_settled_definition_version() {
+    let env = env();
+    env.put_user(1, "a@x");
+    env.put_user(2, "b@x");
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email"),
+        BuildFailure::Withdraw,
+    );
+    env.hold_pages_after(0);
+    let builds = service(&env);
+    builds.submit(def.generation).expect("submit");
+    env.await_held_page();
+    assert_eq!(
+        settle_catalog(&env, &def),
+        Some(0),
+        "precondition: the definition's version settled without a write"
+    );
+    env.release_pages();
+    assert!(
+        matches!(
+            builds.wait_here(def.generation),
+            Some(IndexBuildOutcome::Published { .. })
+        ),
+        "published"
+    );
+    assert_eq!(env.holders(&def, "b@x"), vec![2]);
+}
+
 /// Fills a replacement from a peer's copy of the generation, as segment
 /// transfer does between members: the peer's history imported at its own
 /// seqnos.

@@ -110,11 +110,10 @@ pub struct CheckStatus {
     pub index: Option<super::BuildIndex>,
 }
 
-/// What an executor took: the definition it checks, the version of its
-/// record every repair is bound to, and its token.
+/// What an executor took: the definition it checks, which every repair is
+/// bound to as stored, and its token.
 struct Taken {
     def: IndexDefinition,
-    def_version: Option<u64>,
     token: u64,
 }
 
@@ -901,11 +900,7 @@ impl Shared {
         else {
             return Ok(LocalOutcome::Stopped);
         };
-        let taken = Taken {
-            def,
-            def_version: None,
-            token: 0,
-        };
+        let taken = Taken { def, token: 0 };
         let fields = env.fields()?;
         let field_of = |name: &str| fields.lookup(name);
         let interpretation = taken.def.interpretation(&field_of);
@@ -1073,7 +1068,6 @@ impl Shared {
                         && d.index_type == IndexType::BTree
                         && d.state == IndexState::Ready
                 });
-            let def_version = store.definition_version(record.index).map_err(text)?;
             let token = next_token();
             let Some(check) = record.check.as_mut() else {
                 return Ok(Err(Executed::Outcome(CheckOutcome::Cancelled)));
@@ -1094,11 +1088,7 @@ impl Shared {
             };
             match (committed, def) {
                 (Ok(()), Some(def)) => {
-                    return Ok(Ok(Taken {
-                        def,
-                        def_version,
-                        token,
-                    }));
+                    return Ok(Ok(Taken { def, token }));
                 }
                 (Ok(()), None) => return Ok(Err(Executed::Outcome(CheckOutcome::Cancelled))),
                 (Err(e), _) if is_contention(&e) => continue,
@@ -1468,11 +1458,16 @@ impl Shared {
             coordinode_core::txn::timestamp::Timestamp::ZERO,
             None,
         );
+        // The definition as it stands, still the one checked: an index
+        // rebuilt, dropped or changed meanwhile takes no repair.
+        let Some(def_version) = store.definition_version_as(def).map_err(text)? else {
+            return Ok(0);
+        };
         let mut txn = begin(env);
         // Conditions before the writes they guard: a direct-mode engine
         // decides a condition when it is stated.
         store
-            .expect_definition_txn(&mut txn, def.id, taken.def_version)
+            .expect_definition_txn(&mut txn, def.id, Some(def_version))
             .map_err(text)?;
         store
             .expect_integrity_txn(&mut txn, def.generation, held_version)
