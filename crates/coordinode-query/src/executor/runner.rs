@@ -777,6 +777,18 @@ pub struct ScanPaging {
     pub exhausted: bool,
 }
 
+/// How many rows a node scan has to emit for the LIMIT above it: once
+/// `rows` of its rows pass every `residual` predicate (the filters between
+/// the scan and the LIMIT), the rows the LIMIT keeps are all among those
+/// emitted, and a scan of a label's members stops.
+#[derive(Clone, Debug)]
+pub struct ScanRowCap {
+    /// Rows passing `residual` the LIMIT, and any SKIP, use.
+    pub rows: usize,
+    /// The filters the scan's rows meet before the LIMIT.
+    pub residual: Vec<crate::plan::expr::Expr>,
+}
+
 /// The vector indexes a statement searches and maintains, together with the
 /// engine a `CREATE VECTOR INDEX` builds from in the background.
 ///
@@ -809,6 +821,9 @@ pub struct ExecutionContext<'a> {
     /// Keyset-paging state for a server-side cursor (see [`ScanPaging`]). `None`
     /// on the normal path: the single `NodeScan` source scans the whole prefix.
     pub scan_paging: Option<ScanPaging>,
+    /// The rows the next node scan has to emit for a LIMIT above it, taken
+    /// by the scan (see [`ScanRowCap`]). `None`: every row.
+    pub scan_row_cap: Option<ScanRowCap>,
     /// Live session registry for operational introspection, injected by the
     /// server. `SHOW SESSIONS` / `SHOW TRANSACTIONS` read a snapshot through it;
     /// `None` (embedded / tests) makes those statements report no sessions.
@@ -4545,9 +4560,23 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         }
 
         LogicalOp::Limit { input, count } => {
-            let rows = execute_op(input, ctx)?;
-            ctx.budget.work(1)?;
             let n = eval_neutral(count, &Row::new())?;
+            // The scan below needs no more rows than this LIMIT keeps.
+            ctx.scan_row_cap = match &n {
+                Value::Int(limit) if ctx.correlated_row.is_none() => {
+                    let mut residual = Vec::new();
+                    usize::try_from(*limit)
+                        .ok()
+                        .zip(scan_rows_reach(input, &mut residual))
+                        .and_then(|(limit, skipped)| limit.checked_add(skipped))
+                        .map(|rows| ScanRowCap { rows, residual })
+                }
+                _ => None,
+            };
+            let rows = execute_op(input, ctx);
+            ctx.scan_row_cap = None;
+            let rows = rows?;
+            ctx.budget.work(1)?;
             if let Value::Int(limit) = n {
                 // Truncated in place: the rows kept were charged upstream.
                 let mut rows = rows;
@@ -5517,12 +5546,47 @@ fn counted_nodes(
     }
 }
 
+/// The rows a LIMIT over `op` skips before those it keeps, when `op`'s rows
+/// are rows of one node scan in the scan's order: the scan itself, a
+/// projection without DISTINCT, a SKIP, or a filter, whose predicate goes
+/// to `residual`. A row SKIP drops below a filter may have passed it, so
+/// the skipped rows are counted among the passing ones either way. `None`
+/// for any other operator, which adds, merges or reorders rows, and for a
+/// filter whose predicate reads storage or names a temporal instant.
+fn scan_rows_reach(op: &LogicalOp, residual: &mut Vec<crate::plan::expr::Expr>) -> Option<usize> {
+    match op {
+        LogicalOp::NodeScan { .. } => Some(0),
+        LogicalOp::Project {
+            input,
+            distinct: false,
+            ..
+        } => scan_rows_reach(input, residual),
+        LogicalOp::Skip { input, count } => match eval_neutral(count, &Row::new()).ok()? {
+            Value::Int(skip) => usize::try_from(skip)
+                .ok()?
+                .checked_add(scan_rows_reach(input, residual)?),
+            _ => None,
+        },
+        LogicalOp::Filter { input, predicate } => {
+            let mut instants = Vec::new();
+            named_instants(predicate, &mut instants);
+            if neutral_contains_subplan(predicate) || !instants.is_empty() {
+                return None;
+            }
+            residual.push(predicate.clone());
+            scan_rows_reach(input, residual)
+        }
+        _ => None,
+    }
+}
+
 fn execute_node_scan(
     variable: &str,
     labels: &[String],
     property_filters: &[(String, crate::plan::expr::Expr)],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    let cap = ctx.scan_row_cap.take();
     if let Some(rows) =
         scan_by_table_key(variable, labels, property_filters, property_filters, ctx)?
     {
@@ -5558,6 +5622,9 @@ fn execute_node_scan(
         (ctx.instant_for(variable), ctx.timeline_fields()),
         &budget,
     );
+    if let Some(cap) = &cap {
+        fold.residual = &cap.residual;
+    }
     let paging = ctx
         .scan_paging
         .as_ref()
@@ -5568,7 +5635,8 @@ fn execute_node_scan(
         None
     };
     if let Some(scan) = lookup {
-        scan_label_members(&scan, paging, &mut fold, &budget, ctx)?;
+        let cap = cap.as_ref().map(|cap| cap.rows);
+        scan_label_members(&scan, paging, cap, &mut fold, &budget, ctx)?;
     } else if let Some(label) = columnar_label {
         let env = NodeRowEnv::of(ctx);
         ctx.engine.columnar_for_each(
@@ -5725,10 +5793,13 @@ const LABEL_SCAN_BATCH: usize = 256;
 /// Fold into `fold` the nodes holding `scan`'s driving label, read in
 /// batches in NodeId order: each candidate's record, or the versions of a
 /// temporal node, which keeps no plain record. With `paging`, one page of
-/// candidates after the resume key, and the page's end recorded.
+/// candidates after the resume key, and the page's end recorded. With
+/// `cap`, it stops once that many of the fold's rows pass the filters above
+/// the scan: the first such rows in key order are then all among them.
 fn scan_label_members(
     scan: &LabelLookupScan,
     paging: Option<(Option<Vec<u8>>, usize)>,
+    cap: Option<usize>,
     fold: &mut NodeScanFold<'_, '_>,
     budget: &coordinode_core::budget::QueryBudget,
     ctx: &mut ExecutionContext<'_>,
@@ -5761,8 +5832,24 @@ fn scan_label_members(
     let mut taken = 0usize;
     let mut last_key = None;
     loop {
-        // One batch of candidates, and whether the label has more.
-        let want = limit.map_or(LABEL_SCAN_BATCH, |l| (l - taken).min(LABEL_SCAN_BATCH));
+        // One batch of candidates, and whether the label has more: no more
+        // than the rows still wanted, each candidate giving at most one.
+        let room = match cap {
+            Some(cap) => match cap.checked_sub(fold.passing_rows()) {
+                Some(room) if room > 0 => room,
+                _ => {
+                    if let Some(p) = ctx.scan_paging.as_mut() {
+                        p.last_key = last_key;
+                        p.exhausted = false;
+                    }
+                    return Ok(());
+                }
+            },
+            None => LABEL_SCAN_BATCH,
+        };
+        let want = limit
+            .map_or(LABEL_SCAN_BATCH, |l| (l - taken).min(LABEL_SCAN_BATCH))
+            .min(room);
         let mut batch: Vec<NodeId> = Vec::with_capacity(want);
         let mut more = false;
         store.label_members(
@@ -5851,6 +5938,10 @@ struct NodeScanFold<'s, 'b> {
     /// past, with the position of their row among `results`: built once the
     /// scan lets go of the transaction.
     deferred: Vec<(usize, u64, NodeRecord)>,
+    /// The filters a LIMIT above the scan applies to its rows; rows passing
+    /// them are counted in `passing`.
+    residual: &'s [crate::plan::expr::Expr],
+    passing: usize,
 }
 
 impl<'s, 'b> NodeScanFold<'s, 'b> {
@@ -5875,6 +5966,8 @@ impl<'s, 'b> NodeScanFold<'s, 'b> {
             versions_bytes: 0,
             versions_of: None,
             deferred: Vec::new(),
+            residual: &[],
+            passing: 0,
         }
     }
 
@@ -5958,7 +6051,21 @@ impl<'s, 'b> NodeScanFold<'s, 'b> {
         Ok(())
     }
 
+    /// Rows kept so far that pass every `residual` filter. Rows still
+    /// waiting for their schema, and a predicate that fails to evaluate
+    /// (the filter itself reports it later), are not counted, so the count
+    /// never exceeds what the filters let through.
+    fn passing_rows(&self) -> usize {
+        self.passing
+    }
+
     fn keep(&mut self, row: Row) -> Result<(), ExecutionError> {
+        if self.residual.iter().all(|predicate| {
+            crate::executor::eval_neutral::eval_neutral(predicate, &row)
+                .is_ok_and(|value| crate::executor::eval::is_truthy(&value))
+        }) {
+            self.passing += 1;
+        }
         self.kept.grow(crate::executor::row::row_held_bytes(&row))?;
         self.results.push(row);
         Ok(())

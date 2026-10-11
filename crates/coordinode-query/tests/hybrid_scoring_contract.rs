@@ -55,6 +55,7 @@ fn make_test_ctx<'a>(
         id_allocator: allocator,
         shard_id: 1,
         scan_paging: None,
+        scan_row_cap: None,
         operations: None,
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,

@@ -3045,6 +3045,7 @@ impl Database {
                 id_allocator: &self.allocator,
                 shard_id: self.shard_id,
                 scan_paging: scan_paging.clone(),
+                scan_row_cap: None,
                 operations: self.operations.as_deref(),
                 adaptive: self.adaptive_config.clone(),
                 dedup_varlen_targets: false,

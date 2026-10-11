@@ -179,6 +179,7 @@ fn attempt(
         id_allocator: &allocator,
         shard_id: env.shard_id(),
         scan_paging: None,
+        scan_row_cap: None,
         operations: None,
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,

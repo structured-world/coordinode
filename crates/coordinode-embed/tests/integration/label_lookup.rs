@@ -301,6 +301,52 @@ fn a_label_scan_reads_none_of_the_other_labels_nodes() {
     );
 }
 
+/// A LIMIT over a label scan reads only as many members as it keeps: the
+/// label's large members after the first few are never read, so a statement
+/// whose memory limit all of them would break answers, with the first rows
+/// in node order. SKIP is counted in, and a filter above the scan, which may
+/// drop rows, reads on until it has enough.
+#[test]
+fn a_limit_reads_only_the_members_it_keeps() {
+    let (mut db, _dir) = open_db();
+    let blob = "x".repeat(512 << 10);
+    for i in 0..8 {
+        db.execute_cypher(&format!("CREATE (:Wide {{i: {i}, payload: '{blob}'}})"))
+            .expect("member");
+    }
+    // Room for the three rows the SKIP and LIMIT below keep, not for eight.
+    db.set_query_memory_limit(3 << 20).expect("limit");
+    let first = |db: &mut Database, query: &str| -> Vec<i64> {
+        db.execute_cypher(query)
+            .unwrap_or_else(|e| panic!("{query}: {e}"))
+            .iter()
+            .map(|row| match row.get("i") {
+                Some(Value::Int(i)) => *i,
+                other => panic!("expected i, got {other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(
+        first(&mut db, "MATCH (n:Wide) RETURN n.i AS i LIMIT 2"),
+        [0, 1]
+    );
+    assert_eq!(
+        first(&mut db, "MATCH (n:Wide) RETURN n.i AS i SKIP 1 LIMIT 2"),
+        [1, 2]
+    );
+    assert_eq!(
+        first(
+            &mut db,
+            "MATCH (n:Wide) WHERE n.i >= 1 RETURN n.i AS i LIMIT 1"
+        ),
+        [1]
+    );
+    assert!(
+        db.execute_cypher("MATCH (n:Wide) RETURN n.i AS i").is_err(),
+        "all members do not fit the limit"
+    );
+}
+
 /// A server-side cursor pages a label's members after the last node it
 /// returned: every member once, in order, none of another label, and the
 /// last page says it is the last.
