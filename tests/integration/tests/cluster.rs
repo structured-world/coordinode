@@ -615,6 +615,140 @@ async fn a_member_restarts_into_its_group_with_its_data() {
 }
 
 /// Run `query` on `node` as a primary read or write.
+/// `query` answered by `node` itself, from what it has applied.
+async fn local_read(
+    node: &CoordinodeProcess,
+    query: &str,
+) -> Result<Vec<coordinode_integration::proto::query::Row>, tonic::Status> {
+    node.cypher_client()
+        .await
+        .execute_cypher(ExecuteCypherRequest {
+            query: query.to_string(),
+            parameters: std::collections::HashMap::new(),
+            read_preference: 5, // NEAREST
+            read_concern: Some(ReadConcern {
+                level: 1, // LOCAL
+                after_index: 0,
+                at_timestamp: 0,
+            }),
+            write_concern: None,
+            transaction_id: 0,
+            ..Default::default()
+        })
+        .await
+        .map(|r| r.into_inner().rows)
+}
+
+/// A follower killed while its index copy is in use comes back with that
+/// copy unfit, and checks it itself: the shared check runs where writes are
+/// taken and proves only that member's copy, so the leader records none.
+/// The follower answers lookups from its records meanwhile, and its copy
+/// serves again once its own check ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_checks_its_own_index_copy_after_a_crash() {
+    use coordinode_integration::proto::common::property_value::Value as Pv;
+    let (p1, p2, p3) = (free_port(), free_port(), free_port());
+    let n1 = CoordinodeProcess::start_cluster_member(1, p1, &[p2, p3]).await;
+    let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[p1, p3]).await;
+    let n3 = CoordinodeProcess::start_cluster_member(3, p3, &[p1, p2]).await;
+    let mut leader = n1.cluster_client().await;
+    for (id, member) in [(2, &n2), (3, &n3)] {
+        leader
+            .join_node(JoinNodeRequest {
+                node_id: id,
+                address: member.member_addr(),
+                pre_seeded: false,
+            })
+            .await
+            .expect("JoinNode must be accepted");
+        wait_for_voters(
+            &mut leader,
+            usize::try_from(id).expect("small"),
+            Duration::from_secs(40),
+        )
+        .await;
+    }
+    cypher_on(&n1, "CREATE INDEX g_code ON :G(code)")
+        .await
+        .expect("index");
+    cypher_on(&n1, "CREATE (:G {code: 'a'})")
+        .await
+        .expect("node");
+    let lookup = "MATCH (g:G {code: 'a'}) RETURN g.code";
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !local_read(&n2, lookup)
+        .await
+        .is_ok_and(|rows| rows.len() == 1)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the follower never applied the node"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // A graceful restart puts the follower's copy on disk, as a copy that
+    // has served for a while is; a copy only in memory is rebuilt whole from
+    // the log by a crash, and nothing of it is left to check.
+    let n2 = n2.restart_member(2, &[p1, p3], &[], false).await;
+    let flag = |rows: &[coordinode_integration::proto::query::Row]| {
+        rows.iter().any(|row| {
+            row.values
+                .first()
+                .and_then(|v| v.value.as_ref())
+                .is_some_and(|v| matches!(v, Pv::BoolValue(true)))
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let read = local_read(&n2, lookup).await;
+        let in_use = local_read(&n2, "CALL db.indexCopies() YIELD inUse RETURN inUse")
+            .await
+            .is_ok_and(|rows| flag(&rows));
+        if read.is_ok_and(|rows| rows.len() == 1) && in_use {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the follower's copy never came into use"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Killed with its copy in use: its guard stays open.
+    let n2 = n2.restart_member(2, &[p1, p3], &[], true).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert_eq!(
+            local_read(&n2, lookup)
+                .await
+                .expect("the follower answers")
+                .len(),
+            1,
+            "answered while its copy is checked"
+        );
+        let copies = local_read(&n2, "CALL db.indexCopies() YIELD unfit RETURN unfit")
+            .await
+            .expect("the follower's copies");
+        if !copies.is_empty() && !flag(&copies) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the follower's copy never served again: {copies:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let checks = cypher_on(&n1, "CALL db.indexChecks()")
+        .await
+        .expect("the leader's checks");
+    assert!(
+        checks.is_empty(),
+        "the follower checked its own copy; the leader recorded no check: {checks:?}"
+    );
+    drop((n1, n2, n3));
+}
+
 async fn cypher_on(
     node: &CoordinodeProcess,
     query: &str,
