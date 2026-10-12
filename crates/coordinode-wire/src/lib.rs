@@ -147,8 +147,8 @@ fn encode_compressed<T: Message>(item: &T, level: CompressionLevel) -> Result<Ve
 /// # Errors
 /// [`Status::internal`] if the zstd frame is malformed or prost decoding fails.
 fn decode_compressed<U: Message + Default>(bytes: &[u8]) -> Result<U, Status> {
-    let mut decoder = StreamingDecoder::new(bytes)
-        .map_err(|e| Status::internal(format!("zstd decoder init: {e}")))?;
+    // A body that is not a zstd frame is refused by the first read.
+    let mut decoder = StreamingDecoder::new(bytes);
     let mut raw = Vec::new();
     decoder
         .read_to_end(&mut raw)

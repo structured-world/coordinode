@@ -141,8 +141,9 @@ impl PieceEncoding {
                     .map_err(|e| SwarmError::Source(format!("write piece: {e}")))
             }
             PieceEncoding::Zstd(_) => {
-                let mut decoder = structured_zstd::decoding::StreamingDecoder::new(wire)
-                    .map_err(|e| SwarmError::Source(format!("zstd decoder: {e}")))?;
+                // A piece that is not a zstd stream is refused by the first
+                // read, which the copy reports.
+                let mut decoder = structured_zstd::decoding::StreamingDecoder::new(wire);
                 io::copy(&mut decoder, sink)
                     .map(|_| ())
                     .map_err(|e| SwarmError::Source(format!("zstd decode: {e}")))
