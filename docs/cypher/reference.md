@@ -901,7 +901,13 @@ A database written by an earlier version gets its lookup when it is opened,
 built in the background from the stored nodes. Until the lookup is ready,
 and for a read at a timestamp older than the moment it became ready, a label
 scan reads every node instead, with the same result. EXPLAIN ends with a
-`Label scans:` line saying which of the two a label scan does, and why.
+`Label scans:` line saying which of the two a label scan does, and why,
+followed by a line per scan naming its driving label and the candidates it
+reads (that label's node count), for example
+`:Wide:Narrow: driving :Narrow, ~2 candidates`. While a query runs, each
+label scan logs at debug level under the `coordinode::label_scan` target
+the candidates it read, the rows it kept and the bytes of the records it
+read, or why it read every node instead.
 
 ---
 
