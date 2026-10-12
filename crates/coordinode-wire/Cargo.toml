@@ -11,10 +11,9 @@ publish.workspace = true
 tonic = { workspace = true, features = ["tls-webpki-roots"] }
 prost = { workspace = true }
 bytes = { workspace = true }
-# Pure-Rust zstd (no C FFI) for transport compression. `^0` on purpose: the
-# crate is ours and still on 0.0.x, where a plain requirement pins one exact
-# version and `cargo update` never moves it.
-structured-zstd = "^0"
+# Pure-Rust zstd (no C FFI) for transport compression. 0.2 is the floor: its
+# streaming decoder is built infallibly, as the code here calls it.
+structured-zstd = "0.2"
 # Inter-node TLS/mTLS. CE crypto provider is pure-Rust rustls-rustcrypto (no C
 # FFI); EE swaps the process-default CryptoProvider to aws-lc-rs.
 rustls = { version = "0.23", default-features = false }
