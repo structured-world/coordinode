@@ -4,13 +4,15 @@
 //! grow with the unrelated data, and are shown beside it as the cost
 //! avoided. Then, at the largest size: the cold scan (the first after the
 //! database is opened again, with nothing cached), and what keeping the
-//! label lookup costs a write, in latency and in index entries per write.
+//! label lookup costs a write, in latency and in label postings per write.
 
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
 use std::time::{Duration, Instant};
 
+use coordinode_core::index::encoding::label_postings_prefix;
 use coordinode_embed::Database;
+use coordinode_modality::index::{IndexStore, LocalIndexStore};
 use coordinode_storage::engine::partition::Partition;
 
 /// Nodes of the scanned label.
@@ -52,10 +54,22 @@ fn report(label: &str, mut samples: Vec<Duration>) {
     );
 }
 
-/// Time `count` statements built by `statement`, and the index entries they
-/// added per statement.
+/// The label postings the lookup holds: its live index keys.
+fn postings(db: &Database) -> usize {
+    let lookup = LocalIndexStore::new(db.engine())
+        .label_lookup()
+        .expect("read")
+        .expect("every store has its label lookup");
+    db.engine()
+        .prefix_scan(Partition::Idx, &label_postings_prefix(lookup.generation))
+        .expect("scan")
+        .count()
+}
+
+/// Time `count` statements built by `statement`, and the label postings
+/// they added per statement.
 fn writes(db: &mut Database, label: &str, count: usize, statement: impl Fn(usize) -> String) {
-    let before = db.engine().approximate_len(Partition::Idx).expect("idx");
+    let before = postings(db);
     let samples = (0..count)
         .map(|i| {
             let start = Instant::now();
@@ -63,11 +77,11 @@ fn writes(db: &mut Database, label: &str, count: usize, statement: impl Fn(usize
             start.elapsed()
         })
         .collect();
-    let after = db.engine().approximate_len(Partition::Idx).expect("idx");
+    let after = postings(db);
     report(label, samples);
-    // Entry counts of a store this size, far below f64's exact range.
+    // Posting counts of a store this size, far below f64's exact range.
     println!(
-        "{label}: index entries per write ~{:.2}",
+        "{label}: label postings per write {:.2}",
         (after as f64 - before as f64) / count as f64
     );
 }
@@ -115,16 +129,24 @@ fn main() {
         .collect();
     report(&format!("cold label scan, {unrelated} unrelated"), cold);
 
-    // What the lookup costs a write: a create stages one entry per label, a
-    // label change one, a property edit none.
+    // What the lookup costs a write: a create stages one posting per label,
+    // a label change one, a property edit none. The edits find their node
+    // through an index on `i`, so their time is the write, not a search.
     let mut db = Database::open(dir.path()).expect("reopen");
+    db.execute_cypher("CREATE INDEX edit_i ON :Edit(i)")
+        .expect("index");
     writes(&mut db, "create with one label", WRITES, |i| {
         format!("CREATE (:Fresh {{i: {i}}})")
     });
+    db.execute_cypher(&format!(
+        "UNWIND range(0, {}) AS i CREATE (:Edit {{i: i}})",
+        WRITES - 1
+    ))
+    .expect("edited nodes");
     writes(&mut db, "property edit, labels kept", WRITES, |i| {
-        format!("MATCH (n:Fresh {{i: {i}}}) SET n.v = {i}")
+        format!("MATCH (n:Edit {{i: {i}}}) SET n.v = {i}")
     });
     writes(&mut db, "label added", WRITES, |i| {
-        format!("MATCH (n:Fresh {{i: {i}}}) SET n:Tagged")
+        format!("MATCH (n:Edit {{i: {i}}}) SET n:Tagged")
     });
 }

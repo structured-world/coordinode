@@ -778,3 +778,43 @@ fn forget_label_lookup(db: &Database) {
     }
     engine.persist().expect("persist");
 }
+
+/// Every key of the index partition, sorted.
+fn idx_keys(db: &Database) -> Vec<Vec<u8>> {
+    use coordinode_storage::engine::partition::Partition;
+    db.engine()
+        .prefix_scan(Partition::Idx, &[])
+        .expect("scan")
+        .map(|row| row.into_inner().expect("key").0.to_vec())
+        .collect()
+}
+
+/// The lookup costs a write one index entry per label the write moves and
+/// nothing else: every statement below adds or removes exactly the
+/// postings of the labels it changes, and a write that changes no label
+/// leaves the index partition as it was.
+#[test]
+fn a_write_moves_one_index_entry_per_label_changed() {
+    let (mut db, _dir) = open_db();
+    let cases: [(&str, usize, usize); 7] = [
+        ("CREATE ({name: 'bare'})", 0, 0),
+        ("CREATE (:Fresh {name: 'f'})", 1, 0),
+        ("CREATE (:A:B:C {name: 'abc'})", 3, 0),
+        ("CREATE (:D {name: 'd1'}), (:D {name: 'd2'})", 2, 0),
+        ("MATCH (n:Fresh) SET n.v = 1", 0, 0),
+        ("MATCH (n:Fresh) SET n:Tagged", 1, 0),
+        ("MATCH (n:A) REMOVE n:B", 0, 1),
+    ];
+    for (statement, added, removed) in cases {
+        let before = idx_keys(&db);
+        db.execute_cypher(statement).expect("write");
+        let after = idx_keys(&db);
+        let new: Vec<&Vec<u8>> = after.iter().filter(|k| !before.contains(k)).collect();
+        let gone: Vec<&Vec<u8>> = before.iter().filter(|k| !after.contains(k)).collect();
+        assert_eq!(
+            (new.len(), gone.len()),
+            (added, removed),
+            "{statement}: added {new:?}, removed {gone:?}"
+        );
+    }
+}
