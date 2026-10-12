@@ -463,8 +463,10 @@ pub struct ServerConfig {
     /// business, so they escape the `deny_unknown_fields` above: a typo inside
     /// this table surfaces where the extension parses it, not here.
     ///
-    /// Read it through [`crate::ServerContext::extension_config`].
-    pub extensions: BTreeMap<String, serde_yaml_ng::Value>,
+    /// Read it through [`crate::ServerContext::extension_config`]. Each value
+    /// is kept as a format-neutral tree; the extension deserializes its own
+    /// type from it with `serde_json::from_value`.
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for ServerConfig {
@@ -578,7 +580,7 @@ impl ServerConfig {
             Some(p) => {
                 let text =
                     std::fs::read_to_string(p).map_err(|e| ConfigError::Read(p.to_string(), e))?;
-                serde_yaml_ng::from_str(&text)
+                serde_saphyr::from_str(&text)
                     .map_err(|e| ConfigError::Parse(p.to_string(), e.to_string()))
             }
         }

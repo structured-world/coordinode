@@ -36,7 +36,7 @@ pub struct ServerContext {
     session_registry: Arc<coordinode_session::SessionRegistry>,
     routing: Arc<dyn ShardRouting>,
     topology: Arc<dyn ClusterTopology>,
-    extensions: BTreeMap<String, serde_yaml_ng::Value>,
+    extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl ServerContext {
@@ -99,8 +99,10 @@ impl ServerContext {
     ///
     /// Returns `None` when the key is absent, which a registration should read
     /// as "not configured" rather than an error, so one config file still
-    /// works with the extension left out.
-    pub fn extension_config(&self, key: &str) -> Option<&serde_yaml_ng::Value> {
+    /// works with the extension left out. The block is a format-neutral tree:
+    /// deserialize the extension's own type from it with
+    /// `serde_json::from_value`.
+    pub fn extension_config(&self, key: &str) -> Option<&serde_json::Value> {
         self.extensions.get(key)
     }
 }
@@ -268,7 +270,7 @@ impl ServerContext {
         session_registry: Arc<coordinode_session::SessionRegistry>,
         routing: Arc<dyn ShardRouting>,
         topology: Arc<dyn ClusterTopology>,
-        extensions: BTreeMap<String, serde_yaml_ng::Value>,
+        extensions: BTreeMap<String, serde_json::Value>,
     ) -> Self {
         Self {
             node_id,

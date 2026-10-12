@@ -67,7 +67,8 @@ pin-project-lite = "0.2"
 serde = { workspace = true }
 # The /version report on the ops port.
 serde_json = { workspace = true }
-serde_yaml_ng = "0.10"
+# The config file: a YAML parser in safe Rust.
+serde-saphyr = "1.3"
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 tracing = { workspace = true }
