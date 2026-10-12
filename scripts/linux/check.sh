@@ -25,6 +25,9 @@
 # and, when the host has inferno, a flame graph in profile.svg. The host
 # needs perf.
 #
+# The run works in /var/tmp/cn-check on the host, or in COORDINODE_CHECK_DIR
+# when that is set.
+#
 # The host needs git, the pinned Rust toolchain, cargo-nextest and protoc
 # (scripts/linux/provision.sh installs them); the run stops before uploading
 # anything when one is missing. Logs and the status file land in
@@ -45,7 +48,9 @@ ssh() { command ssh "${ssh_opts[@]}" "$@"; }
 # compilation cache keys on absolute paths, so a path that differs per run
 # would never hit and every run would rebuild the workspace from nothing. A
 # second run on the same host waits for no one; it stops and says why.
-remote_root="/var/tmp/cn-check"
+# COORDINODE_CHECK_DIR moves it to a filesystem with room for a full build
+# (a debug target with API docs takes more than 10 GiB).
+remote_root="${COORDINODE_CHECK_DIR:-/var/tmp/cn-check}"
 locked=0
 only_nextest="${COORDINODE_CHECK_NEXTEST:-}"
 only_bench="${COORDINODE_CHECK_BENCH:-}"
