@@ -5719,17 +5719,30 @@ fn label_lookup_scan(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Option<LabelLookupScan>, ExecutionError> {
     use coordinode_modality::ENTRY_LAYOUT;
+    // Why a scan of `labels` reads every node instead, for inspection.
+    let fallback = |reason: &str| {
+        tracing::debug!(
+            target: "coordinode::label_scan",
+            ?labels,
+            reason,
+            "label scan reads every node of the shard"
+        );
+        Ok(None)
+    };
     if labels.is_empty() {
         return Ok(None);
     }
     let Some(registry) = ctx.btree_index_registry else {
-        return Ok(None);
+        return fallback("no index registry in this context");
     };
     let Some((lookup, published)) = registry.label_lookup_published() else {
-        return Ok(None);
+        return fallback("no label lookup");
     };
-    if lookup.state != IndexState::Ready || lookup.layout != ENTRY_LAYOUT {
-        return Ok(None);
+    if lookup.state != IndexState::Ready {
+        return fallback("the label lookup is not ready");
+    }
+    if lookup.layout != ENTRY_LAYOUT {
+        return fallback("the label lookup has another entry layout");
     }
     let read_ts = match ctx.snapshot_ts {
         Some(at) => u64::try_from(at).unwrap_or(0),
@@ -5738,14 +5751,14 @@ fn label_lookup_scan(
     // A snapshot before the lookup was published may read a generation its
     // build had not filled yet.
     if published.is_some_and(|at| read_ts < at) {
-        return Ok(None);
+        return fallback("the snapshot is older than the label lookup");
     }
     // No use guard: a guard left by a run that ended uncleanly marks the
     // copy unfit until a check proves it, for findings that run may never
     // have stored. A label scan stores no findings and draws no conclusion
     // a guard would have to cover, so it arms none.
     if !registry.answers_at(lookup.generation, read_ts) {
-        return Ok(None);
+        return fallback("the label lookup's copy is not proved for this snapshot");
     }
     let mut driving: Option<(u64, Option<u32>)> = None;
     for name in labels {
@@ -5805,6 +5818,39 @@ fn scan_label_members(
     fold: &mut NodeScanFold<'_, '_>,
     budget: &coordinode_core::budget::QueryBudget,
     ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let rows_before = fold.kept_rows();
+    let mut tally = ScanTally::default();
+    let scanned = read_label_members(scan, paging, cap, fold, budget, ctx, &mut tally);
+    tracing::debug!(
+        target: "coordinode::label_scan",
+        generation = scan.lookup.generation.as_raw(),
+        label = scan.label,
+        candidates = tally.candidates,
+        rows = fold.kept_rows() - rows_before,
+        bytes = tally.bytes,
+        "label scan read its members from the label lookup"
+    );
+    scanned
+}
+
+/// What a label scan read: the candidates its postings named and the bytes
+/// of the records and versions it read for them.
+#[derive(Default)]
+struct ScanTally {
+    candidates: u64,
+    bytes: u64,
+}
+
+/// The reading half of [`scan_label_members`], counting into `tally`.
+fn read_label_members(
+    scan: &LabelLookupScan,
+    paging: Option<(Option<Vec<u8>>, usize)>,
+    cap: Option<usize>,
+    fold: &mut NodeScanFold<'_, '_>,
+    budget: &coordinode_core::budget::QueryBudget,
+    ctx: &mut ExecutionContext<'_>,
+    tally: &mut ScanTally,
 ) -> Result<(), ExecutionError> {
     use coordinode_core::graph::node::{decode_node_key, encode_node_key};
     use coordinode_modality::{
@@ -5879,7 +5925,9 @@ fn scan_label_members(
         for ((node, key), record) in batch.iter().zip(&keys).zip(records) {
             match record {
                 Some(value) => {
-                    let _row = budget.reserve(kv_bytes(key, &value))?;
+                    let bytes = kv_bytes(key, &value);
+                    tally.bytes += bytes;
+                    let _row = budget.reserve(bytes)?;
                     fold.row(key, &value, &env)?;
                     last_key = Some(key.clone());
                 }
@@ -5891,6 +5939,7 @@ fn scan_label_members(
                         &LocalNodeStore.version_prefix(shard, *node),
                         budget,
                         |key, value| {
+                            tally.bytes += kv_bytes(key, value);
                             last_key = Some(key.to_vec());
                             fold.row(key, value, &env)
                         },
@@ -5898,6 +5947,8 @@ fn scan_label_members(
                 }
             }
         }
+        // Counts of candidates read, far below the type's range.
+        tally.candidates += batch.len() as u64;
         taken += batch.len();
         after = batch.last().copied();
         let page_full = limit.is_some_and(|l| taken >= l);
@@ -6051,6 +6102,11 @@ impl<'s, 'b> NodeScanFold<'s, 'b> {
             self.keep(row)?;
         }
         Ok(())
+    }
+
+    /// Rows kept so far, waiting ones not counted.
+    fn kept_rows(&self) -> usize {
+        self.results.len()
     }
 
     /// Rows kept so far that pass every `residual` filter. Rows still

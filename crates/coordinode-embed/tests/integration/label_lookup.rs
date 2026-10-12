@@ -604,12 +604,25 @@ fn a_mount_lookup_beside_large_segments_reads_only_mounts() {
 /// EXPLAIN names the lookup a label scan reads.
 #[test]
 fn explain_names_the_label_lookup() {
-    let (db, _dir) = open_db();
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("UNWIND range(1, 30) AS i CREATE (:Wide {i: i})")
+        .expect("wide");
+    db.execute_cypher("CREATE (:Narrow:Wide {i: 0}), (:Narrow {i: 1})")
+        .expect("narrow");
     let plan = db
         .explain_cypher("MATCH (n:Small) RETURN n")
         .expect("explain");
     assert!(
         plan.contains("read the label's members from the built-in label lookup"),
+        "{plan}"
+    );
+    // A conjunction is driven by its label with the fewest nodes, and the
+    // candidates it reads are that label's count.
+    let plan = db
+        .explain_cypher("MATCH (n:Wide:Narrow) RETURN n")
+        .expect("explain");
+    assert!(
+        plan.contains(":Wide:Narrow: driving :Narrow, ~2 candidates"),
         "{plan}"
     );
 }

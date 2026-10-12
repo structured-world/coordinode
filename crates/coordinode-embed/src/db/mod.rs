@@ -3316,7 +3316,8 @@ impl Database {
         }
         // A scan of a label reads the built-in label lookup when it is ready,
         // and every node of the shard until then.
-        if explain.contains("NodeScan(") && explain.contains(':') {
+        let scans = plan.labeled_node_scans();
+        if !scans.is_empty() {
             explain.push_str("\n\nLabel scans: ");
             explain.push_str(&match self.index_registry.label_lookup() {
                 Some((def, _)) if def.state == coordinode_query::index::IndexState::Ready => {
@@ -3336,6 +3337,25 @@ impl Database {
                 ),
                 None => "read every node of the shard: the store has no label lookup yet".into(),
             });
+            // Each scan's driving label: the one with the fewest nodes by its
+            // counter, the candidates the scan reads.
+            for labels in &scans {
+                let counted: Vec<(&String, Option<u64>)> = labels
+                    .iter()
+                    .map(|l| (l, stats_ref.and_then(|s| s.node_count_for_label(l))))
+                    .collect();
+                let driving = counted
+                    .iter()
+                    .min_by_key(|(_, n)| n.unwrap_or(u64::MAX))
+                    .map(|(l, n)| (l.as_str(), *n));
+                let shown = labels.iter().map(|l| format!(":{l}")).collect::<String>();
+                if let Some((label, count)) = driving {
+                    explain.push_str(&format!(
+                        "\n  {shown}: driving :{label}, {} candidates",
+                        count.map_or_else(|| "unknown".to_string(), |n| format!("~{n}"))
+                    ));
+                }
+            }
         }
         Ok(explain)
     }

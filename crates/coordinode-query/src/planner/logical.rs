@@ -43,6 +43,41 @@ impl LogicalPlan {
         }
         self.root.substitute_params(params);
     }
+
+    /// The label sets of the plan's node scans that name at least one label,
+    /// in plan order: what a label scan would read for inspection to report.
+    pub fn labeled_node_scans(&self) -> Vec<Vec<String>> {
+        fn walk(op: &LogicalOp, out: &mut Vec<Vec<String>>) {
+            match op {
+                LogicalOp::NodeScan { labels, .. } => {
+                    if !labels.is_empty() {
+                        out.push(labels.clone());
+                    }
+                }
+                LogicalOp::CartesianProduct { left, right }
+                | LogicalOp::LeftOuterJoin { left, right } => {
+                    walk(left, out);
+                    walk(right, out);
+                }
+                LogicalOp::Traverse { input, .. }
+                | LogicalOp::Unwind { input, .. }
+                | LogicalOp::ProcedureCall { input, .. }
+                | LogicalOp::Filter { input, .. }
+                | LogicalOp::VectorFilter { input, .. }
+                | LogicalOp::TextFilter { input, .. }
+                | LogicalOp::Aggregate { input, .. }
+                | LogicalOp::Project { input, .. }
+                | LogicalOp::Sort { input, .. }
+                | LogicalOp::Limit { input, .. }
+                | LogicalOp::Skip { input, .. } => walk(input, out),
+                LogicalOp::NodeCountFromCounter { fallback, .. } => walk(fallback, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &mut out);
+        out
+    }
 }
 
 /// Pushed-down time-slice filter for a temporal edge traversal.
