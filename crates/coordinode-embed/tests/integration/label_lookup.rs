@@ -779,6 +779,56 @@ fn forget_label_lookup(db: &Database) {
     engine.persist().expect("persist");
 }
 
+/// A restore writes its nodes past the executor, so none of them stages a
+/// posting on its way in: the lookup is filled over the loaded nodes before
+/// the restore returns, in every format CoordiNode writes, and a label scan
+/// on the restored store reads it.
+#[test]
+fn a_restored_store_has_every_label_in_its_lookup() {
+    use coordinode_embed::backup::restore::RestoreOptions;
+    use coordinode_embed::backup::{BackupFormat, export};
+
+    let (mut source, _source_dir) = open_db();
+    source
+        .execute_cypher(
+            "CREATE (:User {name: 'a'}), (:User:Admin {name: 'b'}), (:Post {name: 'p'})",
+        )
+        .expect("create");
+    let interner = source.interner().expect("dictionary");
+    for format in [
+        BackupFormat::Json,
+        BackupFormat::Cypher,
+        BackupFormat::Binary,
+    ] {
+        let snapshot = source.engine().snapshot();
+        let mut dump = Vec::new();
+        match format {
+            BackupFormat::Json => {
+                export::export_json(source.engine(), &interner, 1, &snapshot, &mut dump)
+            }
+            BackupFormat::Cypher => {
+                export::export_cypher(source.engine(), &interner, 1, &snapshot, &mut dump)
+            }
+            _ => export::export_binary(source.engine(), &interner, 1, &snapshot, &mut dump),
+        }
+        .expect("export");
+        let (mut db, _dir) = open_db();
+        db.restore(format, &dump, &RestoreOptions::default())
+            .expect("restore");
+        for label in ["User", "Admin", "Post"] {
+            let held = holders(&mut db, label);
+            assert!(!held.is_empty(), "{format:?}: {label} restored");
+            assert_eq!(members(&db, label), held, "{format:?}: {label}");
+        }
+        assert!(
+            db.explain_cypher("MATCH (n:User) RETURN n")
+                .expect("explain")
+                .contains("read the label's members from the built-in label lookup"),
+            "{format:?}: the scan reads the lookup"
+        );
+    }
+}
+
 /// Every key of the index partition, sorted.
 fn idx_keys(db: &Database) -> Vec<Vec<u8>> {
     use coordinode_storage::engine::partition::Partition;
