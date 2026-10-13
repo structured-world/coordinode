@@ -408,6 +408,10 @@ async fn an_applied_proposal_is_recorded_in_its_tree() {
         bypass_rate_limiter: false,
     };
 
+    let before = engine_read
+        .raft_coverage()
+        .expect("read coverage")
+        .skip_until();
     pipeline.propose_and_wait(&proposal).expect("propose");
 
     // propose_and_wait blocks until apply() returns, so the mutation and its
@@ -423,9 +427,12 @@ async fn an_applied_proposal_is_recorded_in_its_tree() {
 
     let coverage = engine_read.raft_coverage().expect("read coverage");
     let last = coverage.skip_until();
-    assert!(last > 0, "the applied proposal must be recorded");
+    assert!(last > before, "the applied proposal must be recorded");
+    // The entries applied since `before` include the proposal and possibly
+    // Raft's own entries, which write no Node row: the newest one need not
+    // be the proposal, but the proposal is among them.
     assert!(
-        coverage.holds(Partition::Node, last - 1, 0),
+        (before..last).any(|index| coverage.holds(Partition::Node, index, 0)),
         "the Node tree records the proposal it holds"
     );
 

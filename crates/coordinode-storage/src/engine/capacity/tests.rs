@@ -223,17 +223,18 @@ fn scanner_fires_refresh_then_shuts_down() {
     })
     .expect("scanner spawn");
 
-    // Sleep long enough to observe at least 2 ticks. The scanner
-    // defers its first refresh by `interval` (see
-    // `first_tick_is_deferred_by_interval`), and the loop's
-    // shutdown-check granularity is 100 ms, so the effective
-    // cadence on a 50 ms interval is ~100 ms — yielding ≥2 ticks
-    // in 350 ms (first at ~100 ms, second at ~200 ms, third ~300).
-    std::thread::sleep(Duration::from_millis(350));
-    let observed = count.load(Ordering::Relaxed);
+    // The scanner fires repeatedly: wait for a second tick (about 200 ms on
+    // an idle machine, the loop's granularity being 100 ms) with a deadline
+    // a loaded CI runner cannot miss, rather than a fixed sleep it can.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut observed = count.load(Ordering::Relaxed);
+    while observed < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        observed = count.load(Ordering::Relaxed);
+    }
     assert!(
         observed >= 2,
-        "expected scanner to fire at least 2 times in 350 ms with 50 ms interval, got {observed}",
+        "expected the scanner to fire at least twice within 10 s, got {observed}",
     );
 
     // Drop → shutdown → join. Should return within
