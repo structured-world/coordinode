@@ -2,6 +2,44 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(index)* maintain and provision the built-in label lookup
+- *(index)* label posting codec and lookup catalog record
+- *(index)* carry index copy proofs through transfers
+- *(index)* guard each local index copy before it serves
+- *(storage)* store index generations under local installations
+- *(index)* check B-tree indexes against their records and repair them
+- *(storage)* keep exact edge cardinality counts at commit
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* repair stored duplicates during a unique build
+
+### Fixed
+
+- *(index)* bind builds and checks to the definition, not a held version
+- *(index)* bind a check's repair to the check its executor holds
+- *(query)* store index unfitness when found and lift it only as proved
+- *(query)* keep a member's unfit index copy excluded until proved here
+- *(storage)* fold node deltas into a whole write of the same node
+- *(reads)* reuse the statement schema view
+- *(query)* search temporal labels at their valid state
+- *(storage)* hide rows a transaction deleted from its scans
+- *(modality)* refuse an unresolved temporal edge type on every write
+- refuse to open over unreadable index and consensus state
+- *(index)* refuse to open over an index catalog record it cannot read
+
+### Performance
+
+- *(query)* charge index lookups to the statement budget
+- *(query)* stream node scans within the statement budget
+- *(query)* bound property delta chains with whole writes
+- *(query)* take TTL candidates from a ready anchor index
+- *(query)* write a top-level SET as a property delta
+- *(storage)* borrow node bytes during decode
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

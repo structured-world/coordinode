@@ -2,6 +2,100 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(query)* inspect label scans
+- *(index)* show the label lookup's copy in db.indexCopies
+- *(query)* stop a label scan at the rows a LIMIT keeps
+- *(query)* scan a label from the label lookup
+- *(index)* maintain and provision the built-in label lookup
+- *(index)* carry the peer's proof with a generation's history
+- *(index)* carry index copy proofs through transfers
+- *(index)* show this member's index copies
+- *(index)* guard each local index copy before it serves
+- *(storage)* store index generations under local installations
+- *(query)* account procedure calls and node and document rewrites
+- *(query)* account rank fusion and document scores
+- *(search)* run encrypted index searches within the statement budget
+- *(search)* run text index searches against the statement budget
+- *(vector)* run index searches against the statement budget
+- *(query)* account shortest paths and counter-answered counts
+- *(query)* run per-row subqueries under a part of the budget
+- *(query)* count relationship MERGE as accounted work
+- *(query)* charge detaching deletes and trigger bodies to the budget
+- *(query)* charge joins and UNION to the statement budget
+- *(query)* charge write operators to the statement budget
+- *(query)* charge graph traversal to the statement budget
+- *(session)* cancel a running statement through its budget
+- *(query)* charge UNWIND and aggregation to the statement budget
+- *(storage)* charge staged writes to the statement budget
+- *(query)* refuse an unproved index read that would leave the budget
+- *(query)* add a per-statement memory and time budget
+- *(server)* serve index checks and rebuilds over gRPC
+- *(cypher)* add REINDEX and index check procedures
+- *(index)* check B-tree indexes against their records and repair them
+- *(query)* count a label's nodes from its counter
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* repair stored duplicates during a unique build
+- *(schema)* admit index builds as inspectable operations
+
+### Fixed
+
+- *(query)* a label scan arms no use guard on the lookup's copy
+- *(index)* bind builds and checks to the definition, not a held version
+- *(index)* bind a check's repair to the check its executor holds
+- *(index)* stop a check whose generation the index left
+- *(query)* refuse a duplicate trigger name as an existing object
+- *(server)* carry a session cancel to the leader and charge merges
+- *(index)* bind writes to a definition compaction has settled
+- *(query)* never lift a failed index mark by touching the disk again
+- *(query)* treat an index mark whose removal failed as unknown
+- *(query)* decide index mark durability in the order of its removal
+- *(query)* store index unfitness when found and lift it only as proved
+- *(query)* keep a member's unfit index copy excluded until proved here
+- *(index)* check a unique entry's holder against its record
+- *(query)* leave a build the member cannot take to the leader
+- *(storage)* fold node deltas into a whole write of the same node
+- *(reads)* reuse the statement schema view
+- *(raft)* fence follower cuts with a closed bound
+- *(query)* search temporal labels at their valid state
+- *(embed)* fence the vector freshness watermark at a cut
+- *(query)* end a vector build at its ready mark
+- *(query)* mark a built vector index ready after its tail fold
+- *(storage)* let a catalog change wait for admitted writers
+- *(query)* keep the edge discriminator in the query fingerprint
+- *(query)* stop and join index build executors when a database closes
+- *(storage)* wait for every older transaction in an index build
+- *(index)* refuse to open over an index catalog record it cannot read
+- *(vector)* mark an index ready only at a build's handover
+
+### Performance
+
+- *(query)* find MERGE and UPSERT patterns through the index
+- *(query)* charge index lookups to the statement budget
+- *(query)* stream node scans within the statement budget
+- *(query)* pass over other labels' records by their labels
+- *(query)* write a change carrying most of a record whole
+- *(query)* bound property delta chains with whole writes
+- *(query)* take TTL candidates from a ready anchor index
+- *(query)* reap every TTL target in one read of the shard
+- *(query)* write a top-level SET as a property delta
+- *(storage)* borrow node bytes during decode
+
+### Testing
+
+- *(index)* exclude a copy a dead run left guarded from a capture
+- *(index)* cover compound checks, deletes and check takeover
+- *(index)* cover the edges of index copy transfer
+- *(query)* fail every flush in the index mark fault tests
+- *(storage)* prove a persist after a failed one keeps its write
+- *(query)* bound the repairs a backfill page may make
+- *(schema)* cover type definitions and repair outcomes
+- *(query)* cover a suffix collision and suffix exhaustion in duplicate repair
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

@@ -2,6 +2,17 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(session)* cancel a running statement through its budget
+- *(query)* add a per-statement memory and time budget
+
+### Testing
+
+- pin the statement budget across index repair answers
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

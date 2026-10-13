@@ -2,6 +2,18 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(index)* carry the peer's proof with a generation's history
+- *(replicate)* fill a generation's replacement from a peer
+- *(storage)* store index generations under local installations
+
+### Performance
+
+- *(cdc)* answer a consumer's progress age without rereading the log
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

@@ -2,6 +2,121 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(query)* inspect label scans
+- *(index)* show the label lookup's copy in db.indexCopies
+- *(query)* stop a label scan at the rows a LIMIT keeps
+- *(query)* scan a label from the label lookup
+- *(index)* maintain and provision the built-in label lookup
+- *(index)* carry index copy proofs through transfers
+- *(index)* show this member's index copies
+- *(index)* guard each local index copy before it serves
+- *(server)* configure the auto-commit re-execution budget
+- *(storage)* store index generations under local installations
+- *(query)* account procedure calls and node and document rewrites
+- *(search)* run text index searches against the statement budget
+- *(vector)* run index searches against the statement budget
+- *(query)* account shortest paths and counter-answered counts
+- *(query)* run per-row subqueries under a part of the budget
+- *(query)* count relationship MERGE as accounted work
+- *(query)* charge detaching deletes and trigger bodies to the budget
+- *(query)* charge joins and UNION to the statement budget
+- *(query)* charge graph traversal to the statement budget
+- *(session)* cancel a running statement through its budget
+- *(query)* charge UNWIND and aggregation to the statement budget
+- *(storage)* charge staged writes to the statement budget
+- *(query)* refuse an unproved index read that would leave the budget
+- *(query)* add a per-statement memory and time budget
+- *(server)* serve index checks and rebuilds over gRPC
+- *(cypher)* add REINDEX and index check procedures
+- *(index)* check B-tree indexes against their records and repair them
+- *(config)* make the index feed capacity a setting
+- *(query)* count a label's nodes from its counter
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* repair stored duplicates during a unique build
+- *(schema)* admit index builds as inspectable operations
+
+### Documentation
+
+- *(cypher)* describe label scans over the label lookup
+
+### Fixed
+
+- *(query)* a label scan arms no use guard on the lookup's copy
+- *(storage)* refuse a write over a moved index binding as a conflict
+- *(embed)* run an auto-commit statement again after a refused commit
+- *(query)* refuse a duplicate trigger name as an existing object
+- *(server)* carry a session cancel to the leader and charge merges
+- *(index)* bind writes to a definition compaction has settled
+- *(storage)* read a record's latest value at the present
+- *(query)* decide index mark durability in the order of its removal
+- *(query)* store index unfitness when found and lift it only as proved
+- *(query)* keep a member's unfit index copy excluded until proved here
+- *(index)* check a unique entry's holder against its record
+- *(search)* parse the documented text query language
+- *(search)* highlight the words a fuzzy search matched
+- *(query)* leave a build the member cannot take to the leader
+- *(reads)* reuse the statement schema view
+- *(raft)* fence follower cuts with a closed bound
+- *(search)* match every word a text prefix starts
+- *(query)* search temporal labels at their valid state
+- *(embed)* fence the vector freshness watermark at a cut
+- *(embed)* keep a failed index fold out of later releases
+- *(storage)* let a catalog change wait for admitted writers
+- *(server)* list labels from the counters, under a read lock
+- *(query)* stop and join index build executors when a database closes
+- *(storage)* wait for every older transaction in an index build
+- drop the upgrade path from 0.6 stores
+- refuse to open over unreadable index and consensus state
+- *(index)* refuse to open over an index catalog record it cannot read
+
+### Performance
+
+- *(query)* find MERGE and UPSERT patterns through the index
+- *(query)* charge index lookups to the statement budget
+- *(query)* stream node scans within the statement budget
+- *(storage)* keep five minutes of MVCC history by default
+- *(storage)* borrow node bytes during decode
+
+### Refactored
+
+- *(schema)* drop the property uniqueness flag and index adoption
+
+### Testing
+
+- *(embed)* a restored store fills its label lookup
+- *(embed)* pin the label postings a write moves
+- *(index)* a mount lookup beside large segments reads only mounts
+- *(index)* label lookup after a crash and across temporal holders
+- *(index)* cover compound checks, deletes and check takeover
+- *(index)* race two writers for a value of a suspect unique index
+- *(index)* measure lookups while an index check repairs
+- *(embed)* hold the node until a single-attempt statement returns
+- *(index)* check index copies after a server crash only
+- *(index)* check partial, sparse, derived and temporal indexes
+- *(embed)* keep the re-execution test beside the executor
+- pin the statement budget across index repair answers
+- *(bench)* keep the index wrong for every measured fallback run
+- *(bench)* measure lookups answered by the index and by the records
+- *(embed)* cover reads within the statement budget
+- *(embed)* change a record through the node store in index checks
+- *(search)* cover AS OF after a rebuild and a write the worker cannot fold
+- *(bench)* keep the text history bench's T0 inside the retention window
+- *(index)* index nodes created together under their own ids
+- *(embed)* rank unfolded and own text writes against a fresh index
+- *(schema)* cover the refusals of edge identity
+- *(schema)* cover type definitions and repair outcomes
+- a scoped uniqueness survives a restore and a repair replicates
+- unreadable state refuses the loaders and a replicated member
+
+### Bench
+
+- *(embed)* report text-index resources and recovery
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

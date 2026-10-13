@@ -2,6 +2,29 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(search)* run encrypted index searches within the statement budget
+- *(search)* run text index searches against the statement budget
+
+### Fixed
+
+- *(search)* keep text statistics to what readers see after a failed write
+- *(search)* parse the documented text query language
+- *(search)* highlight the words a fuzzy search matched
+- *(search)* run a text prefix as a term range
+- *(search)* refuse writes after a lost text-index writer
+- *(search)* match every word a text prefix starts
+- *(search)* carry no fictitious birth time in text documents
+- *(query)* search temporal labels at their valid state
+
+### Testing
+
+- *(search)* keep final statistics through segment merge and reopen
+- *(search)* cover refused and zero birth-time reads
+
 ## v0.7.0 - 2026-10-06
 
 ### Documentation
