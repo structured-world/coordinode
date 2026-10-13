@@ -114,6 +114,12 @@ jobs:
           fi
           echo "protoc: $(protoc --version)"
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The runner's $CARGO_HOME/bin is its own and outlives the job:
+          # caching it lets the save step prune what `cargo install` did not
+          # put there, rustup included, and the next job builds with the
+          # system cargo instead of the pinned toolchain.
+          cache-bin: "false"
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Build coordinode binary (required by integration tests)
@@ -168,6 +174,9 @@ jobs:
           fi
           echo "protoc: $(protoc --version)"
       - uses: Swatinem/rust-cache@v2
+        with:
+          # See the `test` job: the runner's own bin directory stays out.
+          cache-bin: "false"
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Build coordinode binary (required by integration tests)
@@ -241,6 +250,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $nextestDir 'bin')
       - uses: Swatinem/rust-cache@v2
+        with:
+          # See the `test` job: the runner's own bin directory stays out.
+          cache-bin: "false"
       - name: Build coordinode binary (required by integration tests)
         run: cargo build -p coordinode-server --all-features
       - name: Run unit + integration tests (nextest)
@@ -332,6 +344,9 @@ jobs:
           fi
           echo "protoc: $(protoc --version)"
       - uses: Swatinem/rust-cache@v2
+        with:
+          # See the `test` job: the runner's own bin directory stays out.
+          cache-bin: "false"
       - name: Build (release)
         run: cargo build --release --all-features
       - name: Clean the build output
