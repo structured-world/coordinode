@@ -2,6 +2,32 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(index)* carry the peer's proof with a generation's history
+- *(index)* carry index copy proofs through transfers
+- *(storage)* store index generations under local installations
+
+### Fixed
+
+- *(storage)* bound a Raft generation history by its applied entries
+- *(storage)* mark a partition capture with the engine format
+- *(reads)* reuse the statement schema view
+- *(raft)* fence follower cuts with a closed bound
+- drop the upgrade path from 0.6 stores
+- refuse to open over unreadable index and consensus state
+
+### Performance
+
+- *(storage)* admit bounds by the way writes move the count
+
+### Testing
+
+- two checks that failed on loaded CI runners
+- *(raft)* wait for leadership before proposing in write-path tests
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

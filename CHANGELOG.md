@@ -1,5 +1,200 @@
 # Changelog
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(index)* carry the peer's proof with a generation's history
+- *(index)* carry index copy proofs through transfers
+- *(index)* guard each local index copy before it serves
+- *(server)* configure the auto-commit re-execution budget
+- *(storage)* store index generations under local installations
+- *(session)* cancel a running statement through its budget
+- *(query)* refuse an unproved index read that would leave the budget
+- *(query)* add a per-statement memory and time budget
+- *(server)* serve index checks and rebuilds over gRPC
+- *(index)* check B-tree indexes against their records and repair them
+- *(config)* make the index feed capacity a setting
+- *(server)* log slow statements
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* repair stored duplicates during a unique build
+- *(schema)* admit index builds as inspectable operations
+- *(index)* label posting codec and lookup catalog record
+- *(vector)* run index searches against the statement budget
+- *(query)* run per-row subqueries under a part of the budget
+- *(query)* charge graph traversal to the statement budget
+- *(storage)* keep exact edge cardinality counts at commit
+- *(core)* count edge cardinality over logical identities
+- *(query)* inspect label scans
+- *(index)* show the label lookup's copy in db.indexCopies
+- *(query)* stop a label scan at the rows a LIMIT keeps
+- *(query)* scan a label from the label lookup
+- *(index)* maintain and provision the built-in label lookup
+- *(index)* show this member's index copies
+- *(query)* account procedure calls and node and document rewrites
+- *(search)* run text index searches against the statement budget
+- *(query)* account shortest paths and counter-answered counts
+- *(query)* count relationship MERGE as accounted work
+- *(query)* charge detaching deletes and trigger bodies to the budget
+- *(query)* charge joins and UNION to the statement budget
+- *(query)* charge UNWIND and aggregation to the statement budget
+- *(storage)* charge staged writes to the statement budget
+- *(cypher)* add REINDEX and index check procedures
+- *(query)* count a label's nodes from its counter
+- *(query)* account rank fusion and document scores
+- *(search)* run encrypted index searches within the statement budget
+- *(query)* charge write operators to the statement budget
+- *(replicate)* fill a generation's replacement from a peer
+- *(storage)* replace a generation's local installation
+- *(migrate)* add the node sizes report module
+- *(migrate)* catalog record migrations, check and journal stats
+- *(migrate)* offline tool to bring a data directory current
+
+### Documentation
+
+- *(cypher)* describe label scans over the label lookup
+
+### Fixed
+
+- *(server)* read the config file without unsafe-libyaml
+- *(server)* carry a session cancel to the leader and charge merges
+- *(search)* keep text statistics to what readers see after a failed write
+- *(query)* leave a build the member cannot take to the leader
+- *(server)* exit when consensus stops on a fatal error
+- *(reads)* reuse the statement schema view
+- *(raft)* fence follower cuts with a closed bound
+- *(query)* search temporal labels at their valid state
+- *(server)* list labels from the counters, under a read lock
+- drop the upgrade path from 0.6 stores
+- *(vector)* mark an index ready only at a build's handover
+- *(storage)* mark a partition capture with the engine format
+- *(core)* key an edge discriminator by its complete value
+- *(query)* a label scan arms no use guard on the lookup's copy
+- *(storage)* refuse a write over a moved index binding as a conflict
+- *(embed)* run an auto-commit statement again after a refused commit
+- *(query)* refuse a duplicate trigger name as an existing object
+- *(index)* bind writes to a definition compaction has settled
+- *(storage)* read a record's latest value at the present
+- *(query)* decide index mark durability in the order of its removal
+- *(query)* store index unfitness when found and lift it only as proved
+- *(query)* keep a member's unfit index copy excluded until proved here
+- *(index)* check a unique entry's holder against its record
+- *(search)* parse the documented text query language
+- *(search)* highlight the words a fuzzy search matched
+- *(search)* match every word a text prefix starts
+- *(embed)* fence the vector freshness watermark at a cut
+- *(embed)* keep a failed index fold out of later releases
+- *(storage)* let a catalog change wait for admitted writers
+- *(query)* stop and join index build executors when a database closes
+- *(storage)* wait for every older transaction in an index build
+- refuse to open over unreadable index and consensus state
+- *(index)* refuse to open over an index catalog record it cannot read
+- *(index)* bind builds and checks to the definition, not a held version
+- *(index)* bind a check's repair to the check its executor holds
+- *(storage)* fold node deltas into a whole write of the same node
+- *(storage)* hide rows a transaction deleted from its scans
+- *(modality)* refuse an unresolved temporal edge type on every write
+- *(index)* stop a check whose generation the index left
+- *(query)* never lift a failed index mark by touching the disk again
+- *(query)* treat an index mark whose removal failed as unknown
+- *(query)* end a vector build at its ready mark
+- *(query)* mark a built vector index ready after its tail fold
+- *(query)* keep the edge discriminator in the query fingerprint
+- *(storage)* bound a Raft generation history by its applied entries
+- *(search)* run a text prefix as a term range
+- *(search)* refuse writes after a lost text-index writer
+- *(search)* carry no fictitious birth time in text documents
+- *(storage)* hold the retention window from the first watermark
+- *(storage)* admit a replacement's writes like any other write
+- *(storage)* announce an applied entry before a reader can see it
+- *(storage)* release commit claims where the writes land
+- *(storage)* flush memtables sealed while the queue was full
+- *(storage)* keep the timeline docs free of private links
+- *(vector)* keep concurrent HNSW inserts apart from their neighbours
+- *(migrate)* find every marked store, Raft snapshot captures too
+
+### Performance
+
+- *(storage)* keep five minutes of MVCC history by default
+- *(cdc)* answer a consumer's progress age without rereading the log
+- *(query)* stream node scans within the statement budget
+- *(query)* reap every TTL target in one read of the shard
+- *(query)* write a top-level SET as a property delta
+- *(storage)* admit bounds by the way writes move the count
+- *(query)* find MERGE and UPSERT patterns through the index
+- *(query)* charge index lookups to the statement budget
+- *(storage)* borrow node bytes during decode
+- *(query)* bound property delta chains with whole writes
+- *(query)* take TTL candidates from a ready anchor index
+- *(query)* pass over other labels' records by their labels
+- *(query)* write a change carrying most of a record whole
+- *(storage)* finish a generation import without flushing
+- *(storage)* hard-link sealed journal segments into checkpoints
+
+### Refactored
+
+- *(schema)* drop the property uniqueness flag and index adoption
+
+### Testing
+
+- pin the statement budget across index repair answers
+- *(server)* drop timing prints from the follower build test
+- *(server)* take cdc raft-tail timestamps from the clock
+- a scoped uniqueness survives a restore and a repair replicates
+- unreadable state refuses the loaders and a replicated member
+- *(cluster)* read recorded checks where they replicate to
+- *(cluster)* a follower checks its own index copy after a crash
+- *(integration)* match the refusal of a directory two formats behind
+- *(index)* check index copies after a server crash only
+- *(integration)* measure the group, not a held write, in version moves
+- *(integration)* ask every member for the voters after restarts
+- *(schema)* cover the refusals of edge identity
+- *(core)* equal starts do not merge independent edge instances
+- *(embed)* a restored store fills its label lookup
+- *(embed)* pin the label postings a write moves
+- *(index)* a mount lookup beside large segments reads only mounts
+- *(index)* label lookup after a crash and across temporal holders
+- *(index)* cover compound checks, deletes and check takeover
+- *(index)* race two writers for a value of a suspect unique index
+- *(index)* measure lookups while an index check repairs
+- *(embed)* hold the node until a single-attempt statement returns
+- *(index)* check partial, sparse, derived and temporal indexes
+- *(embed)* keep the re-execution test beside the executor
+- *(bench)* keep the index wrong for every measured fallback run
+- *(bench)* measure lookups answered by the index and by the records
+- *(embed)* cover reads within the statement budget
+- *(embed)* change a record through the node store in index checks
+- *(search)* cover AS OF after a rebuild and a write the worker cannot fold
+- *(bench)* keep the text history bench's T0 inside the retention window
+- *(index)* index nodes created together under their own ids
+- *(embed)* rank unfolded and own text writes against a fresh index
+- *(schema)* cover type definitions and repair outcomes
+- *(index)* exclude a copy a dead run left guarded from a capture
+- *(index)* cover the edges of index copy transfer
+- *(query)* fail every flush in the index mark fault tests
+- *(storage)* prove a persist after a failed one keeps its write
+- *(query)* bound the repairs a backfill page may make
+- *(query)* cover a suffix collision and suffix exhaustion in duplicate repair
+- two checks that failed on loaded CI runners
+- *(raft)* wait for leadership before proposing in write-path tests
+- *(search)* keep final statistics through segment merge and reopen
+- *(search)* cover refused and zero birth-time reads
+- *(storage)* keep generation-tagged keys out of the round-trip property
+- *(storage)* keep a transaction's view and conflicts across a switch
+- *(storage)* drop a replacement when a Raft snapshot replaces the index
+- *(storage)* cover a replacement's registration, readers and rebuilds
+- *(storage)* cover a replacement against concurrent effects
+- *(storage)* keep each test's doc comment with its test
+- *(storage)* replay kept cardinality counts once after a power cut
+- *(storage)* race edge commits through the whole pipeline
+- *(storage)* first edges into different pairs share an upper bound
+- *(storage)* cover kept counts on every commit path
+
+### Bench
+
+- *(embed)* report text-index resources and recovery
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

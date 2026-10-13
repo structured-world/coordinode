@@ -2,6 +2,49 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(index)* label posting codec and lookup catalog record
+- *(storage)* store index generations under local installations
+- *(vector)* run index searches against the statement budget
+- *(query)* run per-row subqueries under a part of the budget
+- *(query)* charge graph traversal to the statement budget
+- *(session)* cancel a running statement through its budget
+- *(query)* add a per-statement memory and time budget
+- *(index)* check B-tree indexes against their records and repair them
+- *(storage)* keep exact edge cardinality counts at commit
+- *(core)* count edge cardinality over logical identities
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* admit index builds as inspectable operations
+
+### Fixed
+
+- *(storage)* mark a partition capture with the engine format
+- *(server)* carry a session cancel to the leader and charge merges
+- *(raft)* fence follower cuts with a closed bound
+- *(query)* search temporal labels at their valid state
+- *(core)* key an edge discriminator by its complete value
+
+### Performance
+
+- *(query)* stream node scans within the statement budget
+- *(storage)* keep five minutes of MVCC history by default
+- *(query)* reap every TTL target in one read of the shard
+- *(query)* write a top-level SET as a property delta
+- *(storage)* admit bounds by the way writes move the count
+
+### Refactored
+
+- *(schema)* drop the property uniqueness flag and index adoption
+
+### Testing
+
+- *(schema)* cover the refusals of edge identity
+- *(core)* equal starts do not merge independent edge instances
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

@@ -2,6 +2,18 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(vector)* run index searches against the statement budget
+
+### Fixed
+
+- *(vector)* keep concurrent HNSW inserts apart from their neighbours
+- *(embed)* fence the vector freshness watermark at a cut
+- *(query)* mark a built vector index ready after its tail fold
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

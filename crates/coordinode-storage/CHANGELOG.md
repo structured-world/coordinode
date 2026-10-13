@@ -2,6 +2,74 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Added
+
+- *(index)* label posting codec and lookup catalog record
+- *(index)* carry the peer's proof with a generation's history
+- *(index)* carry index copy proofs through transfers
+- *(index)* guard each local index copy before it serves
+- *(replicate)* fill a generation's replacement from a peer
+- *(storage)* replace a generation's local installation
+- *(storage)* store index generations under local installations
+- *(storage)* charge staged writes to the statement budget
+- *(config)* make the index feed capacity a setting
+- *(query)* count a label's nodes from its counter
+- *(storage)* keep exact edge cardinality counts at commit
+- *(core)* count edge cardinality over logical identities
+
+### Fixed
+
+- *(storage)* hold the retention window from the first watermark
+- *(storage)* refuse a write over a moved index binding as a conflict
+- *(storage)* admit a replacement's writes like any other write
+- *(storage)* bound a Raft generation history by its applied entries
+- *(storage)* mark a partition capture with the engine format
+- *(storage)* read a record's latest value at the present
+- *(storage)* announce an applied entry before a reader can see it
+- *(storage)* fold node deltas into a whole write of the same node
+- *(reads)* reuse the statement schema view
+- *(storage)* release commit claims where the writes land
+- *(raft)* fence follower cuts with a closed bound
+- *(query)* search temporal labels at their valid state
+- *(storage)* hide rows a transaction deleted from its scans
+- *(storage)* let a catalog change wait for admitted writers
+- *(server)* list labels from the counters, under a read lock
+- *(storage)* flush memtables sealed while the queue was full
+- *(storage)* wait for every older transaction in an index build
+- drop the upgrade path from 0.6 stores
+- *(storage)* keep the timeline docs free of private links
+- *(index)* refuse to open over an index catalog record it cannot read
+
+### Performance
+
+- *(storage)* finish a generation import without flushing
+- *(query)* stream node scans within the statement budget
+- *(storage)* keep five minutes of MVCC history by default
+- *(query)* bound property delta chains with whole writes
+- *(query)* take TTL candidates from a ready anchor index
+- *(query)* write a top-level SET as a property delta
+- *(storage)* hard-link sealed journal segments into checkpoints
+- *(storage)* borrow node bytes during decode
+- *(storage)* admit bounds by the way writes move the count
+- *(cdc)* answer a consumer's progress age without rereading the log
+
+### Testing
+
+- two checks that failed on loaded CI runners
+- *(storage)* keep generation-tagged keys out of the round-trip property
+- *(storage)* keep a transaction's view and conflicts across a switch
+- *(storage)* drop a replacement when a Raft snapshot replaces the index
+- *(storage)* cover a replacement's registration, readers and rebuilds
+- *(storage)* cover a replacement against concurrent effects
+- *(storage)* keep each test's doc comment with its test
+- *(storage)* prove a persist after a failed one keeps its write
+- *(storage)* replay kept cardinality counts once after a power cut
+- *(storage)* race edge commits through the whole pipeline
+- *(storage)* first edges into different pairs share an upper bound
+- *(storage)* cover kept counts on every commit path
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-13
+
+### Fixed
+
+- *(query)* store index unfitness when found and lift it only as proved
+
+### Testing
+
+- *(storage)* prove a persist after a failed one keeps its write
+
 ## v0.7.0 - 2026-10-06
 
 ### Documentation
