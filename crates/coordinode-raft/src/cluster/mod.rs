@@ -27,6 +27,7 @@ use std::sync::Arc;
 pub use coordinode_core::group::GroupId;
 use coordinode_storage::engine::core::StorageEngine;
 
+use crate::member::MemberNode;
 use crate::proposal::{RaftProposalPipeline, RateLimiter};
 use crate::storage::{
     AppendNotifier, CoordinodeStateMachine, LogStore, TypeConfig, default_raft_config,
@@ -514,7 +515,7 @@ impl RaftNode {
         // On restart: returns NotAllowed (already has state) — expected, skip.
         // Other errors (NotInMembers, Fatal): propagate.
         let mut members = std::collections::BTreeMap::new();
-        members.insert(node_id, openraft::impls::BasicNode::default());
+        members.insert(node_id, MemberNode::default());
 
         match raft.initialize(members).await {
             Ok(_) => {
@@ -702,10 +703,7 @@ impl RaftNode {
 
         // Try initialize — succeeds on fresh, NotAllowed on restart
         let mut members = std::collections::BTreeMap::new();
-        let node_info = openraft::impls::BasicNode {
-            addr: advertise_addr.clone(),
-        };
-        members.insert(node_id, node_info);
+        members.insert(node_id, MemberNode::new(advertise_addr.clone(), None));
 
         match raft.initialize(members).await {
             Ok(_) => {
@@ -891,12 +889,7 @@ impl RaftNode {
 
         // Try initialize — succeeds on fresh start, NotAllowed on restart.
         let mut members = std::collections::BTreeMap::new();
-        members.insert(
-            node_id,
-            openraft::impls::BasicNode {
-                addr: advertise_addr.clone(),
-            },
-        );
+        members.insert(node_id, MemberNode::new(advertise_addr.clone(), None));
 
         match raft.initialize(members).await {
             Ok(_) => {
@@ -1309,7 +1302,7 @@ impl RaftNode {
         self.publish_own_address().await?;
         self.membership_settled().await?;
 
-        let node_info = openraft::impls::BasicNode { addr };
+        let node_info = MemberNode::new(addr, None);
 
         // Add as learner (non-voting, receives log replication)
         let written = self
@@ -1352,12 +1345,7 @@ impl RaftNode {
         }
 
         let mut nodes = std::collections::BTreeMap::new();
-        nodes.insert(
-            self.node_id,
-            openraft::impls::BasicNode {
-                addr: advertise.clone(),
-            },
-        );
+        nodes.insert(self.node_id, MemberNode::new(advertise.clone(), None));
         let written = self
             .raft
             .change_membership(openraft::ChangeMembers::SetNodes(nodes), true)

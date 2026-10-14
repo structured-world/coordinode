@@ -193,11 +193,7 @@ pub struct GrpcNetworkFactory {
 impl RaftNetworkFactory<C> for GrpcNetworkFactory {
     type Network = GrpcNetwork;
 
-    async fn new_client(
-        &mut self,
-        target: u64,
-        node: &openraft::impls::BasicNode,
-    ) -> Self::Network {
+    async fn new_client(&mut self, target: u64, node: &crate::member::MemberNode) -> Self::Network {
         GrpcNetwork {
             group: self.gate.group().raw(),
             local_node_id: self.local_node_id,
@@ -220,7 +216,7 @@ impl RaftNetworkFactory<C> for StubNetworkFactory {
     async fn new_client(
         &mut self,
         _target: u64,
-        _node: &openraft::impls::BasicNode,
+        _node: &crate::member::MemberNode,
     ) -> Self::Network {
         StubNetwork
     }

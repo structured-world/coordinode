@@ -2318,9 +2318,7 @@ async fn shutdown_does_not_wait_out_a_peer_that_never_answers() {
             .raft()
             .add_learner(
                 2,
-                openraft::impls::BasicNode {
-                    addr: format!("http://{hole}"),
-                },
+                coordinode_raft::member::MemberNode::new(format!("http://{hole}"), None),
                 false,
             )
             .await

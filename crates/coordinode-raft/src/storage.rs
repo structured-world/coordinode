@@ -141,7 +141,10 @@ openraft::declare_raft_types!(
     pub TypeConfig:
         D = Request,
         R = Response,
+        Node = MemberNode,
 );
+
+pub use crate::member::MemberNode;
 
 // Type aliases for convenience
 pub type CommittedLeaderId = openraft::vote::leader_id_adv::CommittedLeaderId<u64, u64>;
@@ -150,14 +153,11 @@ pub type LogId = openraft::LogId<CommittedLeaderId>;
 pub type Vote = openraft::impls::Vote<LeaderId>;
 pub type Entry = openraft::impls::Entry<
     CommittedLeaderId,
-    openraft::impls::EntryPayload<Request, u64, openraft::impls::BasicNode>,
+    openraft::impls::EntryPayload<Request, u64, MemberNode>,
 >;
-pub type SnapshotMeta =
-    openraft::storage::SnapshotMeta<CommittedLeaderId, u64, openraft::impls::BasicNode>;
-pub type Snapshot =
-    openraft::storage::Snapshot<CommittedLeaderId, u64, openraft::impls::BasicNode, SnapshotFile>;
-pub type StoredMembership =
-    openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>;
+pub type SnapshotMeta = openraft::storage::SnapshotMeta<CommittedLeaderId, u64, MemberNode>;
+pub type Snapshot = openraft::storage::Snapshot<CommittedLeaderId, u64, MemberNode, SnapshotFile>;
+pub type StoredMembership = openraft::StoredMembership<CommittedLeaderId, u64, MemberNode>;
 
 // ── Key Prefixes ────────────────────────────────────────────────────
 
@@ -674,7 +674,7 @@ impl LogStore {
 
 /// Whether `membership` names `node_id` and at least one other node.
 pub(crate) fn names_beside_another(
-    membership: &openraft::Membership<u64, openraft::impls::BasicNode>,
+    membership: &openraft::Membership<u64, MemberNode>,
     node_id: u64,
 ) -> bool {
     membership.nodes().any(|(id, _)| *id == node_id) && membership.nodes().count() > 1
@@ -1045,8 +1045,7 @@ pub struct CoordinodeStateMachine {
     /// Last applied log id, cached in memory for fast access.
     last_applied: Mutex<Option<openraft::type_config::alias::LogIdOf<TypeConfig>>>,
     /// Last applied membership, cached in memory.
-    last_membership:
-        Mutex<openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>>,
+    last_membership: Mutex<StoredMembership>,
     /// Dedup map: proposal_id → (size, last_seen). Entries older than
     /// `DEDUP_MAX_AGE_SECS` are GC'd periodically. Serial access only
     /// (openraft calls `apply` serially).
@@ -1475,19 +1474,11 @@ impl CoordinodeStateMachine {
     /// The membership the state machine last applied, the initial one when
     /// none was. A stored one that cannot be read or decoded fails the open:
     /// taken as the initial membership, the member would forget its group.
-    fn load_membership(
-        engine: &StorageEngine,
-    ) -> Result<
-        openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>,
-        io::Error,
-    > {
+    fn load_membership(engine: &StorageEngine) -> Result<StoredMembership, io::Error> {
         Ok(load_stored(engine, Partition::Schema, KEY_SM_MEMBERSHIP)?.unwrap_or_default())
     }
 
-    fn save_membership(
-        &self,
-        membership: &openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>,
-    ) -> Result<(), io::Error> {
+    fn save_membership(&self, membership: &StoredMembership) -> Result<(), io::Error> {
         let bytes = rmp_serde::to_vec(membership).map_err(|e| io::Error::other(e.to_string()))?;
         self.engine
             .put(Partition::Schema, KEY_SM_MEMBERSHIP, &bytes)
@@ -1727,7 +1718,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
     ) -> Result<
         (
             Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
-            openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>,
+            StoredMembership,
         ),
         io::Error,
     > {
@@ -2109,7 +2100,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
 /// data itself travels in this binary format, never through the Raft log.
 pub struct CoordinodeSnapshotBuilder {
     last_applied: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
-    last_membership: openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>,
+    last_membership: StoredMembership,
     /// Shared build counter from the owning state machine.
     snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
     /// The store captured at `last_applied`, or why it could not be.

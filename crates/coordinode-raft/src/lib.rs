@@ -1,6 +1,7 @@
 pub mod closure;
 pub mod cluster;
 mod log_sync;
+pub mod member;
 pub mod proposal;
 pub mod read_fence;
 pub mod snapshot;
