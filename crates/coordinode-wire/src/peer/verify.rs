@@ -145,6 +145,11 @@ impl TrustAnchors {
 /// The adapter decides who the chain's holder is, in which issuer scope,
 /// and whether the host's revocation and validity rules still admit it.
 /// It never sees an unverified chain and never replaces verification.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot establish node identities for an embedding host",
+    label = "not a host identity adapter",
+    note = "implement `identify` to map a verified chain to the host's issuer scope and subject"
+)]
 pub trait HostIdentityAdapter: Send + Sync + fmt::Debug {
     /// The node identity of the verified `chain` (leaf first) at `now`.
     ///

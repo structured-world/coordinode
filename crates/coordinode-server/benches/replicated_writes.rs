@@ -35,8 +35,11 @@ use coordinode_storage::engine::config::{
     Durability, EndpointConfig, Media, StorageConfig, SyncMethod, Tier,
 };
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port, serve_member_port};
 use parking_lot::RwLock;
+
+/// The CA the nodes are issued their identities by.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
 
 struct Node {
     db: Arc<RwLock<Database>>,
@@ -44,7 +47,14 @@ struct Node {
     dir: tempfile::TempDir,
 }
 
-async fn open_node(node_id: u64, port: u16, leader: bool, sync: SyncMethod) -> Node {
+/// Open node `node_id` on `port`: founding a group, or joining the one of
+/// the founder given with its port.
+async fn open_node(
+    node_id: u64,
+    port: u16,
+    founder: Option<(&Node, u16)>,
+    sync: SyncMethod,
+) -> Node {
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = Arc::new(TimestampOracle::new());
     let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -56,18 +66,25 @@ async fn open_node(node_id: u64, port: u16, leader: bool, sync: SyncMethod) -> N
     )]);
     config.oplog_sync_method = sync;
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open"));
-    let (raft, raft_handler) = if leader {
-        RaftNode::open_cluster_embedded(
+    let connections = PKI.connections(node_id);
+    let (raft, raft_handler) = match founder {
+        None => RaftNode::open_cluster_embedded(
             node_id,
             Arc::clone(&engine),
-            format!("http://127.0.0.1:{port}"),
+            format!("127.0.0.1:{port}"),
+            connections,
         )
         .await
-        .expect("leader")
-    } else {
-        RaftNode::open_joining_embedded(node_id, Arc::clone(&engine))
-            .await
-            .expect("joining")
+        .expect("leader"),
+        Some((founder, founder_port)) => {
+            let enrollment = founder
+                .raft
+                .enrollment(format!("127.0.0.1:{founder_port}"))
+                .expect("the founder's deployment");
+            RaftNode::open_joining_embedded(node_id, Arc::clone(&engine), connections, enrollment)
+                .await
+                .expect("joining")
+        }
     };
     let raft = Arc::new(raft);
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
@@ -82,15 +99,15 @@ async fn open_node(node_id: u64, port: u16, leader: bool, sync: SyncMethod) -> N
     )
     .with_raft_node(Arc::clone(&raft));
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(RaftServiceServer::new(raft_handler))
-            .add_service(query::cypher_service_server::CypherServiceServer::new(
-                cypher,
-            ))
-            .serve(addr)
-            .await
-    });
+    let context = Arc::clone(raft.connections().expect("peers").context());
+    serve_member_port(
+        addr,
+        &context,
+        tonic::service::Routes::new(RaftServiceServer::new(raft_handler)).add_service(
+            query::cypher_service_server::CypherServiceServer::new(cypher),
+        ),
+    )
+    .await;
     Node { db, raft, dir }
 }
 
@@ -385,9 +402,9 @@ fn main() {
         .expect("runtime");
     runtime.block_on(async {
         let ports = [alloc_port(), alloc_port(), alloc_port()];
-        let n1 = open_node(1, ports[0], true, sync).await;
-        let n2 = open_node(2, ports[1], false, sync).await;
-        let n3 = open_node(3, ports[2], false, sync).await;
+        let n1 = open_node(1, ports[0], None, sync).await;
+        let n2 = open_node(2, ports[1], Some((&n1, ports[0])), sync).await;
+        let n3 = open_node(3, ports[2], Some((&n1, ports[0])), sync).await;
         for _ in 0..150 {
             if n1.raft.is_leader().await {
                 break;
@@ -396,7 +413,7 @@ fn main() {
         }
         for (id, port) in [(2u64, ports[1]), (3, ports[2])] {
             n1.raft
-                .add_node(id, format!("http://127.0.0.1:{port}"))
+                .add_node(id, format!("127.0.0.1:{port}"), PKI.identity(id))
                 .await
                 .expect("add");
         }

@@ -38,14 +38,14 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::{HybridLogicalClock, Timestamp};
-use coordinode_raft::cluster::{RaftNode, nemesis};
+use coordinode_raft::cluster::{Enrollment, RaftNode, nemesis};
 use coordinode_raft::storage::raft_oplog_dirs;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
 use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
 
 /// Hard per-test timeout — a hung election/replication fails fast, never spins.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -55,7 +55,26 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 struct TestNode {
     node: RaftNode,
     engine: Arc<StorageEngine>,
+    /// Where the node listens.
+    port: u16,
     _dir: tempfile::TempDir,
+}
+
+/// The CA the members of a test's group prove their identities under.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
+
+/// The enrollment of a node joining the group `founder` formed.
+fn enroll(founder: &TestNode) -> Enrollment {
+    Enrollment {
+        deployment: founder
+            .node
+            .deployment()
+            .expect("the founder knows its deployment"),
+        authorities: vec![PKI.target(
+            founder.node.node_id(),
+            format!("127.0.0.1:{}", founder.port),
+        )],
+    }
 }
 
 fn engine_at(dir: &std::path::Path) -> Arc<StorageEngine> {
@@ -78,26 +97,35 @@ async fn create_leader(node_id: u64, port: u16) -> TestNode {
         Arc::clone(&engine),
         listen_addr,
         format!("http://127.0.0.1:{port}"),
+        PKI.connections(node_id),
     )
     .await
     .expect("open leader");
     TestNode {
         node,
         engine,
+        port,
         _dir: dir,
     }
 }
 
-async fn create_follower(node_id: u64, port: u16) -> TestNode {
+async fn create_follower(node_id: u64, port: u16, founder: &TestNode) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = engine_at(dir.path());
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let node = RaftNode::open_joining(node_id, Arc::clone(&engine), listen_addr)
-        .await
-        .expect("open joining");
+    let node = RaftNode::open_joining(
+        node_id,
+        Arc::clone(&engine),
+        listen_addr,
+        PKI.connections(node_id),
+        enroll(founder),
+    )
+    .await
+    .expect("open joining");
     TestNode {
         node,
         engine,
+        port,
         _dir: dir,
     }
 }
@@ -105,15 +133,15 @@ async fn create_follower(node_id: u64, port: u16) -> TestNode {
 async fn bootstrap_3_node() -> (TestNode, TestNode, TestNode) {
     let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
     let n1 = create_leader(1, p1).await;
-    let n2 = create_follower(2, p2).await;
-    let n3 = create_follower(3, p3).await;
+    let n2 = create_follower(2, p2, &n1).await;
+    let n3 = create_follower(3, p3, &n1).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
     n1.node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("http://127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .expect("add 2");
     n1.node
-        .add_node(3, format!("http://127.0.0.1:{p3}"))
+        .add_node(3, format!("http://127.0.0.1:{p3}"), PKI.identity(3))
         .await
         .expect("add 3");
     n1.node
@@ -986,16 +1014,28 @@ fn engine_skewed(dir: &std::path::Path, skew_us: u64) -> Arc<StorageEngine> {
     Arc::new(StorageEngine::open_with_oracle(&config, oracle).expect("open skewed engine"))
 }
 
-async fn create_follower_skewed(node_id: u64, port: u16, skew_us: u64) -> TestNode {
+async fn create_follower_skewed(
+    node_id: u64,
+    port: u16,
+    skew_us: u64,
+    founder: &TestNode,
+) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = engine_skewed(dir.path(), skew_us);
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let node = RaftNode::open_joining(node_id, Arc::clone(&engine), listen_addr)
-        .await
-        .expect("open joining");
+    let node = RaftNode::open_joining(
+        node_id,
+        Arc::clone(&engine),
+        listen_addr,
+        PKI.connections(node_id),
+        enroll(founder),
+    )
+    .await
+    .expect("open joining");
     TestNode {
         node,
         engine,
+        port,
         _dir: dir,
     }
 }
@@ -1014,15 +1054,15 @@ async fn linearizable_despite_clock_skew() {
         // 3-node cluster where node 2 runs ~2s ahead of wall clock.
         let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower_skewed(2, p2, 2_000_000).await; // +2s
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower_skewed(2, p2, 2_000_000, &n1).await; // +2s
+        let n3 = create_follower(3, p3, &n1).await;
         tokio::time::sleep(Duration::from_millis(800)).await;
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), PKI.identity(2))
             .await
             .expect("add 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), PKI.identity(3))
             .await
             .expect("add 3");
         n1.node

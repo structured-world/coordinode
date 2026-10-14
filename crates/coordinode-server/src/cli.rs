@@ -126,6 +126,9 @@ pub enum Command {
         node_id: u64,
         /// gRPC address of the new node (host:port). The node must be running.
         node_addr: String,
+        /// The SPIFFE ID the new node proves on the inter-node channel; the
+        /// member is bound to it.
+        node_identity: String,
         /// If set, the new node has pre-seeded data from an offline snapshot backup.
         /// Three-tier recovery skips Tier 3 (full resync) and starts from Tier 1/2.
         pre_seeded: bool,
@@ -329,7 +332,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode verify [--data DIR | --config FILE] [--deep]\n  \
                  coordinode healthcheck [--config FILE] [--ops-addr HOST:PORT] [--timeout-ms N]\n  \
                  coordinode version\n  \
-                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n  \
+                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR --identity SPIFFE_ID [--pre-seeded] [--follow]\n  \
                  coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n",
                 env!("CARGO_PKG_VERSION")
             );
@@ -341,7 +344,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
 /// Parse `coordinode admin <subcommand> ...` arguments.
 ///
 /// Supports:
-/// - `coordinode admin node join --node ADDR --id ID --addr ADDR [--pre-seeded] [--follow]`
+/// - `coordinode admin node join --node ADDR --id ID --addr ADDR --identity SPIFFE_ID [--pre-seeded] [--follow]`
 /// - `coordinode admin node decommission --node ADDR --id ID [--pruning] [--force] [--skip-confirmation]`
 fn parse_admin_args(args: &[String]) -> Command {
     // args[1] = "admin", args[2] should be the admin object
@@ -378,12 +381,23 @@ fn parse_admin_args(args: &[String]) -> Command {
                     std::process::exit(1);
                 }
             };
+            let node_identity = match find_flag(args, "--identity") {
+                Some(i) => i,
+                None => {
+                    eprintln!(
+                        "error: --identity SPIFFE_ID is required for admin node join: the \
+                         identity the new node proves to its peers"
+                    );
+                    std::process::exit(1);
+                }
+            };
             let pre_seeded = args.iter().any(|a| a == "--pre-seeded");
             let follow = args.iter().any(|a| a == "--follow");
             Command::AdminNodeJoin {
                 cluster_addr,
                 node_id,
                 node_addr,
+                node_identity,
                 pre_seeded,
                 follow,
             }
@@ -425,7 +439,7 @@ fn parse_admin_args(args: &[String]) -> Command {
             eprintln!(
                 "coordinode admin: unknown subcommand '{object} {subcommand}'\n\n\
                  Admin commands:\n  \
-                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n  \
+                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR --identity SPIFFE_ID [--pre-seeded] [--follow]\n  \
                  coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n"
             );
             std::process::exit(1);

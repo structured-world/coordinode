@@ -137,8 +137,16 @@ impl SessionServiceTrait for SessionSvc {
     ) -> Result<Response<Self::SessionStream>, Status> {
         // Capture the peer before consuming the request, so the session shows
         // up in introspection tagged with its remote address.
+        // A cluster's shared port reports the address through the peer
+        // listener's own connection info.
         let peer = request
             .remote_addr()
+            .or_else(|| {
+                request
+                    .extensions()
+                    .get::<coordinode_wire::peer::PeerConnectInfo>()
+                    .and_then(|info| info.remote)
+            })
             .map(|a| a.to_string())
             .unwrap_or_default();
         let client = ClientApp::from_metadata(request.metadata());

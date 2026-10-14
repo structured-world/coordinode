@@ -162,6 +162,7 @@ async fn self_decommission_transfers_leadership_off_the_leader() {
             node_id: 2,
             address: n2.member_addr(),
             pre_seeded: false,
+            node_identity: n2.member_identity(),
         })
         .await
         .expect("JoinNode(2) must be accepted");
@@ -172,6 +173,7 @@ async fn self_decommission_transfers_leadership_off_the_leader() {
             node_id: 3,
             address: n3.member_addr(),
             pre_seeded: false,
+            node_identity: n3.member_identity(),
         })
         .await
         .expect("JoinNode(3) must be accepted");
@@ -254,6 +256,7 @@ async fn a_standalone_server_with_data_grows_into_a_cluster() {
             node_id: 2,
             address: n2.member_addr(),
             pre_seeded: false,
+            node_identity: n2.member_identity(),
         })
         .await
         .expect("JoinNode(2) must be accepted");
@@ -334,12 +337,13 @@ async fn a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor() {
     // One membership change at a time: a JoinNode is two of them, so adding
     // both at once collides with the change already in flight.
     let mut leader = n1.cluster_client().await;
-    for (id, address) in [(2u64, n2.member_addr()), (3u64, n3.member_addr())] {
+    for (id, member) in [(2u64, &n2), (3u64, &n3)] {
         leader
             .join_node(JoinNodeRequest {
                 node_id: id,
-                address,
+                address: member.member_addr(),
                 pre_seeded: false,
+                node_identity: member.member_identity(),
             })
             .await
             .unwrap_or_else(|e| panic!("JoinNode({id}) must be accepted: {e}"));
@@ -517,6 +521,7 @@ async fn a_member_restarts_into_its_group_with_its_data() {
                 node_id: id,
                 address: member.member_addr(),
                 pre_seeded: false,
+                node_identity: member.member_identity(),
             })
             .await
             .expect("JoinNode must be accepted");
@@ -658,6 +663,7 @@ async fn a_follower_checks_its_own_index_copy_after_a_crash() {
                 node_id: id,
                 address: member.member_addr(),
                 pre_seeded: false,
+                node_identity: member.member_identity(),
             })
             .await
             .expect("JoinNode must be accepted");
@@ -788,6 +794,7 @@ async fn a_new_leader_never_reissues_a_node_id() {
                 node_id: id,
                 address: member.member_addr(),
                 pre_seeded: false,
+                node_identity: member.member_identity(),
             })
             .await
             .expect("JoinNode must be accepted");
@@ -871,6 +878,7 @@ async fn a_unique_index_holds_across_a_leader_change() {
                 node_id: id,
                 address: member.member_addr(),
                 pre_seeded: false,
+                node_identity: member.member_identity(),
             })
             .await
             .expect("JoinNode must be accepted");
@@ -943,6 +951,7 @@ async fn a_text_index_created_on_the_leader_serves_searches_on_a_follower() {
             node_id: 2,
             address: n2.member_addr(),
             pre_seeded: false,
+            node_identity: n2.member_identity(),
         })
         .await
         .expect("JoinNode(2) must be accepted");
@@ -1016,12 +1025,13 @@ async fn constraints_held_before_the_cluster_bind_every_member_after_a_leader_ch
     let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[n1.port, p3]).await;
     let n3 = CoordinodeProcess::start_cluster_member(3, p3, &[n1.port, p2]).await;
     let mut leader = n1.cluster_client().await;
-    for (id, address) in [(2u64, n2.member_addr()), (3u64, n3.member_addr())] {
+    for (id, member) in [(2u64, &n2), (3u64, &n3)] {
         leader
             .join_node(JoinNodeRequest {
                 node_id: id,
-                address,
+                address: member.member_addr(),
                 pre_seeded: false,
+                node_identity: member.member_identity(),
             })
             .await
             .unwrap_or_else(|e| panic!("JoinNode({id}) must be accepted: {e}"));

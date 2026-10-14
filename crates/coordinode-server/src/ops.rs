@@ -81,6 +81,44 @@ fn respond(
     }
 }
 
+/// Reads the node's credentials and trust again from their files and
+/// publishes them, or says why it kept what it had.
+pub(crate) type ReloadHook = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// Status line, content type and body of a `/reload` request: only a POST
+/// reloads, and a node without anything to reload says so. Whoever reaches
+/// the ops port can ask for it; it reads only the files the configuration
+/// names and publishes them only if they validate, so it grants nothing.
+fn reload_response(
+    method: &str,
+    reload: Option<&ReloadHook>,
+) -> (&'static str, &'static str, String) {
+    match (method, reload) {
+        ("POST", Some(reload)) => match reload() {
+            Ok(()) => (
+                "200 OK",
+                "application/json",
+                r#"{"reloaded":true}"#.to_string(),
+            ),
+            Err(e) => (
+                "500 Internal Server Error",
+                "application/json",
+                serde_json::json!({ "reloaded": false, "error": e }).to_string(),
+            ),
+        },
+        ("POST", None) => (
+            "404 Not Found",
+            "application/json",
+            r#"{"error":"this node has no node identity to reload"}"#.to_string(),
+        ),
+        _ => (
+            "405 Method Not Allowed",
+            "application/json",
+            r#"{"error":"POST to reload"}"#.to_string(),
+        ),
+    }
+}
+
 /// Sets the gauges whose value is only meaningful when sampled, right before
 /// `/metrics` renders them: a scrape samples them, and nothing samples them
 /// between scrapes.
@@ -92,14 +130,15 @@ pub(crate) type VersionView = Arc<dyn Fn() -> String + Send + Sync>;
 /// Start the operational HTTP server on `listener`, bound by the caller at
 /// startup so a busy port fails the start.
 ///
-/// Handles /health, /ready, /metrics, /version; `/ready` follows
-/// `readiness`, `/metrics` runs `sample` first, and `/version` renders
-/// `version`. Runs until the process exits.
+/// Handles /health, /ready, /metrics, /version and `POST /reload`; `/ready`
+/// follows `readiness`, `/metrics` runs `sample` first, `/version` renders
+/// `version`, and `/reload` runs `reload`. Runs until the process exits.
 pub(crate) async fn start_ops_server(
     listener: TcpListener,
     readiness: Readiness,
     sample: SampleGauges,
     version: VersionView,
+    reload: Option<ReloadHook>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Install Prometheus metrics recorder
     let prometheus_handle = PrometheusBuilder::new()
@@ -125,6 +164,7 @@ pub(crate) async fn start_ops_server(
         let handle = prometheus_handle.clone();
         let sample = Arc::clone(&sample);
         let version = Arc::clone(&version);
+        let reload = reload.clone();
         let ready = readiness.get();
 
         tokio::spawn(async move {
@@ -137,21 +177,37 @@ pub(crate) async fn start_ops_server(
             let request = String::from_utf8_lossy(&buf[..n]);
 
             // Parse the HTTP request line
-            let path = request
+            let mut line = request
                 .lines()
                 .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("/");
+                .unwrap_or_default()
+                .split_whitespace();
+            let method = line.next().unwrap_or("GET");
+            let path = line.next().unwrap_or("/");
 
-            let (status, content_type, body) = respond(
-                path,
-                ready,
-                || {
-                    sample();
-                    handle.render()
-                },
-                || version(),
-            );
+            let (status, content_type, body) = if path == "/reload" {
+                // Reading the files blocks; keep it off the runtime.
+                let method = method.to_owned();
+                tokio::task::spawn_blocking(move || reload_response(&method, reload.as_ref()))
+                    .await
+                    .unwrap_or_else(|e| {
+                        (
+                            "500 Internal Server Error",
+                            "application/json",
+                            serde_json::json!({ "error": e.to_string() }).to_string(),
+                        )
+                    })
+            } else {
+                respond(
+                    path,
+                    ready,
+                    || {
+                        sample();
+                        handle.render()
+                    },
+                    || version(),
+                )
+            };
 
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

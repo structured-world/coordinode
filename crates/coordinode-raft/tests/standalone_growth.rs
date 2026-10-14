@@ -14,14 +14,36 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::cluster::{DeploymentId, Enrollment, RaftNode};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
 use openraft::rt::watch::WatchReceiver;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The CA the members of a test's group prove their identities under.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
+
+/// The enrollment of a node joining the group `founder` formed on `port`.
+fn enroll(founder: &RaftNode, port: u16) -> Enrollment {
+    Enrollment {
+        deployment: founder
+            .deployment()
+            .expect("the founder knows its deployment"),
+        authorities: vec![PKI.target(founder.node_id(), format!("127.0.0.1:{port}"))],
+    }
+}
+
+/// An enrollment in a deployment that is not running, for a node that is
+/// refused, or never reached, before it hears from anyone.
+fn enroll_nowhere() -> Enrollment {
+    Enrollment {
+        deployment: DeploymentId([7; 16]),
+        authorities: vec![PKI.target(1, format!("127.0.0.1:{}", alloc_port()))],
+    }
+}
 
 fn open_engine(path: &Path) -> Arc<StorageEngine> {
     Arc::new(
@@ -114,6 +136,7 @@ async fn reopen_on_same_port(node_id: u64, engine: &Arc<StorageEngine>, port: u1
             Arc::clone(engine),
             format!("127.0.0.1:{port}").parse().expect("addr"),
             format!("http://127.0.0.1:{port}"),
+            PKI.connections(node_id),
         )
         .await
         {
@@ -182,6 +205,7 @@ async fn grow_standalone_directory(
         Arc::clone(&e1),
         format!("127.0.0.1:{p1}").parse().expect("addr"),
         format!("http://127.0.0.1:{p1}"),
+        PKI.connections(1),
     )
     .await
     .expect("reopen the standalone directory in cluster mode");
@@ -189,6 +213,8 @@ async fn grow_standalone_directory(
         2,
         Arc::clone(&e2),
         format!("127.0.0.1:{p2}").parse().expect("addr"),
+        PKI.connections(2),
+        enroll(&n1, p1),
     )
     .await
     .expect("open node 2");
@@ -196,15 +222,17 @@ async fn grow_standalone_directory(
         3,
         Arc::clone(&e3),
         format!("127.0.0.1:{p3}").parse().expect("addr"),
+        PKI.connections(3),
+        enroll(&n1, p1),
     )
     .await
     .expect("open node 3");
 
     await_leadership(&n1).await;
-    n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+    n1.add_node(2, format!("http://127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .expect("add node 2");
-    n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+    n1.add_node(3, format!("http://127.0.0.1:{p3}"), PKI.identity(3))
         .await
         .expect("add node 3");
     n1.change_membership(vec![1, 2, 3])
@@ -391,6 +419,8 @@ async fn a_node_holding_data_is_refused_when_it_joins() {
             2,
             Arc::clone(&engine),
             format!("127.0.0.1:{}", alloc_port()).parse().expect("addr"),
+            PKI.connections(2),
+            enroll_nowhere(),
         )
         .await;
         assert!(
@@ -418,6 +448,8 @@ async fn a_node_holding_data_is_refused_when_it_joins() {
             3,
             empty,
             format!("127.0.0.1:{}", alloc_port()).parse().expect("addr"),
+            PKI.connections(3),
+            enroll_nowhere(),
         )
         .await
         .expect("an empty node joins");
@@ -497,6 +529,7 @@ async fn an_embedded_directory_opens_as_the_first_member_of_a_group() {
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("addr"),
             format!("http://127.0.0.1:{p1}"),
+            PKI.connections(1),
         )
         .await
         .expect("open the embedded directory as the first member");
@@ -511,10 +544,12 @@ async fn an_embedded_directory_opens_as_the_first_member_of_a_group() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("addr"),
+            PKI.connections(2),
+            enroll(&n1, p1),
         )
         .await
         .expect("an empty member joins");
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), PKI.identity(2))
             .await
             .expect("add node 2");
         n1.change_membership(vec![1, 2]).await.expect("membership");

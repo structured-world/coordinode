@@ -62,6 +62,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod pki;
+
+pub use pki::{TestPki, serve_member_port};
+
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 

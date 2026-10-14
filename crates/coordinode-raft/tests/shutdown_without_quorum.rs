@@ -7,10 +7,23 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
+
+/// The CA the members of a test's group prove their identities under.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
+
+/// The enrollment of a node joining the group node 1 formed at port `p1`.
+fn enroll(founder: &RaftNode, p1: u16) -> Enrollment {
+    Enrollment {
+        deployment: founder
+            .deployment()
+            .expect("the founder knows its deployment"),
+        authorities: vec![PKI.target(1, format!("127.0.0.1:{p1}"))],
+    }
+}
 
 fn open_engine(path: &std::path::Path) -> Arc<StorageEngine> {
     Arc::new(
@@ -54,6 +67,7 @@ async fn the_last_leader_of_a_group_shuts_down_without_a_quorum() {
             open_engine(d1.path()),
             format!("127.0.0.1:{p1}").parse().expect("addr"),
             format!("http://127.0.0.1:{p1}"),
+            PKI.connections(1),
         )
         .await
         .expect("n1");
@@ -61,6 +75,8 @@ async fn the_last_leader_of_a_group_shuts_down_without_a_quorum() {
             2,
             open_engine(d2.path()),
             format!("127.0.0.1:{p2}").parse().expect("addr"),
+            PKI.connections(2),
+            enroll(&n1, p1),
         )
         .await
         .expect("n2");
@@ -68,15 +84,17 @@ async fn the_last_leader_of_a_group_shuts_down_without_a_quorum() {
             3,
             open_engine(d3.path()),
             format!("127.0.0.1:{p3}").parse().expect("addr"),
+            PKI.connections(3),
+            enroll(&n1, p1),
         )
         .await
         .expect("n3");
 
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), PKI.identity(2))
             .await
             .expect("add 2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), PKI.identity(3))
             .await
             .expect("add 3");
         n1.change_membership(vec![1, 2, 3])
@@ -123,6 +141,7 @@ async fn the_last_member_stops_without_waiting_on_the_group() {
             open_engine(d1.path()),
             format!("127.0.0.1:{p1}").parse().expect("addr"),
             format!("http://127.0.0.1:{p1}"),
+            PKI.connections(1),
         )
         .await
         .expect("n1");
@@ -130,6 +149,8 @@ async fn the_last_member_stops_without_waiting_on_the_group() {
             2,
             open_engine(d2.path()),
             format!("127.0.0.1:{p2}").parse().expect("addr"),
+            PKI.connections(2),
+            enroll(&n1, p1),
         )
         .await
         .expect("n2");
@@ -137,15 +158,17 @@ async fn the_last_member_stops_without_waiting_on_the_group() {
             3,
             open_engine(d3.path()),
             format!("127.0.0.1:{p3}").parse().expect("addr"),
+            PKI.connections(3),
+            enroll(&n1, p1),
         )
         .await
         .expect("n3");
 
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), PKI.identity(2))
             .await
             .expect("add 2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), PKI.identity(3))
             .await
             .expect("add 3");
         n1.change_membership(vec![1, 2, 3])
@@ -187,6 +210,7 @@ async fn asking_a_quorumless_leader_whether_it_leads_returns() {
             open_engine(d1.path()),
             format!("127.0.0.1:{p1}").parse().expect("addr"),
             format!("http://127.0.0.1:{p1}"),
+            PKI.connections(1),
         )
         .await
         .expect("n1");
@@ -194,12 +218,14 @@ async fn asking_a_quorumless_leader_whether_it_leads_returns() {
             2,
             open_engine(d2.path()),
             format!("127.0.0.1:{p2}").parse().expect("addr"),
+            PKI.connections(2),
+            enroll(&n1, p1),
         )
         .await
         .expect("n2");
 
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), PKI.identity(2))
             .await
             .expect("add 2");
         n1.change_membership(vec![1, 2]).await.expect("two voters");

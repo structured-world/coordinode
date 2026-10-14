@@ -24,7 +24,10 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::metadata::node_lease_ceiling;
 use parking_lot::RwLock;
 
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port, serve_member_port};
+
+/// The CA the members are issued their identities by.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
 
 struct Node {
     db: Arc<RwLock<Database>>,
@@ -32,8 +35,9 @@ struct Node {
     _dir: tempfile::TempDir,
 }
 
-/// Open a member and serve its Raft API on `port`.
-async fn open_node(node_id: u64, port: u16, leader: bool) -> Node {
+/// Open a member and serve its Raft API on `port`: the founder of a group,
+/// or a node joining the founder's, which listens on `founder_port`.
+async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -45,18 +49,25 @@ async fn open_node(node_id: u64, port: u16, leader: bool) -> Node {
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
 
-    let (raft, raft_handler) = if leader {
-        RaftNode::open_cluster_embedded(
+    let connections = PKI.connections(node_id);
+    let (raft, raft_handler) = match founder {
+        None => RaftNode::open_cluster_embedded(
             node_id,
             Arc::clone(&engine),
-            format!("http://127.0.0.1:{port}"),
+            format!("127.0.0.1:{port}"),
+            connections,
         )
         .await
-        .unwrap()
-    } else {
-        RaftNode::open_joining_embedded(node_id, Arc::clone(&engine))
-            .await
-            .unwrap()
+        .unwrap(),
+        Some((founder, founder_port)) => {
+            let enrollment = founder
+                .raft
+                .enrollment(format!("127.0.0.1:{founder_port}"))
+                .unwrap();
+            RaftNode::open_joining_embedded(node_id, Arc::clone(&engine), connections, enrollment)
+                .await
+                .unwrap()
+        }
     };
     let raft = Arc::new(raft);
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
@@ -66,12 +77,13 @@ async fn open_node(node_id: u64, port: u16, leader: bool) -> Node {
     ));
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(RaftServiceServer::new(raft_handler))
-            .serve(addr)
-            .await
-    });
+    let context = Arc::clone(raft.connections().unwrap().context());
+    serve_member_port(
+        addr,
+        &context,
+        tonic::service::Routes::new(RaftServiceServer::new(raft_handler)),
+    )
+    .await;
 
     Node {
         db,
@@ -101,14 +113,14 @@ async fn create_on(db: &Arc<RwLock<Database>>) -> u64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_leader_allocates_above_the_restored_identifiers() {
     let ports = [alloc_port(), alloc_port(), alloc_port()];
-    let n1 = open_node(1, ports[0], true).await;
-    let n2 = open_node(2, ports[1], false).await;
-    let _n3 = open_node(3, ports[2], false).await;
+    let n1 = open_node(1, ports[0], None).await;
+    let n2 = open_node(2, ports[1], Some((&n1, ports[0]))).await;
+    let _n3 = open_node(3, ports[2], Some((&n1, ports[0]))).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     for (id, port) in [(2, ports[1]), (3, ports[2])] {
         n1.raft
-            .add_node(id, format!("http://127.0.0.1:{port}"))
+            .add_node(id, format!("127.0.0.1:{port}"), PKI.identity(id))
             .await
             .unwrap();
     }

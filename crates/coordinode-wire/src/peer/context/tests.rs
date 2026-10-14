@@ -1,82 +1,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, SanType,
-};
-use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::server::WebPkiClientVerifier;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
-use crate::peer::{HostIdentity, HostIdentityAdapter, SpiffeId, TrustAnchors};
-
-struct Ca {
-    der: CertificateDer<'static>,
-    issuer: Issuer<'static, KeyPair>,
-}
-
-fn ca() -> Ca {
-    let key = KeyPair::generate().expect("key");
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let der = params.self_signed(&key).expect("ca").der().clone();
-    Ca {
-        der,
-        issuer: Issuer::new(params, key),
-    }
-}
-
-/// A leaf for `sans` (URIs if they start with `spiffe:`, DNS names
-/// otherwise) and its key.
-fn leaf(ca: &Ca, sans: &[&str]) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-    let key = KeyPair::generate().expect("key");
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
-    params.subject_alt_names = sans
-        .iter()
-        .map(|s| {
-            if s.starts_with("spiffe:") {
-                SanType::URI((*s).try_into().expect("uri"))
-            } else {
-                SanType::DnsName((*s).try_into().expect("dns"))
-            }
-        })
-        .collect();
-    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    params.extended_key_usages = vec![
-        ExtendedKeyUsagePurpose::ClientAuth,
-        ExtendedKeyUsagePurpose::ServerAuth,
-    ];
-    let cert = params.signed_by(&key, &ca.issuer).expect("leaf");
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-    (vec![cert.der().clone()], key)
-}
-
-fn provider() -> Arc<CryptoProvider> {
-    crate::tls::rustcrypto_provider()
-}
-
-fn spiffe(domain: &str, ca: &Ca) -> PeerProfile {
-    PeerProfile::Spiffe {
-        bundles: HashMap::from([(
-            domain.to_owned(),
-            TrustAnchors::from_der(std::slice::from_ref(&ca.der)).expect("anchor"),
-        )]),
-    }
-}
-
-fn node(ca: &Ca, id: &str) -> Arc<SecurityContext> {
-    let (chain, key) = leaf(ca, &[id]);
-    Arc::new(SecurityContext::new(provider(), chain, key, spiffe("td.test", ca)).expect("context"))
-}
-
-fn sid(s: &str) -> PeerIdentity {
-    PeerIdentity::Spiffe(SpiffeId::parse(s).expect("id"))
-}
+use crate::peer::test_pki::{Ca, ca, client_with_server_name, leaf, node, provider, sid};
+use crate::peer::{HostIdentity, HostIdentityAdapter, TrustAnchors};
 
 /// One TLS handshake over an in-memory pipe, then one byte each way.
 /// Returns the client-side error, if any, and the leaf the client saw.
@@ -193,71 +124,6 @@ async fn a_node_only_listener_admits_nodes_only() {
         .is_err(),
         "a node-only listener requires a certificate"
     );
-}
-
-fn client_with_server_name(
-    roots: rustls::RootCertStore,
-    identity: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
-) -> ClientConfig {
-    let builder = ClientConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .expect("versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServer));
-    let _ = roots;
-    match identity {
-        Some((chain, key)) => builder.with_client_auth_cert(chain, key).expect("cert"),
-        None => builder.with_no_client_auth(),
-    }
-}
-
-/// A test client that does not check the server: the shared-port cases
-/// test the server's decision about the client only.
-#[derive(Debug)]
-struct AcceptAnyServer;
-
-impl ServerCertVerifier for AcceptAnyServer {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<ServerCertVerified, Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &provider().signature_verification_algorithms,
-        )
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &provider().signature_verification_algorithms,
-        )
-    }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }
 
 /// On a port shared with clients, a client without a certificate and one
@@ -413,6 +279,57 @@ async fn trust_updates_take_effect_and_cannot_orphan_the_node() {
     ));
     b.update_trust(both()).expect("b trusts a.test again");
     dial().await.expect("a's trust was left in place");
+}
+
+/// A CA replaced outright changes the certificate and the trust at once:
+/// neither half validates on its own, the replacement of both does, and
+/// connections made under the old trust are verified again. A replacement
+/// naming another identity leaves everything in place.
+#[tokio::test]
+async fn credentials_and_trust_are_replaced_together() {
+    let old = ca();
+    let new = ca();
+    let only = |ca: &Ca| crate::peer::test_pki::spiffe("td.test", ca);
+    let (chain, key) = leaf(&old, &["spiffe://td.test/a"]);
+    let a = Arc::new(SecurityContext::new(provider(), chain, key, only(&old)).expect("a"));
+    let generation = a.generation();
+
+    let (renewed, renewed_key) = leaf(&new, &["spiffe://td.test/a"]);
+    assert!(
+        a.update_credentials(renewed.clone(), renewed_key).is_err(),
+        "the new certificate is not trusted under the old bundle"
+    );
+    assert!(
+        a.update_trust(only(&new)).is_err(),
+        "the old certificate is not trusted under the new bundle"
+    );
+
+    let (moved, moved_key) = leaf(&new, &["spiffe://td.test/z"]);
+    assert!(matches!(
+        a.replace(moved, moved_key, only(&new)),
+        Err(ContextError::IdentityChanged { .. })
+    ));
+    assert_eq!(
+        a.generation(),
+        generation,
+        "a refused replacement changes nothing"
+    );
+
+    let (renewed, renewed_key) = leaf(&new, &["spiffe://td.test/a"]);
+    a.replace(renewed.clone(), renewed_key, only(&new))
+        .expect("both halves together");
+    assert!(
+        a.generation() > generation,
+        "connections are verified again"
+    );
+    let b = node(&new, "spiffe://td.test/b");
+    let presented = handshake(
+        a.server_config(InboundAuth::NodeOnly).expect("s"),
+        b.client_config(sid("spiffe://td.test/a")).expect("c"),
+    )
+    .await
+    .expect("a peer of the new CA reaches a");
+    assert_eq!(presented, renewed[0]);
 }
 
 /// A host adapter counting the chains it is asked about.

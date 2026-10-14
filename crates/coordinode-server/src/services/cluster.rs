@@ -97,6 +97,19 @@ fn event_to_proto(ev: JoinProgressEvent) -> JoinStatus {
     }
 }
 
+/// The node identity a join names: a SPIFFE ID, compared whole. Required,
+/// since the member is admitted under this identity alone.
+fn node_identity(value: &str) -> Result<coordinode_wire::peer::PeerIdentity, Status> {
+    if value.is_empty() {
+        return Err(Status::invalid_argument(
+            "node_identity is required: the SPIFFE ID the new node proves",
+        ));
+    }
+    coordinode_wire::peer::SpiffeId::parse(value)
+        .map(coordinode_wire::peer::PeerIdentity::Spiffe)
+        .map_err(|e| Status::invalid_argument(format!("node_identity '{value}': {e}")))
+}
+
 fn proto_role(role: NodeRole) -> i32 {
     match role {
         NodeRole::Leader => ProtoNodeRole::Leader as i32,
@@ -144,25 +157,34 @@ impl ClusterService for ClusterServiceImpl {
 
         // Build node list from replication status (leader-only).
         // Falls back to empty list if this node is not the leader.
+        let identity = |id: u64| {
+            self.raft_node
+                .member_identity(id)
+                .map(|identity| identity.to_string())
+                .unwrap_or_default()
+        };
         if let Some(statuses) = self.raft_node.replication_status() {
             for s in statuses {
                 let state = proto_state(&s);
                 nodes.push(ClusterNode {
                     node_id: s.node_id.to_string(),
-                    address: String::new(), // address not tracked in NodeReplicationStatus
+                    address: self.raft_node.node_addr(s.node_id).unwrap_or_default(),
                     role: proto_role(s.role),
                     state,
                     lag_entries: s.lag_entries,
+                    node_identity: identity(s.node_id),
                 });
             }
         } else {
             // Not leader — report self as follower with unknown lag.
+            let id = self.raft_node.node_id();
             nodes.push(ClusterNode {
-                node_id: self.raft_node.node_id().to_string(),
-                address: String::new(),
+                node_id: id.to_string(),
+                address: self.raft_node.node_addr(id).unwrap_or_default(),
                 role: ProtoNodeRole::Follower as i32,
                 state: ProtoNodeState::Healthy as i32,
                 lag_entries: 0,
+                node_identity: identity(id),
             });
         }
 
@@ -170,6 +192,11 @@ impl ClusterService for ClusterServiceImpl {
             nodes,
             leader_id,
             raft_term: term,
+            deployment: self
+                .raft_node
+                .deployment()
+                .map(|d| d.to_string())
+                .unwrap_or_default(),
         }))
     }
 
@@ -183,21 +210,30 @@ impl ClusterService for ClusterServiceImpl {
         let node_id = r.node_id;
         let addr = r.address;
         let pre_seeded = r.pre_seeded;
+        let identity = node_identity(&r.node_identity)?;
 
         tracing::info!(
             node_id,
             addr,
+            identity = %identity,
             pre_seeded,
             "JoinNode: initiating cluster join lifecycle"
         );
 
-        // Step 1: add the node as a learner.
+        // Step 1: add the node as a learner, bound to its identity.
         // This is a Raft proposal and completes quickly. Returns before three-tier
         // recovery starts on the joining node.
         self.raft_node
-            .add_node(node_id, addr.clone())
+            .add_node(node_id, addr.clone(), identity)
             .await
-            .map_err(|e| Status::internal(format!("add_learner failed: {e}")))?;
+            .map_err(|e| match e {
+                // The node or identity it names cannot be bound: the request
+                // is at fault, not the cluster.
+                coordinode_raft::cluster::RaftNodeError::Identity(reason) => {
+                    Status::failed_precondition(reason)
+                }
+                e => Status::internal(format!("add_learner failed: {e}")),
+            })?;
 
         // Create progress broadcast channel (capacity 128 events).
         let (tx, _) = broadcast::channel::<JoinProgressEvent>(128);
@@ -424,13 +460,18 @@ impl ClusterServiceImpl {
             )
         })?;
 
-        // Get peer's gRPC address from openraft membership config.
-        let peer_addr = self.raft_node.node_address(peer_id).ok_or_else(|| {
-            Status::internal(format!(
-                "self-decommission: peer node {peer_id} has no advertise address in membership \
-                 config. Cluster may have been bootstrapped without --addr flags."
-            ))
-        })?;
+        // The peer as the membership records it: where to find it and the
+        // identity it must prove there.
+        let (Some(peer), Some(connections)) = (
+            self.raft_node.member_target(peer_id),
+            self.raft_node.connections(),
+        ) else {
+            return Err(Status::internal(format!(
+                "self-decommission: the membership records no address and identity of peer \
+                 node {peer_id}"
+            )));
+        };
+        let peer_addr = peer.addr.clone();
 
         tracing::info!(
             node_id,
@@ -460,16 +501,11 @@ impl ClusterServiceImpl {
         // Forward DecommissionNode to the new leader (the peer we transferred to).
         // The peer now runs the quorum gate and the membership remove and
         // returns the result.
-        let unreachable = |e: tonic::transport::Error| {
+        let channel = connections.channel(&peer).map_err(|e| {
             Status::unavailable(format!(
-                "self-decommission: could not connect to new leader at {peer_addr}: {e}"
+                "self-decommission: could not dial the new leader at {peer_addr}: {e}"
             ))
-        };
-        let channel = coordinode_wire::peer_endpoint(&peer_addr)
-            .map_err(unreachable)?
-            .connect()
-            .await
-            .map_err(unreachable)?;
+        })?;
         let mut client =
             crate::proto::admin::cluster::cluster_service_client::ClusterServiceClient::new(
                 channel,

@@ -347,6 +347,16 @@ fn decompressing_reader<R: std::io::Read + 'static>(
     }
 }
 
+/// The URI an admin client dials for `addr`: as given when it names a
+/// scheme, plain HTTP/2 otherwise.
+fn client_uri(addr: &str) -> String {
+    if addr.contains("://") {
+        addr.to_owned()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
 /// Execute `coordinode admin node decommission` — connect to a running cluster and
 /// gracefully decommission a node (quorum check, leadership transfer,
 /// membership removal).
@@ -376,7 +386,7 @@ pub(crate) async fn admin_node_decommission(
         std::process::exit(1);
     }
 
-    let endpoint = coordinode_wire::peer_uri(&cluster_addr);
+    let endpoint = client_uri(&cluster_addr);
 
     eprintln!("Connecting to cluster at {endpoint} ...");
 
@@ -426,6 +436,7 @@ pub(crate) async fn admin_node_join(
     cluster_addr: String,
     node_id: u64,
     node_addr: String,
+    node_identity: String,
     pre_seeded: bool,
     follow: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -434,7 +445,7 @@ pub(crate) async fn admin_node_join(
         cluster_service_client::ClusterServiceClient,
     };
 
-    let endpoint = coordinode_wire::peer_uri(&cluster_addr);
+    let endpoint = client_uri(&cluster_addr);
 
     eprintln!("Connecting to cluster at {endpoint} ...");
 
@@ -442,13 +453,14 @@ pub(crate) async fn admin_node_join(
         .await
         .map_err(|e| format!("failed to connect to cluster: {e}"))?;
 
-    eprintln!("Initiating join for node {node_id} at {node_addr} ...");
+    eprintln!("Initiating join for node {node_id} ({node_identity}) at {node_addr} ...");
 
     let resp = client
         .join_node(JoinNodeRequest {
             node_id,
             address: node_addr.clone(),
             pre_seeded,
+            node_identity,
         })
         .await
         .map_err(|e| format!("JoinNode failed: {e}"))?

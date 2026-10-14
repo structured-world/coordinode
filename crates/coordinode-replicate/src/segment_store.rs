@@ -33,8 +33,12 @@ use coordinode_swarm::{
     Freshness, NodeId, PieceEncoding, PieceSource, SourceCandidate, split_segment, swarm_download,
 };
 
+use coordinode_wire::peer::PeerTarget;
+
 use crate::transfer::proto::SegmentDescriptorRef;
-use crate::transfer::{BuiltSegment, GrpcPieceSource, SegmentSink, SegmentSource, SegmentSubject};
+use crate::transfer::{
+    BuiltSegment, GrpcPieceSource, PeerLinks, SegmentSink, SegmentSource, SegmentSubject,
+};
 
 /// One key-value entry of a segment's portable representation.
 type KvEntry = (Vec<u8>, Vec<u8>);
@@ -376,13 +380,13 @@ pub enum DrainError {
     /// Splitting the exported blob into swarm pieces failed.
     #[error("split into pieces: {0}")]
     Pieces(String),
-    /// Could not open the gRPC connection to the peer.
-    #[error("connect to {endpoint}: {source}")]
+    /// The peer's address cannot be dialed.
+    #[error("dial {endpoint}: {source}")]
     Connect {
-        /// The peer endpoint that could not be reached.
+        /// The peer address that could not be dialed.
         endpoint: String,
-        /// The underlying tonic transport error.
-        source: tonic::transport::Error,
+        /// Why it could not be dialed.
+        source: coordinode_wire::peer::DialError,
     },
     /// The transfer stream failed at the transport level.
     #[error("transfer rpc: {0}")]
@@ -399,8 +403,7 @@ pub enum DrainError {
 }
 
 /// Drain (push) the segment described by `descriptor` from `engine` to the
-/// [`SegmentTransferService`](crate::transfer) at `endpoint`
-/// (e.g. `"http://10.0.0.2:7080"`).
+/// [`SegmentTransferService`](crate::transfer) of `peer`, over `links`.
 ///
 /// Reads the segment's key range into a portable blob, splits it into
 /// `piece_size`-byte swarm pieces under `encoding` (the in-flight wire encoding,
@@ -413,12 +416,13 @@ pub enum DrainError {
 /// [`SegmentTransferHandler`](crate::transfer::SegmentTransferHandler).
 ///
 /// # Errors
-/// [`DrainError`] for an export failure, a piece-split failure, a connection
-/// failure, a transport error, or a target rejection.
+/// [`DrainError`] for an export failure, a piece-split failure, an address
+/// that cannot be dialed, a transport error or refusal, or a target rejection.
 pub async fn drain_segment_to_peer(
     engine: &StorageEngine,
     descriptor: &SegmentDescriptor,
-    endpoint: &str,
+    links: &PeerLinks,
+    peer: &PeerTarget,
     piece_size: usize,
     encoding: coordinode_swarm::PieceEncoding,
 ) -> Result<crate::transfer::proto::TransferAck, DrainError> {
@@ -433,17 +437,16 @@ pub async fn drain_segment_to_peer(
     let frames =
         crate::transfer::frames_for(&store, seg).map_err(|e| DrainError::Pieces(e.to_string()))?;
 
-    let ep = coordinode_wire::peer_endpoint(endpoint).map_err(|source| DrainError::Connect {
-        endpoint: endpoint.to_string(),
-        source,
-    })?;
-    let channel = ep.connect().await.map_err(|source| DrainError::Connect {
-        endpoint: endpoint.to_string(),
-        source,
-    })?;
+    let channel = links
+        .connections
+        .channel(peer)
+        .map_err(|source| DrainError::Connect {
+            endpoint: peer.addr.clone(),
+            source,
+        })?;
     let mut client = SegmentTransferServiceClient::new(channel);
     let ack = client
-        .transfer_pieces(futures_util::stream::iter(frames))
+        .transfer_pieces(links.request(futures_util::stream::iter(frames)))
         .await?
         .into_inner();
     if !ack.ok {
@@ -671,7 +674,7 @@ impl SegmentInstaller {
     ///
     /// CE coarse repair: re-fetches the **whole** partition (Merkle page-level
     /// localization is EE). Connects a [`GrpcPieceSource`] to each reachable peer
-    /// (TLS when inter-node TLS is configured), runs the rarest-first,
+    /// over `links`, each expected to prove its identity, runs the rarest-first,
     /// multi-source [`swarm_download`], and installs the reconstructed segment,
     /// replacing the local partition. Peers that are unreachable or do not hold
     /// the segment are skipped; the pull proceeds from whoever answers. Returns
@@ -690,7 +693,8 @@ impl SegmentInstaller {
     /// checksums, every copy stands behind this node, or the install fails.
     pub async fn repair_partition(
         self: &Arc<Self>,
-        peers: &[String],
+        links: &PeerLinks,
+        peers: &[PeerTarget],
         partition: Partition,
         piece_size: usize,
         encoding: PieceEncoding,
@@ -709,7 +713,7 @@ impl SegmentInstaller {
             zstd_level,
             generation: None,
         };
-        Ok(self.pull_until_current(peers, &descriptor).await?.0)
+        Ok(self.pull_until_current(links, peers, &descriptor).await?.0)
     }
 
     /// Fill a local replacement of index `generation` from `peers`: register
@@ -732,7 +736,8 @@ impl SegmentInstaller {
     /// or the import fails.
     pub async fn prepare_generation(
         self: &Arc<Self>,
-        peers: &[String],
+        links: &PeerLinks,
+        peers: &[PeerTarget],
         generation: GenerationId,
         piece_size: usize,
         encoding: PieceEncoding,
@@ -754,7 +759,7 @@ impl SegmentInstaller {
             zstd_level,
             generation: Some(generation.as_raw()),
         };
-        let outcome = self.pull_until_current(peers, &descriptor).await;
+        let outcome = self.pull_until_current(links, peers, &descriptor).await;
         if outcome.is_err() {
             let engine = Arc::clone(&self.engine);
             // The replacement is unreferenced: dropping it is the cleanup,
@@ -773,13 +778,14 @@ impl SegmentInstaller {
     /// bytes installed and the proof a history carried.
     async fn pull_until_current(
         self: &Arc<Self>,
-        peers: &[String],
+        links: &PeerLinks,
+        peers: &[PeerTarget],
         descriptor: &SegmentDescriptorRef,
     ) -> Result<(usize, Option<Vec<u8>>), RepairError> {
         let mut backoff = REPAIR_BACKOFF;
         let mut attempt = 1;
         loop {
-            match self.pull_and_install(peers, descriptor).await {
+            match self.pull_and_install(links, peers, descriptor).await {
                 Err(RepairError::Behind(reason)) if attempt < REPAIR_ATTEMPTS => {
                     tracing::debug!(segment = descriptor.segment_id, %reason, attempt, "copy behind; pulling again");
                     tokio::time::sleep(backoff).await;
@@ -795,18 +801,13 @@ impl SegmentInstaller {
     /// success.
     async fn pull_and_install(
         self: &Arc<Self>,
-        peers: &[String],
+        links: &PeerLinks,
+        peers: &[PeerTarget],
         descriptor: &SegmentDescriptorRef,
     ) -> Result<(usize, Option<Vec<u8>>), RepairError> {
         let mut sources: Vec<GrpcPieceSource> = Vec::new();
         let mut manifest = None;
-        for (i, endpoint) in peers.iter().enumerate() {
-            let Ok(ep) = coordinode_wire::peer_endpoint(endpoint) else {
-                continue;
-            };
-            let Ok(channel) = ep.connect().await else {
-                continue;
-            };
+        for (i, peer) in peers.iter().enumerate() {
             // node id within the transfer mesh: peer index + 1 (0 is local).
             let node = NodeId(i as u64 + 1);
             let candidate = SourceCandidate {
@@ -817,8 +818,10 @@ impl SegmentInstaller {
                 tit_for_tat: 1.0,
                 freshness: Freshness::Verified,
             };
+            // A peer that cannot be dialed, refuses this node or does not hold
+            // the segment is skipped; the pull proceeds from whoever answers.
             if let Ok((source, m)) =
-                GrpcPieceSource::connect(node, channel, descriptor.clone(), candidate).await
+                GrpcPieceSource::connect(node, links, peer, descriptor.clone(), candidate).await
             {
                 // A peer at another position built other bytes; its pieces
                 // would fail the chosen manifest's checksums.

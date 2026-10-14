@@ -2937,7 +2937,8 @@ impl StorageEngine {
                     MetadataCommand::RegisterFields { .. } => DictionaryChange::Extended,
                     MetadataCommand::AdoptFields { .. } => DictionaryChange::Replaced,
                     MetadataCommand::GrantNodeLease { .. }
-                    | MetadataCommand::RecordGroupPair { .. } => DictionaryChange::None,
+                    | MetadataCommand::RecordGroupPair { .. }
+                    | MetadataCommand::RecordDeployment { .. } => DictionaryChange::None,
                 };
             }
             effects.extend(decided_effects);

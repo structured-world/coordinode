@@ -86,7 +86,7 @@ Key flags:
 | `--addr` | `[::]:7080` | gRPC listen address |
 | `--ops-addr` | `[::]:7084` | Health + metrics endpoint |
 | `--data` | `./data` | Data directory |
-| `--peers` | (none) | Peer addresses for cluster mode |
+| `--peers` | (none) | Peer addresses for cluster mode; the node then needs a [node identity](configuration.md#node-identity) |
 
 See [Configuration](/guide/configuration) for the full flag and environment reference, the packaged config file, and the open-file-descriptor limit.
 

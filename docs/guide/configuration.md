@@ -64,14 +64,14 @@ apply when neither the config file nor a flag sets the value.
 | `--addr` | `[::]:7080` | gRPC listen address. Carries the native API and inter-node Raft RPCs. A port already in use fails the start before storage is opened; so does a busy `--rest-addr` or `--ops-addr`. |
 | `--advertise-addr` | same as `--addr` | Address other nodes use to reach this node. Set it when `--addr` binds `0.0.0.0` or `[::]` so peers learn the real host/IP. |
 | `--rest-addr` | `[::]:7081` | REST/JSON listen address. Present only when built with the `rest-proxy` feature. A port already in use fails the start. Pass port `0` for an ephemeral port. |
-| `--ops-addr` | `[::]:7084` | Operational HTTP address for `/metrics`, `/health` (200 while the process runs) and `/ready` (200 while the gRPC server serves; 503 while starting and from the shutdown signal on). Consensus that stops on a fatal error, such as a failed log write or sync, shuts the process down with a non-zero exit status: after a failed sync the unsynced pages may already be gone, so the node does not carry on; its supervisor restarts it and recovery replays the durable state, which holds every acknowledged write. Run the server under a supervisor that restarts it (`restart: unless-stopped` in Compose, `Restart=on-failure` in systemd). A port already in use fails the start, so a health check on this port can never be answered by another process. Pass port `0` to let the OS assign an ephemeral port (handy in tests). |
+| `--ops-addr` | `[::]:7084` | Operational HTTP address for `/metrics`, `/health` (200 while the process runs), `/ready` (200 while the gRPC server serves; 503 while starting and from the shutdown signal on) and `POST /reload` (reads a cluster member's node identity files again, see [Node identity](#node-identity)). Consensus that stops on a fatal error, such as a failed log write or sync, shuts the process down with a non-zero exit status: after a failed sync the unsynced pages may already be gone, so the node does not carry on; its supervisor restarts it and recovery replays the durable state, which holds every acknowledged write. Run the server under a supervisor that restarts it (`restart: unless-stopped` in Compose, `Restart=on-failure` in systemd). A port already in use fails the start, so a health check on this port can never be answered by another process. Pass port `0` to let the OS assign an ephemeral port (handy in tests). |
 | `--pg-addr` | (disabled) | PostgreSQL wire-protocol listen address (for example `127.0.0.1:7085`). Unset = the Postgres frontend is off. Serves SQL over the Postgres Simple Query protocol with trust authentication (no password), so bind it to a trusted interface only. |
 | `--data` | `./data` | Data directory. Holds the storage engine state. |
-| `--peers` | (none) | Comma-separated peer addresses, for example `node2:7080,node3:7080`. Presence enables Raft consensus. |
+| `--peers` | (none) | Comma-separated peer addresses, for example `node2:7080,node3:7080`. Presence enables Raft consensus, and then the node needs a `node_identity` (see [Node identity](#node-identity)). |
 | `--nofile` | hard limit | Open-file-descriptor soft limit requested at startup. Unset raises the soft limit to the hard limit. Unix only. |
-| `--tls-cert` / `--tls-key` | (none) | PEM paths to the node's TLS certificate and private key. Set both to serve inter-node + client gRPC over TLS (pure-Rust crypto, no C FFI); unset = plaintext (single-host dev). |
-| `--tls-ca` | (none) | PEM path to the CA that verifies peer certificates — trusted by clients to verify the server, and (with `--tls-require-client-auth`) by the server to verify connecting nodes. |
-| `--tls-require-client-auth` | `false` | Require and verify a client certificate (mutual TLS) on incoming connections. Needs `--tls-ca`. |
+| `--tls-cert` / `--tls-key` | (none) | PEM paths to a standalone server's TLS certificate and private key. Set both to serve client gRPC over TLS (pure-Rust crypto, no C FFI); unset = plaintext (single-host dev). Refused with `--peers`: a cluster member's port presents its `node_identity` certificate to clients too. |
+| `--tls-ca` | (none) | PEM path to the CA that issues client certificates. The server verifies a client certificate against it; with `--peers`, a client may connect presenting none unless `--tls-require-client-auth` is set. Nodes are never verified against it: they prove their node identity. |
+| `--tls-require-client-auth` | `false` | Require and verify a client certificate (mutual TLS) on incoming client connections, and refuse plain text. Needs `--tls-ca`. |
 
 ### Config-file-only settings (no CLI flag)
 
@@ -166,14 +166,68 @@ Running the stock build, leave the table out.
 
 ### TLS trust and self-signed certificates
 
-There is no "skip verification" switch: whenever TLS is on, the peer certificate
-is always verified against `--tls-ca`, which is the trust root. For a cluster,
-issue every node certificate from one internal CA and point `--tls-ca` at that
-CA on every node (`--tls-require-client-auth` then gives node-to-node mutual
-TLS). For a single self-signed certificate, point `--tls-ca` at the certificate
-itself: a self-signed cert is its own trust anchor. If you want no certificate
-management at all, leave TLS off (the default) and serve plaintext on a trusted
-network, rather than running TLS without verification.
+There is no "skip verification" switch: a client certificate is always verified
+against `--tls-ca`, which is the trust root. For a single self-signed server
+certificate, clients point their trust at the certificate itself: a self-signed
+cert is its own trust anchor. If you want no certificate management on a
+standalone server, leave client TLS off (the default) and serve plaintext on a
+trusted network, rather than running TLS without verification.
+
+### Node identity
+
+Members of a cluster authenticate each other on every connection, in both
+directions, with node identities: X.509-SVIDs, certificates carrying exactly one
+SPIFFE ID (`spiffe://trust-domain/path`) as a URI name. A member is bound to its
+SPIFFE ID when it joins, and its peers admit it under that identity alone, only
+as the member it is bound to and only in the roles it holds. An address says
+where to find a member, never who it is. There is no plain-text peer channel and
+no setting that turns verification off.
+
+A node with `--peers` needs a `node_identity` section (config file only):
+
+```yaml
+node_identity:
+  # The node's certificate chain, leaf first, and its key (PEM).
+  cert: /etc/coordinode/identity/node.crt
+  key: /etc/coordinode/identity/node.key
+  # Per SPIFFE trust domain, the CA certificates (PEM) that issue its
+  # identities. A peer is trusted only under its own domain's bundle.
+  trust_bundles:
+    prod.example: /etc/coordinode/identity/bundle.pem
+  # Joining nodes only: the deployment they join, as the first member's
+  # cluster status (or its startup log line "deployment") reports it, and
+  # the members they learn the membership from, each with its identity.
+  # deployment: 9f0c2e7a5b1d4c3e8a6f0b2d4e6a8c0e
+  # enroll_from:
+  #   - addr: node1:7080
+  #     identity: spiffe://prod.example/db/node1
+```
+
+The SPIFFE path is the operator's choice; nothing about its layout is assumed.
+Give each member its own identity: two members proving one identity cannot be
+told apart, and the second is refused. The first member of a cluster leaves
+`deployment` unset; it records a fresh deployment identity when its group forms
+(a standalone server records one on its first start). A node configured with a
+deployment its store does not belong to refuses to start and names both.
+
+The gRPC port serves clients and nodes alike and presents the node certificate
+to both; give the certificate the DNS names clients verify the server by, as
+X.509-SVIDs may carry. A connection is a node's only when its certificate proves
+a node identity; every inter-node service (consensus, version handshake, segment
+transfer) refuses any other connection before reading what it sent, while the
+client services accept clients as `--tls-ca` and `--tls-require-client-auth`
+say: in plain text unless client certificates are required. A client
+certificate never counts as a node identity, even one from the same CA.
+
+Renewed certificates and changed trust bundles take effect without a restart:
+write the new files in place and send the process `SIGHUP` (Unix) or `POST
+/reload` to its ops port (every platform). The files are read and validated as
+a whole first; a set that does not validate (a key that does not match, a
+certificate no bundle trusts, another identity than the node has) is refused,
+logged, and the last valid set stays in force. Connections made under trust that
+was withdrawn, or with a certificate that expired, stop carrying traffic. A new
+identity is a new member, not a renewal: a node that left the cluster joins
+again under a new identity, its old one stays refused.
 
 Single-node start:
 
@@ -181,13 +235,13 @@ Single-node start:
 coordinode serve --data /var/lib/coordinode
 ```
 
-Three-node cluster (run on each host, adjusting `--node-id`, `--addr`, and the
-peer list):
+Three-node cluster (run on each host, adjusting `--node-id`, `--addr`, the peer
+list and the identity files in the config file):
 
 ```bash
-coordinode serve --node-id 1 --addr 0.0.0.0:7080 \
-  --advertise-addr node1:7080 --peers node2:7080,node3:7080 \
-  --data /var/lib/coordinode
+coordinode serve --config /etc/coordinode/coordinode.conf --node-id 1 \
+  --addr 0.0.0.0:7080 --advertise-addr node1:7080 \
+  --peers node2:7080,node3:7080 --data /var/lib/coordinode
 ```
 
 ## Environment variables
@@ -216,7 +270,7 @@ Environment=COORDINODE_LOG_FORMAT=json
 |------|----------|---------|
 | 7080 | gRPC | Native API and inter-node Raft |
 | 7081 | HTTP/REST | JSON transcoding (with the `rest-proxy` feature) |
-| 7084 | HTTP | `/metrics`, `/health`, `/ready` |
+| 7084 | HTTP | `/metrics`, `/health`, `/ready`, `/version`, `POST /reload` |
 | 7085 | PostgreSQL wire | SQL over the Postgres protocol (opt-in via `--pg-addr`; trust auth) |
 
 Bind the ops address to loopback in production and scrape it through a reverse
@@ -326,11 +380,18 @@ autocommit_retry_backoff_ms: 2
 # Inter-node gRPC transport zstd level for wire traffic.
 wire_compression_level: 3
 
-# Inter-node + client gRPC TLS (PEM paths). Unset = plaintext.
-# tls_cert: /etc/coordinode/tls/node.crt
-# tls_key: /etc/coordinode/tls/node.key
-# tls_ca: /etc/coordinode/tls/ca.crt
+# Client gRPC TLS of a standalone server (PEM paths). Unset = plaintext.
+# tls_cert: /etc/coordinode/tls/server.crt
+# tls_key: /etc/coordinode/tls/server.key
+# tls_ca: /etc/coordinode/tls/client-ca.crt
 # tls_require_client_auth: false
+
+# A cluster member's node identity (required with peers).
+# node_identity:
+#   cert: /etc/coordinode/identity/node.crt
+#   key: /etc/coordinode/identity/node.key
+#   trust_bundles:
+#     prod.example: /etc/coordinode/identity/bundle.pem
 
 # Background integrity scrub (per-node, verifies on-disk block checksums).
 scrub_enabled: false
@@ -701,7 +762,7 @@ ignored. `healthcheck` opens nothing: it asks a running server.
 | `coordinode verify` | (none) | `--config FILE` (multi-endpoint); `--deep` for full-page checksum verification |
 | `coordinode version` | (none) | Print version and exit |
 | `coordinode healthcheck` | (none) | Exit 0 when a running server answers `/ready` with 200, 1 otherwise. Probes the server's `ops_addr`: the built-in default (`[::]:7084`), else the one in `--config FILE`, else `--ops-addr HOST:PORT`, which overrides both. A wildcard address (`[::]`, `0.0.0.0`) is probed on this host's loopback, IPv6 and IPv4. `--timeout-ms N` (default 2000) bounds the connect and the answer. Opens no storage; meant for container health checks |
-| `coordinode admin node join` | `--node ADDR --id ID --addr ADDR` | `--pre-seeded`, `--follow` |
+| `coordinode admin node join` | `--node ADDR --id ID --addr ADDR --identity SPIFFE_ID` | `--pre-seeded`, `--follow` |
 | `coordinode admin node decommission` | `--node ADDR --id ID` | `--pruning`, `--force`, `--skip-confirmation` |
 
 Run `coordinode` with no recognized subcommand to print the full usage summary.
@@ -745,22 +806,25 @@ type and every version of a temporal node under its own discriminator or
 A single machine that already holds data becomes a replicated cluster in
 place, without export or import.
 
-1. Stop the standalone server and start it again as the first member, naming
-   the members to come: `coordinode serve --node-id 1 --advertise-addr
-   node1:7080 --peers node2:7080,node3:7080 --data /var/lib/coordinode`. What
-   it holds becomes the group's starting state.
-2. Start each new machine as a member with an **empty** data directory:
-   `coordinode serve --node-id 2 --peers node1:7080,node3:7080 --data ...`.
-3. Add the members from the first one, one at a time:
-   `coordinode admin node join --node node1:7080 --id 2 --addr node2:7080`,
-   then the same for node 3. A member joins as a learner, receives the
-   group's state, and is promoted to a voter once it has caught up. A
-   member that has not answered yet is never promoted, and the cluster
-   status shows it as `DOWN` until it does.
+1. Stop the standalone server and start it again as the first member, with its
+   [node identity](#node-identity) and naming the members to come:
+   `coordinode serve --config ... --node-id 1 --advertise-addr node1:7080
+   --peers node2:7080,node3:7080 --data /var/lib/coordinode`. What it holds
+   becomes the group's starting state, and it logs its deployment.
+2. Start each new machine as a member with an **empty** data directory and a
+   node identity naming that deployment and the first member to enroll from:
+   `coordinode serve --config ... --node-id 2 --peers node1:7080,node3:7080
+   --data ...`.
+3. Add the members from the first one, one at a time, each with the identity
+   it proves: `coordinode admin node join --node node1:7080 --id 2 --addr
+   node2:7080 --identity spiffe://prod.example/db/node2`, then the same for
+   node 3. A member joins as a learner, receives the group's state, and is
+   promoted to a voter once it has caught up. A member that has not answered
+   yet is never promoted, and the cluster status shows it as `DOWN` until it
+   does.
 
-Member addresses are given as `host:port`. Members dial them over TLS when
-inter-node TLS is configured and in plain text otherwise; an address that
-names its scheme (`http://` or `https://`) is used as given.
+Member addresses are given as `host:port`. Members dial them over mutually
+authenticated TLS, expecting the identity the member is bound to.
 
 Only the member a group is formed around brings data into it. A machine that
 still holds data of its own is refused when it starts as a joiner, and the

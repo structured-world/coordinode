@@ -1,36 +1,24 @@
-//! Inter-node TLS / mTLS configuration (rustls).
+//! TLS crypto provider selection and PEM loading.
 //!
-//! Builds rustls server and client configs for the inter-node wire from PEM
-//! certificate material, with optional mutual TLS. The crypto provider is
-//! chosen once at startup: the stock server picks the pure-Rust
-//! [`rustls_rustcrypto`] one (no C FFI), and a downstream distribution
-//! may select another, `aws-lc-rs` being the reason the seam exists.
-//!
-//! The wire itself runs tonic's own TLS, which builds its rustls configs
-//! from rustls' process default provider: [`install_crypto_provider`] makes
-//! the selection that default, and [`crate::set_wire_client_tls`] installs
-//! the selected provider (the pure-Rust one unless something was selected)
-//! when no default exists yet, so a process that dials peers without having
-//! run the server's startup still negotiates with the selected provider
-//! rather than with whichever backend a dependency's features enabled. The
-//! builders here pin the selected provider explicitly via `*_with_provider`.
-//!
-//! Encryption is server-cert TLS on the shared `:7080` listener (covers
-//! client-to-server and intra-cluster TLS); mutual TLS is opt-in — pass a client
-//! CA to [`server_config`] (server then requires + verifies a peer cert) and a
-//! client identity to [`client_config`].
+//! The crypto provider is chosen once at startup: the stock server picks
+//! the pure-Rust [`rustls_rustcrypto`] one (no C FFI), and a downstream
+//! distribution may select another, `aws-lc-rs` being the reason the seam
+//! exists. [`install_crypto_provider`] also makes the selection rustls'
+//! process default, so a dependency that builds its own TLS configuration
+//! (tonic's client-facing TLS) agrees with the inter-node wire.
 
 use std::sync::{Arc, OnceLock};
 
 use rustls::pki_types::pem::{Error as PemError, PemObject};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 /// Re-exported so a caller naming a provider is guaranteed to be naming this
 /// crate's rustls, not a second copy resolved elsewhere in the tree.
 pub use rustls::crypto::CryptoProvider;
+/// Re-exported for the same reason: what [`load_certs`] and
+/// [`load_private_key`] return.
+pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-/// Errors building a TLS config from PEM material.
+/// Errors loading PEM certificate material.
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
     /// A PEM certificate or key block failed to parse.
@@ -44,24 +32,18 @@ pub enum TlsError {
     /// No private key found in the supplied PEM.
     #[error("no private key in PEM")]
     NoKey,
-    /// rustls rejected the config (bad cert/key pairing, etc.).
-    #[error("rustls: {0}")]
-    Rustls(#[from] rustls::Error),
-    /// The mTLS client-certificate verifier could not be built.
-    #[error("client verifier: {0}")]
-    Verifier(String),
 }
 
 /// The pure-Rust crypto provider: RustCrypto algorithms, zero C FFI.
 ///
 /// What the stock server selects, and the fallback whenever nothing was
-/// selected before the first TLS config was built.
+/// selected.
 #[must_use]
 pub fn rustcrypto_provider() -> Arc<CryptoProvider> {
     Arc::new(rustls_rustcrypto::provider())
 }
 
-/// The provider every TLS config on this wire is built with.
+/// The provider selected for this process.
 static SELECTED: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
 
 /// Select the crypto provider for this process and install it as rustls'
@@ -80,18 +62,11 @@ pub fn install_crypto_provider(provider: Arc<CryptoProvider>) -> bool {
 }
 
 /// The selected provider, falling back to the pure-Rust one when startup
-/// selected nothing (a unit test building a config directly, say).
-fn provider() -> Arc<CryptoProvider> {
+/// selected nothing (an embedding host or a test building a context
+/// directly, say).
+#[must_use]
+pub fn selected_provider() -> Arc<CryptoProvider> {
     SELECTED.get_or_init(rustcrypto_provider).clone()
-}
-
-/// Make the selected provider rustls' process default unless one is already
-/// installed, so a TLS config built from the default (tonic's) uses it.
-pub(crate) fn ensure_default_provider() {
-    if CryptoProvider::get_default().is_none() {
-        // A concurrent installer may win the race; either way a default exists.
-        let _ = provider().as_ref().clone().install_default();
-    }
 }
 
 /// Parse one or more PEM certificates into DER.
@@ -121,82 +96,31 @@ pub fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> 
     })
 }
 
-/// Build a [`RootCertStore`] from PEM CA certificates.
+/// A verifier of ordinary client certificates issued by `roots`, on the
+/// selected provider, for a port shared with clients. With `mandatory`
+/// false a client may also connect without one.
 ///
 /// # Errors
-/// [`TlsError::Pem`] if a CA cert cannot be decoded, [`TlsError::Rustls`] if
-/// rustls rejects one.
-pub fn root_store(ca_pem: &[u8]) -> Result<RootCertStore, TlsError> {
-    let mut roots = RootCertStore::empty();
-    for cert in load_certs(ca_pem)? {
-        roots.add(cert)?;
+///
+/// A root is not a usable trust anchor, or none is given.
+pub fn client_verifier(
+    roots: Vec<CertificateDer<'static>>,
+    mandatory: bool,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, String> {
+    let mut store = rustls::RootCertStore::empty();
+    for root in roots {
+        store.add(root).map_err(|e| e.to_string())?;
     }
-    Ok(roots)
-}
-
-/// Build a server TLS config: present `cert_pem`/`key_pem`. When `client_ca_pem`
-/// is `Some`, require and verify a client certificate against that CA (mTLS);
-/// when `None`, accept any client (server-cert TLS only).
-///
-/// # Errors
-/// [`TlsError`] on a PEM parse failure, a cert/key mismatch, or a verifier-build
-/// failure.
-pub fn server_config(
-    cert_pem: &[u8],
-    key_pem: &[u8],
-    client_ca_pem: Option<&[u8]>,
-) -> Result<ServerConfig, TlsError> {
-    let certs = load_certs(cert_pem)?;
-    let key = load_private_key(key_pem)?;
-    let provider = provider();
-
-    let builder = ServerConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(TlsError::Rustls)?;
-
-    let config = match client_ca_pem {
-        Some(ca) => {
-            let roots = Arc::new(root_store(ca)?);
-            let verifier =
-                rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider)
-                    .build()
-                    .map_err(|e| TlsError::Verifier(e.to_string()))?;
-            builder
-                .with_client_cert_verifier(verifier)
-                .with_single_cert(certs, key)?
-        }
-        None => builder.with_no_client_auth().with_single_cert(certs, key)?,
+    let builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(store),
+        selected_provider(),
+    );
+    let builder = if mandatory {
+        builder
+    } else {
+        builder.allow_unauthenticated()
     };
-    Ok(config)
-}
-
-/// Build a client TLS config trusting `root_ca_pem`. When `client_identity` is
-/// `Some((cert_pem, key_pem))`, present that certificate for mTLS; when `None`,
-/// connect without a client certificate.
-///
-/// # Errors
-/// [`TlsError`] on a PEM parse failure or a cert/key mismatch.
-pub fn client_config(
-    root_ca_pem: &[u8],
-    client_identity: Option<(&[u8], &[u8])>,
-) -> Result<ClientConfig, TlsError> {
-    let roots = root_store(root_ca_pem)?;
-    let provider = provider();
-
-    let builder = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(TlsError::Rustls)?
-        .with_root_certificates(roots);
-
-    let config = match client_identity {
-        Some((cert_pem, key_pem)) => {
-            let certs = load_certs(cert_pem)?;
-            let key = load_private_key(key_pem)?;
-            builder.with_client_auth_cert(certs, key)?
-        }
-        None => builder.with_no_client_auth(),
-    };
-    Ok(config)
+    builder.build().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

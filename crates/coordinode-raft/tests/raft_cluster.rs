@@ -16,21 +16,59 @@ use coordinode_core::txn::proposal::{
     RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::{GroupId, NodeOptions, RaftNode, RaftNodeError};
+use coordinode_raft::cluster::{
+    Enrollment, GroupId, NodeOptions, PeerConnections, RaftNode, RaftNodeError,
+};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::metadata::{field_frontier, load_field_dictionary};
 use coordinode_storage::engine::partition::Partition;
+use coordinode_wire::peer::PeerIdentity;
 use openraft::async_runtime::watch::WatchReceiver as _;
 
 /// Hard timeout for cluster tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
+
+/// The CA the members of a test's group prove their identities under.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
+
+/// The connections of node `node_id`, under a fresh certificate of its
+/// identity.
+fn conn(node_id: u64) -> Arc<PeerConnections> {
+    PKI.connections(node_id)
+}
+
+/// The node identity of node `node_id`.
+fn ident(node_id: u64) -> PeerIdentity {
+    PKI.identity(node_id)
+}
+
+/// The enrollment of a node joining the group `founder` formed, the
+/// founder being reached at `addr`.
+fn enroll(founder: &RaftNode, addr: impl Into<String>) -> Enrollment {
+    Enrollment {
+        deployment: founder
+            .deployment()
+            .expect("the founder knows its deployment"),
+        authorities: vec![PKI.target(founder.node_id(), addr)],
+    }
+}
+
+/// [`NodeOptions`] of node `node_id`, with its connections.
+fn options(node_id: u64) -> NodeOptions {
+    NodeOptions {
+        connections: Some(conn(node_id)),
+        ..NodeOptions::default()
+    }
+}
 
 struct TestNode {
     node: RaftNode,
     engine: Arc<StorageEngine>,
+    /// Where the node is reached.
+    addr: String,
     _dir: tempfile::TempDir,
 }
 
@@ -48,19 +86,27 @@ async fn create_leader(node_id: u64, port: u16) -> TestNode {
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let advertise_addr = format!("http://127.0.0.1:{port}");
 
-    let node = RaftNode::open_cluster(node_id, Arc::clone(&engine), listen_addr, advertise_addr)
-        .await
-        .expect("open leader node");
+    let node = RaftNode::open_cluster(
+        node_id,
+        Arc::clone(&engine),
+        listen_addr,
+        advertise_addr.clone(),
+        conn(node_id),
+    )
+    .await
+    .expect("open leader node");
 
     TestNode {
         node,
         engine,
+        addr: advertise_addr,
         _dir: dir,
     }
 }
 
 /// Create a JOINING node — does NOT call initialize(), waits for leader.
-async fn create_follower(node_id: u64, port: u16) -> TestNode {
+/// It is enrolled in the group `founder` formed.
+async fn create_follower(node_id: u64, port: u16, founder: &TestNode) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -72,13 +118,20 @@ async fn create_follower(node_id: u64, port: u16) -> TestNode {
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
 
-    let node = RaftNode::open_joining(node_id, Arc::clone(&engine), listen_addr)
-        .await
-        .expect("open joining node");
+    let node = RaftNode::open_joining(
+        node_id,
+        Arc::clone(&engine),
+        listen_addr,
+        conn(node_id),
+        enroll(&founder.node, founder.addr.clone()),
+    )
+    .await
+    .expect("open joining node");
 
     TestNode {
         node,
         engine,
+        addr: format!("http://127.0.0.1:{port}"),
         _dir: dir,
     }
 }
@@ -101,8 +154,8 @@ async fn cluster_3_node_bootstrap() {
         // Node 1: leader (initializes cluster)
         // Nodes 2, 3: joining (wait for leader to add them)
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower(2, p2, &n1).await;
+        let n3 = create_follower(3, p3, &n1).await;
 
         // Wait for node 1 to become leader
         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -110,11 +163,11 @@ async fn cluster_3_node_bootstrap() {
 
         // Add nodes 2 and 3 as learners
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add node 3");
 
@@ -205,11 +258,11 @@ async fn a_member_added_by_host_and_port_receives_the_log() {
         let p1 = alloc_port();
         let p2 = alloc_port();
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
+        let n2 = create_follower(2, p2, &n1).await;
         await_leadership(&n1.node).await;
 
         n1.node
-            .add_node(2, format!("127.0.0.1:{p2}"))
+            .add_node(2, format!("127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add 2");
         n1.node
@@ -301,18 +354,18 @@ async fn bootstrap_3_node() -> (TestNode, TestNode, TestNode, u16, u16, u16) {
     let p3 = alloc_port();
 
     let n1 = create_leader(1, p1).await;
-    let n2 = create_follower(2, p2).await;
-    let n3 = create_follower(3, p3).await;
+    let n2 = create_follower(2, p2, &n1).await;
+    let n3 = create_follower(3, p3, &n1).await;
 
     // Membership changes go through the leader, so there has to be one first.
     await_leadership(&n1.node).await;
 
     n1.node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
         .await
         .expect("add 2");
     n1.node
-        .add_node(3, format!("http://127.0.0.1:{p3}"))
+        .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
         .await
         .expect("add 3");
     n1.node
@@ -991,6 +1044,7 @@ async fn cluster_crash_recovery() {
                 Arc::clone(&e1),
                 format!("127.0.0.1:{p1}").parse().expect("a"),
                 format!("http://127.0.0.1:{p1}"),
+                conn(1),
             )
             .await
             .expect("n1");
@@ -998,6 +1052,8 @@ async fn cluster_crash_recovery() {
                 2,
                 Arc::clone(&e2),
                 format!("127.0.0.1:{p2}").parse().expect("a"),
+                conn(2),
+                enroll(&n1, format!("127.0.0.1:{p1}")),
             )
             .await
             .expect("n2");
@@ -1005,6 +1061,8 @@ async fn cluster_crash_recovery() {
                 3,
                 Arc::clone(&e3),
                 format!("127.0.0.1:{p3}").parse().expect("a"),
+                conn(3),
+                enroll(&n1, format!("127.0.0.1:{p1}")),
             )
             .await
             .expect("n3");
@@ -1013,10 +1071,10 @@ async fn cluster_crash_recovery() {
             // Calling it before one exists blocks until the test's own timeout,
             // which reads as a hang rather than as an election that took a moment.
             await_leadership(&n1).await;
-            n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+            n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
                 .await
                 .expect("add 2");
-            n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+            n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
                 .await
                 .expect("add 3");
             n1.change_membership(vec![1, 2, 3])
@@ -1096,12 +1154,14 @@ async fn cluster_crash_recovery() {
                 .expect("reopen 3"),
             );
 
-            // Reopen with SAME ports so membership addresses match
+            // Reopen with SAME ports so membership addresses match. Each node
+            // proves its identity under a fresh certificate, as after renewal.
             let n1 = RaftNode::open_cluster(
                 1,
                 Arc::clone(&e1),
                 format!("127.0.0.1:{p1}").parse().expect("a"),
                 format!("http://127.0.0.1:{p1}"),
+                conn(1),
             )
             .await
             .expect("reopen n1");
@@ -1110,6 +1170,7 @@ async fn cluster_crash_recovery() {
                 Arc::clone(&e2),
                 format!("127.0.0.1:{p2}").parse().expect("a"),
                 format!("http://127.0.0.1:{p2}"),
+                conn(2),
             )
             .await
             .expect("reopen n2");
@@ -1118,6 +1179,7 @@ async fn cluster_crash_recovery() {
                 Arc::clone(&e3),
                 format!("127.0.0.1:{p3}").parse().expect("a"),
                 format!("http://127.0.0.1:{p3}"),
+                conn(3),
             )
             .await
             .expect("reopen n3");
@@ -1474,7 +1536,7 @@ async fn cluster_background_snapshot_trigger() {
             format!("http://127.0.0.1:{p1}"),
             NodeOptions {
                 snapshots: snap_config,
-                ..Default::default()
+                ..options(1)
             },
         )
         .await
@@ -1555,7 +1617,7 @@ async fn a_log_grown_past_its_size_threshold_is_snapshotted() {
                     log_bytes: 64 * 1024,
                     min_interval: Duration::ZERO,
                 },
-                ..Default::default()
+                ..options(1)
             },
         )
         .await
@@ -1637,7 +1699,7 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
             format!("http://127.0.0.1:{p1}"),
             NodeOptions {
                 snapshots: snap_config,
-                ..Default::default()
+                ..options(1)
             },
         )
         .await
@@ -1768,7 +1830,7 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
             format!("http://127.0.0.1:{p1}"),
             NodeOptions {
                 snapshots: snap_config,
-                ..Default::default()
+                ..options(1)
             },
         )
         .await
@@ -1831,6 +1893,8 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("joining node");
@@ -1840,7 +1904,7 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
         // Calling it before one exists blocks until the test's own timeout,
         // which reads as a hang rather than as an election that took a moment.
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
 
@@ -1982,7 +2046,7 @@ async fn a_snapshot_carries_the_sealed_index_inventory() {
                     log_bytes: u64::MAX,
                     ..Default::default()
                 },
-                ..Default::default()
+                ..options(1)
             },
         )
         .await
@@ -2021,10 +2085,12 @@ async fn a_snapshot_carries_the_sealed_index_inventory() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("joining node");
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         await_condition(
@@ -2082,7 +2148,7 @@ async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
     let result = tokio::time::timeout(Duration::from_secs(60), async {
         let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
+        let n2 = create_follower(2, p2, &n1).await;
         let dir3 = tempfile::tempdir().expect("d3");
         let open3 = || {
             Arc::new(
@@ -2101,17 +2167,19 @@ async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
             3,
             Arc::clone(&e3),
             format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1.node, n1.addr.clone()),
         )
         .await
         .expect("n3");
 
         await_leadership(&n1.node).await;
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add3");
         n1.node
@@ -2191,6 +2259,7 @@ async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
                 Arc::clone(&e3),
                 format!("127.0.0.1:{p3}").parse().expect("a"),
                 format!("http://127.0.0.1:{p3}"),
+                conn(3),
             )
             .await
             {
@@ -2246,16 +2315,16 @@ async fn shutdown_hands_leadership_to_a_live_voter() {
     let result = tokio::time::timeout(Duration::from_secs(90), async {
         let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower(2, p2, &n1).await;
+        let n3 = create_follower(3, p3, &n1).await;
 
         await_leadership(&n1.node).await;
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add 3");
         n1.node
@@ -2313,12 +2382,16 @@ async fn shutdown_does_not_wait_out_a_peer_that_never_answers() {
 
         let n1 = create_leader(1, alloc_port()).await;
         await_leadership(&n1.node).await;
-        // Not blocking: the learner never catches up.
+        // Not blocking: the learner never catches up. Its connection stalls
+        // in the TLS handshake the hole never answers.
         n1.node
             .raft()
             .add_learner(
                 2,
-                coordinode_raft::member::MemberNode::new(format!("http://{hole}"), None),
+                coordinode_raft::member::MemberNode::new(
+                    format!("http://{hole}"),
+                    Some(coordinode_raft::member::MemberIdentity::from(&ident(2))),
+                ),
                 false,
             )
             .await
@@ -2329,7 +2402,9 @@ async fn shutdown_does_not_wait_out_a_peer_that_never_answers() {
         let started = tokio::time::Instant::now();
         n1.node.shutdown().await.expect("shutdown");
         let took = started.elapsed();
-        let TestNode { node, engine, _dir } = n1;
+        let TestNode {
+            node, engine, _dir, ..
+        } = n1;
         drop(node);
 
         assert_eq!(
@@ -2376,10 +2451,12 @@ async fn append_stream_to_stopped_node_ends_with_an_error() {
             )]))
             .expect("open"),
         );
+        let connections = conn(1);
         let (node, handler) = RaftNode::open_cluster_embedded(
             1,
             Arc::clone(&engine),
             "http://127.0.0.1:1".to_string(),
+            Arc::clone(&connections),
         )
         .await
         .expect("open node");
@@ -2387,21 +2464,32 @@ async fn append_stream_to_stopped_node_ends_with_an_error() {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local addr");
+        let incoming = coordinode_wire::peer::incoming(
+            listener,
+            connections.context(),
+            coordinode_wire::peer::Accept {
+                inbound: coordinode_wire::peer::InboundAuth::NodeOnly,
+                plaintext_clients: false,
+            },
+        )
+        .expect("listener");
         let server = tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(RaftServiceServer::new(handler))
-                .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+                .serve_with_incoming(incoming),
         );
 
-        // A peer of the same version: a call without a record is refused
-        // before the stream opens, which is not what this test is about.
-        let mut record = node.version().local_handshake();
-        record.node_id = 2;
+        // The group's only voter speaking for itself, at its own version
+        // and deployment: a call admission refuses would be refused before
+        // the stream opens, which is not what this test is about.
+        let record = node.version().local_handshake();
+        let deployment = node.deployment().expect("a deployment");
         node.shutdown().await.expect("shutdown");
 
-        let mut client = RaftServiceClient::connect(format!("http://{addr}"))
-            .await
-            .expect("connect");
+        let channel = conn(1)
+            .channel(&PKI.target(1, addr.to_string()))
+            .expect("channel");
+        let mut client = RaftServiceClient::new(channel);
         let request = openraft::raft::AppendEntriesRequest::<TypeConfig> {
             vote: openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, 1),
             prev_log_id: None,
@@ -2414,6 +2502,10 @@ async fn append_stream_to_stopped_node_ends_with_an_error() {
         };
         let mut request = tonic::Request::new(futures_util::stream::iter([payload]));
         coordinode_raft::cluster::version::write_handshake(request.metadata_mut(), &record);
+        request.metadata_mut().insert_bin(
+            coordinode_raft::cluster::DEPLOYMENT_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_bytes(deployment.as_bytes()),
+        );
         let mut replies = client
             .stream_append(request)
             .await
@@ -2475,7 +2567,7 @@ async fn cluster_snapshot_multi_chunk_transfer() {
             format!("http://127.0.0.1:{p1}"),
             NodeOptions {
                 snapshots: snap_config,
-                ..Default::default()
+                ..options(1)
             },
         )
         .await
@@ -2561,6 +2653,8 @@ async fn cluster_snapshot_multi_chunk_transfer() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("joining node");
@@ -2569,7 +2663,7 @@ async fn cluster_snapshot_multi_chunk_transfer() {
         // Calling it before one exists blocks until the test's own timeout,
         // which reads as a hang rather than as an election that took a moment.
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
 
@@ -2667,6 +2761,7 @@ async fn cluster_follower_restart_reconnection() {
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
+            conn(1),
         )
         .await
         .expect("n1");
@@ -2674,6 +2769,8 @@ async fn cluster_follower_restart_reconnection() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n2");
@@ -2681,6 +2778,8 @@ async fn cluster_follower_restart_reconnection() {
             3,
             Arc::clone(&e3),
             format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n3");
@@ -2689,10 +2788,10 @@ async fn cluster_follower_restart_reconnection() {
         // Calling it before one exists blocks until the test's own timeout,
         // which reads as a hang rather than as an election that took a moment.
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add3");
         n1.change_membership(vec![1, 2, 3])
@@ -2764,6 +2863,7 @@ async fn cluster_follower_restart_reconnection() {
                     Arc::clone(&e3_new),
                     format!("127.0.0.1:{p3}").parse().expect("a"),
                     format!("http://127.0.0.1:{p3}"),
+                    conn(3),
                 )
                 .await
                 {
@@ -2903,6 +3003,7 @@ async fn cluster_graceful_leader_transfer() {
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
+            conn(1),
         )
         .await
         .expect("n1");
@@ -2912,6 +3013,8 @@ async fn cluster_graceful_leader_transfer() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n2");
@@ -2919,6 +3022,8 @@ async fn cluster_graceful_leader_transfer() {
             3,
             Arc::clone(&e3),
             format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n3");
@@ -2927,10 +3032,10 @@ async fn cluster_graceful_leader_transfer() {
         // Calling it before one exists blocks until the test's own timeout,
         // which reads as a hang rather than as an election that took a moment.
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add n2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add n3");
         n1.change_membership(vec![1, 2, 3])
@@ -3050,6 +3155,7 @@ async fn a_transfer_to_a_stopped_member_reports_the_timeout() {
             Arc::clone(&engines[0]),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
+            conn(1),
         )
         .await
         .expect("n1");
@@ -3057,6 +3163,8 @@ async fn a_transfer_to_a_stopped_member_reports_the_timeout() {
             2,
             Arc::clone(&engines[1]),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n2");
@@ -3064,14 +3172,16 @@ async fn a_transfer_to_a_stopped_member_reports_the_timeout() {
             3,
             Arc::clone(&engines[2]),
             format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n3");
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add n2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add n3");
         n1.change_membership(vec![1, 2, 3])
@@ -3108,16 +3218,16 @@ async fn a_transfer_by_a_leader_without_its_quorum_reports_the_timeout() {
     let result = tokio::time::timeout(Duration::from_secs(60), async {
         let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower(2, p2, &n1).await;
+        let n3 = create_follower(3, p3, &n1).await;
 
         await_leadership(&n1.node).await;
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add 3");
         n1.node
@@ -3203,6 +3313,7 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
+            conn(1),
         )
         .await
         .expect("n1");
@@ -3212,6 +3323,8 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n2");
@@ -3219,6 +3332,8 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
             3,
             Arc::clone(&e3),
             format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n3");
@@ -3227,10 +3342,10 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
         // Calling it before one exists blocks until the test's own timeout,
         // which reads as a hang rather than as an election that took a moment.
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add n2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add n3");
         n1.change_membership(vec![1, 2, 3])
@@ -3307,7 +3422,7 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
             format!("http://127.0.0.1:{p1}"),
             NodeOptions {
                 snapshots: snap_config,
-                ..Default::default()
+                ..options(1)
             },
         )
         .await
@@ -3379,6 +3494,8 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("joining");
@@ -3387,7 +3504,7 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         // Calling it before one exists blocks until the test's own timeout,
         // which reads as a hang rather than as an election that took a moment.
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add n2");
         // ── Verify: new node has ALL pre-snapshot AND post-snapshot data ──
@@ -3483,6 +3600,7 @@ async fn cluster_replication_status_tracking() {
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
+            conn(1),
         )
         .await
         .expect("n1");
@@ -3492,6 +3610,8 @@ async fn cluster_replication_status_tracking() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n2");
@@ -3499,6 +3619,8 @@ async fn cluster_replication_status_tracking() {
             3,
             Arc::clone(&e3),
             format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n3");
@@ -3507,10 +3629,10 @@ async fn cluster_replication_status_tracking() {
         // Calling it before one exists blocks until the test's own timeout,
         // which reads as a hang rather than as an election that took a moment.
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add n2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add n3");
         n1.change_membership(vec![1, 2, 3])
@@ -3667,6 +3789,7 @@ async fn cluster_read_concern_levels() {
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
+            conn(1),
         )
         .await
         .expect("n1");
@@ -3676,6 +3799,8 @@ async fn cluster_read_concern_levels() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n2");
@@ -3683,6 +3808,8 @@ async fn cluster_read_concern_levels() {
             3,
             Arc::clone(&e3),
             format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n3");
@@ -3691,10 +3818,10 @@ async fn cluster_read_concern_levels() {
         // Calling it before one exists blocks until the test's own timeout,
         // which reads as a hang rather than as an election that took a moment.
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add n2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add n3");
         n1.change_membership(vec![1, 2, 3])
@@ -3828,6 +3955,7 @@ async fn cluster_write_concern_w0_vs_majority() {
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
+            conn(1),
         )
         .await
         .expect("n1");
@@ -3837,6 +3965,8 @@ async fn cluster_write_concern_w0_vs_majority() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n2");
@@ -3844,6 +3974,8 @@ async fn cluster_write_concern_w0_vs_majority() {
             3,
             Arc::clone(&e3),
             format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n3");
@@ -3852,10 +3984,10 @@ async fn cluster_write_concern_w0_vs_majority() {
         // Calling it before one exists blocks until the test's own timeout,
         // which reads as a hang rather than as an election that took a moment.
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add n2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add n3");
         n1.change_membership(vec![1, 2, 3])
@@ -3981,6 +4113,7 @@ async fn cluster_write_concern_acks_counts_members() {
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
+            conn(1),
         )
         .await
         .expect("n1");
@@ -3989,6 +4122,8 @@ async fn cluster_write_concern_acks_counts_members() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n2");
@@ -3996,15 +4131,17 @@ async fn cluster_write_concern_acks_counts_members() {
             3,
             Arc::clone(&e3),
             format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("n3");
 
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add n2");
-        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add n3");
         n1.change_membership(vec![1, 2, 3])
@@ -4144,14 +4281,14 @@ async fn cluster_join_monitor_and_promote() {
         let p2 = alloc_port();
 
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
+        let n2 = create_follower(2, p2, &n1).await;
 
         // Wait for leader election
         await_leadership(&n1.node).await;
 
         // Step 1: add node 2 as Learner
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add_node");
 
@@ -4238,7 +4375,7 @@ async fn a_learner_that_never_answered_is_not_promoted() {
         await_leadership(&n1.node).await;
         // Nothing listens on this port: the learner never answers.
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{}", alloc_port()))
+            .add_node(2, format!("http://127.0.0.1:{}", alloc_port()), ident(2))
             .await
             .expect("add_node");
 
@@ -4298,7 +4435,7 @@ async fn a_join_that_cannot_catch_up_fails_at_the_configured_timeout() {
         assert_eq!(n1.node.join_readiness_lag(), 5);
 
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{}", alloc_port()))
+            .add_node(2, format!("http://127.0.0.1:{}", alloc_port()), ident(2))
             .await
             .expect("add_node");
         let (tx, mut rx) = tokio::sync::broadcast::channel(64);
@@ -4334,10 +4471,10 @@ async fn the_last_voter_shuts_down_after_its_peer_is_gone() {
         let p1 = alloc_port();
         let p2 = alloc_port();
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
+        let n2 = create_follower(2, p2, &n1).await;
         await_leadership(&n1.node).await;
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
@@ -4377,13 +4514,13 @@ async fn decommission_quorum_gate_blocks_2_node_cluster() {
         let p2 = alloc_port();
 
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
+        let n2 = create_follower(2, p2, &n1).await;
 
         await_leadership(&n1.node).await;
 
         // Add node 2 as voter.
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
@@ -4436,18 +4573,18 @@ async fn decommission_follower_succeeds_in_3_node_cluster() {
         let p3 = alloc_port();
 
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower(2, p2, &n1).await;
+        let n3 = create_follower(3, p3, &n1).await;
 
         await_leadership(&n1.node).await;
 
         // Build 3-node cluster.
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add node 3");
         n1.node
@@ -4510,16 +4647,16 @@ async fn decommission_right_after_a_promotion_waits_for_it() {
         let p3 = alloc_port();
 
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower(2, p2, &n1).await;
+        let n3 = create_follower(3, p3, &n1).await;
         await_leadership(&n1.node).await;
 
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add node 3");
 
@@ -4572,15 +4709,15 @@ async fn the_last_member_shuts_down_after_the_others_are_gone() {
         let p3 = alloc_port();
 
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower(2, p2, &n1).await;
+        let n3 = create_follower(3, p3, &n1).await;
         await_leadership(&n1.node).await;
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add node 3");
         n1.node
@@ -4634,15 +4771,15 @@ async fn a_change_behind_one_that_cannot_commit_is_refused_after_its_wait() {
         let p3 = alloc_port();
 
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower(2, p2, &n1).await;
+        let n3 = create_follower(3, p3, &n1).await;
         await_leadership(&n1.node).await;
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add node 3");
         n1.node
@@ -4723,17 +4860,17 @@ async fn decommission_non_voter_fails() {
         let p3 = alloc_port();
 
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower(2, p2, &n1).await;
+        let n3 = create_follower(3, p3, &n1).await;
 
         await_leadership(&n1.node).await;
 
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add node 3");
         n1.node
@@ -4781,12 +4918,12 @@ async fn decommission_force_skips_quorum_gate() {
         let p2 = alloc_port();
 
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
+        let n2 = create_follower(2, p2, &n1).await;
 
         await_leadership(&n1.node).await;
 
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
@@ -4847,17 +4984,17 @@ async fn decommission_pruning_flag_sets_operator_cleanup_required() {
         let p3 = alloc_port();
 
         let n1 = create_leader(1, p1).await;
-        let n2 = create_follower(2, p2).await;
-        let n3 = create_follower(3, p3).await;
+        let n2 = create_follower(2, p2, &n1).await;
+        let n3 = create_follower(3, p3, &n1).await;
 
         await_leadership(&n1.node).await;
 
         n1.node
-            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add node 2");
         n1.node
-            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
             .await
             .expect("add node 3");
         n1.node
@@ -4980,7 +5117,8 @@ async fn open_cluster_rejects_busy_port() {
     )]);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
 
-    let result = RaftNode::open_cluster(1, engine, addr, format!("http://127.0.0.1:{port}")).await;
+    let result =
+        RaftNode::open_cluster(1, engine, addr, format!("http://127.0.0.1:{port}"), conn(1)).await;
     assert!(
         result.is_err(),
         "open_cluster on a busy port must fail eagerly instead of starting a deaf node"
@@ -5185,7 +5323,7 @@ async fn a_member_bootstrapped_from_a_snapshot_continues_the_dictionary() {
                     log_bytes: u64::MAX,
                     ..Default::default()
                 },
-                ..Default::default()
+                ..options(1)
             },
         )
         .await
@@ -5214,10 +5352,12 @@ async fn a_member_bootstrapped_from_a_snapshot_continues_the_dictionary() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("joining");
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add n2");
 
@@ -5506,24 +5646,34 @@ struct Clocked {
 
 /// Open member `id` over `dir` on `port`: the first member of a new group
 /// initialises it, a restarted member resumes, any other one waits to be
-/// added. A port freed by a stopped member may be taken by another test for
-/// a moment, so the bind is retried.
-async fn open_clocked(id: u64, dir: &std::path::Path, port: u16, joining: bool) -> Clocked {
+/// added, enrolled as `joining` says. A port freed by a stopped member may
+/// be taken by another test for a moment, so the bind is retried.
+async fn open_clocked(
+    id: u64,
+    dir: &std::path::Path,
+    port: u16,
+    joining: Option<Enrollment>,
+) -> Clocked {
     let (engine, oracle) = clocked_engine(dir);
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let mut opened = None;
     let mut last = None;
     for _ in 0..20 {
-        let attempt = if joining {
-            RaftNode::open_joining(id, Arc::clone(&engine), addr).await
-        } else {
-            RaftNode::open_cluster(
-                id,
-                Arc::clone(&engine),
-                addr,
-                format!("http://127.0.0.1:{port}"),
-            )
-            .await
+        let attempt = match &joining {
+            Some(enrollment) => {
+                RaftNode::open_joining(id, Arc::clone(&engine), addr, conn(id), enrollment.clone())
+                    .await
+            }
+            None => {
+                RaftNode::open_cluster(
+                    id,
+                    Arc::clone(&engine),
+                    addr,
+                    format!("http://127.0.0.1:{port}"),
+                    conn(id),
+                )
+                .await
+            }
         };
         match attempt {
             Ok(node) => {
@@ -5548,16 +5698,19 @@ async fn open_clocked(id: u64, dir: &std::path::Path, port: u16, joining: bool) 
 
 /// A group of one member per directory, the first leading.
 async fn clocked_group(dirs: &[tempfile::TempDir]) -> Vec<Clocked> {
-    let mut members = Vec::new();
+    let mut members: Vec<Clocked> = Vec::new();
     for (i, dir) in dirs.iter().enumerate() {
         let id = i as u64 + 1;
-        members.push(open_clocked(id, dir.path(), alloc_port(), i > 0).await);
+        let joining = members
+            .first()
+            .map(|founder| enroll(&founder.node, format!("127.0.0.1:{}", founder.port)));
+        members.push(open_clocked(id, dir.path(), alloc_port(), joining).await);
     }
     await_leadership(&members[0].node).await;
     for m in &members[1..] {
         members[0]
             .node
-            .add_node(m.id, format!("http://127.0.0.1:{}", m.port))
+            .add_node(m.id, format!("http://127.0.0.1:{}", m.port), ident(m.id))
             .await
             .expect("add member");
     }
@@ -5755,11 +5908,11 @@ async fn a_write_whose_answer_is_lost_is_settled_the_same_everywhere() {
         await_closed_past(&members, first, "every member closes past the first write").await;
 
         // The leader loses its quorum, takes a write into its log alone,
-        // and stops before anyone answers.
+        // and stops before anyone answers. The partition comes first so the
+        // write lands while the leader still leads: stopping the followers
+        // first takes long enough for its lease to lapse.
         let ports: Vec<u16> = members.iter().map(|m| m.port).collect();
-        for m in members.drain(1..) {
-            m.node.shutdown().await.expect("stop a follower");
-        }
+        coordinode_raft::cluster::nemesis::isolate(1, &[2, 3]);
         let appended = members[0]
             .node
             .raft()
@@ -5790,10 +5943,14 @@ async fn a_write_whose_answer_is_lost_is_settled_the_same_everywhere() {
             outcome.is_err() && !is_refusal(&outcome),
             "a write in the log with no answer is neither confirmed nor refused: {outcome:?}"
         );
+        for m in members.drain(..) {
+            m.node.shutdown().await.expect("stop a follower");
+        }
+        coordinode_raft::cluster::nemesis::heal();
 
         let mut members = Vec::new();
         for (i, dir) in dirs.iter().enumerate() {
-            members.push(open_clocked(i as u64 + 1, dir.path(), ports[i], false).await);
+            members.push(open_clocked(i as u64 + 1, dir.path(), ports[i], None).await);
         }
         let leader = await_ready_leader(&members).await;
         let after = propose_held(
@@ -5880,7 +6037,7 @@ async fn a_snapshot_carries_the_closed_bound_across_install_and_restart() {
         })
         .await;
 
-        let back = open_clocked(3, dirs[2].path(), port, false).await;
+        let back = open_clocked(3, dirs[2].path(), port, None).await;
         await_condition(
             Duration::from_secs(20),
             "member 3 installs the snapshot",
@@ -5902,7 +6059,7 @@ async fn a_snapshot_carries_the_closed_bound_across_install_and_restart() {
         let installed = back.engine.closure_frontier();
         back.node.shutdown().await.expect("stop member 3");
         drop(back);
-        let back = open_clocked(3, dirs[2].path(), port, false).await;
+        let back = open_clocked(3, dirs[2].path(), port, None).await;
         assert!(
             back.engine.closure_frontier() >= installed,
             "reopened at {} below the installed {installed}",
@@ -5939,6 +6096,7 @@ async fn an_idle_group_closes_past_its_last_commit() {
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("addr"),
             format!("http://127.0.0.1:{p1}"),
+            conn(1),
         )
         .await
         .expect("leader");
@@ -5946,11 +6104,13 @@ async fn an_idle_group_closes_past_its_last_commit() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("addr"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
         )
         .await
         .expect("follower");
         await_leadership(&n1).await;
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
             .await
             .expect("add 2");
         n1.change_membership(vec![1, 2]).await.expect("membership");

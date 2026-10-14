@@ -32,12 +32,20 @@ fn open_engine(dir: &std::path::Path, oracle: &Arc<TimestampOracle>) -> Arc<Stor
     Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(oracle)).unwrap())
 }
 
+/// The CA the member is issued its identity by, across its reopens.
+static PKI: std::sync::LazyLock<coordinode_test_fixtures::TestPki> =
+    std::sync::LazyLock::new(coordinode_test_fixtures::TestPki::new);
+
 /// A single-voter member over `engine`, once it leads.
 async fn open_member(engine: &Arc<StorageEngine>, port: u16) -> Result<RaftNode, String> {
-    let (raft, _handler) =
-        RaftNode::open_cluster_embedded(1, Arc::clone(engine), format!("http://127.0.0.1:{port}"))
-            .await
-            .map_err(|e| e.to_string())?;
+    let (raft, _handler) = RaftNode::open_cluster_embedded(
+        1,
+        Arc::clone(engine),
+        format!("127.0.0.1:{port}"),
+        PKI.connections(1),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     for _ in 0..150 {
         if raft.is_leader().await {
             return Ok(raft);

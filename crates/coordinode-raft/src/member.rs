@@ -23,6 +23,25 @@ pub enum MemberIdentity {
 }
 
 impl MemberIdentity {
+    /// The identity as one byte string, distinct for distinct identities:
+    /// a SPIFFE ID as itself (it starts `spiffe://`), a host identity as
+    /// `host:`, its scope's length, the scope and the subject.
+    #[must_use]
+    pub fn canonical(&self) -> Vec<u8> {
+        match self {
+            Self::Spiffe(id) => id.as_bytes().to_vec(),
+            Self::Host { scope, subject } => {
+                let mut out = Vec::with_capacity(9 + scope.len() + subject.len());
+                out.extend_from_slice(b"host:");
+                // A scope is a configured name, far below 4 GiB.
+                out.extend_from_slice(&(scope.len() as u32).to_be_bytes());
+                out.extend_from_slice(scope.as_bytes());
+                out.extend_from_slice(subject.as_bytes());
+                out
+            }
+        }
+    }
+
     /// The identity a connection must prove to be this member.
     ///
     /// # Errors

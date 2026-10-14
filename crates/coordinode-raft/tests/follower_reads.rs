@@ -21,13 +21,13 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_raft::read_fence::{
     CE_STALENESS_THRESHOLD_ENTRIES, ReadConcern, ReadFenceError, ReadPreference,
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
 
 /// Hard timeout for multi-node tests that require cluster formation.
 const CLUSTER_TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -82,20 +82,28 @@ async fn bootstrap_3node() -> (
         .expect("e3"),
     );
 
+    let pki = TestPki::new();
     let n1 = RaftNode::open_cluster(
         1,
         Arc::clone(&e1),
         format!("127.0.0.1:{p1}").parse().expect("a1"),
         format!("http://127.0.0.1:{p1}"),
+        pki.connections(1),
     )
     .await
     .expect("n1");
     tokio::time::sleep(Duration::from_millis(800)).await;
 
+    let enrollment = Enrollment {
+        deployment: n1.deployment().expect("the founder knows its deployment"),
+        authorities: vec![pki.target(1, format!("127.0.0.1:{p1}"))],
+    };
     let n2 = RaftNode::open_joining(
         2,
         Arc::clone(&e2),
         format!("127.0.0.1:{p2}").parse().expect("a2"),
+        pki.connections(2),
+        enrollment.clone(),
     )
     .await
     .expect("n2");
@@ -103,14 +111,16 @@ async fn bootstrap_3node() -> (
         3,
         Arc::clone(&e3),
         format!("127.0.0.1:{p3}").parse().expect("a3"),
+        pki.connections(3),
+        enrollment,
     )
     .await
     .expect("n3");
 
-    n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+    n1.add_node(2, format!("http://127.0.0.1:{p2}"), pki.identity(2))
         .await
         .expect("add n2");
-    n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+    n1.add_node(3, format!("http://127.0.0.1:{p3}"), pki.identity(3))
         .await
         .expect("add n3");
     n1.change_membership(vec![1, 2, 3])

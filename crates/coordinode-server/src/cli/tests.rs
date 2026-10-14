@@ -494,19 +494,22 @@ fn restore_accepts_config_path() {
 #[test]
 fn admin_node_join_required_flags() {
     let cmd = parse_args_from(&args(
-        "coordinode admin node join --node http://leader:7080 --id 3 --addr node3:7080",
+        "coordinode admin node join --node http://leader:7080 --id 3 --addr node3:7080 \
+         --identity spiffe://prod.test/db/3",
     ));
     match cmd {
         Command::AdminNodeJoin {
             cluster_addr,
             node_id,
             node_addr,
+            node_identity,
             pre_seeded,
             follow,
         } => {
             assert_eq!(cluster_addr, "http://leader:7080");
             assert_eq!(node_id, 3);
             assert_eq!(node_addr, "node3:7080");
+            assert_eq!(node_identity, "spiffe://prod.test/db/3");
             assert!(!pre_seeded);
             assert!(!follow);
         }
@@ -517,7 +520,8 @@ fn admin_node_join_required_flags() {
 #[test]
 fn admin_node_join_with_flags() {
     let cmd = parse_args_from(&args(
-        "coordinode admin node join --node http://n1:7080 --id 5 --addr n5:7080 --pre-seeded --follow",
+        "coordinode admin node join --node http://n1:7080 --id 5 --addr n5:7080 \
+         --identity spiffe://prod.test/db/5 --pre-seeded --follow",
     ));
     match cmd {
         Command::AdminNodeJoin {

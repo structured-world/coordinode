@@ -20,6 +20,7 @@ use coordinode_swarm::{
     NodeId, PieceBitfield, PieceEncoding, PieceIndex, PieceSource, PieceStore, SegmentId,
     SegmentManifest, SegmentWriter, SourceCandidate, SwarmError, SwarmResult,
 };
+use coordinode_wire::peer::{PeerAdmission, PeerConnectInfo, PeerConnections, PeerTarget};
 use futures_util::{Stream, StreamExt};
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
@@ -266,18 +267,58 @@ async fn build_from_ref<Src: SegmentSource + 'static>(
         .map_err(Status::internal)
 }
 
+/// How a member reaches its peers' segment services: the connections made
+/// under its security context, and the admission that marks each call so
+/// the peer admits it.
+#[derive(Clone)]
+pub struct PeerLinks {
+    /// The member's connections to its peers.
+    pub connections: Arc<PeerConnections>,
+    /// The member's admission, stamping its outbound calls.
+    pub admission: Arc<dyn PeerAdmission>,
+}
+
+impl std::fmt::Debug for PeerLinks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerLinks")
+            .field("connections", &self.connections)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PeerLinks {
+    /// `message` as a call to a peer, marked so the peer admits it.
+    pub(crate) fn request<T>(&self, message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        self.admission.stamp(request.metadata_mut());
+        request
+    }
+}
+
 /// The target-side tonic service: assembles inbound transfers into the injected
 /// store ([`SegmentSink`]) and serves the receiver-driven pull from it
-/// ([`SegmentSource`]).
+/// ([`SegmentSource`]). Only a member of the group, connected under its node
+/// identity, is served.
 pub struct SegmentTransferHandler<S: SegmentSink + SegmentSource> {
     store: Arc<S>,
+    admission: Arc<dyn PeerAdmission>,
 }
 
 impl<S: SegmentSink + SegmentSource> SegmentTransferHandler<S> {
     /// Build a handler over `store`, which both installs received segments and
-    /// serves local ones to peers.
-    pub fn new(store: Arc<S>) -> Self {
-        Self { store }
+    /// serves local ones to the peers `admission` admits.
+    pub fn new(store: Arc<S>, admission: Arc<dyn PeerAdmission>) -> Self {
+        Self { store, admission }
+    }
+
+    /// Admit the caller of `request`, or the refusal to answer it with.
+    fn admit<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        self.admission
+            .admit_peer(
+                request.extensions().get::<PeerConnectInfo>(),
+                request.metadata(),
+            )
+            .map(|_| ())
     }
 }
 
@@ -289,7 +330,17 @@ impl<S: SegmentSink + SegmentSource + 'static>
         &self,
         request: Request<Streaming<PieceData>>,
     ) -> Result<Response<TransferAck>, Status> {
-        receive(request.into_inner(), Arc::clone(&self.store))
+        self.admit(&request)?;
+        // Each piece is admitted again: a sender removed from the group or
+        // cut off mid-stream gets the rest of its stream refused.
+        let info = request.extensions().get::<PeerConnectInfo>().cloned();
+        let metadata = request.metadata().clone();
+        let admission = Arc::clone(&self.admission);
+        let pieces = request.into_inner().map(move |item| {
+            admission.admit_peer(info.as_ref(), &metadata)?;
+            item
+        });
+        receive(pieces, Arc::clone(&self.store))
             .await
             .map(Response::new)
     }
@@ -298,6 +349,7 @@ impl<S: SegmentSink + SegmentSource + 'static>
         &self,
         request: Request<SegmentManifestRequest>,
     ) -> Result<Response<SegmentManifestReply>, Status> {
+        self.admit(&request)?;
         let seg = request
             .into_inner()
             .segment
@@ -325,6 +377,7 @@ impl<S: SegmentSink + SegmentSource + 'static>
         &self,
         request: Request<PieceRequest>,
     ) -> Result<Response<PieceFrame>, Status> {
+        self.admit(&request)?;
         let req = request.into_inner();
         let seg = req
             .segment
@@ -356,13 +409,15 @@ pub struct GrpcPieceSource {
     bitfield: PieceBitfield,
     candidate: SourceCandidate,
     client: SegmentTransferServiceClient<Channel>,
+    links: PeerLinks,
     handle: tokio::runtime::Handle,
 }
 
 impl GrpcPieceSource {
-    /// Query `channel`'s peer for the described segment's manifest + piece
-    /// bitfield, returning the source (ready to pull pieces) and the manifest the
-    /// caller drives [`swarm_download`](coordinode_swarm::swarm_download) with.
+    /// Query `peer` for the described segment's manifest + piece bitfield over
+    /// `links`, returning the source (ready to pull pieces) and the manifest
+    /// the caller drives [`swarm_download`](coordinode_swarm::swarm_download)
+    /// with.
     ///
     /// `candidate` carries this peer's source-selection metadata (utilization,
     /// bandwidth, locality, tit-for-tat) from the caller's view. Must be called
@@ -371,18 +426,24 @@ impl GrpcPieceSource {
     /// [`fetch_piece`](PieceSource::fetch_piece)).
     ///
     /// # Errors
-    /// [`Status`] if the manifest RPC fails or the reply is malformed.
+    /// [`Status`] if the peer cannot be dialed, the manifest RPC fails, or the
+    /// reply is malformed.
     pub async fn connect(
         node: NodeId,
-        channel: Channel,
+        links: &PeerLinks,
+        peer: &PeerTarget,
         descriptor: SegmentDescriptorRef,
         candidate: SourceCandidate,
     ) -> Result<(Self, SegmentManifest), Status> {
+        let channel = links
+            .connections
+            .channel(peer)
+            .map_err(|e| Status::unavailable(e.to_string()))?;
         let mut client = SegmentTransferServiceClient::new(channel);
         let reply = client
-            .get_segment_manifest(SegmentManifestRequest {
+            .get_segment_manifest(links.request(SegmentManifestRequest {
                 segment: Some(descriptor.clone()),
-            })
+            }))
             .await?
             .into_inner();
         let header = reply
@@ -398,6 +459,7 @@ impl GrpcPieceSource {
                 bitfield,
                 candidate,
                 client,
+                links: links.clone(),
                 handle,
             },
             manifest,
@@ -420,10 +482,10 @@ impl PieceSource for GrpcPieceSource {
 
     fn fetch_piece(&self, index: PieceIndex) -> SwarmResult<Vec<u8>> {
         let mut client = self.client.clone();
-        let req = PieceRequest {
+        let req = self.links.request(PieceRequest {
             segment: Some(self.descriptor.clone()),
             index,
-        };
+        });
         let frame = self
             .handle
             .block_on(async move { client.get_piece(req).await })

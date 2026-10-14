@@ -1122,6 +1122,7 @@ dependencies = [
  "coordinode-raft",
  "coordinode-storage",
  "coordinode-swarm",
+ "coordinode-test-fixtures",
  "coordinode-wire",
  "futures-util",
  "metrics",
@@ -1132,7 +1133,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -1301,7 +1301,13 @@ version = "0.7.1"
 dependencies = [
  "coordinode-lsm-tree",
  "coordinode-storage",
+ "coordinode-wire",
+ "rcgen",
+ "rustls-pki-types",
+ "rustls-webpki 0.103.15",
  "tempfile",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1348,6 +1354,10 @@ dependencies = [
  "arc-swap",
  "bytes",
  "coordinode-workspace-hack",
+ "futures-util",
+ "hyper-util",
+ "metrics",
+ "parking_lot",
  "prost",
  "rcgen",
  "rustls",
@@ -1359,6 +1369,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tonic",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -5359,9 +5371,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",

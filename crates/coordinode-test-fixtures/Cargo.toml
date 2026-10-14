@@ -14,6 +14,15 @@ coordinode-storage = { workspace = true }
 # and the `MemFs` we hand to the engine builder would be unusable.
 lsm-tree = { workspace = true }
 tempfile = { workspace = true }
+# Node credentials for tests that open members of a group.
+coordinode-wire = { workspace = true }
+rcgen = "0.14"
+rustls-pki-types = { version = "1", features = ["std"] }
+# A test host adapter reads the URI of a chain that already verified.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
+# Serving a member's port the way the server does, for tests that stand one up.
+tokio = { workspace = true }
+tonic = { workspace = true }
 
 [lints.clippy]
 # The storage-partition guard (clippy.toml `disallowed-types`) is global and

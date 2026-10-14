@@ -460,3 +460,44 @@ fn group_pair_records_follow_application_order() {
     apply(&engine, oracle.next().as_raw(), record_pair(1, 0));
     assert_eq!(recorded_group_pair(&engine).unwrap().unwrap().seq, 3);
 }
+
+fn record_deployment(byte: u8) -> Mutation {
+    Mutation::Command(MetadataCommand::RecordDeployment {
+        id: coordinode_core::group::DeploymentId([byte; 16]),
+    })
+}
+
+/// The first deployment record stands: a later one, from a leader that
+/// raced the founder or a replay, changes nothing, so every member and
+/// every restart sees the identity the deployment was founded with.
+#[test]
+fn the_first_deployment_record_stands() {
+    let dir = TempDir::new().unwrap();
+    let (engine, oracle) = open(&dir);
+    assert_eq!(recorded_deployment(&engine).unwrap(), None);
+    apply(&engine, oracle.next().as_raw(), record_deployment(1));
+    apply(&engine, oracle.next().as_raw(), record_deployment(2));
+    assert_eq!(
+        recorded_deployment(&engine).unwrap(),
+        Some(coordinode_core::group::DeploymentId([1; 16]))
+    );
+}
+
+/// A retired identity reads as retired, and an identity it is a prefix of,
+/// or that is a prefix of it, does not.
+#[test]
+fn a_retired_identity_is_retired_alone() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _) = open(&dir);
+    assert!(!identity_retired(&engine, b"spiffe://td/a").unwrap());
+    engine
+        .put(
+            Partition::Schema,
+            &coordinode_core::group::retired_identity_key(b"spiffe://td/a"),
+            &[],
+        )
+        .unwrap();
+    assert!(identity_retired(&engine, b"spiffe://td/a").unwrap());
+    assert!(!identity_retired(&engine, b"spiffe://td/ab").unwrap());
+    assert!(!identity_retired(&engine, b"spiffe://td/").unwrap());
+}

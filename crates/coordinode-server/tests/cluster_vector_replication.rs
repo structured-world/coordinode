@@ -20,7 +20,10 @@ use coordinode_raft::proposal::RaftProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
+
+/// The CA the nodes are issued their identities by.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
 
 struct ClusterNode {
     db: Database,
@@ -30,7 +33,9 @@ struct ClusterNode {
     _dir: tempfile::TempDir,
 }
 
-async fn open_node(node_id: u64, port: u16, leader: bool) -> ClusterNode {
+/// Open node `node_id` on `port`: founding a group, or joining the one of
+/// the founder given with its port.
+async fn open_node(node_id: u64, port: u16, founder: Option<(&ClusterNode, u16)>) -> ClusterNode {
     let dir = tempfile::tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -43,19 +48,32 @@ async fn open_node(node_id: u64, port: u16, leader: bool) -> ClusterNode {
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let node = if leader {
-        RaftNode::open_cluster(
+    let connections = PKI.connections(node_id);
+    let node = match founder {
+        None => RaftNode::open_cluster(
             node_id,
             Arc::clone(&engine),
             listen_addr,
-            format!("http://127.0.0.1:{port}"),
+            format!("127.0.0.1:{port}"),
+            connections,
         )
         .await
-        .unwrap()
-    } else {
-        RaftNode::open_joining(node_id, Arc::clone(&engine), listen_addr)
+        .unwrap(),
+        Some((founder, founder_port)) => {
+            let enrollment = founder
+                ._node
+                .enrollment(format!("127.0.0.1:{founder_port}"))
+                .unwrap();
+            RaftNode::open_joining(
+                node_id,
+                Arc::clone(&engine),
+                listen_addr,
+                connections,
+                enrollment,
+            )
             .await
             .unwrap()
+        }
     };
     let node = Arc::new(node);
 
@@ -178,12 +196,12 @@ async fn follower_vector_search_matches_leader() {
     let p1 = alloc_port();
     let p2 = alloc_port();
 
-    let mut n1 = open_node(1, p1, true).await;
-    let mut n2 = open_node(2, p2, false).await;
+    let mut n1 = open_node(1, p1, None).await;
+    let mut n2 = open_node(2, p2, Some((&n1, p1))).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     n1._node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
@@ -359,8 +377,8 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
 
     let p1 = alloc_port();
     let p2 = alloc_port();
-    let mut n1 = open_node(1, p1, true).await;
-    let n2 = open_node(2, p2, false).await;
+    let mut n1 = open_node(1, p1, None).await;
+    let n2 = open_node(2, p2, Some((&n1, p1))).await;
 
     // A membership change needs a leader; it returns once committed.
     for _ in 0..150 {
@@ -370,7 +388,7 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     n1._node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
@@ -538,12 +556,12 @@ async fn after_commit_trigger_fires_on_leader_and_replicates_to_follower() {
     let p1 = alloc_port();
     let p2 = alloc_port();
 
-    let mut n1 = open_node(1, p1, true).await;
-    let mut n2 = open_node(2, p2, false).await;
+    let mut n1 = open_node(1, p1, None).await;
+    let mut n2 = open_node(2, p2, Some((&n1, p1))).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     n1._node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
@@ -624,12 +642,12 @@ fn text_hits(db: &mut Database, words: &str) -> Vec<String> {
 async fn follower_text_search_follows_leader_commits() {
     let p1 = alloc_port();
     let p2 = alloc_port();
-    let mut n1 = open_node(1, p1, true).await;
-    let mut n2 = open_node(2, p2, false).await;
+    let mut n1 = open_node(1, p1, None).await;
+    let mut n2 = open_node(2, p2, Some((&n1, p1))).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     n1._node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
@@ -689,12 +707,12 @@ async fn follower_text_search_follows_leader_commits() {
 async fn a_follower_that_cannot_fold_answers_from_its_store() {
     let p1 = alloc_port();
     let p2 = alloc_port();
-    let mut n1 = open_node(1, p1, true).await;
-    let mut n2 = open_node(2, p2, false).await;
+    let mut n1 = open_node(1, p1, None).await;
+    let mut n2 = open_node(2, p2, Some((&n1, p1))).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     n1._node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
@@ -769,14 +787,14 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
 
     let p1 = alloc_port();
     let p2 = alloc_port();
-    let mut n1 = open_node(1, p1, true).await;
+    let mut n1 = open_node(1, p1, None).await;
     let ClusterNode {
         db: n2_db,
         engine: n2_engine,
         _node: _n2_node,
         _dir: _n2_dir,
         ..
-    } = open_node(2, p2, false).await;
+    } = open_node(2, p2, Some((&n1, p1))).await;
     let n2_db = Arc::new(parking_lot::RwLock::new(n2_db));
     // Exercise the follower's real gRPC response, including wire metadata,
     // rather than invoking the service implementation directly.
@@ -837,7 +855,7 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     n1._node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();

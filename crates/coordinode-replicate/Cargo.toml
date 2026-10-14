@@ -25,7 +25,7 @@ tokio = { workspace = true }
 metrics = { workspace = true }
 # Inter-node segment-transfer gRPC (SegmentTransferService): the transport that
 # carries swarm pieces between nodes for replication repair, migration, resync.
-tonic = { workspace = true, features = ["tls-webpki-roots"] }
+tonic = { workspace = true }
 tonic-prost = "0.14"
 prost = { workspace = true }
 futures-util = { workspace = true }
@@ -36,8 +36,8 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tempfile = { workspace = true }
 coordinode-raft = { workspace = true }
-# TcpListenerStream for the in-process SegmentTransferService gRPC round-trip test.
-tokio-stream = { version = "0.1", features = ["net"] }
+# Node credentials for the in-process SegmentTransferService round trips.
+coordinode-test-fixtures = { workspace = true }
 
 [lints]
 workspace = true

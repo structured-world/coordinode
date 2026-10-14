@@ -4,6 +4,13 @@
 //! consensus groups behind one service: every request names its group and is
 //! dispatched to this server's replica of it. Uses msgpack for type
 //! serialization.
+//!
+//! Every call is admitted before its payload is acted on: the connection's
+//! node identity must be bound to a member of the group holding the role the
+//! call needs, and the member a call speaks for (a candidate, a leader) must
+//! be that member. A stream is admitted again before each message it
+//! carries, so a member removed, or a peer whose trust or certificate ended,
+//! stops at its next message.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,11 +18,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use coordinode_core::group::GroupId;
+use coordinode_wire::peer::PeerConnectInfo;
 use futures_util::{Stream, StreamExt};
 use tonic::metadata::MetadataMap;
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Extensions, Request, Response, Status, Streaming};
 use tonic_types::{ErrorDetails, StatusExt};
 
+use super::admission::{Admission, MembersReply, Operation};
 use super::version::{
     HandshakeService, VersionGate, read_handshake, refusal_status, write_handshake,
 };
@@ -38,6 +47,8 @@ pub struct GroupReplica {
     /// Refuses calls from members of another version before their payload
     /// is read.
     gate: Arc<VersionGate>,
+    /// Which peers may call, and as which member.
+    admission: Arc<Admission>,
     /// While the disk is below its free-space reserve, entries and snapshots
     /// from the leader are refused as unavailable, so the leader retries
     /// later: consensus pauses here instead of failing a log fsync on a full
@@ -59,16 +70,29 @@ impl GroupReplica {
             .map_err(|e| Status::unavailable(e.to_string()))
     }
 
-    /// Admit a call by the version record in its metadata, or the status
-    /// refusing it. A record naming another group than this replica's is
-    /// refused like a record of another version.
-    fn admit(&self, metadata: &MetadataMap) -> Result<(), Status> {
-        self.gate
-            .admit(read_handshake(metadata))
-            .map_err(|refusal| {
-                metrics::counter!("coordinode_version_refused_calls_total").increment(1);
-                refusal_status(&refusal, &self.gate.local_handshake())
-            })
+    /// Admit a call: its caller must be a member that `op` is open to, its
+    /// version record must speak for that member, and its version must
+    /// match. Returns the member the caller is. A record naming another
+    /// group than this replica's is refused like a record of another
+    /// version.
+    fn admit(
+        &self,
+        metadata: &MetadataMap,
+        extensions: &Extensions,
+        op: Operation,
+    ) -> Result<u64, Status> {
+        let caller = self
+            .admission
+            .admit(extensions.get::<PeerConnectInfo>(), metadata, op)?;
+        let record = read_handshake(metadata);
+        if let Ok(record) = &record {
+            Admission::same_member(caller, record.node_id)?;
+        }
+        self.gate.admit(record).map_err(|refusal| {
+            metrics::counter!("coordinode_version_refused_calls_total").increment(1);
+            refusal_status(&refusal, &self.gate.local_handshake())
+        })?;
+        Ok(caller)
     }
 
     /// `body` as the call's response, carrying this member's record.
@@ -134,36 +158,41 @@ impl HostedGroups {
             .ok_or_else(|| not_hosted(group))
     }
 
+    /// The only replica, if exactly one is hosted.
+    fn sole(&self) -> Option<Arc<GroupReplica>> {
+        let replicas = self.replicas.read();
+        match (replicas.len(), replicas.values().next()) {
+            (1, Some(sole)) => Some(Arc::clone(sole)),
+            _ => None,
+        }
+    }
+
     /// The replica a call is for by the group its version record names. A
     /// call without a readable record is answered by the only replica when
     /// there is one, whose admission then refuses it for the missing record.
     fn replica_by_record(&self, metadata: &MetadataMap) -> Result<Arc<GroupReplica>, Status> {
         match read_handshake(metadata) {
             Ok(peer) => self.replica(peer.group_id),
-            Err(refusal) => {
-                let replicas = self.replicas.read();
-                match (replicas.len(), replicas.values().next()) {
-                    (1, Some(sole)) => Ok(Arc::clone(sole)),
-                    _ => Err(Status::failed_precondition(format!(
-                        "version mismatch: {refusal}"
-                    ))),
-                }
-            }
+            Err(refusal) => self
+                .sole()
+                .ok_or_else(|| Status::failed_precondition(format!("version mismatch: {refusal}"))),
         }
     }
 
-    /// The version gate of this server's member of `group`.
-    pub(crate) fn gate(&self, group: GroupId) -> Result<Arc<VersionGate>, Status> {
-        self.replica(group).map(|r| Arc::clone(&r.gate))
+    /// The version gate and admission of this server's member of `group`.
+    pub(crate) fn member(
+        &self,
+        group: GroupId,
+    ) -> Result<(Arc<VersionGate>, Arc<Admission>), Status> {
+        self.replica(group)
+            .map(|r| (Arc::clone(&r.gate), Arc::clone(&r.admission)))
     }
 
-    /// The version gate of the only group hosted, if exactly one is.
-    pub(crate) fn sole_gate(&self) -> Option<Arc<VersionGate>> {
-        let replicas = self.replicas.read();
-        match (replicas.len(), replicas.values().next()) {
-            (1, Some(sole)) => Some(Arc::clone(&sole.gate)),
-            _ => None,
-        }
+    /// The version gate and admission of the only group hosted, if exactly
+    /// one is.
+    pub(crate) fn sole_member(&self) -> Option<(Arc<VersionGate>, Arc<Admission>)> {
+        self.sole()
+            .map(|r| (Arc::clone(&r.gate), Arc::clone(&r.admission)))
     }
 }
 
@@ -192,12 +221,14 @@ pub struct RaftGrpcHandler {
 impl RaftGrpcHandler {
     /// A handler hosting `raft`, the replica of the group `gate` speaks for,
     /// staging received snapshots in `snapshot_dir` (see
-    /// [`crate::snapshot::snapshot_dir`]), admitting calls through `gate`
-    /// and taking writes only while `space` has room.
-    pub fn new(
+    /// [`crate::snapshot::snapshot_dir`]), admitting peers through
+    /// `admission` and calls through `gate`, and taking writes only while
+    /// `space` has room.
+    pub(crate) fn new(
         raft: Arc<RaftInstance>,
         snapshot_dir: PathBuf,
         gate: Arc<VersionGate>,
+        admission: Arc<Admission>,
         space: Arc<coordinode_storage::engine::space::SpaceGuard>,
     ) -> Self {
         let groups = HostedGroups::default();
@@ -206,6 +237,7 @@ impl RaftGrpcHandler {
             raft,
             snapshot_dir,
             gate,
+            admission,
             space,
         };
         replicas.insert(replica.group(), Arc::new(replica));
@@ -260,22 +292,25 @@ fn de<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, Status> {
         .map_err(|e| Status::invalid_argument(format!("msgpack deserialize: {e}")))
 }
 
-/// A unary request's replica, admitted, with its payload.
+/// A unary request's replica, admitted for `op`, with its payload and the
+/// member its caller is.
 fn admitted(
     groups: &HostedGroups,
     request: Request<RaftPayload>,
-) -> Result<(Arc<GroupReplica>, Vec<u8>), Status> {
-    let (metadata, _, payload) = request.into_parts();
+    op: Operation,
+) -> Result<(Arc<GroupReplica>, Vec<u8>, u64), Status> {
+    let (metadata, extensions, payload) = request.into_parts();
     let replica = groups.replica(GroupId(payload.group))?;
-    replica.admit(&metadata)?;
-    Ok((replica, payload.data))
+    let caller = replica.admit(&metadata, &extensions, op)?;
+    Ok((replica, payload.data, caller))
 }
 
 #[tonic::async_trait]
 impl RaftService for RaftGrpcHandler {
     async fn vote(&self, request: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
-        let (replica, data) = admitted(&self.groups, request)?;
+        let (replica, data, caller) = admitted(&self.groups, request, Operation::Vote)?;
         let vote_req: openraft::raft::VoteRequest<TypeConfig> = de(&data)?;
+        Admission::same_member(caller, vote_req.vote.leader_id().node_id)?;
 
         let vote_resp = replica
             .raft
@@ -290,8 +325,9 @@ impl RaftService for RaftGrpcHandler {
         &self,
         request: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
-        let (replica, data) = admitted(&self.groups, request)?;
+        let (replica, data, caller) = admitted(&self.groups, request, Operation::Append)?;
         let req: openraft::raft::AppendEntriesRequest<TypeConfig> = de(&data)?;
+        Admission::same_member(caller, req.vote.leader_id().node_id)?;
         // A heartbeat writes nothing and keeps this member following its
         // leader; only entries wait for space.
         if !req.entries.is_empty() {
@@ -316,10 +352,11 @@ impl RaftService for RaftGrpcHandler {
         // The stream is routed by its version record, before any message
         // arrives; every message must name the same group, and the first one
         // that does not ends the stream.
-        let (metadata, _, input) = request.into_parts();
+        let (metadata, extensions, input) = request.into_parts();
         let replica = self.groups.replica_by_record(&metadata)?;
-        replica.admit(&metadata)?;
+        let caller = replica.admit(&metadata, &extensions, Operation::Append)?;
         let group = replica.group();
+        let connection = extensions.get::<PeerConnectInfo>().cloned();
 
         let foreign = Arc::new(core::sync::atomic::AtomicBool::new(false));
         let foreign_in = Arc::clone(&foreign);
@@ -352,6 +389,30 @@ impl RaftService for RaftGrpcHandler {
                 }
             }
         });
+
+        // Each request is admitted again before it reaches the consensus:
+        // the caller must still be the member it opened the stream as,
+        // proving an identity that still verifies, and speak for itself.
+        // The first that is not ends the stream with the refusal.
+        let admission = Arc::clone(&replica.admission);
+        let refused: Arc<parking_lot::Mutex<Option<Status>>> = Arc::default();
+        let refused_in = Arc::clone(&refused);
+        let input_stream = input_stream.take_while(move |req| {
+            let check = admission
+                .readmit(connection.as_ref(), Operation::Append)
+                .and_then(|now| Admission::same_member(caller, now))
+                .and_then(|()| Admission::same_member(caller, req.vote.leader_id().node_id));
+            let pass = match check {
+                Ok(()) => true,
+                Err(status) => {
+                    *refused_in.lock() = Some(status);
+                    false
+                }
+            };
+            futures_util::future::ready(pass)
+        });
+        let refusal = futures_util::stream::once(async move { refused.lock().take() })
+            .filter_map(|status| async move { status.map(Err) });
 
         // Heartbeats pass while the disk is below its reserve; the first
         // request carrying entries then ends the stream, and the reply stream
@@ -423,6 +484,7 @@ impl RaftService for RaftGrpcHandler {
         Ok(replica.answer(Box::pin(
             output_stream
                 .chain(stopped)
+                .chain(refusal)
                 .chain(no_space)
                 .chain(wrong_group),
         ) as Self::StreamAppendStream))
@@ -432,7 +494,7 @@ impl RaftService for RaftGrpcHandler {
         &self,
         request: Request<Streaming<RaftPayload>>,
     ) -> Result<Response<RaftPayload>, Status> {
-        let (metadata, _, mut stream) = request.into_parts();
+        let (metadata, extensions, mut stream) = request.into_parts();
 
         // ── Chunked snapshot protocol ──────────────────────────────
         // Message 1: SnapshotChunkMessage::Header (metadata)
@@ -449,7 +511,7 @@ impl RaftService for RaftGrpcHandler {
             .ok_or_else(|| Status::invalid_argument("empty snapshot stream"))?
             .map_err(|e| Status::internal(format!("snapshot stream error: {e}")))?;
         let replica = self.groups.replica(GroupId(first.group))?;
-        replica.admit(&metadata)?;
+        let caller = replica.admit(&metadata, &extensions, Operation::Snapshot)?;
         replica.admit_write()?;
         let group = replica.group();
 
@@ -466,6 +528,7 @@ impl RaftService for RaftGrpcHandler {
                 ));
             }
         };
+        Admission::same_member(caller, header.vote.leader_id().node_id)?;
 
         let expected_data_size = header.data_size;
 
@@ -536,6 +599,13 @@ impl RaftService for RaftGrpcHandler {
         }
         drop(writer);
 
+        // The transfer took a while: the caller is admitted once more
+        // before what it sent replaces this member's state.
+        let now = replica
+            .admission
+            .readmit(extensions.get::<PeerConnectInfo>(), Operation::Snapshot)?;
+        Admission::same_member(caller, now)?;
+
         tracing::info!(
             %group,
             received_bytes,
@@ -569,8 +639,9 @@ impl RaftService for RaftGrpcHandler {
         &self,
         request: Request<RaftPayload>,
     ) -> Result<Response<RaftEmpty>, Status> {
-        let (replica, data) = admitted(&self.groups, request)?;
+        let (replica, data, caller) = admitted(&self.groups, request, Operation::TransferLeader)?;
         let req: openraft::raft::TransferLeaderRequest<TypeConfig> = de(&data)?;
+        Admission::same_member(caller, req.from_leader().leader_id().node_id)?;
 
         // alpha.25 splits the result: outer = Fatal (engine error), inner =
         // TransferLeaderError (the transfer was rejected, e.g. not leader). Both
@@ -584,5 +655,17 @@ impl RaftService for RaftGrpcHandler {
             .map_err(|e| Status::internal(format!("transfer_leader rejected: {e}")))?;
 
         Ok(replica.answer(RaftEmpty {}))
+    }
+
+    async fn members(
+        &self,
+        request: Request<RaftPayload>,
+    ) -> Result<Response<RaftPayload>, Status> {
+        let (replica, _, _) = admitted(&self.groups, request, Operation::Members)?;
+        let reply = MembersReply {
+            deployment: replica.admission.deployment(),
+            view: replica.admission.own_view(),
+        };
+        Ok(replica.answer(replica.payload(ser(&reply)?)))
     }
 }

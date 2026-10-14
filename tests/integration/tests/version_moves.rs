@@ -158,6 +158,7 @@ async fn group_of_three() -> ([CoordinodeProcess; 3], [u16; 3]) {
                 node_id: id,
                 address: member.member_addr(),
                 pre_seeded: false,
+                node_identity: member.member_identity(),
             })
             .await
             .unwrap_or_else(|e| panic!("join {id}: {e}"));
@@ -591,9 +592,12 @@ async fn a_member_two_formats_behind_is_removed_and_re_added_empty() {
     wait_for_voters(&mut admin, 2).await;
     drop(away);
 
+    // A member that left comes back under a new identity: the one it had
+    // is retired. The harness ties a member's identity to its port.
+    let returning = free_port();
     let m3 = CoordinodeProcess::start_cluster_member_with_env(
         3,
-        ports[2],
+        returning,
         &peers_of(ports, 2),
         &at("2"),
     )
@@ -603,11 +607,12 @@ async fn a_member_two_formats_behind_is_removed_and_re_added_empty() {
             node_id: 3,
             address: m3.member_addr(),
             pre_seeded: false,
+            node_identity: m3.member_identity(),
         })
         .await
         .expect("join 3 again");
     wait_for_voters(&mut admin, 3).await;
-    wait_holds(ports[2], &BTreeSet::from([1, 2])).await;
+    wait_holds(returning, &BTreeSet::from([1, 2])).await;
     assert!(m3.version_report()["read_only"].is_null());
     drop((m1, m2));
 }

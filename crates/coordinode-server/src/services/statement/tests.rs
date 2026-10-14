@@ -180,7 +180,7 @@ fn statements_are_counted_by_what_they_did() {
 /// The lines logged under the slow-statement target while `f` runs.
 fn slow_lines(f: impl FnOnce()) -> String {
     #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
+    struct Buf(Arc<parking_lot::Mutex<Vec<u8>>>);
     impl std::io::Write for Buf {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             self.0.lock().extend_from_slice(b);

@@ -23,7 +23,10 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use parking_lot::RwLock;
 
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port, serve_member_port};
+
+/// The CA the nodes are issued their identities by.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
 
 struct Node {
     db: Arc<RwLock<Database>>,
@@ -35,8 +38,9 @@ struct Node {
 /// a deployed node does. That is what makes forwarding meaningful: the address
 /// a peer is told to reach in the membership is the same address a client
 /// reaches, so a node can pass a client's request to the leader by the address
-/// it already knows.
-async fn open_node(node_id: u64, port: u16, leader: bool) -> Node {
+/// it already knows. A node joins the group of `founder`, which listens on
+/// the port given with it; without one it founds a group.
+async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -47,19 +51,28 @@ async fn open_node(node_id: u64, port: u16, leader: bool) -> Node {
         Tier::Warm,
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
-    let advertise = format!("http://127.0.0.1:{port}");
+    let connections = PKI.connections(node_id);
 
-    let (raft, raft_handler) = if leader {
-        RaftNode::open_cluster_embedded(node_id, Arc::clone(&engine), advertise)
-            .await
-            .unwrap()
-    } else {
+    let (raft, raft_handler) = match founder {
+        None => RaftNode::open_cluster_embedded(
+            node_id,
+            Arc::clone(&engine),
+            format!("127.0.0.1:{port}"),
+            connections,
+        )
+        .await
+        .unwrap(),
         // A joining node learns its own advertised address from the leader's
         // add_node call, so it takes none here.
-        let _ = advertise;
-        RaftNode::open_joining_embedded(node_id, Arc::clone(&engine))
-            .await
-            .unwrap()
+        Some((founder, founder_port)) => {
+            let enrollment = founder
+                .raft
+                .enrollment(format!("127.0.0.1:{founder_port}"))
+                .unwrap();
+            RaftNode::open_joining_embedded(node_id, Arc::clone(&engine), connections, enrollment)
+                .await
+                .unwrap()
+        }
     };
     let raft = Arc::new(raft);
 
@@ -77,15 +90,15 @@ async fn open_node(node_id: u64, port: u16, leader: bool) -> Node {
     .with_raft_node(Arc::clone(&raft));
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(RaftServiceServer::new(raft_handler))
-            .add_service(query::cypher_service_server::CypherServiceServer::new(
-                cypher,
-            ))
-            .serve(addr)
-            .await
-    });
+    let context = Arc::clone(raft.connections().unwrap().context());
+    serve_member_port(
+        addr,
+        &context,
+        tonic::service::Routes::new(RaftServiceServer::new(raft_handler)).add_service(
+            query::cypher_service_server::CypherServiceServer::new(cypher),
+        ),
+    )
+    .await;
 
     Node {
         db,
@@ -98,12 +111,12 @@ async fn open_node(node_id: u64, port: u16, leader: bool) -> Node {
 async fn a_write_sent_to_a_follower_is_carried_to_the_leader() {
     let (p1, p2) = (alloc_port(), alloc_port());
 
-    let n1 = open_node(1, p1, true).await;
-    let _n2 = open_node(2, p2, false).await;
+    let n1 = open_node(1, p1, None).await;
+    let _n2 = open_node(2, p2, Some((&n1, p1))).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     n1.raft
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .unwrap();
     n1.raft.change_membership(vec![1, 2]).await.unwrap();

@@ -28,8 +28,8 @@ use coordinode_raft::read_fence::{
     READ_FENCE_TIMEOUT, ReadConcern, ReadFenceError, ReadPreference,
 };
 use coordinode_replicate::ReplicatedWriter;
-// no-std: spin::RwLock / spin::Mutex (drop-in).
-use parking_lot::{Mutex, RwLock};
+// no-std: spin::RwLock (drop-in).
+use parking_lot::RwLock;
 use tonic::{Request, Response, Status};
 
 use crate::config::StatementDefaults;
@@ -130,8 +130,8 @@ pub(crate) enum Admission {
 /// Resolves, checks, fences, runs and records Cypher statements.
 ///
 /// Cheap to clone: every part is shared, so the unary service and the session
-/// hold the same database, consensus node, defaults, advisor and peer
-/// connections.
+/// hold the same database, consensus node, defaults and advisor. A statement
+/// passed to the leader goes over the consensus node's peer connections.
 #[derive(Clone)]
 pub struct StatementExecutor {
     writer: Arc<ReplicatedWriter>,
@@ -139,10 +139,6 @@ pub struct StatementExecutor {
     defaults: StatementDefaults,
     query_registry: Arc<QueryRegistry>,
     nplus1_detector: Arc<NPlus1Detector>,
-    /// Lazily-connected channels to peers, keyed by advertised address, for
-    /// passing a statement on to the leader. Lazy channels reconnect on their
-    /// own, so a peer that restarts does not poison its entry.
-    peer_channels: Arc<Mutex<HashMap<String, tonic::transport::Channel>>>,
     /// Statements running at least this long are logged; `None` logs none.
     slow_query: Option<Duration>,
 }
@@ -157,7 +153,6 @@ impl StatementExecutor {
             defaults: StatementDefaults::default(),
             query_registry: Arc::new(QueryRegistry::new()),
             nplus1_detector: Arc::new(NPlus1Detector::new()),
-            peer_channels: Arc::new(Mutex::new(HashMap::new())),
             slow_query: Some(DEFAULT_SLOW_QUERY),
         }
     }
@@ -453,18 +448,8 @@ impl StatementExecutor {
         source: Option<&SourceContext>,
         deadline: Option<std::time::Instant>,
     ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
-        let addr = self
-            .raft_node
-            .as_ref()
-            .and_then(|n| n.node_addr(leader_id))
-            .ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "not the leader; leader is node {leader_id}, whose address this node \
-                     does not know"
-                ))
-            })?;
-        let mut client =
-            query::cypher_service_client::CypherServiceClient::new(self.peer_channel(&addr)?);
+        let channel = self.leader_channel(leader_id)?;
+        let mut client = query::cypher_service_client::CypherServiceClient::new(channel);
         let mut forwarded = Request::new(req);
         forwarded.metadata_mut().insert(
             FORWARDED_HEADER,
@@ -501,22 +486,25 @@ impl StatementExecutor {
         Ok(response)
     }
 
-    /// A lazily-connected channel to `addr`, created once and reused. The
-    /// first call over it connects; it reconnects by itself afterwards.
-    fn peer_channel(&self, addr: &str) -> Result<tonic::transport::Channel, Status> {
-        if let Some(channel) = self.peer_channels.lock().get(addr) {
-            return Ok(channel.clone());
-        }
-        // Same address form and TLS as the Raft and segment-transfer clients:
-        // a cluster that encrypts peer traffic must not get a plaintext hop.
-        let channel = coordinode_wire::peer_endpoint(addr)
-            .map_err(|e| Status::internal(format!("peer address '{addr}': {e}")))?
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .connect_lazy();
-        self.peer_channels
-            .lock()
-            .insert(addr.to_string(), channel.clone());
-        Ok(channel)
+    /// The connection to member `leader_id`, made under this node's identity
+    /// and expecting the leader's: the one the consensus layer uses, so the
+    /// hop is authenticated both ways like any other peer traffic.
+    fn leader_channel(&self, leader_id: u64) -> Result<tonic::transport::Channel, Status> {
+        let node = self.raft_node.as_ref().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "not the leader; leader is node {leader_id}, and this node has no peers"
+            ))
+        })?;
+        let (Some(target), Some(connections)) = (node.member_target(leader_id), node.connections())
+        else {
+            return Err(Status::failed_precondition(format!(
+                "not the leader; leader is node {leader_id}, whose address and identity this \
+                 node does not know"
+            )));
+        };
+        connections
+            .channel(&target)
+            .map_err(|e| Status::internal(format!("leader {leader_id}: {e}")))
     }
 }
 

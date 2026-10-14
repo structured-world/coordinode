@@ -1061,6 +1061,9 @@ pub struct CoordinodeStateMachine {
     /// first, republished whenever an applied entry or an installed snapshot
     /// moves it.
     group_pair_tx: tokio::sync::watch::Sender<GroupPairs>,
+    /// The deployment's identity as the applied state records it, `None`
+    /// before the founding leader's record applies here.
+    deployment_tx: tokio::sync::watch::Sender<Option<coordinode_core::group::DeploymentId>>,
     /// The highest commit timestamp applied here: what a member that stops
     /// receiving entries serves its reads as of.
     applied_commit_ts: Arc<core::sync::atomic::AtomicU64>,
@@ -1357,6 +1360,9 @@ impl CoordinodeStateMachine {
         let group_pairs = coordinode_storage::engine::metadata::group_pair_records(&engine)
             .map_err(|e| io::Error::other(format!("read the group's version pairs: {e}")))?;
         let (group_pair_tx, _) = tokio::sync::watch::channel(Arc::from(group_pairs));
+        let deployment = coordinode_storage::engine::metadata::recorded_deployment(&engine)
+            .map_err(|e| io::Error::other(format!("read the deployment record: {e}")))?;
+        let (deployment_tx, _) = tokio::sync::watch::channel(deployment);
         // Until an entry applies, what the store holds is as of the clock it
         // reopened at.
         let reopened_at = engine.oracle().map_or(0, |o| o.current().as_raw());
@@ -1371,6 +1377,7 @@ impl CoordinodeStateMachine {
             applied_tx,
             applied_rx,
             group_pair_tx,
+            deployment_tx,
             applied_commit_ts: Arc::new(core::sync::atomic::AtomicU64::new(reopened_at)),
             max_assigned,
             snapshot_builds: Arc::new(core::sync::atomic::AtomicU64::new(0)),
@@ -1445,6 +1452,25 @@ impl CoordinodeStateMachine {
         Arc::clone(&self.applied_commit_ts)
     }
 
+    /// Subscribe to the deployment's identity, as applied here.
+    pub fn subscribe_deployment(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<coordinode_core::group::DeploymentId>> {
+        self.deployment_tx.subscribe()
+    }
+
+    /// Reread the deployment record after the applied state may have set it.
+    fn refresh_deployment(&self) -> Result<(), io::Error> {
+        let recorded = coordinode_storage::engine::metadata::recorded_deployment(&self.engine)
+            .map_err(|e| io::Error::other(format!("read the deployment record: {e}")))?;
+        self.deployment_tx.send_if_modified(|current| {
+            let moved = *current != recorded;
+            *current = recorded;
+            moved
+        });
+        Ok(())
+    }
+
     /// Reread the group's recorded pair after the applied state moved it.
     fn refresh_group_pair(&self) -> Result<(), io::Error> {
         let pairs = coordinode_storage::engine::metadata::group_pair_records(&self.engine)
@@ -1476,6 +1502,34 @@ impl CoordinodeStateMachine {
     /// taken as the initial membership, the member would forget its group.
     fn load_membership(engine: &StorageEngine) -> Result<StoredMembership, io::Error> {
         Ok(load_stored(engine, Partition::Schema, KEY_SM_MEMBERSHIP)?.unwrap_or_default())
+    }
+
+    /// Record every node identity that `previous` binds and `next` no longer
+    /// does as retired: a member that left is never admitted again under
+    /// it, whatever certificate for it is still about. Decided on applying
+    /// the membership entry, so every member records the same retirements
+    /// at the same point of the log.
+    fn retire_removed<'a>(
+        &self,
+        previous: impl Iterator<Item = &'a crate::member::MemberNode>,
+        next: impl Iterator<Item = &'a crate::member::MemberNode>,
+    ) -> Result<(), io::Error> {
+        let kept: Vec<&crate::member::MemberIdentity> =
+            next.filter_map(|node| node.identity.as_ref()).collect();
+        for identity in previous
+            .filter_map(|node| node.identity.as_ref())
+            .filter(|identity| !kept.contains(identity))
+        {
+            tracing::info!(%identity, "a member left: its node identity is retired");
+            self.engine
+                .put(
+                    Partition::Schema,
+                    &coordinode_core::group::retired_identity_key(&identity.canonical()),
+                    &[],
+                )
+                .map_err(|e| io::Error::other(format!("retire {identity}: {e}")))?;
+        }
+        Ok(())
     }
 
     fn save_membership(&self, membership: &StoredMembership) -> Result<(), io::Error> {
@@ -1754,6 +1808,18 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             if let Some(ref membership) = entry.get_membership() {
                 let stored: StoredMembership =
                     openraft::StoredMembership::new(Some(entry.log_id), membership.clone());
+                let previous = self
+                    .last_membership
+                    .lock()
+                    .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))?
+                    .clone();
+                // Before the membership itself: one partition's writes land
+                // in order, so a membership that survives a crash has its
+                // retirements beside it.
+                self.retire_removed(
+                    previous.membership().nodes().map(|(_, node)| node),
+                    membership.nodes().map(|(_, node)| node),
+                )?;
                 *self
                     .last_membership
                     .lock()
@@ -1772,6 +1838,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                 openraft::entry::EntryPayload::Normal(request) => {
                     let mut total = 0;
                     let mut records_pair = false;
+                    let mut records_deployment = false;
                     for (sub, proposal) in request.proposals.iter().enumerate() {
                         let sub = u32::try_from(sub).map_err(|_| {
                             io::Error::other(format!("entry {index} carries over 2^32 proposals"))
@@ -1788,9 +1855,18 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                                 Mutation::Command(MetadataCommand::RecordGroupPair { .. })
                             )
                         });
+                        records_deployment |= proposal.mutations.iter().any(|m| {
+                            matches!(
+                                m,
+                                Mutation::Command(MetadataCommand::RecordDeployment { .. })
+                            )
+                        });
                     }
                     if records_pair {
                         self.refresh_group_pair()?;
+                    }
+                    if records_deployment {
+                        self.refresh_deployment()?;
                     }
                     if request.closed_below > 0 {
                         let sub = u32::try_from(request.proposals.len()).map_err(|_| {
@@ -1989,6 +2065,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         gate.applies.reset(next);
         gate.last = meta.last_log_id;
         self.refresh_group_pair()?;
+        self.refresh_deployment()?;
         // The snapshot carries the bound of the entries it holds.
         self.engine
             .reload_closure_frontier()

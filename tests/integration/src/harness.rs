@@ -34,6 +34,13 @@ pub struct CoordinodeProcess {
     data_dir: Option<tempfile::TempDir>,
     /// The `--config` file the process runs with, carried over every restart.
     config: Option<tempfile::NamedTempFile>,
+    /// A cluster member's credentials, trust bundle and the config naming
+    /// them; issued afresh at every start, as a renewal would. Held so the
+    /// files outlive the process that reads them.
+    _identity: Option<tempfile::TempDir>,
+    /// The deployment a joining member was configured with, kept for its
+    /// restarts.
+    deployment: Option<String>,
     /// Environment variables set on the process.
     env: Vec<(String, String)>,
 }
@@ -74,7 +81,10 @@ impl CoordinodeProcess {
     ) -> Self {
         let path = config.as_ref().map(|f| f.path().to_path_buf());
         let mut proc = Self::spawn_on_free_port(data_dir, |port, ops_port, rest_port, data| {
-            spawn_binary(port, ops_port, rest_port, data, path.as_deref())
+            (
+                spawn_binary(port, ops_port, rest_port, data, path.as_deref()),
+                None,
+            )
         })
         .await;
         proc.config = config;
@@ -90,19 +100,22 @@ impl CoordinodeProcess {
     /// instead of a timeout or a test that talks to someone else's server.
     async fn spawn_on_free_port(
         data_dir: tempfile::TempDir,
-        spawn: impl Fn(u16, u16, u16, PathBuf) -> Child,
+        spawn: impl Fn(u16, u16, u16, PathBuf) -> (Child, Option<tempfile::TempDir>),
     ) -> Self {
         const ATTEMPTS: u32 = 5;
         let mut last_exit = None;
         for _ in 0..ATTEMPTS {
             let (port, ops_port, rest_port) = (free_port(), free_port(), free_port());
+            let (child, identity) = spawn(port, ops_port, rest_port, data_dir.path().to_path_buf());
             let mut proc = Self {
-                child: spawn(port, ops_port, rest_port, data_dir.path().to_path_buf()),
+                child,
                 port,
                 ops_port,
                 rest_port,
                 data_dir: None,
                 config: None,
+                _identity: identity,
+                deployment: None,
                 env: Vec::new(),
             };
             match proc.wait_until_ready(Duration::from_secs(15)).await {
@@ -153,18 +166,29 @@ impl CoordinodeProcess {
         data_dir: tempfile::TempDir,
         env: &[(&str, &str)],
     ) -> Self {
-        let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
         let (ops_port, rest_port) = (free_port(), free_port());
         let env: Vec<(String, String)> = env
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let child = spawn_cluster_binary(
+        let deployment = if node_id > 1 {
+            Some(
+                deployment_of(peer_ports, Duration::from_secs(15))
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!("no member among {peer_ports:?} reports its deployment")
+                    }),
+            )
+        } else {
+            None
+        };
+        let (child, identity) = spawn_cluster_binary(
             node_id,
             port,
             ops_port,
             rest_port,
-            &peers,
+            peer_ports,
+            deployment.as_deref(),
             data_dir.path().to_path_buf(),
             &env,
         );
@@ -175,6 +199,8 @@ impl CoordinodeProcess {
             rest_port,
             data_dir: Some(data_dir),
             config: None,
+            _identity: Some(identity),
+            deployment,
             env,
         };
         // The port is fixed by the caller (peers already name it), so a
@@ -210,30 +236,34 @@ impl CoordinodeProcess {
             .data_dir
             .take()
             .expect("data_dir missing: restart called twice?");
-        let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
         let env: Vec<(String, String)> = env
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         let port = self.port;
+        let deployment = self.deployment.take();
         let mut last = None;
         for _ in 0..20 {
             let (ops_port, rest_port) = (free_port(), free_port());
+            let (child, identity) = spawn_cluster_binary(
+                node_id,
+                port,
+                ops_port,
+                rest_port,
+                peer_ports,
+                deployment.as_deref(),
+                data_dir.path().to_path_buf(),
+                &env,
+            );
             let mut proc = Self {
-                child: spawn_cluster_binary(
-                    node_id,
-                    port,
-                    ops_port,
-                    rest_port,
-                    &peers,
-                    data_dir.path().to_path_buf(),
-                    &env,
-                ),
+                child,
                 port,
                 ops_port,
                 rest_port,
                 data_dir: None,
                 config: None,
+                _identity: Some(identity),
+                deployment: deployment.clone(),
                 env: env.clone(),
             };
             match proc.wait_until_ready(Duration::from_secs(30)).await {
@@ -356,13 +386,30 @@ impl CoordinodeProcess {
             .data_dir
             .take()
             .expect("data_dir missing: restart called twice?");
-        let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
         let env = std::mem::take(&mut self.env);
+        // The first member keeps the deployment its store recorded when it
+        // ran alone; any other joins the one its peers report.
+        let deployment = if node_id > 1 {
+            deployment_of(peer_ports, Duration::from_secs(15)).await
+        } else {
+            None
+        };
         let mut proc = Self::spawn_on_free_port(data_dir, |port, ops_port, rest_port, data| {
-            spawn_cluster_binary(node_id, port, ops_port, rest_port, &peers, data, &env)
+            let (child, identity) = spawn_cluster_binary(
+                node_id,
+                port,
+                ops_port,
+                rest_port,
+                peer_ports,
+                deployment.as_deref(),
+                data,
+                &env,
+            );
+            (child, Some(identity))
         })
         .await;
         proc.env = env;
+        proc.deployment = deployment;
         proc
     }
 
@@ -374,6 +421,12 @@ impl CoordinodeProcess {
     /// This process's address as a cluster member (see [`member_addr`]).
     pub fn member_addr(&self) -> String {
         member_addr(self.port)
+    }
+
+    /// The identity this process proves as a cluster member (see
+    /// [`member_identity`]).
+    pub fn member_identity(&self) -> String {
+        member_identity(self.port)
     }
 
     /// Send one HTTP/1.1 request with an optional JSON body to this process's
@@ -561,10 +614,25 @@ pub async fn start_cluster_member_expecting_refusal_with_env(
     env: &[(&str, &str)],
 ) -> (std::process::ExitStatus, String) {
     let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
+    // A joiner is configured with the deployment its peers report, or, with
+    // none of them up, with one of its own: the refusal under test comes
+    // before any peer is asked.
+    let deployment = if node_id > 1 {
+        Some(
+            deployment_of(peer_ports, Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|| "00000000000000000000000000000001".to_owned()),
+        )
+    } else {
+        None
+    };
+    let identity = write_member_identity(node_id, port, peer_ports, deployment.as_deref());
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
     cmd.envs(env.iter().copied());
     cmd.arg("serve")
+        .arg("--config")
+        .arg(identity.path().join(MEMBER_CONFIG))
         .arg("--node-id")
         .arg(node_id.to_string())
         .arg("--addr")
@@ -854,20 +922,118 @@ pub fn member_addr(port: u16) -> String {
     format!("[::1]:{port}")
 }
 
+/// The CA that issues every cluster member of this test process its identity.
+static PKI: std::sync::LazyLock<coordinode_test_fixtures::TestPki> =
+    std::sync::LazyLock::new(coordinode_test_fixtures::TestPki::new);
+
+/// The config file in a member's identity directory.
+const MEMBER_CONFIG: &str = "member.conf";
+
+/// The deployment a member among `peer_ports` reports in its cluster
+/// status, as an operator reads it to configure a joining node; `None` when
+/// none reports one within `within`.
+async fn deployment_of(peer_ports: &[u16], within: Duration) -> Option<String> {
+    use crate::proto::admin::GetClusterStatusRequest;
+
+    let deadline = Instant::now() + within;
+    loop {
+        for &port in peer_ports {
+            let Ok(endpoint) =
+                tonic::transport::Endpoint::from_shared(format!("http://[::1]:{port}"))
+            else {
+                continue;
+            };
+            let channel = endpoint
+                .connect_timeout(Duration::from_millis(500))
+                .timeout(Duration::from_secs(2))
+                .connect_lazy();
+            let status = ClusterServiceClient::new(channel)
+                .get_cluster_status(GetClusterStatusRequest {})
+                .await;
+            if let Ok(status) = status {
+                let deployment = status.into_inner().deployment;
+                if !deployment.is_empty() {
+                    return Some(deployment);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The identity the member listening on `port` proves: its SPIFFE ID. Tied
+/// to the port, so a member's peers know who must answer at each address.
+pub fn member_identity(port: u16) -> String {
+    format!("spiffe://{}/port/{port}", PKI.trust_domain())
+}
+
+/// Issue member `node_id` on `port` fresh credentials and write them, the
+/// trust bundle and a config naming them into a new directory; a joining
+/// member joins `deployment` and learns its group's membership from
+/// `peer_ports`.
+fn write_member_identity(
+    node_id: u64,
+    port: u16,
+    peer_ports: &[u16],
+    deployment: Option<&str>,
+) -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().expect("identity tempdir");
+    let (cert, key) = PKI.write_credentials(dir.path(), "node", &member_identity(port));
+    let bundle = PKI.write_bundle(dir.path());
+    let quote = |path: &std::path::Path| {
+        serde_json::to_string(&path.display().to_string()).expect("a string")
+    };
+    let mut yaml = format!(
+        "node_identity:\n  cert: {}\n  key: {}\n  trust_bundles:\n    {}: {}\n",
+        quote(&cert),
+        quote(&key),
+        PKI.trust_domain(),
+        quote(&bundle),
+    );
+    if let Some(deployment) = deployment {
+        yaml.push_str(&format!("  deployment: \"{deployment}\"\n"));
+    }
+    if node_id > 1 {
+        yaml.push_str("  enroll_from:\n");
+        for &peer in peer_ports {
+            yaml.push_str(&format!(
+                "    - addr: \"{}\"\n      identity: \"{}\"\n",
+                member_addr(peer),
+                member_identity(peer)
+            ));
+        }
+    }
+    std::fs::write(dir.path().join(MEMBER_CONFIG), yaml).expect("write the member config");
+    dir
+}
+
 /// Spawn a cluster member with explicit `--node-id`, `--advertise-addr`, and
-/// `--peers`. See [`CoordinodeProcess::start_cluster_member`].
+/// `--peers`, and its identity written for it; a joining member joins
+/// `deployment`. See [`CoordinodeProcess::start_cluster_member`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each is one flag or file of the command line it builds"
+)]
 fn spawn_cluster_binary(
     node_id: u64,
     port: u16,
     ops_port: u16,
     rest_port: u16,
-    peers: &[String],
+    peer_ports: &[u16],
+    deployment: Option<&str>,
     data_dir: PathBuf,
     env: &[(String, String)],
-) -> Child {
+) -> (Child, tempfile::TempDir) {
+    let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
+    let identity = write_member_identity(node_id, port, peer_ports, deployment);
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
     cmd.arg("serve")
+        .arg("--config")
+        .arg(identity.path().join(MEMBER_CONFIG))
         .arg("--node-id")
         .arg(node_id.to_string())
         .arg("--addr")
@@ -889,8 +1055,10 @@ fn spawn_cluster_binary(
     cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     own_process_group(&mut cmd);
 
-    cmd.spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e))
+    let child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e));
+    (child, identity)
 }
 
 /// A free port on `[::1]`, where the spawned server listens.

@@ -19,12 +19,12 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_core::version::VersionPair;
 use coordinode_raft::cluster::version::MemberState;
-use coordinode_raft::cluster::{NodeOptions, RaftNode};
+use coordinode_raft::cluster::{Enrollment, NodeOptions, RaftNode};
 use coordinode_raft::read_fence::{ReadConcern, ReadFenceError, ReadPreference};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -41,10 +41,28 @@ fn open_engine(path: &Path) -> Arc<StorageEngine> {
     )
 }
 
-fn options(host_epoch: u64) -> NodeOptions {
+/// The CA the members of a test's group prove their identities under.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
+
+/// Member `id`'s options at `host_epoch`.
+fn options(id: u64, host_epoch: u64) -> NodeOptions {
     NodeOptions {
         host_epoch,
+        connections: Some(PKI.connections(id)),
         ..Default::default()
+    }
+}
+
+/// Member `id` joining the group `founder` formed on `port`, at `host_epoch`.
+fn joining(id: u64, host_epoch: u64, founder: &RaftNode, port: u16) -> NodeOptions {
+    NodeOptions {
+        enrollment: Some(Enrollment {
+            deployment: founder
+                .deployment()
+                .expect("the founder knows its deployment"),
+            authorities: vec![PKI.target(founder.node_id(), format!("127.0.0.1:{port}"))],
+        }),
+        ..options(id, host_epoch)
     }
 }
 
@@ -100,7 +118,7 @@ async fn reopen(id: u64, engine: &Arc<StorageEngine>, port: u16, host_epoch: u64
             Arc::clone(engine),
             format!("127.0.0.1:{port}").parse().expect("addr"),
             format!("http://127.0.0.1:{port}"),
-            options(host_epoch),
+            options(id, host_epoch),
         )
         .await
         {
@@ -155,7 +173,7 @@ async fn group_of_three(host_epoch: u64) -> [Member; 3] {
         Arc::clone(&e1),
         format!("127.0.0.1:{}", ports[0]).parse().expect("addr"),
         format!("http://127.0.0.1:{}", ports[0]),
-        options(host_epoch),
+        options(1, host_epoch),
     )
     .await
     .expect("open 1");
@@ -163,7 +181,7 @@ async fn group_of_three(host_epoch: u64) -> [Member; 3] {
         2,
         Arc::clone(&e2),
         format!("127.0.0.1:{}", ports[1]).parse().expect("addr"),
-        options(host_epoch),
+        joining(2, host_epoch, &n1, ports[0]),
     )
     .await
     .expect("open 2");
@@ -171,7 +189,7 @@ async fn group_of_three(host_epoch: u64) -> [Member; 3] {
         3,
         Arc::clone(&e3),
         format!("127.0.0.1:{}", ports[2]).parse().expect("addr"),
-        options(host_epoch),
+        joining(3, host_epoch, &n1, ports[0]),
     )
     .await
     .expect("open 3");
@@ -179,10 +197,10 @@ async fn group_of_three(host_epoch: u64) -> [Member; 3] {
         n1.version().group_pair().map(|r| r.pair) == Some(pair(host_epoch))
     })
     .await;
-    n1.add_node(2, format!("http://127.0.0.1:{}", ports[1]))
+    n1.add_node(2, format!("http://127.0.0.1:{}", ports[1]), PKI.identity(2))
         .await
         .expect("add 2");
-    n1.add_node(3, format!("http://127.0.0.1:{}", ports[2]))
+    n1.add_node(3, format!("http://127.0.0.1:{}", ports[2]), PKI.identity(3))
         .await
         .expect("add 3");
     n1.change_membership(vec![1, 2, 3])
@@ -380,18 +398,37 @@ async fn a_move_is_abandoned_by_removing_and_re_adding_the_updated_member() {
         let fresh = tempfile::tempdir().expect("fresh directory");
         m3.engine = open_engine(fresh.path());
         m3._dir = fresh;
+        // The member left: its identity is retired, and it returns under a
+        // new one.
+        let returning = format!("{}-returning", PKI.spiffe_id(3));
         m3.node = Some(
             RaftNode::open_joining_with_options(
                 3,
                 Arc::clone(&m3.engine),
                 format!("127.0.0.1:{}", m3.port).parse().expect("addr"),
-                options(0),
+                NodeOptions {
+                    connections: Some(PKI.connections_of(&returning)),
+                    ..joining(3, 0, m1.node(), m1.port)
+                },
             )
             .await
             .expect("open 3 empty"),
         );
+        assert!(
+            matches!(
+                m1.node()
+                    .add_node(3, format!("http://127.0.0.1:{}", m3.port), PKI.identity(3))
+                    .await,
+                Err(coordinode_raft::cluster::RaftNodeError::Identity(_))
+            ),
+            "a member that left is not admitted again under its old identity"
+        );
         m1.node()
-            .add_node(3, format!("http://127.0.0.1:{}", m3.port))
+            .add_node(
+                3,
+                format!("http://127.0.0.1:{}", m3.port),
+                TestPki::identity_of(&returning),
+            )
             .await
             .expect("add 3 back");
         m1.node()

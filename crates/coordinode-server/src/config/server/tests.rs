@@ -642,6 +642,55 @@ fn packaged_conf_parses_against_current_schema() {
     assert_eq!(c.storage_endpoints().len(), 1);
 }
 
+/// The node identity section of a joining member parses whole; one with an
+/// unknown key, or without its certificate, is refused at load rather than
+/// at the first peer connection.
+#[test]
+fn node_identity_parses_and_is_strict() {
+    let parse = |text: &str| serde_saphyr::from_str::<ServerConfig>(text);
+    let c = parse(
+        "node_identity:\n  cert: /id/node.crt\n  key: /id/node.key\n  trust_bundles:\n    \
+         prod.example: /id/bundle.pem\n  deployment: \"00112233445566778899aabbccddeeff\"\n  \
+         enroll_from:\n    - addr: node1:7080\n      identity: spiffe://prod.example/db/1\n",
+    )
+    .expect("parse");
+    let identity = c.node_identity.expect("a node identity");
+    assert_eq!(identity.cert, "/id/node.crt");
+    assert_eq!(identity.key, "/id/node.key");
+    assert_eq!(
+        identity
+            .trust_bundles
+            .get("prod.example")
+            .map(String::as_str),
+        Some("/id/bundle.pem")
+    );
+    assert_eq!(
+        identity.deployment.as_deref(),
+        Some("00112233445566778899aabbccddeeff")
+    );
+    assert_eq!(
+        identity.enroll_from,
+        vec![PeerEntry {
+            addr: "node1:7080".to_owned(),
+            identity: "spiffe://prod.example/db/1".to_owned(),
+        }]
+    );
+
+    // The first member names neither a deployment nor members to enroll from.
+    let founder =
+        parse("node_identity:\n  cert: /c\n  key: /k\n  trust_bundles:\n    td.test: /b\n")
+            .expect("parse")
+            .node_identity
+            .expect("a node identity");
+    assert!(founder.deployment.is_none() && founder.enroll_from.is_empty());
+
+    assert!(parse("node_identity:\n  key: /k\n  trust_bundles: {}\n").is_err());
+    assert!(
+        parse("node_identity:\n  cert: /c\n  key: /k\n  trust_bundles: {}\n  ca: /x\n").is_err()
+    );
+    assert!(ServerConfig::default().node_identity.is_none());
+}
+
 #[test]
 fn resolve_storage_config_carries_endpoints() {
     let c = ServerConfig {

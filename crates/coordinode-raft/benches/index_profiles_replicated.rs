@@ -23,10 +23,10 @@ use coordinode_core::txn::proposal::{
     ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
 
 /// Units per profile.
 const UNITS: u64 = 2_000;
@@ -50,24 +50,39 @@ fn open_engine(dir: &Path) -> Arc<StorageEngine> {
     )
 }
 
-async fn group() -> Vec<Member> {
+async fn group(pki: &TestPki) -> Vec<Member> {
     let ports = [alloc_port(), alloc_port(), alloc_port()];
-    let mut members = Vec::new();
+    let mut members: Vec<Member> = Vec::new();
     for (i, port) in ports.iter().enumerate() {
         let dir = tempfile::tempdir().expect("dir");
         let engine = open_engine(dir.path());
         let listen = format!("127.0.0.1:{port}").parse().expect("addr");
         let id = i as u64 + 1;
-        let node = if id == 1 {
-            RaftNode::open_cluster(
-                id,
-                Arc::clone(&engine),
-                listen,
-                format!("http://127.0.0.1:{port}"),
-            )
-            .await
-        } else {
-            RaftNode::open_joining(id, Arc::clone(&engine), listen).await
+        let node = match members.first() {
+            None => {
+                RaftNode::open_cluster(
+                    id,
+                    Arc::clone(&engine),
+                    listen,
+                    format!("http://127.0.0.1:{port}"),
+                    pki.connections(id),
+                )
+                .await
+            }
+            Some(founder) => {
+                let enrollment = Enrollment {
+                    deployment: founder.node.deployment().expect("a deployment"),
+                    authorities: vec![pki.target(1, format!("127.0.0.1:{}", ports[0]))],
+                };
+                RaftNode::open_joining(
+                    id,
+                    Arc::clone(&engine),
+                    listen,
+                    pki.connections(id),
+                    enrollment,
+                )
+                .await
+            }
         }
         .expect("member");
         members.push(Member {
@@ -85,7 +100,7 @@ async fn group() -> Vec<Member> {
     }
     for (id, port) in [(2u64, ports[1]), (3, ports[2])] {
         leader
-            .add_node(id, format!("http://127.0.0.1:{port}"))
+            .add_node(id, format!("http://127.0.0.1:{port}"), pki.identity(id))
             .await
             .expect("add");
     }
@@ -216,7 +231,8 @@ fn main() {
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let members = group().await;
+        let pki = TestPki::new();
+        let members = group(&pki).await;
         println!("== index maintenance profiles, three members on one host ==");
         // A warm-up round first, so neither profile pays the group's start.
         run(&members, "warm-up", 0, false).await;

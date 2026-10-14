@@ -14,12 +14,13 @@ async fn a_server_that_exits_during_startup_is_restarted_on_another_port() {
             if attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
                 first_port.store(u32::from(port), std::sync::atomic::Ordering::Relaxed);
                 // A start that fails before binding: an unknown mode.
-                return Command::new(binary_path())
+                let failing = Command::new(binary_path())
                     .args(["serve", "--mode", "no-such-mode", "--ops-addr", "[::1]:0"])
                     .spawn()
                     .expect("spawn a failing start");
+                return (failing, None);
             }
-            spawn_binary(port, ops_port, rest_port, data, None)
+            (spawn_binary(port, ops_port, rest_port, data, None), None)
         })
         .await;
 

@@ -47,26 +47,28 @@ fn set_nofile_limit(_target: Option<u64>) -> Option<(u64, u64)> {
     None
 }
 
-/// The configured peers as URIs a segment pull dials; empty when standalone.
-fn peer_uris(peers: Option<&[String]>) -> Vec<String> {
-    peers
-        .unwrap_or_default()
-        .iter()
-        .map(|p| {
-            if p.contains("://") {
-                p.clone()
-            } else {
-                format!("http://{p}")
-            }
-        })
-        .collect()
+/// How this member reaches its peers' segment services, and the members it
+/// has now, each with the identity it must prove; `None` for a node without
+/// peers. Read at each use, so a membership change reaches the next pull.
+fn segment_peers(
+    node: &coordinode_raft::cluster::RaftNode,
+) -> Option<(
+    coordinode_replicate::PeerLinks,
+    Vec<coordinode_raft::cluster::PeerTarget>,
+)> {
+    let links = coordinode_replicate::PeerLinks {
+        connections: Arc::clone(node.connections()?),
+        admission: Arc::clone(node.admission()?) as _,
+    };
+    let peers = node.peer_targets();
+    (!peers.is_empty()).then_some((links, peers))
 }
 
 /// Fills a replacement of one of this member's index copies from its peers'
 /// copies over the segment transfer.
 struct PeerIndexCopy {
     installer: Arc<coordinode_replicate::SegmentInstaller>,
-    peers: Vec<String>,
+    node: Arc<coordinode_raft::cluster::RaftNode>,
     runtime: tokio::runtime::Handle,
 }
 
@@ -75,10 +77,13 @@ impl coordinode_query::index::IndexCopySource for PeerIndexCopy {
         &self,
         generation: coordinode_query::index::GenerationId,
     ) -> Result<Option<Vec<u8>>, String> {
+        let (links, peers) = segment_peers(&self.node)
+            .ok_or("no peer holds a copy to replace this member's from")?;
         // Called from an index-check thread, outside the runtime.
         self.runtime
             .block_on(self.installer.prepare_generation(
-                &self.peers,
+                &links,
+                &peers,
                 generation,
                 1 << 20,
                 coordinode_replicate::PieceEncoding::None,
@@ -260,6 +265,7 @@ pub(crate) async fn serve(
         tls_key,
         tls_ca,
         tls_require_client_auth,
+        node_identity: node_identity_settings,
         // Already captured above via scrub_cfg before the move.
         scrub_enabled: _,
         scrub_interval_secs: _,
@@ -294,6 +300,40 @@ pub(crate) async fn serve(
         );
         std::process::exit(1);
     }
+    if tls_require_client_auth && tls_ca.is_none() {
+        return Err("tls_require_client_auth requires tls_ca".into());
+    }
+    // A node with peers authenticates every inter-node call under its node
+    // identity; there is no plaintext peer channel to fall back to. Its port
+    // presents that certificate to clients too, so a second server
+    // certificate would be ambiguous.
+    let node_identity = match (&peers, node_identity_settings) {
+        (Some(_), None) => {
+            return Err(
+                "a node with peers needs node_identity: the certificate, key and \
+                        trust bundles it proves itself to its peers with"
+                    .into(),
+            );
+        }
+        (Some(_), Some(_)) if tls_cert.is_some() || tls_key.is_some() => {
+            return Err(
+                "tls_cert / tls_key are not used with peers: the gRPC port presents \
+                        the node_identity certificate, which may carry the DNS names clients \
+                        verify"
+                    .into(),
+            );
+        }
+        (Some(_), Some(settings)) => Some(Arc::new(
+            crate::node_identity::NodeIdentity::load(settings)
+                .map_err(|e| format!("node_identity: {e}"))?,
+        )),
+        (None, Some(_)) => {
+            // Logging starts below; this line must not be lost.
+            eprintln!("warning: node_identity is configured without peers and is not used");
+            None
+        }
+        (None, None) => None,
+    };
 
     // A consumer's own liveness timeout is checked against the heartbeat
     // interval when it registers; nothing is shared to check here.
@@ -324,11 +364,11 @@ pub(crate) async fn serve(
     // possibly recovered) only to be abandoned. A client that connects before
     // the services are wired waits in the accept backlog. TCP_NODELAY is the
     // value `serve_with_shutdown(addr)` would have applied.
-    let grpc_incoming = tonic::transport::server::TcpIncoming::bind(addr)
-        .map_err(|e| format!("cannot bind the gRPC address {addr}: {e}"))?
-        .with_nodelay(Some(true));
+    let grpc_listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("cannot bind the gRPC address {addr}: {e}"))?;
     #[cfg(feature = "rest-proxy")]
-    let grpc_upstream = local_upstream(grpc_incoming.local_addr()?);
+    let grpc_upstream = local_upstream(grpc_listener.local_addr()?);
     // The ops and REST ports are claimed here too. A node running without its
     // ops listener has no /ready of its own, so a health check against that
     // port would get its answer from whatever holds it; one running without
@@ -417,10 +457,9 @@ pub(crate) async fn serve(
             let scrub_raft = Arc::clone(&raft_slot);
             let scrub_ckpt_dir = checkpoint_dir.clone();
             // Peers to pull a fresh copy from when scrub finds corruption
-            // (CE basic replica-fetch repair). Normalised to URIs; empty
-            // when standalone (nothing to repair from). Each node repairs
-            // its own corruption independently.
-            let repair_peers = peer_uris(peers.as_deref());
+            // (CE basic replica-fetch repair): the members at repair time,
+            // none when standalone. Each node repairs its own corruption
+            // independently.
             let repair_installer = Arc::new(coordinode_replicate::SegmentInstaller::new(
                 Arc::clone(&engine),
             ));
@@ -487,19 +526,21 @@ pub(crate) async fn serve(
                                 // standalone node has no peer to repair from.
                                 for part in corrupt {
                                     // 1) Replica-fetch repair from healthy peers.
-                                    let from_peers = if repair_peers.is_empty() {
-                                        None
-                                    } else {
-                                        Some(
+                                    let repair_peers =
+                                        scrub_raft.get().and_then(|raft| segment_peers(raft));
+                                    let from_peers = match &repair_peers {
+                                        None => None,
+                                        Some((links, peers)) => Some(
                                             repair_installer
                                                 .repair_partition(
-                                                    &repair_peers,
+                                                    links,
+                                                    peers,
                                                     part,
                                                     1 << 20,
                                                     coordinode_replicate::PieceEncoding::None,
                                                 )
                                                 .await,
-                                        )
+                                        ),
                                     };
                                     match from_peers {
                                         Some(Ok(bytes)) => {
@@ -676,57 +717,70 @@ pub(crate) async fn serve(
     // A server is not embedded in an application with a format of its own:
     // its host epoch is zero. It hosts the one group a deployment is formed
     // with.
-    let options = coordinode_raft::cluster::NodeOptions {
+    let mut options = coordinode_raft::cluster::NodeOptions {
         snapshots,
         host_epoch: 0,
         group: coordinode_raft::cluster::GroupId::FORMING,
-        connections: Default::default(),
+        ..Default::default()
     };
-    let (raft_node, raft_grpc_handler) = if let Some(ref peers_list) = peers {
-        let peer_count = peers_list.len();
-        if node_id == 1 {
-            info!(
-                peers = peer_count,
-                node_id, "cluster mode: bootstrap leader (open_cluster_embedded)"
-            );
-            let (rn, handler) =
-                coordinode_raft::cluster::RaftNode::open_cluster_embedded_with_options(
-                    node_id,
-                    Arc::clone(&engine),
-                    effective_advertise,
-                    options,
-                )
-                .await
-                .map_err(|e| format!("failed to open cluster Raft node: {e}"))?;
-            (rn, Some(handler))
+    let (raft_node, raft_grpc_handler) =
+        if let (Some(peers_list), Some(identity)) = (&peers, &node_identity) {
+            let peer_count = peers_list.len();
+            options.connections = Some(Arc::new(coordinode_raft::cluster::PeerConnections::new(
+                Arc::clone(identity.context()),
+            )));
+            info!(identity = %identity.context().identity(), "node identity");
+            if node_id == 1 {
+                info!(
+                    peers = peer_count,
+                    node_id, "cluster mode: bootstrap leader (open_cluster_embedded)"
+                );
+                // A deployment named here is the one an existing deployment's
+                // node forms its group in; none founds a new one.
+                options.deployment = identity.deployment()?;
+                let (rn, handler) =
+                    coordinode_raft::cluster::RaftNode::open_cluster_embedded_with_options(
+                        node_id,
+                        Arc::clone(&engine),
+                        effective_advertise,
+                        options,
+                    )
+                    .await
+                    .map_err(|e| format!("failed to open cluster Raft node: {e}"))?;
+                (rn, Some(handler))
+            } else {
+                info!(
+                    peers = peer_count,
+                    node_id, "cluster mode: joining node (open_joining_embedded)"
+                );
+                options.enrollment = Some(identity.enrollment()?);
+                let (rn, handler) =
+                    coordinode_raft::cluster::RaftNode::open_joining_embedded_with_options(
+                        node_id,
+                        Arc::clone(&engine),
+                        options,
+                    )
+                    .await
+                    .map_err(|e| format!("failed to open joining Raft node: {e}"))?;
+                (rn, Some(handler))
+            }
         } else {
-            info!(
-                peers = peer_count,
-                node_id, "cluster mode: joining node (open_joining_embedded)"
-            );
-            let (rn, handler) =
-                coordinode_raft::cluster::RaftNode::open_joining_embedded_with_options(
-                    node_id,
-                    Arc::clone(&engine),
-                    options,
-                )
-                .await
-                .map_err(|e| format!("failed to open joining Raft node: {e}"))?;
-            (rn, Some(handler))
-        }
-    } else {
-        info!(node_id, "standalone mode: single-node Raft (StubNetwork)");
-        let rn = coordinode_raft::cluster::RaftNode::open_with_oracle_and_options(
-            node_id,
-            Arc::clone(&engine),
-            Some(Arc::clone(&oracle)),
-            options,
-        )
-        .await
-        .map_err(|e| format!("failed to open Raft node: {e}"))?;
-        (rn, None)
-    };
+            info!(node_id, "standalone mode: single-node Raft (StubNetwork)");
+            let rn = coordinode_raft::cluster::RaftNode::open_with_oracle_and_options(
+                node_id,
+                Arc::clone(&engine),
+                Some(Arc::clone(&oracle)),
+                options,
+            )
+            .await
+            .map_err(|e| format!("failed to open Raft node: {e}"))?;
+            (rn, None)
+        };
 
+    // The deployment a node joining this one's is configured with.
+    if let Some(deployment) = raft_node.deployment() {
+        info!(%deployment, "deployment");
+    }
     if let Some(secs) = membership_change_timeout_secs {
         raft_node.set_membership_settle_timeout(std::time::Duration::from_secs(secs));
     }
@@ -795,13 +849,12 @@ pub(crate) async fn serve(
     // A copy of an index found damaged on this member alone is replaced from
     // a peer's copy; a standalone member has no peer and answers from its
     // records instead.
-    let index_copy_peers = peer_uris(peers.as_deref());
-    if !index_copy_peers.is_empty() {
+    if raft_node.connections().is_some() {
         database.set_index_copy_source(Arc::new(PeerIndexCopy {
             installer: Arc::new(coordinode_replicate::SegmentInstaller::new(Arc::clone(
                 &engine,
             ))),
-            peers: index_copy_peers,
+            node: Arc::clone(&raft_node),
             runtime: tokio::runtime::Handle::current(),
         }));
     }
@@ -1190,6 +1243,32 @@ pub(crate) async fn serve(
         });
     }
     let ops_readiness = readiness.clone();
+    // Reading the node's files again, on `POST /reload` and on SIGHUP: a
+    // renewed certificate or changed trust bundles take effect without a
+    // restart, and a set that does not validate leaves the last in force.
+    let reload: Option<ops::ReloadHook> = node_identity.clone().map(|identity| {
+        let hook: ops::ReloadHook = Arc::new(move || {
+            let outcome = identity.reload();
+            match &outcome {
+                Ok(()) => info!("node credentials and trust reloaded"),
+                Err(e) => tracing::error!(%e, "node credentials and trust not reloaded; the last valid ones stay"),
+            }
+            outcome
+        });
+        hook
+    });
+    #[cfg(unix)]
+    if let Some(reload) = reload.clone() {
+        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .map_err(|e| format!("failed to install SIGHUP handler: {e}"))?;
+        tokio::spawn(async move {
+            while hangup.recv().await.is_some() {
+                let reload = Arc::clone(&reload);
+                // The outcome is logged by the hook.
+                let _ = tokio::task::spawn_blocking(move || reload()).await;
+            }
+        });
+    }
     let version_view: ops::VersionView = {
         let node = Arc::clone(&raft_node);
         Arc::new(move || {
@@ -1198,8 +1277,14 @@ pub(crate) async fn serve(
         })
     };
     tokio::spawn(async move {
-        if let Err(e) =
-            ops::start_ops_server(ops_listener, ops_readiness, sample_gauges, version_view).await
+        if let Err(e) = ops::start_ops_server(
+            ops_listener,
+            ops_readiness,
+            sample_gauges,
+            version_view,
+            reload,
+        )
+        .await
         {
             tracing::error!("ops server error: {e}");
         }
@@ -1364,50 +1449,67 @@ pub(crate) async fn serve(
         server = server.http2_keepalive_interval(Some(std::time::Duration::from_secs(secs)));
     }
 
-    // TLS / mTLS for inter-node + client gRPC. Enabled when a cert+key are
-    // configured; the pure-Rust crypto provider was installed above so
-    // tonic's rustls config uses it (no C FFI). With require-client-auth,
-    // verify peer certs against the CA (mutual TLS).
-    if let (Some(cert_path), Some(key_path)) = (tls_cert.as_ref(), tls_key.as_ref()) {
-        use tonic::transport::{Certificate, Identity, ServerTlsConfig};
-        let cert =
-            std::fs::read(cert_path).map_err(|e| format!("read tls cert {cert_path}: {e}"))?;
-        let key = std::fs::read(key_path).map_err(|e| format!("read tls key {key_path}: {e}"))?;
-        // Read the CA once if configured: it verifies connecting clients
-        // (server-side mTLS) and the peers we dial (outbound client side).
-        let ca = match tls_ca.as_ref() {
-            Some(ca_path) => {
-                Some(std::fs::read(ca_path).map_err(|e| format!("read tls ca {ca_path}: {e}"))?)
-            }
-            None => None,
-        };
-        let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert, &key));
-        if tls_require_client_auth {
-            let ca = ca
-                .as_ref()
-                .ok_or("--tls-require-client-auth requires --tls-ca")?;
-            tls = tls.client_ca_root(Certificate::from_pem(ca));
+    // Client TLS. A standalone node serves TLS when a cert+key are
+    // configured; the crypto provider was installed above so tonic's rustls
+    // config uses it. With require-client-auth, client certificates are
+    // verified against the CA (mutual TLS).
+    //
+    // A node with peers serves one port to clients and nodes alike: it makes
+    // the TLS connection itself, presenting the node certificate, and tells a
+    // node's connection from a client's by the identity the certificate
+    // proves. Clients may connect in plain text unless they must present a
+    // certificate; nodes never.
+    let shared_port = match node_identity.as_ref() {
+        Some(identity) => {
+            let clients = match tls_ca.as_ref() {
+                Some(ca_path) => {
+                    let pem = std::fs::read(ca_path)
+                        .map_err(|e| format!("read tls ca {ca_path}: {e}"))?;
+                    let roots = coordinode_wire::tls::load_certs(&pem)
+                        .map_err(|e| format!("tls ca {ca_path}: {e}"))?;
+                    Some(
+                        coordinode_wire::tls::client_verifier(roots, tls_require_client_auth)
+                            .map_err(|e| format!("tls ca {ca_path}: {e}"))?,
+                    )
+                }
+                None => None,
+            };
+            info!(
+                client_certificates = clients.is_some(),
+                mtls = tls_require_client_auth,
+                "gRPC port shared by clients and nodes"
+            );
+            Some((
+                Arc::clone(identity.context()),
+                coordinode_wire::peer::Accept {
+                    inbound: coordinode_wire::peer::InboundAuth::Shared { clients },
+                    plaintext_clients: !tls_require_client_auth,
+                },
+            ))
         }
-        server = server
-            .tls_config(tls)
-            .map_err(|e| format!("tls config: {e}"))?;
-        // Outbound inter-node TLS (Raft network + segment drain): verify
-        // peers against the CA and present our identity for mutual TLS.
-        // Without a CA the node serves TLS but cannot verify peers, so a
-        // TLS cluster would not interconnect; keep outbound plaintext and
-        // warn rather than dial unverified.
-        match ca {
-            Some(ca) => {
-                let client_tls = coordinode_wire::build_client_tls(&ca, Some((cert, key)));
-                coordinode_wire::set_wire_client_tls(client_tls);
+        None => {
+            if let (Some(cert_path), Some(key_path)) = (tls_cert.as_ref(), tls_key.as_ref()) {
+                use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+                let cert = std::fs::read(cert_path)
+                    .map_err(|e| format!("read tls cert {cert_path}: {e}"))?;
+                let key =
+                    std::fs::read(key_path).map_err(|e| format!("read tls key {key_path}: {e}"))?;
+                let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert, &key));
+                if tls_require_client_auth {
+                    if let Some(ca_path) = tls_ca.as_ref() {
+                        let ca = std::fs::read(ca_path)
+                            .map_err(|e| format!("read tls ca {ca_path}: {e}"))?;
+                        tls = tls.client_ca_root(Certificate::from_pem(ca));
+                    }
+                }
+                server = server
+                    .tls_config(tls)
+                    .map_err(|e| format!("tls config: {e}"))?;
+                info!(mtls = tls_require_client_auth, "gRPC TLS enabled");
             }
-            None => tracing::warn!(
-                "gRPC TLS enabled without --tls-ca: outbound peer connections stay \
-                         plaintext; set --tls-ca to interconnect a TLS cluster"
-            ),
+            None
         }
-        info!(mtls = tls_require_client_auth, "gRPC TLS enabled");
-    }
+    };
 
     // Cap the decoded size of any single request to guard against
     // unbounded-allocation messages. Applied to every service.
@@ -1522,10 +1624,20 @@ pub(crate) async fn serve(
     // server). Gated on cluster mode: raft_grpc_handler is Some only when
     // peers are configured.
     if let Some(handler) = raft_grpc_handler {
+        use coordinode_raft::cluster::admission::nodes_only;
         use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
+        use tonic::service::interceptor::InterceptedService;
+        // Every inter-node service refuses a client before reading its
+        // message; the port also serves clients.
         // The frozen exchange a member of another version is answered with.
-        routes.add_service(handler.handshake_service());
-        routes.add_service(RaftServiceServer::new(handler));
+        routes.add_service(InterceptedService::new(
+            handler.handshake_service(),
+            nodes_only,
+        ));
+        routes.add_service(InterceptedService::new(
+            RaftServiceServer::new(handler),
+            nodes_only,
+        ));
         info!(node_id, "RaftService registered on :7080 (shared port)");
 
         // SegmentTransferService: receive bulk segment pushes (replication
@@ -1534,12 +1646,18 @@ pub(crate) async fn serve(
         use coordinode_replicate::segment_store::SegmentInstaller;
         use coordinode_replicate::transfer::SegmentTransferHandler;
         use coordinode_replicate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-        let segment_handler =
-            SegmentTransferHandler::new(Arc::new(SegmentInstaller::new(Arc::clone(&engine))));
-        routes.add_service(
+        let admission = raft_node
+            .admission()
+            .ok_or("a node with peers has an admission")?;
+        let segment_handler = SegmentTransferHandler::new(
+            Arc::new(SegmentInstaller::new(Arc::clone(&engine))),
+            Arc::clone(admission) as _,
+        );
+        routes.add_service(InterceptedService::new(
             SegmentTransferServiceServer::new(segment_handler)
                 .max_decoding_message_size(max_req_bytes),
-        );
+            nodes_only,
+        ));
         info!(
             node_id,
             "SegmentTransferService registered on :7080 (shared port)"
@@ -1560,9 +1678,22 @@ pub(crate) async fn serve(
     // The listener is bound and every service registered: connections that
     // arrive now are accepted as soon as the server below starts polling.
     readiness.set(true);
-    router
-        .serve_with_incoming_shutdown(grpc_incoming, shutdown)
-        .await?;
+    match shared_port {
+        Some((context, accept)) => {
+            let incoming = coordinode_wire::peer::incoming(grpc_listener, &context, accept)
+                .map_err(|e| format!("gRPC port TLS configuration: {e}"))?;
+            router
+                .serve_with_incoming_shutdown(incoming, shutdown)
+                .await?;
+        }
+        None => {
+            let incoming =
+                tonic::transport::server::TcpIncoming::from(grpc_listener).with_nodelay(Some(true));
+            router
+                .serve_with_incoming_shutdown(incoming, shutdown)
+                .await?;
+        }
+    }
     drop(index_definitions);
 
     if let Some(fatal) = fatal_rx.borrow().clone() {

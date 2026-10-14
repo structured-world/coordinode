@@ -45,6 +45,7 @@ pub use registry::{
     ShardConsumerRegistry, SystemClock, TerminalReason, TopologyScope, ValidatedRetentionBounds,
 };
 pub use segment_store::{RepairError, SegmentInstaller};
+pub use transfer::PeerLinks;
 pub use writer::ReplicatedWriter;
 
 // Re-exported so server-side callers can name the causal token type

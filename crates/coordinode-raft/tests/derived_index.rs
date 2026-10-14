@@ -17,11 +17,11 @@ use coordinode_core::txn::proposal::{
     ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
 
 struct Member {
     node: RaftNode,
@@ -52,6 +52,19 @@ async fn await_leadership(node: &RaftNode) {
     assert!(node.is_leader().await, "node {} never led", node.node_id());
 }
 
+/// The CA the members of a test's group prove their identities under.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
+
+/// The enrollment of a node joining the group `founder` formed on `port`.
+fn enroll(founder: &RaftNode, port: u16) -> Enrollment {
+    Enrollment {
+        deployment: founder
+            .deployment()
+            .expect("the founder knows its deployment"),
+        authorities: vec![PKI.target(founder.node_id(), format!("127.0.0.1:{port}"))],
+    }
+}
+
 async fn bootstrap_3() -> (Member, Member, Member) {
     let ports = [alloc_port(), alloc_port(), alloc_port()];
     let dir1 = tempfile::tempdir().expect("d1");
@@ -61,6 +74,7 @@ async fn bootstrap_3() -> (Member, Member, Member) {
         Arc::clone(&e1),
         format!("127.0.0.1:{}", ports[0]).parse().expect("addr"),
         format!("http://127.0.0.1:{}", ports[0]),
+        PKI.connections(1),
     )
     .await
     .expect("leader");
@@ -72,6 +86,8 @@ async fn bootstrap_3() -> (Member, Member, Member) {
             id,
             Arc::clone(&engine),
             format!("127.0.0.1:{port}").parse().expect("addr"),
+            PKI.connections(id),
+            enroll(&n1, ports[0]),
         )
         .await
         .expect("joining");
@@ -83,7 +99,7 @@ async fn bootstrap_3() -> (Member, Member, Member) {
     }
     await_leadership(&n1).await;
     for (id, port) in [(2u64, ports[1]), (3, ports[2])] {
-        n1.add_node(id, format!("http://127.0.0.1:{port}"))
+        n1.add_node(id, format!("http://127.0.0.1:{port}"), PKI.identity(id))
             .await
             .expect("add");
     }
@@ -302,6 +318,7 @@ async fn a_member_joining_from_a_snapshot_derives_the_log_tail() {
                     log_bytes: u64::MAX,
                     ..Default::default()
                 },
+                connections: Some(PKI.connections(1)),
                 ..Default::default()
             },
         )
@@ -327,10 +344,12 @@ async fn a_member_joining_from_a_snapshot_derives_the_log_tail() {
             2,
             Arc::clone(&e2),
             format!("127.0.0.1:{p2}").parse().expect("addr"),
+            PKI.connections(2),
+            enroll(&n1, p1),
         )
         .await
         .expect("joining");
-        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), PKI.identity(2))
             .await
             .expect("add n2");
 

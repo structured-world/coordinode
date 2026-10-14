@@ -48,3 +48,8 @@ pub mod admin {
 pub mod session {
     include!(concat!(env!("OUT_DIR"), "/coordinode.v1.session.rs"));
 }
+
+#[allow(clippy::all, dead_code)]
+pub mod internode {
+    include!(concat!(env!("OUT_DIR"), "/coordinode.internode.rs"));
+}

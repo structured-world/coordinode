@@ -40,10 +40,14 @@ async fn more_writes_than_workers_all_commit() {
         Tier::Warm,
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
-    let (raft, raft_handler) =
-        RaftNode::open_cluster_embedded(1, Arc::clone(&engine), format!("http://127.0.0.1:{port}"))
-            .await
-            .unwrap();
+    let (raft, raft_handler) = RaftNode::open_cluster_embedded(
+        1,
+        Arc::clone(&engine),
+        format!("127.0.0.1:{port}"),
+        coordinode_test_fixtures::TestPki::new().connections(1),
+    )
+    .await
+    .unwrap();
     let raft = Arc::new(raft);
     for _ in 0..150 {
         if raft.is_leader().await {
@@ -63,15 +67,15 @@ async fn more_writes_than_workers_all_commit() {
     )
     .with_raft_node(Arc::clone(&raft));
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(RaftServiceServer::new(raft_handler))
-            .add_service(query::cypher_service_server::CypherServiceServer::new(
-                cypher,
-            ))
-            .serve(addr)
-            .await
-    });
+    let context = Arc::clone(raft.connections().unwrap().context());
+    coordinode_test_fixtures::serve_member_port(
+        addr,
+        &context,
+        tonic::service::Routes::new(RaftServiceServer::new(raft_handler)).add_service(
+            query::cypher_service_server::CypherServiceServer::new(cypher),
+        ),
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let writes: Vec<_> = (0..8)

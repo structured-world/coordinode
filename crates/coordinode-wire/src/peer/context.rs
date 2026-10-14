@@ -10,6 +10,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -87,6 +88,9 @@ struct State {
 pub struct SecurityContext {
     provider: Arc<CryptoProvider>,
     state: ArcSwap<State>,
+    /// Raised by every trust update, so a connection verified under older
+    /// trust is verified again before it carries more traffic.
+    generation: AtomicU64,
 }
 
 impl fmt::Debug for SecurityContext {
@@ -122,6 +126,7 @@ impl SecurityContext {
                 profile,
                 identity: own.identity,
             }),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -129,6 +134,19 @@ impl SecurityContext {
     #[must_use]
     pub fn identity(&self) -> PeerIdentity {
         self.state.load().identity.clone()
+    }
+
+    /// The trust generation: raised by every trust update.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Whether `end_entity` presents itself as a node identity under the
+    /// current profile.
+    #[must_use]
+    pub fn claims_node_identity(&self, end_entity: &CertificateDer<'_>) -> bool {
+        self.state.load().profile.claims_node_identity(end_entity)
     }
 
     /// Replace the node's certificate and key: a renewal keeping the same
@@ -183,7 +201,52 @@ impl SecurityContext {
             profile,
             identity: own.identity,
         }));
+        // After the store: a connection that sees the new generation
+        // verifies against the new profile.
+        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Replace the credentials and the profile together, as one validated
+    /// replacement: what a reload of a node's certificate, key and trust
+    /// bundles publishes when a CA rotation changes both at once. Every
+    /// established connection is verified again under the new profile.
+    ///
+    /// # Errors
+    ///
+    /// The credentials do not parse or match, are no valid identity under
+    /// `profile`, or name another identity than the node has; the current
+    /// credentials and profile stay in force.
+    pub fn replace(
+        &self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        profile: PeerProfile,
+    ) -> Result<(), ContextError> {
+        let current = self.state.load_full();
+        let profile = Arc::new(profile);
+        let (credentials, own) = certify(&self.provider, chain, key, &profile)?;
+        if own.identity != current.identity {
+            return Err(ContextError::IdentityChanged {
+                current: current.identity.clone(),
+                new: own.identity,
+            });
+        }
+        self.state.store(Arc::new(State {
+            credentials,
+            profile,
+            identity: own.identity,
+        }));
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Verify every established connection's peer again before it carries
+    /// more traffic, under the trust in force: what a host calls once its
+    /// adapter stops admitting an identity (its issuer revoked it), so the
+    /// revocation reaches connections made before it.
+    pub fn reverify_peers(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Verify a peer's chain under the current profile.
@@ -397,11 +460,23 @@ impl InboundVerifier {
 
 impl ClientCertVerifier for InboundVerifier {
     fn client_auth_mandatory(&self) -> bool {
-        matches!(self.inbound, InboundAuth::NodeOnly)
+        match &self.inbound {
+            InboundAuth::NodeOnly => true,
+            // A port whose clients must present certificates leaves no one
+            // without one.
+            InboundAuth::Shared { clients } => clients
+                .as_ref()
+                .is_some_and(|clients| clients.client_auth_mandatory()),
+        }
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
+        match &self.inbound {
+            InboundAuth::Shared {
+                clients: Some(clients),
+            } => clients.root_hint_subjects(),
+            _ => &[],
+        }
     }
 
     fn verify_client_cert(

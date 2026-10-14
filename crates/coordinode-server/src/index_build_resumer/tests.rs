@@ -10,13 +10,20 @@ use coordinode_test_fixtures::alloc_port;
 
 use super::*;
 
+/// The CA the members of these tests are issued their identities by.
+static PKI: std::sync::LazyLock<coordinode_test_fixtures::TestPki> =
+    std::sync::LazyLock::new(coordinode_test_fixtures::TestPki::new);
+
 struct Member {
     db: Arc<parking_lot::RwLock<Database>>,
     node: Arc<RaftNode>,
+    port: u16,
     _dir: tempfile::TempDir,
 }
 
-async fn open_member(node_id: u64, port: u16, founder: bool) -> Member {
+/// Open member `node_id` on `port`: the founder of a group, or a node
+/// joining `founder`'s.
+async fn open_member(node_id: u64, port: u16, founder: Option<&Member>) -> Member {
     let dir = tempfile::tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -28,19 +35,32 @@ async fn open_member(node_id: u64, port: u16, founder: bool) -> Member {
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).unwrap());
     let listen: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let node = Arc::new(if founder {
-        RaftNode::open_cluster(
+    let connections = PKI.connections(node_id);
+    let node = Arc::new(match founder {
+        None => RaftNode::open_cluster(
             node_id,
             Arc::clone(&engine),
             listen,
-            format!("http://127.0.0.1:{port}"),
+            format!("127.0.0.1:{port}"),
+            connections,
         )
         .await
-        .unwrap()
-    } else {
-        RaftNode::open_joining(node_id, Arc::clone(&engine), listen)
+        .unwrap(),
+        Some(founder) => {
+            let enrollment = founder
+                .node
+                .enrollment(format!("127.0.0.1:{}", founder.port))
+                .unwrap();
+            RaftNode::open_joining(
+                node_id,
+                Arc::clone(&engine),
+                listen,
+                connections,
+                enrollment,
+            )
             .await
             .unwrap()
+        }
     });
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
@@ -50,6 +70,7 @@ async fn open_member(node_id: u64, port: u16, founder: bool) -> Member {
     Member {
         db,
         node,
+        port,
         _dir: dir,
     }
 }
@@ -166,11 +187,11 @@ async fn hand_over_a_held_build(from: &Member, to: &Member, name: &str, property
 #[tokio::test(flavor = "multi_thread")]
 async fn a_repair_on_the_leader_reaches_a_follower() {
     let (p1, p2) = (alloc_port(), alloc_port());
-    let m1 = open_member(1, p1, true).await;
-    let m2 = open_member(2, p2, false).await;
+    let m1 = open_member(1, p1, None).await;
+    let m2 = open_member(2, p2, Some(&m1)).await;
     await_leader(&m1).await;
     m1.node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .unwrap();
     m1.node.change_membership(vec![1, 2]).await.unwrap();
@@ -234,11 +255,11 @@ async fn a_repair_on_the_leader_reaches_a_follower() {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_new_leader_finishes_the_build_the_old_one_held() {
     let (p1, p2) = (alloc_port(), alloc_port());
-    let m1 = open_member(1, p1, true).await;
-    let m2 = open_member(2, p2, false).await;
+    let m1 = open_member(1, p1, None).await;
+    let m2 = open_member(2, p2, Some(&m1)).await;
     await_leader(&m1).await;
     m1.node
-        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
         .await
         .unwrap();
     m1.node.change_membership(vec![1, 2]).await.unwrap();

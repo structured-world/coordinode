@@ -265,6 +265,12 @@ pub enum MetadataCommand {
         /// The pair the leader runs.
         pair: crate::version::VersionPair,
     },
+    /// Record the deployment's identity, unless one is recorded already:
+    /// the first record stands for the deployment's life.
+    RecordDeployment {
+        /// The identity the founding leader chose.
+        id: crate::group::DeploymentId,
+    },
 }
 
 impl MetadataCommand {
@@ -275,6 +281,7 @@ impl MetadataCommand {
             Self::AdoptFields { bindings } => bindings.iter().map(|(n, _)| n.len() + 6).sum(),
             Self::GrantNodeLease { token, .. } => 16 + token.len(),
             Self::RecordGroupPair { .. } => 12,
+            Self::RecordDeployment { .. } => 16,
         }
     }
 }

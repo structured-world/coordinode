@@ -1,4 +1,5 @@
-//! Inter-node wire transport codec: pure-Rust zstd compression for gRPC.
+//! Inter-node wire: the transport codec and the authenticated connections
+//! every inter-node service runs over.
 //!
 //! [`ZstdCodec`] is a drop-in [`tonic::codec::Codec`] that compresses every gRPC
 //! message body on the wire with pure-Rust zstd ([`structured_zstd`], no C
@@ -7,6 +8,10 @@
 //! both ends use it symmetrically, so a service's payloads travel compressed
 //! between replicas — most valuable on a bandwidth-constrained geo link. Shared
 //! by every inter-node service (RaftService, SegmentTransferService).
+//!
+//! [`peer`] authenticates the nodes at both ends of a connection: each
+//! database has its own security context, dials a peer expecting the
+//! identity it must prove, and accepts connections that prove one.
 //!
 //! The transport zstd level is process-global, set once at startup from config
 //! ([`set_wire_zstd_level`]); the default is a fast level suited to hot paths and
@@ -19,7 +24,6 @@
 
 use core::marker::PhantomData;
 use std::io::Read;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use bytes::{Buf, BufMut};
@@ -28,76 +32,9 @@ use structured_zstd::decoding::StreamingDecoder;
 use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
 use tonic::Status;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 pub mod peer;
 pub mod tls;
-
-/// Process-wide outbound TLS config for inter-node gRPC clients (the Raft network
-/// and segment-transfer drain). Set once at startup from config when inter-node
-/// TLS is enabled; `None` (never set) means plaintext outbound connections. The
-/// node's own certificate is a single per-process identity, so one config covers
-/// every peer dial, mirroring [`set_wire_zstd_level`].
-static WIRE_CLIENT_TLS: OnceLock<ClientTlsConfig> = OnceLock::new();
-
-/// Install the outbound inter-node client TLS config. Call once at startup,
-/// before any peer connection is opened; later calls are ignored. tonic builds
-/// the rustls config from the process default provider, so the selected one
-/// is installed here when no default exists yet.
-pub fn set_wire_client_tls(config: ClientTlsConfig) {
-    tls::ensure_default_provider();
-    let _ = WIRE_CLIENT_TLS.set(config);
-}
-
-/// The installed outbound client TLS config, or `None` when inter-node TLS is
-/// off. Outbound connectors apply it to their endpoint before dialing a peer.
-#[must_use]
-pub fn wire_client_tls() -> Option<ClientTlsConfig> {
-    WIRE_CLIENT_TLS.get().cloned()
-}
-
-/// A peer address as a URI to dial. Operators give members as `host:port`; that
-/// gets the scheme this node's inter-node transport uses (`https` when
-/// inter-node TLS is on, `http` otherwise). An address that names its scheme is
-/// kept as given.
-#[must_use]
-pub fn peer_uri(addr: &str) -> String {
-    if addr.contains("://") {
-        addr.to_owned()
-    } else if WIRE_CLIENT_TLS.get().is_some() {
-        format!("https://{addr}")
-    } else {
-        format!("http://{addr}")
-    }
-}
-
-/// An endpoint for dialing the peer at `addr`: [`peer_uri`], with the outbound
-/// inter-node TLS applied when it is on. Every inter-node client builds its
-/// connection here, so no hop is left plaintext or unreachable by address form.
-///
-/// # Errors
-///
-/// `addr` is not a valid URI, or the TLS config does not apply to it.
-pub fn peer_endpoint(addr: &str) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
-    let endpoint = tonic::transport::Endpoint::from_shared(peer_uri(addr))?;
-    match wire_client_tls() {
-        Some(tls) => endpoint.tls_config(tls),
-        None => Ok(endpoint),
-    }
-}
-
-/// Build an outbound [`ClientTlsConfig`] from PEM bytes: `ca_pem` is the trust
-/// root that verifies the peer's certificate; `identity` is this node's
-/// `(cert_pem, key_pem)`, presented when the peer enforces mutual TLS (harmless
-/// otherwise). Pair with [`set_wire_client_tls`] at startup.
-#[must_use]
-pub fn build_client_tls(ca_pem: &[u8], identity: Option<(Vec<u8>, Vec<u8>)>) -> ClientTlsConfig {
-    let mut config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
-    if let Some((cert_pem, key_pem)) = identity {
-        config = config.identity(Identity::from_pem(cert_pem, key_pem));
-    }
-    config
-}
 
 /// Process-global transport zstd level (C-zstd numbering). Positive 1..=22 trade
 /// speed for ratio; NEGATIVE values select zstd ultra-fast modes (fastest, lowest

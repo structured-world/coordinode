@@ -2,6 +2,10 @@
 //!
 //! Implements all 5 openraft network traits over tonic gRPC.
 //! Uses opaque bytes (msgpack serialization) for all openraft types.
+//!
+//! A peer is dialed expecting the node identity its membership entry
+//! records: the address there is only where to find it. A member that
+//! records no identity is never dialed.
 
 use std::future::Future;
 use std::time::Duration;
@@ -20,7 +24,13 @@ use std::sync::Arc;
 
 use coordinode_core::version::Handshake;
 
+use coordinode_wire::peer::PeerTarget;
+
+use coordinode_wire::peer::PeerConnections;
+
+use super::admission::{DeploymentView, member_target, write_deployment};
 use super::version::{VersionGate, read_handshake, write_handshake};
+use crate::member::MemberNode;
 use crate::proto::internode::HandshakeRecord;
 use crate::proto::internode::version_handshake_client::VersionHandshakeClient;
 use crate::proto::replication::RaftPayload;
@@ -58,10 +68,13 @@ fn tonic_to_rpc_error(status: tonic::Status) -> RPCError<C> {
 
 // ── Version records ────────────────────────────────────────────────
 
-/// A call carrying this member's version record.
-fn stamped<T>(gate: &VersionGate, body: T) -> tonic::Request<T> {
+/// A call carrying this member's version record and its deployment.
+fn stamped<T>(gate: &VersionGate, deployment: &DeploymentView, body: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(body);
     write_handshake(request.metadata_mut(), &gate.local_handshake());
+    if let Some(deployment) = deployment.get() {
+        write_deployment(request.metadata_mut(), deployment);
+    }
     request
 }
 
@@ -124,53 +137,28 @@ async fn unless_closing<T>(
     }
 }
 
-// ── Peer connections ───────────────────────────────────────────────
+// ── Member book ────────────────────────────────────────────────────
 
-/// The connections from this server to its peers, one per peer address,
-/// shared by every group the server hosts and by every client openraft makes
-/// for a peer. All groups two servers share travel over one HTTP/2
-/// connection between them, so connections grow with peer pairs, not with
-/// groups or with replication restarts.
+/// Where each member is found and whom it must prove there, as the
+/// membership in effect says. A replication stream outlives a change to its
+/// member's entry, so a call reads the entry here each time it dials rather
+/// than keeping the one its stream started with: a member re-addressed is
+/// reached at its new address with no other change.
 #[derive(Default)]
-pub struct PeerConnections {
-    // no-std: spin::Mutex; taken once per new peer client, never per call.
-    channels: parking_lot::Mutex<std::collections::HashMap<String, tonic::transport::Channel>>,
+pub(crate) struct MemberBook {
+    // no-std: spin::RwLock; read when a peer client is built, written when
+    // the membership changes.
+    members: parking_lot::RwLock<std::collections::BTreeMap<u64, MemberNode>>,
 }
 
-impl PeerConnections {
-    /// The connection to the peer at `addr`, made on first use. A channel
-    /// connects lazily and reconnects after a drop, so the one kept here
-    /// serves the peer for the life of the server.
-    fn channel(&self, addr: &str) -> Result<tonic::transport::Channel, RPCError<C>> {
-        let mut channels = self.channels.lock();
-        if let Some(channel) = channels.get(addr) {
-            return Ok(channel.clone());
-        }
-        let endpoint = coordinode_wire::peer_endpoint(addr)
-            .map_err(|e| {
-                RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("peer address '{addr}': {e}"),
-                )))
-            })?
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30));
-        // connect_lazy() returns at once and connects on the first call;
-        // connect().await would make a one-shot connection that never
-        // recovers once it drops.
-        let channel = endpoint.connect_lazy();
-        channels.insert(addr.to_string(), channel.clone());
-        Ok(channel)
+impl MemberBook {
+    /// Replace the book with the members of the membership in effect.
+    pub(crate) fn set<'a>(&self, members: impl Iterator<Item = (&'a u64, &'a MemberNode)>) {
+        *self.members.write() = members.map(|(&id, node)| (id, node.clone())).collect();
     }
 
-    /// How many peers this server holds a connection to.
-    pub fn len(&self) -> usize {
-        self.channels.lock().len()
-    }
-
-    /// Whether this server holds no peer connection yet.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    fn get(&self, node_id: u64) -> Option<MemberNode> {
+        self.members.read().get(&node_id).cloned()
     }
 }
 
@@ -186,23 +174,29 @@ pub struct GrpcNetworkFactory {
     /// This member's version view: stamps every call, learns from every
     /// answer.
     pub(crate) gate: Arc<VersionGate>,
-    /// The server's connections to its peers, shared with its other groups.
+    /// The deployment every call names.
+    pub(crate) deployment: DeploymentView,
+    /// The connections to peers, made under this member's security context.
     pub(crate) connections: Arc<PeerConnections>,
+    /// The members as the membership in effect records them.
+    pub(crate) book: Arc<MemberBook>,
 }
 
 impl RaftNetworkFactory<C> for GrpcNetworkFactory {
     type Network = GrpcNetwork;
 
-    async fn new_client(&mut self, target: u64, node: &crate::member::MemberNode) -> Self::Network {
+    async fn new_client(&mut self, target: u64, node: &MemberNode) -> Self::Network {
         GrpcNetwork {
             group: self.gate.group().raw(),
             local_node_id: self.local_node_id,
             target_node_id: target,
-            addr: node.addr.clone(),
-            connections: Arc::clone(&self.connections),
+            first_seen: node.clone(),
+            book: Arc::clone(&self.book),
             client: None,
             closing: self.closing.clone(),
             gate: Arc::clone(&self.gate),
+            deployment: self.deployment.clone(),
+            connections: Arc::clone(&self.connections),
         }
     }
 }
@@ -233,14 +227,19 @@ pub struct GrpcNetwork {
     local_node_id: u64,
     /// Target peer node id, for the test-only partition nemesis gate.
     target_node_id: u64,
-    addr: String,
-    /// The server's connections; the one to this peer carries the consensus
-    /// client and the version exchange of every group.
-    connections: Arc<PeerConnections>,
-    client: Option<RaftServiceClient<tonic::transport::Channel>>,
+    /// The peer's entry when its stream started, until the book has one.
+    first_seen: MemberNode,
+    /// The members as the membership in effect records them.
+    book: Arc<MemberBook>,
+    /// The consensus client, and the peer it dials.
+    client: Option<(PeerTarget, RaftServiceClient<tonic::transport::Channel>)>,
     /// Fails this peer's calls once this node shuts down.
     closing: Closing,
     gate: Arc<VersionGate>,
+    /// The deployment calls name.
+    deployment: DeploymentView,
+    /// The connections calls travel over.
+    connections: Arc<PeerConnections>,
 }
 
 impl GrpcNetwork {
@@ -273,17 +272,26 @@ impl GrpcNetwork {
         &mut self,
     ) -> Result<&mut RaftServiceClient<tonic::transport::Channel>, RPCError<C>> {
         self.ensure_peer_matches().await?;
-        if self.client.is_none() {
-            let channel = self.get_channel()?;
-            self.client = Some(RaftServiceClient::new(channel));
+        let peer = self.peer()?;
+        // A client made for where the peer was before it moved is replaced.
+        if self
+            .client
+            .as_ref()
+            .is_none_or(|(dialed, _)| *dialed != peer)
+        {
+            let channel = self.channel(&peer)?;
+            self.client = Some((peer, RaftServiceClient::new(channel)));
         }
 
         // Safe: we just set client above if it was None
-        self.client.as_mut().ok_or_else(|| {
-            RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
-                "client initialization failed",
-            )))
-        })
+        self.client
+            .as_mut()
+            .map(|(_, client)| client)
+            .ok_or_else(|| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
+                    "client initialization failed",
+                )))
+            })
     }
 
     /// A peer last seen at another pair is sent the version exchange alone:
@@ -293,12 +301,16 @@ impl GrpcNetwork {
         if self.gate.peer_matches(self.target_node_id) != Some(false) {
             return Ok(());
         }
-        let channel = self.get_channel()?;
+        let channel = self.channel(&self.peer()?)?;
         let mut exchange = VersionHandshakeClient::new(channel);
         let answer = exchange
-            .exchange(HandshakeRecord {
-                record: self.gate.local_handshake().encode(),
-            })
+            .exchange(stamped(
+                &self.gate,
+                &self.deployment,
+                HandshakeRecord {
+                    record: self.gate.local_handshake().encode(),
+                },
+            ))
             .await
             .map_err(tonic_to_rpc_error)?;
         if let Ok(peer) = Handshake::decode(&answer.into_inner().record) {
@@ -319,10 +331,43 @@ impl GrpcNetwork {
         )))
     }
 
-    /// A handle onto the server's one connection to this peer.
-    fn get_channel(&self) -> Result<tonic::transport::Channel, RPCError<C>> {
-        self.connections.channel(&self.addr)
+    /// The peer as the membership in effect records it: where to find it
+    /// and the identity it must prove there.
+    fn peer(&self) -> Result<PeerTarget, RPCError<C>> {
+        let node = self
+            .book
+            .get(self.target_node_id)
+            .unwrap_or_else(|| self.first_seen.clone());
+        member_target(&node).ok_or_else(|| {
+            unreachable(format!(
+                "node {} at '{}' records no node identity to expect",
+                self.target_node_id, node.addr
+            ))
+        })
     }
+
+    /// A handle onto the one connection to `peer`, made expecting its
+    /// identity.
+    fn channel(&self, peer: &PeerTarget) -> Result<tonic::transport::Channel, RPCError<C>> {
+        self.connections
+            .channel(peer)
+            .map_err(|e| unreachable(e.to_string()))
+    }
+
+    /// Where the peer is found, for messages.
+    fn addr(&self) -> String {
+        self.book
+            .get(self.target_node_id)
+            .unwrap_or_else(|| self.first_seen.clone())
+            .addr
+    }
+}
+
+fn unreachable(reason: String) -> RPCError<C> {
+    RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        reason,
+    )))
 }
 
 impl NetBackoff<C> for GrpcNetwork {
@@ -344,9 +389,11 @@ impl NetVote<C> for GrpcNetwork {
         }
         let closing = self.closing.clone();
         let gate = Arc::clone(&self.gate);
+        let deployment = self.deployment.clone();
         unless_closing(&closing, async {
             let request = stamped(
                 &gate,
+                &deployment,
                 RaftPayload {
                     data: serialize(&rpc)?,
                     group: self.group,
@@ -381,6 +428,7 @@ impl NetStreamAppend<C> for GrpcNetwork {
         let group = self.group;
         let closing = self.closing.clone();
         let gate = Arc::clone(&self.gate);
+        let deployment = self.deployment.clone();
         Box::pin(async move {
             if let Some(e) = partition {
                 return Err(e);
@@ -402,7 +450,7 @@ impl NetStreamAppend<C> for GrpcNetwork {
             // Call bidi streaming RPC
             let response = unless_closing(&closing, async {
                 client
-                    .stream_append(stamped(&gate, request_stream))
+                    .stream_append(stamped(&gate, &deployment, request_stream))
                     .await
                     .map_err(|s| refused(&gate, s))
             })
@@ -463,9 +511,10 @@ impl NetSnapshot<C> for GrpcNetwork {
                 )),
             ));
         }
-        let target_addr = self.addr.clone();
+        let target_addr = self.addr();
         let closing = self.closing.clone();
         let gate = Arc::clone(&self.gate);
+        let deployment = self.deployment.clone();
         let group = self.group;
         let client = self.get_client().await.map_err(|e| {
             let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e.to_string());
@@ -551,7 +600,7 @@ impl NetSnapshot<C> for GrpcNetwork {
         // If replication is cancelled (leader steps down, follower removed),
         // abort the transfer immediately instead of blocking on send.
         let cancel_boxed = Box::pin(cancel);
-        let grpc_fut = client.snapshot(stamped(&gate, request_stream));
+        let grpc_fut = client.snapshot(stamped(&gate, &deployment, request_stream));
 
         let response = tokio::select! {
             result = grpc_fut => {
@@ -607,9 +656,11 @@ impl NetTransferLeader<C> for GrpcNetwork {
         }
         let closing = self.closing.clone();
         let gate = Arc::clone(&self.gate);
+        let deployment = self.deployment.clone();
         unless_closing(&closing, async {
             let request = stamped(
                 &gate,
+                &deployment,
                 RaftPayload {
                     data: serialize(&req)?,
                     group: self.group,

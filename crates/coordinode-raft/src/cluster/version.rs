@@ -428,9 +428,18 @@ impl crate::proto::internode::version_handshake_server::VersionHandshake for Han
         &self,
         request: tonic::Request<crate::proto::internode::HandshakeRecord>,
     ) -> Result<tonic::Response<crate::proto::internode::HandshakeRecord>, tonic::Status> {
-        let gate = match Handshake::decode(&request.into_inner().record) {
+        use super::admission::{Admission, Operation};
+        use coordinode_wire::peer::PeerConnectInfo;
+
+        // The caller is admitted as a member before anything it says is
+        // learnt or anything about this member is told.
+        let (metadata, extensions, body) = request.into_parts();
+        let info = extensions.get::<PeerConnectInfo>();
+        let gate = match Handshake::decode(&body.record) {
             Ok(peer) => {
-                let gate = self.groups.gate(peer.group_id)?;
+                let (gate, admission) = self.groups.member(peer.group_id)?;
+                let caller = admission.admit(info, &metadata, Operation::Exchange)?;
+                Admission::same_member(caller, peer.node_id)?;
                 gate.observe(&peer);
                 gate
             }
@@ -439,11 +448,13 @@ impl crate::proto::internode::version_handshake_server::VersionHandshake for Han
             // what this member runs.
             Err(e) => {
                 tracing::debug!(%e, "an undecodable version handshake");
-                self.groups.sole_gate().ok_or_else(|| {
+                let (gate, admission) = self.groups.sole_member().ok_or_else(|| {
                     tonic::Status::invalid_argument(format!(
                         "an undecodable version handshake names no group: {e}"
                     ))
-                })?
+                })?;
+                admission.admit(info, &metadata, Operation::Exchange)?;
+                gate
             }
         };
         Ok(tonic::Response::new(

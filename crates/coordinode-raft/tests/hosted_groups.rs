@@ -7,7 +7,6 @@
 //! host, or one whose parts name different groups, is refused by name.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use coordinode_core::txn::proposal::{
@@ -16,7 +15,9 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::grpc_server::{GROUP_NOT_HOSTED, HostError};
 use coordinode_raft::cluster::version::write_handshake;
-use coordinode_raft::cluster::{GroupId, NodeOptions, PeerConnections, RaftGrpcHandler, RaftNode};
+use coordinode_raft::cluster::{
+    DeploymentId, Enrollment, GroupId, NodeOptions, PeerConnections, RaftGrpcHandler, RaftNode,
+};
 use coordinode_raft::proto::replication::RaftPayload;
 use coordinode_raft::proto::replication::raft_service_client::RaftServiceClient;
 use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
@@ -24,7 +25,7 @@ use coordinode_raft::storage::TypeConfig;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
 use futures_util::StreamExt;
 use tonic_types::StatusExt;
 
@@ -49,42 +50,67 @@ fn engine() -> (Arc<StorageEngine>, tempfile::TempDir) {
     (Arc::new(StorageEngine::open(&config).expect("open")), dir)
 }
 
-fn options(group: GroupId, connections: &Arc<PeerConnections>) -> NodeOptions {
+/// The CA the servers of a test prove their identities under; server `n`
+/// is node `n` of every group it hosts.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
+
+/// How a server's replica of a group is opened.
+enum Role {
+    /// The group forms around it, in the deployment given or a new one.
+    Forms(Option<DeploymentId>),
+    /// It joins, enrolled so.
+    Joins(Enrollment),
+}
+
+/// The enrollment of a replica joining a group of `deployment` that server
+/// `founder` formed on `port`.
+fn enroll(deployment: DeploymentId, founder: u64, port: u16) -> Enrollment {
+    Enrollment {
+        deployment,
+        authorities: vec![PKI.target(founder, format!("127.0.0.1:{port}"))],
+    }
+}
+
+fn options(group: GroupId, connections: &Arc<PeerConnections>, role: &Role) -> NodeOptions {
+    let (enrollment, deployment) = match role {
+        Role::Forms(deployment) => (None, *deployment),
+        Role::Joins(enrollment) => (Some(enrollment.clone()), None),
+    };
     NodeOptions {
         group,
-        connections: Arc::clone(connections),
+        connections: Some(Arc::clone(connections)),
+        enrollment,
+        deployment,
         ..NodeOptions::default()
     }
 }
 
-/// Server `node_id`'s replica of `group`: the group's founding member when
-/// `forms`, a member waiting to be added otherwise. The server's groups share
-/// `connections`.
+/// Server `node_id`'s replica of `group`, opened as `role`. The server's
+/// groups share `connections`.
 async fn replica(
     node_id: u64,
     group: GroupId,
     port: u16,
-    forms: bool,
+    role: Role,
     connections: &Arc<PeerConnections>,
 ) -> (Replica, RaftGrpcHandler) {
     let (engine, dir) = engine();
-    let (node, handler) = if forms {
-        RaftNode::open_cluster_embedded_with_options(
+    let (node, handler) = match &role {
+        Role::Forms(_) => RaftNode::open_cluster_embedded_with_options(
             node_id,
             Arc::clone(&engine),
             format!("http://127.0.0.1:{port}"),
-            options(group, connections),
+            options(group, connections, &role),
         )
         .await
-        .expect("open the forming member")
-    } else {
-        RaftNode::open_joining_embedded_with_options(
+        .expect("open the forming member"),
+        Role::Joins(_) => RaftNode::open_joining_embedded_with_options(
             node_id,
             Arc::clone(&engine),
-            options(group, connections),
+            options(group, connections, &role),
         )
         .await
-        .expect("open a joining member")
+        .expect("open a joining member"),
     };
     (
         Replica {
@@ -96,33 +122,50 @@ async fn replica(
     )
 }
 
-/// Serve `handler`, and every group it hosts, on `port`.
-fn serve(handler: RaftGrpcHandler, port: u16) -> tokio::task::JoinHandle<()> {
-    serve_counting(handler, port, Arc::new(AtomicUsize::new(0)))
+/// Serve `handler`, and every group it hosts, on `port`, admitting nodes of
+/// `connections`' trust only.
+fn serve(
+    handler: RaftGrpcHandler,
+    port: u16,
+    connections: &Arc<PeerConnections>,
+) -> tokio::task::JoinHandle<()> {
+    serve_counting(handler, port, connections, Arc::default())
 }
 
-/// [`serve`], counting the connections the server accepts in `accepted`.
+/// [`serve`], recording in `peers` the address of every connection a call
+/// arrived on.
 fn serve_counting(
     handler: RaftGrpcHandler,
     port: u16,
-    accepted: Arc<AtomicUsize>,
+    connections: &Arc<PeerConnections>,
+    peers: Arc<parking_lot::Mutex<std::collections::BTreeSet<std::net::SocketAddr>>>,
 ) -> tokio::task::JoinHandle<()> {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    let context = Arc::clone(connections.context());
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
-        let incoming = futures_util::stream::unfold(listener, move |listener| {
-            let accepted = Arc::clone(&accepted);
-            async move {
-                let next = listener.accept().await.map(|(stream, _)| {
-                    accepted.fetch_add(1, Ordering::SeqCst);
-                    stream
-                });
-                Some((next, listener))
+        let incoming = coordinode_wire::peer::incoming(
+            listener,
+            &context,
+            coordinode_wire::peer::Accept {
+                inbound: coordinode_wire::peer::InboundAuth::NodeOnly,
+                plaintext_clients: false,
+            },
+        )
+        .expect("listener");
+        let record = move |request: tonic::Request<()>| {
+            if let Some(remote) = request
+                .extensions()
+                .get::<coordinode_wire::peer::PeerConnectInfo>()
+                .and_then(|info| info.remote)
+            {
+                peers.lock().insert(remote);
             }
-        });
+            Ok(request)
+        };
         tonic::transport::Server::builder()
             .add_service(handler.handshake_service())
-            .add_service(RaftServiceServer::new(handler))
+            .add_service(RaftServiceServer::with_interceptor(handler, record))
             .serve_with_incoming(incoming)
             .await
             .expect("serve");
@@ -170,7 +213,7 @@ async fn form_group(forming: &RaftNode, others: [(u64, u16); 2]) {
     await_leadership(forming).await;
     for (id, port) in others {
         forming
-            .add_node(id, format!("http://127.0.0.1:{port}"))
+            .add_node(id, format!("http://127.0.0.1:{port}"), PKI.identity(id))
             .await
             .expect("add a member");
     }
@@ -195,18 +238,33 @@ async fn two_groups_on_the_same_three_servers_replicate_independently() {
         let b = GroupId(1);
         let ports = [alloc_port(), alloc_port(), alloc_port()];
 
-        // Group a forms on server 1, group b on server 2.
-        let mut a_replicas = Vec::new();
+        // Group a forms on server 1, group b on server 2, both in the
+        // deployment group a identifies.
+        let mut a_replicas: Vec<Replica> = Vec::new();
         let mut b_replicas = Vec::new();
         let mut servers = Vec::new();
         for (i, port) in ports.iter().copied().enumerate() {
             let id = i as u64 + 1;
-            let connections = Arc::new(PeerConnections::default());
-            let (ra, ha) = replica(id, a, port, id == 1, &connections).await;
-            let (rb, hb) = replica(id, b, port, id == 2, &connections).await;
+            let connections = PKI.connections(id);
+            let a_role = match a_replicas.first() {
+                None => Role::Forms(None),
+                Some(founder) => Role::Joins(enroll(
+                    founder.node.deployment().expect("a deployment"),
+                    1,
+                    ports[0],
+                )),
+            };
+            let (ra, ha) = replica(id, a, port, a_role, &connections).await;
+            let deployment = ra.node.deployment().expect("a deployment");
+            let b_role = if id == 2 {
+                Role::Forms(Some(deployment))
+            } else {
+                Role::Joins(enroll(deployment, 2, ports[1]))
+            };
+            let (rb, hb) = replica(id, b, port, b_role, &connections).await;
             ha.host(&hb).expect("host both groups on one server");
             assert_eq!(ha.hosted().groups(), vec![a, b]);
-            servers.push(serve(ha, port));
+            servers.push(serve(ha, port, &connections));
             a_replicas.push(ra);
             b_replicas.push(rb);
         }
@@ -282,19 +340,31 @@ async fn groups_led_from_one_server_share_its_connection_to_each_peer() {
         let b = GroupId(1);
         let ports = [alloc_port(), alloc_port(), alloc_port()];
 
-        let mut replicas = Vec::new();
+        let mut replicas: Vec<(Replica, Replica)> = Vec::new();
         let mut servers = Vec::new();
         let mut accepted = Vec::new();
         let mut pools = Vec::new();
         for (i, port) in ports.iter().copied().enumerate() {
             let id = i as u64 + 1;
-            let connections = Arc::new(PeerConnections::default());
+            let connections = PKI.connections(id);
             // Both groups form on server 1, so it leads both.
-            let (ra, ha) = replica(id, a, port, id == 1, &connections).await;
-            let (rb, hb) = replica(id, b, port, id == 1, &connections).await;
+            let (a_role, b_role) = match replicas.first() {
+                None => (Role::Forms(None), None),
+                Some((founder, _)) => {
+                    let deployment = founder.node.deployment().expect("a deployment");
+                    (
+                        Role::Joins(enroll(deployment, 1, ports[0])),
+                        Some(Role::Joins(enroll(deployment, 1, ports[0]))),
+                    )
+                }
+            };
+            let (ra, ha) = replica(id, a, port, a_role, &connections).await;
+            let b_role =
+                b_role.unwrap_or_else(|| Role::Forms(Some(ra.node.deployment().expect("ours"))));
+            let (rb, hb) = replica(id, b, port, b_role, &connections).await;
             ha.host(&hb).expect("host both groups on one server");
-            let count = Arc::new(AtomicUsize::new(0));
-            servers.push(serve_counting(ha, port, Arc::clone(&count)));
+            let count = Arc::default();
+            servers.push(serve_counting(ha, port, &connections, Arc::clone(&count)));
             accepted.push(count);
             pools.push(connections);
             replicas.push((ra, rb));
@@ -320,11 +390,13 @@ async fn groups_led_from_one_server_share_its_connection_to_each_peer() {
         assert_eq!(pools[0].len(), 2, "one connection per peer of server 1");
         assert!(replicas[0].0.node.is_leader().await);
         assert!(replicas[0].1.node.is_leader().await);
-        for (server, count) in accepted.iter().enumerate().skip(1) {
+        for (server, peers) in accepted.iter().enumerate().skip(1) {
+            let peers: &parking_lot::Mutex<std::collections::BTreeSet<std::net::SocketAddr>> =
+                peers;
             assert_eq!(
-                count.load(Ordering::SeqCst),
+                peers.lock().len(),
                 1,
-                "server {} accepted more than the one connection from its leader",
+                "server {} was called over more than the one connection from its leader",
                 server + 1
             );
         }
@@ -356,16 +428,31 @@ fn vote_request() -> Vec<u8> {
 /// One server hosting the forming group only, and its member.
 async fn one_group_server() -> (Replica, u16, tokio::task::JoinHandle<()>) {
     let port = alloc_port();
-    let (r, handler) = replica(1, GroupId::FORMING, port, true, &Arc::default()).await;
-    let server = serve(handler, port);
+    let connections = PKI.connections(1);
+    let (r, handler) = replica(1, GroupId::FORMING, port, Role::Forms(None), &connections).await;
+    let server = serve(handler, port, &connections);
     await_leadership(&r.node).await;
     (r, port, server)
 }
 
-async fn client(port: u16) -> RaftServiceClient<tonic::transport::Channel> {
-    RaftServiceClient::connect(format!("http://127.0.0.1:{port}"))
-        .await
-        .expect("connect")
+/// A client of the server on `port` proving the identity of its only
+/// member, so admission lets its calls through to what each test checks.
+fn client(port: u16) -> RaftServiceClient<tonic::transport::Channel> {
+    let channel = PKI
+        .connections(1)
+        .channel(&PKI.target(1, format!("127.0.0.1:{port}")))
+        .expect("channel");
+    RaftServiceClient::new(channel)
+}
+
+/// Name the deployment of `node` in a call.
+fn stamp<T>(request: &mut tonic::Request<T>, node: &RaftNode) {
+    request.metadata_mut().insert_bin(
+        coordinode_raft::cluster::DEPLOYMENT_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_bytes(
+            node.deployment().expect("a deployment").as_bytes(),
+        ),
+    );
 }
 
 /// A request for a group the server hosts no replica of is refused with
@@ -377,7 +464,6 @@ async fn a_request_for_a_group_not_hosted_is_refused_by_name() {
         let (r, port, server) = one_group_server().await;
 
         let status = client(port)
-            .await
             .vote(RaftPayload {
                 data: vote_request(),
                 group: 7,
@@ -411,16 +497,15 @@ async fn a_record_of_another_group_than_its_message_is_refused() {
         let (r, port, server) = one_group_server().await;
 
         let mut record = r.node.version().local_handshake();
-        record.node_id = 2;
         record.group_id = GroupId(5);
         let mut request = tonic::Request::new(RaftPayload {
             data: vote_request(),
             group: GroupId::FORMING.raw(),
         });
         write_handshake(request.metadata_mut(), &record);
+        stamp(&mut request, &r.node);
 
         let status = client(port)
-            .await
             .vote(request)
             .await
             .expect_err("a call whose record names another group is refused");
@@ -445,10 +530,9 @@ async fn a_stream_message_of_another_group_ends_the_stream() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let (r, port, server) = one_group_server().await;
 
-        let mut record = r.node.version().local_handshake();
-        record.node_id = 2;
+        let record = r.node.version().local_handshake();
         let append = openraft::raft::AppendEntriesRequest::<TypeConfig> {
-            vote: openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, 9),
+            vote: openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, 1),
             prev_log_id: None,
             entries: Vec::new(),
             leader_commit: None,
@@ -458,9 +542,9 @@ async fn a_stream_message_of_another_group_ends_the_stream() {
             group: 3,
         }]));
         write_handshake(request.metadata_mut(), &record);
+        stamp(&mut request, &r.node);
 
         let mut replies = client(port)
-            .await
             .stream_append(request)
             .await
             .expect("the stream opens: it is routed by its record")
@@ -493,9 +577,17 @@ async fn a_stream_message_of_another_group_ends_the_stream() {
 async fn a_second_replica_of_a_hosted_group_is_refused() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let port = alloc_port();
-        let (first, handler) = replica(1, GroupId::FORMING, port, true, &Arc::default()).await;
-        let (second, other) =
-            replica(1, GroupId::FORMING, alloc_port(), true, &Arc::default()).await;
+        let connections = PKI.connections(1);
+        let (first, handler) =
+            replica(1, GroupId::FORMING, port, Role::Forms(None), &connections).await;
+        let (second, other) = replica(
+            1,
+            GroupId::FORMING,
+            alloc_port(),
+            Role::Forms(None),
+            &connections,
+        )
+        .await;
 
         assert_eq!(
             handler.host(&other),

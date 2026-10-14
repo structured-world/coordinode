@@ -21,6 +21,7 @@ use coordinode_core::graph::node::{
     NODE_ID_MAX_SEQUENCE, NODE_LEASE_KEY_PREFIX, NODE_LEASE_TOKEN_LEN, decode_node_lease_key,
     node_lease_key,
 };
+use coordinode_core::group::{DEPLOYMENT_KEY, DeploymentId, retired_identity_key};
 use coordinode_core::txn::proposal::{MetadataCommand, Mutation, PartitionId};
 use coordinode_core::version::{
     GROUP_PAIR_KEY_PREFIX, RecordedPair, VersionPair, decode_group_pair_key, decode_pair,
@@ -46,7 +47,37 @@ pub(crate) fn decide(
             token,
         } => decide_lease(engine, *base, *ceiling, token),
         MetadataCommand::RecordGroupPair { pair } => decide_group_pair(engine, *pair),
+        MetadataCommand::RecordDeployment { id } => Ok(if recorded_deployment(engine)?.is_some() {
+            Vec::new()
+        } else {
+            vec![schema_put(DEPLOYMENT_KEY.to_vec(), id.as_bytes().to_vec())]
+        }),
     }
+}
+
+/// The deployment's identity, `None` before the founding leader recorded it.
+///
+/// # Errors
+///
+/// The record does not decode.
+pub fn recorded_deployment(engine: &StorageEngine) -> StorageResult<Option<DeploymentId>> {
+    match engine.get(Partition::Schema, DEPLOYMENT_KEY)? {
+        None => Ok(None),
+        Some(bytes) => DeploymentId::from_slice(&bytes).map(Some).ok_or_else(|| {
+            StorageError::Serialization("the deployment record does not decode".into())
+        }),
+    }
+}
+
+/// Whether the node identity `identity` (canonically encoded) was retired.
+///
+/// # Errors
+///
+/// The record cannot be read.
+pub fn identity_retired(engine: &StorageEngine, identity: &[u8]) -> StorageResult<bool> {
+    Ok(engine
+        .get(Partition::Schema, &retired_identity_key(identity))?
+        .is_some())
 }
 
 /// A new record only when the pair changes: a leader re-elected at the pair

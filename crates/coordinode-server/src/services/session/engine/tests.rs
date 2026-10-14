@@ -531,10 +531,14 @@ async fn a_cancel_stops_a_statement_waiting_on_the_leader() {
         )
         .expect("engine"),
     );
-    let (node, _handler) =
-        RaftNode::open_cluster_embedded(1, Arc::clone(&storage), format!("http://{silent_addr}"))
-            .await
-            .expect("raft");
+    let (node, _handler) = RaftNode::open_cluster_embedded(
+        1,
+        Arc::clone(&storage),
+        silent_addr.to_string(),
+        coordinode_test_fixtures::TestPki::new().connections(1),
+    )
+    .await
+    .expect("raft");
     let node = Arc::new(node);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> = Arc::new(

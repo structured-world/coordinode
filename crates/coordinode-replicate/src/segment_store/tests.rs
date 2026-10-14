@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
@@ -8,7 +10,86 @@ use coordinode_swarm::{
     LocalPieceStore, PieceEncoding, PieceStore, SegmentId, assemble, verify_piece,
 };
 
+use coordinode_test_fixtures::TestPki;
+use coordinode_wire::peer::{Accept, InboundAuth, PeerAdmission, PeerConnectInfo};
+
 use super::*;
+use crate::transfer::SegmentTransferHandler;
+use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+
+/// Node credentials of the transfer tests: node 1 pulls or drains, every
+/// served peer gets a node number of its own from 2 on.
+static PKI: LazyLock<TestPki> = LazyLock::new(TestPki::new);
+
+/// The next node number a served peer takes.
+static NEXT_PEER: AtomicU64 = AtomicU64::new(2);
+
+/// Admits any caller connected under a node identity, as a group whose
+/// every node is a member would; the membership checks of a real group are
+/// the consensus layer's.
+struct AnyNode;
+
+impl PeerAdmission for AnyNode {
+    fn admit_peer(
+        &self,
+        info: Option<&PeerConnectInfo>,
+        _metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<u64, tonic::Status> {
+        info.and_then(|info| info.node.as_ref())
+            .ok_or_else(|| tonic::Status::unauthenticated("not a node"))?
+            .identity()
+            .map(|_| 0)
+            .map_err(|e| tonic::Status::unauthenticated(e.to_string()))
+    }
+
+    fn stamp(&self, _metadata: &mut tonic::metadata::MetadataMap) {}
+}
+
+/// How node 1 reaches the peers it is served by.
+fn links() -> PeerLinks {
+    PeerLinks {
+        connections: PKI.connections(1),
+        admission: Arc::new(AnyNode),
+    }
+}
+
+/// Serve `engine`'s segments as a new peer node, accepting nodes only;
+/// returns the target that reaches it.
+async fn serve(engine: &Arc<StorageEngine>) -> PeerTarget {
+    let node = NEXT_PEER.fetch_add(1, Ordering::Relaxed);
+    let accept = Accept {
+        inbound: InboundAuth::NodeOnly,
+        plaintext_clients: false,
+    };
+    let addr = serve_with(engine, &PKI.context(node), accept).await;
+    PKI.target(node, addr)
+}
+
+/// Serve `engine`'s segments under `context` as `accept` says; returns the
+/// address it listens on.
+async fn serve_with(
+    engine: &Arc<StorageEngine>,
+    context: &Arc<coordinode_wire::peer::SecurityContext>,
+    accept: Accept,
+) -> String {
+    let handler = SegmentTransferHandler::new(
+        Arc::new(SegmentInstaller::new(Arc::clone(engine))),
+        Arc::new(AnyNode),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let incoming = coordinode_wire::peer::incoming(listener, context, accept).expect("incoming");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SegmentTransferServiceServer::new(handler))
+            .serve_with_incoming(incoming)
+            .await
+            .expect("server");
+    });
+    addr
+}
 
 fn test_engine(dir: &std::path::Path) -> StorageEngine {
     let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -190,11 +271,6 @@ fn segment_source_builds_and_caches_servable_pieces() {
 
 #[tokio::test]
 async fn drain_client_pushes_segment_into_target_engine() {
-    use crate::transfer::SegmentTransferHandler;
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-    use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
-
     // Source engine: write entries, materialise SSTs, derive the spanning segment.
     let src_dir = tempfile::tempdir().expect("tempdir");
     let src = test_engine(src_dir.path());
@@ -211,27 +287,15 @@ async fn drain_client_pushes_segment_into_target_engine() {
     // service main.rs registers in cluster mode).
     let tgt_dir = tempfile::tempdir().expect("tempdir");
     let tgt = std::sync::Arc::new(test_engine(tgt_dir.path()));
-    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
-        std::sync::Arc::clone(&tgt),
-    )));
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let incoming = TcpListenerStream::new(listener);
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SegmentTransferServiceServer::new(handler))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("server");
-    });
+    let target = serve(&tgt).await;
 
     // Drain the segment from the source to the peer via the public client helper
     // (export → split → stream → install) and verify every entry installed.
     let ack = drain_segment_to_peer(
         &src,
         &descriptor,
-        &format!("http://{addr}"),
+        &links(),
+        &target,
         64,
         PieceEncoding::None,
     )
@@ -268,27 +332,82 @@ async fn drain_to_unreachable_peer_is_connect_error() {
     let err = drain_segment_to_peer(
         &src,
         descriptor,
-        "http://127.0.0.1:1",
+        &links(),
+        &PKI.target(2, "127.0.0.1:1"),
         64,
         PieceEncoding::None,
     )
     .await
     .expect_err("unreachable peer must error");
     assert!(
+        matches!(&err, DrainError::Rpc(status) if status.code() == tonic::Code::Unavailable),
+        "expected an unavailable peer, got {err:?}"
+    );
+
+    // An address without a port is refused before anything is dialed.
+    let err = drain_segment_to_peer(
+        &src,
+        descriptor,
+        &links(),
+        &PKI.target(2, "no-port"),
+        64,
+        PieceEncoding::None,
+    )
+    .await
+    .expect_err("an address without a port");
+    assert!(
         matches!(err, DrainError::Connect { .. }),
         "expected Connect error, got {err:?}"
     );
 }
 
+/// The transfer service serves members of the group alone: a client with
+/// no node identity, here in plain text on a port that takes clients, is
+/// refused before anything is built or installed.
+#[tokio::test]
+async fn a_caller_without_a_node_identity_is_refused() {
+    use crate::transfer::proto::segment_transfer_service_client::SegmentTransferServiceClient;
+    use crate::transfer::proto::{SegmentDescriptorRef, SegmentManifestRequest};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = Arc::new(test_engine(dir.path()));
+    engine
+        .put(Partition::Node, b"node:0:00000001", b"v")
+        .expect("put");
+    let accept = Accept {
+        inbound: InboundAuth::Shared { clients: None },
+        plaintext_clients: true,
+    };
+    let addr = serve_with(&engine, &PKI.context(9), accept).await;
+    let mut client = SegmentTransferServiceClient::connect(format!("http://{addr}"))
+        .await
+        .expect("a client connects");
+    let status = client
+        .get_segment_manifest(SegmentManifestRequest {
+            segment: Some(SegmentDescriptorRef {
+                segment_id: 1,
+                partition: u32::from(coordinode_storage::placement::partition_wire_tag(
+                    Partition::Node,
+                )),
+                range_start: Vec::new(),
+                range_end: Vec::new(),
+                piece_size: 256,
+                encoding: 0,
+                zstd_level: 0,
+                generation: None,
+            }),
+        })
+        .await
+        .expect_err("a client is no member");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+}
+
 #[tokio::test]
 async fn swarm_pull_reconstructs_segment_over_grpc() {
+    use crate::transfer::GrpcPieceSource;
     use crate::transfer::proto::SegmentDescriptorRef;
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-    use crate::transfer::{GrpcPieceSource, SegmentTransferHandler};
     use coordinode_storage::placement::{KeyRange, partition_wire_tag};
     use coordinode_swarm::{Freshness, NodeId, PieceSource, SourceCandidate, swarm_download};
-    use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
 
     // Source engine with data, behind the real SegmentTransferService.
     let src_dir = tempfile::tempdir().expect("tempdir");
@@ -302,19 +421,7 @@ async fn swarm_pull_reconstructs_segment_over_grpc() {
         .expect("put");
     }
     src.persist().expect("persist");
-    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
-        std::sync::Arc::clone(&src),
-    )));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let incoming = TcpListenerStream::new(listener);
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SegmentTransferServiceServer::new(handler))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("server");
-    });
+    let target = serve(&src).await;
 
     // Whole-Node-partition descriptor with agreed split parameters (raw pieces).
     let descriptor = SegmentDescriptorRef {
@@ -329,11 +436,6 @@ async fn swarm_pull_reconstructs_segment_over_grpc() {
     };
 
     // Connect a gRPC piece source to the peer (fetches manifest + bitfield).
-    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
-        .expect("uri")
-        .connect()
-        .await
-        .expect("connect");
     let candidate = SourceCandidate {
         node: NodeId(2),
         utilization: 0.0,
@@ -342,9 +444,10 @@ async fn swarm_pull_reconstructs_segment_over_grpc() {
         tit_for_tat: 1.0,
         freshness: Freshness::Verified,
     };
-    let (source, manifest) = GrpcPieceSource::connect(NodeId(2), channel, descriptor, candidate)
-        .await
-        .expect("connect source");
+    let (source, manifest) =
+        GrpcPieceSource::connect(NodeId(2), &links(), &target, descriptor, candidate)
+            .await
+            .expect("connect source");
 
     // Run the rarest-first download on a blocking thread (fetch_piece bridges the
     // async client via block_on, which must not run on a runtime worker).
@@ -375,11 +478,6 @@ async fn swarm_pull_reconstructs_segment_over_grpc() {
 
 #[tokio::test]
 async fn repair_partition_pulls_and_installs_from_peer() {
-    use crate::transfer::SegmentTransferHandler;
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-    use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
-
     // Healthy peer with data, behind the real SegmentTransferService.
     let peer_dir = tempfile::tempdir().expect("tempdir");
     let peer = std::sync::Arc::new(test_engine(peer_dir.path()));
@@ -392,19 +490,7 @@ async fn repair_partition_pulls_and_installs_from_peer() {
         .expect("put");
     }
     peer.persist().expect("persist");
-    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
-        std::sync::Arc::clone(&peer),
-    )));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let incoming = TcpListenerStream::new(listener);
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SegmentTransferServiceServer::new(handler))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("server");
-    });
+    let target = serve(&peer).await;
 
     // Local node with an empty Node partition repairs it from the peer.
     let local_dir = tempfile::tempdir().expect("tempdir");
@@ -413,7 +499,8 @@ async fn repair_partition_pulls_and_installs_from_peer() {
 
     let bytes = installer
         .repair_partition(
-            &[format!("http://{addr}")],
+            &links(),
+            &[target],
             Partition::Node,
             256,
             PieceEncoding::None,
@@ -445,7 +532,8 @@ async fn repair_partition_no_reachable_peer_errors() {
     // Port 1 is never listening here → no source can be reached.
     let err = installer
         .repair_partition(
-            &["http://127.0.0.1:1".to_string()],
+            &links(),
+            &[PKI.target(2, "127.0.0.1:1")],
             Partition::Node,
             256,
             PieceEncoding::None,
@@ -460,11 +548,7 @@ async fn repair_partition_no_reachable_peer_errors() {
 
 #[tokio::test]
 async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
-    use crate::transfer::SegmentTransferHandler;
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
     use coordinode_storage::scrub::{ScrubConfig, scrub_all};
-    use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
 
     let entries = 60u32;
     let put_all = |engine: &StorageEngine| {
@@ -484,19 +568,7 @@ async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
     let peer = std::sync::Arc::new(test_engine(peer_dir.path()));
     put_all(&peer);
     peer.persist().expect("persist");
-    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
-        std::sync::Arc::clone(&peer),
-    )));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let incoming = TcpListenerStream::new(listener);
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SegmentTransferServiceServer::new(handler))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("server");
-    });
+    let target = serve(&peer).await;
 
     // Local node with the same data, then one SST physically corrupted.
     let local_dir = tempfile::tempdir().expect("tempdir");
@@ -521,7 +593,8 @@ async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
     let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
     installer
         .repair_partition(
-            &[format!("http://{addr}")],
+            &links(),
+            &[target],
             Partition::Node,
             256,
             PieceEncoding::None,
@@ -575,26 +648,6 @@ fn raft_engine(dir: &std::path::Path, next: u64) -> (Arc<StorageEngine>, Arc<Tes
     (engine, fence)
 }
 
-/// Serve `engine`'s segments on a local port; returns the peer URI.
-async fn serve(engine: &Arc<StorageEngine>) -> String {
-    use crate::transfer::SegmentTransferHandler;
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-    use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
-
-    let handler = SegmentTransferHandler::new(Arc::new(SegmentInstaller::new(Arc::clone(engine))));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SegmentTransferServiceServer::new(handler))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .expect("server");
-    });
-    format!("http://{addr}")
-}
-
 /// A copy from a peer further along replaces the partition at the peer's
 /// position: the tree records it, and the local applies leave the partition
 /// alone until they pass it, so the entries in between are not applied twice.
@@ -613,7 +666,7 @@ async fn a_copy_ahead_installs_at_its_position_and_raises_the_floor() {
         .expect("put");
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .repair_partition(&[uri], Partition::Node, 256, PieceEncoding::None)
+        .repair_partition(&links(), &[uri], Partition::Node, 256, PieceEncoding::None)
         .await
         .expect("repair");
 
@@ -658,7 +711,7 @@ async fn a_copy_behind_the_local_applies_is_refused() {
         .expect("put");
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     let err = installer
-        .repair_partition(&[uri], Partition::Node, 256, PieceEncoding::None)
+        .repair_partition(&links(), &[uri], Partition::Node, 256, PieceEncoding::None)
         .await
         .expect_err("a copy behind is refused");
     assert!(matches!(err, RepairError::Behind(_)), "{err:?}");
@@ -702,7 +755,13 @@ async fn a_repair_from_peers_with_different_copies_installs_one_of_them_whole() 
     let (local, _) = raft_engine(local_dir.path(), 10);
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .repair_partition(&[uri_a, uri_b], Partition::Node, 256, PieceEncoding::None)
+        .repair_partition(
+            &links(),
+            &[uri_a, uri_b],
+            Partition::Node,
+            256,
+            PieceEncoding::None,
+        )
         .await
         .expect("repair");
 
@@ -753,7 +812,13 @@ async fn a_schema_copy_keeps_the_node_local_records() {
         .expect("put");
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .repair_partition(&[uri], Partition::Schema, 256, PieceEncoding::None)
+        .repair_partition(
+            &links(),
+            &[uri],
+            Partition::Schema,
+            256,
+            PieceEncoding::None,
+        )
         .await
         .expect("repair");
 
@@ -785,7 +850,7 @@ async fn the_raft_partition_is_never_copied() {
     let (local, _) = raft_engine(local_dir.path(), 10);
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .repair_partition(&[uri], Partition::Raft, 256, PieceEncoding::None)
+        .repair_partition(&links(), &[uri], Partition::Raft, 256, PieceEncoding::None)
         .await
         .expect_err("the peer refuses to export it");
 }
@@ -864,11 +929,6 @@ async fn a_generation_replaced_from_a_peer_drops_local_damage_and_keeps_history(
     use coordinode_core::txn::proposal::{Mutation, PartitionId};
     use coordinode_core::txn::timestamp::TimestampOracle;
 
-    use crate::transfer::SegmentTransferHandler;
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-    use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
-
     const GEN: u64 = 40;
     let config = |dir: &std::path::Path| {
         StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -909,29 +969,12 @@ async fn a_generation_replaced_from_a_peer_drops_local_damage_and_keeps_history(
     commit(&a, b"a2");
     commit(&b, b"b1");
     local.put(Partition::Idx, &wrong, b"x").expect("damage");
-
-    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
-        std::sync::Arc::clone(&peer),
-    )));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SegmentTransferServiceServer::new(handler))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .expect("server");
-    });
+    let target = serve(&peer).await;
 
     let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
     let generation = GenerationId::from_raw(GEN);
     let (bytes, proof) = installer
-        .prepare_generation(
-            &[format!("http://{addr}")],
-            generation,
-            128,
-            PieceEncoding::None,
-        )
+        .prepare_generation(&links(), &[target], generation, 128, PieceEncoding::None)
         .await
         .expect("prepare");
     assert!(bytes > 0, "nothing imported");
@@ -966,26 +1009,10 @@ async fn a_generation_replaced_from_a_peer_drops_local_damage_and_keeps_history(
 /// and a later replacement can be registered.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_generation_pull_drops_the_replacement() {
-    use crate::transfer::SegmentTransferHandler;
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-    use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
-
     const GEN: u64 = 40;
     let peer_dir = tempfile::tempdir().expect("tempdir");
     let peer = std::sync::Arc::new(test_engine(peer_dir.path()));
-    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
-        std::sync::Arc::clone(&peer),
-    )));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SegmentTransferServiceServer::new(handler))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .expect("server");
-    });
+    let target = serve(&peer).await;
 
     let local_dir = tempfile::tempdir().expect("tempdir");
     let local = std::sync::Arc::new(test_engine(local_dir.path()));
@@ -994,12 +1021,7 @@ async fn a_failed_generation_pull_drops_the_replacement() {
     let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
     let generation = GenerationId::from_raw(GEN);
     let err = installer
-        .prepare_generation(
-            &[format!("http://{addr}")],
-            generation,
-            128,
-            PieceEncoding::None,
-        )
+        .prepare_generation(&links(), &[target], generation, 128, PieceEncoding::None)
         .await
         .expect_err("the peer holds no copy");
     assert!(matches!(err, RepairError::NoSource(_)), "got {err}");
@@ -1062,11 +1084,6 @@ async fn a_generation_pull_carries_the_peers_standing_proof() {
     use coordinode_core::txn::proposal::{Mutation, PartitionId};
     use coordinode_core::txn::timestamp::TimestampOracle;
 
-    use crate::transfer::SegmentTransferHandler;
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-    use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
-
     const GEN: u64 = 40;
     let config = |dir: &std::path::Path| {
         StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -1099,24 +1116,14 @@ async fn a_generation_pull_carries_the_peers_standing_proof() {
         proved: std::sync::atomic::AtomicBool::new(true),
     });
     peer.set_index_copy_qualifier(std::sync::Arc::clone(&layer) as _);
-
-    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
-        std::sync::Arc::clone(&peer),
-    )));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SegmentTransferServiceServer::new(handler))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .expect("server");
-    });
+    let target = serve(&peer).await;
 
     let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
     let generation = GenerationId::from_raw(GEN);
-    let peers = [format!("http://{addr}")];
-    let pull = || installer.prepare_generation(&peers, generation, 128, PieceEncoding::None);
+    let peers = [target];
+    let links = links();
+    let pull =
+        || installer.prepare_generation(&links, &peers, generation, 128, PieceEncoding::None);
     let (_, proof) = pull().await.expect("prepare");
     assert_eq!(proof.as_deref(), Some(&b"proof"[..]), "the peer's proof");
     local.publish_generation(generation).expect("publish");

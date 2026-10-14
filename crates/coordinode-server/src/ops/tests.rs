@@ -1,4 +1,29 @@
-use super::{Readiness, respond};
+use std::sync::Arc;
+
+use super::{Readiness, ReloadHook, reload_response, respond};
+
+/// `POST /reload` runs the reload and reports its outcome; a refused reload
+/// is an error the caller sees, any other method changes nothing, and a node
+/// without a node identity has nothing to reload.
+#[test]
+fn reload_runs_only_on_post_and_reports_its_outcome() {
+    let ok: ReloadHook = Arc::new(|| Ok(()));
+    let (status, _, body) = reload_response("POST", Some(&ok));
+    assert_eq!(status, "200 OK");
+    assert_eq!(body, r#"{"reloaded":true}"#);
+
+    let refused: ReloadHook = Arc::new(|| Err("the key does not match".to_owned()));
+    let (status, _, body) = reload_response("POST", Some(&refused));
+    assert_eq!(status, "500 Internal Server Error");
+    assert!(body.contains("the key does not match"), "{body}");
+
+    let untouched: ReloadHook = Arc::new(|| unreachable!("a GET reloads nothing"));
+    let (status, _, _) = reload_response("GET", Some(&untouched));
+    assert_eq!(status, "405 Method Not Allowed");
+
+    let (status, _, _) = reload_response("POST", None);
+    assert_eq!(status, "404 Not Found");
+}
 
 /// `/ready` answers from the readiness flag: 503 until the server starts
 /// serving and again once shutdown begins, so health checks and balancers

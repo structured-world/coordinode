@@ -63,6 +63,7 @@ mod healthcheck;
 mod index_build_resumer;
 mod logging;
 mod metrics_catalog;
+mod node_identity;
 mod ops;
 mod pg;
 mod registry;
@@ -248,10 +249,19 @@ pub(crate) async fn run_with(
             cluster_addr,
             node_id,
             node_addr,
+            node_identity,
             pre_seeded,
             follow,
         } => {
-            admin_node_join(cluster_addr, node_id, node_addr, pre_seeded, follow).await?;
+            admin_node_join(
+                cluster_addr,
+                node_id,
+                node_addr,
+                node_identity,
+                pre_seeded,
+                follow,
+            )
+            .await?;
         }
 
         cli::Command::AdminNodeDecommission {

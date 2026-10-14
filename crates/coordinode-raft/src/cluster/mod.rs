@@ -16,7 +16,17 @@
 //! [`RaftNode::monitor_and_promote`] promotes it to a voter once it has
 //! caught up. The network layer handles AppendEntries, Vote, and Snapshot
 //! RPCs between nodes.
+//!
+//! ## Node identity
+//!
+//! A member that talks to peers is opened with its security context, inside
+//! [`NodeOptions::connections`]: the node identity it proves and the trust
+//! its peers are verified under. There is no unauthenticated channel, so a
+//! node opened without one has no peers. Every member is bound to its node
+//! identity in the membership; the deployment is identified when its first
+//! group forms, and a joining node is provisioned with it.
 
+pub mod admission;
 pub mod grpc_server;
 pub mod nemesis;
 pub(crate) mod network;
@@ -24,18 +34,20 @@ pub mod version;
 
 use std::sync::Arc;
 
-pub use coordinode_core::group::GroupId;
+pub use coordinode_core::group::{DeploymentId, GroupId};
+use coordinode_core::txn::proposal::MetadataCommand;
 use coordinode_storage::engine::core::StorageEngine;
+pub use coordinode_wire::peer::{PeerConnections, PeerTarget};
 
-use crate::member::MemberNode;
+use crate::member::{MemberIdentity, MemberNode};
 use crate::proposal::{RaftProposalPipeline, RateLimiter};
 use crate::storage::{
     AppendNotifier, CoordinodeStateMachine, LogStore, TypeConfig, default_raft_config,
 };
 use crate::wait_majority::{BatchConfig, WaitForMajorityService};
 
+pub use admission::{Admission, DEPLOYMENT_METADATA_KEY, Enrollment};
 pub use grpc_server::RaftGrpcHandler;
-pub use network::PeerConnections;
 use network::{GrpcNetworkFactory, StubNetworkFactory};
 use version::VersionGate;
 
@@ -103,10 +115,113 @@ pub struct NodeOptions {
     /// it sends names it, and a server hosting several groups dispatches by
     /// it.
     pub group: GroupId,
-    /// The server's connections to its peers. The nodes of every group one
-    /// server hosts are opened with the same set, so the groups two servers
-    /// share travel over one connection between them.
-    pub connections: Arc<PeerConnections>,
+    /// The node's connections to its peers, made under its security
+    /// context: the node identity it proves and the trust its peers are
+    /// verified under. Required to open a member that talks to peers. The
+    /// nodes of every group one server hosts are opened with the same set,
+    /// so the groups two servers share travel over one connection between
+    /// them.
+    pub connections: Option<Arc<PeerConnections>>,
+    /// How a joining node is provisioned: the deployment it joins and the
+    /// members it trusts until it has a membership of its own. Required to
+    /// join.
+    pub enrollment: Option<Enrollment>,
+    /// The deployment a group being formed belongs to, when it is not the
+    /// deployment's first: another group of the same deployment. `None`
+    /// identifies a new deployment.
+    pub deployment: Option<DeploymentId>,
+}
+
+/// Writes the metadata commands a node proposes on its own behalf: the
+/// deployment record, the group's version pair, retired identities.
+#[derive(Clone)]
+struct Commands {
+    raft: Arc<RaftInstance>,
+    engine: Arc<StorageEngine>,
+    oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+    ids: Arc<coordinode_core::txn::proposal::ProposalIdGenerator>,
+}
+
+impl Commands {
+    fn new(
+        raft: Arc<RaftInstance>,
+        engine: Arc<StorageEngine>,
+        oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+    ) -> Self {
+        // An engine opened without an oracle stamps writes from a counter; a
+        // command then takes a wall-clock stamp of its own.
+        let oracle = oracle
+            .unwrap_or_else(|| Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new()));
+        let ids = coordinode_core::txn::proposal::ProposalIdGenerator::with_base(
+            coordinode_core::txn::proposal::fresh_proposal_id_base(),
+        );
+        Self {
+            raft,
+            engine,
+            oracle,
+            ids: Arc::new(ids),
+        }
+    }
+
+    /// Commit `command` through this node, which must lead; returns once it
+    /// applied here.
+    async fn write(&self, command: MetadataCommand) -> Result<(), String> {
+        // Held as not yet logged until it is handed over, so no entry's
+        // bound passes over it meanwhile.
+        let (at, held) = self
+            .engine
+            .pending_commits()
+            .obligate(|| self.oracle.next().as_raw());
+        let mut request = command_request(
+            command,
+            self.ids.next(),
+            coordinode_core::txn::timestamp::Timestamp::from_raw(at),
+        );
+        let written = match crate::closure::stamp(&self.raft, &self.engine, &mut request).await {
+            Ok(()) => self
+                .raft
+                .client_write(request)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        drop(held);
+        written
+    }
+}
+
+/// Record the deployment identity `given`, or a fresh one, unless one is
+/// recorded already.
+async fn found_deployment(
+    commands: &Commands,
+    recorded: &mut tokio::sync::watch::Receiver<Option<DeploymentId>>,
+    given: Option<DeploymentId>,
+) -> Result<DeploymentId, RaftNodeError> {
+    if let Some(id) = *recorded.borrow() {
+        return Ok(id);
+    }
+    let id = match given {
+        Some(id) => id,
+        None => {
+            let mut id = [0u8; 16];
+            coordinode_wire::tls::selected_provider()
+                .secure_random
+                .fill(&mut id)
+                .map_err(|e| RaftNodeError::Init(format!("a random deployment identity: {e:?}")))?;
+            DeploymentId(id)
+        }
+    };
+    commands
+        .write(MetadataCommand::RecordDeployment { id })
+        .await
+        .map_err(|e| RaftNodeError::Init(format!("record the deployment identity: {e}")))?;
+    // The leader answers once the record applied here; the first one stands.
+    let recorded = *recorded
+        .wait_for(Option::is_some)
+        .await
+        .map_err(|e| RaftNodeError::Init(format!("the deployment record: {e}")))?;
+    recorded.ok_or_else(|| RaftNodeError::Init("the deployment record vanished".to_owned()))
 }
 
 /// The version gate of member `node_id` of `group`, over its state
@@ -128,32 +243,37 @@ fn version_gate(
 
 /// Keep the gate's view of the leader current, and while this node leads,
 /// record its pair as the group's when the group does not run it yet: the
-/// first leader at a pair commits it as soon as it leads.
+/// first leader at a pair commits it as soon as it leads. Keeps `book`, when
+/// the node has peers, at the membership in effect.
 fn spawn_version_watch(
     raft: Arc<RaftInstance>,
     gate: Arc<VersionGate>,
     engine: Arc<StorageEngine>,
-    oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+    commands: Commands,
+    book: Option<Arc<network::MemberBook>>,
 ) -> BackgroundTasks {
     let closer =
         crate::closure::spawn_closer(Arc::clone(&raft), Arc::clone(&engine), CLOSURE_SETTLE);
     let space = Arc::clone(engine.space());
-    // An engine opened without an oracle stamps writes from a counter; the
-    // record then takes a wall-clock stamp of its own.
-    let oracle =
-        oracle.unwrap_or_else(|| Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new()));
-    let ids = coordinode_core::txn::proposal::ProposalIdGenerator::with_base(
-        coordinode_core::txn::proposal::fresh_proposal_id_base(),
-    );
     let watch = tokio::spawn(async move {
+        use openraft::LogIdOptionExt;
         use openraft::rt::watch::WatchReceiver;
         let mut metrics = raft.metrics();
         // The term this node last recorded its pair in, so a refused or
         // lost attempt is retried once per change, not in a loop.
         let mut recorded_in: Option<u64> = None;
+        // The membership the book holds, so it is rewritten once per change.
+        let mut booked: Option<Option<u64>> = None;
         loop {
             let (leader, leading_term) = {
                 let m = metrics.borrow_watched();
+                if let Some(book) = &book {
+                    let index = m.membership_config.log_id().index();
+                    if booked != Some(index) {
+                        book.set(m.membership_config.membership().nodes());
+                        booked = Some(index);
+                    }
+                }
                 let leader = m.current_leader.map(|id| {
                     let addr = m
                         .membership_config
@@ -178,22 +298,9 @@ fn spawn_version_watch(
                 waits_for_space = recorded_in != Some(term) && !room;
                 if recorded_in != Some(term) && room {
                     if let Some(pair) = gate.pair_to_record() {
-                        // Held as not yet logged until it is handed over, so
-                        // no entry's bound passes over it meanwhile.
-                        let (at, held) =
-                            engine.pending_commits().obligate(|| oracle.next().as_raw());
-                        let mut request = record_pair_request(
-                            pair,
-                            ids.next(),
-                            coordinode_core::txn::timestamp::Timestamp::from_raw(at),
-                        );
-                        let written = match crate::closure::stamp(&raft, &engine, &mut request)
-                            .await
-                        {
-                            Ok(()) => raft.client_write(request).await.map_err(|e| e.to_string()),
-                            Err(e) => Err(e.to_string()),
-                        };
-                        drop(held);
+                        let written = commands
+                            .write(MetadataCommand::RecordGroupPair { pair })
+                            .await;
                         match written {
                             Ok(_) => {
                                 tracing::info!(%pair, term, "recorded the group's version pair");
@@ -272,16 +379,16 @@ const SPACE_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 /// member's cut may trail an idle group's last commit.
 const CLOSURE_SETTLE: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// The entry recording `pair` as the group's.
-fn record_pair_request(
-    pair: coordinode_core::version::VersionPair,
+/// The entry carrying `command`.
+fn command_request(
+    command: MetadataCommand,
     id: coordinode_core::txn::proposal::ProposalId,
     at: coordinode_core::txn::timestamp::Timestamp,
 ) -> crate::storage::Request {
-    use coordinode_core::txn::proposal::{MetadataCommand, Mutation, RaftProposal};
+    use coordinode_core::txn::proposal::{Mutation, RaftProposal};
     crate::storage::Request::single(RaftProposal {
         id,
-        mutations: vec![Mutation::Command(MetadataCommand::RecordGroupPair { pair })],
+        mutations: vec![Mutation::Command(command)],
         commit_ts: at,
         start_ts: at,
         bypass_rate_limiter: true,
@@ -291,6 +398,109 @@ fn record_pair_request(
 /// How long opening a node that is its group's only voter waits for it to
 /// elect itself: one vote made durable, so seconds only on a stalled disk.
 const SINGLE_NODE_ELECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a member being opened forms (or resumes) its group, or joins one.
+enum Founding {
+    /// The group forms around this node, reached at `advertise`.
+    Form { advertise: String },
+    /// The node joins a group whose leader adds it.
+    Join,
+}
+
+/// Whether `node_id` is the only voter of the membership in effect.
+fn only_voter(raft: &RaftInstance, node_id: u64) -> bool {
+    use openraft::rt::watch::WatchReceiver;
+    let metrics = raft.metrics();
+    let metrics = metrics.borrow_watched();
+    let joint = metrics.membership_config.membership().get_joint_config();
+    matches!(joint.as_slice(), [voters] if voters.len() == 1 && voters.contains(&node_id))
+}
+
+/// Wait until the metrics show the membership just initialized or
+/// restored; whether there is one.
+async fn await_membership(raft: &RaftInstance) -> Result<bool, RaftNodeError> {
+    raft.wait(Some(SINGLE_NODE_ELECTION_WAIT))
+        .metrics(
+            |m| {
+                m.membership_config
+                    .membership()
+                    .get_joint_config()
+                    .first()
+                    .is_some_and(|voters| !voters.is_empty())
+            },
+            "the membership shows in the metrics",
+        )
+        .await
+        .map(|_| true)
+        .map_err(|e| RaftNodeError::Init(format!("the membership did not show: {e}")))
+}
+
+/// Whether `node_id` leads a group whose only voter it is.
+fn leads_alone(raft: &RaftInstance, node_id: u64) -> bool {
+    use openraft::rt::watch::WatchReceiver;
+    only_voter(raft, node_id) && raft.metrics().borrow_watched().state.is_leader()
+}
+
+/// Wait for a group's only voter to elect itself and apply the entry that
+/// opens its term, so it takes writes.
+async fn await_self_election(raft: &RaftInstance) -> Result<(), RaftNodeError> {
+    raft.wait(Some(SINGLE_NODE_ELECTION_WAIT))
+        .metrics(
+            |m| {
+                m.state.is_leader()
+                    && m.vote.is_committed()
+                    && m.last_applied.map(|id| id.index) >= m.last_log_index
+            },
+            "the only voter elects itself",
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| RaftNodeError::Init(format!("the node did not become leader: {e}")))
+}
+
+/// Schema-partition key recording the deployment a joining store is bound
+/// to before the deployment's own record reaches it.
+const KEY_ENROLLED_DEPLOYMENT: &[u8] = b"raft:enrolled_deployment";
+
+/// Bind this store to the deployment it is being enrolled in, or refuse an
+/// enrollment in another one: a store bootstrapping into a deployment, or
+/// already part of one, never takes in another's state. The binding is
+/// durable before any peer is heard, so an interrupted bootstrap resumes
+/// into the same deployment or is refused.
+fn bind_enrollment(
+    engine: &StorageEngine,
+    state_machine: &CoordinodeStateMachine,
+    enrollment: &Enrollment,
+) -> Result<(), RaftNodeError> {
+    use coordinode_storage::engine::partition::Partition;
+    let refuse = |bound: DeploymentId| RaftNodeError::OtherDeployment {
+        bound,
+        asked: enrollment.deployment,
+    };
+    if let Some(recorded) = *state_machine.subscribe_deployment().borrow() {
+        if recorded != enrollment.deployment {
+            return Err(refuse(recorded));
+        }
+    }
+    let enrolled = engine
+        .get(Partition::Schema, KEY_ENROLLED_DEPLOYMENT)
+        .map_err(|e| RaftNodeError::Init(format!("read the enrollment: {e}")))?;
+    match enrolled.as_deref().map(DeploymentId::from_slice) {
+        Some(Some(bound)) if bound != enrollment.deployment => Err(refuse(bound)),
+        Some(Some(_)) => Ok(()),
+        Some(None) => Err(RaftNodeError::Init(
+            "the store's enrollment record does not decode".to_owned(),
+        )),
+        None => engine
+            .put(
+                Partition::Schema,
+                KEY_ENROLLED_DEPLOYMENT,
+                enrollment.deployment.as_bytes(),
+            )
+            .and_then(|()| engine.persist())
+            .map_err(|e| RaftNodeError::Init(format!("record the enrollment: {e}"))),
+    }
+}
 
 /// How long a shutdown waits for snapshot work still holding the engine: a
 /// full build of a large store takes minutes, and cutting it short would
@@ -366,6 +576,15 @@ pub struct RaftNode {
     /// When a joining learner is promoted, and how long a join may take. See
     /// [`Self::set_join_readiness_lag`] and [`Self::set_join_timeout`].
     join: JoinTuning,
+    /// Which peers this member admits; `None` for a node without peers.
+    admission: Option<Arc<Admission>>,
+    /// The connections to peers, under this node's security context; `None`
+    /// for a node without peers.
+    connections: Option<Arc<PeerConnections>>,
+    /// The deployment, as the applied state records it.
+    deployment: tokio::sync::watch::Receiver<Option<DeploymentId>>,
+    /// Writes this node's own metadata commands.
+    commands: Commands,
 }
 
 /// Default for [`RaftNode::join_readiness_lag`]: close enough that the
@@ -473,12 +692,14 @@ impl RaftNode {
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
         options: NodeOptions,
     ) -> Result<Self, RaftNodeError> {
-        // A single-node group talks to no peer.
+        // A single-node group talks to no peer, and needs no node identity.
         let NodeOptions {
             snapshots: snap_config,
             host_epoch,
             group,
             connections: _,
+            enrollment: _,
+            deployment: forming_in,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -496,6 +717,7 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
         let version = version_gate(node_id, group, &state_machine, host_epoch);
+        let mut deployment = state_machine.subscribe_deployment();
 
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
@@ -573,6 +795,12 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Init(format!("the node did not become leader: {e}")))?;
 
         let raft = Arc::new(raft);
+        let commands = Commands::new(Arc::clone(&raft), Arc::clone(&engine), oracle);
+        // The deployment is identified when its first group forms, so a
+        // store that grows later keeps the identity it started with.
+        if leads_alone(&raft, node_id) {
+            found_deployment(&commands, &mut deployment, forming_in).await?;
+        }
         let snap_handle = spawn_snapshot_trigger(
             Arc::clone(&raft),
             Arc::clone(&engine),
@@ -584,7 +812,8 @@ impl RaftNode {
             Arc::clone(&raft),
             Arc::clone(&version),
             Arc::clone(&engine),
-            oracle,
+            commands.clone(),
+            None,
         );
 
         Ok(Self {
@@ -608,6 +837,10 @@ impl RaftNode {
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
             join: JoinTuning::default(),
+            admission: None,
+            connections: None,
+            deployment,
+            commands,
         })
     }
 
@@ -632,18 +865,25 @@ impl RaftNode {
     ///   to the cluster membership.
     /// - **Restart** (existing state): resumes from persisted state regardless
     ///   of `peers` argument.
+    ///
+    /// The node proves the identity of `connections`' security context and
+    /// admits nodes only on its listener.
     pub async fn open_cluster(
         node_id: u64,
         engine: Arc<StorageEngine>,
         listen_addr: std::net::SocketAddr,
         advertise_addr: String,
+        connections: Arc<PeerConnections>,
     ) -> Result<Self, RaftNodeError> {
         Self::open_cluster_with_options(
             node_id,
             engine,
             listen_addr,
             advertise_addr,
-            NodeOptions::default(),
+            NodeOptions {
+                connections: Some(connections),
+                ..NodeOptions::default()
+            },
         )
         .await
     }
@@ -657,12 +897,47 @@ impl RaftNode {
         advertise_addr: String,
         options: NodeOptions,
     ) -> Result<Self, RaftNodeError> {
+        Self::open_member(
+            node_id,
+            engine,
+            options,
+            Founding::Form {
+                advertise: advertise_addr,
+            },
+            Some(listen_addr),
+        )
+        .await
+        .map(|(node, _)| node)
+    }
+
+    /// Open a member of a group with peers, under the security context in
+    /// `options`: one that forms its group or resumes it, or one that joins
+    /// one. With `listen`, the node serves its peers on a listener of its
+    /// own that admits nodes only; without it, the caller registers the
+    /// returned handler on a server of its own.
+    async fn open_member(
+        node_id: u64,
+        engine: Arc<StorageEngine>,
+        options: NodeOptions,
+        founding: Founding,
+        listen: Option<std::net::SocketAddr>,
+    ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
         let NodeOptions {
             snapshots: snap_config,
             host_epoch,
             group,
             connections,
+            enrollment,
+            deployment: forming_in,
         } = options;
+        let connections = connections.ok_or(RaftNodeError::NoNodeIdentity)?;
+        let own = connections.context().identity();
+        let enrollment = match (&founding, enrollment) {
+            (Founding::Join, Some(enrollment)) => Some(enrollment),
+            (Founding::Join, None) => return Err(RaftNodeError::NotEnrolled),
+            // A node forming its group is enrolled in nothing.
+            (Founding::Form { .. }, _) => None,
+        };
         let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
@@ -679,17 +954,43 @@ impl RaftNode {
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
+        if let Founding::Join = founding {
+            refuse_join_with_local_data(node_id, &engine, &log_store, &state_machine)?;
+        }
+        if let Some(enrollment) = &enrollment {
+            bind_enrollment(&engine, &state_machine, enrollment)?;
+        }
+        // The deployment the caller names is a statement of which one this
+        // store is in; a store recorded in another is not served under it.
+        if let (Some(named), Some(recorded)) =
+            (forming_in, *state_machine.subscribe_deployment().borrow())
+        {
+            if named != recorded {
+                return Err(RaftNodeError::OtherDeployment {
+                    bound: recorded,
+                    asked: named,
+                });
+            }
+        }
         let version = version_gate(node_id, group, &state_machine, host_epoch);
+        let mut deployment = state_machine.subscribe_deployment();
+        let deployment_view = admission::DeploymentView::new(
+            deployment.clone(),
+            enrollment.as_ref().map(|e| e.deployment),
+        );
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
 
         let (closing, closing_rx) = tokio::sync::watch::channel(false);
+        let book = Arc::new(network::MemberBook::default());
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
             closing: network::Closing::new(closing_rx),
             gate: Arc::clone(&version),
-            connections,
+            deployment: deployment_view.clone(),
+            connections: Arc::clone(&connections),
+            book: Arc::clone(&book),
         };
 
         let raft: RaftInstance =
@@ -700,64 +1001,100 @@ impl RaftNode {
                 })?;
 
         let raft = Arc::new(raft);
+        let commands = Commands::new(Arc::clone(&raft), Arc::clone(&engine), engine.oracle());
 
-        // Try initialize — succeeds on fresh, NotAllowed on restart
-        let mut members = std::collections::BTreeMap::new();
-        members.insert(node_id, MemberNode::new(advertise_addr.clone(), None));
-
-        match raft.initialize(members).await {
-            Ok(_) => {
-                tracing::info!(node_id, "fresh cluster node initialized as leader");
-                publish_existing_state_as_group_base(&raft, &engine).await?;
-            }
-            Err(openraft::error::RaftError::APIError(
-                openraft::error::InitializeError::NotAllowed(_),
-            )) => {
-                tracing::debug!(
+        let advertise_addr = match &founding {
+            Founding::Form { advertise } => {
+                // Try initialize — succeeds on fresh, NotAllowed on restart.
+                // The member is bound to the identity it proves from the
+                // start.
+                let mut members = std::collections::BTreeMap::new();
+                members.insert(
                     node_id,
-                    "raft already initialized, resuming from existing state"
+                    MemberNode::new(advertise.clone(), Some(MemberIdentity::from(&own))),
                 );
+                match raft.initialize(members).await {
+                    Ok(_) => {
+                        tracing::info!(node_id, "fresh cluster node initialized as leader");
+                        publish_existing_state_as_group_base(&raft, &engine).await?;
+                    }
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::InitializeError::NotAllowed(_),
+                    )) => {
+                        tracing::debug!(
+                            node_id,
+                            "raft already initialized, resuming from existing state"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(RaftNodeError::Init(format!("initialize failed: {e}")));
+                    }
+                }
+                // A group of one identifies its deployment as it forms: a
+                // node joining it is provisioned with the identity.
+                let unrecorded = deployment.borrow().is_none();
+                if unrecorded && await_membership(&raft).await? && only_voter(&raft, node_id) {
+                    await_self_election(&raft).await?;
+                    found_deployment(&commands, &mut deployment, forming_in).await?;
+                }
+                Some(advertise.clone())
             }
-            Err(e) => {
-                return Err(RaftNodeError::Init(format!("initialize failed: {e}")));
-            }
-        }
+            Founding::Join => None,
+        };
 
-        // Start gRPC server for inter-node Raft RPCs with shutdown signal.
-        // The listener is bound EAGERLY: a busy port must fail this open
-        // instead of producing a node that reports success while its server
-        // task dies unheard — deaf to the cluster, green on every local
-        // check. Bound through tokio rather than tonic's TcpIncoming::bind
-        // because tokio sets SO_REUSEADDR: a node restarting on its own
-        // address must not be locked out by its previous life's TIME_WAIT
-        // sockets. Nodelay mirrors tonic's serve(addr) default.
-        let listener = tokio::net::TcpListener::bind(listen_addr)
-            .await
-            .map_err(|e| RaftNodeError::Init(format!("bind {listen_addr}: {e}")))?;
-        let incoming =
-            tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
+        let admission = Arc::new(Admission::new(
+            node_id,
+            Arc::clone(&raft),
+            deployment_view,
+            enrollment.map(|e| e.authorities).unwrap_or_default(),
+            Arc::clone(&connections),
+            Arc::clone(&version),
+        ));
         let handler = RaftGrpcHandler::new(
             Arc::clone(&raft),
             crate::snapshot::snapshot_dir(&engine),
             Arc::clone(&version),
+            Arc::clone(&admission),
             Arc::clone(engine.space()),
         );
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let server = tonic::transport::Server::builder()
-            .add_service(handler.handshake_service())
-            .add_service(RaftServiceServer::new(handler));
-
-        let grpc_task = tokio::spawn(async move {
-            let graceful = server.serve_with_incoming_shutdown(incoming, async {
-                let _ = shutdown_rx.await;
-            });
-            if let Err(e) = graceful.await {
-                tracing::error!(%e, "raft gRPC server failed");
+        // A listener of the node's own, when it has one. It is bound EAGERLY:
+        // a busy port must fail this open instead of producing a node that
+        // reports success while its server task dies unheard — deaf to the
+        // cluster, green on every local check. Bound through tokio, which sets
+        // SO_REUSEADDR: a node restarting on its own address must not be
+        // locked out by its previous life's TIME_WAIT sockets.
+        let (grpc_shutdown, grpc_task) = match listen {
+            Some(listen_addr) => {
+                let listener = tokio::net::TcpListener::bind(listen_addr)
+                    .await
+                    .map_err(|e| RaftNodeError::Init(format!("bind {listen_addr}: {e}")))?;
+                let incoming = coordinode_wire::peer::incoming(
+                    listener,
+                    connections.context(),
+                    coordinode_wire::peer::Accept {
+                        inbound: coordinode_wire::peer::InboundAuth::NodeOnly,
+                        plaintext_clients: false,
+                    },
+                )
+                .map_err(|e| RaftNodeError::Init(format!("listener TLS: {e}")))?;
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                let server = tonic::transport::Server::builder()
+                    .add_service(handler.handshake_service())
+                    .add_service(RaftServiceServer::new(handler.clone()));
+                let grpc_task = tokio::spawn(async move {
+                    let graceful = server.serve_with_incoming_shutdown(incoming, async {
+                        let _ = shutdown_rx.await;
+                    });
+                    if let Err(e) = graceful.await {
+                        tracing::error!(%e, "raft gRPC server failed");
+                    }
+                });
+                tracing::info!(node_id, %listen_addr, "raft gRPC server started");
+                (Some(shutdown_tx), Some(grpc_task))
             }
-        });
-
-        tracing::info!(node_id, %listen_addr, "raft gRPC server started");
+            None => (None, None),
+        };
 
         // Start background snapshot trigger (WAL size + periodic timer)
         let snap_handle = spawn_snapshot_trigger(
@@ -771,21 +1108,26 @@ impl RaftNode {
             Arc::clone(&raft),
             Arc::clone(&version),
             Arc::clone(&engine),
-            engine.oracle(),
+            commands.clone(),
+            Some(book),
         );
 
-        Ok(Self {
+        if let Founding::Join = founding {
+            tracing::info!(node_id, %own, "joining node started (waiting for leader to add it)");
+        }
+
+        let node = Self {
             raft,
             applied_rx,
             snapshot_builds,
             engine_work,
             node_id,
-            advertise_addr: Some(advertise_addr),
+            advertise_addr,
             engine,
             oplog,
             append_notifier,
-            grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
-            grpc_task: std::sync::Mutex::new(Some(grpc_task)),
+            grpc_shutdown: std::sync::Mutex::new(grpc_shutdown),
+            grpc_task: std::sync::Mutex::new(grpc_task),
             closing,
             _snapshot_trigger: Some(snap_handle),
             version,
@@ -794,7 +1136,12 @@ impl RaftNode {
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
             join: JoinTuning::default(),
-        })
+            admission: Some(admission),
+            connections: Some(connections),
+            deployment,
+            commands,
+        };
+        Ok((node, handler))
     }
 
     /// Open a cluster-mode bootstrap node for embedding into an existing tonic server.
@@ -825,12 +1172,16 @@ impl RaftNode {
         node_id: u64,
         engine: Arc<StorageEngine>,
         advertise_addr: String,
+        connections: Arc<PeerConnections>,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
         Self::open_cluster_embedded_with_options(
             node_id,
             engine,
             advertise_addr,
-            NodeOptions::default(),
+            NodeOptions {
+                connections: Some(connections),
+                ..NodeOptions::default()
+            },
         )
         .await
     }
@@ -843,119 +1194,16 @@ impl RaftNode {
         advertise_addr: String,
         options: NodeOptions,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
-        let NodeOptions {
-            snapshots: snap_config,
-            host_epoch,
-            group,
-            connections,
-        } = options;
-        let config = Arc::new(snap_config.raft_config());
-        let log_store =
-            LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
-        // Clone the oplog handle before openraft consumes the LogStore, so
-        // WAL-replay repair can read committed entries since a checkpoint.
-        let oplog = log_store.oplog_handle();
-        let append_notifier = log_store.append_notifier();
-        // Wire the engine's own timestamp oracle into the state machine:
-        // applied entries carry the leader's commit timestamps, and the
-        // local oracle must advance past them or MVCC readers on this
-        // node keep drawing stale snapshots that observe none of the
-        // replicated data.
-        let state_machine =
-            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
-                .map_err(|e| RaftNodeError::Init(e.to_string()))?
-                .with_engine_work(log_store.engine_work());
-        let version = version_gate(node_id, group, &state_machine, host_epoch);
-        let applied_rx = state_machine.subscribe_applied();
-        let snapshot_builds = state_machine.snapshot_builds_handle();
-        let engine_work = state_machine.engine_work_handle();
-
-        let (closing, closing_rx) = tokio::sync::watch::channel(false);
-        let network = GrpcNetworkFactory {
-            local_node_id: node_id,
-            closing: network::Closing::new(closing_rx),
-            gate: Arc::clone(&version),
-            connections,
-        };
-
-        let raft: RaftInstance =
-            openraft::Raft::new(node_id, config, network, log_store, state_machine)
-                .await
-                .map_err(|e: openraft::error::Fatal<TypeConfig>| {
-                    RaftNodeError::Init(e.to_string())
-                })?;
-
-        let raft = Arc::new(raft);
-
-        // Try initialize — succeeds on fresh start, NotAllowed on restart.
-        let mut members = std::collections::BTreeMap::new();
-        members.insert(node_id, MemberNode::new(advertise_addr.clone(), None));
-
-        match raft.initialize(members).await {
-            Ok(_) => {
-                tracing::info!(node_id, "fresh cluster node initialized as leader");
-                publish_existing_state_as_group_base(&raft, &engine).await?;
-            }
-            Err(openraft::error::RaftError::APIError(
-                openraft::error::InitializeError::NotAllowed(_),
-            )) => {
-                tracing::debug!(
-                    node_id,
-                    "raft already initialized, resuming from existing state"
-                );
-            }
-            Err(e) => {
-                return Err(RaftNodeError::Init(format!("initialize failed: {e}")));
-            }
-        }
-
-        // Build the gRPC handler — caller registers it into the main tonic router.
-        // No internal gRPC server is started here.
-        let handler = RaftGrpcHandler::new(
-            Arc::clone(&raft),
-            crate::snapshot::snapshot_dir(&engine),
-            Arc::clone(&version),
-            Arc::clone(engine.space()),
-        );
-
-        let snap_handle = spawn_snapshot_trigger(
-            Arc::clone(&raft),
-            Arc::clone(&engine),
-            &engine_work,
-            snap_config,
-            applied_rx.clone(),
-        );
-        let version_watch = spawn_version_watch(
-            Arc::clone(&raft),
-            Arc::clone(&version),
-            Arc::clone(&engine),
-            engine.oracle(),
-        );
-
-        let node = Self {
-            raft,
-            applied_rx,
-            snapshot_builds,
-            engine_work,
+        Self::open_member(
             node_id,
-            advertise_addr: Some(advertise_addr),
             engine,
-            oplog,
-            append_notifier,
-            // no internal server — caller manages the router
-            grpc_shutdown: std::sync::Mutex::new(None),
-            grpc_task: std::sync::Mutex::new(None),
-            closing,
-            _snapshot_trigger: Some(snap_handle),
-            version,
-            version_watch,
-            membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
-                DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
-            ),
-            join: JoinTuning::default(),
-        };
-
-        Ok((node, handler))
+            options,
+            Founding::Form {
+                advertise: advertise_addr,
+            },
+            None,
+        )
+        .await
     }
 
     /// Open a joining node for embedding into an existing tonic server.
@@ -969,8 +1217,19 @@ impl RaftNode {
     pub async fn open_joining_embedded(
         node_id: u64,
         engine: Arc<StorageEngine>,
+        connections: Arc<PeerConnections>,
+        enrollment: Enrollment,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
-        Self::open_joining_embedded_with_options(node_id, engine, NodeOptions::default()).await
+        Self::open_joining_embedded_with_options(
+            node_id,
+            engine,
+            NodeOptions {
+                connections: Some(connections),
+                enrollment: Some(enrollment),
+                ..NodeOptions::default()
+            },
+        )
+        .await
     }
 
     /// Like `open_joining_embedded`, with the snapshot policy and host epoch
@@ -980,102 +1239,7 @@ impl RaftNode {
         engine: Arc<StorageEngine>,
         options: NodeOptions,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
-        let NodeOptions {
-            snapshots: snap_config,
-            host_epoch,
-            group,
-            connections,
-        } = options;
-        let config = Arc::new(snap_config.raft_config());
-        let log_store =
-            LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
-        // Clone the oplog handle before openraft consumes the LogStore, so
-        // WAL-replay repair can read committed entries since a checkpoint.
-        let oplog = log_store.oplog_handle();
-        let append_notifier = log_store.append_notifier();
-        // Wire the engine's own timestamp oracle into the state machine:
-        // applied entries carry the leader's commit timestamps, and the
-        // local oracle must advance past them or MVCC readers on this
-        // node keep drawing stale snapshots that observe none of the
-        // replicated data.
-        let state_machine =
-            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
-                .map_err(|e| RaftNodeError::Init(e.to_string()))?
-                .with_engine_work(log_store.engine_work());
-        refuse_join_with_local_data(node_id, &engine, &log_store, &state_machine)?;
-        let version = version_gate(node_id, group, &state_machine, host_epoch);
-        let applied_rx = state_machine.subscribe_applied();
-        let snapshot_builds = state_machine.snapshot_builds_handle();
-        let engine_work = state_machine.engine_work_handle();
-
-        let (closing, closing_rx) = tokio::sync::watch::channel(false);
-        let network = GrpcNetworkFactory {
-            local_node_id: node_id,
-            closing: network::Closing::new(closing_rx),
-            gate: Arc::clone(&version),
-            connections,
-        };
-
-        let raft: RaftInstance =
-            openraft::Raft::new(node_id, config, network, log_store, state_machine)
-                .await
-                .map_err(|e: openraft::error::Fatal<TypeConfig>| {
-                    RaftNodeError::Init(e.to_string())
-                })?;
-
-        let raft = Arc::new(raft);
-
-        // Build the gRPC handler — caller registers it into the main tonic router.
-        let handler = RaftGrpcHandler::new(
-            Arc::clone(&raft),
-            crate::snapshot::snapshot_dir(&engine),
-            Arc::clone(&version),
-            Arc::clone(engine.space()),
-        );
-
-        let snap_handle = spawn_snapshot_trigger(
-            Arc::clone(&raft),
-            Arc::clone(&engine),
-            &engine_work,
-            snap_config,
-            applied_rx.clone(),
-        );
-        let version_watch = spawn_version_watch(
-            Arc::clone(&raft),
-            Arc::clone(&version),
-            Arc::clone(&engine),
-            engine.oracle(),
-        );
-
-        tracing::info!(
-            node_id,
-            "joining node started (waiting for leader to add via add_node)"
-        );
-
-        let node = Self {
-            raft,
-            applied_rx,
-            snapshot_builds,
-            engine_work,
-            node_id,
-            advertise_addr: None,
-            engine,
-            oplog,
-            append_notifier,
-            // no internal server — caller manages the router
-            grpc_shutdown: std::sync::Mutex::new(None),
-            grpc_task: std::sync::Mutex::new(None),
-            closing,
-            _snapshot_trigger: Some(snap_handle),
-            version,
-            version_watch,
-            membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
-                DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
-            ),
-            join: JoinTuning::default(),
-        };
-
-        Ok((node, handler))
+        Self::open_member(node_id, engine, options, Founding::Join, None).await
     }
 
     /// Open a Raft node that joins an existing cluster.
@@ -1084,13 +1248,28 @@ impl RaftNode {
     /// add it via `add_node()`. This avoids creating conflicting single-node
     /// clusters when bootstrapping a multi-node cluster.
     ///
-    /// Used by nodes 2+ in the bootstrap sequence.
+    /// Used by nodes 2+ in the bootstrap sequence. The node proves the
+    /// identity of `connections`' security context and admits a peer once
+    /// a member it trusts (one of `enrollment`'s authorities, until it has
+    /// a membership of its own) binds that peer.
     pub async fn open_joining(
         node_id: u64,
         engine: Arc<StorageEngine>,
         listen_addr: std::net::SocketAddr,
+        connections: Arc<PeerConnections>,
+        enrollment: Enrollment,
     ) -> Result<Self, RaftNodeError> {
-        Self::open_joining_with_options(node_id, engine, listen_addr, NodeOptions::default()).await
+        Self::open_joining_with_options(
+            node_id,
+            engine,
+            listen_addr,
+            NodeOptions {
+                connections: Some(connections),
+                enrollment: Some(enrollment),
+                ..NodeOptions::default()
+            },
+        )
+        .await
     }
 
     /// Like `open_joining`, with the snapshot policy and host epoch of
@@ -1101,118 +1280,9 @@ impl RaftNode {
         listen_addr: std::net::SocketAddr,
         options: NodeOptions,
     ) -> Result<Self, RaftNodeError> {
-        let NodeOptions {
-            snapshots: snap_config,
-            host_epoch,
-            group,
-            connections,
-        } = options;
-        let config = Arc::new(snap_config.raft_config());
-        let log_store =
-            LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
-        // Clone the oplog handle before openraft consumes the LogStore, so
-        // WAL-replay repair can read committed entries since a checkpoint.
-        let oplog = log_store.oplog_handle();
-        let append_notifier = log_store.append_notifier();
-        // Wire the engine's own timestamp oracle into the state machine:
-        // applied entries carry the leader's commit timestamps, and the
-        // local oracle must advance past them or MVCC readers on this
-        // node keep drawing stale snapshots that observe none of the
-        // replicated data.
-        let state_machine =
-            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
-                .map_err(|e| RaftNodeError::Init(e.to_string()))?
-                .with_engine_work(log_store.engine_work());
-        refuse_join_with_local_data(node_id, &engine, &log_store, &state_machine)?;
-        let version = version_gate(node_id, group, &state_machine, host_epoch);
-        let applied_rx = state_machine.subscribe_applied();
-        let snapshot_builds = state_machine.snapshot_builds_handle();
-        let engine_work = state_machine.engine_work_handle();
-
-        let (closing, closing_rx) = tokio::sync::watch::channel(false);
-        let network = GrpcNetworkFactory {
-            local_node_id: node_id,
-            closing: network::Closing::new(closing_rx),
-            gate: Arc::clone(&version),
-            connections,
-        };
-
-        let raft: RaftInstance =
-            openraft::Raft::new(node_id, config, network, log_store, state_machine)
-                .await
-                .map_err(|e: openraft::error::Fatal<TypeConfig>| {
-                    RaftNodeError::Init(e.to_string())
-                })?;
-
-        let raft = Arc::new(raft);
-
-        // Bound eagerly for the same reason as in open_cluster: a busy port
-        // is a hard open error, never a deaf node. tokio's bind sets
-        // SO_REUSEADDR so a restart on the same address is not locked out
-        // by the previous life's TIME_WAIT sockets.
-        let listener = tokio::net::TcpListener::bind(listen_addr)
+        Self::open_member(node_id, engine, options, Founding::Join, Some(listen_addr))
             .await
-            .map_err(|e| RaftNodeError::Init(format!("bind {listen_addr}: {e}")))?;
-        let incoming =
-            tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
-        let handler = RaftGrpcHandler::new(
-            Arc::clone(&raft),
-            crate::snapshot::snapshot_dir(&engine),
-            Arc::clone(&version),
-            Arc::clone(engine.space()),
-        );
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let server = tonic::transport::Server::builder()
-            .add_service(handler.handshake_service())
-            .add_service(RaftServiceServer::new(handler));
-
-        let grpc_task = tokio::spawn(async move {
-            let graceful = server.serve_with_incoming_shutdown(incoming, async {
-                let _ = shutdown_rx.await;
-            });
-            if let Err(e) = graceful.await {
-                tracing::error!(%e, "raft gRPC server failed");
-            }
-        });
-
-        tracing::info!(node_id, %listen_addr, "joining node started (waiting for leader)");
-
-        let snap_handle = spawn_snapshot_trigger(
-            Arc::clone(&raft),
-            Arc::clone(&engine),
-            &engine_work,
-            snap_config,
-            applied_rx.clone(),
-        );
-        let version_watch = spawn_version_watch(
-            Arc::clone(&raft),
-            Arc::clone(&version),
-            Arc::clone(&engine),
-            engine.oracle(),
-        );
-
-        Ok(Self {
-            raft,
-            applied_rx,
-            snapshot_builds,
-            engine_work,
-            node_id,
-            advertise_addr: None,
-            engine,
-            oplog,
-            append_notifier,
-            grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
-            grpc_task: std::sync::Mutex::new(Some(grpc_task)),
-            closing,
-            _snapshot_trigger: Some(snap_handle),
-            version,
-            version_watch,
-            membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
-                DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
-            ),
-            join: JoinTuning::default(),
-        })
+            .map(|(node, _)| node)
     }
 
     /// Say why openraft refused a membership change in the terms an operator
@@ -1296,13 +1366,85 @@ impl RaftNode {
     /// 1. Node 1: `open_cluster(1, engine, addr1, addr1)` → becomes leader
     /// 2. Node 2: `open_cluster(2, engine, addr2, addr2)` → starts, no init
     /// 3. Node 3: `open_cluster(3, engine, addr3, addr3)` → starts, no init
-    /// 4. On node 1: `add_node(2, addr2)`, `add_node(3, addr3)`
+    /// 4. On node 1: `add_node(2, addr2, id2)`, `add_node(3, addr3, id3)`
     /// 5. On node 1: `change_membership([1, 2, 3])` → all become voters
-    pub async fn add_node(&self, node_id: u64, addr: String) -> Result<(), RaftNodeError> {
+    ///
+    /// The member is bound to `identity`: the leader dials `addr` expecting
+    /// it, and every member admits the node under it alone. This is the
+    /// explicit authorization a joining node's bootstrap rests on.
+    ///
+    /// # Errors
+    ///
+    /// `identity` already left the deployment (a returning node joins under
+    /// a new one), is bound to another member, or `node_id` is a member bound
+    /// to another identity.
+    ///
+    /// For a member already bound to `identity`, only its address changes:
+    /// the address is where to find it, the identity who must answer there,
+    /// so a member that moved is re-addressed with no other change.
+    pub async fn add_node(
+        &self,
+        node_id: u64,
+        addr: String,
+        identity: coordinode_wire::peer::PeerIdentity,
+    ) -> Result<(), RaftNodeError> {
+        use openraft::rt::watch::WatchReceiver;
+
         self.publish_own_address().await?;
         self.membership_settled().await?;
+        self.await_deployment().await?;
 
-        let node_info = MemberNode::new(addr, None);
+        let member = MemberIdentity::from(&identity);
+        let retired = coordinode_storage::engine::metadata::identity_retired(
+            &self.engine,
+            &member.canonical(),
+        )
+        .map_err(|e| RaftNodeError::Init(format!("read retired identities: {e}")))?;
+        if retired {
+            return Err(RaftNodeError::Identity(format!(
+                "{member} left this deployment and is not admitted again: a returning node joins \
+                 under a new identity"
+            )));
+        }
+        let mut readdress = false;
+        {
+            let metrics = self.raft.metrics();
+            let metrics = metrics.borrow_watched();
+            for (&id, node) in metrics.membership_config.membership().nodes() {
+                let same = node.identity.as_ref() == Some(&member);
+                if id != node_id && same {
+                    return Err(RaftNodeError::Identity(format!(
+                        "{member} is bound to node {id} already"
+                    )));
+                }
+                if id == node_id && !same {
+                    return Err(RaftNodeError::Identity(format!(
+                        "node {node_id} is a member bound to {} already",
+                        node.identity
+                            .as_ref()
+                            .map_or_else(|| "no identity".to_owned(), ToString::to_string)
+                    )));
+                }
+                readdress |= id == node_id;
+            }
+        }
+
+        let node_info = MemberNode::new(addr, Some(member));
+        if readdress {
+            let written = self
+                .raft
+                .change_membership(
+                    openraft::ChangeMembers::SetNodes(std::collections::BTreeMap::from([(
+                        node_id, node_info,
+                    )])),
+                    true,
+                )
+                .await
+                .map_err(|e| RaftNodeError::Membership(Self::describe_membership_refusal(&e)))?;
+            self.membership_published(written.log_id.index).await?;
+            tracing::info!(node_id, "re-addressed a member");
+            return Ok(());
+        }
 
         // Add as learner (non-voting, receives log replication)
         let written = self
@@ -1316,27 +1458,33 @@ impl RaftNode {
         Ok(())
     }
 
-    /// Record this node's advertised address in the membership while it is
-    /// still the cluster's only member.
+    /// Record this node's advertised address and node identity in the
+    /// membership while it is still the cluster's only member.
     ///
-    /// A directory first opened standalone holds a placeholder address for its
-    /// single member, and reopening it in cluster mode resumes that state rather
-    /// than initialising again. Peers dial members by this address, so it has to
-    /// be right before the first peer joins. Replacing an address is safe only
-    /// while no other member exists: with peers present a wrong address can split
-    /// the cluster, and the node has to be removed and added back instead.
+    /// A directory first opened standalone holds a placeholder address and no
+    /// identity for its single member, and reopening it in cluster mode
+    /// resumes that state rather than initialising again. Peers dial members
+    /// by this address expecting this identity, so both have to be right
+    /// before the first peer joins. Once there are peers, a member that moved
+    /// is re-addressed through [`Self::add_node`], and its identity stays.
     async fn publish_own_address(&self) -> Result<(), RaftNodeError> {
         use openraft::rt::watch::WatchReceiver;
 
-        let Some(advertise) = self.advertise_addr.as_ref() else {
+        let (Some(advertise), Some(connections)) =
+            (self.advertise_addr.as_ref(), self.connections.as_ref())
+        else {
             return Ok(());
         };
+        let own = MemberIdentity::from(&connections.context().identity());
         let stale = {
             let rx = self.raft.metrics();
             let metrics = rx.borrow_watched();
             let mut members = metrics.membership_config.membership().nodes();
             match (members.next(), members.next()) {
-                (Some((id, info)), None) => *id == self.node_id && info.addr != *advertise,
+                (Some((id, info)), None) => {
+                    *id == self.node_id
+                        && (info.addr != *advertise || info.identity.as_ref() != Some(&own))
+                }
                 _ => false,
             }
         };
@@ -1345,7 +1493,7 @@ impl RaftNode {
         }
 
         let mut nodes = std::collections::BTreeMap::new();
-        nodes.insert(self.node_id, MemberNode::new(advertise.clone(), None));
+        nodes.insert(self.node_id, MemberNode::new(advertise.clone(), Some(own)));
         let written = self
             .raft
             .change_membership(openraft::ChangeMembers::SetNodes(nodes), true)
@@ -1357,10 +1505,26 @@ impl RaftNode {
         Ok(())
     }
 
+    /// The deployment's identity, recorded when its first group formed.
+    async fn await_deployment(&self) -> Result<DeploymentId, RaftNodeError> {
+        if let Some(id) = *self.deployment.borrow() {
+            return Ok(id);
+        }
+        if leads_alone(&self.raft, self.node_id) {
+            let mut recorded = self.deployment.clone();
+            return found_deployment(&self.commands, &mut recorded, None).await;
+        }
+        Err(RaftNodeError::Membership(
+            "this member does not know its deployment yet".to_owned(),
+        ))
+    }
+
     /// Change cluster membership (leader-only).
     ///
     /// Sets the voting members to the given set of node IDs.
-    /// All nodes must have been previously added as learners.
+    /// All nodes must have been previously added as learners. A voter left
+    /// out of the set leaves the deployment: its identity is retired as the
+    /// change applies.
     pub async fn change_membership(&self, member_ids: Vec<u64>) -> Result<(), RaftNodeError> {
         self.membership_settled().await?;
         let members: std::collections::BTreeSet<u64> = member_ids.into_iter().collect();
@@ -1388,31 +1552,34 @@ impl RaftNode {
         self.membership_settled().await?;
         // Get current voter set from raft metrics.
         // Must collect inside borrow scope — voter_ids() borrows from the ref guard.
-        let current_members: std::collections::BTreeSet<u64> = {
+        let (current_members, learner): (std::collections::BTreeSet<u64>, bool) = {
             let rx = self.raft.metrics();
             let metrics_ref = rx.borrow_watched();
-            let ids: Vec<u64> = metrics_ref
-                .membership_config
-                .membership()
-                .voter_ids()
-                .collect();
-            ids.into_iter().collect()
+            let membership = metrics_ref.membership_config.membership();
+            let ids: Vec<u64> = membership.voter_ids().collect();
+            let learner = membership.learner_ids().any(|id| id == node_id);
+            (ids.into_iter().collect(), learner)
         };
 
-        let new_members: std::collections::BTreeSet<u64> = current_members
-            .into_iter()
-            .filter(|&id| id != node_id)
-            .collect();
-
-        if new_members.is_empty() {
-            return Err(RaftNodeError::Membership(
-                "cannot remove last voting member".to_string(),
-            ));
-        }
+        // A learner is not among the voters; it leaves the nodes instead.
+        let change = if learner {
+            openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([node_id]))
+        } else {
+            let new_members: std::collections::BTreeSet<u64> = current_members
+                .into_iter()
+                .filter(|&id| id != node_id)
+                .collect();
+            if new_members.is_empty() {
+                return Err(RaftNodeError::Membership(
+                    "cannot remove last voting member".to_string(),
+                ));
+            }
+            openraft::ChangeMembers::ReplaceAllVoters(new_members)
+        };
 
         let written = self
             .raft
-            .change_membership(new_members, false)
+            .change_membership(change, false)
             .await
             .map_err(|e| RaftNodeError::Membership(Self::describe_membership_refusal(&e)))?;
         self.membership_published(written.log_id.index).await?;
@@ -1880,6 +2047,90 @@ impl RaftNode {
     /// Get this node's ID.
     pub fn node_id(&self) -> u64 {
         self.node_id
+    }
+
+    /// The deployment this member belongs to: the one its applied state
+    /// records, or on a joining member the one it was enrolled in. `None`
+    /// only before either is known.
+    pub fn deployment(&self) -> Option<DeploymentId> {
+        match &self.admission {
+            Some(admission) => admission.deployment(),
+            None => *self.deployment.borrow(),
+        }
+    }
+
+    /// What a node joining this member's deployment through it enrolls
+    /// with: the deployment, and this member, found at `addr`, as the one
+    /// it learns the membership from. `None` until the deployment is known
+    /// or for a node without peers.
+    pub fn enrollment(&self, addr: impl Into<String>) -> Option<Enrollment> {
+        Some(Enrollment {
+            deployment: self.deployment()?,
+            authorities: vec![PeerTarget {
+                addr: addr.into(),
+                identity: self.node_identity()?,
+            }],
+        })
+    }
+
+    /// The node identity this node proves to its peers; `None` for a node
+    /// without peers.
+    pub fn node_identity(&self) -> Option<coordinode_wire::peer::PeerIdentity> {
+        self.connections.as_ref().map(|c| c.context().identity())
+    }
+
+    /// This node's connections to its peers. Their security context is
+    /// where a host renews the node's credentials or replaces the trust its
+    /// peers are verified under, without reopening the node.
+    pub fn connections(&self) -> Option<&Arc<PeerConnections>> {
+        self.connections.as_ref()
+    }
+
+    /// Which peers this member admits; `None` for a node without peers.
+    /// A service a peer calls admits the caller through it.
+    pub fn admission(&self) -> Option<&Arc<Admission>> {
+        self.admission.as_ref()
+    }
+
+    /// The node identity member `node_id` is bound to, if the membership
+    /// records it.
+    pub fn member_identity(&self, node_id: u64) -> Option<MemberIdentity> {
+        use openraft::async_runtime::watch::WatchReceiver;
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .get_node(&node_id)
+            .and_then(|node| node.identity.clone())
+    }
+
+    /// Member `node_id` as a peer to dial: its address and the identity it
+    /// must prove there. `None` when the membership does not contain it or
+    /// records no identity for it.
+    pub fn member_target(&self, node_id: u64) -> Option<PeerTarget> {
+        use openraft::async_runtime::watch::WatchReceiver;
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .get_node(&node_id)
+            .and_then(admission::member_target)
+    }
+
+    /// Every other member as a peer to dial.
+    pub fn peer_targets(&self) -> Vec<PeerTarget> {
+        use openraft::async_runtime::watch::WatchReceiver;
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .nodes()
+            .filter(|(&id, _)| id != self.node_id)
+            .filter_map(|(_, node)| admission::member_target(node))
+            .collect()
     }
 
     /// Get a reference to the underlying openraft instance.
@@ -2914,6 +3165,37 @@ pub enum RaftNodeError {
          this node instead, or point it at an empty data directory"
     )]
     JoinWithLocalData,
+
+    /// A node with peers was opened without a node identity. The
+    /// inter-node channel is authenticated or absent; a node that has no
+    /// identity has no peers.
+    #[error(
+        "a node that talks to peers needs a node identity: give it its certificate, key and \
+         the trust its peers are verified under"
+    )]
+    NoNodeIdentity,
+
+    /// A joining node was opened without the deployment it joins and the
+    /// members it trusts until it has a membership of its own.
+    #[error(
+        "a joining node needs its enrollment: the deployment it joins and at least one \
+         existing member, by address and node identity"
+    )]
+    NotEnrolled,
+
+    /// The store belongs to another deployment than the one it was asked to
+    /// join.
+    #[error("this store belongs to deployment {bound}, not to deployment {asked}")]
+    OtherDeployment {
+        /// The deployment the store is bound to.
+        bound: DeploymentId,
+        /// The deployment it was asked to join.
+        asked: DeploymentId,
+    },
+
+    /// A member cannot be bound to this identity.
+    #[error("{0}")]
+    Identity(String),
 }
 
 /// Refuse to join a group while this store holds data of its own.

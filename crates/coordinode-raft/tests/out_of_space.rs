@@ -18,14 +18,27 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::alloc_port;
+use coordinode_test_fixtures::{TestPki, alloc_port};
 use openraft::rt::watch::WatchReceiver;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The CA the members of a test's group prove their identities under.
+static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
+
+/// The enrollment of a node joining the group node 1 formed at `port`.
+fn enroll(founder: &RaftNode, port: u16) -> Enrollment {
+    Enrollment {
+        deployment: founder
+            .deployment()
+            .expect("the founder knows its deployment"),
+        authorities: vec![PKI.target(1, format!("127.0.0.1:{port}"))],
+    }
+}
 
 fn open_engine(path: &Path) -> Arc<StorageEngine> {
     Arc::new(
@@ -149,6 +162,7 @@ async fn a_follower_out_of_space_pauses_and_catches_up() {
             Arc::clone(&engines[0]),
             format!("127.0.0.1:{}", ports[0]).parse().expect("addr"),
             format!("http://127.0.0.1:{}", ports[0]),
+            PKI.connections(1),
         )
         .await
         .expect("open 1");
@@ -156,6 +170,8 @@ async fn a_follower_out_of_space_pauses_and_catches_up() {
             2,
             Arc::clone(&engines[1]),
             format!("127.0.0.1:{}", ports[1]).parse().expect("addr"),
+            PKI.connections(2),
+            enroll(&n1, ports[0]),
         )
         .await
         .expect("open 2");
@@ -163,6 +179,8 @@ async fn a_follower_out_of_space_pauses_and_catches_up() {
             3,
             Arc::clone(&engines[2]),
             format!("127.0.0.1:{}", ports[2]).parse().expect("addr"),
+            PKI.connections(3),
+            enroll(&n1, ports[0]),
         )
         .await
         .expect("open 3");
@@ -170,10 +188,10 @@ async fn a_follower_out_of_space_pauses_and_catches_up() {
             n1.raft().metrics().borrow_watched().state.is_leader()
         })
         .await;
-        n1.add_node(2, format!("http://127.0.0.1:{}", ports[1]))
+        n1.add_node(2, format!("http://127.0.0.1:{}", ports[1]), PKI.identity(2))
             .await
             .expect("add 2");
-        n1.add_node(3, format!("http://127.0.0.1:{}", ports[2]))
+        n1.add_node(3, format!("http://127.0.0.1:{}", ports[2]), PKI.identity(3))
             .await
             .expect("add 3");
         n1.change_membership(vec![1, 2, 3])
@@ -242,6 +260,7 @@ async fn a_leader_out_of_space_refuses_writes_without_stopping() {
             Arc::clone(&engines[0]),
             format!("127.0.0.1:{}", ports[0]).parse().expect("addr"),
             format!("http://127.0.0.1:{}", ports[0]),
+            PKI.connections(1),
         )
         .await
         .expect("open 1");
@@ -249,6 +268,8 @@ async fn a_leader_out_of_space_refuses_writes_without_stopping() {
             2,
             Arc::clone(&engines[1]),
             format!("127.0.0.1:{}", ports[1]).parse().expect("addr"),
+            PKI.connections(2),
+            enroll(&n1, ports[0]),
         )
         .await
         .expect("open 2");
@@ -256,7 +277,7 @@ async fn a_leader_out_of_space_refuses_writes_without_stopping() {
             n1.raft().metrics().borrow_watched().state.is_leader()
         })
         .await;
-        n1.add_node(2, format!("http://127.0.0.1:{}", ports[1]))
+        n1.add_node(2, format!("http://127.0.0.1:{}", ports[1]), PKI.identity(2))
             .await
             .expect("add 2");
         let ids = ProposalIdGenerator::with_base(1u64 << 48);

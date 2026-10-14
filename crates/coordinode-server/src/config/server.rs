@@ -193,6 +193,44 @@ pub struct OplogSettings {
     pub sync_method: Option<SyncMethod>,
 }
 
+/// The identity a node with peers proves on the inter-node channel, and the
+/// trust it verifies its peers under (the X.509-SVID profile). Inter-node
+/// traffic is always mutually authenticated; there is no plaintext peer
+/// channel. Every file is read again on a reload.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeIdentitySettings {
+    /// PEM certificate chain of the node, leaf first: an X.509-SVID with
+    /// exactly one SPIFFE ID URI SAN. It may carry DNS names as well, for
+    /// clients verifying the server by host name.
+    pub cert: String,
+    /// PEM private key of the certificate.
+    pub key: String,
+    /// Trust bundle per SPIFFE trust domain: the domain, and the PEM file of
+    /// the CA certificates that issue its identities. A peer is trusted only
+    /// under its own domain's bundle.
+    pub trust_bundles: BTreeMap<String, String>,
+    /// The deployment this node belongs to, 32 hexadecimal digits, as the
+    /// cluster status reports it. Required to join; on the first node of a
+    /// new deployment leave it unset and one is chosen.
+    #[serde(default)]
+    pub deployment: Option<String>,
+    /// Members a joining node learns its group's membership from, each with
+    /// the identity it must prove. Required to join.
+    #[serde(default)]
+    pub enroll_from: Vec<PeerEntry>,
+}
+
+/// A peer node: where to find it and the identity it must prove there.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerEntry {
+    /// Where the peer listens, `host:port`.
+    pub addr: String,
+    /// The SPIFFE ID it proves.
+    pub identity: String,
+}
+
 /// Errors from loading the YAML config file.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -412,6 +450,10 @@ pub struct ServerConfig {
     /// Require + verify a client certificate (mutual TLS) on incoming
     /// connections. Needs `tls_ca`. Default false.
     pub tls_require_client_auth: bool,
+    /// The node's inter-node identity; required with `peers`. In a cluster
+    /// the gRPC port presents this certificate to clients as well, so
+    /// `tls_cert` / `tls_key` are refused there.
+    pub node_identity: Option<NodeIdentitySettings>,
     /// Whether the background integrity scrub runs. Each node scrubs its own
     /// local storage independently (no leader election). Default false: a
     /// full pass reads every block, which an operator schedules deliberately.
@@ -532,6 +574,7 @@ impl Default for ServerConfig {
             tls_key: None,
             tls_ca: None,
             tls_require_client_auth: false,
+            node_identity: None,
             scrub_enabled: false,
             scrub_interval_secs: 7 * 24 * 3600,
             scrub_throttle_ms: Some(50),

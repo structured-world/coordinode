@@ -67,6 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_root_str}/coordinode/v1/query/cypher.proto"),
                 format!("{proto_root_str}/coordinode/v1/session/session.proto"),
                 format!("{proto_root_str}/coordinode/v1/admin/cluster.proto"),
+                // The inter-node services, called as a client would to check
+                // that only nodes are served.
+                format!("{proto_root_str}/coordinode/v1/replication/raft.proto"),
+                format!("{proto_root_str}/coordinode/v1/replication/transfer.proto"),
+                format!("{proto_root_str}/coordinode/internode/handshake.proto"),
             ],
             &includes,
         )?;
