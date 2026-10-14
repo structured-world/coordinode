@@ -444,20 +444,22 @@ impl OplogManager {
     /// by the data actually about to be deleted. Pass `&|_| true` when every
     /// journaled write is known durable (tests, post-persist maintenance).
     ///
-    /// `now_secs` — current Unix time in seconds. HLC `last_ts` packs wall ms
-    /// in the upper bits, so the cutoff is `(now_secs - retention_secs) * 1000
-    /// << 18`.
+    /// `now_secs` — current Unix time in seconds. An entry's timestamp is HLC
+    /// wall-clock microseconds, so the cutoff is `(now_secs - retention_secs)
+    /// * 1_000_000`.
     pub fn purge_with_floor(
         &mut self,
         now_secs: u64,
         oplog_index_floor: u64,
         is_durable: &dyn Fn(&OplogEntry) -> bool,
     ) -> StorageResult<usize> {
-        let cutoff_ms = now_secs
-            .saturating_sub(self.retention_secs)
-            .saturating_mul(1_000);
-        // HLC: wall-clock ms occupies the upper bits (shift by 18 for the logical counter).
-        let cutoff_hlc = cutoff_ms << 18;
+        // A window longer than the clock reaches back keeps everything.
+        let cutoff_hlc = match now_secs.checked_sub(self.retention_secs) {
+            Some(secs) => secs.checked_mul(1_000_000).ok_or_else(|| {
+                StorageError::Io(format!("oplog purge: {secs} s past any timestamp"))
+            })?,
+            None => 0,
+        };
 
         let mut purged = 0usize;
         let mut remaining = Vec::with_capacity(self.sealed.len());

@@ -301,19 +301,16 @@ fn purge_expired_removes_old_segments() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 50_000, 3600).expect("open");
 
-    // Entries with ts = 100ms in HLC (100 << 18)
-    let old_ts = 100u64 << 18;
+    // Entries written at 100 s, in HLC wall-clock microseconds.
+    let old_ts = 100 * 1_000_000;
     for i in 0..3u64 {
-        let mut e = make_entry(i, old_ts);
-        e.ts = old_ts;
-        mgr.append(&e).expect("append old");
+        mgr.append(&make_entry(i, old_ts)).expect("append old");
     }
     mgr.rotate().expect("rotate");
     assert_eq!(mgr.sealed.len(), 1);
 
-    // now_secs=10000; cutoff = 10000-3600 = 6400s = 6_400_000ms
-    // old segment last_ts ≈ 100ms << 18 ≪ 6_400_000ms << 18 → purged
-    // (no consumer floor, every entry durable)
+    // now_secs=10000; cutoff = 10000-3600 = 6400 s; the segment ends at
+    // 100 s → purged (no consumer floor, every entry durable).
     let purged = mgr
         .purge_with_floor(10_000, u64::MAX, &|_| true)
         .expect("purge");
@@ -326,12 +323,11 @@ fn purge_keeps_recent_segments() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 50_000, 3600).expect("open");
 
-    // Entries with ts at "now" = 10000s = 10_000_000ms
-    let recent_ts = 10_000_000u64 << 18;
+    // Entries written at "now" = 10000 s, in microseconds.
+    let recent_ts = 10_000 * 1_000_000;
     for i in 0..3u64 {
-        let mut e = make_entry(i, recent_ts);
-        e.ts = recent_ts;
-        mgr.append(&e).expect("append recent");
+        mgr.append(&make_entry(i, recent_ts))
+            .expect("append recent");
     }
     mgr.rotate().expect("rotate");
 
@@ -342,6 +338,43 @@ fn purge_keeps_recent_segments() {
     assert_eq!(mgr.sealed.len(), 1);
 }
 
+/// The retention window holds what the clock wrote within it. Timestamps are
+/// HLC wall-clock microseconds; a cutoff computed as packed milliseconds
+/// (`ms << 18`) lies far in the future of every real timestamp, so the window
+/// kept nothing and a segment written a minute ago was purged.
+#[test]
+fn a_segment_written_within_the_window_is_kept() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 50_000, 3600).expect("open");
+    let now_secs = 1_800_000_000u64;
+    let us = |secs: u64| secs * 1_000_000;
+    for i in 0..3u64 {
+        mgr.append(&make_entry(i, us(now_secs - 7200)))
+            .expect("append old");
+    }
+    mgr.rotate().expect("rotate");
+    for i in 3..6u64 {
+        mgr.append(&make_entry(i, us(now_secs - 60)))
+            .expect("append recent");
+    }
+    mgr.rotate().expect("rotate");
+
+    let purged = mgr
+        .purge_with_floor(now_secs, u64::MAX, &|_| true)
+        .expect("purge");
+    assert_eq!(
+        purged, 1,
+        "only the segment two hours old is outside the hour"
+    );
+    assert_eq!(
+        mgr.sealed
+            .iter()
+            .map(|&(first, _)| first)
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+}
+
 /// Feed (b): a time-expired segment is KEPT when its last index is at or
 /// above the consumer oplog floor, and PURGED once below it — the logical
 /// OR of time-window and CDC-consumer need.
@@ -350,18 +383,15 @@ fn purge_with_floor_keeps_consumer_needed_segments() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 50_000, 3600).expect("open");
 
-    // Two time-expired segments: seg0 = indices [0,2], seg1 = [3,5].
-    let old_ts = 100u64 << 18;
+    // Two time-expired segments (written at 100 s): seg0 = indices [0,2],
+    // seg1 = [3,5].
+    let old_ts = 100 * 1_000_000;
     for i in 0..3u64 {
-        let mut e = make_entry(i, old_ts);
-        e.ts = old_ts;
-        mgr.append(&e).expect("append seg0");
+        mgr.append(&make_entry(i, old_ts)).expect("append seg0");
     }
     mgr.rotate().expect("rotate seg0");
     for i in 3..6u64 {
-        let mut e = make_entry(i, old_ts);
-        e.ts = old_ts;
-        mgr.append(&e).expect("append seg1");
+        mgr.append(&make_entry(i, old_ts)).expect("append seg1");
     }
     mgr.rotate().expect("rotate seg1");
     assert_eq!(mgr.sealed.len(), 2);
