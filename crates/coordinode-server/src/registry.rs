@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_replicate::{
-    BackgroundConfig, ConsumerKind, RegistryBackground, RetentionSource, ShardConsumerRegistry,
-    SystemClock,
+    BackgroundConfig, ConsumerKind, RegistryBackground, RetentionSource, SeqnoConsumerRegistry,
+    ShardConsumerRegistry, SystemClock,
 };
 use coordinode_storage::engine::core::{StorageEngine, WritePressure};
 use coordinode_storage::oplog::OplogTimeline;
@@ -89,7 +89,9 @@ impl RetentionSource for NodeRetentionSource {
         if kind.is_seqno_space() {
             return None;
         }
-        match self.timeline.written_at(position) {
+        // Work a consumer owes starts at the first committed entry from its
+        // position: an entry with no commit carries no event and no time.
+        match self.timeline.first_committed_at(position, self.head(kind)) {
             // An entry's timestamp is wall-clock microseconds.
             Ok(ts) => ts.map(|ts| ts / 1_000),
             Err(e) => {
@@ -170,6 +172,14 @@ pub(crate) fn build_consumer_registry(
     // for producers to register through (the bg task holds its own Arc to core).
     let background = registry.start_background(bg_cfg);
     (registry, background)
+}
+
+/// Set the per-consumer gauges (lag in positions, age of the work owed,
+/// heartbeat age, retained bytes) from the registry as it stands: called when
+/// the ops port is scraped, so the `consumer_id` label is produced only then.
+pub(crate) fn sample_consumer_gauges(registry: &ShardConsumerRegistry) {
+    // The listing sets the gauges; the snapshot it returns is not needed.
+    let _listed = registry.list_consumers();
 }
 
 #[cfg(test)]

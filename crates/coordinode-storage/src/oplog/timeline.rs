@@ -139,6 +139,26 @@ impl OplogTimeline {
         Ok(None)
     }
 
+    /// The timestamp of the first entry at or after `index` and below
+    /// `below` that carries a commit, or `None` when none does or a segment
+    /// no longer holds one on the way. Entries with no commit (timestamp 0:
+    /// a leader's closing entry, the first entry of its term, a membership
+    /// change) come singly between commits, so the walk is short.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::written_at`].
+    pub fn first_committed_at(&self, index: u64, below: u64) -> StorageResult<Option<u64>> {
+        let mut at = index;
+        while at < below {
+            match self.written_at(at)? {
+                Some(0) => at += 1,
+                found => return Ok(found),
+            }
+        }
+        Ok(None)
+    }
+
     /// Forget what was kept to answer for positions below `position`: no
     /// one asks for them any more (`u64::MAX`: no one asks at all).
     pub fn release_below(&self, position: u64) {

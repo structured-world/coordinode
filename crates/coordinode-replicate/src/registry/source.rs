@@ -26,8 +26,10 @@ pub trait RetentionSource: Send + Sync {
     /// `kind`, which a BOUNDED limit needs to be judged at all.
     fn accounts(&self, kind: ConsumerKind) -> bool;
 
-    /// Clock ms at which the work at `position` was produced, or `None` when
-    /// nothing is there or the source cannot tell.
+    /// Clock ms at which the first work at or after `position` was produced,
+    /// or `None` when there is none up to the head or the source cannot
+    /// tell. Source entries that carry no work (nothing a consumer receives)
+    /// are passed over: they are not owed.
     fn produced_at_ms(&self, kind: ConsumerKind, position: u64) -> Option<u64>;
 
     /// Bytes of source material a checkpoint at `position` requires the

@@ -970,7 +970,11 @@ pub(crate) async fn serve(
         let db_metrics = Arc::clone(&database);
         let engine_metrics = Arc::clone(&engine);
         let version_node = Arc::clone(&raft_node);
+        let registry_metrics = consumer_registry.clone();
         Arc::new(move || {
+            // How far each change-stream consumer is behind, sampled per
+            // scrape.
+            registry::sample_consumer_gauges(&registry_metrics);
             // Where this member stands in consensus, sampled per scrape.
             {
                 let raft = &version_node;

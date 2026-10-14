@@ -170,6 +170,41 @@ async fn next_index(
         .map(|event| event.expect("event").log_index)
 }
 
+/// A scrape of the ops port shows how far each live consumer is behind and
+/// how old the work it owes is: the gauges are set when the scrape samples
+/// the registry, and nothing else sets them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scrape_shows_each_consumers_lag() {
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        write_oplog(oplog_dir.path(), 3),
+        Arc::new(|| 3),
+        None,
+        RegistryTuning::default(),
+    );
+    let _stream = f
+        .service
+        .subscribe(Request::new(register("behind", bounded(None))))
+        .await
+        .expect("subscribe");
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        crate::registry::sample_consumer_gauges(&f.registry);
+    });
+    let scrape = handle.render();
+    assert!(
+        scrape.contains("registry_consumer_lag_seqno{consumer_id=\"behind\""),
+        "{scrape}"
+    );
+    assert!(
+        scrape.contains("registry_consumer_lag_age_seconds{consumer_id=\"behind\"}"),
+        "{scrape}"
+    );
+}
+
 /// A stream registers its consumer with the chosen policy, reports the
 /// incarnation in the response metadata, and leaving does not end the
 /// registration: the consumer is durable, not the connection.

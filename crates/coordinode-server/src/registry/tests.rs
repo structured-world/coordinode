@@ -237,6 +237,62 @@ fn node_source_answers_an_unmoved_checkpoint_without_reading_the_log() {
     assert!(source.timeline.bytes_read() - before < 256 * 1024);
 }
 
+/// Write one entry per element of `stamps` into `dir`, entry `i` carrying
+/// `stamps[i]` as its timestamp (0: an entry with no commit, such as the
+/// closing entry a leader appends after a burst of commits).
+fn write_stamped_log(dir: &std::path::Path, stamps: &[u64]) -> OplogManager {
+    let mut mgr =
+        OplogManager::open(dir, 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600).expect("open oplog");
+    for (index, &ts) in (0u64..).zip(stamps) {
+        mgr.append(&OplogEntry {
+            ts,
+            term: 1,
+            index,
+            shard: 0,
+            ops: vec![OplogOp::Noop],
+            is_migration: false,
+            pre_images: None,
+        })
+        .expect("append");
+    }
+    mgr.flush().expect("flush");
+    mgr
+}
+
+/// An entry that carries no commit (a leader's closing entry, its first
+/// entry of a term, a membership change) is no work a consumer must
+/// acknowledge: the age of what a consumer owes is the write time of the
+/// first committed entry from its checkpoint on, and with none up to the
+/// head it owes nothing. Aging such an entry from timestamp 0 made every
+/// BOUNDED consumer whose checkpoint reached a closing entry exceed any
+/// progress lag at once.
+#[test]
+fn entries_without_a_commit_owe_no_progress() {
+    let (engine, _engine_dir) = open_engine(None);
+    let log_dir = tempfile::tempdir().expect("log dir");
+    let t = |s: u64| US_PER_SEC * s;
+    let _mgr = write_stamped_log(log_dir.path(), &[t(1), t(2), 0, t(4), 0, 0]);
+    let source = NodeRetentionSource::new(
+        Arc::clone(&engine),
+        vec![log_dir.path().to_path_buf()],
+        empty_floor(),
+        Arc::new(|| 6),
+    );
+    let kind = ConsumerKind::OplogEvents;
+
+    assert_eq!(source.produced_at_ms(kind, 1), Some(2_000));
+    assert_eq!(
+        source.produced_at_ms(kind, 2),
+        Some(4_000),
+        "a closing entry ages from the commit after it"
+    );
+    assert_eq!(
+        source.produced_at_ms(kind, 4),
+        None,
+        "nothing but closing entries up to the head is no outstanding work"
+    );
+}
+
 /// A log with no segment keeps nothing below the head, so a new consumer
 /// cannot claim a position under it.
 #[test]
