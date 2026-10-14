@@ -1039,6 +1039,12 @@ async fn a_host_revocation_cuts_a_member_off() {
 async fn a_member_that_moves_keeps_its_identity(fx: Fixture) {
     // Three voters: the two that stay commit while the third moves.
     let mut g = group(&fx, 3).await;
+    // Node 3 moves holding its group's log: a member that never received
+    // it would wait, at its new address, for a leader that does not know
+    // that address yet.
+    let ids = ProposalIdGenerator::with_base(9 << 48);
+    write(&g[0].node, &ids, "node:1:before", 100);
+    assert!(reaches(&g[2].engine, "node:1:before", ARRIVES).await);
     let moved = g.pop().expect("node 3");
     let dir = moved._dir;
     moved.node.shutdown().await.expect("stop node 3");
@@ -1067,8 +1073,7 @@ async fn a_member_that_moves_keeps_its_identity(fx: Fixture) {
         )),
         "the member keeps its identity"
     );
-    let ids = ProposalIdGenerator::with_base(9 << 48);
-    write(&g[0].node, &ids, "node:1:moved", 100);
+    write(&g[0].node, &ids, "node:1:moved", 200);
     assert!(reaches(&engine, "node:1:moved", ARRIVES).await);
     node3.shutdown().await.expect("shutdown");
     for m in g {
