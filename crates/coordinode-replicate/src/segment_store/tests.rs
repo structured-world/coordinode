@@ -11,7 +11,7 @@ use coordinode_swarm::{
 };
 
 use coordinode_test_fixtures::TestPki;
-use coordinode_wire::peer::{Accept, InboundAuth, PeerAdmission, PeerConnectInfo};
+use coordinode_wire::peer::{Accept, InboundAuth, PeerAdmission, PeerConnectInfo, PeerTimeouts};
 
 use super::*;
 use crate::transfer::SegmentTransferHandler;
@@ -60,6 +60,7 @@ async fn serve(engine: &Arc<StorageEngine>) -> PeerTarget {
     let accept = Accept {
         inbound: InboundAuth::NodeOnly,
         plaintext_clients: false,
+        handshake_timeout: PeerTimeouts::default().handshake,
     };
     let addr = serve_with(engine, &PKI.context(node), accept).await;
     PKI.target(node, addr)
@@ -377,6 +378,7 @@ async fn a_caller_without_a_node_identity_is_refused() {
     let accept = Accept {
         inbound: InboundAuth::Shared { clients: None },
         plaintext_clients: true,
+        handshake_timeout: PeerTimeouts::default().handshake,
     };
     let addr = serve_with(&engine, &PKI.context(9), accept).await;
     let mut client = SegmentTransferServiceClient::connect(format!("http://{addr}"))

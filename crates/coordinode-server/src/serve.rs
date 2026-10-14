@@ -200,6 +200,7 @@ pub(crate) async fn serve(
     let trigger_dispatch_cfg = cfg.trigger_dispatch_config();
     let trigger_dispatch_interval = cfg.trigger_dispatch_interval();
     let statement_defaults = cfg.statement_defaults();
+    let peer_timeouts = cfg.peer_timeouts();
     let config::ServerConfig {
         node_id,
         grpc_addr,
@@ -266,6 +267,10 @@ pub(crate) async fn serve(
         tls_ca,
         tls_require_client_auth,
         node_identity: node_identity_settings,
+        // Already captured above (peer_timeouts) before the move.
+        peer_connect_timeout_ms: _,
+        peer_call_timeout_ms: _,
+        peer_handshake_timeout_ms: _,
         // Already captured above via scrub_cfg before the move.
         scrub_enabled: _,
         scrub_interval_secs: _,
@@ -726,9 +731,10 @@ pub(crate) async fn serve(
     let (raft_node, raft_grpc_handler) =
         if let (Some(peers_list), Some(identity)) = (&peers, &node_identity) {
             let peer_count = peers_list.len();
-            options.connections = Some(Arc::new(coordinode_raft::cluster::PeerConnections::new(
-                Arc::clone(identity.context()),
-            )));
+            options.connections = Some(Arc::new(
+                coordinode_raft::cluster::PeerConnections::new(Arc::clone(identity.context()))
+                    .with_timeouts(peer_timeouts),
+            ));
             info!(identity = %identity.context().identity(), "node identity");
             if node_id == 1 {
                 info!(
@@ -1484,6 +1490,7 @@ pub(crate) async fn serve(
                 coordinode_wire::peer::Accept {
                     inbound: coordinode_wire::peer::InboundAuth::Shared { clients },
                     plaintext_clients: !tls_require_client_auth,
+                    handshake_timeout: peer_timeouts.handshake,
                 },
             ))
         }

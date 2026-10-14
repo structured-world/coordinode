@@ -126,6 +126,9 @@ the key is unset.
 | `interactive_txn_max_bytes` | `268435456` (256 MiB) | restart | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping leader memory a client can hold without committing. |
 | `autocommit_retry_attempts` | `6` | restart | Runs, in all, of a statement executed without `BEGIN` whose commit is refused for contention, before the conflict is returned. A refused run applied nothing, so the server runs it again from a fresh snapshot. At least `1`; `1` returns the first refusal. Statements of an explicit transaction, ones pinned to a named timestamp and cursor pages always run once. |
 | `autocommit_retry_backoff_ms` | `2` | restart | Wait before the second run of a refused auto-commit statement, in ms; each later run waits twice as long as the one before. With the defaults the runs wait about 60 ms in all. |
+| `peer_connect_timeout_ms` | `5000` | restart | How long a member's dial to a peer may take, the TCP connection and the TLS handshake together, in ms. A dial that runs out fails, and the call that needed it fails with it; the next call dials again. Raise it on distant or lossy links where a handshake takes longer. Zero is refused. |
+| `peer_call_timeout_ms` | `30000` | restart | How long one call from a member to a peer (a consensus message, a version handshake, a forwarded write, a segment piece) may take, in ms, before it fails. Zero is refused. |
+| `peer_handshake_timeout_ms` | `10000` | restart | How long a connection accepted on a member's gRPC port has to complete its TLS handshake, in ms. A connection that opens one and stalls is dropped at this bound, freeing what it held. Zero is refused. |
 | `wire_compression_level` | `3` | restart | Inter-node gRPC transport zstd compression level (C-zstd `1`..=`22`). Default `3` is zstd's standard default (~9x reduction on Raft batches); raise on a bandwidth-constrained link. Independent of the on-disk codec. |
 | `scrub_enabled` | `false` | restart | Whether the background integrity scrub runs (each node verifies its own on-disk block checksums). A pass reads every block, so it is off unless enabled. |
 | `scrub_interval_secs` | `604800` (7 days) | restart | Seconds between background scrub cycles. |
@@ -217,7 +220,11 @@ a node identity; every inter-node service (consensus, version handshake, segment
 transfer) refuses any other connection before reading what it sent, while the
 client services accept clients as `--tls-ca` and `--tls-require-client-auth`
 say: in plain text unless client certificates are required. A client
-certificate never counts as a node identity, even one from the same CA.
+certificate never counts as a node identity, even one from the same CA. An
+application may present an X.509-SVID of its own; it is a client as long as
+its trust domain is not one of `trust_bundles`. A certificate naming a SPIFFE ID
+in one of those trust domains is judged as a node identity only, and refused if
+that domain's bundle does not verify it.
 
 Renewed certificates and changed trust bundles take effect without a restart:
 write the new files in place and send the process `SIGHUP` (Unix) or `POST
@@ -392,6 +399,10 @@ wire_compression_level: 3
 #   key: /etc/coordinode/identity/node.key
 #   trust_bundles:
 #     prod.example: /etc/coordinode/identity/bundle.pem
+# Bounds of the inter-node channel (ms): dial, call, accepted handshake.
+# peer_connect_timeout_ms: 5000
+# peer_call_timeout_ms: 30000
+# peer_handshake_timeout_ms: 10000
 
 # Background integrity scrub (per-node, verifies on-disk block checksums).
 scrub_enabled: false

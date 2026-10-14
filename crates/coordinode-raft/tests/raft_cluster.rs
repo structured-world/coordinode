@@ -2470,6 +2470,7 @@ async fn append_stream_to_stopped_node_ends_with_an_error() {
             coordinode_wire::peer::Accept {
                 inbound: coordinode_wire::peer::InboundAuth::NodeOnly,
                 plaintext_clients: false,
+                handshake_timeout: connections.timeouts().handshake,
             },
         )
         .expect("listener");

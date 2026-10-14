@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
-use crate::peer::test_pki::{Ca, ca, leaf, leaf_until, node, provider, sid, spiffe};
+use crate::peer::test_pki::{Ca, Credentials, ca, leaf, leaf_until, node, provider, sid, spiffe};
 use crate::peer::{PeerProfile, TrustAnchors};
 
 /// A listener on a free loopback port and its address.
@@ -50,6 +50,7 @@ fn node_only() -> Accept {
     Accept {
         inbound: InboundAuth::NodeOnly,
         plaintext_clients: false,
+        handshake_timeout: PeerTimeouts::default().handshake,
     }
 }
 
@@ -101,6 +102,7 @@ async fn plain_text_is_a_client_where_allowed_and_refused_elsewhere() {
     let shared = Accept {
         inbound: InboundAuth::Shared { clients: None },
         plaintext_clients: true,
+        handshake_timeout: PeerTimeouts::default().handshake,
     };
     let mut server = incoming(listener, &a, shared).expect("incoming");
     let mut client = TcpStream::connect(&addr).await.expect("connect");
@@ -140,6 +142,7 @@ async fn an_ordinary_client_certificate_is_never_a_node() {
             clients: Some(clients),
         },
         plaintext_clients: false,
+        handshake_timeout: PeerTimeouts::default().handshake,
     };
     let mut server = incoming(listener, &a, shared).expect("incoming");
 
@@ -165,6 +168,88 @@ async fn an_ordinary_client_certificate_is_never_a_node() {
     assert!(
         info.node.is_none(),
         "a client certificate is no node identity"
+    );
+}
+
+/// Dial `addr` presenting `identity` and return what the shared port made
+/// of the connection, or `None` when it took none.
+async fn shared_port_takes(
+    addr: &str,
+    server: &mut Incoming,
+    identity: Credentials,
+) -> Option<InboundStream> {
+    let config = crate::peer::test_pki::client_with_server_name(
+        rustls::RootCertStore::empty(),
+        Some(identity),
+    );
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("client.example").expect("name"), tcp)
+        .await
+        .ok()?;
+    // A TLS 1.3 server judges the client's certificate after the client
+    // has finished; its verdict arrives with the first exchange.
+    tls.write_all(&[7]).await.ok()?;
+    tls.flush().await.ok()?;
+    tokio::time::timeout(Duration::from_secs(2), server.next())
+        .await
+        .ok()
+        .flatten()
+        .map(|accepted| accepted.expect("accepted"))
+}
+
+/// A port shared with clients that trusts `client_ca` for client
+/// certificates, held by node `spiffe://td.test/a`.
+async fn shared_port_trusting(node_ca: &Ca, client_ca: &Ca) -> (Incoming, String) {
+    let a = node(node_ca, "spiffe://td.test/a");
+    let clients = crate::tls::client_verifier(vec![client_ca.der.clone()], true).expect("verifier");
+    let (listener, addr) = bind().await;
+    let shared = Accept {
+        inbound: InboundAuth::Shared {
+            clients: Some(clients),
+        },
+        plaintext_clients: false,
+        handshake_timeout: PeerTimeouts::default().handshake,
+    };
+    (incoming(listener, &a, shared).expect("incoming"), addr)
+}
+
+/// An application whose client certificate is an X.509-SVID of a trust
+/// domain the node holds no bundle for is a client like any other: the
+/// client verifier decides, and its connection carries no node identity.
+#[tokio::test]
+async fn a_workload_identity_of_another_trust_domain_is_a_client() {
+    let node_ca = ca();
+    let apps_ca = ca();
+    let (mut server, addr) = shared_port_trusting(&node_ca, &apps_ca).await;
+    let accepted = shared_port_takes(
+        &addr,
+        &mut server,
+        leaf(&apps_ca, &["spiffe://apps.test/web"]),
+    )
+    .await
+    .expect("the client verifier accepts the workload's certificate");
+    let info = tonic::transport::server::Connected::connect_info(&accepted);
+    assert!(info.node.is_none(), "a client, not a node");
+}
+
+/// A certificate naming an identity in the node's own trust domain is
+/// judged as a node identity only, under that domain's bundle: one the
+/// bundle does not verify is refused, though the client verifier would
+/// accept its issuer.
+#[tokio::test]
+async fn an_identity_in_a_node_trust_domain_is_never_left_to_the_clients() {
+    let node_ca = ca();
+    let apps_ca = ca();
+    let (mut server, addr) = shared_port_trusting(&node_ca, &apps_ca).await;
+    let taken =
+        shared_port_takes(&addr, &mut server, leaf(&apps_ca, &["spiffe://td.test/b"])).await;
+    assert!(taken.is_none(), "a node identity the bundle refuses");
+    let malformed =
+        shared_port_takes(&addr, &mut server, leaf(&apps_ca, &["spiffe://TD.test/b"])).await;
+    assert!(
+        malformed.is_none(),
+        "a SPIFFE ID that does not parse claims a node"
     );
 }
 
@@ -301,6 +386,71 @@ async fn connections_are_kept_per_peer_identity() {
         connections.channel(&bare),
         Err(DialError::Address { .. })
     ));
+}
+
+/// A dial to a peer that takes the TCP connection and never answers the TLS
+/// handshake fails at the configured connect bound, not the default one.
+#[tokio::test]
+async fn a_silent_peer_fails_the_dial_at_its_bound() {
+    let ca = ca();
+    let a = node(&ca, "spiffe://td.test/a");
+    // Bound but never accepted: the kernel completes TCP, nobody speaks TLS.
+    let (_silent, addr) = bind().await;
+    let connect = Duration::from_millis(300);
+    let connections = PeerConnections::new(a).with_timeouts(PeerTimeouts {
+        connect,
+        ..PeerTimeouts::default()
+    });
+    let mut channel = connections
+        .channel(&PeerTarget {
+            addr: addr.clone(),
+            identity: sid("spiffe://td.test/b"),
+        })
+        .expect("a channel");
+    let started = Instant::now();
+    // The channel is lazy: only a call makes it dial.
+    let call = async {
+        std::future::poll_fn(|cx| tonic::codegen::Service::poll_ready(&mut channel, cx)).await?;
+        let request = http::Request::builder()
+            .uri(format!("http://{addr}/test.Peer/Call"))
+            .body(tonic::body::Body::empty())
+            .expect("request");
+        tonic::codegen::Service::call(&mut channel, request).await
+    };
+    let answered = tokio::time::timeout(Duration::from_secs(4), call)
+        .await
+        .expect("the dial ends before the default bound");
+    assert!(answered.is_err(), "nobody answered the handshake");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+/// A connection that opens a TLS handshake and stalls is dropped at the
+/// listener's handshake bound, freeing what it held.
+#[tokio::test]
+async fn a_stalled_handshake_is_dropped_at_its_bound() {
+    let ca = ca();
+    let a = node(&ca, "spiffe://td.test/a");
+    let (listener, addr) = bind().await;
+    let accept = Accept {
+        handshake_timeout: Duration::from_millis(300),
+        ..node_only()
+    };
+    let _server = incoming(listener, &a, accept).expect("incoming");
+    let mut stalled = TcpStream::connect(&addr).await.expect("connect");
+    // The first byte of a TLS handshake record, then nothing.
+    stalled.write_all(&[22]).await.expect("write");
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(4), stalled.read(&mut byte))
+        .await
+        .expect("the listener gives up before the default bound");
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "the stalled connection is closed: {closed:?}"
+    );
 }
 
 fn bundles(domains: &[(&str, &Ca)]) -> PeerProfile {

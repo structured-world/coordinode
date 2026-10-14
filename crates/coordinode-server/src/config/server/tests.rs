@@ -691,6 +691,35 @@ fn node_identity_parses_and_is_strict() {
     assert!(ServerConfig::default().node_identity.is_none());
 }
 
+/// The inter-node bounds are config-file settings: unset they are the
+/// channel's built-in ones, set they carry the values given, and a zero,
+/// which would fail every dial, call or handshake, is refused.
+#[test]
+fn peer_timeouts_parse_from_the_config_file() {
+    let defaults = coordinode_wire::peer::PeerTimeouts::default();
+    assert_eq!(ServerConfig::default().peer_timeouts(), defaults);
+    let parse = |text: &str| serde_saphyr::from_str::<ServerConfig>(text);
+    let c =
+        parse("peer_connect_timeout_ms: 1500\npeer_handshake_timeout_ms: 2500\n").expect("parse");
+    assert_eq!(
+        c.peer_timeouts(),
+        coordinode_wire::peer::PeerTimeouts {
+            connect: std::time::Duration::from_millis(1500),
+            call: defaults.call,
+            handshake: std::time::Duration::from_millis(2500),
+        }
+    );
+    let c = parse("peer_call_timeout_ms: 120000\n").expect("parse");
+    assert_eq!(c.peer_timeouts().call, std::time::Duration::from_secs(120));
+    for key in [
+        "peer_connect_timeout_ms",
+        "peer_call_timeout_ms",
+        "peer_handshake_timeout_ms",
+    ] {
+        assert!(parse(&format!("{key}: 0\n")).is_err(), "{key} = 0");
+    }
+}
+
 #[test]
 fn resolve_storage_config_carries_endpoints() {
     let c = ServerConfig {

@@ -290,9 +290,11 @@ fn the_host_adapter_sees_only_verified_chains() {
     );
 }
 
-/// On a port shared with clients, a certificate naming a SPIFFE ID (in any
-/// letter case of the scheme) is a node's and is verified as one; an
-/// ordinary client certificate is not claimed.
+/// On a port shared with clients, a certificate naming a SPIFFE ID of a
+/// trusted trust domain (in any letter case of the scheme), or one that does
+/// not parse, is a node's and is verified as one; an ordinary client
+/// certificate, and a workload identity of a trust domain the node has no
+/// bundle for, are not claimed.
 #[test]
 fn node_certificates_are_told_from_client_certificates() {
     let ca = ca();
@@ -309,4 +311,11 @@ fn node_certificates_are_told_from_client_certificates() {
     assert!(!profile.claims_node_identity(&client));
     assert!(profile.claims_node_identity(&leaf(&ca, &["spiffe://td.test/a"], |_| {})));
     assert!(profile.claims_node_identity(&leaf(&ca, &["SPIFFE://td.test/a"], |_| {})));
+    assert!(!profile.claims_node_identity(&leaf(&ca, &["spiffe://apps.test/web"], |_| {})));
+    assert!(profile.claims_node_identity(&leaf(&ca, &["spiffe://TD.test/a"], |_| {})));
+    assert!(profile.claims_node_identity(&leaf(
+        &ca,
+        &["spiffe://apps.test/web", "spiffe://td.test/a"],
+        |_| {}
+    )));
 }

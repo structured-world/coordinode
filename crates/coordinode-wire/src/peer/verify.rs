@@ -199,14 +199,24 @@ impl PeerProfile {
     /// profile. On a port shared with clients, a certificate that does
     /// not is left to client authentication; one that does is verified
     /// here and never handed to it.
+    ///
+    /// Under the SPIFFE profile a certificate claims a node identity when a
+    /// SPIFFE ID it carries names a trust domain this node has a bundle
+    /// for, or does not parse: a workload identity of another trust domain
+    /// is a client's (X509-SVID §5: trust is per trust domain).
     #[must_use]
     pub fn claims_node_identity(&self, end_entity: &CertificateDer<'_>) -> bool {
         match self {
-            Self::Spiffe { .. } => der::leaf_fields(end_entity).map_or(true, |fields| {
-                fields
-                    .uris
-                    .iter()
-                    .any(|uri| uri.starts_with(b"spiffe:") || uri.starts_with(b"SPIFFE:"))
+            Self::Spiffe { bundles } => der::leaf_fields(end_entity).map_or(true, |fields| {
+                fields.uris.iter().any(|uri| {
+                    if !(uri.starts_with(b"spiffe:") || uri.starts_with(b"SPIFFE:")) {
+                        return false;
+                    }
+                    let parsed = std::str::from_utf8(uri)
+                        .ok()
+                        .and_then(|text| SpiffeId::parse(text).ok());
+                    parsed.is_none_or(|id| bundles.contains_key(id.trust_domain()))
+                })
             }),
             // A host's anchors are its own: anything ending there is a node.
             Self::Host { .. } => true,

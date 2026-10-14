@@ -84,9 +84,26 @@ impl TestPki {
     /// The certificate cannot be issued or the files cannot be written.
     #[must_use]
     pub fn write_credentials(&self, dir: &Path, name: &str, uri: &str) -> (PathBuf, PathBuf) {
+        self.write_credentials_until(dir, name, uri, None)
+    }
+
+    /// [`Self::write_credentials`], valid until `not_after` when given; the
+    /// files replace any of the same name, as a renewal does.
+    ///
+    /// # Panics
+    ///
+    /// The certificate cannot be issued or the files cannot be written.
+    #[must_use]
+    pub fn write_credentials_until(
+        &self,
+        dir: &Path,
+        name: &str,
+        uri: &str,
+        not_after: Option<SystemTime>,
+    ) -> (PathBuf, PathBuf) {
         let key = KeyPair::generate().expect("node key");
         let cert = self
-            .leaf_params(uri, None)
+            .leaf_params(uri, not_after)
             .signed_by(&key, &self.issuer)
             .expect("node certificate");
         let cert_path = dir.join(format!("{name}.crt"));
@@ -333,6 +350,7 @@ pub async fn serve_member_port(
         coordinode_wire::peer::Accept {
             inbound: coordinode_wire::peer::InboundAuth::Shared { clients: None },
             plaintext_clients: true,
+            handshake_timeout: coordinode_wire::peer::PeerTimeouts::default().handshake,
         },
     )
     .expect("the port's TLS configuration");

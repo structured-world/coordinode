@@ -454,6 +454,14 @@ pub struct ServerConfig {
     /// the gRPC port presents this certificate to clients as well, so
     /// `tls_cert` / `tls_key` are refused there.
     pub node_identity: Option<NodeIdentitySettings>,
+    /// How long a dial to a peer may take, TCP and TLS together, in
+    /// milliseconds (`None` = 5000).
+    pub peer_connect_timeout_ms: Option<NonZeroU64>,
+    /// How long one call to a peer may take, in milliseconds (`None` = 30000).
+    pub peer_call_timeout_ms: Option<NonZeroU64>,
+    /// How long a connection accepted on the gRPC port has to complete its
+    /// TLS handshake, in milliseconds (`None` = 10000).
+    pub peer_handshake_timeout_ms: Option<NonZeroU64>,
     /// Whether the background integrity scrub runs. Each node scrubs its own
     /// local storage independently (no leader election). Default false: a
     /// full pass reads every block, which an operator schedules deliberately.
@@ -575,6 +583,9 @@ impl Default for ServerConfig {
             tls_ca: None,
             tls_require_client_auth: false,
             node_identity: None,
+            peer_connect_timeout_ms: None,
+            peer_call_timeout_ms: None,
+            peer_handshake_timeout_ms: None,
             scrub_enabled: false,
             scrub_interval_secs: 7 * 24 * 3600,
             scrub_throttle_ms: Some(50),
@@ -777,6 +788,20 @@ impl ServerConfig {
     #[must_use]
     pub fn trigger_dispatch_interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.trigger_dispatch_interval_ms.unwrap_or(1000))
+    }
+
+    /// The bounds of the inter-node channel, the built-in ones where unset.
+    #[must_use]
+    pub fn peer_timeouts(&self) -> coordinode_wire::peer::PeerTimeouts {
+        let d = coordinode_wire::peer::PeerTimeouts::default();
+        let ms = |v: Option<NonZeroU64>, default| {
+            v.map_or(default, |v| std::time::Duration::from_millis(v.get()))
+        };
+        coordinode_wire::peer::PeerTimeouts {
+            connect: ms(self.peer_connect_timeout_ms, d.connect),
+            call: ms(self.peer_call_timeout_ms, d.call),
+            handshake: ms(self.peer_handshake_timeout_ms, d.handshake),
+        }
     }
 
     /// Resolve the storage endpoints for this node.

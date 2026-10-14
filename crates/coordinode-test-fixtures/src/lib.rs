@@ -62,8 +62,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod client;
 pub mod pki;
 
+pub use client::tls_client_channel;
 pub use pki::{TestPki, serve_member_port};
 
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};

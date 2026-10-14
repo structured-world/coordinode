@@ -223,17 +223,33 @@ pub enum DialError {
     Tls(#[from] rustls::Error),
 }
 
-/// How long a dial waits for the TCP connection and the TLS handshake.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The bounds of the inter-node channel; what overruns one fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTimeouts {
+    /// A dial: the TCP connection and the TLS handshake (5 s by default).
+    pub connect: Duration,
+    /// One call to a peer (30 s by default).
+    pub call: Duration,
+    /// The TLS handshake of an accepted connection (10 s by default).
+    pub handshake: Duration,
+}
 
-/// How long one call to a peer may take before it fails.
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+impl Default for PeerTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(5),
+            call: Duration::from_secs(30),
+            handshake: Duration::from_secs(10),
+        }
+    }
+}
 
 /// One database's connections to its peers, one per peer identity, made
 /// under its security context. Every service the database calls a peer on
 /// shares the connection to that peer.
 pub struct PeerConnections {
     context: Arc<SecurityContext>,
+    timeouts: PeerTimeouts,
     // no-std: spin::Mutex; taken once per new client of a peer, never per call.
     channels: parking_lot::Mutex<HashMap<PeerIdentity, (String, tonic::transport::Channel)>>,
 }
@@ -248,19 +264,33 @@ impl fmt::Debug for PeerConnections {
 }
 
 impl PeerConnections {
-    /// Connections made under `context`.
+    /// Connections made under `context`, with the default timeouts.
     #[must_use]
     pub fn new(context: Arc<SecurityContext>) -> Self {
         Self {
             context,
+            timeouts: PeerTimeouts::default(),
             channels: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The same connections bounded by `timeouts`.
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: PeerTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// The security context the connections are made under.
     #[must_use]
     pub fn context(&self) -> &Arc<SecurityContext> {
         &self.context
+    }
+
+    /// The bounds the connections are made with.
+    #[must_use]
+    pub fn timeouts(&self) -> PeerTimeouts {
+        self.timeouts
     }
 
     /// The connection to `target`, made on first use and kept: it connects
@@ -308,8 +338,8 @@ impl PeerConnections {
                 addr: target.addr.clone(),
                 reason: e.to_string(),
             })?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(CALL_TIMEOUT);
+            .connect_timeout(self.timeouts.connect)
+            .timeout(self.timeouts.call);
         Ok(endpoint.connect_with_connector_lazy(Connector {
             context: Arc::clone(&self.context),
             config,
@@ -518,10 +548,9 @@ pub struct Accept {
     /// Whether a client may connect in plain text. Never a node: an
     /// inter-node service finds no node identity on such a connection.
     pub plaintext_clients: bool,
+    /// How long an accepted connection has to complete its TLS handshake.
+    pub handshake_timeout: Duration,
 }
-
-/// How long an accepted connection has to complete its TLS handshake.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connections whose handshake has completed and the server has not taken
 /// yet; the accept loop waits for room.
@@ -569,9 +598,10 @@ pub fn incoming(
             let acceptor = acceptor.clone();
             let context = Arc::clone(&context);
             let plaintext = accept.plaintext_clients;
+            let bound = accept.handshake_timeout;
             tokio::spawn(async move {
                 let handshake = authenticate(tcp, remote, &acceptor, context, plaintext);
-                match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                match tokio::time::timeout(bound, handshake).await {
                     Ok(Ok(stream)) => {
                         // A closed queue means the server stopped.
                         let _ = tx.send(stream).await;

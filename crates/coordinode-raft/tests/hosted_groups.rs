@@ -142,6 +142,7 @@ fn serve_counting(
 ) -> tokio::task::JoinHandle<()> {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let context = Arc::clone(connections.context());
+    let handshake_timeout = connections.timeouts().handshake;
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
         let incoming = coordinode_wire::peer::incoming(
@@ -150,6 +151,7 @@ fn serve_counting(
             coordinode_wire::peer::Accept {
                 inbound: coordinode_wire::peer::InboundAuth::NodeOnly,
                 plaintext_clients: false,
+                handshake_timeout,
             },
         )
         .expect("listener");
