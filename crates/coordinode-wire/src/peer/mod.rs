@@ -1,0 +1,17 @@
+//! Inter-node peer identity: who is at the other end of an authenticated
+//! connection, established from the certificate it proved possession of.
+//!
+//! A verified identity says only who the peer is. Whether it may take part
+//! in a group, and in which role, is decided afterwards against the
+//! deployment's membership and admission state.
+
+mod der;
+mod spiffe;
+mod verify;
+
+pub use der::DerError;
+pub use spiffe::{SpiffeId, SpiffeIdError};
+pub use verify::{
+    HostIdentity, HostIdentityAdapter, PeerError, PeerIdentity, PeerProfile, PeerRole,
+    TrustAnchors, VerifiedPeer,
+};

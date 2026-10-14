@@ -30,6 +30,7 @@ use tonic::Status;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
+pub mod peer;
 pub mod tls;
 
 /// Process-wide outbound TLS config for inter-node gRPC clients (the Raft network

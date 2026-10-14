@@ -1345,6 +1345,7 @@ dependencies = [
 name = "coordinode-wire"
 version = "0.7.1"
 dependencies = [
+ "arc-swap",
  "bytes",
  "coordinode-workspace-hack",
  "prost",
@@ -1352,6 +1353,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-rustcrypto",
+ "rustls-webpki 0.103.15",
  "structured-zstd",
  "thiserror 2.0.21",
  "tokio",

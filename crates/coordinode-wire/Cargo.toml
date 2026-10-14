@@ -20,6 +20,10 @@ rustls = { version = "0.23", default-features = false }
 rustls-rustcrypto = "0.0.2-alpha"
 # PEM parsing lives in rustls-pki-types now (rustls-pemfile is unmaintained).
 rustls-pki-types = { version = "1", features = ["std"] }
+# Chain validation for peer identities, the verifier rustls itself uses.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
+# Trust and credentials replaced whole without a restart.
+arc-swap = "1.9"
 thiserror = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
