@@ -2950,6 +2950,205 @@ async fn cluster_follower_restart_reconnection() {
     );
 }
 
+fn open_engine_at(path: &std::path::Path) -> Arc<StorageEngine> {
+    Arc::new(
+        StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            path,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]))
+        .expect("open engine"),
+    )
+}
+
+/// Open member `node_id` of a formed group on `port` again, retrying while a
+/// concurrently running test still holds the port it released.
+async fn reopen_member(node_id: u64, engine: &Arc<StorageEngine>, port: u16) -> RaftNode {
+    let open = || {
+        RaftNode::open_cluster(
+            node_id,
+            Arc::clone(engine),
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            format!("http://127.0.0.1:{port}"),
+            conn(node_id),
+        )
+    };
+    for _ in 0..19 {
+        if let Ok(node) = open().await {
+            return node;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    open().await.expect("reopen the member")
+}
+
+/// A member whose disk lost log entries the group had committed is still a
+/// member: it reopens with its log ending before the loss and takes no part
+/// in an election until a leader has sent the entries again, since a vote
+/// cast on the shorter log could elect a leader without them. With the former
+/// leader down, the two other members therefore elect no one; once it is back
+/// the damaged member catches up, votes again and holds every write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_that_lost_committed_entries_votes_again_only_once_caught_up() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+        ];
+        let e1 = open_engine_at(dirs[0].path());
+        let e2 = open_engine_at(dirs[1].path());
+        let e3 = open_engine_at(dirs[2].path());
+
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+            conn(1),
+        )
+        .await
+        .expect("n1");
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n2");
+        let n3 = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n3");
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
+            .await
+            .expect("add 2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
+            .await
+            .expect("add 3");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+
+        let key = |i: u64| format!("node:1:lost-{i}").into_bytes();
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        let pipeline = n1.pipeline();
+        for i in 1..=20u64 {
+            pipeline
+                .propose_and_wait(&RaftProposal {
+                    id: id_gen.next(),
+                    mutations: vec![Mutation::Put {
+                        partition: PartitionId::Node,
+                        key: key(i),
+                        value: b"v".to_vec(),
+                    }],
+                    commit_ts: Timestamp::from_raw(100 + i),
+                    start_ts: Timestamp::from_raw(99 + i),
+                    bypass_rate_limiter: false,
+                })
+                .expect("propose");
+        }
+        drop(pipeline);
+        assert!(
+            await_replicated(&e3, &key(20), b"v").await,
+            "n3 has every write"
+        );
+
+        // The whole group stops, so the next leader is elected after the loss.
+        for node in [n3, n2, n1] {
+            node.shutdown().await.expect("stop");
+        }
+        for engine in [e1, e2, e3] {
+            assert_eq!(
+                Arc::strong_count(&engine),
+                1,
+                "a stopped node still holds its engine"
+            );
+        }
+
+        // Member 3's disk loses the last third of its newest log segment:
+        // entries the group committed.
+        let log_dir = dirs[2].path().join("oplog").join("0");
+        let newest = std::fs::read_dir(&log_dir)
+            .expect("list the log")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+            .max()
+            .expect("a segment");
+        let len = std::fs::metadata(&newest).expect("stat").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&newest)
+            .expect("open segment")
+            .set_len(len - len / 3)
+            .expect("lose the tail");
+
+        // Members 2 and 3 come back without the former leader.
+        let e2 = open_engine_at(dirs[1].path());
+        let n2 = reopen_member(2, &e2, p2).await;
+        assert!(!n2.catching_up(), "member 2 lost nothing");
+        let e3 = open_engine_at(dirs[2].path());
+        let n3 = reopen_member(3, &e3, p3).await;
+        assert!(
+            n3.catching_up(),
+            "a member that lost committed entries reopens catching up"
+        );
+
+        // Several election timeouts (generous ones on a loaded CI host):
+        // member 2 cannot win without member 3's vote, which it withholds.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(
+            !n2.is_leader().await && !n3.is_leader().await,
+            "no leader is elected on the vote of a member missing committed entries"
+        );
+
+        let e1 = open_engine_at(dirs[0].path());
+        let n1 = reopen_member(1, &e1, p1).await;
+        let mut caught_up = false;
+        for _ in 0..300 {
+            if !n3.catching_up() {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(caught_up, "member 3 catches up once a leader serves it");
+        for i in 1..=20u64 {
+            assert_eq!(
+                e3.get(Partition::Node, &key(i)).expect("read").as_deref(),
+                Some(b"v".as_slice()),
+                "member 3 holds write {i} again"
+            );
+        }
+
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+        n3.shutdown().await.expect("s3");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_member_that_lost_committed_entries_votes_again_only_once_caught_up"
+    );
+}
+
 /// Graceful leader transfer — leader transfers to specific peer,
 /// new leader serves writes, old leader becomes follower.
 #[tokio::test(flavor = "multi_thread")]

@@ -2629,6 +2629,47 @@ async fn a_hole_below_the_committed_index_refuses_the_log() {
     );
 }
 
+/// A member whose peers still hold what its disk lost opens instead: the log
+/// ends before the hole, the committed index comes down to that end so the
+/// state machine is not asked to replay entries that are gone, and the lost
+/// committed entry is recorded durably, so a restart before the member has
+/// caught up keeps it out of elections all the same.
+#[tokio::test]
+async fn a_member_whose_peers_hold_the_lost_entries_opens_to_catch_up() {
+    let (_dir, config) = log_with_a_hole_at_3(5).await;
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen engine"));
+        let (mut store, through) =
+            LogStore::open_with(Arc::clone(&engine), LostCommitted::CatchUp).expect("open");
+        assert_eq!(through, Some(log_id(1, 5)), "the lost committed entry");
+        let state = store.get_log_state().await.expect("log state");
+        assert_eq!(state.last_log_id.map(|id| id.index), Some(2));
+        assert_eq!(
+            store.read_committed().await.expect("committed"),
+            Some(log_id(1, 2)),
+            "committed comes down to what the log holds"
+        );
+    }
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen engine"));
+    let (_, through) =
+        LogStore::open_with(Arc::clone(&engine), LostCommitted::CatchUp).expect("open again");
+    assert_eq!(through, Some(log_id(1, 5)), "the loss survives a restart");
+
+    // Without peers to catch up from, a recorded loss refuses the member.
+    drop(engine);
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen engine"));
+    let err = LogStore::open(Arc::clone(&engine))
+        .err()
+        .expect("a member alone cannot recover what it lost");
+    assert!(err.to_string().contains("index 5"), "{err}");
+
+    // Caught up, the record goes, and the member opens like any other.
+    clear_catch_up(&engine).expect("clear");
+    let (_, through) =
+        LogStore::open_with(Arc::clone(&engine), LostCommitted::CatchUp).expect("open caught up");
+    assert_eq!(through, None);
+}
+
 /// A hole above the committed index lost only entries never acknowledged:
 /// the log reopens ending right before it, and the entries past it are not
 /// part of the log.

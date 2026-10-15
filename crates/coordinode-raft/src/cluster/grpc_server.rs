@@ -54,6 +54,9 @@ pub struct GroupReplica {
     /// later: consensus pauses here instead of failing a log fsync on a full
     /// disk, which would stop it for good.
     space: Arc<coordinode_storage::engine::space::SpaceGuard>,
+    /// While this member lacks committed entries its disk lost, every vote
+    /// is withheld: its shorter log could elect a leader without them.
+    catch_up: super::catch_up::CatchUp,
 }
 
 impl GroupReplica {
@@ -222,14 +225,15 @@ impl RaftGrpcHandler {
     /// A handler hosting `raft`, the replica of the group `gate` speaks for,
     /// staging received snapshots in `snapshot_dir` (see
     /// [`crate::snapshot::snapshot_dir`]), admitting peers through
-    /// `admission` and calls through `gate`, and taking writes only while
-    /// `space` has room.
+    /// `admission` and calls through `gate`, taking writes only while
+    /// `space` has room and withholding votes while `catch_up` is pending.
     pub(crate) fn new(
         raft: Arc<RaftInstance>,
         snapshot_dir: PathBuf,
         gate: Arc<VersionGate>,
         admission: Arc<Admission>,
         space: Arc<coordinode_storage::engine::space::SpaceGuard>,
+        catch_up: super::catch_up::CatchUp,
     ) -> Self {
         let groups = HostedGroups::default();
         let mut replicas = groups.replicas.write();
@@ -239,6 +243,7 @@ impl RaftGrpcHandler {
             gate,
             admission,
             space,
+            catch_up,
         };
         replicas.insert(replica.group(), Arc::new(replica));
         drop(replicas);
@@ -312,6 +317,16 @@ impl RaftService for RaftGrpcHandler {
         let vote_req: openraft::raft::VoteRequest<TypeConfig> = de(&data)?;
         Admission::same_member(caller, vote_req.vote.leader_id().node_id)?;
 
+        if replica.catch_up.pending() {
+            // Withheld, not refused as an error: the candidate counts it as a
+            // vote against. No last log id is offered, since this member's
+            // own is shorter than what it once acknowledged.
+            use openraft::async_runtime::watch::WatchReceiver;
+            let current = replica.raft.metrics().borrow_watched().vote;
+            let withheld = openraft::raft::VoteResponse::<TypeConfig>::new(current, None, false);
+            return Ok(replica.answer(replica.payload(ser(&withheld)?)));
+        }
+
         let vote_resp = replica
             .raft
             .vote(vote_req)
@@ -333,6 +348,7 @@ impl RaftService for RaftGrpcHandler {
         if !req.entries.is_empty() {
             replica.admit_write()?;
         }
+        replica.catch_up.note(&req);
 
         let resp = replica
             .raft
@@ -427,6 +443,8 @@ impl RaftService for RaftGrpcHandler {
             }
             futures_util::future::ready(pass)
         });
+        let catch_up = replica.catch_up.clone();
+        let input_stream = input_stream.inspect(move |req| catch_up.note(req));
         let no_space =
             futures_util::stream::once(
                 async move { cut.load(core::sync::atomic::Ordering::Acquire) },

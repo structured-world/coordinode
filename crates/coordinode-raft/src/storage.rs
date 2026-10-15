@@ -166,6 +166,46 @@ const KEY_COMMITTED: &[u8] = b"raft:committed";
 const KEY_SM_APPLIED: &[u8] = b"raft:sm:applied";
 const KEY_SM_MEMBERSHIP: &[u8] = b"raft:sm:membership";
 const KEY_PURGED: &[u8] = b"raft:purged";
+/// The committed entry a member's disk lost and its peers still hold; present
+/// until the member has caught up past it.
+const KEY_CATCH_UP: &[u8] = b"raft:catch-up";
+
+/// What opening the log does when the disk lost entries already committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostCommitted {
+    /// Refuse the open: no peer holds them, so nothing could restore them.
+    Refuse,
+    /// Open with the log ending before the hole and record the loss: the
+    /// member's peers hold the entries and its leader sends them again.
+    CatchUp,
+}
+
+/// Whether the membership the state machine last applied has a voter other
+/// than `node_id`: one that may hold entries this member's disk lost.
+///
+/// # Errors
+///
+/// The stored membership cannot be read or decoded.
+pub(crate) fn has_other_voters(engine: &StorageEngine, node_id: u64) -> Result<bool, io::Error> {
+    let stored: Option<StoredMembership> =
+        load_stored(engine, Partition::Schema, KEY_SM_MEMBERSHIP)?;
+    Ok(stored.is_some_and(|m| m.membership().voter_ids().any(|id| id != node_id)))
+}
+
+/// Forget the committed entry recorded as lost, once the member holds it
+/// again. Durable before it returns.
+///
+/// # Errors
+///
+/// The write or its flush fails.
+pub fn clear_catch_up(engine: &StorageEngine) -> Result<(), io::Error> {
+    engine
+        .delete(Partition::Raft, KEY_CATCH_UP)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    engine
+        .persist_partition(Partition::Raft)
+        .map_err(|e| io::Error::other(format!("persist the caught-up member: {e}")))
+}
 
 /// Rebuild `partition` from the checkpoint at `checkpoint_dir` and this
 /// node's Raft log `log`, with the applies paused: the checkpoint's rows,
@@ -418,8 +458,29 @@ impl LogStore {
     /// The log's directories or its last segment cannot be read. A log that
     /// cannot be read is refused rather than taken as empty: an empty log
     /// would let the group start over on top of acknowledged entries. So is a
-    /// log whose recovery would end it at or below its committed index.
+    /// log whose recovery would end it at or below its committed index, and
+    /// one recorded as having lost committed entries: no peer could send
+    /// them again.
     pub fn open(engine: Arc<StorageEngine>) -> Result<Self, io::Error> {
+        Self::open_with(engine, LostCommitted::Refuse).map(|(store, _)| store)
+    }
+
+    /// Open the log as [`open`](Self::open) does, deciding by `lost` what a
+    /// disk that lost committed entries leads to. With
+    /// [`LostCommitted::CatchUp`] the log ends before the first entry it no
+    /// longer holds, the committed index comes down to that end, and the
+    /// highest committed entry lost is recorded durably until
+    /// [`clear_catch_up`]; it is returned while recorded, for the member to
+    /// stay out of elections until its leader has sent it back.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open), except for lost committed entries under
+    /// [`LostCommitted::CatchUp`].
+    pub fn open_with(
+        engine: Arc<StorageEngine>,
+        lost: LostCommitted,
+    ) -> Result<(Self, Option<LogId>), io::Error> {
         // Shard 0 = single Raft log shard in CE. Multi-shard EE will
         // open one LogStore per shard, each routing to its own
         // select_oplog_endpoint(shard_id).
@@ -429,9 +490,23 @@ impl LogStore {
             all: recovery_dirs,
         } = raft_oplog_dirs(&engine, shard_id)?;
         let settings = engine.oplog_config();
-        // Recovering the segments must not end the log below an entry
-        // already committed: those were acknowledged.
         let committed: Option<LogId> = load_stored(&engine, Partition::Raft, KEY_COMMITTED)?;
+        let recorded: Option<LogId> = load_stored(&engine, Partition::Raft, KEY_CATCH_UP)?;
+        // Recovering the segments must not end the log below an entry
+        // already committed (those were acknowledged) unless peers hold it.
+        let must_hold = match lost {
+            LostCommitted::Refuse => {
+                if let Some(lost) = recorded {
+                    return Err(io::Error::other(format!(
+                        "this member lost committed log entries through index {} and no \
+                         peer is left to send them again",
+                        lost.index
+                    )));
+                }
+                committed.map(|id| id.index)
+            }
+            LostCommitted::CatchUp => None,
+        };
         let oplog = OplogManager::open_multi(
             &active_dir,
             &recovery_dirs,
@@ -439,7 +514,7 @@ impl LogStore {
             settings.max_segment_bytes,
             settings.max_segment_entries,
             settings.retention_secs,
-            committed.map(|id| id.index),
+            must_hold,
         )
         .map_err(|e| io::Error::other(e.to_string()))?
         .with_sync_method(settings.sync_method);
@@ -456,11 +531,43 @@ impl LogStore {
         };
         let last_log_id = recovered.max(last_purged);
 
+        // Committed entries the log no longer holds: the leader sends them
+        // again. Until then the replay openraft starts from must stop where
+        // the log does, and the loss stays recorded across restarts.
+        let mut catch_up = recorded;
+        if let Some(lost) = committed.filter(|c| Some(*c) > last_log_id) {
+            catch_up = catch_up.max(Some(lost));
+            let write = |key: &[u8], id: &LogId| -> Result<(), io::Error> {
+                let bytes = rmp_serde::to_vec(id).map_err(|e| io::Error::other(e.to_string()))?;
+                engine
+                    .put(Partition::Raft, key, &bytes)
+                    .map_err(|e| io::Error::other(e.to_string()))
+            };
+            if let Some(through) = &catch_up {
+                write(KEY_CATCH_UP, through)?;
+            }
+            match &last_log_id {
+                Some(end) => write(KEY_COMMITTED, end)?,
+                None => engine
+                    .delete(Partition::Raft, KEY_COMMITTED)
+                    .map_err(|e| io::Error::other(e.to_string()))?,
+            }
+            engine
+                .persist_partition(Partition::Raft)
+                .map_err(|e| io::Error::other(format!("persist the lost entries: {e}")))?;
+            tracing::error!(
+                lost_through = lost.index,
+                log_ends_at = last_log_id.map(|id| id.index),
+                "raft: the disk lost committed log entries; this member stays out of \
+                 elections until its leader has sent them again"
+            );
+        }
+
         let append_notifier = Arc::new(AppendNotifier::default());
         let sync = Arc::new(crate::log_sync::LogSync::start(Arc::clone(
             &append_notifier,
         ))?);
-        Ok(Self {
+        let store = Self {
             engine,
             oplog: Arc::new(Mutex::new(oplog)),
             append_notifier,
@@ -468,7 +575,8 @@ impl LogStore {
             last_log_id: Arc::new(Mutex::new(last_log_id)),
             last_purged: Arc::new(Mutex::new(last_purged)),
             hold: EngineWork::default().start(),
-        })
+        };
+        Ok((store, catch_up))
     }
 
     /// Reconstruct `last_log_id` from oplog segment files.
@@ -2297,6 +2405,10 @@ pub fn default_raft_config() -> openraft::Config {
         election_timeout_max,
         max_payload_entries: 300,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(10_000),
+        // A member whose disk lost committed entries reopens with a shorter
+        // log and stays out of elections until its leader has sent them
+        // again; the leader replicates to it from where its log now ends.
+        allow_log_reversion: Some(true),
         ..Default::default()
     }
 }

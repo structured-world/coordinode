@@ -27,6 +27,7 @@
 //! group forms, and a joining node is provisioned with it.
 
 pub mod admission;
+mod catch_up;
 pub mod grpc_server;
 pub mod nemesis;
 pub(crate) mod network;
@@ -42,9 +43,11 @@ pub use coordinode_wire::peer::{PeerConnections, PeerTarget};
 use crate::member::{MemberIdentity, MemberNode};
 use crate::proposal::{RaftProposalPipeline, RateLimiter};
 use crate::storage::{
-    AppendNotifier, CoordinodeStateMachine, LogStore, TypeConfig, default_raft_config,
+    AppendNotifier, CoordinodeStateMachine, LogStore, LostCommitted, TypeConfig,
+    default_raft_config, has_other_voters,
 };
 use crate::wait_majority::{BatchConfig, WaitForMajorityService};
+use catch_up::CatchUp;
 
 pub use admission::{Admission, DEPLOYMENT_METADATA_KEY, Enrollment};
 pub use grpc_server::RaftGrpcHandler;
@@ -570,6 +573,11 @@ pub struct RaftNode {
     version: Arc<VersionGate>,
     /// Keeps the gate's leader current and records the group's pair.
     version_watch: BackgroundTasks,
+    /// Committed entries this member's disk lost and has not received again;
+    /// until then it neither votes nor campaigns.
+    catch_up: CatchUp,
+    /// Lifts `catch_up` once a leader has sent the entries again.
+    catch_up_watch: BackgroundTasks,
     /// How long a membership change waits for the previous one to settle,
     /// in ms. See [`Self::set_membership_settle_timeout`].
     membership_settle_timeout_ms: core::sync::atomic::AtomicU64,
@@ -833,6 +841,11 @@ impl RaftNode {
             _snapshot_trigger: Some(snap_handle),
             version,
             version_watch,
+            // A node without peers refuses a disk that lost committed entries.
+            catch_up: CatchUp::new(None),
+            catch_up_watch: BackgroundTasks {
+                running: parking_lot::Mutex::new(Vec::new()),
+            },
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
@@ -938,9 +951,28 @@ impl RaftNode {
             // A node forming its group is enrolled in nothing.
             (Founding::Form { .. }, _) => None,
         };
-        let config = Arc::new(snap_config.raft_config());
-        let log_store =
-            LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        let mut config = snap_config.raft_config();
+        // Committed entries the disk lost are sent again by a leader when the
+        // group has another voter to hold them; alone, nothing could.
+        let lost = if has_other_voters(&engine, node_id)
+            .map_err(|e| RaftNodeError::Init(e.to_string()))?
+        {
+            LostCommitted::CatchUp
+        } else {
+            LostCommitted::Refuse
+        };
+        let (log_store, lost_through) = LogStore::open_with(Arc::clone(&engine), lost)
+            .map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        let catch_up = CatchUp::new(lost_through.map(|id| id.index));
+        let elect = config.enable_elect;
+        if catch_up.pending() {
+            // Neither campaign nor take leadership back on restart: a leader
+            // on this shorter log would overwrite the lost entries on every
+            // member.
+            config.enable_elect = false;
+            config.enable_leader_restore = Some(false);
+        }
+        let config = Arc::new(config);
         // Clone the oplog handle before openraft consumes the LogStore, so
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
@@ -1056,6 +1088,7 @@ impl RaftNode {
             Arc::clone(&version),
             Arc::clone(&admission),
             Arc::clone(engine.space()),
+            catch_up.clone(),
         );
 
         // A listener of the node's own, when it has one. It is bound EAGERLY:
@@ -1112,6 +1145,18 @@ impl RaftNode {
             commands.clone(),
             Some(book),
         );
+        let catch_up_watch = BackgroundTasks {
+            running: parking_lot::Mutex::new(
+                catch_up::spawn_lift(
+                    Arc::clone(&raft),
+                    Arc::clone(&engine),
+                    catch_up.clone(),
+                    elect,
+                )
+                .into_iter()
+                .collect(),
+            ),
+        };
 
         if let Founding::Join = founding {
             tracing::info!(node_id, %own, "joining node started (waiting for leader to add it)");
@@ -1133,6 +1178,8 @@ impl RaftNode {
             _snapshot_trigger: Some(snap_handle),
             version,
             version_watch,
+            catch_up,
+            catch_up_watch,
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
@@ -1859,6 +1906,12 @@ impl RaftNode {
         }
     }
 
+    /// Whether this member's disk lost committed log entries it has not
+    /// received again; until it has, it neither votes nor campaigns.
+    pub fn catching_up(&self) -> bool {
+        self.catch_up.pending()
+    }
+
     /// Check if this node is currently the Raft leader, as its group confirms.
     ///
     /// Leadership the group does not confirm within two election timeouts is
@@ -2383,6 +2436,7 @@ impl RaftNode {
     /// stops.
     pub async fn shutdown(&self) -> Result<(), RaftNodeError> {
         self.version_watch.stop().await;
+        self.catch_up_watch.stop().await;
         let has_peers = self.has_voter_peers();
 
         let result = if has_peers {
