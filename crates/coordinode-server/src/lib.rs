@@ -60,7 +60,6 @@ pub mod cli;
 pub mod config;
 mod grpc;
 mod healthcheck;
-mod index_build_resumer;
 mod logging;
 mod metrics_catalog;
 mod node_identity;
@@ -75,6 +74,7 @@ mod serve;
 /// binary is the product, and no crate may depend on it.
 pub mod services;
 mod txn_reaper;
+mod writer;
 
 use admin::{admin_node_decommission, admin_node_join, admin_open_engine, admin_storage_config};
 use tracing::info;

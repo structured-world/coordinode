@@ -491,11 +491,11 @@ fn snapshot_mode_emits_stats_warning() {
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_query::executor::runner::execute;
     use coordinode_query::{cypher, planner};
-    use coordinode_raft::proposal::LocalProposalPipeline;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
     use coordinode_storage::engine::core::StorageEngine;
+    use coordinode_storage::engine::local_pipeline::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -619,11 +619,11 @@ fn concurrent_insert_invisible_in_snapshot() {
     use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
     use coordinode_query::executor::runner::execute;
     use coordinode_query::{cypher, planner};
-    use coordinode_raft::proposal::LocalProposalPipeline;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
     use coordinode_storage::engine::core::StorageEngine;
+    use coordinode_storage::engine::local_pipeline::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -768,11 +768,11 @@ fn concurrent_delete_still_visible_in_snapshot() {
     use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
     use coordinode_query::executor::runner::execute;
     use coordinode_query::{cypher, planner};
-    use coordinode_raft::proposal::LocalProposalPipeline;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
     use coordinode_storage::engine::core::StorageEngine;
+    use coordinode_storage::engine::local_pipeline::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -907,11 +907,11 @@ fn time_travel_vector_search_via_mvcc_read_ts() {
     use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
     use coordinode_query::executor::runner::execute;
     use coordinode_query::{cypher, planner};
-    use coordinode_raft::proposal::LocalProposalPipeline;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
     use coordinode_storage::engine::core::StorageEngine;
+    use coordinode_storage::engine::local_pipeline::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(

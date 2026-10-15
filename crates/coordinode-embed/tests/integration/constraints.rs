@@ -47,7 +47,7 @@ fn stored_state(db: &Database, label: &str, name: &str) -> Option<ConstraintStat
 /// an index definition and applies everything else: a catalog commit that
 /// fails after the statement decided to make it.
 struct RefuseDefinitionDeletes {
-    inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
+    inner: coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline,
     refuse: Arc<AtomicBool>,
 }
 
@@ -85,7 +85,7 @@ fn open_db_refusing_definition_deletes() -> (Database, Arc<AtomicBool>, tempfile
         Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).expect("engine"));
     let refuse = Arc::new(AtomicBool::new(false));
     let pipeline: Arc<dyn ProposalPipeline> = Arc::new(RefuseDefinitionDeletes {
-        inner: coordinode_raft::proposal::OwnedLocalProposalPipeline::new(&engine),
+        inner: coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
         refuse: Arc::clone(&refuse),
     });
     let db = Database::from_engine(dir.path(), engine, oracle, pipeline).expect("open db");

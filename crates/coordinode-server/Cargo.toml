@@ -36,7 +36,8 @@ test-format-bump = ["coordinode-storage/test-format-bump"]
 [dependencies]
 coordinode-cluster = { workspace = true }
 coordinode-core = { workspace = true }
-coordinode-embed = { workspace = true }
+# The member assembly: store, consensus node, database and background work.
+coordinode-embed = { workspace = true, features = ["replication"] }
 coordinode-replicate = { workspace = true }
 coordinode-query = { workspace = true }
 coordinode-session = { workspace = true }

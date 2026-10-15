@@ -115,6 +115,30 @@ enum CodecName {
     Zstd,
 }
 
+/// The election and heartbeat timing a group runs, as written in the file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElectionProfile {
+    /// Servers in one rack or data centre: a failover within a second.
+    #[default]
+    Rack,
+    /// Machines that sleep and roam: a leader is given tens of seconds
+    /// before its group replaces it.
+    PersonalFleet,
+}
+
+/// When this member stands for election, as written in the file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElectionStanding {
+    /// As soon as its election timeout expires.
+    #[default]
+    Ordinary,
+    /// Only once every other member could have: it leads when no other
+    /// member can win, and hands the lead back once another has caught up.
+    Last,
+}
+
 /// Zstd level when the file names zstd without one: the library's default.
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
@@ -315,6 +339,18 @@ pub struct ServerConfig {
     /// Shortest time between two Raft snapshots the log size asks for, in
     /// seconds (`None` = 60). Time alone never takes a snapshot.
     pub raft_snapshot_min_interval_secs: Option<NonZeroU64>,
+    /// The group's election timing profile: `rack` (a failover within a
+    /// second) or `personal_fleet` (a leader is given tens of seconds).
+    pub election_profile: ElectionProfile,
+    /// Replaces the profile's heartbeat interval, in milliseconds.
+    pub election_heartbeat_ms: Option<NonZeroU64>,
+    /// Replaces the profile's shortest election timeout, in milliseconds.
+    pub election_timeout_min_ms: Option<NonZeroU64>,
+    /// Replaces the profile's longest election timeout, in milliseconds.
+    pub election_timeout_max_ms: Option<NonZeroU64>,
+    /// When this member stands for election: `ordinary`, or `last` for a
+    /// member that should lead only when no other can.
+    pub election_preference: ElectionStanding,
     /// How long the planner's storage statistics are reused before they are
     /// read again, in seconds (`None` = 60). A read that fails is remembered
     /// for the same time.
@@ -538,6 +574,11 @@ impl Default for ServerConfig {
             raft_snapshot_entries: None,
             raft_snapshot_log_bytes: None,
             raft_snapshot_min_interval_secs: None,
+            election_profile: ElectionProfile::Rack,
+            election_heartbeat_ms: None,
+            election_timeout_min_ms: None,
+            election_timeout_max_ms: None,
+            election_preference: ElectionStanding::Ordinary,
             planner_stats_ttl_secs: None,
             slow_query_ms: None,
             vector_build_wait_ms: None,
@@ -788,6 +829,39 @@ impl ServerConfig {
     #[must_use]
     pub fn trigger_dispatch_interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.trigger_dispatch_interval_ms.unwrap_or(1000))
+    }
+
+    /// The election timing the group runs: the profile, with each value the
+    /// file sets in its place.
+    ///
+    /// # Errors
+    ///
+    /// The timing would let a healthy group keep electing, or its election
+    /// window is empty.
+    pub fn election_timing(&self) -> Result<coordinode_raft::cluster::ElectionTiming, String> {
+        use coordinode_raft::cluster::ElectionTiming;
+        let base = match self.election_profile {
+            ElectionProfile::Rack => ElectionTiming::RACK,
+            ElectionProfile::PersonalFleet => ElectionTiming::PERSONAL_FLEET,
+        };
+        let ms = |v: Option<NonZeroU64>, default| {
+            v.map_or(default, |v| std::time::Duration::from_millis(v.get()))
+        };
+        ElectionTiming::new(
+            ms(self.election_heartbeat_ms, base.heartbeat()),
+            ms(self.election_timeout_min_ms, base.election_min()),
+            ms(self.election_timeout_max_ms, base.election_max()),
+        )
+        .map_err(|e| format!("election timing: {e}"))
+    }
+
+    /// When this member stands for election.
+    #[must_use]
+    pub fn election_preference(&self) -> coordinode_raft::cluster::ElectionPreference {
+        match self.election_preference {
+            ElectionStanding::Ordinary => coordinode_raft::cluster::ElectionPreference::Ordinary,
+            ElectionStanding::Last => coordinode_raft::cluster::ElectionPreference::Last,
+        }
     }
 
     /// The bounds of the inter-node channel, the built-in ones where unset.

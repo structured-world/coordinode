@@ -1265,9 +1265,9 @@ fn trigger_fail_fast_on_capacity_exhausted() {
         .expect("open engine"),
     );
     let pipeline: std::sync::Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
-        std::sync::Arc::new(coordinode_raft::proposal::OwnedLocalProposalPipeline::new(
-            &engine,
-        ));
+        std::sync::Arc::new(
+            coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
+        );
     let mut db =
         Database::from_engine(dir.path(), std::sync::Arc::clone(&engine), oracle, pipeline)
             .expect("from_engine");

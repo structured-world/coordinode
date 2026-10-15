@@ -301,7 +301,7 @@ fn two_writers_on_one_key_cannot_both_commit_from_the_same_base() {
     use coordinode_core::txn::proposal::ProposalIdGenerator;
     use coordinode_core::txn::timestamp::TimestampOracle;
     use coordinode_core::txn::write_concern::WriteConcern;
-    use coordinode_raft::proposal::OwnedLocalProposalPipeline;
+    use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
     use coordinode_storage::engine::partition::Partition;
     use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
 
@@ -364,7 +364,7 @@ fn a_reader_sees_a_thousand_write_commit_whole_or_not_at_all() {
     use coordinode_core::txn::proposal::ProposalIdGenerator;
     use coordinode_core::txn::timestamp::TimestampOracle;
     use coordinode_core::txn::write_concern::WriteConcern;
-    use coordinode_raft::proposal::OwnedLocalProposalPipeline;
+    use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
     use coordinode_storage::engine::partition::Partition;
     use coordinode_storage::engine::transaction::{CommitContext, Transaction};
     use std::sync::atomic::AtomicBool;

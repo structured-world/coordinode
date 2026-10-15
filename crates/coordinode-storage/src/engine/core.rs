@@ -441,6 +441,70 @@ impl StorageEngine {
         Self::finish_open(config, seqno, gc_watermark, Some(oracle), Some(journal))
     }
 
+    /// Bring a store the non-replicated build wrote to the cut a replicated
+    /// group starts from.
+    ///
+    /// Its journal's entries are replayed and flushed into the partition
+    /// trees, which then hold every one of them, and the journal's segments
+    /// are removed: the consensus log that follows lives where the journal
+    /// did, and an entry of the old journal read as one of the new log is
+    /// refused. Interrupted at any point, it is run again on the next open:
+    /// entries the trees already hold are not replayed twice. Returns whether
+    /// there was a journal to retire; a store without one, or whose log is
+    /// already a consensus log, is left as it is.
+    ///
+    /// Must run with no engine open on the store.
+    ///
+    /// # Errors
+    ///
+    /// The journal cannot be read or replayed, the flush fails, or a segment
+    /// cannot be removed.
+    pub fn retire_embedded_journal(config: &StorageConfig) -> StorageResult<bool> {
+        use crate::oplog::OplogOp;
+        use crate::oplog::manager::OplogManager;
+
+        let Ok(endpoint) = config.select_oplog_endpoint(0) else {
+            return Ok(false);
+        };
+        let dir = endpoint.path.join("oplog").join("0");
+        if !dir.exists() {
+            return Ok(false);
+        }
+        let journal = OplogJournalConfig::from(config);
+        let open_log = || {
+            OplogManager::open(
+                &dir,
+                0,
+                journal.max_segment_bytes,
+                journal.max_segment_entries,
+                journal.retention_secs,
+            )
+        };
+        // A consensus log frames every entry; a journal entry carries the
+        // unit itself. The newest entry tells which this directory holds.
+        let consensus = |op: &OplogOp| {
+            matches!(
+                op,
+                OplogOp::RaftEntry { .. } | OplogOp::RaftTruncation { .. }
+            )
+        };
+        match open_log()?.recover_last_entry()? {
+            None => return Ok(false),
+            Some(last) if last.ops.iter().any(consensus) => return Ok(false),
+            Some(_) => {}
+        }
+        {
+            let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+            let engine = Self::open_embedded(config, oracle)?;
+            // Every entry is in a tree's memtable after the replay; the flush
+            // makes the trees the only place any of it needs to be.
+            engine.persist()?;
+        }
+        open_log()?.truncate_all()?;
+        tracing::info!(dir = %dir.display(), "embedded journal retired into the store");
+        Ok(true)
+    }
+
     fn finish_open(
         config: &StorageConfig,
         seqno: lsm_tree::SharedSequenceNumberGenerator,

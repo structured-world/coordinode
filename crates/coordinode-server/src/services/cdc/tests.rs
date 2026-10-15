@@ -7,13 +7,13 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline as _, RaftProposal,
 };
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
-use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_replicate::{
     ConsumerKind, RegistrationState, RegistryBackground, SeqnoConsumerRegistry,
     ShardConsumerRegistry, TerminalReason,
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
 use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
 use coordinode_storage::oplog::manager::{OplogManager, RetainedFloor};
 use tokio_stream::StreamExt as _;

@@ -12,9 +12,9 @@ use std::sync::Arc;
 use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_embed::Database;
-use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
 use tempfile::tempdir;
 
 /// Database::from_engine() opens successfully and executes queries.

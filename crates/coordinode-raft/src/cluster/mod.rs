@@ -31,7 +31,10 @@ mod catch_up;
 pub mod grpc_server;
 pub mod nemesis;
 pub(crate) mod network;
+pub mod timing;
 pub mod version;
+
+pub use timing::{ElectionPreference, ElectionTiming, TimingError};
 
 use std::sync::Arc;
 
@@ -95,12 +98,34 @@ impl Default for SnapshotTriggerConfig {
 }
 
 impl SnapshotTriggerConfig {
-    /// The openraft configuration under this snapshot policy. Both
-    /// thresholds are the trigger task's, so the minimum interval bounds
-    /// them alike; openraft builds a snapshot only when the task asks.
-    fn raft_config(&self) -> openraft::Config {
+    /// The openraft configuration under this snapshot policy and `timing`.
+    /// Both snapshot thresholds are the trigger task's, so the minimum
+    /// interval bounds them alike; openraft builds a snapshot only when the
+    /// task asks.
+    fn raft_config(
+        &self,
+        timing: ElectionTiming,
+        preference: ElectionPreference,
+    ) -> openraft::Config {
+        // The test harness's generous window: shared CI runners starve
+        // heartbeats, and only a longer election timeout tolerates it. It
+        // only ever lengthens the group's window, and a member's preference
+        // is derived from the result, so a member that stands last still
+        // stands after every other.
+        let timing = if std::env::var_os("COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS").is_some() {
+            timing.at_least(
+                std::time::Duration::from_millis(1500),
+                std::time::Duration::from_millis(3000),
+            )
+        } else {
+            timing
+        };
+        let (heartbeat, election_min, election_max) = timing.for_member(preference).millis();
         openraft::Config {
             snapshot_policy: openraft::SnapshotPolicy::Never,
+            heartbeat_interval: heartbeat,
+            election_timeout_min: election_min,
+            election_timeout_max: election_max,
             ..default_raft_config()
         }
     }
@@ -111,6 +136,10 @@ impl SnapshotTriggerConfig {
 pub struct NodeOptions {
     /// When the node snapshots its state.
     pub snapshots: SnapshotTriggerConfig,
+    /// The group's election and heartbeat timing.
+    pub timing: ElectionTiming,
+    /// When this member stands for election relative to the others.
+    pub preference: ElectionPreference,
     /// The embedding application's format epoch, half of the version pair
     /// members are matched on. A server runs zero.
     pub host_epoch: u64,
@@ -703,13 +732,15 @@ impl RaftNode {
         // A single-node group talks to no peer, and needs no node identity.
         let NodeOptions {
             snapshots: snap_config,
+            timing,
+            preference,
             host_epoch,
             group,
             connections: _,
             enrollment: _,
             deployment: forming_in,
         } = options;
-        let config = Arc::new(snap_config.raft_config());
+        let config = Arc::new(snap_config.raft_config(timing, preference));
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
         // Clone the oplog handle before openraft consumes the LogStore, so
@@ -937,6 +968,8 @@ impl RaftNode {
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
         let NodeOptions {
             snapshots: snap_config,
+            timing,
+            preference,
             host_epoch,
             group,
             connections,
@@ -951,7 +984,7 @@ impl RaftNode {
             // A node forming its group is enrolled in nothing.
             (Founding::Form { .. }, _) => None,
         };
-        let mut config = snap_config.raft_config();
+        let mut config = snap_config.raft_config(timing, preference);
         // Committed entries the disk lost are sent again by a leader when the
         // group has another voter to hold them; alone, nothing could.
         let lost = if has_other_voters(&engine, node_id)
@@ -2418,6 +2451,52 @@ impl RaftNode {
                     .map(|log| log.index);
                 (matched, core::cmp::Reverse(*id))
             })
+    }
+
+    /// A live voter, other than this leader, that holds every entry of the
+    /// leader's log: one leadership can move to without a write in flight
+    /// waiting on it. `None` when this node does not lead or no other voter
+    /// has caught up.
+    pub fn caught_up_voter(&self) -> Option<u64> {
+        use openraft::async_runtime::watch::WatchReceiver;
+
+        let target = self.find_transfer_target()?;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let last = metrics.last_log_index?;
+        let matched = metrics
+            .replication
+            .as_ref()?
+            .get(&target)
+            .and_then(Option::as_ref)
+            .map(|log| log.index)?;
+        (matched >= last).then_some(target)
+    }
+
+    /// While this member leads, hand leadership to a live voter as soon as one
+    /// holds every entry of the log. A member that stands for election last
+    /// runs this: it leads only when no other member could win, and gives the
+    /// lead back once another can take it without losing a write. Woken by
+    /// the engine's metrics, so it costs nothing while nothing changes.
+    /// Returns once the node stops.
+    pub async fn yield_leadership_when_caught_up(&self) {
+        use openraft::async_runtime::watch::WatchReceiver;
+
+        let mut rx = self.raft.metrics();
+        loop {
+            if let Some(target) = self.caught_up_voter() {
+                tracing::info!(
+                    node_id = self.node_id,
+                    target,
+                    "a member that stands last hands leadership back"
+                );
+                if let Err(e) = self.transfer_leadership_to(target).await {
+                    tracing::warn!(target, %e, "handing leadership back failed");
+                }
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Whether the membership has a voter besides this node.

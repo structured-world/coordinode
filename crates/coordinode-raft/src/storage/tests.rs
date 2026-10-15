@@ -2737,7 +2737,6 @@ mod snap2_watermark_integration {
         // A wait at T=800 returns immediately.
         let got = wm
             .wait_for(Timestamp::from_raw(800), Duration::from_millis(50))
-            .await
             .expect("fast path");
         assert_eq!(got.as_raw(), 1000);
     }
@@ -2798,18 +2797,16 @@ mod snap2_watermark_integration {
         let sm = Arc::new(open_with_watermark(engine, &wm));
 
         let wm_reader = Arc::clone(&wm);
-        let reader = tokio::spawn(async move {
-            wm_reader
-                .wait_for(Timestamp::from_raw(777), Duration::from_millis(500))
-                .await
+        let reader = std::thread::spawn(move || {
+            wm_reader.wait_for(Timestamp::from_raw(777), Duration::from_millis(500))
         });
 
         // Applier delay — ensure reader is actually blocked.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::thread::sleep(Duration::from_millis(20));
         sm.apply_proposal(&make_proposal(1, 777), 1, 0)
             .expect("apply");
 
-        let got = reader.await.expect("task").expect("reader unblocks");
+        let got = reader.join().expect("thread").expect("reader unblocks");
         assert_eq!(got.as_raw(), 777);
     }
 
@@ -2822,19 +2819,13 @@ mod snap2_watermark_integration {
         let wm = MaxAssignedWatermark::new(Timestamp::from_raw(100));
         let _sm = open_with_watermark(engine, &wm);
 
-        let err = wm
+        let WaitError::Timeout {
+            target, current, ..
+        } = wm
             .wait_for(Timestamp::from_raw(500), Duration::from_millis(50))
-            .await
             .expect_err("must time out");
-        match err {
-            WaitError::Timeout {
-                target, current, ..
-            } => {
-                assert_eq!(target, 500);
-                assert_eq!(current, 100);
-            }
-            other => panic!("expected Timeout, got {other:?}"),
-        }
+        assert_eq!(target, 500);
+        assert_eq!(current, 100);
     }
 
     #[tokio::test]

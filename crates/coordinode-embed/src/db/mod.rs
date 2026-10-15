@@ -24,9 +24,9 @@ use coordinode_query::executor::runner::{
 use coordinode_query::frontend::{CypherFrontend, QueryFrontend};
 use coordinode_query::planner;
 use coordinode_query::procedure::{Procedure, ProcedureError, ProcedureRegistry};
-use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::partition::Partition;
 
 /// Outcome of a Cypher execution: result rows plus mutation statistics. Used
@@ -3859,14 +3859,43 @@ impl Database {
         };
         let build_indexes = || self.build_indexes_over_stored_nodes();
         let check_constraints = || self.check_constraints_over_stored_nodes();
+        let commit = |txn| self.commit_restored(txn);
         let target = crate::backup::restore::RestoreTarget {
             engine: &self.engine,
+            oracle: &self.oracle,
+            commit: &commit,
             fields: self.fields.as_ref(),
             raise_lease: &raise,
             build_indexes: &build_indexes,
             check_constraints: &check_constraints,
         };
         crate::backup::restore::run(&target, format, source, options)
+    }
+
+    /// Commit a batch a restore staged through the write pipeline. Every
+    /// batch waits for a majority of the group: a restore reports done only
+    /// for what survives the loss of its leader.
+    fn commit_restored(
+        &self,
+        mut txn: coordinode_storage::engine::transaction::Transaction<'_>,
+    ) -> Result<(), crate::backup::restore::RestoreError> {
+        use coordinode_storage::engine::transaction::CommitError;
+
+        use crate::backup::restore::RestoreError;
+
+        let wc = coordinode_core::txn::write_concern::WriteConcern::majority();
+        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
+            write_concern: &wc,
+            pipeline: Some(self.pipeline.as_ref()),
+            id_gen: Some(&self.proposal_id_gen),
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        match txn.commit(&commit_ctx) {
+            Ok(_) => Ok(()),
+            Err(CommitError::NotLeader { leader_id }) => Err(RestoreError::NotLeader { leader_id }),
+            Err(e) => Err(RestoreError::Storage(e.to_string())),
+        }
     }
 
     /// Build every declared index again from the nodes in the store: the
@@ -3939,15 +3968,19 @@ impl Database {
         let labels = LocalSchemaStore::new(&self.engine)
             .list_labels()
             .map_err(|e| format!("read the label schemas: {e}"))?;
+        // The names are recorded in one commit through the write pipeline,
+        // with the rest of the restore.
+        let mut names = self.begin_catalog_txn();
         for schema in &labels {
             for constraint in schema.constraints() {
                 let key = encode_constraint_name_key(&constraint.name);
-                match self
-                    .engine
+                // Read through the staged names: two labels of the load
+                // that name a constraint alike collide here too.
+                match names
                     .get(Partition::Schema, &key)
                     .map_err(|e| e.to_string())?
                 {
-                    Some(holder) if holder.as_ref() == schema.name.as_bytes() => {}
+                    Some(holder) if holder.as_slice() == schema.name.as_bytes() => {}
                     Some(holder) => {
                         return Err(format!(
                             "constraint '{}' of :{} is also held by :{}",
@@ -3956,8 +3989,7 @@ impl Database {
                             String::from_utf8_lossy(&holder)
                         ));
                     }
-                    None => self
-                        .engine
+                    None => names
                         .put(Partition::Schema, &key, schema.name.as_bytes())
                         .map_err(|e| e.to_string())?,
                 }
@@ -3986,7 +4018,7 @@ impl Database {
                 ));
             }
         }
-        Ok(())
+        self.commit_restored(names).map_err(|e| e.to_string())
     }
 
     /// Get the query advisor registry for performance analysis.

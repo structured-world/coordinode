@@ -6440,3 +6440,74 @@ async fn the_closed_bound_survives_a_restart() {
         "TIMED OUT: the_closed_bound_survives_a_restart"
     );
 }
+
+/// A member cut off from its leader does not raise its term while it cannot
+/// win, and on its return the leader keeps leading in the same term: each of
+/// its candidacies first asks the others in a pre-vote they refuse, since
+/// they still hear their leader. Without the pre-vote it comes back with an
+/// inflated term and deposes a healthy leader.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_cut_off_from_its_leader_does_not_depose_it_on_return() {
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let members = clocked_group(&dirs).await;
+        let leader = await_ready_leader(&members).await;
+        let cut = (leader + 1) % members.len();
+        let term = members[leader].node.current_term();
+        let others: Vec<u64> = members
+            .iter()
+            .filter(|m| m.id != members[cut].id)
+            .map(|m| m.id)
+            .collect();
+
+        // Several election timeouts (the harness's generous window included)
+        // with the group kept active, so the cut member's timer runs.
+        coordinode_raft::cluster::nemesis::isolate(members[cut].id, &others);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let mut n = 0u32;
+        while std::time::Instant::now() < until {
+            let key = format!("node:during:{n}");
+            propose_held(
+                &members[leader].node,
+                &members[leader].engine,
+                &members[leader].oracle,
+                key.as_bytes(),
+            );
+            n += 1;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            members[cut].node.current_term(),
+            term,
+            "a member that cannot win does not raise its term"
+        );
+
+        coordinode_raft::cluster::nemesis::heal();
+        for i in 0..15 {
+            let key = format!("node:after:{i}");
+            propose_held(
+                &members[leader].node,
+                &members[leader].engine,
+                &members[leader].oracle,
+                key.as_bytes(),
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            members[leader].node.is_leader().await,
+            "the leader keeps leading"
+        );
+        assert_eq!(
+            members[leader].node.current_term(),
+            term,
+            "no election took place"
+        );
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_member_cut_off_from_its_leader_does_not_depose_it_on_return"
+    );
+}

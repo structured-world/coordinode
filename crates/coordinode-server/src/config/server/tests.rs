@@ -120,6 +120,52 @@ fn join_settings_parse_from_the_config_file() {
     assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
 }
 
+/// The election settings: unset they give the rack profile and an ordinary
+/// member; a profile and a single replaced value combine; timing that would
+/// let a healthy group keep electing is refused when it is resolved.
+#[test]
+fn election_settings_parse_and_resolve_from_the_config_file() {
+    use coordinode_raft::cluster::{ElectionPreference, ElectionTiming};
+    use std::time::Duration;
+
+    let d = ServerConfig::default();
+    assert_eq!(d.election_timing().unwrap(), ElectionTiming::RACK);
+    assert_eq!(d.election_preference(), ElectionPreference::Ordinary);
+
+    let parse = |text: &str| serde_saphyr::from_str::<ServerConfig>(text).unwrap();
+    let fleet = parse("election_profile: personal_fleet\nelection_preference: last\n");
+    assert_eq!(
+        fleet.election_timing().unwrap(),
+        ElectionTiming::PERSONAL_FLEET
+    );
+    assert_eq!(fleet.election_preference(), ElectionPreference::Last);
+
+    let tuned = parse("election_profile: personal_fleet\nelection_heartbeat_ms: 1000\n");
+    let timing = tuned.election_timing().unwrap();
+    assert_eq!(timing.heartbeat(), Duration::from_secs(1));
+    assert_eq!(
+        timing.election_min(),
+        ElectionTiming::PERSONAL_FLEET.election_min(),
+        "the values not replaced stay the profile's"
+    );
+
+    for refused in [
+        // The heartbeat is not below the shortest election timeout.
+        "election_heartbeat_ms: 400\n",
+        // The election window is empty.
+        "election_timeout_min_ms: 600\nelection_timeout_max_ms: 300\n",
+    ] {
+        assert!(
+            parse(refused).election_timing().is_err(),
+            "{refused:?} is refused"
+        );
+    }
+    assert!(
+        serde_saphyr::from_str::<ServerConfig>("election_heartbeat_ms: 0\n").is_err(),
+        "a zero heartbeat is refused"
+    );
+}
+
 /// The Raft snapshot triggers are config-file settings: unset they leave the
 /// node's defaults, set they carry the values given, and a zero, which would
 /// snapshot on every entry, byte or moment, is refused.

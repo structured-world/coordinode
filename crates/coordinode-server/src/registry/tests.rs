@@ -1,7 +1,7 @@
 use super::*;
 use coordinode_core::txn::timestamp::TimestampOracle;
-use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
 use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
 use coordinode_storage::oplog::manager::OplogManager;
 

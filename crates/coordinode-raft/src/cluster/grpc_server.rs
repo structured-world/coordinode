@@ -336,6 +336,32 @@ impl RaftService for RaftGrpcHandler {
         Ok(replica.answer(replica.payload(ser(&vote_resp)?)))
     }
 
+    async fn pre_vote(
+        &self,
+        request: Request<RaftPayload>,
+    ) -> Result<Response<RaftPayload>, Status> {
+        let (replica, data, caller) = admitted(&self.groups, request, Operation::Vote)?;
+        let vote_req: openraft::raft::VoteRequest<TypeConfig> = de(&data)?;
+        Admission::same_member(caller, vote_req.vote.leader_id().node_id)?;
+
+        // A member catching up on entries its disk lost would not grant the
+        // vote itself, so it does not promise to.
+        if replica.catch_up.pending() {
+            use openraft::async_runtime::watch::WatchReceiver;
+            let current = replica.raft.metrics().borrow_watched().vote;
+            let withheld = openraft::raft::VoteResponse::<TypeConfig>::new(current, None, false);
+            return Ok(replica.answer(replica.payload(ser(&withheld)?)));
+        }
+
+        let vote_resp = replica
+            .raft
+            .pre_vote(vote_req)
+            .await
+            .map_err(|e| Status::internal(format!("pre-vote: {e}")))?;
+
+        Ok(replica.answer(replica.payload(ser(&vote_resp)?)))
+    }
+
     async fn append_entries(
         &self,
         request: Request<RaftPayload>,

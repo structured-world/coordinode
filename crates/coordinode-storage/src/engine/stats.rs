@@ -20,6 +20,7 @@ use coordinode_core::graph::stats::{LABEL_KEY_PREFIX, NODES_TOTAL_KEY, StorageSt
 use crate::engine::core::StorageEngine;
 use crate::engine::merge;
 use crate::engine::partition::Partition;
+use crate::engine::transaction::Transaction;
 use crate::error::{StorageError, StorageResult};
 
 /// Pre-computed storage statistics snapshot.
@@ -214,19 +215,21 @@ fn type_key(edge_type: &str, suffix: &str) -> Vec<u8> {
 /// estimator then prices every plan against an empty graph. This reads the
 /// rows that are actually there and writes the counters to match.
 ///
-/// Written with `put` rather than with deltas because this establishes the
+/// Staged with `put` rather than with deltas because this establishes the
 /// value rather than moving it; it is a rebuild from the truth on disk, not
-/// an increment, so it must not be composed with what was there before.
+/// an increment, so it must not be composed with what was there before. The
+/// counters land with `txn`'s commit, so they reach every member the commit
+/// does.
 ///
 /// One row counts once, so a temporal node counts once per stored version,
 /// which is what the counters mean and what a scan of the partition sees.
 ///
 /// # Errors
 ///
-/// A row that is not a node record is reported and no counter is written: a
+/// A row that is not a node record is reported and no counter is staged: a
 /// total that left it out would durably claim a smaller graph than the one
 /// on disk.
-pub fn rebuild_node_counters(engine: &StorageEngine) -> StorageResult<()> {
+pub fn rebuild_node_counters(txn: &mut Transaction<'_>) -> StorageResult<()> {
     use coordinode_core::graph::node::NODE_KEY_PREFIX;
     use coordinode_core::graph::stats::label_count_key;
 
@@ -235,7 +238,7 @@ pub fn rebuild_node_counters(engine: &StorageEngine) -> StorageResult<()> {
     let mut total: i64 = 0;
     let mut label_counts: HashMap<String, i64> = HashMap::new();
 
-    for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
+    for guard in txn.engine().prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
         let (key, value) = guard.into_inner()?;
         let record = decode_node_record(&value)
             .map_err(|_| corrupt(Partition::Node, &key, "not a node record"))?;
@@ -245,9 +248,9 @@ pub fn rebuild_node_counters(engine: &StorageEngine) -> StorageResult<()> {
         }
     }
 
-    engine.put(Partition::Counter, NODES_TOTAL_KEY, &total.to_le_bytes())?;
+    txn.put(Partition::Counter, NODES_TOTAL_KEY, &total.to_le_bytes())?;
     for (label, count) in label_counts {
-        engine.put(
+        txn.put(
             Partition::Counter,
             &label_count_key(&label),
             &count.to_le_bytes(),

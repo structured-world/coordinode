@@ -311,6 +311,35 @@ jobs:
       - name: Run doc tests
         run: cargo test --doc --all-features --target ${{ matrix.target }} $CRATES
 
+  embedded-without-replication:
+    name: Embedded library without replication
+    # Every other job builds with all features. This one builds the embedded
+    # library the way an application that does not replicate takes it: no
+    # consensus, no inter-node channel, no async runtime compiled in, and its
+    # tests passing without them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler (skip if present)
+        run: |
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
+          else
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          fi
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Nothing of replication in the dependency tree
+        run: scripts/embedded-without-replication.sh
+      - name: Clippy without replication
+        run: cargo clippy -p coordinode-embed --all-targets -- -D warnings
+      - name: Tests without replication (nextest)
+        run: cargo nextest run -p coordinode-embed
+
   build:
     name: Build
     # See `test` job: the release build is even larger than debug and

@@ -47,52 +47,6 @@ fn set_nofile_limit(_target: Option<u64>) -> Option<(u64, u64)> {
     None
 }
 
-/// How this member reaches its peers' segment services, and the members it
-/// has now, each with the identity it must prove; `None` for a node without
-/// peers. Read at each use, so a membership change reaches the next pull.
-fn segment_peers(
-    node: &coordinode_raft::cluster::RaftNode,
-) -> Option<(
-    coordinode_replicate::PeerLinks,
-    Vec<coordinode_raft::cluster::PeerTarget>,
-)> {
-    let links = coordinode_replicate::PeerLinks {
-        connections: Arc::clone(node.connections()?),
-        admission: Arc::clone(node.admission()?) as _,
-    };
-    let peers = node.peer_targets();
-    (!peers.is_empty()).then_some((links, peers))
-}
-
-/// Fills a replacement of one of this member's index copies from its peers'
-/// copies over the segment transfer.
-struct PeerIndexCopy {
-    installer: Arc<coordinode_replicate::SegmentInstaller>,
-    node: Arc<coordinode_raft::cluster::RaftNode>,
-    runtime: tokio::runtime::Handle,
-}
-
-impl coordinode_query::index::IndexCopySource for PeerIndexCopy {
-    fn prepare(
-        &self,
-        generation: coordinode_query::index::GenerationId,
-    ) -> Result<Option<Vec<u8>>, String> {
-        let (links, peers) = segment_peers(&self.node)
-            .ok_or("no peer holds a copy to replace this member's from")?;
-        // Called from an index-check thread, outside the runtime.
-        self.runtime
-            .block_on(self.installer.prepare_generation(
-                &links,
-                &peers,
-                generation,
-                1 << 20,
-                coordinode_replicate::PieceEncoding::None,
-            ))
-            .map(|(_, proof)| proof)
-            .map_err(|e| e.to_string())
-    }
-}
-
 /// Delay before a periodic task's first run: `node_id mod 16` sixteenths of
 /// its interval, so a fleet does not run it in lockstep. The product is at
 /// most the interval itself, so it cannot overflow.
@@ -201,6 +155,10 @@ pub(crate) async fn serve(
     let trigger_dispatch_interval = cfg.trigger_dispatch_interval();
     let statement_defaults = cfg.statement_defaults();
     let peer_timeouts = cfg.peer_timeouts();
+    // Refused at start: a timing that keeps a healthy group electing is not
+    // one to run with.
+    let election_timing = cfg.election_timing()?;
+    let election_preference = cfg.election_preference();
     let config::ServerConfig {
         node_id,
         grpc_addr,
@@ -247,6 +205,12 @@ pub(crate) async fn serve(
         raft_snapshot_entries,
         raft_snapshot_log_bytes,
         raft_snapshot_min_interval_secs,
+        // Already captured above (election_timing / _preference) before the move.
+        election_profile: _,
+        election_heartbeat_ms: _,
+        election_timeout_min_ms: _,
+        election_timeout_max_ms: _,
+        election_preference: _,
         planner_stats_ttl_secs,
         slow_query_ms,
         vector_build_wait_ms,
@@ -433,19 +397,57 @@ pub(crate) async fn serve(
                      `--features page_ecc` to enable it"
         );
     }
-    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let engine = coordinode_storage::engine::core::StorageEngine::open_with_oracle(
-        &storage_config,
-        oracle.clone(),
-    )
-    .map_err(|e| format!("failed to open storage: {e}"))?;
-    let engine = Arc::new(engine);
-
-    // Shared slot for this node's RaftNode, filled once it is built below.
-    // The scrub task (spawned now) reads it for WAL-replay repair; its
-    // first run is jitter-delayed by minutes, long after the slot is set.
-    let raft_slot: Arc<std::sync::OnceLock<Arc<coordinode_raft::cluster::RaftNode>>> =
-        Arc::new(std::sync::OnceLock::new());
+    // The member: the store, its consensus node and the database over the
+    // replicated pipeline, assembled by the embedded library the same way an
+    // embedding host gets it. Every mode writes through the log: a standalone
+    // server is a group of one, which is what lets it grow later.
+    let defaults = coordinode_raft::cluster::SnapshotTriggerConfig::default();
+    let mut member_options = coordinode_embed::replication::MemberOptions::new(node_id);
+    member_options.snapshots = coordinode_raft::cluster::SnapshotTriggerConfig {
+        logs_since_last: raft_snapshot_entries.map_or(defaults.logs_since_last, |n| n.get()),
+        log_bytes: raft_snapshot_log_bytes.map_or(defaults.log_bytes, |n| n.get()),
+        min_interval: raft_snapshot_min_interval_secs.map_or(defaults.min_interval, |n| {
+            std::time::Duration::from_secs(n.get())
+        }),
+    };
+    member_options.timing = election_timing;
+    member_options.preference = election_preference;
+    // A server is not embedded in an application with a format of its own:
+    // its host epoch is zero.
+    member_options.host_epoch = 0;
+    if let (Some(peers_list), Some(identity)) = (&peers, &node_identity) {
+        info!(identity = %identity.context().identity(), "node identity");
+        let founding = if node_id == 1 {
+            info!(
+                peers = peers_list.len(),
+                node_id, "cluster mode: the member the group is formed around"
+            );
+            // A deployment named here is the one an existing deployment's
+            // node forms its group in; none founds a new one.
+            coordinode_embed::replication::Founding::Form {
+                deployment: identity.deployment()?,
+            }
+        } else {
+            info!(
+                peers = peers_list.len(),
+                node_id, "cluster mode: joining node"
+            );
+            coordinode_embed::replication::Founding::Join(identity.enrollment()?)
+        };
+        member_options.peering = Some(coordinode_embed::replication::Peering {
+            security: Arc::clone(identity.context()),
+            advertise: effective_advertise.clone(),
+            founding,
+            timeouts: peer_timeouts,
+        });
+    } else {
+        info!(node_id, "standalone mode: a group of one");
+    }
+    let mut member = coordinode_embed::replication::Member::open(&storage_config, member_options)
+        .await
+        .map_err(|e| format!("failed to open the member: {e}"))?;
+    let engine = Arc::clone(member.engine());
+    let raft_node = Arc::clone(member.node());
 
     // Background integrity scrub. Each node verifies its OWN local
     // storage independently (no leader election — silent bit rot is a
@@ -459,7 +461,7 @@ pub(crate) async fn serve(
             let interval = scrub_cfg.interval;
             // For WAL-replay repair: the Raft oplog source + the checkpoint
             // base directory.
-            let scrub_raft = Arc::clone(&raft_slot);
+            let scrub_raft = Arc::clone(&raft_node);
             let scrub_ckpt_dir = checkpoint_dir.clone();
             // Peers to pull a fresh copy from when scrub finds corruption
             // (CE basic replica-fetch repair): the members at repair time,
@@ -532,7 +534,7 @@ pub(crate) async fn serve(
                                 for part in corrupt {
                                     // 1) Replica-fetch repair from healthy peers.
                                     let repair_peers =
-                                        scrub_raft.get().and_then(|raft| segment_peers(raft));
+                                        coordinode_embed::replication::segment_peers(&scrub_raft);
                                     let from_peers = match &repair_peers {
                                         None => None,
                                         Some((links, peers)) => Some(
@@ -576,13 +578,6 @@ pub(crate) async fn serve(
 
                                     // 2) Rebuild from the latest local checkpoint and
                                     // the Raft log, with the applies paused.
-                                    let Some(raft) = scrub_raft.get() else {
-                                        tracing::warn!(
-                                            partition = part.name(),
-                                            "no replica and no Raft log yet — cannot repair"
-                                        );
-                                        continue;
-                                    };
                                     let Some(ckpt) = checkpoint::latest_checkpoint(&scrub_ckpt_dir)
                                     else {
                                         tracing::warn!(
@@ -591,7 +586,7 @@ pub(crate) async fn serve(
                                         );
                                         continue;
                                     };
-                                    let raft = Arc::clone(raft);
+                                    let raft = Arc::clone(&scrub_raft);
                                     match tokio::task::spawn_blocking(move || {
                                         raft.rebuild_partition_from_checkpoint(&ckpt, part)
                                     })
@@ -694,95 +689,6 @@ pub(crate) async fn serve(
         }
     }
 
-    // Open Raft node and build database — both modes use RaftProposalPipeline.
-    //
-    // Three construction paths:
-    //
-    // 1. Standalone (no --peers): single-node Raft via StubNetworkFactory.
-    //    No gRPC Raft handler needed — no peers can connect.
-    //
-    // 2. Cluster, node_id == 1 (bootstrap leader): open_cluster_embedded().
-    //    Calls initialize(), returns a RaftGrpcHandler for the main router.
-    //
-    // 3. Cluster, node_id > 1 (joining node): open_joining_embedded().
-    //    Does NOT call initialize(). Waits for leader to add it via
-    //    `coordinode admin node join`. Returns a RaftGrpcHandler for the
-    //    main router.
-    //
-    // In cases 2 and 3, RaftServiceServer is registered at the end of
-    // router construction so inter-node Raft RPCs share the :7080 port.
-    let defaults = coordinode_raft::cluster::SnapshotTriggerConfig::default();
-    let snapshots = coordinode_raft::cluster::SnapshotTriggerConfig {
-        logs_since_last: raft_snapshot_entries.map_or(defaults.logs_since_last, |n| n.get()),
-        log_bytes: raft_snapshot_log_bytes.map_or(defaults.log_bytes, |n| n.get()),
-        min_interval: raft_snapshot_min_interval_secs.map_or(defaults.min_interval, |n| {
-            std::time::Duration::from_secs(n.get())
-        }),
-    };
-    // A server is not embedded in an application with a format of its own:
-    // its host epoch is zero. It hosts the one group a deployment is formed
-    // with.
-    let mut options = coordinode_raft::cluster::NodeOptions {
-        snapshots,
-        host_epoch: 0,
-        group: coordinode_raft::cluster::GroupId::FORMING,
-        ..Default::default()
-    };
-    let (raft_node, raft_grpc_handler) =
-        if let (Some(peers_list), Some(identity)) = (&peers, &node_identity) {
-            let peer_count = peers_list.len();
-            options.connections = Some(Arc::new(
-                coordinode_raft::cluster::PeerConnections::new(Arc::clone(identity.context()))
-                    .with_timeouts(peer_timeouts),
-            ));
-            info!(identity = %identity.context().identity(), "node identity");
-            if node_id == 1 {
-                info!(
-                    peers = peer_count,
-                    node_id, "cluster mode: bootstrap leader (open_cluster_embedded)"
-                );
-                // A deployment named here is the one an existing deployment's
-                // node forms its group in; none founds a new one.
-                options.deployment = identity.deployment()?;
-                let (rn, handler) =
-                    coordinode_raft::cluster::RaftNode::open_cluster_embedded_with_options(
-                        node_id,
-                        Arc::clone(&engine),
-                        effective_advertise,
-                        options,
-                    )
-                    .await
-                    .map_err(|e| format!("failed to open cluster Raft node: {e}"))?;
-                (rn, Some(handler))
-            } else {
-                info!(
-                    peers = peer_count,
-                    node_id, "cluster mode: joining node (open_joining_embedded)"
-                );
-                options.enrollment = Some(identity.enrollment()?);
-                let (rn, handler) =
-                    coordinode_raft::cluster::RaftNode::open_joining_embedded_with_options(
-                        node_id,
-                        Arc::clone(&engine),
-                        options,
-                    )
-                    .await
-                    .map_err(|e| format!("failed to open joining Raft node: {e}"))?;
-                (rn, Some(handler))
-            }
-        } else {
-            info!(node_id, "standalone mode: single-node Raft (StubNetwork)");
-            let rn = coordinode_raft::cluster::RaftNode::open_with_oracle_and_options(
-                node_id,
-                Arc::clone(&engine),
-                Some(Arc::clone(&oracle)),
-                options,
-            )
-            .await
-            .map_err(|e| format!("failed to open Raft node: {e}"))?;
-            (rn, None)
-        };
-
     // The deployment a node joining this one's is configured with.
     if let Some(deployment) = raft_node.deployment() {
         info!(%deployment, "deployment");
@@ -796,80 +702,64 @@ pub(crate) async fn serve(
     if let Some(secs) = join_timeout_secs {
         raft_node.set_join_timeout(std::time::Duration::from_secs(secs.get()));
     }
-    let raft_node = Arc::new(raft_node);
 
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(raft_node.pipeline());
 
-    let mut database = coordinode_embed::Database::from_engine(
-        &data_dir,
-        Arc::clone(&engine),
-        oracle.clone(),
-        Arc::clone(&pipeline),
-    )
-    .map_err(|e| format!("failed to open database: {e}"))?;
-    if let Some(secs) = planner_stats_ttl_secs {
-        database.set_stats_ttl(std::time::Duration::from_secs(secs));
+    // The database is configured before the member's background work
+    // starts, below: an interrupted index build resumes under these settings.
+    let database = Arc::clone(member.database());
+    {
+        let mut database = database.write();
+        if let Some(secs) = planner_stats_ttl_secs {
+            database.set_stats_ttl(std::time::Duration::from_secs(secs));
+        }
+        if let Some(ms) = vector_build_wait_ms {
+            database.set_vector_build_wait(std::time::Duration::from_millis(ms));
+        }
+        if let Some(mib) = query_memory_limit_mb {
+            // Refused at start rather than clamped: an operator who wrote a
+            // limit past the ceiling meant something the server cannot honour.
+            let bytes = mib
+                .checked_mul(1 << 20)
+                .ok_or_else(|| format!("query_memory_limit_mb = {mib} does not fit in bytes"))?;
+            database
+                .set_query_memory_limit(bytes)
+                .map_err(|e| format!("query_memory_limit_mb = {mib}: {e}"))?;
+        }
+        if let Some(bytes) = vector_retired_bytes_budget {
+            // A budget past the address space is no bound at all, which is what
+            // `usize::MAX` means.
+            database.set_vector_retired_bytes_budget(usize::try_from(bytes).unwrap_or(usize::MAX));
+        }
+        // Before any build resumes: this process takes up interrupted builds only
+        // once it leads, below.
+        let defaults = database.index_build_config();
+        database.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+            max_running: index_build_max_running.map_or(defaults.max_running, |n| n.get()),
+            older_transactions_wait: index_build_older_transactions_wait_secs.map_or(
+                defaults.older_transactions_wait,
+                std::time::Duration::from_secs,
+            ),
+            unique_admission_read_limit: index_build_unique_read_limit
+                .unwrap_or(defaults.unique_admission_read_limit),
+            statement_wait: index_build_statement_wait_secs
+                .map_or(defaults.statement_wait, std::time::Duration::from_secs),
+            check_page: index_check_page.map_or(defaults.check_page, |n| n.get()),
+            check_max_repairs: index_check_max_repairs.unwrap_or(defaults.check_max_repairs),
+            // Zero turns the periodic check off; reports and requests still
+            // check.
+            check_interval: match index_check_interval_secs {
+                None => defaults.check_interval,
+                Some(0) => None,
+                Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            },
+        });
+        // What a statement executes under when neither it nor its session names a
+        // concern.
+        database.set_read_concern(statement_defaults.read_concern);
+        database.set_write_concern(statement_defaults.write_concern);
     }
-    if let Some(ms) = vector_build_wait_ms {
-        database.set_vector_build_wait(std::time::Duration::from_millis(ms));
-    }
-    if let Some(mib) = query_memory_limit_mb {
-        // Refused at start rather than clamped: an operator who wrote a
-        // limit past the ceiling meant something the server cannot honour.
-        let bytes = mib
-            .checked_mul(1 << 20)
-            .ok_or_else(|| format!("query_memory_limit_mb = {mib} does not fit in bytes"))?;
-        database
-            .set_query_memory_limit(bytes)
-            .map_err(|e| format!("query_memory_limit_mb = {mib}: {e}"))?;
-    }
-    if let Some(bytes) = vector_retired_bytes_budget {
-        // A budget past the address space is no bound at all, which is what
-        // `usize::MAX` means.
-        database.set_vector_retired_bytes_budget(usize::try_from(bytes).unwrap_or(usize::MAX));
-    }
-    // Before any build resumes: this process takes up interrupted builds only
-    // once it leads, below.
-    let defaults = database.index_build_config();
-    database.set_index_build_config(coordinode_query::index::IndexBuildConfig {
-        max_running: index_build_max_running.map_or(defaults.max_running, |n| n.get()),
-        older_transactions_wait: index_build_older_transactions_wait_secs.map_or(
-            defaults.older_transactions_wait,
-            std::time::Duration::from_secs,
-        ),
-        unique_admission_read_limit: index_build_unique_read_limit
-            .unwrap_or(defaults.unique_admission_read_limit),
-        statement_wait: index_build_statement_wait_secs
-            .map_or(defaults.statement_wait, std::time::Duration::from_secs),
-        check_page: index_check_page.map_or(defaults.check_page, |n| n.get()),
-        check_max_repairs: index_check_max_repairs.unwrap_or(defaults.check_max_repairs),
-        // Zero turns the periodic check off; reports and requests still
-        // check.
-        check_interval: match index_check_interval_secs {
-            None => defaults.check_interval,
-            Some(0) => None,
-            Some(secs) => Some(std::time::Duration::from_secs(secs)),
-        },
-    });
-    // A copy of an index found damaged on this member alone is replaced from
-    // a peer's copy; a standalone member has no peer and answers from its
-    // records instead.
-    if raft_node.connections().is_some() {
-        database.set_index_copy_source(Arc::new(PeerIndexCopy {
-            installer: Arc::new(coordinode_replicate::SegmentInstaller::new(Arc::clone(
-                &engine,
-            ))),
-            node: Arc::clone(&raft_node),
-            runtime: tokio::runtime::Handle::current(),
-        }));
-    }
-    // What a statement executes under when neither it nor its session names a
-    // concern.
-    database.set_read_concern(statement_defaults.read_concern);
-    database.set_write_concern(statement_defaults.write_concern);
-    // no-std: spin::RwLock (drop-in).
-    let database = Arc::new(parking_lot::RwLock::new(database));
 
     // Live session registry for operational introspection
     // (SHOW SESSIONS / SHOW TRANSACTIONS). Shared between the session
@@ -1092,84 +982,11 @@ pub(crate) async fn serve(
     let raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> =
         Some(Arc::clone(&raft_node));
 
-    // Hand the RaftNode to the scrub task so WAL-replay repair can read
-    // the oplog. Set-once; the scrub's first (jitter-delayed) run is well
-    // after this point.
-    let _ = raft_slot.set(Arc::clone(&raft_node));
-
-    // Bring index definitions live as their entries apply: a replica's copy of
-    // a leader's CREATE / DROP INDEX, and on a single node the definitions the
-    // log replays after the database opened. Woken only by applied Schema
-    // entries that write an index definition (or replace the partition), so
-    // an ordinary write costs nothing here. The field dictionary needs no such
-    // follower: each statement refreshes its view whenever a binding applied.
-    let index_definitions = IndexDefinitionFollower::spawn(&engine, Arc::downgrade(&database));
-
-    // Drive AFTER COMMIT trigger dispatch on the Raft leader. The event
-    // queue (`trigger_pending:`) is Raft-replicated, so every node sees the
-    // same backlog; gating execution on the lease holder means only one
-    // node runs the backlog at a time (the body's writes have to go through
-    // the leader's pipeline anyway). A leader change before an event is
-    // acknowledged runs it again on the new leader, so bodies run at least
-    // once. Woken by each applied entry (covers fresh enqueues, a trigger
-    // enabled, and the entry a new leader appends) and by the earliest
-    // retry the last pass left scheduled; with nothing queued it sleeps.
-    // Passes are at least `trigger_dispatch_interval` apart. The blocking
-    // dispatch runs off the async runtime so a long body never stalls
-    // consensus.
-    if peers.is_some() {
-        let db = Arc::clone(&database);
-        let rn = Arc::clone(&raft_node);
-        let mut applied_rx = rn.subscribe_applied();
-        tokio::spawn(async move {
-            let mut due: Option<tokio::time::Instant> = None;
-            loop {
-                tokio::select! {
-                    changed = applied_rx.changed() => {
-                        if changed.is_err() {
-                            break; // RaftNode dropped — shut the worker down.
-                        }
-                    }
-                    _ = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {}
-                }
-                due = None;
-                if rn.current_leader() != Some(rn.node_id()) {
-                    continue;
-                }
-                let passed_at = tokio::time::Instant::now();
-                let db2 = Arc::clone(&db);
-                match tokio::task::spawn_blocking(move || {
-                    db2.read().dispatch_after_commit_triggers()
-                })
-                .await
-                {
-                    Ok(report) => {
-                        for e in &report.errors {
-                            tracing::warn!("after-commit trigger dispatch: {e}");
-                        }
-                        // A bookkeeping failure leaves its event due: try again.
-                        let retry_in = if report.errors.is_empty() {
-                            report.next_due_us.map(|at| {
-                                // A retry already due waits for nothing.
-                                std::time::Duration::from_micros(at.saturating_sub(unix_now_us()))
-                            })
-                        } else {
-                            Some(std::time::Duration::ZERO)
-                        };
-                        due = retry_in.map(|wait| passed_at + wait.max(trigger_dispatch_interval));
-                    }
-                    Err(e) => {
-                        tracing::warn!(%e, "after-commit dispatch task join error");
-                        due = Some(passed_at + trigger_dispatch_interval);
-                    }
-                }
-            }
-        });
-    }
-
-    // Finish the index builds no executor finishes, each time this member
-    // becomes the leader.
-    crate::index_build_resumer::spawn(Arc::clone(&database), Arc::clone(&raft_node));
+    // The member's background work, now that the database is configured:
+    // index definitions brought live as their entries apply, and on the
+    // leader the index builds no executor finishes and AFTER COMMIT trigger
+    // dispatch, passes at least `trigger_dispatch_interval` apart.
+    member.start_background(trigger_dispatch_interval);
 
     let query_registry = Arc::new(coordinode_query::advisor::QueryRegistry::new());
     let nplus1_detector = Arc::new(coordinode_query::advisor::nplus1::NPlus1Detector::new());
@@ -1630,49 +1447,12 @@ pub(crate) async fn serve(
         info!("ClusterService registered — cluster join/leave management available");
     }
 
-    // Register cluster-only inter-node services in cluster mode — embedded
-    // into :7080 so inter-node RPCs share the main gRPC port (no separate
-    // server). Gated on cluster mode: raft_grpc_handler is Some only when
-    // peers are configured.
-    if let Some(handler) = raft_grpc_handler {
-        use coordinode_raft::cluster::admission::nodes_only;
-        use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
-        use tonic::service::interceptor::InterceptedService;
-        // Every inter-node service refuses a client before reading its
-        // message; the port also serves clients.
-        // The frozen exchange a member of another version is answered with.
-        routes.add_service(InterceptedService::new(
-            handler.handshake_service(),
-            nodes_only,
-        ));
-        routes.add_service(InterceptedService::new(
-            RaftServiceServer::new(handler),
-            nodes_only,
-        ));
-        info!(node_id, "RaftService registered on :7080 (shared port)");
-
-        // SegmentTransferService: receive bulk segment pushes (replication
-        // repair, operator-commanded migration, node resync) and install
-        // them into local storage via the engine-backed sink.
-        use coordinode_replicate::segment_store::SegmentInstaller;
-        use coordinode_replicate::transfer::SegmentTransferHandler;
-        use coordinode_replicate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-        let admission = raft_node
-            .admission()
-            .ok_or("a node with peers has an admission")?;
-        let segment_handler = SegmentTransferHandler::new(
-            Arc::new(SegmentInstaller::new(Arc::clone(&engine))),
-            Arc::clone(admission) as _,
-        );
-        routes.add_service(InterceptedService::new(
-            SegmentTransferServiceServer::new(segment_handler)
-                .max_decoding_message_size(max_req_bytes),
-            nodes_only,
-        ));
-        info!(
-            node_id,
-            "SegmentTransferService registered on :7080 (shared port)"
-        );
+    // The services peers call (version handshake, consensus, segment
+    // transfer) share the main gRPC port with the client services; each one
+    // refuses a caller that is not an admitted node before it reads the
+    // message. A standalone member serves none.
+    if member.add_inter_node_services(&mut routes, max_req_bytes) {
+        info!(node_id, "inter-node services registered on the shared port");
     }
 
     // Services contributed by a downstream distribution, added after the
@@ -1705,7 +1485,8 @@ pub(crate) async fn serve(
                 .await?;
         }
     }
-    drop(index_definitions);
+    // The member's background work stops with it.
+    drop(member);
 
     if let Some(fatal) = fatal_rx.borrow().clone() {
         return Err(format!("consensus stopped on a fatal error: {fatal}").into());
@@ -1719,106 +1500,6 @@ async fn fatal_reported(fatal: &mut tokio::sync::watch::Receiver<Option<String>>
     if fatal.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
     }
-}
-
-/// Brings this member's B-tree, vector and text indexes in line with the
-/// index definitions as their entries apply.
-struct IndexDefinitionFollower {
-    stop: coordinode_storage::engine::applied::AppliedStop,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-/// Queue of applied Schema events the follower may fall behind on; a full
-/// queue arrives as "replaced" and costs one refresh, never a missed one.
-const INDEX_DEFINITION_QUEUE: usize = 1024;
-
-impl IndexDefinitionFollower {
-    fn spawn(
-        engine: &Arc<coordinode_storage::engine::core::StorageEngine>,
-        database: std::sync::Weak<parking_lot::RwLock<coordinode_embed::Database>>,
-    ) -> Self {
-        use coordinode_storage::engine::applied::AppliedEvent;
-        let applied = engine.subscribe_applied(
-            coordinode_storage::engine::partition::Partition::Schema,
-            INDEX_DEFINITION_QUEUE,
-        );
-        let stop = applied.stopper();
-        let thread = std::thread::Builder::new()
-            .name("index-def-follower".to_string())
-            .spawn(move || {
-                // Asleep until a Schema entry applies; `None` once stopped.
-                while let Some(first) = applied.next(None) {
-                    let mut event = Some(first);
-                    let mut definitions_changed = false;
-                    while let Some(current) = event {
-                        definitions_changed |= match current {
-                            AppliedEvent::Keys { keys, .. } => {
-                                keys.iter().any(|k| k.starts_with(b"schema:idx:"))
-                            }
-                            // A command or a replaced partition: which keys
-                            // changed is not known.
-                            AppliedEvent::Replaced => true,
-                        };
-                        event = applied.try_next();
-                    }
-                    if !definitions_changed {
-                        continue;
-                    }
-                    let Some(db) = database.upgrade() else {
-                        break;
-                    };
-                    refresh_index_definitions(&db.read());
-                }
-            })
-            .map_err(|e| tracing::error!(%e, "could not start the index definition follower"))
-            .ok();
-        Self { stop, thread }
-    }
-}
-
-/// Stopped on every way out of `serve`, an early error included.
-impl Drop for IndexDefinitionFollower {
-    fn drop(&mut self) {
-        self.stop.stop();
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                tracing::error!("the index definition follower panicked");
-            }
-        }
-    }
-}
-
-/// Register, rebuild or drop this member's indexes to match the stored
-/// definitions.
-fn refresh_index_definitions(db: &coordinode_embed::Database) {
-    // Register + local HNSW rebuild (the graph itself is never replicated).
-    match db.refresh_vector_indexes() {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(n, "vector indexes brought live from apply"),
-        Err(e) => tracing::warn!(%e, "vector index refresh failed"),
-    }
-    // Text index definitions another member created or dropped: registered
-    // and rebuilt from the store here; the text worker keeps them current
-    // from then on.
-    match db.refresh_text_indexes() {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(n, "text indexes brought in line from apply"),
-        Err(e) => tracing::warn!(%e, "text index refresh failed"),
-    }
-    // B-tree definitions another member created or dropped: their entries
-    // arrive in the log, the definitions tell this member to maintain and use
-    // them.
-    if let Err(e) = db.refresh_btree_indexes() {
-        tracing::warn!(%e, "B-tree index refresh failed");
-    }
-}
-
-/// Wall-clock microseconds since the Unix epoch, the clock the AFTER COMMIT
-/// queue schedules retries on.
-fn unix_now_us() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as u64)
 }
 
 #[cfg(test)]

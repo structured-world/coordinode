@@ -406,6 +406,41 @@ impl NetVote<C> for GrpcNetwork {
         })
         .await
     }
+
+    /// Asked of the peer itself: the engine's default answers "granted"
+    /// without asking anyone, and a member cut off from its leader would then
+    /// raise its term and depose a healthy leader on its return. A peer that
+    /// cannot be reached is an error, never a grant.
+    async fn pre_vote(
+        &mut self,
+        rpc: openraft::raft::VoteRequest<C>,
+        _option: RPCOption,
+    ) -> Result<openraft::raft::VoteResponse<C>, RPCError<C>> {
+        if let Some(e) = self.partitioned() {
+            return Err(e);
+        }
+        let closing = self.closing.clone();
+        let gate = Arc::clone(&self.gate);
+        let deployment = self.deployment.clone();
+        unless_closing(&closing, async {
+            let request = stamped(
+                &gate,
+                &deployment,
+                RaftPayload {
+                    data: serialize(&rpc)?,
+                    group: self.group,
+                },
+            );
+            let client = self.get_client().await?;
+            let response = client
+                .pre_vote(request)
+                .await
+                .map_err(|s| refused(&gate, s))?;
+            learn(&gate, response.metadata());
+            deserialize(&response.into_inner().data)
+        })
+        .await
+    }
 }
 
 impl NetStreamAppend<C> for GrpcNetwork {
@@ -694,6 +729,16 @@ impl NetBackoff<C> for StubNetwork {
 
 impl NetVote<C> for StubNetwork {
     async fn vote(
+        &mut self,
+        _rpc: openraft::raft::VoteRequest<C>,
+        _option: RPCOption,
+    ) -> Result<openraft::raft::VoteResponse<C>, RPCError<C>> {
+        Err(RPCError::Unreachable(Unreachable::new(
+            &std::io::Error::new(std::io::ErrorKind::NotConnected, "stub: no peers"),
+        )))
+    }
+
+    async fn pre_vote(
         &mut self,
         _rpc: openraft::raft::VoteRequest<C>,
         _option: RPCOption,

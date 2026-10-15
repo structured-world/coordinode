@@ -112,11 +112,11 @@ pub enum ExecutionError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
-    /// No NodeId could be handed out for a created node: the log granted no
-    /// lease (this member does not lead, or the grant failed) or the shard's
-    /// identifier space is used up. Nothing was written.
+    /// No NodeId could be handed out for a created node: the grant failed or
+    /// the shard's identifier space is used up. Nothing was written. A member
+    /// that does not lead is refused as [`ExecutionError::NotLeader`].
     #[error("{0}")]
-    NodeIdLease(#[from] coordinode_core::graph::node::IdLeaseError),
+    NodeIdLease(coordinode_core::graph::node::IdLeaseError),
 
     /// A property name could not be given an id, or stored data carries an
     /// id the dictionary cannot name. Nothing encoded with the missing
@@ -171,6 +171,7 @@ pub enum ExecutionError {
 
     /// The write reached a node that is not the leader, so it could not be
     /// replicated. Nothing was applied; the same write succeeds at the leader.
+    /// Its identifiers too: a lease refused for want of the lead lands here.
     #[error("not the leader{}", match leader_id {
         Some(id) => format!("; leader is node {id}"),
         None => String::from("; no leader known yet"),
@@ -358,6 +359,19 @@ impl KeyClaims {
 impl From<crate::index::UniqueViolation> for ExecutionError {
     fn from(v: crate::index::UniqueViolation) -> Self {
         unique_violation(v)
+    }
+}
+
+impl From<coordinode_core::graph::node::IdLeaseError> for ExecutionError {
+    fn from(e: coordinode_core::graph::node::IdLeaseError) -> Self {
+        match e {
+            // One refusal for a write on a member that does not lead, whether
+            // the commit or the identifier it needed met it first.
+            coordinode_core::graph::node::IdLeaseError::NotLeader { leader_id } => {
+                ExecutionError::NotLeader { leader_id }
+            }
+            other => ExecutionError::NodeIdLease(other),
+        }
     }
 }
 
@@ -3767,10 +3781,9 @@ pub fn execute_no_commit(
             if target_raw > 0 {
                 let target = coordinode_core::txn::timestamp::Timestamp::from_raw(target_raw);
                 let timeout = ctx.read_timeout;
-                // The executor is sync; use the blocking helper that builds
-                // a private current-thread runtime per call. `wait_for` is
-                // typically sub-millisecond, so this is cheap.
-                if let Err(err) = wm.wait_for_blocking(target, timeout) {
+                // The executor is sync, and so is the wait: it parks this
+                // thread until the applier reaches the target.
+                if let Err(err) = wm.wait_for(target, timeout) {
                     return Err(ExecutionError::Unsupported(format!(
                         "read_consistency='{}' timed out waiting for applier \
                          to reach commit_ts={target_raw}: {err}. Retry or fall \

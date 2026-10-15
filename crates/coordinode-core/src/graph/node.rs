@@ -211,7 +211,17 @@ pub enum IdLeaseError {
         /// The shard whose space ran out.
         shard_hint: u32,
     },
-    /// The log did not grant a lease, e.g. because this member does not lead.
+    /// This member does not lead, so the log takes no grant from it; the
+    /// leader is named when one is known. Nothing was granted.
+    #[error("no NodeId lease was granted: not the leader{}", match leader_id {
+        Some(id) => format!("; leader is node {id}"),
+        None => String::from("; no leader known yet"),
+    })]
+    NotLeader {
+        /// The member the group last named leader; `None` during an election.
+        leader_id: Option<u64>,
+    },
+    /// The log did not grant a lease for another reason.
     #[error("no NodeId lease was granted: {0}")]
     NotGranted(String),
     /// The reserver answered with a range the allocator cannot use.

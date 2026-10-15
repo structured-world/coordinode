@@ -539,8 +539,11 @@ fn a_lease_granted_during_a_restore_sends_it_back_to_the_check() {
             .raise_from(base, target, token)
             .map_err(|e| e.to_string())
     };
+    let commit = |txn| db.commit_restored(txn);
     let target = RestoreTarget {
         engine: &db.engine,
+        oracle: &db.oracle,
+        commit: &commit,
         fields: db.fields.as_ref(),
         raise_lease: &raise,
         build_indexes: &|| Ok(()),

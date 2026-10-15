@@ -93,18 +93,17 @@ pub trait EdgeStore {
         tgt: NodeId,
     ) -> StoreResult<Vec<(Option<Vec<u8>>, EdgeProperties)>>;
 
-    /// Direct, non-transactional write of one edge property body, for the
-    /// backup restore path that applies writes straight to the engine (the
-    /// oracle auto-stamps the seqno) rather than through a [`Transaction`].
-    /// `suffix` is the encoded discriminator of an instance, as
+    /// Stage one edge property body in `txn` under the instance `suffix`, for
+    /// the backup restore path, which carries an instance's encoded
+    /// discriminator rather than its valid-from instant. `suffix` is as
     /// [`Self::scan_props_snapshot`] reports it, or `None` for a plain edge.
     /// Writes ONLY the edgeprop body (adjacency is restored separately) through
     /// the single canonical edge-property codec, so restored bytes are identical
     /// to a transactional write. A typed helper so restore never hand-rolls the
     /// edge-prop key.
-    fn put_props_direct(
+    fn put_restored_props(
         &self,
-        engine: &StorageEngine,
+        txn: &mut Transaction,
         edge_type: &str,
         src: NodeId,
         tgt: NodeId,
@@ -665,9 +664,9 @@ impl EdgeStore for LocalEdgeStore {
         Ok(out)
     }
 
-    fn put_props_direct(
+    fn put_restored_props(
         &self,
-        engine: &StorageEngine,
+        txn: &mut Transaction,
         edge_type: &str,
         src: NodeId,
         tgt: NodeId,
@@ -683,7 +682,7 @@ impl EdgeStore for LocalEdgeStore {
             }
         };
         let value = Self::encode_props(props)?;
-        engine.put(Partition::EdgeProp, &key, &value)?;
+        txn.put(Partition::EdgeProp, &key, &value)?;
         Ok(())
     }
 

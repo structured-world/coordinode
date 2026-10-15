@@ -1119,7 +1119,7 @@ async fn a_sweep_deletes_records_of_the_old_format() {
 /// A pipeline that runs a one-shot hook inside the next proposal: what
 /// happens elsewhere while a registry write is in flight.
 struct HookPipeline {
-    inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
+    inner: coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline,
     hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Refuse every proposal as a follower would, naming member 2 leader.
     follower: AtomicBool,
@@ -1170,7 +1170,7 @@ fn hooked_registry() -> (
         .expect("open engine"),
     );
     let pipeline = Arc::new(HookPipeline {
-        inner: coordinode_raft::proposal::OwnedLocalProposalPipeline::new(&engine),
+        inner: coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
         hook: Mutex::new(None),
         follower: AtomicBool::new(false),
     });

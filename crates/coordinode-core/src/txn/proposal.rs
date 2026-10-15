@@ -619,8 +619,9 @@ impl ProposalOutcome {
 ///
 /// ## Implementations
 ///
-/// - `LocalProposalPipeline` (coordinode-raft): applies directly to
-///   MvccEngine. Used in single-node CE and embedded mode.
+/// - `LocalProposalPipeline` / `OwnedLocalProposalPipeline`
+///   (coordinode-storage): apply directly to the engine. Used by a store
+///   that is not a member of a replicated group.
 /// - `RaftProposalPipeline` (coordinode-raft, distributed mode): replicates via
 ///   openraft, applies after majority ACK.
 ///

@@ -250,7 +250,11 @@ pub trait StateMachineBackend: Send + Sync {
     fn list(&self, filter: &OperationFilter) -> Vec<OperationSummary>;
 }
 
+// The in-process backend runs transitions on tokio tasks; a build that does not
+// ask for it carries no async runtime.
+#[cfg(any(test, feature = "local-state-machine"))]
 mod local;
+#[cfg(any(test, feature = "local-state-machine"))]
 pub use local::{
     ActionContext, LocalStateMachine, LocalStateMachineBuilder, TransitionCheckpoint, TransitionLog,
 };

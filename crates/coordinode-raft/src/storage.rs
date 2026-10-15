@@ -2409,6 +2409,10 @@ pub fn default_raft_config() -> openraft::Config {
         // log and stays out of elections until its leader has sent them
         // again; the leader replicates to it from where its log now ends.
         allow_log_reversion: Some(true),
+        // A candidate first asks whether it could win, without raising its
+        // term; a member cut off from its leader then cannot depose it on
+        // return. The question travels as a real request to every peer.
+        enable_pre_vote: Some(true),
         ..Default::default()
     }
 }

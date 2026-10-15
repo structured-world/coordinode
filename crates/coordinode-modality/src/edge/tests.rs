@@ -190,9 +190,10 @@ fn every_instance_of_a_pair_comes_back_with_its_discriminator() {
     // on the keys the temporal store reads.
     let c = NodeId::from_raw(43);
     for (suffix, props) in &instances {
-        store
-            .put_props_direct(&db.engine, "WORKS_AT", a, c, suffix.as_deref(), props)
-            .expect("direct put");
+        db.write(|s, t| {
+            s.put_restored_props(t, "WORKS_AT", a, c, suffix.as_deref(), props)
+                .expect("restored put");
+        });
     }
     let r = db.read();
     let versions = store
@@ -205,17 +206,18 @@ fn every_instance_of_a_pair_comes_back_with_its_discriminator() {
 }
 
 #[test]
-fn put_props_direct_writes_canonical_body_readable_via_snapshot() {
-    // Direct engine write (backup restore path, no transaction).
-    // The body must be readable through a plain snapshot and byte-identical
-    // to a transactional put_edge write (single canonical codec).
+fn put_restored_props_writes_canonical_body_readable_via_snapshot() {
+    // The backup restore path's body write. The body must be readable
+    // through a plain snapshot and byte-identical to a put_edge write
+    // (single canonical codec).
     let db = open();
     let a = NodeId::from_raw(31);
     let b = NodeId::from_raw(32);
     let store = LocalEdgeStore;
-    store
-        .put_props_direct(&db.engine, "OWNS", a, b, None, &props_with(7, 42))
-        .expect("direct put");
+    db.write(|s, t| {
+        s.put_restored_props(t, "OWNS", a, b, None, &props_with(7, 42))
+            .expect("restored put");
+    });
 
     let snap = db.engine.snapshot();
     let loaded = store

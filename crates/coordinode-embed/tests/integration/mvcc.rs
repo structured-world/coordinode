@@ -713,7 +713,7 @@ fn executor_mvcc_flush_via_proposal_pipeline() {
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_core::txn::proposal::ProposalIdGenerator;
 
-    use coordinode_raft::proposal::LocalProposalPipeline;
+    use coordinode_storage::engine::local_pipeline::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -793,7 +793,7 @@ fn executor_occ_conflict_with_pipeline() {
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_core::txn::proposal::ProposalIdGenerator;
 
-    use coordinode_raft::proposal::LocalProposalPipeline;
+    use coordinode_storage::engine::local_pipeline::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
@@ -859,7 +859,7 @@ fn executor_adj_excluded_from_occ_with_pipeline() {
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_core::txn::proposal::ProposalIdGenerator;
 
-    use coordinode_raft::proposal::LocalProposalPipeline;
+    use coordinode_storage::engine::local_pipeline::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -921,7 +921,7 @@ fn executor_pipeline_mixed_puts_and_deletes() {
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_core::txn::proposal::ProposalIdGenerator;
 
-    use coordinode_raft::proposal::LocalProposalPipeline;
+    use coordinode_storage::engine::local_pipeline::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -994,7 +994,7 @@ fn executor_pipeline_read_only_no_proposal() {
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_core::txn::proposal::ProposalIdGenerator;
 
-    use coordinode_raft::proposal::LocalProposalPipeline;
+    use coordinode_storage::engine::local_pipeline::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(

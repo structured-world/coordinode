@@ -7,11 +7,21 @@
 //! let mut db = Database::open("/tmp/coordinode-data").unwrap();
 //! let results = db.execute_cypher("MATCH (n:User) RETURN n.name").unwrap();
 //! ```
+//!
+//! ## Features
+//!
+//! - `replication`: a database that is a member of a replicated group, in
+//!   [`replication`]. Without it no consensus, inter-node channel, listener or
+//!   async runtime is compiled; with it the host supplies a multi-threaded
+//!   tokio runtime.
+//! - `io-uring`: the io_uring storage backend on Linux.
 
 pub mod api;
 pub mod backup;
 pub mod db;
 pub mod repair;
+#[cfg(feature = "replication")]
+pub mod replication;
 pub mod text_worker;
 pub mod vector_worker;
 

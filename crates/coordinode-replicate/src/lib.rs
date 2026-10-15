@@ -9,34 +9,26 @@
 //!
 //! Current contents:
 //!
-//! - [`ReplicatedWriter`] — the write entrypoint the gRPC layer routes
-//!   Cypher execution through. The leader materialises the write (the
-//!   executor resolves `NOW()` / `RAND()` / trigger results during
-//!   execution), the deterministic write-set is proposed through the
-//!   injected proposal pipeline, and the committed Raft index is surfaced
-//!   on the result as the causal `operationTime` token. Followers apply the
-//!   same write-set through the state machine; standalone mode is a
-//!   pass-through with no committed index.
-//!
 //! - [`SeqnoConsumerRegistry`] — the per-shard,
 //!   Raft-replicated retention registry that feeds the lsm-tree
 //!   `gc_watermark`, oplog segment retention, and the tiering-DDL validator.
 //!   It lives here because storage / oplog / tiering all consume its
 //!   per-shard floor, and its registrations replicate through the same Raft
-//!   group as data; co-locating it with [`ReplicatedWriter`] keeps the
-//!   replication layer cohesive. The public surface (types + trait) is in
-//!   [`registry`]; the Raft-backed implementation, heartbeat batching,
-//!   eviction, and downstream feeds land incrementally.
+//!   group as data. The public surface (types + trait) is in [`registry`].
+//! - [`SegmentInstaller`] and the segment-transfer service: the inter-node
+//!   bulk transfer behind repair, migration and resync.
 //!
-//! Tier: `std-only` — wraps the running database and a tokio-backed Raft
-//! proposal pipeline; not a no-std target.
+//! The embedded database consumes this crate when it is a member of a
+//! replicated group, so this crate does not depend on it.
+//!
+//! Tier: `std-only`: wraps tokio-backed transfer and a Raft proposal
+//! pipeline; not a no-std target.
 
 #![forbid(unsafe_code)]
 
 pub mod registry;
 pub mod segment_store;
 pub mod transfer;
-mod writer;
 
 pub use registry::{
     BackgroundConfig, Clock, ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy,
@@ -46,7 +38,6 @@ pub use registry::{
 };
 pub use segment_store::{RepairError, SegmentInstaller};
 pub use transfer::PeerLinks;
-pub use writer::ReplicatedWriter;
 
 // Re-exported so server-side callers can name the causal token type
 // without reaching past the replication layer into core directly.

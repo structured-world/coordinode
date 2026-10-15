@@ -25,9 +25,11 @@
 //! ## Waiting without a per-timestamp registry
 //!
 //! A central oracle would keep one wait list per requested timestamp. Here
-//! the wait is per shard, on a single `tokio::sync::watch::channel<u64>`:
-//! memory is O(1) regardless of how many readers wait, and every waiter
-//! re-reads the current value on each `changed()` tick.
+//! the wait is per shard, on a single condition variable: memory is O(1)
+//! regardless of how many readers wait, and every waiter re-reads the
+//! current value each time the watermark moves. The wait blocks the calling
+//! thread; the readers that use it are synchronous, and no async runtime is
+//! needed to serve them.
 //!
 //! ## Multi-instance safety
 //!
@@ -40,7 +42,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::txn::timestamp::Timestamp;
 
@@ -66,10 +68,6 @@ pub enum WaitError {
         current: u64,
         elapsed: Duration,
     },
-
-    /// The watermark sender was dropped — the owning shard has shut down.
-    #[error("WaitForTs aborted: shard watermark channel closed")]
-    Closed,
 }
 
 /// Per-shard monotonic watermark of the highest `commit_ts` whose write has
@@ -81,12 +79,14 @@ pub enum WaitError {
 /// the target is still in the future.
 pub struct MaxAssignedWatermark {
     /// Current maxAssigned value. Read via `load(Acquire)`, written via
-    /// `fetch_max(Release)` to keep atomic monotonic progress.
+    /// `fetch_max(AcqRel)` to keep atomic monotonic progress.
     current: AtomicU64,
-    /// Broadcast channel — every `advance` call also publishes the new
-    /// value so waiters can wake and re-check. The watch::Sender is also
-    /// the source of truth for waiters (they subscribe via `Receiver`).
-    tx: tokio::sync::watch::Sender<u64>,
+    /// Held by a waiter while it checks `current` and parks, and by an
+    /// advance while it notifies: an advance landing between a waiter's
+    /// check and its sleep waits for the sleep, so its wake is never lost.
+    // no-std: spin::Mutex with a caller-provided parking hook.
+    parked: parking_lot::Mutex<()>,
+    advanced: parking_lot::Condvar,
 }
 
 impl std::fmt::Debug for MaxAssignedWatermark {
@@ -102,11 +102,10 @@ impl MaxAssignedWatermark {
     /// from `Timestamp::ZERO` and let the first applied entry move the
     /// watermark forward.
     pub fn new(initial: Timestamp) -> Arc<Self> {
-        let raw = initial.as_raw();
-        let (tx, _rx) = tokio::sync::watch::channel(raw);
         Arc::new(Self {
-            current: AtomicU64::new(raw),
-            tx,
+            current: AtomicU64::new(initial.as_raw()),
+            parked: parking_lot::Mutex::new(()),
+            advanced: parking_lot::Condvar::new(),
         })
     }
 
@@ -122,80 +121,51 @@ impl MaxAssignedWatermark {
         let target = ts.as_raw();
         let prev = self.current.fetch_max(target, Ordering::AcqRel);
         if prev < target {
-            // Broadcast new value. `send` fails only if every receiver
-            // was dropped — that is OK for us (no-op).
-            let _ = self.tx.send(target);
+            let _parked = self.parked.lock();
+            self.advanced.notify_all();
             true
         } else {
             false
         }
     }
 
-    /// Block until `maxAssigned ≥ target` or the timeout expires.
+    /// Block the calling thread until `maxAssigned ≥ target` or the timeout
+    /// expires.
     ///
-    /// Fast path: if `current ≥ target` at the moment of the call, returns
-    /// immediately with `Ok(current)`.
-    ///
-    /// Slow path: subscribes to the broadcast channel, re-checks after
-    /// every advance, and returns `Err(WaitError::Timeout { … })` if the
-    /// deadline fires before the watermark reaches `target`.
-    pub async fn wait_for(
-        &self,
-        target: Timestamp,
-        timeout: Duration,
-    ) -> Result<Timestamp, WaitError> {
+    /// Returns at once when the watermark is already there, without taking
+    /// the lock. Otherwise it parks, re-checks after every advance, and
+    /// returns `Err(WaitError::Timeout { … })` if the deadline passes first.
+    /// An async caller runs it where blocking is allowed (`spawn_blocking`,
+    /// `block_in_place`).
+    pub fn wait_for(&self, target: Timestamp, timeout: Duration) -> Result<Timestamp, WaitError> {
         let target_raw = target.as_raw();
-        let started = tokio::time::Instant::now();
-        let deadline = started + timeout;
-
-        // Fast path — skip channel subscription when already past target.
         let snap = self.current.load(Ordering::Acquire);
         if snap >= target_raw {
             return Ok(Timestamp::from_raw(snap));
         }
 
-        let mut rx = self.tx.subscribe();
-        // `changed()` marks the value as seen. Re-check on each iteration
-        // in case the watermark advanced between `changed()` and our read.
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut parked = self.parked.lock();
         loop {
-            // Re-check after each changed() — another advance may have
-            // already pushed current past target.
             let snap = self.current.load(Ordering::Acquire);
             if snap >= target_raw {
                 return Ok(Timestamp::from_raw(snap));
             }
-            match tokio::time::timeout_at(deadline, rx.changed()).await {
-                Ok(Ok(())) => continue,
-                Ok(Err(_)) => return Err(WaitError::Closed),
-                Err(_) => {
-                    // Deadline expired. Report final observed value so the
-                    // client can decide to retry vs fall back.
-                    let current = self.current.load(Ordering::Acquire);
-                    return Err(WaitError::Timeout {
-                        target: target_raw,
-                        current,
-                        elapsed: started.elapsed(),
-                    });
+            if self.advanced.wait_until(&mut parked, deadline).timed_out() {
+                // An advance may have landed with the deadline: report it
+                // as reached rather than as a timeout it is not.
+                let current = self.current.load(Ordering::Acquire);
+                if current >= target_raw {
+                    return Ok(Timestamp::from_raw(current));
                 }
+                return Err(WaitError::Timeout {
+                    target: target_raw,
+                    current,
+                    elapsed: started.elapsed(),
+                });
             }
         }
-    }
-
-    /// Blocking variant for use from sync contexts (legacy tests / EXPLAIN).
-    /// Internally spawns onto a temporary current_thread runtime — cheap
-    /// but should not be used on a hot path. Async callers must use
-    /// `wait_for`.
-    #[doc(hidden)]
-    pub fn wait_for_blocking(
-        &self,
-        target: Timestamp,
-        timeout: Duration,
-    ) -> Result<Timestamp, WaitError> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(|_| WaitError::Closed)?
-            .block_on(self.wait_for(target, timeout))
     }
 }
 

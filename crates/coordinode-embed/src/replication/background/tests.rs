@@ -66,7 +66,7 @@ async fn open_member(node_id: u64, port: u16, founder: Option<&Member>) -> Membe
         Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
     let db = Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap();
     let db = Arc::new(parking_lot::RwLock::new(db));
-    spawn(Arc::clone(&db), Arc::clone(&node));
+    spawn_index_build_resumer(Arc::clone(&db), Arc::clone(&node));
     Member {
         db,
         node,

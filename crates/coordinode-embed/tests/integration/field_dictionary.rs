@@ -19,9 +19,9 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_embed::Database;
 use coordinode_query::index::VectorIndexConfig;
-use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::partition::Partition;
 
 /// Key prefixes the field dictionary has been kept under.

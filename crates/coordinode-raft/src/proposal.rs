@@ -1,11 +1,9 @@
-//! Proposal pipeline implementations.
+//! The replicated proposal pipeline.
 //!
-//! - [`LocalProposalPipeline`]: single-node CE / embedded mode. Applies
-//!   mutations directly to StorageEngine without Raft replication, the
-//!   whole proposal at one seqno equal to its `commit_ts`.
-//! - [`RaftProposalPipeline`]: 3-node HA cluster mode. Replicates mutations
-//!   via openraft before applying. Includes rate limiting, retry with
-//!   exponential backoff, and dedup tracking.
+//! [`RaftProposalPipeline`] replicates mutations via openraft before
+//! applying them, with rate limiting, retry with exponential backoff and
+//! dedup tracking. The pipelines for a store with nothing to replicate to
+//! live beside the engine, in `coordinode_storage::engine::local_pipeline`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,42 +13,10 @@ use coordinode_core::txn::proposal::{
     PartitionId, ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::write_concern::WriteAck;
-use coordinode_storage::engine::config::FlushPolicy;
-use coordinode_storage::engine::core::StorageEngine;
+pub(crate) use coordinode_storage::engine::local_pipeline::storage_to_proposal_err;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::error::StorageError;
 
 use crate::storage::{AppendNotifier, CoordinodeStateMachine, Request, TypeConfig};
-
-/// Map a [`StorageError`] from the engine into a [`ProposalError`]
-/// preserving the typed `CapacityExhausted` variant. Other storage
-/// errors collapse into [`ProposalError::Storage`] (stringified) for
-/// now — only the capacity case needs structured propagation today,
-/// since it carries operator-actionable metadata (endpoint id +
-/// limits) that the gRPC handler maps to `Status::resource_exhausted`.
-pub(crate) fn storage_to_proposal_err(e: StorageError) -> ProposalError {
-    match e {
-        StorageError::CapacityExhausted {
-            endpoint_id,
-            used_bytes,
-            hard_limit_bytes,
-        } => ProposalError::CapacityExhausted {
-            endpoint_id,
-            used_bytes,
-            hard_limit_bytes,
-        },
-        StorageError::OutOfSpace {
-            path,
-            available_bytes,
-            min_free_bytes,
-        } => ProposalError::OutOfSpace {
-            path,
-            available_bytes,
-            min_free_bytes,
-        },
-        other => ProposalError::Storage(other.to_string()),
-    }
-}
 
 /// Base timeout for Raft proposal (first attempt).
 /// Doubles on each retry: 4s → 8s → 16s.
@@ -99,153 +65,6 @@ pub fn to_partition_id(p: Partition) -> PartitionId {
         Partition::Counter => PartitionId::Counter,
         Partition::VectorF32 => PartitionId::VectorF32,
         Partition::Registry => PartitionId::Registry,
-    }
-}
-
-/// Single-node proposal pipeline: applies mutations directly to CoordiNode storage.
-///
-/// No Raft replication — mutations are applied synchronously via
-/// [`StorageEngine`] within the caller's thread. Used in:
-///
-/// - Embedded mode (`coordinode-embed`)
-/// - Single-node CE server (before openraft integration)
-///
-/// ## Durability
-///
-/// coordinode-lsm-tree has no WAL. Mutations are written to the active
-/// memtable. In cluster mode the Raft log serves as WAL; in standalone mode
-/// the `OwnedLocalProposalPipeline` calls `engine.persist()` after each
-/// proposal when `FlushPolicy::SyncPerBatch` is set (default), which fsyncs
-/// the memtable to SST before returning. Crash-safety window is limited to
-/// the duration of the `persist()` call itself.
-///
-/// ## Cluster-ready
-///
-/// This implementation will be replaced by `RaftProposalPipeline`
-/// for distributed deployments. The `ProposalPipeline` trait ensures the
-/// executor doesn't need to change.
-pub struct LocalProposalPipeline<'a> {
-    engine: &'a StorageEngine,
-}
-
-impl<'a> LocalProposalPipeline<'a> {
-    /// Create a pipeline that applies directly to the given engine.
-    pub fn new(engine: &'a StorageEngine) -> Self {
-        Self { engine }
-    }
-}
-
-impl ProposalPipeline for LocalProposalPipeline<'_> {
-    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
-        self.engine
-            .space()
-            .admit()
-            .map_err(storage_to_proposal_err)?;
-        // The whole proposal lands at one seqno, its commit_ts, so a
-        // snapshot at commit_ts sees all of it and one tick earlier none.
-        self.engine
-            .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
-            .map_err(storage_to_proposal_err)?;
-
-        tracing::debug!(
-            proposal_id = %proposal.id,
-            mutations = proposal.mutation_count(),
-            commit_ts = proposal.commit_ts.as_raw(),
-            "local proposal applied"
-        );
-
-        // Local pipeline has no Raft log — no cluster-wide commit index.
-        Ok(ProposalOutcome::local())
-    }
-}
-
-/// Owned version of [`LocalProposalPipeline`] that holds an `Arc<StorageEngine>`.
-///
-/// Used by the drain thread and other contexts that need `'static` lifetime
-/// on the pipeline. Same apply logic as `LocalProposalPipeline`.
-///
-/// ## Durability
-///
-/// Two modes depending on whether the engine was opened with a standalone WAL:
-///
-/// **WAL mode** (`StorageEngine::open_with_wal`):
-/// 1. Append mutations to WAL + fsync (≤0.5 ms for ≤4 KB record)
-/// 2. Apply mutations to memtable
-/// 3. Return — no SST flush per proposal
-///    Checkpoint (WAL rotation) happens automatically when `persist()` is called.
-///
-/// **Legacy mode** (plain `StorageEngine::open`, no WAL):
-/// Apply to memtable, then `persist()` when `FlushPolicy::SyncPerBatch`.
-/// Correct but expensive (5–50 ms SST flush per write). Use WAL mode for
-/// production embedded deployments.
-///
-/// Cluster mode always uses `RaftProposalPipeline`; `OwnedLocalProposalPipeline`
-/// is only for embedded/standalone (unit tests, CLI tools, embedded library).
-pub struct OwnedLocalProposalPipeline {
-    engine: Arc<StorageEngine>,
-}
-
-impl OwnedLocalProposalPipeline {
-    /// Create a pipeline that applies directly to the given engine.
-    pub fn new(engine: &Arc<StorageEngine>) -> Self {
-        Self {
-            engine: Arc::clone(engine),
-        }
-    }
-}
-
-impl ProposalPipeline for OwnedLocalProposalPipeline {
-    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
-        // ── WAL-first write path ─────────────────────────────────────────────
-        // When a standalone WAL is active: append mutations to the journal and
-        // fsync BEFORE applying to the memtable.  This ensures any record that
-        // reached the WAL survives a crash and is replayed on recovery.
-        //
-        // When no WAL is configured (cluster mode or tests that use plain open):
-        // fall through to the legacy persist() path below.
-        // Journal-first: an embedded engine (open_embedded) appends every
-        // proposal to a RETAINED oplog before applying — this drives crash
-        // recovery and WAL-replay-repair. Engines without a journal (plain
-        // `open`, in-memory) fall through to the per-batch persist below.
-        // The journal append, the apply at commit_ts and the coverage marker
-        // that tells recovery this entry is in each partition it touched are
-        // one engine call.
-        if self.engine.has_journal() {
-            self.engine
-                .commit_journaled(&proposal.mutations, proposal.commit_ts.as_raw())
-                .map_err(storage_to_proposal_err)?;
-        } else {
-            // Refused before the apply and the flush that would hit a full
-            // disk; `commit_journaled` checks for itself.
-            self.engine
-                .space()
-                .admit()
-                .map_err(storage_to_proposal_err)?;
-            // The whole proposal lands at one seqno, its commit_ts.
-            self.engine
-                .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
-                .map_err(storage_to_proposal_err)?;
-            // ── Legacy durability path (no WAL) ──────────────────────────────
-            // Without a WAL the only way to guarantee crash safety is a full SST
-            // flush after every proposal (atomic rename, no corruption possible).
-            // This is expensive but correct. Open with WAL to avoid this overhead.
-            if self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
-                self.engine
-                    .persist()
-                    .map_err(|e| ProposalError::Storage(format!("persist failed: {e}")))?;
-            }
-        }
-
-        tracing::debug!(
-            proposal_id = %proposal.id,
-            mutations = proposal.mutation_count(),
-            commit_ts = proposal.commit_ts.as_raw(),
-            has_journal = self.engine.has_journal(),
-            "owned local proposal applied"
-        );
-
-        // Embedded/standalone WAL pipeline — no Raft commit index.
-        Ok(ProposalOutcome::local())
     }
 }
 

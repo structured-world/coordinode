@@ -17,7 +17,7 @@ use coordinode_core::graph::node::{
     encode_node_key,
 };
 use coordinode_core::graph::types::Value;
-use coordinode_core::txn::timestamp::Timestamp;
+use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_modality::edge::{EdgeStore, LocalEdgeStore};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::metadata::{node_lease_ceiling, node_lease_holder};
@@ -85,6 +85,11 @@ pub enum RestoreError {
     #[error("the restored nodes are in, but they break a constraint: {0}")]
     Constraints(String),
 
+    /// This member takes no writes: a restore runs on the leader of its
+    /// group, which the error names when it is known. Nothing was written.
+    #[error("not the leader; restore on the leader (node {leader_id:?})")]
+    NotLeader { leader_id: Option<u64> },
+
     /// The format has no logical restore through this path.
     #[error("{0:?} is not restored record by record; install it as a snapshot")]
     Unsupported(BackupFormat),
@@ -147,6 +152,12 @@ impl Default for RestoreOptions<'_> {
 /// What a restore writes into.
 pub(crate) struct RestoreTarget<'a> {
     pub(crate) engine: &'a StorageEngine,
+    /// The clock the transactions a restore stages its writes in read at.
+    pub(crate) oracle: &'a TimestampOracle,
+    /// Commit a transaction of staged writes through the database's write
+    /// pipeline: on a member of a group the log carries them to every
+    /// member, and a member that is not the leader refuses them.
+    pub(crate) commit: &'a CommitWrites<'a>,
     pub(crate) fields: &'a dyn FieldRegistrar,
     /// Take the node identifier sequences `(base, target]` through the log
     /// under the given token, while the granted ceiling is still `base`, so
@@ -166,10 +177,59 @@ pub(crate) struct RestoreTarget<'a> {
 pub(crate) type RaiseLease<'a> =
     dyn Fn(u64, u64, [u8; NODE_LEASE_TOKEN_LEN]) -> Result<bool, String> + 'a;
 
+/// See [`RestoreTarget::commit`].
+pub(crate) type CommitWrites<'a> = dyn Fn(Transaction<'a>) -> Result<(), RestoreError> + 'a;
+
+impl<'a> RestoreTarget<'a> {
+    /// A transaction to stage writes in, at the latest state.
+    fn begin(&self) -> Transaction<'a> {
+        Transaction::begin(self.engine, Some(self.oracle), self.oracle.next())
+    }
+
+    /// Stage what `stage` writes in a transaction of its own and commit it.
+    fn commit_one(
+        &self,
+        stage: impl FnOnce(&mut Transaction<'a>) -> Result<(), RestoreError>,
+    ) -> Result<(), RestoreError> {
+        let mut txn = self.begin();
+        stage(&mut txn)?;
+        (self.commit)(txn)
+    }
+}
+
+/// Records a commit of the write pass carries at most: one proposal stays a
+/// bounded unit of log, apply and memory, whatever the size of the input.
+const BATCH_RECORDS: usize = 512;
+
+/// Staged bytes past which a batch commits before it holds
+/// [`BATCH_RECORDS`], so a batch of large records stays bounded too.
+const BATCH_BYTES: usize = 4 << 20;
+
+/// Records between two measurements of a batch's staged bytes: measuring
+/// walks the batch, so it is not done per record.
+const BATCH_MEASURE_EVERY: usize = 64;
+
+/// The bytes `txn` has staged: its point writes and adjacency operands.
+fn staged_bytes(txn: &Transaction<'_>) -> usize {
+    let writes: usize = txn
+        .write_buffer()
+        .iter()
+        .map(|((_, key), value)| key.len() + value.as_ref().map_or(0, Vec::len))
+        .sum();
+    // A key and the identifier it adds.
+    let adjacency: usize = txn
+        .merge_adj_ops()
+        .iter()
+        .map(|(key, _)| key.len() + 8)
+        .sum();
+    writes + adjacency
+}
+
 /// The record of a load in progress: the digest of its input and the
-/// highest sequence of hint 0 it holds. A node-local `meta:` key, since the
-/// load writes this member's store directly.
-pub(crate) const LOAD_KEY: &[u8] = b"meta:restore:load";
+/// highest sequence of hint 0 it holds. Written through the log and outside
+/// the node-local `meta:` keys, so every member holds it, a snapshot carries
+/// it, and the member that leads after a failover resumes the load.
+pub(crate) const LOAD_KEY: &[u8] = b"restore:load";
 
 /// The value of [`LOAD_KEY`] for a load of the input with `digest`.
 pub(crate) fn load_record(digest: &[u8; 32], max_sequence: u64) -> [u8; 40] {
@@ -211,10 +271,12 @@ pub(crate) fn run(
             .map_err(storage)
     };
     let record_load = |value: &[u8]| {
-        engine
-            .put(Partition::Schema, LOAD_KEY, value)
-            .and_then(|()| engine.persist_partition(Partition::Schema))
-            .map_err(storage)
+        target.commit_one(|txn| txn.put(Partition::Schema, LOAD_KEY, value).map_err(storage))?;
+        engine.persist_partition(Partition::Schema).map_err(storage)
+    };
+    let forget_load = || {
+        target.commit_one(|txn| txn.delete(Partition::Schema, LOAD_KEY).map_err(storage))?;
+        engine.persist_partition(Partition::Schema).map_err(storage)
     };
 
     let mut surveys = 0;
@@ -263,12 +325,7 @@ pub(crate) fn run(
         }
         if checked.issued_count > 0 {
             if recorded.is_some() {
-                engine
-                    .delete(Partition::Schema, LOAD_KEY)
-                    .map_err(storage)?;
-                engine
-                    .persist_partition(Partition::Schema)
-                    .map_err(storage)?;
+                forget_load()?;
             }
             return Err(RestoreError::IdentifiersIssued {
                 count: checked.issued_count,
@@ -296,22 +353,21 @@ pub(crate) fn run(
     // Pass two: write.
     let mut write = Load::write(target);
     read_input(format, source, options, &mut write, None)?;
+    write.flush()?;
     let stats = write.stats;
 
-    // The rows went in directly, so the planner's counters never saw them,
-    // and no index did. Both are built while the load is still recorded: a
-    // crash before they are whole reruns it, which builds them again.
-    coordinode_storage::engine::stats::rebuild_node_counters(engine).map_err(storage)?;
+    // The rows went in past the write executor, so the planner's counters
+    // never saw them, and no index did. Both are built while the load is
+    // still recorded: a crash before they are whole reruns it, which builds
+    // them again.
+    target.commit_one(|txn| {
+        coordinode_storage::engine::stats::rebuild_node_counters(txn).map_err(storage)
+    })?;
     (target.build_indexes)().map_err(RestoreError::Indexes)?;
     (target.check_constraints)().map_err(RestoreError::Constraints)?;
     // Every record durable before the load stops being unfinished.
     engine.persist().map_err(storage)?;
-    engine
-        .delete(Partition::Schema, LOAD_KEY)
-        .map_err(storage)?;
-    engine
-        .persist_partition(Partition::Schema)
-        .map_err(storage)?;
+    forget_load()?;
     Ok(stats)
 }
 
@@ -433,6 +489,10 @@ struct Load<'t, 'a> {
     /// What the survey pass records into; absent in the write pass.
     survey: Option<&'t mut Survey>,
     stats: RestoreStats,
+    /// The batch the write pass stages records in, committed whole.
+    staged: Option<Transaction<'a>>,
+    /// Records staged in the batch.
+    staged_records: usize,
 }
 
 impl<'t, 'a> Load<'t, 'a> {
@@ -441,6 +501,8 @@ impl<'t, 'a> Load<'t, 'a> {
             target,
             survey: Some(survey),
             stats: RestoreStats::default(),
+            staged: None,
+            staged_records: 0,
         }
     }
 
@@ -449,11 +511,41 @@ impl<'t, 'a> Load<'t, 'a> {
             target,
             survey: None,
             stats: RestoreStats::default(),
+            staged: None,
+            staged_records: 0,
         }
     }
 
     fn writes(&self) -> bool {
         self.survey.is_none()
+    }
+
+    /// Stage one record through `write` in the current batch, committing the
+    /// batch once it is full.
+    fn stage(
+        &mut self,
+        write: impl FnOnce(&RestoreTarget<'a>, &mut Transaction<'a>) -> Result<(), RestoreError>,
+    ) -> Result<(), RestoreError> {
+        let target = self.target;
+        let txn = self.staged.get_or_insert_with(|| target.begin());
+        write(target, txn)?;
+        self.staged_records += 1;
+        let full = self.staged_records >= BATCH_RECORDS
+            || (self.staged_records.is_multiple_of(BATCH_MEASURE_EVERY)
+                && staged_bytes(txn) >= BATCH_BYTES);
+        if full {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Commit the records staged so far.
+    fn flush(&mut self) -> Result<(), RestoreError> {
+        self.staged_records = 0;
+        match self.staged.take() {
+            Some(txn) => (self.target.commit)(txn),
+            None => Ok(()),
+        }
     }
 
     /// Check a node about to be written on `shard_id` (survey pass).
@@ -507,11 +599,11 @@ impl<'t, 'a> Load<'t, 'a> {
         &mut self,
         shard_id: u16,
         id: u64,
-        write: impl FnOnce(&RestoreTarget<'_>) -> Result<(), RestoreError>,
+        write: impl FnOnce(&RestoreTarget<'a>, &mut Transaction<'a>) -> Result<(), RestoreError>,
     ) -> Result<(), RestoreError> {
         let node_id = NodeId::from_raw(id);
         if self.writes() {
-            write(self.target)?;
+            self.stage(write)?;
             self.stats.nodes += 1;
             Ok(())
         } else {
@@ -522,10 +614,10 @@ impl<'t, 'a> Load<'t, 'a> {
     /// An edge: written in the write pass only.
     fn edge(
         &mut self,
-        write: impl FnOnce(&RestoreTarget<'_>) -> Result<(), RestoreError>,
+        write: impl FnOnce(&RestoreTarget<'a>, &mut Transaction<'a>) -> Result<(), RestoreError>,
     ) -> Result<(), RestoreError> {
         if self.writes() {
-            write(self.target)?;
+            self.stage(write)?;
             self.stats.edges += 1;
         }
         Ok(())
@@ -534,9 +626,9 @@ impl<'t, 'a> Load<'t, 'a> {
 
 /// Restore from a binary (MessagePack) backup dump.
 ///
-/// Reads length-prefixed MessagePack entries and writes them
-/// directly to storage partitions. Fastest restore method.
-/// Writes use plain engine.put(); the oracle stamps each seqno.
+/// Reads length-prefixed MessagePack entries and writes their records as
+/// they are, in batches committed through the write pipeline. Fastest
+/// restore method.
 ///
 /// The dump's records are encoded with its field dictionary, which it
 /// carries ahead of them: those exact bindings are published through
@@ -548,7 +640,6 @@ fn restore_binary<R: Read>(
     force: bool,
 ) -> Result<(), RestoreError> {
     let storage = |e: coordinode_storage::error::StorageError| RestoreError::Storage(e.to_string());
-    let engine = load.target.engine;
     let mut adopted = false;
     let mut len_buf = [0u8; 4];
     let mut entries = 0u64;
@@ -615,7 +706,7 @@ fn restore_binary<R: Read>(
             }
             BackupEntry::Node { key, value } => {
                 if load.writes() {
-                    engine.put(Partition::Node, &key, &value).map_err(storage)?;
+                    load.stage(|_, txn| txn.put(Partition::Node, &key, &value).map_err(storage))?;
                     load.stats.nodes += 1;
                 } else {
                     let (shard, id) = decode_node_key(&key)
@@ -632,8 +723,8 @@ fn restore_binary<R: Read>(
             }
             BackupEntry::Adj { key, value } => {
                 if load.writes() {
-                    // Adj keys are raw (no MVCC timestamps) — write directly to engine.
-                    engine.put(Partition::Adj, &key, &value).map_err(storage)?;
+                    // A whole posting list: it replaces what the key held.
+                    load.stage(|_, txn| txn.put(Partition::Adj, &key, &value).map_err(storage))?;
                     let key_str = std::str::from_utf8(&key).unwrap_or("");
                     if key_str.contains(":out:") {
                         load.stats.edges += 1;
@@ -642,9 +733,9 @@ fn restore_binary<R: Read>(
             }
             BackupEntry::EdgeProp { key, value } => {
                 if load.writes() {
-                    engine
-                        .put(Partition::EdgeProp, &key, &value)
-                        .map_err(storage)?;
+                    load.stage(|_, txn| {
+                        txn.put(Partition::EdgeProp, &key, &value).map_err(storage)
+                    })?;
                 }
             }
             BackupEntry::Schema { key, value } => {
@@ -674,10 +765,13 @@ fn restore_binary<R: Read>(
                     continue;
                 }
                 if load.writes() {
-                    // Schema is not MVCC-versioned — write directly.
-                    engine
-                        .put(Partition::Schema, &key, &value)
-                        .map_err(storage)?;
+                    load.stage(|_, txn| {
+                        txn.put(Partition::Schema, &key, &value).map_err(storage)?;
+                        // A definition changed: attempts that evaluated
+                        // predicates under the old one are judged again.
+                        txn.note_schema_change();
+                        Ok(())
+                    })?;
                     load.stats.schema_entries += 1;
                 }
             }
@@ -800,8 +894,8 @@ fn restore_json<R: BufRead>(
                     })?),
                 };
                 let props = obj.get("properties").and_then(|v| v.as_object());
-                load.node(shard_id, id, |t| {
-                    write_node(t, shard_id, id, valid_from, labels, json_props(props))
+                load.node(shard_id, id, |t, txn| {
+                    write_node(t, txn, shard_id, id, valid_from, labels, json_props(props))
                 })?;
             }
             "edge" => {
@@ -832,9 +926,10 @@ fn restore_json<R: BufRead>(
                     continue;
                 }
                 let props = obj.get("properties").and_then(|v| v.as_object());
-                load.edge(|t| {
+                load.edge(|t, txn| {
                     write_edge_record(
                         t,
+                        txn,
                         source,
                         target,
                         edge_type,
@@ -900,7 +995,13 @@ fn json_schema(
                 Some(current) if current == schema => false,
                 Some(_) => return Err(differs("label", &schema.name)),
                 None if load.writes() => {
-                    schemas.save_label(&schema).map_err(storage)?;
+                    // The loaded nodes are checked against it once they are
+                    // all in, not at its commit.
+                    load.stage(|_, txn| {
+                        schemas
+                            .save_label_admitting_txn(txn, &schema)
+                            .map_err(storage)
+                    })?;
                     true
                 }
                 None => false,
@@ -912,7 +1013,7 @@ fn json_schema(
                 Some(current) if current == schema => false,
                 Some(_) => return Err(differs("edge type", &schema.name)),
                 None if load.writes() => {
-                    schemas.save_edge_type(&schema).map_err(storage)?;
+                    load.stage(|_, txn| schemas.save_edge_type_txn(txn, &schema).map_err(storage))?;
                     true
                 }
                 None => false,
@@ -969,17 +1070,17 @@ fn restore_index(
             let mut names: Vec<&str> = vec![dumped.label.as_str()];
             names.extend(dumped.properties.iter().map(String::as_str));
             field_ids(load.target.fields, &names)?;
-            // The restore writes straight to storage, so the publication
-            // applies at once.
-            let mut txn = coordinode_storage::engine::transaction::Transaction::new(
-                engine,
-                None,
-                coordinode_core::txn::timestamp::Timestamp::ZERO,
-                None,
-            );
-            indexes
-                .publish_definition_txn(&mut txn, dumped)
-                .map_err(storage)?;
+            // A catalog change of its own, as its DDL commits it: what is
+            // staged lands first, and the publication gives the index its
+            // identities and binds its name.
+            load.flush()?;
+            load.target.commit_one(|txn| {
+                indexes
+                    .publish_definition_txn(txn, dumped)
+                    .map_err(storage)?;
+                txn.note_schema_change();
+                Ok(())
+            })?;
             Ok(true)
         }
         None => Ok(false),
@@ -1052,8 +1153,8 @@ fn restore_apoc_json<R: BufRead>(
                     kept.insert(id);
                 }
                 let props = obj.get("properties").and_then(|v| v.as_object());
-                load.node(shard_id, id, |t| {
-                    write_node_record(t, shard_id, id, labels, props)
+                load.node(shard_id, id, |t, txn| {
+                    write_node_record(t, txn, shard_id, id, labels, props)
                 })?;
             }
             Some("relationship") => {
@@ -1069,7 +1170,9 @@ fn restore_apoc_json<R: BufRead>(
                     continue;
                 }
                 let props = obj.get("properties").and_then(|v| v.as_object());
-                load.edge(|t| write_edge_record(t, source, target, edge_type, None, props))?;
+                load.edge(|t, txn| {
+                    write_edge_record(t, txn, source, target, edge_type, None, props)
+                })?;
             }
             _ => {}
         }
@@ -1108,18 +1211,17 @@ fn field_ids(fields: &dyn FieldRegistrar, names: &[&str]) -> Result<Vec<u32>, Re
         .map_err(|e| RestoreError::Storage(e.to_string()))
 }
 
-/// Write one node (labels + properties) to storage, registering its
-/// property names first. Each record commits in its own MVCC transaction
-/// (bulk restore is a stream of independent writes; per-record commit
-/// bounds buffer growth).
+/// Stage one node (labels + properties) in `txn`, registering its property
+/// names first.
 fn write_node_record(
     target: &RestoreTarget<'_>,
+    txn: &mut Transaction<'_>,
     shard_id: u16,
     id: u64,
     labels: Vec<String>,
     props: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<(), RestoreError> {
-    write_node(target, shard_id, id, None, labels, json_props(props))
+    write_node(target, txn, shard_id, id, None, labels, json_props(props))
 }
 
 /// A json property map as `(name, value)` pairs.
@@ -1134,13 +1236,12 @@ fn json_props(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Vec
         .unwrap_or_default()
 }
 
-/// Write a single fully-built node record straight to the engine (cheap
-/// direct-mode transaction: bulk restore is non-transactional, so it skips
-/// the MVCC buffer / OCC / snapshot / commit overhead — `put` lands
-/// immediately). Shared by every text restore path. A `valid_from` makes it
-/// the version of a temporal node stored under that instant.
+/// Stage a single fully-built node record in `txn`, the batch it commits
+/// with. Shared by every text restore path. A `valid_from` makes it the
+/// version of a temporal node stored under that instant.
 fn write_node(
     target: &RestoreTarget<'_>,
+    txn: &mut Transaction<'_>,
     shard_id: u16,
     id: u64,
     valid_from: Option<i64>,
@@ -1156,20 +1257,20 @@ fn write_node(
     for ((_, value), field_id) in props.into_iter().zip(ids) {
         record.set(field_id, value);
     }
-    let mut txn = Transaction::new(target.engine, None, Timestamp::ZERO, None);
     let node_id = NodeId::from_raw(id);
     match valid_from {
-        None => LocalNodeStore.put(&mut txn, shard_id, node_id, &record),
+        None => LocalNodeStore.put(txn, shard_id, node_id, &record),
         Some(valid_from) => {
-            LocalNodeStore.put_temporal(&mut txn, shard_id, node_id, valid_from, &record)
+            LocalNodeStore.put_temporal(txn, shard_id, node_id, valid_from, &record)
         }
     }
     .map_err(|e| RestoreError::Storage(e.to_string()))
 }
 
-/// Write one edge from a json property map.
+/// Stage one edge from a json property map.
 fn write_edge_record(
     target: &RestoreTarget<'_>,
+    txn: &mut Transaction<'_>,
     source: u64,
     target_id: u64,
     edge_type: &str,
@@ -1178,6 +1279,7 @@ fn write_edge_record(
 ) -> Result<(), RestoreError> {
     write_edge(
         target,
+        txn,
         source,
         target_id,
         edge_type,
@@ -1186,13 +1288,14 @@ fn write_edge_record(
     )
 }
 
-/// Write one edge: both adjacency directions (merge operator, raw keys) plus
+/// Stage one edge: both adjacency directions (merge operands, raw keys) plus
 /// its property body in executor-native shape. An instance of a discriminated
 /// or temporal edge type is its body under the discriminator, so that body is
 /// written even when it holds no property; a plain edge without properties
 /// has none.
 fn write_edge(
     target: &RestoreTarget<'_>,
+    txn: &mut Transaction<'_>,
     source: u64,
     target_id: u64,
     edge_type: &str,
@@ -1201,32 +1304,22 @@ fn write_edge(
 ) -> Result<(), RestoreError> {
     use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
 
-    let engine = target.engine;
-    let fwd_key = encode_adj_key_forward(edge_type, NodeId::from_raw(source));
-    engine
-        .merge(
-            Partition::Adj,
-            &fwd_key,
-            &coordinode_storage::engine::merge::encode_add(target_id),
-        )
-        .map_err(|e| RestoreError::Storage(e.to_string()))?;
-
-    let rev_key = encode_adj_key_reverse(edge_type, NodeId::from_raw(target_id));
-    engine
-        .merge(
-            Partition::Adj,
-            &rev_key,
-            &coordinode_storage::engine::merge::encode_add(source),
-        )
-        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+    txn.merge_adj_add(
+        &encode_adj_key_forward(edge_type, NodeId::from_raw(source)),
+        target_id,
+    );
+    txn.merge_adj_add(
+        &encode_adj_key_reverse(edge_type, NodeId::from_raw(target_id)),
+        source,
+    );
 
     if props.is_empty() && discriminator.is_none() {
         return Ok(());
     }
-    // Write the edge property body through the typed EdgeStore direct-write
-    // helper so restore never hand-rolls the edge-prop key. The body uses the
-    // single canonical codec, so restored bytes match a transactional write
-    // exactly and stay readable by queries.
+    // Staged through the typed EdgeStore helper so restore never hand-rolls
+    // the edge-prop key. The body uses the single canonical codec, so
+    // restored bytes match a transactional write exactly and stay readable
+    // by queries.
     let mut edge_props = EdgeProperties::new();
     let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
     let ids = field_ids(target.fields, &names)?;
@@ -1234,8 +1327,8 @@ fn write_edge(
         edge_props.set(field_id, value);
     }
     LocalEdgeStore
-        .put_props_direct(
-            engine,
+        .put_restored_props(
+            txn,
             edge_type,
             NodeId::from_raw(source),
             NodeId::from_raw(target_id),
@@ -1291,9 +1384,10 @@ fn restore_cypher<R: BufRead>(
 
         if body.contains(")-[") {
             let (source, edge_type, target, props) = parse_cypher_edge(body)?;
-            load.edge(|t| {
+            load.edge(|t, txn| {
                 write_edge(
                     t,
+                    txn,
                     source,
                     target,
                     &edge_type,
@@ -1303,8 +1397,8 @@ fn restore_cypher<R: BufRead>(
             })?;
         } else {
             let (id, labels, props) = parse_cypher_node(body)?;
-            load.node(shard_id, id, |t| {
-                write_node(t, shard_id, id, valid_from, labels, props)
+            load.node(shard_id, id, |t, txn| {
+                write_node(t, txn, shard_id, id, valid_from, labels, props)
             })?;
         }
     }
@@ -1666,7 +1760,7 @@ fn apply_apoc_unwind(
             let source = nested_id(row, "start")?;
             let target = nested_id(row, "end")?;
             let props = row.get("properties").and_then(|v| v.as_object());
-            load.edge(|t| write_edge_record(t, source, target, &edge_type, None, props))?;
+            load.edge(|t, txn| write_edge_record(t, txn, source, target, &edge_type, None, props))?;
         }
     } else {
         let labels = extract_create_labels(&rest)?;
@@ -1676,8 +1770,8 @@ fn apply_apoc_unwind(
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| RestoreError::InvalidFormat("UNWIND node row missing _id".into()))?;
             let props = row.get("properties").and_then(|v| v.as_object());
-            load.node(shard_id, id, |t| {
-                write_node_record(t, shard_id, id, labels.clone(), props)
+            load.node(shard_id, id, |t, txn| {
+                write_node_record(t, txn, shard_id, id, labels.clone(), props)
             })?;
         }
     }
@@ -1721,8 +1815,8 @@ fn apply_apoc_plain_node(
                     .into(),
             )
         })?;
-    load.node(shard_id, id, |t| {
-        write_node_record(t, shard_id, id, labels, Some(&obj))
+    load.node(shard_id, id, |t, txn| {
+        write_node_record(t, txn, shard_id, id, labels, Some(&obj))
     })
 }
 
@@ -1741,7 +1835,7 @@ fn apply_apoc_plain_rel(stmt: &str, load: &mut Load<'_, '_>) -> Result<(), Resto
     let edge_type = extract_reltype(create_part)?;
     let props = extract_rel_props(create_part)?;
     let (source, target) = (ids[0], ids[1]);
-    load.edge(|t| write_edge_record(t, source, target, &edge_type, None, props.as_ref()))
+    load.edge(|t, txn| write_edge_record(t, txn, source, target, &edge_type, None, props.as_ref()))
 }
 
 /// Pull the relationship type out of a `-[var:`TYPE` {props}]->` pattern.
@@ -2344,8 +2438,8 @@ fn restore_hetio_json<R: BufRead>(
             props.insert("name".to_string(), name.clone());
         }
         props.insert("identifier".to_string(), n.identifier.clone());
-        load.node(shard_id, id, |t| {
-            write_node_record(t, shard_id, id, vec![n.kind.clone()], Some(&props))
+        load.node(shard_id, id, |t, txn| {
+            write_node_record(t, txn, shard_id, id, vec![n.kind.clone()], Some(&props))
         })?;
     }
 
@@ -2361,7 +2455,7 @@ fn restore_hetio_json<R: BufRead>(
         } else {
             Some(&e.data)
         };
-        load.edge(|t| write_edge_record(t, src, tgt, &e.kind, None, props))?;
+        load.edge(|t, txn| write_edge_record(t, txn, src, tgt, &e.kind, None, props))?;
     }
     Ok(())
 }

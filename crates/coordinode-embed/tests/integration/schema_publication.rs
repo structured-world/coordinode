@@ -23,9 +23,9 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_embed::Database;
 use coordinode_query::index::{TextIndexConfig, VectorIndexConfig};
-use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
 
 /// Applies every proposal and keeps a copy of each, optionally refusing the
 /// ones that write a Schema key starting with `refuse`.

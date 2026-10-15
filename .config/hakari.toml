@@ -65,7 +65,14 @@ workspace-members = ["coordinode-core"]
 # whatever the hack unifies reaches that consumer's build: the server's
 # features and crates (the proxy, JWT, the S3 gateway) must not be in it.
 # These members resolve their own extra features per build instead.
+#
+# Consensus and the inter-node channel are the embedded library's opt-in
+# `replication` feature: unified here, a library build without it would
+# compile them all the same.
 workspace-members = [
+    "coordinode-raft",
+    "coordinode-wire",
+    "coordinode-migrate",
     "coordinode-server",
     "coordinode-s3",
     "coordinode-client",
@@ -85,4 +92,7 @@ third-party = [
     # Test certificates only. Its crypto backends (ring, aws-lc-rs) are C, and
     # unified here they would reach every build, the server binary included.
     { name = "rcgen" },
+    # The async runtime. The embedded library without `replication` needs
+    # none, and unified here it would reach that build through every crate.
+    { name = "tokio" },
 ]

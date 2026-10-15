@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::writer::ReplicatedWriter;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 use coordinode_core::txn::read_concern::{
     ReadConcern as ExecutorReadConcern, ReadConcernLevel as ExecutorReadConcernLevel,
@@ -27,7 +28,6 @@ use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::{
     READ_FENCE_TIMEOUT, ReadConcern, ReadFenceError, ReadPreference,
 };
-use coordinode_replicate::ReplicatedWriter;
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
 use tonic::{Request, Response, Status};

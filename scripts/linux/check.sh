@@ -284,9 +284,11 @@ cargo test --doc --all-features > ../doctest.log 2>&1
 echo doctest=\$? >> ../status.txt
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --workspace --all-features > ../doc.log 2>&1
 echo doc=\$? >> ../status.txt
+{ scripts/embedded-without-replication.sh && cargo clippy -p coordinode-embed --all-targets -- -D warnings && cargo nextest run -p coordinode-embed --no-fail-fast --status-level fail --final-status-level fail --failure-output final; } > ../embedded.log 2>&1
+echo embedded=\$? >> ../status.txt
 echo done >> ../status.txt" || true
 
-for f in status.txt clippy.log build.log test.log doctest.log doc.log; do
+for f in status.txt clippy.log build.log test.log doctest.log doc.log embedded.log; do
   ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
 done
 

@@ -11,11 +11,26 @@ publish.workspace = true
 # Use the io_uring storage backend on Linux (forwards to
 # coordinode-storage/io-uring). Default-off; no-op on non-Linux targets.
 io-uring = ["coordinode-storage/io-uring"]
+# A database that is a member of a replicated group: consensus, the
+# inter-node channel and its listener. Without it none of them is compiled
+# and the library needs no async runtime.
+replication = [
+    "dep:coordinode-raft",
+    "dep:coordinode-wire",
+    "dep:coordinode-replicate",
+    "dep:tokio",
+    "dep:tonic",
+]
 
 [dependencies]
 coordinode-core = { workspace = true }
 coordinode-query = { workspace = true }
-coordinode-raft = { workspace = true }
+coordinode-raft = { workspace = true, optional = true }
+# The inter-node channel: node identity, the listener, segment transfer.
+coordinode-wire = { workspace = true, optional = true }
+coordinode-replicate = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 coordinode-vector = { workspace = true }
 coordinode-search = { workspace = true }
 coordinode-storage = { workspace = true }
@@ -40,10 +55,18 @@ coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-h
 
 [dev-dependencies]
 chrono = { workspace = true }
+# The oplog placement test opens the consensus log store on an embedded
+# directory.
+coordinode-raft = { workspace = true }
 tempfile = { workspace = true }
 coordinode-test-fixtures = { workspace = true }
 metrics = { workspace = true }
 metrics-util = "0.20"
+
+# A replicated group through the entry point a host opens.
+[[test]]
+name = "replicated"
+required-features = ["replication"]
 
 [[bench]]
 name = "field_names"

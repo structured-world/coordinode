@@ -16,9 +16,15 @@ smallvec = "1.16"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # CE LocalStateMachine: background transition tasks + broadcast event streams.
-tokio = { workspace = true }
+tokio = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
+
+[features]
+# The in-process state-machine backend, which runs its transitions on tokio
+# tasks. Off by default: the routing and topology types alone need no async
+# runtime.
+local-state-machine = ["dep:tokio"]
 
 [dev-dependencies]
 proptest = { workspace = true }

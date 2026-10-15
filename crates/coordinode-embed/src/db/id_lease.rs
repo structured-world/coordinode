@@ -18,7 +18,7 @@ use coordinode_core::graph::node::{
     IdLease, IdLeaseError, IdLeaseReserver, NODE_ID_MAX_SEQUENCE, NODE_LEASE_TOKEN_LEN,
 };
 use coordinode_core::txn::proposal::{
-    MetadataCommand, Mutation, ProposalIdGenerator, ProposalPipeline, RaftProposal,
+    MetadataCommand, Mutation, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::core::StorageEngine;
@@ -100,7 +100,12 @@ impl LogLeaseReserver {
                 start_ts: Timestamp::from_raw(0),
                 bypass_rate_limiter: false,
             })
-            .map_err(|e| IdLeaseError::NotGranted(e.to_string()))?;
+            .map_err(|e| match e {
+                // Typed, so the statement that needed the identifier is
+                // refused as any write on a member that does not lead is.
+                ProposalError::NotLeader { leader_id } => IdLeaseError::NotLeader { leader_id },
+                other => IdLeaseError::NotGranted(other.to_string()),
+            })?;
 
         let holder = node_lease_holder(&self.engine, target)
             .map_err(|e| IdLeaseError::NotGranted(format!("read the lease record: {e}")))?;

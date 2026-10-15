@@ -63,11 +63,48 @@ fn openraft_takes_no_snapshot_of_its_own() {
         logs_since_last: 1234,
         ..Default::default()
     }
-    .raft_config();
+    .raft_config(ElectionTiming::RACK, ElectionPreference::Ordinary);
     assert_eq!(config.snapshot_policy, openraft::SnapshotPolicy::Never);
     assert_eq!(
         config.max_payload_entries,
         default_raft_config().max_payload_entries
+    );
+}
+
+/// The member's timing reaches openraft: a personal-fleet profile and a
+/// member that stands last both change the election window the engine runs.
+#[test]
+fn the_member_timing_reaches_the_engine_config() {
+    // The harness's generous window would lengthen the rack profile; the
+    // fleet profile and the stands-last window are longer than it anyway.
+    let fleet = SnapshotTriggerConfig::default()
+        .raft_config(ElectionTiming::PERSONAL_FLEET, ElectionPreference::Ordinary);
+    assert_eq!(fleet.heartbeat_interval, 2_000);
+    assert_eq!(fleet.election_timeout_min, 20_000);
+    assert_eq!(fleet.election_timeout_max, 40_000);
+
+    let last = SnapshotTriggerConfig::default()
+        .raft_config(ElectionTiming::PERSONAL_FLEET, ElectionPreference::Last);
+    assert_eq!(last.election_timeout_min, 80_000);
+    assert_eq!(last.election_timeout_max, 120_000);
+    assert!(last.validate().is_ok(), "openraft accepts the window");
+}
+
+/// A member that stands last stands after every other member under the rack
+/// profile too, whatever the harness's generous window does to it: the
+/// preference is derived from the group's window as widened, not widened
+/// after the fact.
+#[test]
+fn a_member_that_stands_last_stays_last_on_the_rack_profile() {
+    let ordinary = SnapshotTriggerConfig::default()
+        .raft_config(ElectionTiming::RACK, ElectionPreference::Ordinary);
+    let last = SnapshotTriggerConfig::default()
+        .raft_config(ElectionTiming::RACK, ElectionPreference::Last);
+    assert!(
+        last.election_timeout_min > ordinary.election_timeout_max,
+        "last stands from {} ms, the others by {} ms",
+        last.election_timeout_min,
+        ordinary.election_timeout_max
     );
 }
 

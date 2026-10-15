@@ -392,7 +392,14 @@ fn rebuild_refuses_an_unreadable_node_row() {
         )
         .unwrap();
 
-    let result = rebuild_node_counters(&engine);
+    // A direct-mode transaction: whatever it stages lands at once.
+    let mut txn = Transaction::new(
+        &engine,
+        None,
+        coordinode_core::txn::timestamp::Timestamp::ZERO,
+        None,
+    );
+    let result = rebuild_node_counters(&mut txn);
     assert!(
         matches!(result, Err(StorageError::Serialization(_))),
         "expected a serialization error, got {result:?}"
