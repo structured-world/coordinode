@@ -265,6 +265,76 @@ fn json_roundtrip() {
     );
 }
 
+/// A float survives an export and restore in each own format bit for bit.
+/// The text formats write the shortest decimal that reads back to the same
+/// double, so any drift is the reader's: a parser that rounds long mantissas
+/// approximately lands one unit in the last place away on some values.
+#[test]
+fn a_roundtrip_keeps_every_float_bit() {
+    use coordinode_core::graph::types::Value;
+
+    let mut values = vec![
+        2_251_799_813_685_247.0_f64,
+        0.1,
+        1e-300,
+        1.797_693_134_862_315_7e308,
+    ];
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    while values.len() < 2000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let f = f64::from_bits(state);
+        if f.is_finite() {
+            values.push(f);
+        }
+    }
+    let rows: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{{i: {i}, v: {f:?}}}"))
+        .collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_cypher(&format!(
+        "UNWIND [{}] AS r CREATE (:F {{i: r.i, v: r.v}})",
+        rows.join(", ")
+    ))
+    .unwrap();
+
+    for format in OWN_FORMATS {
+        let buf = dump(&db, format);
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db2 = Database::open(dir2.path()).unwrap();
+        db2.restore(format, &buf, &RestoreOptions::default())
+            .unwrap();
+
+        let restored = db2
+            .execute_cypher("MATCH (n:F) RETURN n.i AS i, n.v AS v")
+            .unwrap();
+        assert_eq!(restored.len(), values.len(), "{format:?}");
+        let mut drifted = Vec::new();
+        for row in &restored {
+            let Some(Value::Int(i)) = row.get("i") else {
+                panic!("{format:?}: row without an index: {row:?}");
+            };
+            let expected = values[usize::try_from(*i).unwrap()];
+            match row.get("v") {
+                Some(Value::Float(f)) if f.to_bits() == expected.to_bits() => {}
+                other => drifted.push((expected, other.cloned())),
+            }
+        }
+        assert!(
+            drifted.is_empty(),
+            "{format:?}: {} of {} floats changed, first: {:?}",
+            drifted.len(),
+            values.len(),
+            drifted.first()
+        );
+    }
+}
+
 #[test]
 fn apoc_json_restore_loads_nodes_edges_and_is_queryable() {
     let dir = tempfile::tempdir().unwrap();
