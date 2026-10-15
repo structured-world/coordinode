@@ -66,17 +66,24 @@ if ! rustup run "$channel" cargo nextest --version 2>/dev/null | grep -q "cargo-
 fi
 
 # The compilation cache goes on the filesystem with the most room among the
-# home directory and /srv (a host often keeps a small root disk and a large
-# data disk), sized to fit it: 40G, or 80% of that filesystem when smaller.
-# COORDINODE_SCCACHE_DIR names the directory instead.
+# home directory, /srv and /var (a host often keeps a small root disk and a
+# large data disk mounted at one of them), sized to fit it: 40G, or 80% of
+# that filesystem when smaller. COORDINODE_SCCACHE_DIR names the directory
+# instead.
 old_cache="$HOME/.cache/sccache"
 cache_dir="${cache_dir_override:-}"
 if [ -z "$cache_dir" ]; then
   cache_dir="$old_cache"
   best="$(df --output=avail "$HOME" | tail -n 1)"
-  if [ -d /srv ] && [ "$(df --output=avail /srv | tail -n 1)" -gt "$best" ]; then
-    cache_dir="/srv/sccache-$(id -un)"
-  fi
+  for data in /srv /var/cache; do
+    if [ -d "$data" ]; then
+      avail="$(df --output=avail "$data" | tail -n 1)"
+      if [ "$avail" -gt "$best" ]; then
+        best="$avail"
+        cache_dir="$data/sccache-$(id -un)"
+      fi
+    fi
+  done
 fi
 mkdir -p "$cache_dir"
 fs_kib="$(df --output=size "$cache_dir" | tail -n 1)"

@@ -25,8 +25,8 @@
 # and, when the host has inferno, a flame graph in profile.svg. The host
 # needs perf.
 #
-# The run works in /var/tmp/cn-check on the host, or in COORDINODE_CHECK_DIR
-# when that is set.
+# The run works in cn-check under /var/tmp or /srv on the host, whichever
+# filesystem is larger, or in COORDINODE_CHECK_DIR when that is set.
 #
 # The host needs git, the pinned Rust toolchain, cargo-nextest and protoc
 # (scripts/linux/provision.sh installs them); the run stops before uploading
@@ -48,9 +48,18 @@ ssh() { command ssh "${ssh_opts[@]}" "$@"; }
 # compilation cache keys on absolute paths, so a path that differs per run
 # would never hit and every run would rebuild the workspace from nothing. A
 # second run on the same host waits for no one; it stops and says why.
-# COORDINODE_CHECK_DIR moves it to a filesystem with room for a full build
-# (a debug target with API docs takes more than 10 GiB).
-remote_root="${COORDINODE_CHECK_DIR:-/var/tmp/cn-check}"
+# It goes under /var/tmp or /srv, whichever sits on the larger filesystem (a
+# debug target with API docs takes more than 10 GiB, and hosts keep a small
+# root disk with the data disk mounted at one of them); the size, not the free
+# space, decides, so the path stays the same from run to run.
+# COORDINODE_CHECK_DIR names it instead.
+if [ -n "${COORDINODE_CHECK_DIR:-}" ]; then
+  remote_root="$COORDINODE_CHECK_DIR"
+else
+  remote_root="$(ssh "$host" 'base=/var/tmp
+if [ -d /srv ] && [ "$(df --output=size /srv | tail -n 1)" -gt "$(df --output=size /var/tmp | tail -n 1)" ]; then base=/srv; fi
+echo "$base/cn-check"')"
+fi
 locked=0
 only_nextest="${COORDINODE_CHECK_NEXTEST:-}"
 only_bench="${COORDINODE_CHECK_BENCH:-}"
