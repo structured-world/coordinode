@@ -2,6 +2,19 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.2 - 2026-10-15
+
+### Added
+
+- *(cluster)* authenticate every inter-node call by node identity
+- *(raft)* record each member's node identity
+
+### Fixed
+
+- *(storage)* recover oplog segments that lost writes mid-log
+- *(cdc)* age a consumer's lag from committed work only
+- *(storage)* keep oplog segments inside the retention window
+
 ## v0.7.1 - 2026-10-13
 
 ### Added

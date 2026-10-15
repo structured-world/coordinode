@@ -2,6 +2,23 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.2 - 2026-10-15
+
+### Added
+
+- *(cluster)* authenticate every inter-node call by node identity
+- *(raft)* record each member's node identity
+
+### Fixed
+
+- *(raft)* a member that lost committed entries rejoins without a vote
+- *(storage)* recover oplog segments that lost writes mid-log
+- *(cluster)* admit foreign-domain SVIDs as clients
+
+### Testing
+
+- *(cluster)* move a member only once it holds the log
+
 ## v0.7.1 - 2026-10-13
 
 ### Added
