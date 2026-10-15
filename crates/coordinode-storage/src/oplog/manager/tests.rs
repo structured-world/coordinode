@@ -1,5 +1,6 @@
 use super::*;
 use crate::oplog::entry::OplogOp;
+use crate::oplog::segment::FOOTER_SIZE;
 
 fn make_entry(index: u64, ts: u64) -> OplogEntry {
     OplogEntry {
@@ -598,6 +599,7 @@ fn open_multi_recovers_segments_from_recovery_dirs() {
         64 * 1024 * 1024,
         50_000,
         7 * 24 * 3600,
+        None,
     )
     .expect("open_multi");
 
@@ -632,6 +634,7 @@ fn open_multi_rejects_duplicate_first_index_across_endpoints() {
         64 * 1024 * 1024,
         50_000,
         7 * 24 * 3600,
+        None,
     );
     let err = match result {
         Ok(_) => panic!("duplicate first_index must fail"),
@@ -661,6 +664,7 @@ fn open_multi_skips_missing_recovery_dirs() {
         64 * 1024 * 1024,
         50_000,
         7 * 24 * 3600,
+        None,
     )
     .expect("missing recovery dir must not error");
     assert_eq!(mgr.sealed.len(), 0);
@@ -933,6 +937,160 @@ fn the_published_floor_follows_the_segments_on_disk() {
         (Some(20), Some(20)),
         "after reopening"
     );
+}
+
+/// Sealed segments the way rotation leaves them: each pair of neighbouring
+/// `bounds` is one segment, holding the indexes from the first up to the
+/// second.
+fn sealed_segments(dir: &Path, bounds: &[u64]) {
+    let mut mgr = test_manager(dir);
+    for pair in bounds.windows(2) {
+        for i in pair[0]..pair[1] {
+            mgr.append(&make_entry(i, 1000 + i)).expect("append");
+        }
+        mgr.rotate().expect("seal");
+    }
+}
+
+/// Overwrite the last `bytes` of the segment starting at `first` with zeros,
+/// the way a disk shows writes it lost after a failed fsync.
+fn zero_tail(dir: &Path, first: u64, bytes: usize) {
+    let path = segment_path(dir, first);
+    let mut data = std::fs::read(&path).expect("read segment");
+    let at = data.len() - bytes;
+    data[at..].fill(0);
+    std::fs::write(&path, &data).expect("write segment");
+}
+
+fn set_aside(dir: &Path, first: u64) -> PathBuf {
+    let path = segment_path(dir, first);
+    let mut name = path.file_name().expect("name").to_os_string();
+    name.push(".beyond-gap");
+    path.with_file_name(name)
+}
+
+/// After a failed fsync the page cache can hold writes the disk never got: a
+/// restart on the same kernel reads them back, seals the segment and writes
+/// on, and once the cache is evicted the disk shows zeros where the footer and
+/// the last entries were, in a segment that is no longer the newest, followed
+/// by a segment of zeros. Reopening keeps every complete entry and ends the
+/// log at the first index it no longer holds. A segment after the hole would
+/// continue the log past entries it lacks; it is set aside, not read and not
+/// deleted.
+#[test]
+fn a_hole_in_the_middle_of_the_log_ends_it_there() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    sealed_segments(dir.path(), &[0, 5, 10, 12, 14]);
+    // The footer and part of entry 9.
+    zero_tail(dir.path(), 5, FOOTER_SIZE as usize + 8);
+    let lost = segment_path(dir.path(), 10);
+    let len = std::fs::metadata(&lost).expect("stat").len();
+    std::fs::write(&lost, vec![0u8; usize::try_from(len).expect("small")]).expect("zero segment");
+
+    let mut mgr = test_manager(dir.path());
+    let entries = mgr.read_range(0, u64::MAX).expect("read after the hole");
+    assert_eq!(indexes_of(&entries), (0..9).collect::<Vec<_>>());
+    mgr.verify_all().expect("every kept segment verifies");
+    assert!(!lost.exists(), "a segment of zeros holds nothing");
+    assert!(
+        set_aside(dir.path(), 12).exists(),
+        "the segment past the hole is kept aside"
+    );
+
+    // The log continues at the first index it lost, across a restart.
+    mgr.append(&make_entry(9, 1009))
+        .expect("append at the hole");
+    mgr.flush().expect("flush");
+    drop(mgr);
+    let mut mgr = test_manager(dir.path());
+    let entries = mgr.read_range(0, u64::MAX).expect("read after reopen");
+    assert_eq!(indexes_of(&entries), (0..10).collect::<Vec<_>>());
+}
+
+/// A segment in the middle that lost only its footer still holds every entry,
+/// and the next segment starts right after its last one: nothing is missing,
+/// so nothing after it is set aside.
+#[test]
+fn a_lost_footer_in_the_middle_of_the_log_drops_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    sealed_segments(dir.path(), &[0, 5, 10]);
+    zero_tail(dir.path(), 0, FOOTER_SIZE as usize);
+
+    let mut mgr = test_manager(dir.path());
+    let entries = mgr.read_range(0, u64::MAX).expect("read");
+    assert_eq!(indexes_of(&entries), (0..10).collect::<Vec<_>>());
+    mgr.verify_all().expect("the resealed segment verifies");
+    assert!(!set_aside(dir.path(), 5).exists());
+}
+
+/// A newest segment whose header never reached the disk reads as zeros. It
+/// holds nothing and goes, like a header-only one; it is not refused as a
+/// file of some other format.
+#[test]
+fn a_newest_segment_of_zeros_is_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    sealed_segments(dir.path(), &[0, 5]);
+    let lost = segment_path(dir.path(), 5);
+    std::fs::write(&lost, [0u8; 357]).expect("zero segment");
+
+    let mut mgr = test_manager(dir.path());
+    let entries = mgr.read_range(0, u64::MAX).expect("read");
+    assert_eq!(indexes_of(&entries), (0..5).collect::<Vec<_>>());
+    assert!(!lost.exists());
+}
+
+/// Entries known to be acknowledged are never cut: when the hole lies at or
+/// below them the open is refused, and the segments are left exactly as they
+/// were, so nothing is decided before the refusal.
+#[test]
+fn a_hole_below_what_must_be_kept_refuses_the_open_and_changes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    sealed_segments(dir.path(), &[0, 5, 10, 12]);
+    zero_tail(dir.path(), 5, FOOTER_SIZE as usize + 8);
+    let listing = || {
+        let mut files: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .map(|e| {
+                let path = e.expect("entry").path();
+                let bytes = std::fs::read(&path).expect("read");
+                (path, bytes)
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let before = listing();
+
+    let err = OplogManager::open_multi(
+        dir.path(),
+        &[],
+        0,
+        64 * 1024 * 1024,
+        50_000,
+        7 * 24 * 3600,
+        Some(10),
+    )
+    .err()
+    .expect("a hole below index 10 must refuse the open");
+    assert!(
+        err.to_string().contains("from index 9"),
+        "names the first lost index: {err}"
+    );
+    assert_eq!(listing(), before, "a refused recovery changes no file");
+
+    // At its last complete entry the hole loses nothing that must be kept.
+    let mut mgr = OplogManager::open_multi(
+        dir.path(),
+        &[],
+        0,
+        64 * 1024 * 1024,
+        50_000,
+        7 * 24 * 3600,
+        Some(8),
+    )
+    .expect("nothing that must be kept is lost");
+    let entries = mgr.read_range(0, u64::MAX).expect("read");
+    assert_eq!(indexes_of(&entries), (0..9).collect::<Vec<_>>());
 }
 
 /// Recovery is for the tail a crash can leave, and only for it. A segment

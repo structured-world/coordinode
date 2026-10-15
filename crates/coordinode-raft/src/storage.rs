@@ -417,7 +417,8 @@ impl LogStore {
     ///
     /// The log's directories or its last segment cannot be read. A log that
     /// cannot be read is refused rather than taken as empty: an empty log
-    /// would let the group start over on top of acknowledged entries.
+    /// would let the group start over on top of acknowledged entries. So is a
+    /// log whose recovery would end it at or below its committed index.
     pub fn open(engine: Arc<StorageEngine>) -> Result<Self, io::Error> {
         // Shard 0 = single Raft log shard in CE. Multi-shard EE will
         // open one LogStore per shard, each routing to its own
@@ -428,6 +429,9 @@ impl LogStore {
             all: recovery_dirs,
         } = raft_oplog_dirs(&engine, shard_id)?;
         let settings = engine.oplog_config();
+        // Recovering the segments must not end the log below an entry
+        // already committed: those were acknowledged.
+        let committed: Option<LogId> = load_stored(&engine, Partition::Raft, KEY_COMMITTED)?;
         let oplog = OplogManager::open_multi(
             &active_dir,
             &recovery_dirs,
@@ -435,6 +439,7 @@ impl LogStore {
             settings.max_segment_bytes,
             settings.max_segment_entries,
             settings.retention_secs,
+            committed.map(|id| id.index),
         )
         .map_err(|e| io::Error::other(e.to_string()))?
         .with_sync_method(settings.sync_method);

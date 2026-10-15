@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::engine::config::SyncMethod;
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, ShardId};
-use crate::oplog::segment::{SegmentReader, SegmentWriter, TailRecovery};
+use crate::oplog::segment::{SegmentFooter, SegmentReader, SegmentWriter, TailState, is_sealed};
 
 // ── Filename helpers ──────────────────────────────────────────────────────────
 
@@ -30,6 +30,156 @@ fn parse_first_index(path: &Path) -> Option<u64> {
     let stem = path.file_stem()?.to_str()?;
     let idx_str = stem.strip_prefix("oplog-")?;
     idx_str.parse().ok()
+}
+
+// ── Recovery on open ──────────────────────────────────────────────────────────
+
+/// A change recovery makes to one segment file.
+enum Repair {
+    /// Cut off what follows the complete entries and write their footer.
+    Seal {
+        path: PathBuf,
+        end: u64,
+        footer: SegmentFooter,
+        discarded_bytes: u64,
+    },
+    /// No complete entry: the file goes.
+    Remove(PathBuf),
+    /// Complete entries past the end of the log: renamed out of the log.
+    SetAside(PathBuf),
+}
+
+/// The segments `paths` (sorted by first index) once what a crash or a disk's
+/// lost writes left of them is recovered.
+///
+/// Rotation seals every segment but the newest, so normally only the newest
+/// can lack a footer. A failed `fsync` breaks that: the page cache can keep
+/// writes the disk never got, a restart on the same kernel reads them back,
+/// seals the segment and writes on, and once the cache is evicted the disk
+/// shows zeros in a segment that is no longer the newest. So every segment
+/// without a valid footer keeps its complete entries, and the log ends at the
+/// first index it no longer holds: a later segment would continue it past
+/// entries it lacks, which no reader may apply, so it is set aside under
+/// another name rather than read or deleted.
+///
+/// Everything is decided before any file changes, so a refusal leaves the
+/// segments as they were.
+///
+/// # Errors
+///
+/// I/O failures, a segment header of another format or shard, and a log that
+/// would end at or below `must_hold`.
+fn recover_segments(
+    paths: Vec<(u64, PathBuf)>,
+    shard_id: ShardId,
+    must_hold: Option<u64>,
+) -> StorageResult<Vec<(u64, PathBuf)>> {
+    let mut kept = Vec::with_capacity(paths.len());
+    let mut repairs = Vec::new();
+    // Where the next segment must start, known after a recovered one.
+    let mut next: Option<u64> = None;
+    // The first index the log no longer holds, once a segment skips it.
+    let mut lost_from: Option<u64> = None;
+    for (first, path) in paths {
+        if lost_from.is_none() && next.is_some_and(|next| next != first) {
+            lost_from = next;
+        }
+        if lost_from.is_some() {
+            let empty = !is_sealed(&path)?
+                && SegmentWriter::inspect_tail(&path, shard_id)? == TailState::Empty;
+            repairs.push(if empty {
+                Repair::Remove(path)
+            } else {
+                Repair::SetAside(path)
+            });
+            continue;
+        }
+        if is_sealed(&path)? {
+            next = None;
+            kept.push((first, path));
+            continue;
+        }
+        match SegmentWriter::inspect_tail(&path, shard_id)? {
+            TailState::Sealed => {
+                next = None;
+                kept.push((first, path));
+            }
+            TailState::Unsealed {
+                footer,
+                end,
+                discarded_bytes,
+                last_index,
+            } => {
+                // A log index is a Raft index; it never reaches u64::MAX.
+                next = Some(last_index + 1);
+                repairs.push(Repair::Seal {
+                    path: path.clone(),
+                    end,
+                    footer,
+                    discarded_bytes,
+                });
+                kept.push((first, path));
+            }
+            TailState::Empty => {
+                // Named after the first index it was to hold.
+                next = Some(next.unwrap_or(first));
+                repairs.push(Repair::Remove(path));
+            }
+        }
+    }
+
+    // The log now ends below `next` when its last segment was recovered, and
+    // below `lost_from` when a segment past the end was set aside.
+    if let (Some(ends_before), Some(must_hold)) = (lost_from.or(next), must_hold) {
+        if ends_before <= must_hold {
+            return Err(StorageError::Io(format!(
+                "the oplog no longer holds entries from index {ends_before}, but entries \
+                 through index {must_hold} were acknowledged"
+            )));
+        }
+    }
+
+    for repair in repairs {
+        match repair {
+            Repair::Seal {
+                path,
+                end,
+                footer,
+                discarded_bytes,
+            } => {
+                SegmentWriter::seal_at(&path, end, &footer)?;
+                tracing::warn!(
+                    segment = %path.display(),
+                    entries = footer.entry_count,
+                    discarded_bytes,
+                    "oplog: sealed a segment an unclean shutdown or lost writes left incomplete"
+                );
+            }
+            Repair::Remove(path) => {
+                std::fs::remove_file(&path).map_err(|e| {
+                    StorageError::Io(format!("remove empty segment {:?}: {e}", path))
+                })?;
+                tracing::warn!(
+                    segment = %path.display(),
+                    "oplog: removed a segment left without entries"
+                );
+            }
+            Repair::SetAside(path) => {
+                let mut name = path.file_name().unwrap_or_default().to_os_string();
+                name.push(".beyond-gap");
+                let aside = path.with_file_name(name);
+                std::fs::rename(&path, &aside)
+                    .map_err(|e| StorageError::Io(format!("set aside segment {:?}: {e}", path)))?;
+                tracing::error!(
+                    segment = %aside.display(),
+                    log_ends_before = lost_from,
+                    "oplog: a segment continues the log past entries the disk lost; \
+                     it is set aside and not applied"
+                );
+            }
+        }
+    }
+    Ok(kept)
 }
 
 // ── RetainedFloor ─────────────────────────────────────────────────────────────
@@ -107,12 +257,26 @@ impl OplogManager {
         max_entries: u32,
         retention_secs: u64,
     ) -> StorageResult<Self> {
-        Self::open_multi(dir, &[], shard_id, max_bytes, max_entries, retention_secs)
+        Self::open_multi(
+            dir,
+            &[],
+            shard_id,
+            max_bytes,
+            max_entries,
+            retention_secs,
+            None,
+        )
     }
 
     /// Open the oplog manager with an active write directory plus extra
     /// directories scanned for sealed segments at startup (segments written
     /// under an earlier endpoint routing).
+    ///
+    /// Segments a crash or a disk's lost writes left incomplete are recovered
+    /// on open: the log keeps every complete entry and ends at the first index
+    /// it no longer holds. `must_hold` is the last index known to have been
+    /// acknowledged; a recovery that would end the log at or below it is
+    /// refused before any file changes.
     ///
     /// `active_dir` receives all new segments. `recovery_dirs` are
     /// scanned at startup for `oplog-*.bin` files and merged into the
@@ -130,6 +294,7 @@ impl OplogManager {
         max_bytes: u64,
         max_entries: u32,
         retention_secs: u64,
+        must_hold: Option<u64>,
     ) -> StorageResult<Self> {
         std::fs::create_dir_all(active_dir)
             .map_err(|e| StorageError::Io(format!("create oplog dir {:?}: {e}", active_dir)))?;
@@ -176,30 +341,7 @@ impl OplogManager {
             )));
         }
 
-        // Only the newest segment can have been open for writing when the
-        // process died: every earlier one was sealed at rotation. Seal it now,
-        // so everything below treats the list as what it claims to be.
-        if let Some((_, tail)) = paths.last() {
-            match SegmentWriter::recover_tail(tail, shard_id)? {
-                TailRecovery::Sealed => {}
-                TailRecovery::Resealed {
-                    entries,
-                    discarded_bytes,
-                } => tracing::warn!(
-                    segment = %tail.display(),
-                    entries,
-                    discarded_bytes,
-                    "oplog: sealed a segment left open by an unclean shutdown"
-                ),
-                TailRecovery::Removed => {
-                    tracing::warn!(
-                        segment = %tail.display(),
-                        "oplog: removed a segment that an unclean shutdown left without entries"
-                    );
-                    paths.pop();
-                }
-            }
-        }
+        let paths = recover_segments(paths, shard_id, must_hold)?;
 
         Ok(Self {
             dir: active_dir.to_path_buf(),

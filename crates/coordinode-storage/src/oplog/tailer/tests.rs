@@ -362,6 +362,7 @@ fn tailer_reads_a_log_spread_over_directories() {
         64 * 1024 * 1024,
         50_000,
         7 * 24 * 3600,
+        None,
     )
     .expect("open over both");
     for i in 3..6u64 {

@@ -2575,6 +2575,77 @@ async fn restart_after_crash_with_sealed_segment_recovers_last_log_id() {
     }
 }
 
+/// A log of entries 1..=6 in two sealed segments (1..=3, 4..=6) with
+/// `committed` recorded, whose first segment then lost its footer and part of
+/// entry 3 the way a disk shows writes it lost after a failed fsync.
+async fn log_with_a_hole_at_3(committed: u64) -> (tempfile::TempDir, StorageConfig) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = Arc::new(StorageEngine::open(&config).expect("open engine"));
+    let active = raft_oplog_dirs(&engine, 0).expect("oplog dirs").active;
+    {
+        let mut store = LogStore::open(Arc::clone(&engine)).expect("open store");
+        append_durable(&mut store, (1..=3).map(|i| make_entry(i, 1, "x")).collect()).await;
+        store.oplog.lock().expect("lock").rotate().expect("rotate");
+        append_durable(&mut store, (4..=6).map(|i| make_entry(i, 1, "x")).collect()).await;
+        store.oplog.lock().expect("lock").rotate().expect("rotate");
+        store
+            .save_committed(Some(log_id(1, committed)))
+            .await
+            .expect("committed");
+        engine
+            .persist_partition(Partition::Raft)
+            .expect("persist committed");
+    }
+    drop(engine);
+    let first = active.join(format!("oplog-{:020}.bin", 1));
+    let mut bytes = std::fs::read(&first).expect("read segment");
+    let at = bytes.len() - (coordinode_storage::oplog::FOOTER_SIZE as usize + 8);
+    bytes[at..].fill(0);
+    std::fs::write(&first, &bytes).expect("write segment");
+    (dir, config)
+}
+
+/// Committed entries are never cut away. When writes the disk lost leave a
+/// hole at or below the committed index, the log is refused rather than
+/// reopened shorter than what was acknowledged, and its segments stay as they
+/// were.
+#[tokio::test]
+async fn a_hole_below_the_committed_index_refuses_the_log() {
+    let (_dir, config) = log_with_a_hole_at_3(5).await;
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen engine"));
+    let err = LogStore::open(Arc::clone(&engine))
+        .err()
+        .expect("a hole below committed must refuse the log");
+    assert!(
+        err.to_string().contains("from index 3"),
+        "names the first lost index: {err}"
+    );
+}
+
+/// A hole above the committed index lost only entries never acknowledged:
+/// the log reopens ending right before it, and the entries past it are not
+/// part of the log.
+#[tokio::test]
+async fn a_hole_above_the_committed_index_ends_the_log_before_it() {
+    let (_dir, config) = log_with_a_hole_at_3(2).await;
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen engine"));
+    let mut store = LogStore::open(Arc::clone(&engine)).expect("reopen store");
+    let state = store.get_log_state().await.expect("log state");
+    assert_eq!(state.last_log_id.map(|id| id.index), Some(2));
+    let entries = store.try_get_log_entries(1..7).await.expect("read");
+    assert_eq!(
+        entries.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // MaxAssignedWatermark integration with apply_proposal.
 // ─────────────────────────────────────────────────────────────────────

@@ -136,7 +136,7 @@ fn read_header<R: Read>(r: &mut R) -> StorageResult<SegmentHeader> {
 // ── Footer ───────────────────────────────────────────────────────────────────
 
 /// Decoded segment footer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentFooter {
     pub entry_count: u32,
     pub first_ts: u64,
@@ -458,21 +458,26 @@ fn decode_frames(data: &[u8], count: usize, path: &Path) -> StorageResult<Vec<Op
     Ok(entries)
 }
 
-/// What [`SegmentWriter::recover_tail`] found and did.
+/// What a segment holds on disk, as [`SegmentWriter::inspect_tail`] read it
+/// without changing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TailRecovery {
-    /// The segment already carries a valid footer; nothing was changed.
+pub enum TailState {
+    /// The segment carries a valid footer.
     Sealed,
-    /// The segment had no valid footer. Its complete entries were kept, any
-    /// torn bytes after them cut off, and a footer written.
-    Resealed {
-        /// Entries recovered into the sealed segment.
-        entries: u32,
-        /// Bytes after the last complete entry that were cut off.
+    /// No valid footer; complete entries up to `last_index` end at byte `end`.
+    Unsealed {
+        /// The footer the complete entries make.
+        footer: SegmentFooter,
+        /// Offset just past the last complete entry.
+        end: u64,
+        /// Bytes after it, cut off when the segment is sealed.
         discarded_bytes: u64,
+        /// Index of the last complete entry.
+        last_index: u64,
     },
-    /// The segment held no complete entry and was removed.
-    Removed,
+    /// No complete entry: a header and nothing after it, or a header that
+    /// never reached the disk.
+    Empty,
 }
 
 // ── SegmentWriter ─────────────────────────────────────────────────────────────
@@ -661,41 +666,36 @@ impl SegmentWriter {
         Self::create(path, shard_id, first_index, sync)
     }
 
-    /// Seal the segment at `path` if a crash left it unsealed.
+    /// What a crash left of the segment at `path`, read without changing it.
     ///
     /// Entries are made durable one `fsync` at a time, and the footer is only
     /// written when a segment rotates, so a killed process leaves its active
     /// segment with acknowledged entries and no footer, possibly followed by a
-    /// frame (or part of a footer) that was being written. This keeps every
-    /// complete entry, cuts off what follows the last one, and writes the
-    /// footer, so the segment reads like any other. A segment with no complete
-    /// entry never held anything acknowledged and is removed.
+    /// frame (or part of a footer) that was being written. Writes a disk lost
+    /// after a failed `fsync` read as zeros, from where the loss starts: a
+    /// header of zeros never reached the disk.
     ///
     /// Only a missing or invalid footer counts as a crash. A segment with a
-    /// valid footer is left untouched even if an entry inside it is damaged:
-    /// that is corruption, and cutting there would drop the entries after it.
-    /// Safe to repeat: a crash during recovery leaves a state it recovers
-    /// from again.
+    /// valid footer is [`TailState::Sealed`] even if an entry inside it is
+    /// damaged: that is corruption, and cutting there would drop the entries
+    /// after it.
     ///
     /// # Errors
     ///
     /// I/O failures, and a header that is not an oplog segment of `shard_id`
     /// in the supported format (not a crash leftover; refused rather than
     /// rewritten).
-    pub fn recover_tail(path: &Path, shard_id: u32) -> StorageResult<TailRecovery> {
+    pub fn inspect_tail(path: &Path, shard_id: u32) -> StorageResult<TailState> {
         let data = std::fs::read(path)
             .map_err(|e| StorageError::Io(format!("read segment {:?}: {e}", path)))?;
         if has_valid_footer(&data) {
-            return Ok(TailRecovery::Sealed);
+            return Ok(TailState::Sealed);
         }
-        let remove = || {
-            std::fs::remove_file(path)
-                .map_err(|e| StorageError::Io(format!("remove empty segment {:?}: {e}", path)))
-                .map(|()| TailRecovery::Removed)
+        let Some(header_bytes) = data.get(..HEADER_SIZE as usize) else {
+            return Ok(TailState::Empty);
         };
-        if (data.len() as u64) < HEADER_SIZE {
-            // The header itself never reached the disk.
-            return remove();
+        if header_bytes.iter().all(|&b| b == 0) {
+            return Ok(TailState::Empty);
         }
 
         let header = read_header(&mut Cursor::new(&data))?;
@@ -713,38 +713,48 @@ impl SegmentWriter {
         }
 
         let prefix = read_frame_prefix(&data);
-        if prefix.entries.is_empty() {
-            return remove();
-        }
+        let Some(last) = prefix.entries.last() else {
+            return Ok(TailState::Empty);
+        };
         let entries = u32::try_from(prefix.entries.len()).map_err(|_| {
             StorageError::Io(format!(
                 "segment {:?} holds more entries than a footer counts",
                 path
             ))
         })?;
-        let footer = SegmentFooter {
-            entry_count: entries,
-            first_ts: prefix.first_ts,
-            last_ts: prefix.last_ts,
-            total_bytes: prefix.end - HEADER_SIZE,
-        };
+        Ok(TailState::Unsealed {
+            footer: SegmentFooter {
+                entry_count: entries,
+                first_ts: prefix.first_ts,
+                last_ts: prefix.last_ts,
+                total_bytes: prefix.end - HEADER_SIZE,
+            },
+            end: prefix.end,
+            discarded_bytes: data.len() as u64 - prefix.end,
+            last_index: last.index,
+        })
+    }
 
+    /// Seal the segment at `path` at its complete entries, as
+    /// [`inspect_tail`](Self::inspect_tail) found them: cut off what follows
+    /// `end` and write `footer`, so the segment reads like any other. Safe to
+    /// repeat: a crash during it leaves a state inspected the same way again.
+    ///
+    /// # Errors
+    ///
+    /// I/O failures.
+    pub fn seal_at(path: &Path, end: u64, footer: &SegmentFooter) -> StorageResult<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(path)
             .map_err(|e| StorageError::Io(format!("open segment {:?}: {e}", path)))?;
-        file.set_len(prefix.end)
+        file.set_len(end)
             .map_err(|e| StorageError::Io(format!("truncate segment {:?}: {e}", path)))?;
-        file.seek(SeekFrom::Start(prefix.end)).map_err(io_err)?;
-        write_footer(&mut file, &footer)
+        file.seek(SeekFrom::Start(end)).map_err(io_err)?;
+        write_footer(&mut file, footer)
             .map_err(|e| StorageError::Io(format!("write footer {:?}: {e}", path)))?;
         file.sync_data()
-            .map_err(|e| StorageError::Io(format!("sync_data on recovery {:?}: {e}", path)))?;
-
-        Ok(TailRecovery::Resealed {
-            entries,
-            discarded_bytes: data.len() as u64 - prefix.end,
-        })
+            .map_err(|e| StorageError::Io(format!("sync_data on recovery {:?}: {e}", path)))
     }
 
     /// Append one [`OplogEntry`] to the segment.
