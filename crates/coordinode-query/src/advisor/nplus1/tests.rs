@@ -206,18 +206,19 @@ fn window_expiration_clears_flag() {
         window: std::time::Duration::from_millis(50), // 50ms window
     };
     let source = src("app.rs", 10, "handler");
+    // Executions at given instants, not at the host's pace: a loaded host
+    // must not stretch three calls past the window.
+    let start = std::time::Instant::now();
+    let at = |ms| start + std::time::Duration::from_millis(ms);
 
-    // Record 3 calls quickly (triggers within 50ms window)
-    for _ in 0..3 {
-        detector.record(0xABC, "query", &source);
+    // 3 calls within the 50ms window trigger.
+    for ms in 0..3 {
+        detector.record_at(0xABC, "query", &source, at(ms));
     }
     assert!(detector.is_flagged(0xABC, &source));
 
-    // Wait for window to expire
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Record one more — prunes expired timestamps, only 1 in window now
-    detector.record(0xABC, "query", &source);
+    // One more after the window passed: only it is left in the window.
+    detector.record_at(0xABC, "query", &source, at(100));
 
     assert!(
         !detector.is_flagged(0xABC, &source),
@@ -239,22 +240,22 @@ fn alert_fires_again_after_window_reset() {
         window: std::time::Duration::from_millis(50),
     };
     let source = src("app.rs", 10, "handler");
+    // Executions at given instants, not at the host's pace.
+    let start = std::time::Instant::now();
+    let at = |ms| start + std::time::Duration::from_millis(ms);
 
     // First window: trigger
-    for _ in 0..2 {
-        detector.record(0xABC, "query", &source);
+    for ms in 0..2 {
+        detector.record_at(0xABC, "query", &source, at(ms));
     }
-    let alert1 = detector.record(0xABC, "query", &source);
+    let alert1 = detector.record_at(0xABC, "query", &source, at(2));
     assert!(alert1.is_some(), "first window should trigger");
 
-    // Let window expire
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Second window: trigger again
-    for _ in 0..2 {
-        detector.record(0xABC, "query", &source);
+    // Second window, after the first expired: trigger again
+    for ms in 100..102 {
+        detector.record_at(0xABC, "query", &source, at(ms));
     }
-    let alert2 = detector.record(0xABC, "query", &source);
+    let alert2 = detector.record_at(0xABC, "query", &source, at(102));
     assert!(
         alert2.is_some(),
         "second window should trigger again after reset"

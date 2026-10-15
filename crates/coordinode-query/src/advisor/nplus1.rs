@@ -167,8 +167,18 @@ impl NPlus1Detector {
         canonical_query: &str,
         source: &SourceContext,
     ) -> Option<NPlus1Alert> {
+        self.record_at(fingerprint, canonical_query, source, Instant::now())
+    }
+
+    /// [`Self::record`] for an execution at `now`.
+    pub(crate) fn record_at(
+        &self,
+        fingerprint: u64,
+        canonical_query: &str,
+        source: &SourceContext,
+        now: Instant,
+    ) -> Option<NPlus1Alert> {
         let key = TrackingKey::from_context(fingerprint, source);
-        let now = Instant::now();
 
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
