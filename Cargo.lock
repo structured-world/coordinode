@@ -980,9 +980,9 @@ dependencies = [
 
 [[package]]
 name = "coordinode-lsm-tree"
-version = "5.12.2"
+version = "5.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23a5e88439d2e0354f0e9f8e4c021eddcfa43a9af0f0e488a74eaf77db7f50dd"
+checksum = "b5f4f179a6dfb6bf7757603318757f8e5b389e651e1da4c7a667ee34ee776720"
 dependencies = [
  "aes-gcm 0.11.1",
  "arc-swap",
@@ -5619,7 +5619,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8050abb251097357e24aff63ba2c52a6309ecb7d23a5474023df960a02694d8"
 dependencies = [
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.23.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
@@ -6255,7 +6255,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

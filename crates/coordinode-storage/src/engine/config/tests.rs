@@ -718,6 +718,20 @@ fn to_tree_config_uses_first_endpoint_path() {
 
 // ── ColonSeparatedPrefix tests ──────────────────────────────────
 
+/// The engine trusts a table's prefix filter only under the name of the
+/// extractor that built it. The two extractors emit different prefixes for
+/// an index entry, so a shared (or the default empty) name would let a scan
+/// skip a table by prefixes it never indexed.
+#[test]
+fn prefix_extractors_carry_distinct_names() {
+    use lsm_tree::PrefixExtractor;
+    let colon = ColonSeparatedPrefix.name();
+    let index = IndexEntryPrefix.name();
+    assert!(!colon.is_empty(), "colon extractor keeps the default name");
+    assert!(!index.is_empty(), "index extractor keeps the default name");
+    assert_ne!(colon, index);
+}
+
 #[test]
 fn prefix_extractor_adj_key() {
     use lsm_tree::PrefixExtractor;

@@ -1297,6 +1297,11 @@ impl StorageConfig {
 pub(crate) struct ColonSeparatedPrefix;
 
 impl lsm_tree::PrefixExtractor for ColonSeparatedPrefix {
+    #[expect(clippy::unnecessary_literal_bound, reason = "the trait's signature")]
+    fn name(&self) -> &str {
+        "coordinode.colon"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         Box::new(colon_prefixes(key))
     }
@@ -1318,6 +1323,11 @@ fn colon_prefixes(key: &[u8]) -> impl Iterator<Item = &[u8]> {
 pub(crate) struct IndexEntryPrefix;
 
 impl lsm_tree::PrefixExtractor for IndexEntryPrefix {
+    #[expect(clippy::unnecessary_literal_bound, reason = "the trait's signature")]
+    fn name(&self) -> &str {
+        "coordinode.index-entry"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         match coordinode_core::index::encoding::entry_scan_prefixes(key) {
             Some(prefixes) => Box::new(prefixes),
