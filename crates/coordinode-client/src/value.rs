@@ -21,6 +21,8 @@ pub enum Value {
     Float(f64),
     /// UTF-8 string.
     String(String),
+    /// An instant: microseconds since the Unix epoch, negative before 1970.
+    Timestamp(i64),
     /// Raw bytes / binary blob.
     Bytes(Vec<u8>),
     /// Dense float vector (used in vector search).
@@ -71,6 +73,7 @@ impl std::fmt::Display for Value {
             Value::Int(i) => write!(f, "{i}"),
             Value::Float(v) => write!(f, "{v}"),
             Value::String(s) => write!(f, "{s}"),
+            Value::Timestamp(us) => write_utc(f, *us),
             Value::Bytes(b) => write!(f, "<bytes:{}>", b.len()),
             Value::Vector(v) => write!(f, "<vec:{}>", v.len()),
             Value::List(l) => {
@@ -102,6 +105,41 @@ impl std::fmt::Display for Value {
     }
 }
 
+/// Write epoch microseconds as an RFC 3339 UTC instant with microsecond
+/// fraction. A year outside 0000..=9999 is written with an explicit sign, the
+/// ISO 8601 expanded form, since RFC 3339 has no spelling for it.
+fn write_utc(f: &mut std::fmt::Formatter<'_>, us: i64) -> std::fmt::Result {
+    const US_PER_DAY: i64 = 86_400_000_000;
+    let days = us.div_euclid(US_PER_DAY);
+    let in_day = us.rem_euclid(US_PER_DAY);
+    // Civil date from days since 1970-01-01, proleptic Gregorian (Howard
+    // Hinnant, "chrono-Compatible Low-Level Date Algorithms"). |days| is at
+    // most about 1.1e8, so none of the products below overflow.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    if (0..=9_999).contains(&year) {
+        write!(f, "{year:04}")?;
+    } else {
+        write!(f, "{year:+}")?;
+    }
+    let secs = in_day / 1_000_000;
+    write!(
+        f,
+        "-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:06}Z",
+        secs / 3_600,
+        secs / 60 % 60,
+        secs % 60,
+        in_day % 1_000_000
+    )
+}
+
 /// Convert a proto `PropertyValue` to a client-side [`Value`].
 pub(crate) fn from_proto(pv: PropertyValue) -> Value {
     match pv.value {
@@ -111,7 +149,7 @@ pub(crate) fn from_proto(pv: PropertyValue) -> Value {
         Some(property_value::Value::StringValue(s)) => Value::String(s),
         Some(property_value::Value::BoolValue(b)) => Value::Bool(b),
         Some(property_value::Value::BytesValue(b)) => Value::Bytes(b),
-        Some(property_value::Value::TimestampValue(ts)) => Value::Int(ts.wall_time as i64),
+        Some(property_value::Value::TimestampValue(ts)) => Value::Timestamp(ts.unix_micros),
         Some(property_value::Value::VectorValue(v)) => Value::Vector(v.values),
         Some(property_value::Value::ListValue(l)) => {
             Value::List(l.values.into_iter().map(from_proto).collect())
@@ -144,7 +182,7 @@ pub(crate) fn from_proto(pv: PropertyValue) -> Value {
 ///
 /// Used when passing query parameters.
 pub(crate) fn to_proto(value: Value) -> PropertyValue {
-    use crate::proto::common::{HlcTimestamp, PropertyList, PropertyMap, Vector};
+    use crate::proto::common::{PropertyList, PropertyMap, Timestamp, Vector};
 
     let v = match value {
         Value::Null => None,
@@ -152,6 +190,9 @@ pub(crate) fn to_proto(value: Value) -> PropertyValue {
         Value::Int(i) => Some(property_value::Value::IntValue(i)),
         Value::Float(f) => Some(property_value::Value::FloatValue(f)),
         Value::String(s) => Some(property_value::Value::StringValue(s)),
+        Value::Timestamp(unix_micros) => Some(property_value::Value::TimestampValue(Timestamp {
+            unix_micros,
+        })),
         Value::Bytes(b) => Some(property_value::Value::BytesValue(b)),
         Value::Vector(v) => Some(property_value::Value::VectorValue(Vector { values: v })),
         Value::List(l) => Some(property_value::Value::ListValue(PropertyList {
@@ -180,9 +221,6 @@ pub(crate) fn to_proto(value: Value) -> PropertyValue {
             },
         )),
     };
-    // Timestamps without wall_time are emitted as Null; client-side we
-    // don't expose HlcTimestamp directly.
-    let _ = HlcTimestamp::default;
     PropertyValue { value: v }
 }
 

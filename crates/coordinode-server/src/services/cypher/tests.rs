@@ -1502,6 +1502,31 @@ fn proto_to_value_roundtrip() {
     }
 }
 
+/// A timestamp leaves as a timestamp and keeps its sign: a value sent as an
+/// integer comes back as `Value::Int` and no longer compares or indexes as a
+/// timestamp, and an instant before 1970 is negative.
+#[test]
+fn timestamp_roundtrip_keeps_type_and_sign() {
+    for us in [
+        1_700_000_000_123_456_i64,
+        0,
+        -86_400_000_000,
+        i64::MIN,
+        i64::MAX,
+    ] {
+        let original = Value::Timestamp(us);
+        let proto = value_to_proto(&original);
+        assert!(
+            matches!(
+                proto.value,
+                Some(common::property_value::Value::TimestampValue(_))
+            ),
+            "{original:?} must travel as a timestamp, got {proto:?}"
+        );
+        assert_eq!(proto_to_value(&proto), original);
+    }
+}
+
 // --- Causal consistency tests ---
 
 /// after_index > 0 with readConcern=LOCAL is rejected with FailedPrecondition.

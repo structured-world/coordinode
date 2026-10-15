@@ -57,7 +57,9 @@ fn value_to_proto(value: &Value) -> common::PropertyValue {
         Value::Int(i) => Some(common::property_value::Value::IntValue(*i)),
         Value::Float(f) => Some(common::property_value::Value::FloatValue(*f)),
         Value::String(s) => Some(common::property_value::Value::StringValue(s.clone())),
-        Value::Timestamp(ts) => Some(common::property_value::Value::IntValue(*ts)),
+        Value::Timestamp(ts) => Some(common::property_value::Value::TimestampValue(
+            common::Timestamp { unix_micros: *ts },
+        )),
         Value::Vector(v) => Some(common::property_value::Value::VectorValue(common::Vector {
             values: v.clone(),
         })),
@@ -138,9 +140,7 @@ fn proto_to_value(pv: &common::PropertyValue) -> Value {
                     .map(|(k, v)| (k.clone(), proto_to_value(v)))
                     .collect(),
             ),
-            common::property_value::Value::TimestampValue(ts) => {
-                Value::Timestamp(ts.wall_time as i64)
-            }
+            common::property_value::Value::TimestampValue(ts) => Value::Timestamp(ts.unix_micros),
             common::property_value::Value::MultiVectorValue(mv) => {
                 Value::MultiVector(mv.rows.iter().map(|row| row.values.clone()).collect())
             }
