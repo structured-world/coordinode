@@ -63,6 +63,12 @@ rm -f "$out"/sub-*.bundle
 while read -r key path; do
   name="${key#submodule.}"
   name="${name%.path}"
+  # An uninitialized submodule (a fresh worktree) is an empty directory, and
+  # git there would answer for the enclosing repository instead.
+  if [ "$(git -C "$repo/$path" rev-parse --show-toplevel 2>/dev/null)" != "$(cd "$repo/$path" && pwd -P)" ]; then
+    echo "submodule $path is not checked out; run: git -C '$repo' submodule update --init" >&2
+    exit 1
+  fi
   git -C "$repo/$path" bundle create -q "$out/sub-$name.bundle" HEAD
 done < <(git -C "$repo" config -f .gitmodules --get-regexp '^submodule\..*\.path$' || true)
 
