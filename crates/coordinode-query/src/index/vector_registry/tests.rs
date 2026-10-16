@@ -109,6 +109,38 @@ fn register_and_lookup() {
     assert_eq!(reg.len(), 1);
 }
 
+/// A generation is registered for its build once. `CREATE VECTOR INDEX` and
+/// the member's own catalog follower both register the definition it
+/// published; a second registration that replaced the graph and its health
+/// signal left a search reading a graph no build was filling, while the
+/// running build filled the one no longer served.
+#[test]
+fn registering_a_generation_for_its_build_twice_keeps_the_first() {
+    let reg = VectorIndexRegistry::new();
+    let def = hnsw(7, "doc_embedding", "Doc", "embedding");
+
+    assert!(reg.register_for_build(def.clone(), None));
+    let graph = reg.get("Doc", "embedding").expect("graph");
+    let health = reg.health_handle("Doc", "embedding").expect("health");
+
+    assert!(!reg.register_for_build(def, None));
+    assert!(Arc::ptr_eq(
+        &graph,
+        &reg.get("Doc", "embedding").expect("graph")
+    ));
+    assert!(Arc::ptr_eq(
+        &health,
+        &reg.health_handle("Doc", "embedding").expect("health")
+    ));
+
+    // A new generation of the index is a new graph.
+    assert!(reg.register_for_build(hnsw(8, "doc_embedding", "Doc", "embedding"), None));
+    assert!(!Arc::ptr_eq(
+        &graph,
+        &reg.get("Doc", "embedding").expect("graph")
+    ));
+}
+
 #[test]
 fn health_tracks_state_and_freshness_watermark() {
     let reg = VectorIndexRegistry::new();

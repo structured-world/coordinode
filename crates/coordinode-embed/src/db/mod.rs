@@ -1448,8 +1448,11 @@ impl Database {
                 continue;
             };
             let tier = registry.tier_handle(label_id, property_id);
-            registry.register_for_build(def.clone(), tier);
-            resolved.push((def, property_id));
+            // Registered already, by the statement that created it on this
+            // member: that statement's build fills it.
+            if registry.register_for_build(def.clone(), tier) {
+                resolved.push((def, property_id));
+            }
         }
 
         let mut members = Vec::with_capacity(resolved.len());

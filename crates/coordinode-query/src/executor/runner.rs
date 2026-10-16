@@ -19203,9 +19203,11 @@ fn execute_create_vector_index(
     let def = ctx.publish_index_in_catalog(descriptor)?;
 
     // Register the empty HNSW graph in memory with its tier handle,
-    // keyed by the ids bound above.
+    // keyed by the ids bound above. This member's catalog follower may have
+    // registered the generation first, from the definition published above:
+    // its build fills the graph then, and this statement starts none.
     let tier = registry.tier_handle(label_id, property_id);
-    registry.register_for_build(def.clone(), tier);
+    let registered = registry.register_for_build(def.clone(), tier);
 
     let shard_id = ctx.shard_id;
 
@@ -19217,77 +19219,79 @@ fn execute_create_vector_index(
         ))
     })?;
 
-    // The build runs on its own thread, owned by the registry, and the
-    // statement returns once it has started. Its readiness is this member's
-    // own: the graph's health signal carries it, and every member builds
-    // its graph from the data it holds; the replicated definition says only
-    // that the index exists. A member that restarts rebuilds the graph on
-    // open.
-    let engine = Arc::clone(engine_arc);
-    let label_owned = label.to_string();
-    let name_owned = name.to_string();
-    let token = registry.new_build_token();
-    let build_token = token.clone();
-    // The build publishes through the index's health signal, not
-    // the registry: the signal is atomic and `Arc`-shared, so the
-    // thread needs neither a borrow of the registry nor a lock on
-    // the search path to report where it is.
-    let health = registry.health_handle(label, property).ok_or_else(|| {
-        ExecutionError::Unsupported(format!(
-            "vector index '{name}' has no health signal to publish build progress on"
-        ))
-    })?;
-    let unbuilt = Arc::clone(&health);
-
-    let thread = std::thread::Builder::new()
-        .name(format!("vec-backfill-{name}"))
-        .spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::index::VectorBuild {
-                    engine: engine.as_ref(),
-                    token: &build_token,
-                    shard_id,
-                    targets: &[crate::index::BuildTarget {
-                        hnsw: hnsw.as_ref(),
-                        health: health.as_ref(),
-                        label: &label_owned,
-                        field_id: property_id,
-                    }],
-                }
-                .run()
-            }));
-            match outcome {
-                // The build marked the index ready after its last fold, only
-                // from the handed-over state; marking it again here would
-                // overrule a rebuild started since.
-                Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
-                    tracing::info!(
-                        index = %name_owned,
-                        scanned,
-                        "vector index backfill complete"
-                    );
-                }
-                // Cancelled: the index is being dropped or replaced by
-                // whoever cancelled us, who owns it from here.
-                Ok(Ok(crate::index::BuildOutcome::Cancelled)) => {}
-                Ok(Err(reason)) => health.mark_offline(reason),
-                Err(panic) => {
-                    let reason = panic
-                        .downcast_ref::<&'static str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "panic in backfill thread".to_string());
-                    health.mark_offline(reason);
-                }
-            }
-        })
-        .map_err(|e| {
-            // Registered rebuilding with no build behind it, the
-            // index would hold a blocked reader until its timeout.
-            unbuilt.mark_offline(format!("could not start the build: {e}"));
-            ExecutionError::Unsupported(format!("spawn backfill thread: {e}"))
+    if registered {
+        // The build runs on its own thread, owned by the registry, and the
+        // statement returns once it has started. Its readiness is this member's
+        // own: the graph's health signal carries it, and every member builds
+        // its graph from the data it holds; the replicated definition says only
+        // that the index exists. A member that restarts rebuilds the graph on
+        // open.
+        let engine = Arc::clone(engine_arc);
+        let label_owned = label.to_string();
+        let name_owned = name.to_string();
+        let token = registry.new_build_token();
+        let build_token = token.clone();
+        // The build publishes through the index's health signal, not
+        // the registry: the signal is atomic and `Arc`-shared, so the
+        // thread needs neither a borrow of the registry nor a lock on
+        // the search path to report where it is.
+        let health = registry.health_handle(label, property).ok_or_else(|| {
+            ExecutionError::Unsupported(format!(
+                "vector index '{name}' has no health signal to publish build progress on"
+            ))
         })?;
-    registry.register_build(&def, &token, thread);
+        let unbuilt = Arc::clone(&health);
+
+        let thread = std::thread::Builder::new()
+            .name(format!("vec-backfill-{name}"))
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::index::VectorBuild {
+                        engine: engine.as_ref(),
+                        token: &build_token,
+                        shard_id,
+                        targets: &[crate::index::BuildTarget {
+                            hnsw: hnsw.as_ref(),
+                            health: health.as_ref(),
+                            label: &label_owned,
+                            field_id: property_id,
+                        }],
+                    }
+                    .run()
+                }));
+                match outcome {
+                    // The build marked the index ready after its last fold, only
+                    // from the handed-over state; marking it again here would
+                    // overrule a rebuild started since.
+                    Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
+                        tracing::info!(
+                            index = %name_owned,
+                            scanned,
+                            "vector index backfill complete"
+                        );
+                    }
+                    // Cancelled: the index is being dropped or replaced by
+                    // whoever cancelled us, who owns it from here.
+                    Ok(Ok(crate::index::BuildOutcome::Cancelled)) => {}
+                    Ok(Err(reason)) => health.mark_offline(reason),
+                    Err(panic) => {
+                        let reason = panic
+                            .downcast_ref::<&'static str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "panic in backfill thread".to_string());
+                        health.mark_offline(reason);
+                    }
+                }
+            })
+            .map_err(|e| {
+                // Registered rebuilding with no build behind it, the
+                // index would hold a blocked reader until its timeout.
+                unbuilt.mark_offline(format!("could not start the build: {e}"));
+                ExecutionError::Unsupported(format!("spawn backfill thread: {e}"))
+            })?;
+        registry.register_build(&def, &token, thread);
+    }
 
     // The build has only started: nothing is indexed yet, and the state
     // reported is the one persisted above.

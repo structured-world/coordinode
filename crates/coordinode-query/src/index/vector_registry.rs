@@ -361,10 +361,38 @@ impl VectorIndexRegistry {
     /// [`Self::register_with_tier`] for an index a build is about to fill:
     /// published already rebuilding, so neither a reader nor a writer ever
     /// takes the empty graph for a finished one.
-    pub fn register_for_build(&self, def: IndexDefinition, tier: Option<VectorTierHandle>) {
+    ///
+    /// Returns whether it registered. A generation already registered keeps
+    /// its graph, its health signal and the build filling them, and the
+    /// caller starts no build of its own: the statement that created the
+    /// index and this member's catalog follower both register it.
+    #[must_use = "only the registration that returns true may start the build"]
+    pub fn register_for_build(&self, def: IndexDefinition, tier: Option<VectorTierHandle>) -> bool {
+        let key = (def.label.clone(), def.property().to_string());
+        // Held from the check to the insert, so two registrations of one
+        // generation cannot both pass the check.
+        let mut definitions = self.definitions.write().unwrap_or_else(|e| e.into_inner());
+        if definitions
+            .get(&key)
+            .is_some_and(|registered| registered.generation == def.generation)
+        {
+            return false;
+        }
+        let Some(hnsw) = self.new_graph(&def, tier) else {
+            return false;
+        };
         let health = HealthSignal::new_ready();
         health.report_rebuild_progress(0.0, 0);
-        self.insert_index(def, tier, health);
+        self.indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), hnsw);
+        self.health
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), health);
+        definitions.insert(key, def);
+        true
     }
 
     fn insert_index(
@@ -373,23 +401,14 @@ impl VectorIndexRegistry {
         tier: Option<VectorTierHandle>,
         health: Arc<HealthSignal>,
     ) {
-        let Some(config) = def.vector_config.as_ref() else {
-            tracing::error!("register called with non-vector IndexDefinition: {def}");
+        let Some(hnsw) = self.new_graph(&def, tier) else {
             return;
         };
-
-        let mut hnsw = HnswIndex::new(self.hnsw_config_from(config, def.property()));
-        // Bind the caller-resolved tier handle BEFORE the index is
-        // moved into the registry so subsequent inserts persist f32
-        // to disk. `None` keeps the index pure in-RAM
-        // (test path, ad-hoc analytics).
-        hnsw.set_vector_tier(tier);
-
         let key = (def.label.clone(), def.property().to_string());
         self.indexes
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), Arc::new(RwLock::new(hnsw)));
+            .insert(key.clone(), hnsw);
         self.health
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -398,6 +417,26 @@ impl VectorIndexRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key, def);
+    }
+
+    /// An empty graph for `def` bound to `tier`, or `None` when `def` is not
+    /// a vector index.
+    fn new_graph(
+        &self,
+        def: &IndexDefinition,
+        tier: Option<VectorTierHandle>,
+    ) -> Option<HnswHandle> {
+        let Some(config) = def.vector_config.as_ref() else {
+            tracing::error!("register called with non-vector IndexDefinition: {def}");
+            return None;
+        };
+        let mut hnsw = HnswIndex::new(self.hnsw_config_from(config, def.property()));
+        // Bind the caller-resolved tier handle BEFORE the index is
+        // moved into the registry so subsequent inserts persist f32
+        // to disk. `None` keeps the index pure in-RAM
+        // (test path, ad-hoc analytics).
+        hnsw.set_vector_tier(tier);
+        Some(Arc::new(RwLock::new(hnsw)))
     }
 
     /// Build the [`HnswConfig`] for an index from its vector config + property
