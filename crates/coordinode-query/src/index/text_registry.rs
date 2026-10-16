@@ -507,12 +507,33 @@ impl TextIndexRegistry {
     /// sharing one index across properties would overwrite on the same node_id.
     ///
     /// Uses interior mutability — safe to call via `&self`.
-    pub fn register(&self, def: IndexDefinition) -> Result<(), String> {
+    ///
+    /// Returns whether this call registered it: `false` when the same
+    /// generation of the index is registered already, which is then left as
+    /// it is. Only the caller that registered it rebuilds it.
+    pub fn register(&self, def: IndexDefinition) -> Result<bool, String> {
         let Some(config) = def.text_config.as_ref() else {
             return Err(format!(
                 "register called with non-text IndexDefinition: {def}"
             ));
         };
+
+        // Held until the definition is stored: the check and the creation are
+        // one step, so two callers registering one new generation (the
+        // statement that created it and the follower of applied definitions)
+        // cannot both create it. A second creation would empty the directory
+        // the first one's rebuild is writing.
+        let canonical_key = (def.label.clone(), def.property().to_string());
+        let mut defs = self
+            .definitions
+            .write()
+            .map_err(|_| "text index registry lock poisoned".to_string())?;
+        if defs
+            .get(&canonical_key)
+            .is_some_and(|registered| registered.generation == def.generation)
+        {
+            return Ok(false);
+        }
 
         // Create one tantivy index per indexed property.
         for prop in &def.properties {
@@ -571,11 +592,8 @@ impl TextIndexRegistry {
         }
 
         // Store definition under the first property (canonical key for metadata lookup).
-        let canonical_key = (def.label.clone(), def.property().to_string());
-        if let Ok(mut defs) = self.definitions.write() {
-            defs.insert(canonical_key, def);
-        }
-        Ok(())
+        defs.insert(canonical_key, def);
+        Ok(true)
     }
 
     /// Unregister a text index by label and any one of its properties.

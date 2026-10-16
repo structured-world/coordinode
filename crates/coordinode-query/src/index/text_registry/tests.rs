@@ -44,6 +44,37 @@ fn register_and_lookup() {
     assert_eq!(reg.len(), 1);
 }
 
+/// Two paths can register one new definition: the statement that created it
+/// and the member's follower of applied definitions. The second registration
+/// of the same generation leaves the index as it is, and says it did not
+/// register it, so only the first rebuilds. Recreating it instead emptied
+/// the index the first had just filled and, run beside that rebuild,
+/// removed the files it was writing.
+#[test]
+fn registering_the_same_generation_again_keeps_the_index() {
+    let dir = TempDir::new().unwrap();
+    let reg = TextIndexRegistry::new(dir.path());
+    let def = text(
+        1,
+        "article_body",
+        "Article",
+        vec!["body".into()],
+        test_config(),
+    );
+    assert!(reg.register(def.clone()).unwrap(), "the first registers it");
+    reg.on_text_written(
+        "Article",
+        NodeId::from_raw(1),
+        "body",
+        "Rust graph database engine",
+    );
+
+    let second = reg.register(def).unwrap();
+    let results = reg.search("Article", "body", "rust", 10).unwrap();
+    assert_eq!(results.len(), 1, "the index keeps what it held");
+    assert!(!second, "the second finds it registered");
+}
+
 #[test]
 fn index_and_search() {
     let dir = TempDir::new().unwrap();
