@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::writer::ReplicatedWriter;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
+use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::read_concern::{
     ReadConcern as ExecutorReadConcern, ReadConcernLevel as ExecutorReadConcernLevel,
 };
@@ -62,6 +63,9 @@ pub(crate) struct Requested {
     pub deadline: Option<std::time::Instant>,
     /// Thrown when the caller cancels the statement or goes away.
     pub cancel: Option<coordinode_core::budget::CancelFlag>,
+    /// The client operation the statement carries out; `None` runs it
+    /// unbound.
+    pub operation: Option<OperationDescriptor>,
 }
 
 /// A statement whose settings are resolved and consistent, not yet fenced.
@@ -75,6 +79,7 @@ pub(crate) struct Checked {
     query_memory_limit: Option<u64>,
     deadline: Option<std::time::Instant>,
     cancel: Option<coordinode_core::budget::CancelFlag>,
+    operation: Option<OperationDescriptor>,
 }
 
 /// A statement this node may run, with what the fence learned about it.
@@ -95,6 +100,8 @@ pub(crate) struct Admitted {
     pub deadline: Option<std::time::Instant>,
     /// Thrown when the caller cancels the statement or goes away.
     pub cancel: Option<coordinode_core::budget::CancelFlag>,
+    /// The client operation the statement carries out.
+    pub operation: Option<OperationDescriptor>,
     /// The applied log index the read was served at; zero outside a cluster.
     pub applied_index: u64,
     /// Whether this node led when it served the statement.
@@ -114,6 +121,7 @@ impl Admitted {
             query_memory_limit: self.query_memory_limit,
             deadline: self.deadline,
             cancel: self.cancel.clone(),
+            operation: self.operation,
         }
     }
 }
@@ -284,6 +292,7 @@ impl StatementExecutor {
             query_memory_limit: requested.query_memory_limit,
             deadline: requested.deadline,
             cancel: requested.cancel.clone(),
+            operation: requested.operation,
         })
     }
 
@@ -298,6 +307,7 @@ impl StatementExecutor {
             query_memory_limit: checked.query_memory_limit,
             deadline: checked.deadline,
             cancel: checked.cancel,
+            operation: checked.operation,
             applied_index: 0,
             served_by_leader: false,
             read_as_of_ts: 0,
@@ -356,6 +366,7 @@ impl StatementExecutor {
             query_memory_limit: checked.query_memory_limit,
             deadline: checked.deadline,
             cancel: checked.cancel,
+            operation: checked.operation,
             applied_index,
             served_by_leader,
             read_as_of_ts: fence.as_of().unwrap_or(0),
@@ -489,7 +500,10 @@ impl StatementExecutor {
     /// The connection to member `leader_id`, made under this node's identity
     /// and expecting the leader's: the one the consensus layer uses, so the
     /// hop is authenticated both ways like any other peer traffic.
-    fn leader_channel(&self, leader_id: u64) -> Result<tonic::transport::Channel, Status> {
+    pub(crate) fn leader_channel(
+        &self,
+        leader_id: u64,
+    ) -> Result<tonic::transport::Channel, Status> {
         let node = self.raft_node.as_ref().ok_or_else(|| {
             Status::failed_precondition(format!(
                 "not the leader; leader is node {leader_id}, and this node has no peers"

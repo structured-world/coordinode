@@ -67,20 +67,47 @@ fn to_op_maps_begin_ordering_with_unspecified_defaulting_to_ordered() {
 
 #[test]
 fn to_op_maps_commit_rollback_cancel() {
+    let reference = crate::proto::operation::OperationRef {
+        issuer: vec![7; 16],
+        incarnation: 2,
+        sequence: 5,
+        deployment: vec![8; 16],
+    };
     let commit = ClientFrame {
         request_id: 1,
         op: Some(client_frame::Op::Commit(Commit {
             txid: 4,
             last_nonce: 9,
+            operation: Some(reference.clone()),
         })),
     };
-    assert!(matches!(
-        to_op(commit.op, &anonymous()),
+    match to_op(commit.op, &anonymous()) {
         Ok(SessionOp::Commit {
             txid: 4,
-            last_nonce: 9
-        })
-    ));
+            last_nonce: 9,
+            operation: Some(descriptor),
+        }) => assert_eq!(
+            crate::services::operation::descriptor_to_proto(&descriptor),
+            reference
+        ),
+        other => panic!("a commit keeps its operation, got {other:?}"),
+    }
+    // A reference without its domain is refused, never committed unbound.
+    let stripped = ClientFrame {
+        request_id: 1,
+        op: Some(client_frame::Op::Commit(Commit {
+            txid: 4,
+            last_nonce: 9,
+            operation: Some(crate::proto::operation::OperationRef {
+                deployment: Vec::new(),
+                ..reference
+            }),
+        })),
+    };
+    assert_eq!(
+        to_op(stripped.op, &anonymous()).unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
     let rollback = ClientFrame {
         request_id: 1,
         op: Some(client_frame::Op::Rollback(Rollback { txid: 4 })),
@@ -298,8 +325,8 @@ fn to_op_reads_a_statements_own_settings_and_source() {
                 "an unspecified preference and zero positions leave those to the session"
             );
             assert_eq!(
-                source,
-                Some(StatementSource {
+                source.as_deref(),
+                Some(&StatementSource {
                     file: "pay.rs".to_string(),
                     line: 12,
                     function: "charge".to_string(),

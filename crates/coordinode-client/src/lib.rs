@@ -133,6 +133,9 @@ mod proto {
     pub mod session {
         include!(concat!(env!("OUT_DIR"), "/coordinode.v1.session.rs"));
     }
+    pub mod operation {
+        include!(concat!(env!("OUT_DIR"), "/coordinode.v1.operation.rs"));
+    }
 }
 
 use proto::{
@@ -569,6 +572,8 @@ impl CoordinodeClient {
                     write_concern,
                     read_preference: (read_preference != 0).then_some(read_preference),
                     source: location.map(source::statement_source),
+                    // The driver does not number its writes yet.
+                    operation: None,
                 },
             )
             .await;
@@ -591,6 +596,8 @@ impl CoordinodeClient {
             // The server's memory limit; a session's `SET query_memory_limit_mb`
             // names another.
             query_memory_limit_mb: None,
+            // The driver does not number its writes yet.
+            operation: None,
         });
 
         if let Some(loc) = location {

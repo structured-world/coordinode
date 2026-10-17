@@ -17,8 +17,10 @@ use coordinode_embed::Database;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proposal::RaftProposalPipeline;
 use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
-use coordinode_server::proto::query;
+use coordinode_server::proto::{operation, query};
 use coordinode_server::services::cypher::CypherServiceImpl;
+use coordinode_server::services::operation::OperationServiceImpl;
+use coordinode_server::services::statement::StatementExecutor;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use parking_lot::RwLock;
@@ -82,21 +84,22 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> No
         Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap(),
     ));
 
-    let cypher = CypherServiceImpl::new(
-        Arc::clone(&db),
-        Arc::new(coordinode_query::advisor::QueryRegistry::new()),
-        Arc::new(coordinode_query::advisor::nplus1::NPlus1Detector::new()),
-    )
-    .with_raft_node(Arc::clone(&raft));
+    let executor = StatementExecutor::new(Arc::clone(&db)).with_raft_node(Arc::clone(&raft));
+    let cypher = CypherServiceImpl::from_executor(executor.clone());
+    let operations = OperationServiceImpl::new(executor);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let context = Arc::clone(raft.connections().unwrap().context());
     serve_member_port(
         addr,
         &context,
-        tonic::service::Routes::new(RaftServiceServer::new(raft_handler)).add_service(
-            query::cypher_service_server::CypherServiceServer::new(cypher),
-        ),
+        tonic::service::Routes::new(RaftServiceServer::new(raft_handler))
+            .add_service(query::cypher_service_server::CypherServiceServer::new(
+                cypher,
+            ))
+            .add_service(
+                operation::operation_service_server::OperationServiceServer::new(operations),
+            ),
     )
     .await;
 
@@ -163,4 +166,81 @@ async fn a_write_sent_to_a_follower_is_carried_to_the_leader() {
         rows[0].get("tag").and_then(|v| v.as_str()),
         Some("via-follower")
     );
+}
+
+/// A client that only knows a follower numbers its writes all the same: the
+/// enrollment, a bound write and its retry, and an exclusion all reach the
+/// leader, and the write takes effect once.
+#[tokio::test(flavor = "multi_thread")]
+async fn operation_identity_works_through_a_follower() {
+    use tonic_types::StatusExt;
+
+    let (p1, p2) = (alloc_port(), alloc_port());
+    let n1 = open_node(1, p1, None).await;
+    let _n2 = open_node(2, p2, Some((&n1, p1))).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    n1.raft
+        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
+        .await
+        .unwrap();
+    n1.raft.change_membership(vec![1, 2]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let follower = format!("http://127.0.0.1:{p2}");
+    let mut operations =
+        operation::operation_service_client::OperationServiceClient::connect(follower.clone())
+            .await
+            .unwrap();
+    let mut cypher = query::cypher_service_client::CypherServiceClient::connect(follower)
+        .await
+        .unwrap();
+
+    let enrolled = operations
+        .enroll_issuer(operation::EnrollIssuerRequest {
+            issuer: vec![0x52; 16],
+        })
+        .await
+        .expect("an enrollment through a follower reaches the leader")
+        .into_inner();
+    let reference = |sequence| operation::OperationRef {
+        issuer: vec![0x52; 16],
+        incarnation: enrolled.incarnation,
+        sequence,
+        deployment: enrolled.deployment.clone(),
+    };
+    let write = |sequence| query::ExecuteCypherRequest {
+        query: "CREATE (:Bound {k: 1})".to_string(),
+        operation: Some(reference(sequence)),
+        ..Default::default()
+    };
+
+    cypher
+        .execute_cypher(write(enrolled.next_sequence))
+        .await
+        .expect("a bound write through a follower");
+    let refused = cypher
+        .execute_cypher(write(enrolled.next_sequence))
+        .await
+        .expect_err("its retry runs nothing");
+    let info = refused.get_details_error_info().expect("ErrorInfo");
+    assert_eq!(info.reason, "OPERATION_SETTLED");
+    assert_eq!(info.metadata["outcome"], "COMMITTED");
+
+    let excluded = operations
+        .resolve_operation(operation::ResolveOperationRequest {
+            operation: Some(reference(enrolled.next_sequence + 1)),
+            exclude: true,
+        })
+        .await
+        .expect("an exclusion through a follower reaches the leader")
+        .into_inner();
+    assert_eq!(excluded.state(), operation::OperationState::Aborted);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rows = n1
+        .db
+        .write()
+        .execute_cypher("MATCH (n:Bound) RETURN n")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the write took effect once");
 }

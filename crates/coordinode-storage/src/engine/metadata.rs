@@ -21,7 +21,9 @@ use coordinode_core::graph::node::{
     NODE_ID_MAX_SEQUENCE, NODE_LEASE_KEY_PREFIX, NODE_LEASE_TOKEN_LEN, decode_node_lease_key,
     node_lease_key,
 };
-use coordinode_core::group::{DEPLOYMENT_KEY, DeploymentId, retired_identity_key};
+use coordinode_core::group::{
+    DEPLOYMENT_KEY, DeploymentId, ENROLLED_DEPLOYMENT_KEY, retired_identity_key,
+};
 use coordinode_core::txn::proposal::{MetadataCommand, Mutation, PartitionId};
 use coordinode_core::version::{
     GROUP_PAIR_KEY_PREFIX, RecordedPair, VersionPair, decode_group_pair_key, decode_pair,
@@ -65,6 +67,26 @@ pub fn recorded_deployment(engine: &StorageEngine) -> StorageResult<Option<Deplo
         None => Ok(None),
         Some(bytes) => DeploymentId::from_slice(&bytes).map(Some).ok_or_else(|| {
             StorageError::Serialization("the deployment record does not decode".into())
+        }),
+    }
+}
+
+/// The deployment this store belongs to: its record, or, on a member that
+/// joined a group and has not received the record (a joiner installs the
+/// group's state from a snapshot, which leaves each member's own records
+/// out), the deployment it was enrolled in. `None` before either exists.
+///
+/// # Errors
+///
+/// A record does not decode.
+pub fn bound_deployment(engine: &StorageEngine) -> StorageResult<Option<DeploymentId>> {
+    if let Some(recorded) = recorded_deployment(engine)? {
+        return Ok(Some(recorded));
+    }
+    match engine.get(Partition::Schema, ENROLLED_DEPLOYMENT_KEY)? {
+        None => Ok(None),
+        Some(bytes) => DeploymentId::from_slice(&bytes).map(Some).ok_or_else(|| {
+            StorageError::Serialization("the enrollment record does not decode".into())
         }),
     }
 }

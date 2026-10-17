@@ -52,8 +52,13 @@ pub(crate) fn admin_open_engine(
     Ok(coordinode_storage::engine::core::StorageEngine::open_with_oracle(config, oracle)?)
 }
 
-/// The raft-snapshot backup frame's mode byte: a whole database.
-const SNAPSHOT_MODE_FULL: u8 = 0;
+/// The raft-snapshot backup frame's mode byte: a whole database, framed with
+/// the deployment identity its operation records belong to.
+const SNAPSHOT_MODE_FULL: u8 = 2;
+
+/// The mode byte of a whole-database frame without the deployment identity,
+/// written by earlier releases.
+const SNAPSHOT_MODE_FULL_WITHOUT_DOMAIN: u8 = 0;
 
 /// Export the database to a backup file in the requested format.
 ///
@@ -136,17 +141,24 @@ pub(crate) fn run_backup(
         coordinode_embed::backup::BackupFormat::RaftSnapshot => {
             // Self-contained whole-database blob, not the entity-counted
             // logical export. The frame is [mode u8][u32 interner_len]
-            // [interner][snapshot]: the dictionary ahead of the records, so
-            // restore publishes its bindings before it installs anything
-            // encoded with them. The mode byte is always 0 (a whole
-            // database); it stays in the frame so dumps taken with 0.6 still
-            // restore.
+            // [interner][u8 has_deployment][16-byte deployment][snapshot]:
+            // the dictionary ahead of the records, so restore publishes its
+            // bindings before it installs anything encoded with them, and the
+            // deployment the operation records belong to, which the snapshot
+            // leaves out with the rest of the node's own configuration.
             use std::io::Write;
             let interner_bytes = dictionary
                 .to_bytes()
                 .map_err(|e| format!("serialize the field dictionary: {e}"))?;
             let interner_len = u32::try_from(interner_bytes.len())
                 .map_err(|_| "field interner too large to frame".to_string())?;
+            let deployment = coordinode_storage::engine::metadata::bound_deployment(db.engine())
+                .map_err(|e| format!("read the deployment identity: {e}"))?;
+            let mut domain = [0u8; 17];
+            if let Some(id) = deployment {
+                domain[0] = 1;
+                domain[1..].copy_from_slice(id.as_bytes());
+            }
             // The snapshot streams into the file, which it seeks and reads
             // back, so it takes the file itself rather than the buffer.
             let mut file = writer
@@ -155,6 +167,7 @@ pub(crate) fn run_backup(
             file.write_all(&[SNAPSHOT_MODE_FULL])
                 .and_then(|()| file.write_all(&interner_len.to_be_bytes()))
                 .and_then(|()| file.write_all(&interner_bytes))
+                .and_then(|()| file.write_all(&domain))
                 .map_err(|e| format!("backup write failed: {e}"))?;
             let snapshot_bytes =
                 // Read from the live store while writes go on, so no
@@ -224,7 +237,8 @@ pub(crate) fn run_restore(
             use std::io::Read;
             let mut reader = coordinode_embed::backup::restore::RestoreSource::open(&source)
                 .map_err(|e| format!("failed to read input file '{input}': {e}"))?;
-            // Frame: [mode u8][u32 interner_len][interner][snapshot].
+            // Frame: [mode u8][u32 interner_len][interner]
+            // [u8 has_deployment][16-byte deployment][snapshot].
             // The snapshot is installed first, then the framed dictionary's
             // exact bindings are published: installing replaces the Schema
             // partition wholesale and would drop bindings a snapshot taken
@@ -237,6 +251,16 @@ pub(crate) fn run_restore(
                 .map_err(|e| format!("raft-snapshot file truncated (no frame header): {e}"))?;
             match frame[0] {
                 SNAPSHOT_MODE_FULL => {}
+                // Without the deployment its operation records belong to, a
+                // restored store could not tell their descriptors from
+                // another domain's.
+                SNAPSHOT_MODE_FULL_WITHOUT_DOMAIN => {
+                    return Err(
+                        "this raft-snapshot backup was taken by an earlier release and does \
+                         not carry its deployment identity; take a new backup"
+                            .into(),
+                    );
+                }
                 // 0.6 also wrote seqno-bounded deltas; a delta holds only
                 // what changed after a seqno and cannot stand alone.
                 1 => {
@@ -259,8 +283,37 @@ pub(crate) fn run_restore(
             if interner_bytes.len() as u64 != u64::from(interner_len) {
                 return Err("raft-snapshot file truncated (interner body)".into());
             }
+            let mut domain = [0u8; 17];
+            reader
+                .read_exact(&mut domain)
+                .map_err(|e| format!("raft-snapshot file truncated (deployment): {e}"))?;
+            let deployment = match domain[0] {
+                0 => None,
+                1 => coordinode_core::group::DeploymentId::from_slice(&domain[1..]),
+                other => return Err(format!("unknown deployment flag: {other}").into()),
+            };
+            // The admission fences of the history the image replaces: the
+            // image must not reopen what that history closed or retired.
+            let surviving = coordinode_storage::engine::operations::admission_fences(db.engine())
+                .map_err(|e| format!("read the operation fences: {e}"))?;
             coordinode_raft::snapshot::install_full_snapshot_from_reader(db.engine(), &mut reader)
                 .map_err(|e| format!("restore failed: {e}"))?;
+            coordinode_storage::engine::operations::fence_restored(db.engine(), &surviving)
+                .map_err(|e| format!("fence the restored operation records: {e}"))?;
+            // The store continues the image's domain: a descriptor issued
+            // before the backup resolves to its recorded outcome here.
+            if let Some(id) = deployment {
+                db.engine()
+                    .put(
+                        coordinode_storage::engine::partition::Partition::Schema,
+                        coordinode_core::group::DEPLOYMENT_KEY,
+                        id.as_bytes(),
+                    )
+                    .map_err(|e| format!("record the restored deployment identity: {e}"))?;
+            }
+            db.engine()
+                .persist()
+                .map_err(|e| format!("persist the restored operation fences: {e}"))?;
             db.adopt_field_bindings(&interner_bytes)
                 .map_err(|e| format!("restore the field dictionary failed: {e}"))?;
             info!(

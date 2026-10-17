@@ -5,6 +5,7 @@ pub mod coalesce;
 pub mod drain;
 pub mod frame;
 pub mod invariant;
+pub mod operation;
 pub mod proposal;
 pub mod read_concern;
 pub mod read_consistency;

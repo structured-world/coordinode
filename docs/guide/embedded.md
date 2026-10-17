@@ -67,9 +67,25 @@ let as_of = receipt.commit_ts.as_raw();
 // with `OutsideRetention` instead of answering from collected history.
 db.set_retention_window(std::time::Duration::from_secs(24 * 3600));
 let horizon = db.oldest_readable_timestamp();
+
+// A write that takes effect at most once however it is retried: number it
+// with an enrolled issuer, persist the descriptor (`to_bytes`) before running
+// it, and after a lost reply or a restart resolve the same descriptor.
+use coordinode_embed::db::StatementOptions;
+use coordinode_embed::operation::{IssuerId, Resolve};
+let issuer = db.enroll_issuer(IssuerId(*b"payments-worker1"))?;
+let op = issuer.next()?;
+db.execute_cypher_shared_with(
+    "CREATE (:Payment {amount: 10})",
+    None,
+    None,
+    &StatementOptions { operation: Some(op), ..Default::default() },
+)?;
+let outcome = db.resolve_operation(&op, Resolve::Lookup)?; // Committed { .. }
+db.acknowledge_operation(&op)?; // release the outcome once it is no longer needed
 ```
 
-See [Transactions](./transactions) for the full interactive-transaction contract and what the retention window costs in storage.
+See [Transactions](./transactions) for the full interactive-transaction contract, safe retries with operation identity, and what the retention window costs in storage.
 
 ## What Is and Isn't Available
 

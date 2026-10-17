@@ -375,6 +375,23 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
         DatabaseError::SessionSetting(refused) => {
             return super::error_details::invalid_field(refused.setting, refused.reason.clone());
         }
+        // A retry of a settled operation ran nothing; the outcome is its
+        // answer, carried as metadata a client branches on.
+        DatabaseError::OperationSettled {
+            outcome,
+            intent_differs,
+            ..
+        }
+        | DatabaseError::Execution(ExecutionError::OperationSettled {
+            outcome,
+            intent_differs,
+            ..
+        }) => {
+            return super::operation::settled_status(rendered, *outcome, *intent_differs);
+        }
+        DatabaseError::ForeignOperation { descriptor } => {
+            return super::operation::foreign_status(rendered, *descriptor);
+        }
         DatabaseError::Execution(ExecutionError::UniquenessUnresolved { index, limit }) => {
             return status_with_reason(
                 Code::Unavailable,
@@ -899,6 +916,7 @@ fn requested_from_proto(
         query_memory_limit: memory_limit_from_proto(req.query_memory_limit_mb)?,
         deadline,
         cancel: Some(cancel.clone()),
+        operation: super::operation::optional_descriptor("operation", req.operation.as_ref())?,
     })
 }
 
@@ -927,6 +945,15 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // commit and no causal fence (the snapshot was pinned at BEGIN). A zero
         // transaction_id is the auto-commit path below.
         if req.transaction_id != 0 {
+            // The transaction's operation is named on its commit: one named on
+            // a statement inside it would bind part of the transaction.
+            if req.operation.is_some() {
+                return Err(super::error_details::invalid_field(
+                    "operation",
+                    "a statement inside a transaction carries no operation; name it on \
+                     CommitTransactionRequest.operation",
+                ));
+            }
             let params = if req.parameters.is_empty() {
                 None
             } else {
@@ -1170,6 +1197,8 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         request: Request<query::CommitTransactionRequest>,
     ) -> Result<Response<query::CommitTransactionResponse>, Status> {
         let request = request.into_inner();
+        let operation =
+            super::operation::optional_descriptor("operation", request.operation.as_ref())?;
         let receipt = super::blocking(|| {
             let db = self.database().read();
             // The conditions the caller built its statements on, stated before
@@ -1183,7 +1212,10 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                     expect.version,
                 )?;
             }
-            db.commit_transaction(request.transaction_id)
+            match &operation {
+                Some(operation) => db.commit_transaction_as(request.transaction_id, operation),
+                None => db.commit_transaction(request.transaction_id),
+            }
         })
         .map_err(db_error_to_status)?;
         // `applied_index` 0 = no Raft log (embedded / single node); `commit_ts`

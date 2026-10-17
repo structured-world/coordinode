@@ -186,6 +186,11 @@ pub enum Mutation {
     /// entries from the sealed interpretation and exact inputs carried here,
     /// never from its current catalog or rows.
     Derive(DerivedIndexWork),
+    /// A change to the client operation records, decided where the unit is
+    /// applied, in log order. A `Bind` decides whether the unit's other
+    /// effects apply at all: the first attempt of an operation applies, any
+    /// later one applies nothing.
+    Operation(super::operation::OperationCommand),
 }
 
 /// The maintenance binding a DERIVED effect was sealed under.
@@ -320,6 +325,7 @@ impl Mutation {
             Self::RemoveRange { start, end, .. } => 1 + start.len() + end.len(),
             Self::Command(command) => 1 + command.size_estimate(),
             Self::Derive(work) => 1 + work.size_estimate(),
+            Self::Operation(command) => 1 + command.size_estimate(),
         }
     }
 }

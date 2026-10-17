@@ -76,6 +76,105 @@ fn raft_snapshot_round_trips_data_and_interner() {
     assert_eq!(all.len(), 2, "both users restored");
 }
 
+/// A restored image carries its operation outcomes and admits nothing new
+/// under a descriptor issued before the restore: a committed write resolves
+/// as committed and its retry runs nothing, an unused number is refused, the
+/// old incarnation cannot be resumed, and enrollment opens a fresh one above
+/// every incarnation the image or the replaced store held.
+#[test]
+fn a_restored_snapshot_keeps_outcomes_and_fences_old_descriptors() {
+    use coordinode_embed::db::StatementOptions;
+    use coordinode_embed::operation::{IssuerId, OperationOutcome, Resolve};
+
+    const ISSUER: IssuerId = IssuerId([0x31; 16]);
+    let options = |op| StatementOptions {
+        operation: Some(op),
+        ..StatementOptions::default()
+    };
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let (src_dir, dst_dir) = (dir.path().join("src"), dir.path().join("dst"));
+    let backup = dir.path().join("db.snap");
+    let (done, unused) = {
+        let src = Database::open(&src_dir).expect("open src");
+        let issuer = src.enroll_issuer(ISSUER).expect("enroll");
+        let done = issuer.next().expect("number");
+        let unused = issuer.next().expect("number");
+        src.execute_cypher_shared_with("CREATE (:Paid {k: 1})", None, None, &options(done))
+            .expect("bound write");
+        (done, unused)
+    };
+    // The store the image replaces enrolled the issuer three times.
+    {
+        let dst = Database::open(&dst_dir).expect("open dst");
+        for _ in 0..3 {
+            dst.enroll_issuer(ISSUER)
+                .expect("enroll in the replaced store");
+        }
+    }
+
+    let format = std::ffi::OsStr::new("raft-snapshot");
+    coordinode(&[
+        "backup".as_ref(),
+        "--data".as_ref(),
+        src_dir.as_os_str(),
+        "--output".as_ref(),
+        backup.as_os_str(),
+        "--format".as_ref(),
+        format,
+    ]);
+    coordinode(&[
+        "restore".as_ref(),
+        "--data".as_ref(),
+        dst_dir.as_os_str(),
+        "--input".as_ref(),
+        backup.as_os_str(),
+        "--format".as_ref(),
+        format,
+    ]);
+    let mut dst = Database::open(&dst_dir).expect("open dst");
+
+    assert!(matches!(
+        dst.resolve_operation(&done, Resolve::Lookup)
+            .expect("lookup"),
+        OperationOutcome::Committed { .. }
+    ));
+    assert!(
+        dst.execute_cypher_shared_with("CREATE (:Paid {k: 1})", None, None, &options(done))
+            .is_err(),
+        "a retry of the committed write runs nothing"
+    );
+    assert!(
+        dst.execute_cypher_shared_with("CREATE (:Paid {k: 2})", None, None, &options(unused))
+            .is_err(),
+        "an unused number of the old domain is refused"
+    );
+    assert_eq!(
+        dst.resolve_operation(&unused, Resolve::Lookup)
+            .expect("lookup"),
+        OperationOutcome::Aborted
+    );
+    assert_eq!(
+        dst.execute_cypher("MATCH (n:Paid) RETURN n")
+            .expect("count")
+            .len(),
+        1
+    );
+    assert!(
+        dst.resume_issuer(ISSUER, done.op.incarnation, unused.op.sequence)
+            .is_err(),
+        "the old incarnation is closed"
+    );
+    let fresh = dst.enroll_issuer(ISSUER).expect("enroll after restore");
+    assert_eq!(
+        fresh.incarnation(),
+        4,
+        "above every incarnation the image or the replaced store held"
+    );
+    let next = fresh.next().expect("number");
+    dst.execute_cypher_shared_with("CREATE (:Paid {k: 3})", None, None, &options(next))
+        .expect("a fresh incarnation writes");
+}
+
 /// 0.6 could also write a delta of the changes after a seqno. A delta cannot
 /// stand alone, and a seqno does not bound what changed after it (an entry
 /// can apply later at a lower commit timestamp), so restore refuses one and

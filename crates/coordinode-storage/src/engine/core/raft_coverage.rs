@@ -267,6 +267,31 @@ impl StorageEngine {
             index,
             sub,
         };
+        // A unit bound to a client operation is decided first, holding the
+        // issuer's lock through the apply: the next decision about the
+        // operation reads this one's record. A unit its binding refuses
+        // applies only the mark that tells raw readers of the log so.
+        let mut _decision = None;
+        let decided;
+        let mutations = match crate::engine::operations::unit_command(mutations)? {
+            None => mutations,
+            Some((command, rest)) => {
+                _decision = Some(self.operation_decisions.lock(&command.issuer()));
+                let at = coordinode_core::txn::operation::LogPosition { index, sub };
+                let outcome =
+                    crate::engine::operations::decide(self, command, rest, commit_ts, at)?;
+                decided = if outcome.skipped {
+                    vec![Mutation::Put {
+                        partition: coordinode_core::txn::proposal::PartitionId::Schema,
+                        key: crate::engine::operations::skipped_unit_key(at),
+                        value: Vec::new(),
+                    }]
+                } else {
+                    outcome.effects
+                };
+                decided.as_slice()
+            }
+        };
         // Derive before choosing partitions: DERIVED entries are read from
         // the unit's own data effects, which a partition that already holds
         // the entry skips. A data tree ahead of the index tree must not cost
@@ -280,7 +305,7 @@ impl StorageEngine {
             | Mutation::Merge { partition, .. }
             | Mutation::RemoveRange { partition, .. } => Partition::from(*partition),
             // A command's effects are Schema records.
-            Mutation::Command(_) => Partition::Schema,
+            Mutation::Command(_) | Mutation::Operation(_) => Partition::Schema,
             // Resolved above; its entries are index records.
             Mutation::Derive(_) => Partition::Idx,
         };

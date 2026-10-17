@@ -492,7 +492,7 @@ async fn await_self_election(raft: &RaftInstance) -> Result<(), RaftNodeError> {
 
 /// Schema-partition key recording the deployment a joining store is bound
 /// to before the deployment's own record reaches it.
-const KEY_ENROLLED_DEPLOYMENT: &[u8] = b"raft:enrolled_deployment";
+const KEY_ENROLLED_DEPLOYMENT: &[u8] = coordinode_core::group::ENROLLED_DEPLOYMENT_KEY;
 
 /// Bind this store to the deployment it is being enrolled in, or refuse an
 /// enrollment in another one: a store bootstrapping into a deployment, or

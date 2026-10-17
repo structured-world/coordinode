@@ -297,6 +297,9 @@ fn describe(m: &Mutation) -> (String, &[u8], u64) {
             0,
         ),
         Mutation::Command(_) => ("command".to_string(), &[], 0),
+        Mutation::Operation(command) => {
+            ("operation".to_string(), &[], command.size_estimate() as u64)
+        }
         Mutation::Derive(work) => (
             "derive".to_string(),
             &[],

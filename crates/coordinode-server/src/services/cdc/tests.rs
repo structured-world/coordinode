@@ -69,8 +69,10 @@ fn fixture(
         floor,
         Arc::clone(&applied),
     ));
+    let decisions = coordinode_storage::engine::operations::unit_decisions(Arc::clone(&engine));
     let (registry, bg) = build_consumer_registry(engine, pipeline, source, tuning);
-    let service = ChangeEventServiceImpl::new(0, dirs, registry.clone(), applied, signal);
+    let service =
+        ChangeEventServiceImpl::new(0, dirs, registry.clone(), applied, signal, decisions);
     Fixture {
         service,
         registry,

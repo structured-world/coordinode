@@ -537,3 +537,202 @@ async fn a_member_that_stands_last_leads_only_when_no_other_can() {
     nemesis::heal();
     assert!(result.is_ok(), "TIMED OUT");
 }
+
+/// Growing a standalone store into a group keeps its operations: the group
+/// keeps the store's domain, so a descriptor issued before the growth still
+/// resolves, its retry runs nothing, an unused number of the same open
+/// incarnation still writes once, and a member that joins holds the same
+/// outcomes.
+#[tokio::test(flavor = "multi_thread")]
+async fn descriptors_issued_standalone_stay_valid_in_the_grown_group() {
+    use coordinode_embed::db::StatementOptions;
+    use coordinode_embed::operation::{IssuerId, OperationDescriptor, OperationOutcome, Resolve};
+
+    fn run(db: &Database, op: &OperationDescriptor, query: &str) -> Result<(), DatabaseError> {
+        db.execute_cypher_shared_with(
+            query,
+            None,
+            None,
+            &StatementOptions {
+                operation: Some(*op),
+                ..StatementOptions::default()
+            },
+        )
+        .map(drop)
+    }
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (done, later) = {
+            let alone = Database::open(dirs[0].path()).unwrap();
+            let issuer = alone.enroll_issuer(IssuerId([0x29; 16])).unwrap();
+            let done = issuer.next().unwrap();
+            let later = issuer.next().unwrap();
+            run(&alone, &done, "CREATE (:Early {k: 1})").unwrap();
+            (done, later)
+        };
+
+        let (p1, p2) = (alloc_port(), alloc_port());
+        let founder = open(
+            1,
+            dirs[0].path(),
+            p1,
+            Founding::Form { deployment: None },
+            ElectionPreference::Ordinary,
+        )
+        .await
+        .unwrap();
+        let enrollment = founder.enrollment(addr(p1)).expect("enrollment");
+        let joiner = open(
+            2,
+            dirs[1].path(),
+            p2,
+            Founding::Join(enrollment),
+            ElectionPreference::Ordinary,
+        )
+        .await
+        .unwrap();
+        founder
+            .add_learner(2, addr(p2), PKI.identity(2))
+            .await
+            .unwrap();
+        founder.promote(2).await.unwrap();
+
+        {
+            let leader = founder.database().write();
+            assert!(matches!(
+                leader.resolve_operation(&done, Resolve::Lookup).unwrap(),
+                OperationOutcome::Committed { .. }
+            ));
+            assert!(matches!(
+                run(&leader, &done, "CREATE (:Early {k: 1})"),
+                Err(DatabaseError::OperationSettled { .. })
+            ));
+            run(&leader, &later, "CREATE (:Later {k: 1})").unwrap();
+        }
+        wait_until("the joiner holds the later write", || {
+            count(&joiner, "Later") == 1
+        })
+        .await;
+        for m in [&founder, &joiner] {
+            let db = m.database().write();
+            for op in [&done, &later] {
+                assert!(matches!(
+                    db.resolve_operation(op, Resolve::Lookup).unwrap(),
+                    OperationOutcome::Committed { .. }
+                ));
+            }
+            drop(db);
+            assert_eq!(count(m, "Early"), 1);
+        }
+
+        joiner.shutdown().await.unwrap();
+        founder.shutdown().await.unwrap();
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// A bound write's outcome lives in the group's history, not with the member
+/// that led when it ran: after leadership moves, the new leader reports the
+/// commit, answers a retry without running it, and excludes a number the old
+/// leader handed out but never used. Exclusion is the log's decision, so a
+/// follower refuses it, and every member reports the same outcomes.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operation_keeps_its_outcome_across_a_leader_change() {
+    use coordinode_embed::db::StatementOptions;
+    use coordinode_embed::operation::{IssuerId, OperationDescriptor, OperationOutcome, Resolve};
+
+    fn run(db: &Database, op: &OperationDescriptor) -> Result<(), DatabaseError> {
+        db.execute_cypher_shared_with(
+            "CREATE (:Bound {k: 1})",
+            None,
+            None,
+            &StatementOptions {
+                operation: Some(*op),
+                ..StatementOptions::default()
+            },
+        )
+        .map(drop)
+    }
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        let (done, unused) = {
+            let leader = members[0].database().write();
+            let issuer = leader.enroll_issuer(IssuerId([0x17; 16])).unwrap();
+            let done = issuer.next().unwrap();
+            let unused = issuer.next().unwrap();
+            run(&leader, &done).unwrap();
+            (done, unused)
+        };
+
+        members[0].transfer_leadership(2).await.unwrap();
+        assert!(members[1].is_leader().await);
+        {
+            let new_leader = members[1].database().write();
+            assert!(matches!(
+                new_leader
+                    .resolve_operation(&done, Resolve::Lookup)
+                    .unwrap(),
+                OperationOutcome::Committed { .. }
+            ));
+            assert!(matches!(
+                run(&new_leader, &done),
+                Err(DatabaseError::OperationSettled {
+                    outcome: OperationOutcome::Committed { .. },
+                    intent_differs: false,
+                    ..
+                })
+            ));
+        }
+        wait_until("member 1 follows 2", || members[0].leader() == Some(2)).await;
+        assert!(matches!(
+            members[0]
+                .database()
+                .write()
+                .resolve_operation(&unused, Resolve::Exclude),
+            Err(DatabaseError::NotLeader { .. })
+        ));
+        assert_eq!(
+            members[1]
+                .database()
+                .write()
+                .resolve_operation(&unused, Resolve::Exclude)
+                .unwrap(),
+            OperationOutcome::Aborted
+        );
+        assert!(matches!(
+            run(&members[1].database().write(), &unused),
+            Err(DatabaseError::OperationSettled {
+                outcome: OperationOutcome::Aborted,
+                ..
+            })
+        ));
+
+        for m in &members {
+            wait_until("every member holds the exclusion", || {
+                m.database()
+                    .write()
+                    .resolve_operation(&unused, Resolve::Lookup)
+                    .is_ok_and(|o| o == OperationOutcome::Aborted)
+            })
+            .await;
+            assert!(matches!(
+                m.database()
+                    .write()
+                    .resolve_operation(&done, Resolve::Lookup)
+                    .unwrap(),
+                OperationOutcome::Committed { .. }
+            ));
+            assert_eq!(count(m, "Bound"), 1, "the write took effect once");
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}

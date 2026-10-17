@@ -112,6 +112,18 @@ pub enum ExecutionError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// The client operation the statement carries out already stands as
+    /// `outcome`, or cannot be admitted: this run applied nothing.
+    #[error("operation {op:?} stands as {outcome:?}; this run applied nothing")]
+    OperationSettled {
+        /// The operation.
+        op: coordinode_core::txn::operation::OperationId,
+        /// How it stands.
+        outcome: coordinode_core::txn::operation::OperationOutcome,
+        /// Whether its committed outcome carries another intent.
+        intent_differs: bool,
+    },
+
     /// No NodeId could be handed out for a created node: the grant failed or
     /// the shard's identifier space is used up. Nothing was written. A member
     /// that does not lead is refused as [`ExecutionError::NotLeader`].
@@ -20519,6 +20531,15 @@ fn commit_err_to_execution(
         CommitError::RevisionMismatch { expected, current } => {
             ExecutionError::RevisionMismatch { expected, current }
         }
+        CommitError::OperationSettled {
+            op,
+            outcome,
+            intent_differs,
+        } => ExecutionError::OperationSettled {
+            op,
+            outcome,
+            intent_differs,
+        },
     }
 }
 

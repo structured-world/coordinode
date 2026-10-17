@@ -168,6 +168,7 @@ async fn grpc_commit_conditioned_on_a_node_version() {
     let status = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: account.as_raw(),
                 version: Some(read_version),
@@ -231,6 +232,7 @@ async fn grpc_commit_conditioned_on_a_node_version() {
     .expect("statement");
     svc.commit_transaction(Request::new(query::CommitTransactionRequest {
         transaction_id: retry,
+        operation: None,
         expect: vec![query::ExpectedNodeVersion {
             node_id: account.as_raw(),
             version: Some(current),
@@ -277,6 +279,7 @@ async fn grpc_a_read_only_commit_still_checks_its_condition() {
     let status = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: guard.as_raw(),
                 version: Some(read_version),
@@ -306,6 +309,7 @@ async fn grpc_a_read_only_commit_still_checks_its_condition() {
         .transaction_id;
     svc.commit_transaction(Request::new(query::CommitTransactionRequest {
         transaction_id: again,
+        operation: None,
         expect: vec![query::ExpectedNodeVersion {
             node_id: guard.as_raw(),
             version: Some(current),
@@ -363,6 +367,7 @@ async fn grpc_a_guard_condition_is_refused_beside_a_write_of_the_guard_in_flight
     let status = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: guard.as_raw(),
                 version: Some(version),
@@ -434,6 +439,7 @@ async fn grpc_a_self_committing_statement_reports_the_version_it_wrote() {
     .expect("statement");
     svc.commit_transaction(Request::new(query::CommitTransactionRequest {
         transaction_id: tx,
+        operation: None,
         expect: vec![query::ExpectedNodeVersion {
             node_id: node.as_raw(),
             version: Some(reported),
@@ -470,6 +476,7 @@ async fn grpc_a_buffered_statement_reports_no_timestamp_of_its_own() {
     let receipt = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            operation: None,
             expect: vec![],
         }))
         .await
@@ -532,6 +539,7 @@ async fn grpc_a_claim_fences_the_writes_of_the_holder_it_replaced() {
     let status = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: claim.as_raw(),
                 version: Some(held_at),
@@ -598,6 +606,7 @@ async fn grpc_a_retry_after_an_unheard_outcome_learns_which_way_it_went() {
             .expect("statement");
             svc.commit_transaction(Request::new(query::CommitTransactionRequest {
                 transaction_id: tx,
+                operation: None,
                 expect: vec![query::ExpectedNodeVersion {
                     node_id: counter.as_raw(),
                     version: Some(before),
@@ -665,6 +674,7 @@ async fn grpc_two_claimers_of_one_record_produce_one_winner() {
     let commit = |tx: u64| {
         svc.commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: lease.as_raw(),
                 version: Some(free_at),
@@ -731,6 +741,7 @@ async fn grpc_interactive_transaction_commit() {
     let receipt = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            operation: None,
             expect: vec![],
         }))
         .await
@@ -819,6 +830,7 @@ async fn grpc_interactive_transaction_rollback() {
     assert!(
         svc.commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            operation: None,
             expect: vec![],
         }))
         .await

@@ -70,6 +70,8 @@ const KIND_REMOVE_RANGE: u8 = 3;
 const KIND_COMMAND: u8 = 4;
 /// DERIVED index work, MessagePack-encoded under the Idx partition tag.
 const KIND_DERIVE: u8 = 5;
+/// An operation command, MessagePack-encoded under the Schema partition tag.
+const KIND_OPERATION: u8 = 6;
 
 // ── NvmeWriteBuffer ───────────────────────────────────────────────
 
@@ -326,6 +328,12 @@ fn encode_mutation(mutation: &Mutation, buf: &mut Vec<u8>) -> io::Result<()> {
             let encoded = rmp_serde::to_vec(work).map_err(io::Error::other)?;
             write_bytes(&encoded, buf);
         }
+        Mutation::Operation(command) => {
+            buf.push(KIND_OPERATION);
+            buf.push(partition_to_u8(PartitionId::Schema));
+            let encoded = rmp_serde::to_vec(command).map_err(io::Error::other)?;
+            write_bytes(&encoded, buf);
+        }
     }
     Ok(())
 }
@@ -491,6 +499,10 @@ fn decode_entry(data: &[u8]) -> Option<DrainEntry> {
             KIND_DERIVE => {
                 let encoded = read_bytes(data, &mut pos)?;
                 Mutation::Derive(rmp_serde::from_slice(&encoded).ok()?)
+            }
+            KIND_OPERATION => {
+                let encoded = read_bytes(data, &mut pos)?;
+                Mutation::Operation(rmp_serde::from_slice(&encoded).ok()?)
             }
             _ => return None,
         };

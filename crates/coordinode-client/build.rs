@@ -80,6 +80,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // stream subscriptions on one stream.
                 format!("{proto_root_str}/coordinode/v1/replication/cdc.proto"),
                 format!("{proto_root_str}/coordinode/v1/session/session.proto"),
+                // Client operation identity: enrollment, resolution and the
+                // reference a write carries.
+                format!("{proto_root_str}/coordinode/v1/operation/operation.proto"),
             ],
             &includes,
         )?;

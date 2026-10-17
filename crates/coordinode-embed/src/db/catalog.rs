@@ -477,6 +477,7 @@ impl Database {
             vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
             budget: super::statement_budget(self.query_memory_limit, None, None),
+            operation: None,
         };
         self.run_plan(
             Statement {

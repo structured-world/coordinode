@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 
 use crate::types::{ConnectionSettings, Failure, SessionStats, StatementSource};
@@ -41,14 +42,18 @@ impl std::error::Error for EngineError {}
 /// for an autonomous (auto-commit) statement. `settings` are the statement's
 /// own settings over its session's: a field still unset is the engine's
 /// default. `source` is where in the client's code the statement was issued.
-/// `cancel` is thrown when the client cancels the statement: the engine stops
-/// its work at the next check and answers with a cancellation.
+/// `operation` is the client operation an autonomous statement carries out:
+/// its writes take effect at most once, and a retry of one already settled is
+/// refused with its outcome. `cancel` is thrown when the client cancels the
+/// statement: the engine stops its work at the next check and answers with a
+/// cancellation.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot serve a session's statements",
     label = "needs `CursorEngine`",
     note = "the server implements it over the database as `DatabaseCursorEngine`"
 )]
 pub trait CursorEngine: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn open_cursor(
         &self,
         query: &str,
@@ -56,6 +61,7 @@ pub trait CursorEngine: Send + Sync {
         txid: u64,
         settings: &ConnectionSettings,
         source: Option<&StatementSource>,
+        operation: Option<&OperationDescriptor>,
         cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError>;
 
@@ -77,7 +83,14 @@ pub trait CursorEngine: Send + Sync {
     /// Commit an interactive transaction, flushing its buffered writes in one
     /// proposal and returning the commit receipt: the HLC commit timestamp plus
     /// the applied Raft index (the causal token; `None` in embedded mode).
-    fn commit_transaction(&self, txid: u64) -> Result<CommitReceipt, EngineError>;
+    /// With `operation`, the commit carries out that client operation: it
+    /// takes effect at most once, and a repeat of one already settled is
+    /// refused with its outcome.
+    fn commit_transaction(
+        &self,
+        txid: u64,
+        operation: Option<&OperationDescriptor>,
+    ) -> Result<CommitReceipt, EngineError>;
 
     /// Roll back an interactive transaction, discarding its buffered writes. No
     /// proposal is emitted (nothing was durable).

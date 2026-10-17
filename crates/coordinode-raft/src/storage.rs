@@ -746,13 +746,15 @@ impl LogStore {
                     | Mutation::Merge { partition, key, .. } => {
                         Partition::from(*partition).is_user_key(key)
                     }
-                    // Removals, metadata commands and index maintenance add
-                    // nothing of the user's: an index entry follows a record
-                    // the same unit or an earlier one wrote.
+                    // Removals, metadata and operation commands and index
+                    // maintenance add nothing of the user's: an index entry
+                    // follows a record the same unit or an earlier one wrote,
+                    // and an operation record describes the unit's own data.
                     Mutation::Delete { .. }
                     | Mutation::RemoveRange { .. }
                     | Mutation::Command(_)
-                    | Mutation::Derive(_) => false,
+                    | Mutation::Derive(_)
+                    | Mutation::Operation(_) => false,
                 });
             if writes {
                 return Ok(true);
@@ -1671,9 +1673,13 @@ impl CoordinodeStateMachine {
     ) -> Result<Response, io::Error> {
         let proposal_key = proposal.id.as_raw();
         let proposal_size = proposal.size_estimate();
+        // A unit bound to a client operation is decided by its binding, which
+        // is durable and marks a refused unit for raw readers of the log; the
+        // process-local filter below would drop a retransmission unmarked.
+        let bound = matches!(proposal.mutations.last(), Some(Mutation::Operation(_)));
 
         // Dedup check: same key + same size = already applied
-        {
+        if !bound {
             let mut dedup = self
                 .dedup
                 .lock()
@@ -1729,7 +1735,7 @@ impl CoordinodeStateMachine {
         }
 
         // Record in dedup map
-        {
+        if !bound {
             let mut dedup = self
                 .dedup
                 .lock()

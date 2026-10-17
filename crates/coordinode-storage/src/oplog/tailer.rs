@@ -61,7 +61,7 @@
 use std::path::PathBuf;
 
 use crate::error::{StorageError, StorageResult};
-use crate::oplog::convert::expand_units;
+use crate::oplog::convert::expand_units_decided;
 use crate::oplog::entry::{OplogEntry, OplogOp, ShardId};
 use crate::oplog::segment::{HEADER_SIZE, read_frames_from};
 
@@ -147,7 +147,16 @@ pub struct OplogTailer {
     /// through it must carry the index expected next, and a segment that no
     /// longer matches is located again by index.
     cursor: Option<SegmentCursor>,
+    /// Which units of a Raft log their operation binding refused, as the
+    /// member that applied them recorded. Without it a bound unit fails the
+    /// read instead of being delivered on a guess.
+    decisions: Option<UnitDecisionSource>,
 }
+
+/// See [`OplogTailer::with_unit_decisions`].
+pub type UnitDecisionSource = std::sync::Arc<
+    dyn Fn(coordinode_core::txn::operation::LogPosition) -> StorageResult<bool> + Send + Sync,
+>;
 
 /// A segment and a byte offset inside it.
 struct SegmentCursor {
@@ -175,7 +184,18 @@ impl OplogTailer {
             next: token.next_index()?,
             held: !token.is_start(),
             cursor: None,
+            decisions: None,
         })
+    }
+
+    /// Read a Raft log whose units may be bound to client operations: a unit
+    /// `decisions` says its binding refused is left out, since none of its
+    /// operations took effect. The source is the applying member's record,
+    /// [`unit_skipped`](crate::engine::operations::unit_skipped).
+    #[must_use]
+    pub fn with_unit_decisions(mut self, decisions: UnitDecisionSource) -> Self {
+        self.decisions = Some(decisions);
+        self
     }
 
     /// The next log index the tailer reads.
@@ -258,8 +278,10 @@ impl OplogTailer {
                 self.next = entry.index + 1;
                 self.held = true;
                 reached = true;
-                // A reader sees the operations a unit frame encodes.
-                let ops = expand_units(&entry.ops)?.into_owned();
+                // A reader sees the operations a unit frame encodes, and
+                // none of a unit that took no effect.
+                let ops = expand_units_decided(&entry.ops, entry.index, self.decisions.as_deref())?
+                    .into_owned();
                 if passes_filter(&entry, &ops, filters) {
                     let token = ResumeToken {
                         shard_id: self.shard_id,

@@ -483,6 +483,31 @@ fn the_first_deployment_record_stands() {
     );
 }
 
+/// A member that joined a group belongs to the deployment it was enrolled
+/// in until the deployment's record reaches it, which a joiner installing
+/// the group's state from a snapshot never receives; the record, once
+/// there, is what the store belongs to.
+#[test]
+fn a_joined_store_belongs_to_the_deployment_it_was_enrolled_in() {
+    use coordinode_core::group::{DeploymentId, ENROLLED_DEPLOYMENT_KEY};
+
+    let dir = TempDir::new().unwrap();
+    let (engine, oracle) = open(&dir);
+    assert_eq!(bound_deployment(&engine).unwrap(), None);
+    engine
+        .put(Partition::Schema, ENROLLED_DEPLOYMENT_KEY, &[3; 16])
+        .unwrap();
+    assert_eq!(
+        bound_deployment(&engine).unwrap(),
+        Some(DeploymentId([3; 16]))
+    );
+    apply(&engine, oracle.next().as_raw(), record_deployment(3));
+    assert_eq!(
+        bound_deployment(&engine).unwrap(),
+        Some(DeploymentId([3; 16]))
+    );
+}
+
 /// A retired identity reads as retired, and an identity it is a prefix of,
 /// or that is a prefix of it, does not.
 #[test]

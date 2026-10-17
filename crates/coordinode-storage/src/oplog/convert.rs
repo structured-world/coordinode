@@ -11,6 +11,7 @@ use std::borrow::Cow;
 
 use coordinode_core::index::derive::resolve_unit;
 use coordinode_core::txn::frame::decode_unit;
+use coordinode_core::txn::operation::LogPosition;
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
 
 use crate::engine::MAX_DERIVED_EFFECTS;
@@ -59,9 +60,9 @@ pub fn mutation_to_op(m: &Mutation) -> StorageResult<OplogOp> {
             start: start.clone(),
             end: end.clone(),
         },
-        Mutation::Command(_) => {
+        Mutation::Command(_) | Mutation::Operation(_) => {
             return Err(StorageError::InvalidConfig(
-                "a metadata command reached the journal undecided".into(),
+                "a metadata or operation command reached the journal undecided".into(),
             ));
         }
         Mutation::Derive(work) => OplogOp::Derive {
@@ -141,27 +142,70 @@ fn op_to_mutation(op: &OplogOp) -> StorageResult<Mutation> {
     })
 }
 
+/// Whether the unit at a log position was refused by its operation binding,
+/// as the member that applied it recorded.
+pub type UnitDecisions<'a> = &'a (dyn Fn(LogPosition) -> StorageResult<bool> + Send + Sync);
+
 /// The ops a journalled entry records, each unit frame expanded into the
-/// operations it encodes, in order. DERIVED work stays work; a metadata
-/// command a Raft log entry carries is left out, its effects being decided
-/// at application and never a data change. An entry without a frame is
-/// returned as it is.
+/// operations it encodes, in order. DERIVED work stays work; a metadata or
+/// operation command a Raft log entry carries is left out, its effects being
+/// decided at application and never a data change. An entry without a frame
+/// is returned as it is.
 ///
 /// # Errors
 ///
-/// A frame that does not decode.
+/// A frame that does not decode, or a unit bound to a client operation: only
+/// the member's decision says whether it took effect, see
+/// [`expand_units_decided`].
 pub fn expand_units(ops: &[OplogOp]) -> StorageResult<Cow<'_, [OplogOp]>> {
+    expand_units_decided(ops, 0, None)
+}
+
+/// [`expand_units`] for the entry at log `index`, leaving out every unit
+/// `decisions` says its binding refused. Without `decisions`, a bound unit
+/// is an error rather than a guess.
+///
+/// # Errors
+///
+/// A frame that does not decode, a decision that cannot be read, or a bound
+/// unit without `decisions`.
+pub fn expand_units_decided<'o>(
+    ops: &'o [OplogOp],
+    index: u64,
+    decisions: Option<UnitDecisions<'_>>,
+) -> StorageResult<Cow<'o, [OplogOp]>> {
     if !ops.iter().any(|op| matches!(op, OplogOp::Unit { .. })) {
         return Ok(Cow::Borrowed(ops));
     }
     let mut out = Vec::with_capacity(ops.len());
+    let mut sub = 0u32;
     for op in ops {
         let OplogOp::Unit { frame } = op else {
             out.push(op.clone());
             continue;
         };
-        for mutation in decode_unit(frame)? {
-            if !matches!(mutation, Mutation::Command(_)) {
+        let at = LogPosition { index, sub };
+        sub = sub.checked_add(1).ok_or_else(|| {
+            StorageError::Serialization(format!("entry {index} carries over 2^32 units"))
+        })?;
+        let mutations = decode_unit(frame)?;
+        if mutations
+            .iter()
+            .any(|m| matches!(m, Mutation::Operation(_)))
+        {
+            let Some(decisions) = decisions else {
+                return Err(StorageError::InvalidConfig(format!(
+                    "unit {index}/{} is bound to a client operation, and no decision source \
+                     says whether it took effect",
+                    at.sub
+                )));
+            };
+            if decisions(at)? {
+                continue;
+            }
+        }
+        for mutation in mutations {
+            if !matches!(mutation, Mutation::Command(_) | Mutation::Operation(_)) {
                 out.push(mutation_to_op(&mutation)?);
             }
         }

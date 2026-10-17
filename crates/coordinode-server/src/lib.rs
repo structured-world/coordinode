@@ -23,6 +23,9 @@ pub mod proto {
     pub mod session {
         tonic::include_proto!("coordinode.v1.session");
     }
+    pub mod operation {
+        tonic::include_proto!("coordinode.v1.operation");
+    }
     pub mod health {
         tonic::include_proto!("coordinode.v1.health");
     }

@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
 
 use coordinode_core::budget::CancelFlag;
+use coordinode_core::txn::operation::OperationDescriptor;
 
 use crate::engine::{CursorEngine, EngineError};
 use crate::registry::SessionRegistry;
@@ -215,6 +216,24 @@ impl Session {
             }
         }
         match op {
+            // A transaction's operation is named on its commit: one named on
+            // a statement inside it would bind part of the transaction.
+            SessionOp::Execute {
+                txid,
+                operation: Some(_),
+                ..
+            } if txid != 0 => {
+                send_error(
+                    out,
+                    request_id,
+                    Failure::new(
+                        ErrorCode::InvalidArgument,
+                        "a statement inside a transaction carries no operation; name it on \
+                         the transaction's commit",
+                    ),
+                )
+                .await;
+            }
             // A statement bound to an open transaction: route to its mailbox.
             // Its settings are taken now, so a Configure that arrives after it
             // does not reach back.
@@ -225,6 +244,7 @@ impl Session {
                 nonce,
                 settings,
                 source,
+                ..
             } if txid != 0 && txns.contains_key(&txid) => {
                 let msg = TxnMsg::Statement {
                     nonce,
@@ -233,7 +253,8 @@ impl Session {
                         query,
                         params,
                         settings: self.settings.lock().under(&settings),
-                        source: source.map(Box::new),
+                        source,
+                        operation: None,
                         cancel: self.cancels.register(request_id),
                     },
                 };
@@ -249,6 +270,7 @@ impl Session {
                                 params: HashMap::new(),
                                 settings: ConnectionSettings::default(),
                                 source: None,
+                                operation: None,
                                 cancel: self.cancels.register(request_id),
                             },
                             txid,
@@ -265,6 +287,7 @@ impl Session {
                 txid,
                 settings,
                 source,
+                operation,
                 ..
             } => {
                 let statement = Statement {
@@ -272,7 +295,8 @@ impl Session {
                     query,
                     params,
                     settings: self.settings.lock().under(&settings),
-                    source: source.map(Box::new),
+                    source,
+                    operation,
                     cancel: self.cancels.register(request_id),
                 };
                 self.spawn_autonomous(statement, txid, out);
@@ -287,7 +311,9 @@ impl Session {
             }
 
             SessionOp::Commit {
-                txid, last_nonce, ..
+                txid,
+                last_nonce,
+                operation,
             } => match txns.get(&txid) {
                 // Keep the entry: the task removes itself via `done` once it has
                 // drained and resolved.
@@ -296,10 +322,11 @@ impl Session {
                         .send(TxnMsg::Commit {
                             request_id,
                             last_nonce,
+                            operation,
                         })
                         .await;
                 }
-                None => self.spawn_commit_unknown(request_id, txid, out),
+                None => self.spawn_commit_unknown(request_id, txid, operation, out),
             },
 
             // Rolling back an unknown / already-resolved transaction is a silent
@@ -397,14 +424,20 @@ impl Session {
 
     /// Commit a transaction not in the mailbox map: let the engine produce the
     /// "unknown transaction" error (or commit a racing late-resolved handle).
-    fn spawn_commit_unknown(&self, request_id: u64, txid: u64, out: &mpsc::Sender<OutEvent>) {
+    fn spawn_commit_unknown(
+        &self,
+        request_id: u64,
+        txid: u64,
+        operation: Option<OperationDescriptor>,
+        out: &mpsc::Sender<OutEvent>,
+    ) {
         let engine = Arc::clone(&self.engine);
         let registry = Arc::clone(&self.registry);
         let session_id = self.session_id;
         let out = out.clone();
         registry.request_started(session_id);
         tokio::spawn(async move {
-            commit(&engine, request_id, txid, &out).await;
+            commit(&engine, request_id, txid, operation, &out).await;
             registry.request_finished(session_id);
         });
     }
@@ -461,6 +494,8 @@ struct Statement {
     /// debug mode sends one, and inline it would triple the size of every
     /// statement queued to a transaction.
     source: Option<Box<StatementSource>>,
+    /// The client operation an autonomous statement carries out.
+    operation: Option<OperationDescriptor>,
     /// Its registration as cancellable, from the moment it is received.
     cancel: CancelGuard,
 }
@@ -475,8 +510,13 @@ enum TxnMsg {
         statement: Statement,
     },
     /// Commit the transaction and finish. `last_nonce` is the expected final
-    /// nonce of an ORDERED chain, so the commit can drain a reorder gap.
-    Commit { request_id: u64, last_nonce: u64 },
+    /// nonce of an ORDERED chain, so the commit can drain a reorder gap;
+    /// `operation` is the client operation the commit carries out.
+    Commit {
+        request_id: u64,
+        last_nonce: u64,
+        operation: Option<OperationDescriptor>,
+    },
     /// Roll the transaction back and finish (silent, carries no request id).
     Rollback,
 }
@@ -539,11 +579,15 @@ async fn run_unordered(
                     }
                 }
             }
-            TxnMsg::Commit { request_id, .. } => {
+            TxnMsg::Commit {
+                request_id,
+                operation,
+                ..
+            } => {
                 if aborted {
                     send_error(out, request_id, aborted_txn()).await;
                 } else {
-                    commit(engine, request_id, txid, out).await;
+                    commit(engine, request_id, txid, operation, out).await;
                 }
                 registry.request_finished(session_id);
                 resolved = true;
@@ -616,6 +660,7 @@ async fn run_ordered(
             TxnMsg::Commit {
                 request_id,
                 last_nonce,
+                operation,
             } => {
                 registry.request_started(session_id);
                 if !aborted {
@@ -638,7 +683,7 @@ async fn run_ordered(
                     rollback(engine, txid).await;
                     send_error(out, request_id, aborted_txn()).await;
                 } else {
-                    commit(engine, request_id, txid, out).await;
+                    commit(engine, request_id, txid, operation, out).await;
                 }
                 finish_buffered(registry, session_id, &mut buffer);
                 registry.request_finished(session_id);
@@ -751,10 +796,13 @@ async fn commit(
     engine: &Arc<dyn CursorEngine>,
     request_id: u64,
     txid: u64,
+    operation: Option<OperationDescriptor>,
     out: &mpsc::Sender<OutEvent>,
 ) {
     let engine = Arc::clone(engine);
-    match tokio::task::spawn_blocking(move || engine.commit_transaction(txid)).await {
+    match tokio::task::spawn_blocking(move || engine.commit_transaction(txid, operation.as_ref()))
+        .await
+    {
         Ok(Ok(receipt)) => {
             let _ = out
                 .send((request_id, SessionEvent::Committed { receipt }))
@@ -798,14 +846,22 @@ async fn execute(
         params,
         settings,
         source,
+        operation,
         cancel,
     } = statement;
     // Open on the blocking pool: a write statement commits through Raft here.
     let engine = Arc::clone(engine);
     let flag = cancel.flag.clone();
     let opened = tokio::task::spawn_blocking(move || {
-        let cursor =
-            engine.open_cursor(&query, params, txid, &settings, source.as_deref(), &flag)?;
+        let cursor = engine.open_cursor(
+            &query,
+            params,
+            txid,
+            &settings,
+            source.as_deref(),
+            operation.as_ref(),
+            &flag,
+        )?;
         let columns = cursor.columns();
         Ok::<_, EngineError>((cursor, columns))
     })

@@ -42,6 +42,31 @@ impl GraphServiceImpl {
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
         Self { database }
     }
+
+    /// Run the write `cypher` a typed call builds, carrying out `operation`
+    /// when the client named one.
+    fn write(
+        &self,
+        cypher: &str,
+        params: std::collections::HashMap<String, Value>,
+        operation: Option<coordinode_embed::operation::OperationDescriptor>,
+    ) -> Result<Vec<coordinode_query::executor::row::Row>, coordinode_embed::DatabaseError> {
+        let options = coordinode_embed::db::StatementOptions {
+            operation,
+            ..Default::default()
+        };
+        super::blocking(|| {
+            self.database
+                .read()
+                .execute_cypher_shared_with(
+                    cypher,
+                    (!params.is_empty()).then_some(params),
+                    None,
+                    &options,
+                )
+                .map(|result| result.rows)
+        })
+    }
 }
 
 #[tonic::async_trait]
@@ -51,6 +76,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         request: Request<graph::CreateNodeRequest>,
     ) -> Result<Response<graph::Node>, Status> {
         let req = request.into_inner();
+        let operation = super::operation::optional_descriptor("operation", req.operation.as_ref())?;
 
         // Build `:Label1:Label2` part.
         let label_part: String = req
@@ -79,12 +105,9 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
 
         let cypher = format!("CREATE (n{label_part}{props_part}) RETURN n");
 
-        let rows = super::blocking(|| {
-            self.database
-                .write()
-                .execute_cypher_with_params(&cypher, params)
-        })
-        .map_err(|e| db_err_to_status("create_node", e))?;
+        let rows = self
+            .write(&cypher, params, operation)
+            .map_err(|e| db_err_to_status("create_node", e))?;
 
         let node_id = match rows.first().and_then(|r| r.get("n")) {
             Some(Value::Int(id)) => *id as u64,
@@ -111,6 +134,15 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         request: Request<graph::CreateNodesBatchRequest>,
     ) -> Result<Response<graph::CreateNodesBatchResponse>, Status> {
         let req = request.into_inner();
+        let operation = super::operation::optional_descriptor("operation", req.operation.as_ref())?;
+        // The batch names its operation; one on an entry would bind part of
+        // the batch.
+        if let Some(i) = req.nodes.iter().position(|n| n.operation.is_some()) {
+            return Err(super::error_details::invalid_field(
+                format!("nodes[{i}].operation"),
+                "an entry of a batch carries no operation; name it on the batch",
+            ));
+        }
 
         if req.nodes.is_empty() {
             return Ok(Response::new(graph::CreateNodesBatchResponse {
@@ -158,12 +190,9 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         params.insert("rows".to_string(), Value::Array(rows));
 
-        let result_rows = super::blocking(|| {
-            self.database
-                .write()
-                .execute_cypher_with_params(&cypher, params)
-        })
-        .map_err(|e| db_err_to_status("create_nodes_batch", e))?;
+        let result_rows = self
+            .write(&cypher, params, operation)
+            .map_err(|e| db_err_to_status("create_nodes_batch", e))?;
 
         if result_rows.len() != req.nodes.len() {
             return Err(Status::internal(format!(
@@ -278,6 +307,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         request: Request<graph::CreateEdgeRequest>,
     ) -> Result<Response<graph::Edge>, Status> {
         let req = request.into_inner();
+        let operation = super::operation::optional_descriptor("operation", req.operation.as_ref())?;
 
         let rel_type = cypher_ident(&req.edge_type);
 
@@ -308,12 +338,9 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
              RETURN src, dst"
         );
 
-        let rows = super::blocking(|| {
-            self.database
-                .write()
-                .execute_cypher_with_params(&cypher, params)
-        })
-        .map_err(|e| db_err_to_status("create_edge", e))?;
+        let rows = self
+            .write(&cypher, params, operation)
+            .map_err(|e| db_err_to_status("create_edge", e))?;
 
         let row = rows
             .first()

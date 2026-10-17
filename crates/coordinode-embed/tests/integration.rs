@@ -41,6 +41,7 @@ mod integration {
     mod mvcc;
     mod mvcc_snapshots;
     mod node_id_lookup;
+    mod operation_identity;
     mod oplog_placement;
     mod oplog_segments;
     mod page_checksum;

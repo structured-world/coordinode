@@ -1030,6 +1030,9 @@ pub(crate) async fn serve(
                 consumer_registry,
                 Arc::new(|| 0),
                 None,
+                coordinode_storage::engine::operations::unit_decisions(
+                    database.read().engine_shared(),
+                ),
             ),
         }
         .with_tuning(cdc_tuning),
@@ -1396,6 +1399,12 @@ pub(crate) async fn serve(
         .add_service(
             proto::query::cypher_service_server::CypherServiceServer::new(cypher_service)
                 .max_decoding_message_size(max_req_bytes),
+        )
+        .add_service(
+            proto::operation::operation_service_server::OperationServiceServer::new(
+                services::operation::OperationServiceImpl::new(statement_executor.clone()),
+            )
+            .max_decoding_message_size(max_req_bytes),
         )
         .add_service(
             proto::session::session_service_server::SessionServiceServer::new({

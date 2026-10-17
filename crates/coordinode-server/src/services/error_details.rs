@@ -183,6 +183,18 @@ pub enum Reason {
     /// `label`, `property` and `operator`. Retry once the index is verified
     /// or rebuilt.
     IndexUnresolved,
+    /// The client operation the write carries out already stands settled, or
+    /// cannot be admitted: this attempt ran and applied nothing. Metadata
+    /// carries `outcome` (COMMITTED, ABORTED, ADMITTED, UNKNOWN or RETIRED,
+    /// as `OperationState` names them), `commit_ts` for a committed one, and
+    /// `intent_differs` ("true" when the operation's number was used for
+    /// another write). Terminal: a COMMITTED outcome is the write's answer;
+    /// any other means no attempt of it takes effect now.
+    OperationSettled,
+    /// An operation reference names another deployment than this server's:
+    /// its record is not here, and nothing here resolves it. Metadata carries
+    /// `deployment`, the one the reference names. Terminal.
+    ForeignOperation,
 }
 
 impl Reason {
@@ -223,6 +235,8 @@ impl Reason {
             Reason::QueryDeadlineExceeded => "QUERY_DEADLINE_EXCEEDED",
             Reason::QueryCancelled => "QUERY_CANCELLED",
             Reason::IndexUnresolved => "INDEX_UNRESOLVED",
+            Reason::OperationSettled => "OPERATION_SETTLED",
+            Reason::ForeignOperation => "FOREIGN_OPERATION",
         }
     }
 

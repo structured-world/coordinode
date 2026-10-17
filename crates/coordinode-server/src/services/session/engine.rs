@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::db::{SessionSetting, StatementOptions};
 use coordinode_embed::{Database, DatabaseError};
@@ -82,6 +83,7 @@ impl DatabaseCursorEngine {
 
     /// Run `query` at the leader and page its answer out of memory. A Cancel
     /// thrown meanwhile drops the call, and with it the leader's statement.
+    #[allow(clippy::too_many_arguments)]
     fn forwarded(
         &self,
         leader_id: u64,
@@ -89,9 +91,10 @@ impl DatabaseCursorEngine {
         params: Option<HashMap<String, Value>>,
         settings: &ConnectionSettings,
         source: Option<&SourceContext>,
+        operation: Option<&OperationDescriptor>,
         cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
-        let request = forwarded_request(query, params, settings);
+        let request = forwarded_request(query, params, settings, operation);
         let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
             EngineError::internal(format!("no runtime to reach the leader on: {e}"))
         })?;
@@ -153,6 +156,7 @@ impl CursorEngine for DatabaseCursorEngine {
         txid: u64,
         settings: &ConnectionSettings,
         source: Option<&StatementSource>,
+        operation: Option<&OperationDescriptor>,
         cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         let params = if params.is_empty() {
@@ -188,10 +192,18 @@ impl CursorEngine for DatabaseCursorEngine {
         }
 
         let start = Instant::now();
-        let admitted = match self.admit(query, &requested(settings, cancel))? {
+        let admitted = match self.admit(query, &requested(settings, cancel, operation))? {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
-                return self.forwarded(leader_id, query, params, settings, source.as_ref(), cancel);
+                return self.forwarded(
+                    leader_id,
+                    query,
+                    params,
+                    settings,
+                    source.as_ref(),
+                    operation,
+                    cancel,
+                );
             }
         };
         let fenced = SessionStats {
@@ -242,6 +254,7 @@ impl CursorEngine for DatabaseCursorEngine {
                         params,
                         settings,
                         source.as_ref(),
+                        operation,
                         cancel,
                     );
                 }
@@ -274,11 +287,17 @@ impl CursorEngine for DatabaseCursorEngine {
         Ok(self.database().read().begin_transaction())
     }
 
-    fn commit_transaction(&self, txid: u64) -> Result<CommitReceipt, EngineError> {
-        self.database()
-            .read()
-            .commit_transaction(txid)
-            .map_err(engine_error)
+    fn commit_transaction(
+        &self,
+        txid: u64,
+        operation: Option<&OperationDescriptor>,
+    ) -> Result<CommitReceipt, EngineError> {
+        let db = self.database().read();
+        match operation {
+            Some(operation) => db.commit_transaction_as(txid, operation),
+            None => db.commit_transaction(txid),
+        }
+        .map_err(engine_error)
     }
 
     fn rollback_transaction(&self, txid: u64) -> Result<(), EngineError> {
@@ -329,6 +348,7 @@ fn source_context(source: &StatementSource) -> Option<SourceContext> {
 fn requested(
     settings: &ConnectionSettings,
     cancel: &coordinode_core::budget::CancelFlag,
+    operation: Option<&OperationDescriptor>,
 ) -> Requested {
     Requested {
         read_concern: settings
@@ -347,6 +367,7 @@ fn requested(
         // stream lives on, and Cancel stops a statement.
         deadline: None,
         cancel: Some(cancel.clone()),
+        operation: operation.copied(),
     }
 }
 
@@ -356,6 +377,7 @@ fn forwarded_request(
     query: &str,
     params: Option<HashMap<String, Value>>,
     settings: &ConnectionSettings,
+    operation: Option<&OperationDescriptor>,
 ) -> query::ExecuteCypherRequest {
     let read_concern = (settings.read_concern.is_some()
         || settings.after_index.is_some()
@@ -383,6 +405,9 @@ fn forwarded_request(
         query_memory_limit_mb: settings
             .query_memory_limit
             .and_then(|bytes| u32::try_from(bytes >> 20).ok()),
+        // The leader binds the statement to the same operation, so a retry
+        // through any member is still one write.
+        operation: operation.map(crate::services::operation::descriptor_to_proto),
     }
 }
 

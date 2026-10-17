@@ -124,6 +124,12 @@ pub struct StorageEngine {
     /// Field dictionary reads and snapshot installs take it too, so a reader
     /// never sees a binding's two records half written.
     metadata_decisions: parking_lot::Mutex<()>,
+    /// Held, per issuer stripe, while an operation command is decided and
+    /// applied (and, on the journalled path, journalled), so a decision about
+    /// an operation reads every earlier one about it. Separate from
+    /// `metadata_decisions`: client writes of different issuers decide in
+    /// parallel and never hold off dictionary reads.
+    operation_decisions: crate::engine::operations::DecisionLocks,
     /// Counts changes to the field dictionary this process has seen applied
     /// or installed. A view of the dictionary taken at one value covers every
     /// binding applied before it, so a reader compares it once per query.
@@ -1118,6 +1124,7 @@ impl StorageEngine {
             schema_generation: AtomicU64::new(0),
             node_delta_runs: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             metadata_decisions: parking_lot::Mutex::new(()),
+            operation_decisions: crate::engine::operations::DecisionLocks::default(),
             field_dictionary_generation: AtomicU64::new(0),
             field_dictionary_epoch: AtomicU64::new(0),
             pending_commits,
@@ -2959,8 +2966,8 @@ impl StorageEngine {
                 start,
                 end,
             } => self.remove_range(Partition::from(*partition), start, end),
-            // Both are resolved by the unit they belong to.
-            Mutation::Command(_) | Mutation::Derive(_) => {
+            // Each is resolved by the unit it belongs to.
+            Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => {
                 self.apply_proposal_at(std::slice::from_ref(mutation), 0)
             }
         }
@@ -3089,6 +3096,25 @@ impl StorageEngine {
     /// canonicalises each key to one final operation, so this marks an
     /// upstream bug rather than silently ordering the pair.
     pub fn apply_proposal_at(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
+        if let Some((command, rest)) = crate::engine::operations::unit_command(mutations)? {
+            // The decision and the apply hold the issuer's lock together, so
+            // the next decision about the operation reads this one's record.
+            let _decision = self.operation_decisions.lock(&command.issuer());
+            let decided = crate::engine::operations::decide(
+                self,
+                command,
+                rest,
+                commit_ts,
+                coordinode_core::txn::operation::LogPosition::LOCAL,
+            )?;
+            if decided.effects.is_empty() {
+                return Ok(());
+            }
+            let staged = self.applied_feed.stage(0, commit_ts, &decided.effects);
+            self.apply_proposal_covered(&decided.effects, commit_ts, None)?;
+            staged.publish();
+            return Ok(());
+        }
         // A local commit has no log position; its subscribers follow it by
         // commit timestamp. Staged before the write lands, so a reader that
         // sees it is told the derived indexes may not hold it yet.
@@ -3115,6 +3141,24 @@ impl StorageEngine {
         // Refused before the journal append, which is the write a full disk
         // would fail in.
         self.space.admit()?;
+        if let Some((command, rest)) = crate::engine::operations::unit_command(mutations)? {
+            // The decision, the journal append and the apply hold the
+            // issuer's lock together: the journal records each decision's
+            // effects in the order they were decided, and replay reproduces
+            // them without deciding again.
+            let _decision = self.operation_decisions.lock(&command.issuer());
+            let decided = crate::engine::operations::decide(
+                self,
+                command,
+                rest,
+                commit_ts,
+                coordinode_core::txn::operation::LogPosition::LOCAL,
+            )?;
+            if decided.effects.is_empty() {
+                return Ok(());
+            }
+            return self.journal_and_apply(&decided.effects, commit_ts);
+        }
         if mutations.iter().any(|m| matches!(m, Mutation::Command(_))) {
             // The decision, the journal append and the apply happen under one
             // lock: the journal then records each decision's effects in the
@@ -3266,6 +3310,11 @@ impl StorageEngine {
                 Mutation::Derive(_) => {
                     return Err(StorageError::InvalidConfig(
                         "derived index work reached the write batch unresolved".into(),
+                    ));
+                }
+                Mutation::Operation(_) => {
+                    return Err(StorageError::InvalidConfig(
+                        "an operation command reached the write batch undecided".into(),
                     ));
                 }
             }

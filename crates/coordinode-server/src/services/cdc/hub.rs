@@ -16,7 +16,9 @@ use rustc_hash::FxHashMap;
 
 use coordinode_storage::error::StorageResult;
 use coordinode_storage::oplog::entry::OplogEntry;
-use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken, entry_passes};
+use coordinode_storage::oplog::tailer::{
+    CdcFilters, OplogTailer, ResumeToken, UnitDecisionSource, entry_passes,
+};
 
 /// An entry as the hub holds it, shared by every stream it is handed to.
 pub(crate) type SharedEntry = Arc<(OplogEntry, ResumeToken)>;
@@ -77,6 +79,8 @@ pub(crate) struct CdcHub {
     max_bytes: usize,
     oplog_dirs: Vec<PathBuf>,
     shard_id: u32,
+    /// Which units of the log their operation binding refused.
+    decisions: UnitDecisionSource,
 }
 
 struct Inner {
@@ -115,12 +119,14 @@ impl Inner {
 impl CdcHub {
     /// A hub over the log in `oplog_dirs` of `shard_id`, holding from index
     /// `from` on (the oldest retained entry when 0) and at most `max_bytes`
-    /// of entries.
+    /// of entries. `decisions` says which units their operation binding
+    /// refused, so none of their operations is delivered.
     pub(crate) fn new(
         oplog_dirs: &[PathBuf],
         shard_id: u32,
         from: u64,
         max_bytes: usize,
+        decisions: UnitDecisionSource,
     ) -> StorageResult<Self> {
         let token = if from == 0 {
             ResumeToken::from_start(shard_id)
@@ -131,7 +137,8 @@ impl CdcHub {
                 entry_offset: 0,
             }
         };
-        let tailer = OplogTailer::new(oplog_dirs, token)?;
+        let tailer =
+            OplogTailer::new(oplog_dirs, token)?.with_unit_decisions(Arc::clone(&decisions));
         let base = tailer.next_index();
         Ok(Self {
             inner: parking_lot::Mutex::new(Inner {
@@ -145,7 +152,14 @@ impl CdcHub {
             max_bytes,
             oplog_dirs: oplog_dirs.to_vec(),
             shard_id,
+            decisions,
         })
+    }
+
+    /// Which units of the log their operation binding refused, for a tailer
+    /// of the same log.
+    pub(crate) fn decisions(&self) -> UnitDecisionSource {
+        Arc::clone(&self.decisions)
     }
 
     /// Register a stream at log index `position`.
@@ -185,7 +199,8 @@ impl CdcHub {
                     segment_id: position,
                     entry_offset: 0,
                 },
-            )?;
+            )?
+            .with_unit_decisions(Arc::clone(&self.decisions));
             inner.base = position;
         }
         // Read what was applied since, once for every stream, a batch at a

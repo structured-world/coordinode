@@ -186,6 +186,20 @@ pub enum CommitError {
         /// The node holding it.
         holder: coordinode_core::graph::node::NodeId,
     },
+    /// The client operation this attempt is bound to already stands as
+    /// `outcome`, or cannot be admitted: this attempt applied nothing. A
+    /// committed outcome is the operation's answer, reached by another
+    /// attempt; anything else says why no attempt of it takes effect now.
+    #[error("operation {op:?} stands as {outcome:?}; this attempt applied nothing")]
+    OperationSettled {
+        /// The operation.
+        op: coordinode_core::txn::operation::OperationId,
+        /// How it stands.
+        outcome: coordinode_core::txn::operation::OperationOutcome,
+        /// Whether a committed outcome carries another intent than this
+        /// attempt's: the same number reused for a different write.
+        intent_differs: bool,
+    },
     /// Proving a value this attempt takes in a unique index still being
     /// built free would read more than `limit` stored rows. Nothing was
     /// applied; the value may be free, and the attempt can be retried once
@@ -376,6 +390,12 @@ pub struct Transaction<'a> {
     /// added to [`Self::merge_counter_deltas`], so an attempt that fails
     /// after deriving leaves nothing a later one would count twice.
     kept_counts: rustc_hash::FxHashMap<Vec<u8>, i64>,
+    /// The client operation this attempt carries out, and what it means
+    /// ([`Self::bind_operation`]).
+    operation: Option<(
+        coordinode_core::txn::operation::OperationId,
+        coordinode_core::txn::operation::IntentDigest,
+    )>,
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -591,7 +611,128 @@ impl<'a> Transaction<'a> {
             pressure_exempt: false,
             overlap_wait: None,
             kept_counts: rustc_hash::FxHashMap::default(),
+            operation: None,
         }
+    }
+
+    /// Carry out client operation `op`, meaning `intent`, with this attempt:
+    /// its writes commit together with the operation's record, and only if
+    /// no other attempt of the operation has taken effect. When one has, or
+    /// the operation cannot be admitted, the commit applies nothing and
+    /// reports how the operation stands
+    /// ([`CommitError::OperationSettled`]).
+    pub fn bind_operation(
+        &mut self,
+        op: coordinode_core::txn::operation::OperationId,
+        intent: coordinode_core::txn::operation::IntentDigest,
+    ) {
+        self.operation = Some((op, intent));
+    }
+
+    /// Whether the bound operation `op` (meaning `intent`) let `attempt`
+    /// stand once its unit was applied: the record names `attempt`,
+    /// committed or admitted. A record not written yet (a write concern that
+    /// does not wait for the apply) does not refuse it.
+    fn check_operation(
+        &self,
+        op: coordinode_core::txn::operation::OperationId,
+        intent: coordinode_core::txn::operation::IntentDigest,
+        attempt: u64,
+    ) -> Result<(), CommitError> {
+        use coordinode_core::txn::operation::{OperationOutcome, OperationState, outcome_of};
+
+        use crate::engine::operations::{incarnation_record, operation_record};
+
+        // The record alone answers the common case, that this attempt took
+        // effect; the incarnation is read only to classify a refusal.
+        let record = operation_record(self.engine, &op)?;
+        if let Some(record) = record.as_ref() {
+            if matches!(
+                record.state,
+                OperationState::Committed { attempt: theirs, .. }
+                    | OperationState::Admitted { attempt: theirs, .. }
+                    if theirs == attempt
+            ) {
+                return Ok(());
+            }
+        }
+        let incarnation = incarnation_record(self.engine, &op.issuer, op.incarnation)?;
+        let outcome = outcome_of(&op, incarnation.as_ref(), record.as_ref());
+        let admissible = incarnation.is_some_and(|inc| {
+            inc.open
+                && op.sequence >= inc.retired_below
+                && op.sequence - inc.retired_below < inc.window
+        });
+        if outcome == OperationOutcome::Unknown && admissible {
+            return Ok(());
+        }
+        Err(CommitError::OperationSettled {
+            op,
+            outcome,
+            intent_differs: record.is_some_and(|r| r.intent_differs(&intent)),
+        })
+    }
+
+    /// Admit client operation `op`, meaning `intent`, through the log ahead
+    /// of the provisional effect this attempt exposes: the admission is
+    /// durable before the effect is, and excludes every other attempt of the
+    /// operation. Returns the admitted attempt, which the drain completes.
+    ///
+    /// # Errors
+    ///
+    /// The admission could not be committed, or another attempt of the
+    /// operation took effect or was admitted first
+    /// ([`CommitError::OperationSettled`]).
+    fn admit_provisional(
+        &self,
+        ctx: &CommitContext<'_>,
+        oracle: &TimestampOracle,
+        op: coordinode_core::txn::operation::OperationId,
+        intent: coordinode_core::txn::operation::IntentDigest,
+    ) -> Result<u64, CommitError> {
+        use coordinode_core::txn::operation::{BindMode, OperationBinding, OperationCommand};
+
+        let unit = |attempt: u64| {
+            vec![Mutation::Operation(OperationCommand::Bind(
+                OperationBinding {
+                    op,
+                    intent,
+                    attempt,
+                    mode: BindMode::Admit,
+                },
+            ))]
+        };
+        // Held as not yet logged until the admission is applied, so no
+        // closed bound passes over its timestamp meanwhile.
+        let (ts, _held) = self
+            .engine
+            .pending_commits()
+            .obligate(|| oracle.next().as_raw());
+        let attempt = if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
+            let id = id_gen.next();
+            let proposal = RaftProposal {
+                id,
+                mutations: unit(id.as_raw()),
+                commit_ts: Timestamp::from_raw(ts),
+                start_ts: self.read_ts,
+                bypass_rate_limiter: false,
+            };
+            pipeline
+                .propose_with_ack(&proposal, ctx.write_concern.w, None)
+                .map_err(proposal_err_to_commit)?;
+            id.as_raw()
+        } else {
+            // Without a pipeline the admission's timestamp names the attempt.
+            let mutations = unit(ts);
+            if self.engine.has_journal() {
+                self.engine.commit_journaled(&mutations, ts)?;
+            } else {
+                self.engine.apply_proposal_at(&mutations, ts)?;
+            }
+            ts
+        };
+        self.check_operation(op, intent, attempt)?;
+        Ok(attempt)
     }
 
     /// The change this transaction has staged to the counter `key` and not
@@ -786,6 +927,7 @@ impl<'a> Transaction<'a> {
             pressure_exempt: false,
             overlap_wait: None,
             kept_counts: rustc_hash::FxHashMap::default(),
+            operation: None,
         }
     }
 
@@ -1774,6 +1916,12 @@ impl<'a> Transaction<'a> {
         // Flush adj merge buffers even in legacy (no MVCC) mode.
         // Legacy puts write directly to engine, but merge adds are buffered.
         if self.oracle.is_none() {
+            if self.operation.is_some() {
+                // Its point writes are already applied, unbound.
+                return Err(CommitError::Serialization(
+                    "a client operation binds only a buffered transaction".into(),
+                ));
+            }
             // No admission without a clock: the conditions are checked
             // against the state as it stands, as the writes are applied to it.
             self.check_expected_versions()?;
@@ -1833,6 +1981,11 @@ impl<'a> Transaction<'a> {
                 applied_index: None,
             });
         }
+        // A bound operation is not checked here: the caller refuses a settled
+        // retry before running its statements, the binding decides at the
+        // apply, and the check after the commit reports a unit it refused.
+        // Checking here too would read both records on every bound write to
+        // catch only a retry racing this very attempt.
 
         // Protection is installed here, in one place, and nothing of this
         // attempt is applied until all of it is: the conditions it declared,
@@ -2055,6 +2208,23 @@ impl<'a> Transaction<'a> {
         // Crash before drain = data lost (explicit contract).
         // Drained entries preserve original commit_ts for CDC fidelity.
         if ctx.write_concern.is_volatile() {
+            // A provisional effect of a client operation is exposed only once
+            // the operation is admitted durably, through the log: its drain
+            // completes that admitted attempt, and a payload lost before the
+            // drain leaves the operation admitted until the host excludes it.
+            let admitted = match self.operation {
+                Some((op, intent)) => {
+                    if ctx.drain_buffer.is_none() {
+                        return Err(CommitError::Serialization(
+                            "a client operation under a memory or cache concern needs the \
+                             drain that completes it"
+                                .into(),
+                        ));
+                    }
+                    Some(self.admit_provisional(ctx, oracle, op, intent)?)
+                }
+                None => None,
+            };
             // Step 1: Apply locally for read visibility.
             for (part, start, end) in &self.range_removals {
                 self.engine.remove_range(*part, start, end)?;
@@ -2084,10 +2254,24 @@ impl<'a> Transaction<'a> {
             // The entry reaches the log only when it is drained: until then
             // its timestamp stays registered as not yet logged, taken while
             // the admission still holds it, so no closed bound passes over it.
-            let unlogged = ctx
-                .drain_buffer
-                .is_some()
-                .then(|| self.engine.pending_commits().hold(commit_ts.as_raw()));
+            // An admitted operation completes at a timestamp taken after its
+            // admission: the drain's record of the outcome must be a later
+            // version than the admission's, and the commit timestamp taken
+            // before the admission is not a reservation for it.
+            let (drain_ts, unlogged) = match (admitted, ctx.drain_buffer) {
+                (Some(_), Some(_)) => {
+                    let (ts, held) = self
+                        .engine
+                        .pending_commits()
+                        .obligate(|| oracle.next().as_raw());
+                    (Timestamp::from_raw(ts), Some(held))
+                }
+                (None, Some(_)) => (
+                    commit_ts,
+                    Some(self.engine.pending_commits().hold(commit_ts.as_raw())),
+                ),
+                (_, None) => (commit_ts, None),
+            };
 
             // The writes are local state now, so the registration has done its
             // work: from here a validating writer finds them by reading, and a
@@ -2100,8 +2284,22 @@ impl<'a> Transaction<'a> {
 
             // Step 2: Buffer for drain (if drain buffer is available).
             if let Some(drain_buf) = ctx.drain_buffer {
-                let mutations = self.seal_unit(wb);
-                let mut entry = DrainEntry::new(mutations, commit_ts, self.read_ts);
+                let mut mutations = self.seal_unit(wb);
+                // The drain completes the admitted attempt: last in its unit,
+                // after the sealed DERIVED work.
+                if let (Some((op, intent)), Some(attempt)) = (self.operation, admitted) {
+                    mutations.push(Mutation::Operation(
+                        coordinode_core::txn::operation::OperationCommand::Bind(
+                            coordinode_core::txn::operation::OperationBinding {
+                                op,
+                                intent,
+                                attempt,
+                                mode: coordinode_core::txn::operation::BindMode::Commit,
+                            },
+                        ),
+                    ));
+                }
+                let mut entry = DrainEntry::new(mutations, drain_ts, self.read_ts);
                 if let Some(unlogged) = unlogged {
                     entry = entry.holding(Box::new(unlogged));
                 }
@@ -2132,7 +2330,7 @@ impl<'a> Transaction<'a> {
 
             self.publish_schema_change();
             return Ok(CommitOutcome {
-                commit_ts: Some(commit_ts),
+                commit_ts: Some(drain_ts),
                 applied_index: None,
             });
         }
@@ -2149,12 +2347,32 @@ impl<'a> Transaction<'a> {
         // written directly to the engine.
         // One mutation list for both application paths below: proposed
         // through the pipeline, or applied directly at commit_ts.
-        let mutations = self.seal_unit(wb);
+        let mut mutations = self.seal_unit(wb);
+        // The binding goes last, after the sealed DERIVED work whose record
+        // sources name positions of the list before it.
+        let bind = |mutations: &mut Vec<Mutation>, attempt: u64| {
+            if let Some((op, intent)) = self.operation {
+                mutations.push(Mutation::Operation(
+                    coordinode_core::txn::operation::OperationCommand::Bind(
+                        coordinode_core::txn::operation::OperationBinding {
+                            op,
+                            intent,
+                            attempt,
+                            mode: coordinode_core::txn::operation::BindMode::Commit,
+                        },
+                    ),
+                ));
+            }
+        };
 
         let mut applied_index: Option<u64> = None;
+        let attempt;
         if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
+            let id = id_gen.next();
+            attempt = id.as_raw();
+            bind(&mut mutations, attempt);
             let proposal = RaftProposal {
-                id: id_gen.next(),
+                id,
                 mutations,
                 commit_ts,
                 start_ts: self.read_ts,
@@ -2177,7 +2395,10 @@ impl<'a> Transaction<'a> {
         } else {
             // Direct-write path (no pipeline configured): the same single-seqno
             // apply the pipelines perform, at this transaction's commit_ts,
-            // journalled first when the engine keeps a journal.
+            // journalled first when the engine keeps a journal. The commit
+            // timestamp is unique to this attempt, so it names it.
+            attempt = commit_ts.as_raw();
+            bind(&mut mutations, attempt);
             if self.engine.has_journal() {
                 self.engine
                     .commit_journaled(&mutations, commit_ts.as_raw())?;
@@ -2211,6 +2432,13 @@ impl<'a> Transaction<'a> {
             self.engine
                 .persist()
                 .map_err(|e| CommitError::Serialization(format!("journal fsync failed: {e}")))?;
+        }
+
+        // The binding decided where the unit applied: another attempt of the
+        // operation may have taken effect since the caller's check, and then
+        // this one applied nothing.
+        if let Some((op, intent)) = self.operation {
+            self.check_operation(op, intent, attempt)?;
         }
 
         self.publish_schema_change();

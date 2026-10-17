@@ -426,14 +426,17 @@ pub struct Database {
     /// Open interactive multi-statement transactions, keyed by a
     /// server-allocated transaction id. Leader-local and ephemeral: parked
     /// `TransactionState` (uncommitted writes + OCC read-set + pinned
-    /// snapshot) plus the last-touched instant for idle-timeout reaping.
-    /// Never replicated — durability happens only at `commit_transaction`.
+    /// snapshot), the last-touched instant for idle-timeout reaping, and the
+    /// intent of the statements run so far, which a commit carrying out a
+    /// client operation binds. Never replicated: durability happens only at
+    /// `commit_transaction`.
     interactive_txns: Mutex<
         std::collections::HashMap<
             u64,
             (
                 coordinode_storage::engine::transaction::TransactionState,
                 Instant,
+                crate::operation::IntentDigest,
             ),
         >,
     >,
@@ -614,6 +617,11 @@ pub struct StatementOptions {
     /// The switch that cancels this statement, held by whoever may cancel
     /// it: work after it is thrown stops with a cancellation error.
     pub cancel: Option<coordinode_core::budget::CancelFlag>,
+    /// The client operation this statement carries out: its writes take
+    /// effect at most once however often it is sent, and a retry of one that
+    /// took effect runs nothing and reports
+    /// [`DatabaseError::OperationSettled`]. See [`crate::operation`].
+    pub operation: Option<crate::operation::OperationDescriptor>,
 }
 
 #[derive(Debug, Clone)]
@@ -635,6 +643,12 @@ struct QuerySession {
     after_commit_generation: u32,
     /// The statement's execution budget, bound here, before it is planned.
     budget: Arc<coordinode_core::budget::QueryBudget>,
+    /// The client operation an auto-commit statement carries out, and what
+    /// it means.
+    operation: Option<(
+        crate::operation::OperationId,
+        crate::operation::IntentDigest,
+    )>,
 }
 
 /// Nanoseconds on the process's monotonic clock: the clock statement
@@ -803,8 +817,52 @@ pub enum DatabaseError {
         oldest_readable: u64,
     },
 
+    /// The client operation a write carries out already stands as
+    /// `outcome`, or cannot be admitted: this attempt ran or applied nothing.
+    /// A committed outcome is the operation's answer, reached by an earlier
+    /// attempt; `intent_differs` says that attempt meant something else (one
+    /// number used for two writes). Anything else says why no attempt takes
+    /// effect: aborted (excluded), retired, or not admissible now (an issuer
+    /// not enrolled, closed, or past its admission window).
+    #[error("operation {op:?} stands as {outcome:?}; this attempt applied nothing")]
+    OperationSettled {
+        /// The operation.
+        op: crate::operation::OperationId,
+        /// How it stands.
+        outcome: crate::operation::OperationOutcome,
+        /// Whether its committed outcome carries another intent.
+        intent_differs: bool,
+    },
+
+    /// A descriptor names another deployment than this database's: its
+    /// operation's record is not here, and nothing here can resolve it.
+    #[error("the operation belongs to another deployment ({descriptor}), not this one")]
+    ForeignOperation {
+        /// The deployment the descriptor names.
+        descriptor: coordinode_core::group::DeploymentId,
+    },
+
     #[error("{0}")]
     Other(String),
+}
+
+impl DatabaseError {
+    /// The operation outcome this error reports, when it is one: the same
+    /// whether the statement or its commit found it.
+    fn into_operation_settled(self) -> Self {
+        match self {
+            Self::Execution(ExecutionError::OperationSettled {
+                op,
+                outcome,
+                intent_differs,
+            }) => Self::OperationSettled {
+                op,
+                outcome,
+                intent_differs,
+            },
+            other => other,
+        }
+    }
 }
 
 impl From<coordinode_modality::StoreError> for DatabaseError {
@@ -1624,9 +1682,15 @@ impl Database {
     ) {
         let mut total_docs = 0usize;
         for def in text_defs {
-            if let Err(e) = registry.register(def.clone()) {
-                tracing::warn!("failed to register text index {def}: {e}");
-                continue;
+            match registry.register(def.clone()) {
+                Ok(true) => {}
+                // Registered by another path (the statement that created it)
+                // which builds it: a second build would be work for nothing.
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!("failed to register text index {def}: {e}");
+                    continue;
+                }
             }
             for property in &def.properties {
                 let rebuilt = registry.rebuild_index(&def.label, property, || {
@@ -1668,6 +1732,7 @@ impl Database {
             vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
             budget: statement_budget(self.query_memory_limit, None, None),
+            operation: None,
         }
     }
 
@@ -1940,7 +2005,7 @@ impl Database {
         self.interactive_txns
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(id, (state, Instant::now()));
+            .insert(id, (state, Instant::now(), crate::operation::EMPTY_CHAIN));
         if let Some(begun) = &self.interactive_begun {
             begun();
         }
@@ -1981,13 +2046,13 @@ impl Database {
         params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
         options: &StatementOptions,
     ) -> Result<Vec<Row>, DatabaseError> {
-        let state = {
+        let (state, chain) = {
             let mut reg = self
                 .interactive_txns
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             match reg.remove(&txn_id) {
-                Some((state, _touched)) => state,
+                Some((state, _touched, chain)) => (state, chain),
                 None => return Err(DatabaseError::UnknownTransaction(txn_id)),
             }
         };
@@ -1999,8 +2064,16 @@ impl Database {
             vector_build_wait: options.vector_build_wait.unwrap_or(self.vector_build_wait),
             after_commit_generation: 0,
             budget: self.options_budget(options)?,
+            // The transaction's commit carries its operation.
+            operation: None,
         };
         let params = params.filter(|p| !p.is_empty());
+        // The chain a commit of the transaction binds as its intent: every
+        // statement it ran, in order.
+        let chain = crate::operation::chain_intent(
+            &chain,
+            &crate::operation::statement_intent(query, params.as_ref()),
+        );
         // On error the state is intentionally NOT re-parked → transaction aborts.
         let (rows, _stats, out_state) = self.execute_cypher_impl(
             query,
@@ -2025,7 +2098,7 @@ impl Database {
             self.interactive_txns
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(txn_id, (state, Instant::now()));
+                .insert(txn_id, (state, Instant::now(), chain));
         }
         Ok(rows)
     }
@@ -2044,13 +2117,52 @@ impl Database {
         &self,
         txn_id: u64,
     ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
-        let state = self
+        self.commit_transaction_inner(txn_id, None)
+    }
+
+    /// [`Self::commit_transaction`] carrying out client operation
+    /// `operation`, whose intent is the transaction's statements in the
+    /// order they ran: the writes take effect at most once however often
+    /// the operation is committed. When an attempt of it took effect already
+    /// or it cannot be admitted, this one applies nothing and the error is
+    /// [`DatabaseError::OperationSettled`] with how it stands; a lost reply
+    /// is resolved with [`Self::resolve_operation`], never by running the
+    /// statements again under a new operation.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::commit_transaction`], and the above.
+    pub fn commit_transaction_as(
+        &self,
+        txn_id: u64,
+        operation: &crate::operation::OperationDescriptor,
+    ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
+        self.commit_transaction_inner(txn_id, Some(operation))
+    }
+
+    fn commit_transaction_inner(
+        &self,
+        txn_id: u64,
+        operation: Option<&crate::operation::OperationDescriptor>,
+    ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
+        let parked = self
             .interactive_txns
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&txn_id)
-            .map(|(s, _)| s);
-        let Some(state) = state else {
+            .remove(&txn_id);
+        let Some((state, _touched, chain)) = parked else {
+            // A commit repeated after its reply was lost: the handle is gone
+            // with the attempt, and the operation's outcome is the answer.
+            // The attempt's intent went with its buffer, so it is not
+            // compared.
+            if let Some(descriptor) = operation {
+                return Err(DatabaseError::OperationSettled {
+                    op: descriptor.op,
+                    outcome: self
+                        .resolve_operation(descriptor, crate::operation::Resolve::Lookup)?,
+                    intent_differs: false,
+                });
+            }
             return Err(DatabaseError::UnknownTransaction(txn_id));
         };
         let mut txn = coordinode_storage::engine::transaction::Transaction::resume(
@@ -2058,6 +2170,10 @@ impl Database {
             Some(&self.oracle),
             state,
         );
+        if let Some(descriptor) = operation {
+            self.admit_operation(descriptor, &chain)?;
+            txn.bind_operation(descriptor.op, chain);
+        }
         // Constraints judge each node as the whole transaction leaves it,
         // not as one of its statements did.
         let fields = self.fields.current()?;
@@ -2160,6 +2276,17 @@ impl Database {
                     current,
                 }
             }
+            // The operation the commit carries out stands already: the
+            // caller resolves it rather than running it again.
+            CommitError::OperationSettled {
+                op,
+                outcome,
+                intent_differs,
+            } => DatabaseError::OperationSettled {
+                op,
+                outcome,
+                intent_differs,
+            },
         })?;
         // An interactive transaction is always opened against the oracle
         // (`begin_transaction`), so the storage commit is never on the legacy
@@ -2233,7 +2360,7 @@ impl Database {
             .interactive_txns
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let Some((state, touched)) = reg.get_mut(&txn_id) else {
+        let Some((state, touched, _)) = reg.get_mut(&txn_id) else {
             return Err(DatabaseError::UnknownTransaction(txn_id));
         };
         *touched = Instant::now();
@@ -2259,8 +2386,10 @@ impl Database {
             .interactive_txns
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        txns.retain(|_, (_, touched)| now.duration_since(*touched) < timeout);
-        txns.values().map(|(_, touched)| *touched + timeout).min()
+        txns.retain(|_, (_, touched, _)| now.duration_since(*touched) < timeout);
+        txns.values()
+            .map(|(_, touched, _)| *touched + timeout)
+            .min()
     }
 
     /// Run one pass of the COMPUTED TTL reaper now, as the background reaper
@@ -2610,6 +2739,7 @@ impl Database {
             vector_build_wait: options.vector_build_wait.unwrap_or(self.vector_build_wait),
             after_commit_generation: 0,
             budget: self.options_budget(options)?,
+            operation: None,
         };
         if let Some(rc) = &options.read_concern {
             rc.validate()
@@ -2622,6 +2752,13 @@ impl Database {
         }
 
         let params = params.filter(|p| !p.is_empty());
+        if let Some(descriptor) = &options.operation {
+            let intent = crate::operation::statement_intent(query, params.as_ref());
+            // A retry of an operation that took effect runs nothing: its
+            // statement may read what it wrote, or choose differently now.
+            self.admit_operation(descriptor, &intent)?;
+            session.operation = Some((descriptor.op, intent));
+        }
         self.execute_cypher_impl(
             query,
             source,
@@ -2631,6 +2768,7 @@ impl Database {
             &mut None,
         )
         .map(|(rows, write_stats, _)| CypherResult { rows, write_stats })
+        .map_err(DatabaseError::into_operation_settled)
     }
 
     /// Execute one page of a keyset-resumable server-side cursor.
@@ -2670,6 +2808,7 @@ impl Database {
             vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
             budget: statement_budget(self.query_memory_limit, None, None),
+            operation: None,
         };
         let params = params.filter(|p| !p.is_empty());
         let mut paging = Some(ScanPaging {
@@ -3016,12 +3155,18 @@ impl Database {
                         *state,
                     )
                 }
-                TxnMode::AutoCommit => coordinode_storage::engine::transaction::Transaction::new(
-                    &self.engine,
-                    Some(&self.oracle),
-                    read_ts,
-                    None,
-                ),
+                TxnMode::AutoCommit => {
+                    let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+                        &self.engine,
+                        Some(&self.oracle),
+                        read_ts,
+                        None,
+                    );
+                    if let Some((op, intent)) = session.operation {
+                        txn.bind_operation(op, intent);
+                    }
+                    txn
+                }
             };
             // The statement's view of the field dictionary: every binding
             // applied before it started, refreshed here when one has landed
@@ -4168,6 +4313,7 @@ fn query_memory_limit_from_mib(text: &str) -> Result<u64, SessionSettingRefused>
 
 mod after_commit;
 mod catalog;
+mod client_ops;
 mod fields;
 mod id_lease;
 mod index_builds;

@@ -25,6 +25,10 @@
 
 use rustc_hash::FxHashMap;
 
+use super::operation::{
+    BindMode, INTENT_DIGEST_LEN, ISSUER_ID_LEN, IntentDigest, IssuerId, OperationBinding,
+    OperationCommand, OperationId,
+};
 use super::proposal::{
     DerivedIndexWork, DerivedSource, IndexBinding, Mutation, PartitionId, ProposalId, RaftProposal,
 };
@@ -43,7 +47,19 @@ const KIND_MERGE: u8 = 2;
 const KIND_REMOVE_RANGE: u8 = 3;
 const KIND_COMMAND: u8 = 4;
 const KIND_DERIVE: u8 = 5;
+const KIND_OPERATION: u8 = 6;
 const KIND_MASK: u8 = 0b111;
+
+/// The operation commands, as the byte after [`KIND_OPERATION`] numbers
+/// them.
+const OPERATION_ENROLL: u8 = 0;
+const OPERATION_BIND: u8 = 1;
+const OPERATION_EXCLUDE: u8 = 2;
+const OPERATION_RETIRE: u8 = 3;
+const OPERATION_RELEASE: u8 = 4;
+
+const BIND_COMMIT: u8 = 0;
+const BIND_ADMIT: u8 = 1;
 
 const SOURCE_UNIT_RECORD: u8 = 0;
 const SOURCE_VALUES: u8 = 1;
@@ -387,6 +403,11 @@ impl<'a> Encoder<'a> {
                     }
                 }
             }
+            Mutation::Operation(command) => {
+                out.push(KIND_OPERATION);
+                self.expanded += command.size_estimate();
+                encode_operation(command, out);
+            }
         }
         Ok(())
     }
@@ -440,6 +461,56 @@ impl<'a> Encoder<'a> {
     }
 }
 
+/// An operation command: its number, the issuer and the command's fields.
+fn encode_operation(command: &OperationCommand, out: &mut Vec<u8>) {
+    match command {
+        OperationCommand::Enroll {
+            issuer,
+            incarnation,
+            window,
+        } => {
+            out.push(OPERATION_ENROLL);
+            out.extend_from_slice(&issuer.0);
+            put_varint(*incarnation, out);
+            put_varint(*window, out);
+        }
+        OperationCommand::Bind(binding) => {
+            out.push(OPERATION_BIND);
+            put_operation_id(&binding.op, out);
+            out.extend_from_slice(&binding.intent.0);
+            put_varint(binding.attempt, out);
+            out.push(match binding.mode {
+                BindMode::Commit => BIND_COMMIT,
+                BindMode::Admit => BIND_ADMIT,
+            });
+        }
+        OperationCommand::Exclude(op) => {
+            out.push(OPERATION_EXCLUDE);
+            put_operation_id(op, out);
+        }
+        OperationCommand::Release(op) => {
+            out.push(OPERATION_RELEASE);
+            put_operation_id(op, out);
+        }
+        OperationCommand::Retire {
+            issuer,
+            incarnation,
+            below,
+        } => {
+            out.push(OPERATION_RETIRE);
+            out.extend_from_slice(&issuer.0);
+            put_varint(*incarnation, out);
+            put_varint(*below, out);
+        }
+    }
+}
+
+fn put_operation_id(op: &OperationId, out: &mut Vec<u8>) {
+    out.extend_from_slice(&op.issuer.0);
+    put_varint(op.incarnation, out);
+    put_varint(op.sequence, out);
+}
+
 /// Whether `proposal` encodes as a frame, checked without encoding it far
 /// from the frame bound. A pipeline runs this before handing a unit to the
 /// log: the log store encodes the unit and has no way to refuse it there.
@@ -491,6 +562,7 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
                     + msgpack_len(&work.old).map_err(FrameError::Derive)?
                     + new
             }
+            Mutation::Operation(command) => command.size_estimate(),
         };
     }
     if expanded > limits.max_expanded_bytes {
@@ -724,6 +796,12 @@ impl<'a> Decoder<'a> {
                 rmp_serde::from_slice(bytes).map_err(|e| FrameError::Command(e.to_string()))?;
             return Ok(Mutation::Command(command));
         }
+        if kind == KIND_OPERATION {
+            if tag != KIND_OPERATION {
+                return Err(FrameError::UnknownTag(tag));
+            }
+            return self.operation().map(Mutation::Operation);
+        }
         let p = usize::from(tag >> 3);
         let partition = *PARTITIONS.get(p).ok_or(FrameError::UnknownTag(tag))?;
         match kind {
@@ -748,6 +826,59 @@ impl<'a> Decoder<'a> {
             }),
             _ => Err(FrameError::UnknownTag(tag)),
         }
+    }
+
+    /// An operation command [`encode_operation`] wrote.
+    fn operation(&mut self) -> Result<OperationCommand, FrameError> {
+        let sub = self.reader.u8()?;
+        let command = match sub {
+            OPERATION_ENROLL => OperationCommand::Enroll {
+                issuer: self.issuer()?,
+                incarnation: self.reader.varint()?,
+                window: self.reader.varint()?,
+            },
+            OPERATION_BIND => {
+                let op = self.operation_id()?;
+                let mut intent = [0u8; INTENT_DIGEST_LEN];
+                intent.copy_from_slice(self.reader.take(INTENT_DIGEST_LEN)?);
+                let attempt = self.reader.varint()?;
+                let mode = match self.reader.u8()? {
+                    BIND_COMMIT => BindMode::Commit,
+                    BIND_ADMIT => BindMode::Admit,
+                    _ => return Err(FrameError::UnknownTag(KIND_OPERATION)),
+                };
+                OperationCommand::Bind(OperationBinding {
+                    op,
+                    intent: IntentDigest(intent),
+                    attempt,
+                    mode,
+                })
+            }
+            OPERATION_EXCLUDE => OperationCommand::Exclude(self.operation_id()?),
+            OPERATION_RELEASE => OperationCommand::Release(self.operation_id()?),
+            OPERATION_RETIRE => OperationCommand::Retire {
+                issuer: self.issuer()?,
+                incarnation: self.reader.varint()?,
+                below: self.reader.varint()?,
+            },
+            _ => return Err(FrameError::UnknownTag(KIND_OPERATION)),
+        };
+        self.spend(command.size_estimate())?;
+        Ok(command)
+    }
+
+    fn issuer(&mut self) -> Result<IssuerId, FrameError> {
+        let mut issuer = [0u8; ISSUER_ID_LEN];
+        issuer.copy_from_slice(self.reader.take(ISSUER_ID_LEN)?);
+        Ok(IssuerId(issuer))
+    }
+
+    fn operation_id(&mut self) -> Result<OperationId, FrameError> {
+        Ok(OperationId {
+            issuer: self.issuer()?,
+            incarnation: self.reader.varint()?,
+            sequence: self.reader.varint()?,
+        })
     }
 
     fn key(&mut self, partition: usize) -> Result<Vec<u8>, FrameError> {

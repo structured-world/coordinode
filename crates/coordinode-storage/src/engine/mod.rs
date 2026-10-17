@@ -17,6 +17,7 @@ pub mod local_pipeline;
 pub mod merge;
 pub mod metadata;
 pub mod open_txns;
+pub mod operations;
 pub mod oplog_journal;
 pub mod partition;
 pub mod pending;

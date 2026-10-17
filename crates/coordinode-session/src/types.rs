@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
+use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_core::txn::write_concern::WriteConcern;
 
@@ -29,22 +30,33 @@ pub enum SessionOp {
     /// transaction. `params` are already in the engine's value space; the
     /// binding converts its wire values before constructing this. `settings`
     /// are the ones the statement names itself; each one it leaves unset is
-    /// the session's. `source` is where in the client's code it was issued.
+    /// the session's. `source` is where in the client's code it was issued,
+    /// boxed: only a client in debug mode sends one, and inline it would
+    /// dominate the size of every operation. `operation` is the client
+    /// operation an autonomous statement carries out; a statement inside a
+    /// transaction carrying one is refused, since the transaction's
+    /// operation is named on its commit.
     Execute {
         query: String,
         params: HashMap<String, Value>,
         txid: u64,
         nonce: u64,
         settings: ConnectionSettings,
-        source: Option<StatementSource>,
+        source: Option<Box<StatementSource>>,
+        operation: Option<OperationDescriptor>,
     },
     /// Open an interactive transaction.
     Begin {
         ordering: Ordering,
         drain_timeout_ms: u32,
     },
-    /// Commit an interactive transaction by handle.
-    Commit { txid: u64, last_nonce: u64 },
+    /// Commit an interactive transaction by handle, carrying out `operation`
+    /// when the client named one.
+    Commit {
+        txid: u64,
+        last_nonce: u64,
+        operation: Option<OperationDescriptor>,
+    },
     /// Roll back an interactive transaction by handle.
     Rollback { txid: u64 },
     /// Abort an in-flight request and close its cursor.

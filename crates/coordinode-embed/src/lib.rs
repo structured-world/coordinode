@@ -19,6 +19,7 @@
 pub mod api;
 pub mod backup;
 pub mod db;
+pub mod operation;
 pub mod repair;
 #[cfg(feature = "replication")]
 pub mod replication;

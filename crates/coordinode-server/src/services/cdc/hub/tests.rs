@@ -43,6 +43,11 @@ fn indexes(read: HubRead) -> (Vec<u64>, u64) {
     }
 }
 
+/// The logs of these tests carry no unit bound to an operation.
+fn decisions() -> coordinode_storage::oplog::tailer::UnitDecisionSource {
+    Arc::new(|_| Ok(false))
+}
+
 fn held(hub: &CdcHub) -> usize {
     hub.inner.lock().ring.len()
 }
@@ -52,7 +57,9 @@ fn held(hub: &CdcHub) -> usize {
 #[test]
 fn streams_share_entries_until_every_one_has_passed_them() {
     let dir = log(5);
-    let hub = Arc::new(CdcHub::new(&[dir.path().to_path_buf()], 0, 0, 1 << 20).expect("hub"));
+    let hub = Arc::new(
+        CdcHub::new(&[dir.path().to_path_buf()], 0, 0, 1 << 20, decisions()).expect("hub"),
+    );
     let (a, b) = (hub.reader(0), hub.reader(0));
     let all = CdcFilters::default();
 
@@ -73,7 +80,9 @@ fn streams_share_entries_until_every_one_has_passed_them() {
 #[test]
 fn a_stream_behind_the_hub_is_told_where_it_starts() {
     let dir = log(6);
-    let hub = Arc::new(CdcHub::new(&[dir.path().to_path_buf()], 0, 4, 1 << 20).expect("hub"));
+    let hub = Arc::new(
+        CdcHub::new(&[dir.path().to_path_buf()], 0, 4, 1 << 20, decisions()).expect("hub"),
+    );
     let early = hub.reader(1);
     let late = hub.reader(4);
     let all = CdcFilters::default();
@@ -91,7 +100,8 @@ fn a_stream_behind_the_hub_is_told_where_it_starts() {
 fn the_byte_bound_releases_entries_a_slow_stream_still_needs() {
     let dir = log(10);
     // Room for about three entries.
-    let hub = Arc::new(CdcHub::new(&[dir.path().to_path_buf()], 0, 0, 700).expect("hub"));
+    let hub =
+        Arc::new(CdcHub::new(&[dir.path().to_path_buf()], 0, 0, 700, decisions()).expect("hub"));
     let (fast, slow) = (hub.reader(0), hub.reader(0));
     let all = CdcFilters::default();
     let (got, _) = indexes(hub.read(&fast, 0, 100, 10, &all).expect("read fast"));
@@ -116,7 +126,9 @@ fn each_stream_filters_the_shared_entries_its_own_way() {
         .expect("append");
     manager.append(&entry(2, "node:b")).expect("append");
     manager.flush().expect("flush");
-    let hub = Arc::new(CdcHub::new(&[dir.path().to_path_buf()], 0, 0, 1 << 20).expect("hub"));
+    let hub = Arc::new(
+        CdcHub::new(&[dir.path().to_path_buf()], 0, 0, 1 << 20, decisions()).expect("hub"),
+    );
     let (edges, everything) = (hub.reader(0), hub.reader(0));
     let knows = CdcFilters {
         edge_types: vec!["KNOWS".into()],

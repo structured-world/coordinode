@@ -414,7 +414,7 @@ impl AppliedFeed {
                     }
                     // The keys a command writes are decided as it applies and
                     // are not in the entry, so a Schema follower rereads.
-                    Mutation::Command(_) => {
+                    Mutation::Command(_) | Mutation::Operation(_) => {
                         if subscriber.partition == Partition::Schema {
                             replaced = true;
                         }

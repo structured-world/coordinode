@@ -67,6 +67,7 @@ fn commit(request_id: u64) -> ClientFrame {
         op: Some(client_frame::Op::Commit(Commit {
             txid: 1,
             last_nonce: 0,
+            operation: None,
         })),
     }
 }
@@ -103,7 +104,11 @@ fn execute_tx_nonce(request_id: u64, query: &str, txid: u64, nonce: u64) -> Clie
 fn commit_tx_nonce(request_id: u64, txid: u64, last_nonce: u64) -> ClientFrame {
     ClientFrame {
         request_id,
-        op: Some(client_frame::Op::Commit(Commit { txid, last_nonce })),
+        op: Some(client_frame::Op::Commit(Commit {
+            txid,
+            last_nonce,
+            operation: None,
+        })),
     }
 }
 
@@ -114,6 +119,7 @@ fn commit_tx(request_id: u64, txid: u64) -> ClientFrame {
         op: Some(client_frame::Op::Commit(Commit {
             txid,
             last_nonce: 0,
+            operation: None,
         })),
     }
 }

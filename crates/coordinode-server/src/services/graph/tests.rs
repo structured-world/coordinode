@@ -27,6 +27,7 @@ async fn create_nodes_batch_returns_all_nodes_in_order() {
         graph::CreateNodeRequest {
             labels: vec!["BatchItem".to_string()],
             properties: props,
+            operation: None,
         }
     };
     let batch: Vec<_> = (0..5).map(mk).collect();
@@ -34,6 +35,7 @@ async fn create_nodes_batch_returns_all_nodes_in_order() {
     let resp = svc
         .create_nodes_batch(Request::new(graph::CreateNodesBatchRequest {
             nodes: batch,
+            operation: None,
         }))
         .await
         .expect("create_nodes_batch should succeed");
@@ -61,12 +63,15 @@ async fn create_nodes_batch_mixed_labels_rejected() {
                 graph::CreateNodeRequest {
                     labels: vec!["A".to_string()],
                     properties: Default::default(),
+                    operation: None,
                 },
                 graph::CreateNodeRequest {
                     labels: vec!["B".to_string()],
                     properties: Default::default(),
+                    operation: None,
                 },
             ],
+            operation: None,
         }))
         .await;
     let err = resp.expect_err("mixed labels must error");
@@ -80,6 +85,7 @@ async fn create_nodes_batch_empty_is_noop() {
     let resp = svc
         .create_nodes_batch(Request::new(graph::CreateNodesBatchRequest {
             nodes: vec![],
+            operation: None,
         }))
         .await
         .expect("empty batch must succeed");
@@ -95,6 +101,7 @@ async fn create_node_returns_nonzero_id() {
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["Person".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create_node should succeed");
@@ -114,6 +121,7 @@ async fn create_node_returns_well_formed_element_id() {
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["Member".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create_node");
@@ -146,6 +154,7 @@ async fn create_edge_returns_well_formed_element_id() {
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["Person".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("src")
@@ -154,6 +163,7 @@ async fn create_edge_returns_well_formed_element_id() {
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["Person".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("dst")
@@ -165,6 +175,7 @@ async fn create_edge_returns_well_formed_element_id() {
             source_node_id: src.node_id,
             target_node_id: dst.node_id,
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("edge")
@@ -200,6 +211,7 @@ async fn create_node_persists() {
             );
             m
         },
+        operation: None,
     }))
     .await
     .expect("create should succeed");
@@ -221,6 +233,7 @@ async fn get_node_returns_created_node() {
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["Item".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create should succeed")
@@ -259,6 +272,7 @@ async fn get_node_returns_labels_and_properties() {
                 );
                 m
             },
+            operation: None,
         }))
         .await
         .expect("create should succeed")
@@ -311,6 +325,7 @@ async fn create_edge_returns_nonzero_id() {
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["A".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create A")
@@ -320,6 +335,7 @@ async fn create_edge_returns_nonzero_id() {
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["B".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create B")
@@ -331,6 +347,7 @@ async fn create_edge_returns_nonzero_id() {
             source_node_id: a.node_id,
             target_node_id: b.node_id,
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create_edge should succeed")
@@ -376,6 +393,7 @@ async fn create_node_visible_via_cypher_service() {
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["RegTest".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create_node should succeed")
@@ -425,6 +443,7 @@ async fn setup_two_nodes_with_edge() -> (GraphServiceImpl, tempfile::TempDir, u6
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["X".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create A")
@@ -434,6 +453,7 @@ async fn setup_two_nodes_with_edge() -> (GraphServiceImpl, tempfile::TempDir, u6
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["Y".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create B")
@@ -444,6 +464,7 @@ async fn setup_two_nodes_with_edge() -> (GraphServiceImpl, tempfile::TempDir, u6
         source_node_id: a.node_id,
         target_node_id: b.node_id,
         properties: std::collections::HashMap::new(),
+        operation: None,
     }))
     .await
     .expect("create edge")
@@ -565,6 +586,7 @@ async fn traverse_returns_labels_and_properties() {
         .create_node(Request::new(graph::CreateNodeRequest {
             labels: vec!["Source".to_string()],
             properties: std::collections::HashMap::new(),
+            operation: None,
         }))
         .await
         .expect("create source")
@@ -586,6 +608,7 @@ async fn traverse_returns_labels_and_properties() {
                 );
                 m
             },
+            operation: None,
         }))
         .await
         .expect("create target")
@@ -596,6 +619,7 @@ async fn traverse_returns_labels_and_properties() {
         source_node_id: src.node_id,
         target_node_id: dst.node_id,
         properties: std::collections::HashMap::new(),
+        operation: None,
     }))
     .await
     .expect("create edge");

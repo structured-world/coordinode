@@ -37,7 +37,7 @@ use coordinode_replicate::{
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::error::StorageError;
 use coordinode_storage::oplog::entry::OplogOp;
-use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
+use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken, UnitDecisionSource};
 
 use super::error_details::{Reason, status_with_reason};
 use crate::proto::replication::cdc::{
@@ -75,18 +75,24 @@ pub struct ChangeEventServiceImpl {
     /// The log reader every stream shares, made on the first subscription.
     // no-std: spin::Mutex; taken once per subscription.
     hub: parking_lot::Mutex<Option<Arc<CdcHub>>>,
+    /// Which units of the log their operation binding refused.
+    decisions: UnitDecisionSource,
 }
 
 impl ChangeEventServiceImpl {
     /// A service streaming shard `shard_id`'s Raft log from `oplog_dirs`
     /// (see `coordinode_raft::storage::raft_oplog_dirs`), up to `applied`,
-    /// which `applied_changes` signals moving.
+    /// which `applied_changes` signals moving. `decisions` says which units
+    /// their operation binding refused (see
+    /// `coordinode_storage::engine::operations::unit_decisions`): none of
+    /// their operations is streamed.
     pub fn new(
         shard_id: u32,
         oplog_dirs: Vec<PathBuf>,
         registry: ShardConsumerRegistry,
         applied: AppliedFrontier,
         applied_changes: AppliedSignal,
+        decisions: UnitDecisionSource,
     ) -> Self {
         Self {
             shard_id,
@@ -96,6 +102,7 @@ impl ChangeEventServiceImpl {
             applied_changes,
             tuning: CdcStreamTuning::default(),
             hub: parking_lot::Mutex::new(None),
+            decisions,
         }
     }
 
@@ -112,6 +119,7 @@ impl ChangeEventServiceImpl {
                 self.shard_id,
                 (self.applied)(),
                 self.tuning.buffer_bytes,
+                Arc::clone(&self.decisions),
             )
             .map_err(|e| Status::internal(format!("change stream reader: {e}")))?,
         );
@@ -132,7 +140,7 @@ impl ChangeEventServiceImpl {
     ///
     /// No endpoint of `engine` is eligible to hold the oplog.
     pub fn for_raft_node(
-        engine: &StorageEngine,
+        engine: &Arc<StorageEngine>,
         node: Arc<RaftNode>,
         registry: ShardConsumerRegistry,
     ) -> std::io::Result<Self> {
@@ -144,6 +152,7 @@ impl ChangeEventServiceImpl {
             registry,
             Arc::new(move || node.applied_through()),
             Some(changes),
+            coordinode_storage::engine::operations::unit_decisions(Arc::clone(engine)),
         ))
     }
 
@@ -703,14 +712,17 @@ fn read_batch(
         HubRead::Behind(base) => {
             let tailer = match s.own_tailer.as_mut() {
                 Some(tailer) => tailer,
-                None => s.own_tailer.insert(OplogTailer::new(
-                    &s.oplog_dirs,
-                    ResumeToken {
-                        shard_id: s.shard_id,
-                        segment_id: s.position,
-                        entry_offset: 0,
-                    },
-                )?),
+                None => s.own_tailer.insert(
+                    OplogTailer::new(
+                        &s.oplog_dirs,
+                        ResumeToken {
+                            shard_id: s.shard_id,
+                            segment_id: s.position,
+                            entry_offset: 0,
+                        },
+                    )?
+                    .with_unit_decisions(s.hub.decisions()),
+                ),
             };
             let entries = tailer.read_next(max, &s.filters, until.min(base))?;
             s.position = tailer.next_index();

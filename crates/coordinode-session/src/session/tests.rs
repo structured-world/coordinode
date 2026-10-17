@@ -60,6 +60,7 @@ impl CursorEngine for MockEngine {
         _txid: u64,
         _settings: &ConnectionSettings,
         _source: Option<&StatementSource>,
+        _operation: Option<&OperationDescriptor>,
         _cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         if let Some(message) = &self.fail {
@@ -83,7 +84,11 @@ impl CursorEngine for MockEngine {
         Ok(self.next_txn.fetch_add(1, AtomicOrdering::Relaxed) + 1)
     }
 
-    fn commit_transaction(&self, _txid: u64) -> Result<CommitReceipt, EngineError> {
+    fn commit_transaction(
+        &self,
+        _txid: u64,
+        _operation: Option<&OperationDescriptor>,
+    ) -> Result<CommitReceipt, EngineError> {
         Ok(MOCK_RECEIPT)
     }
 
@@ -110,6 +115,7 @@ fn exec() -> SessionOp {
         nonce: 0,
         settings: ConnectionSettings::default(),
         source: None,
+        operation: None,
     }
 }
 
@@ -118,10 +124,12 @@ fn exec() -> SessionOp {
 type Received = (String, (ConnectionSettings, Option<StatementSource>));
 
 /// An engine that answers every statement with an empty result and keeps
-/// the settings and source each one reached it with, by query text.
+/// the settings and source each one reached it with, by query text, and the
+/// operation each statement and commit carried.
 #[derive(Default)]
 struct RecordingEngine {
     seen: parking_lot::Mutex<Vec<Received>>,
+    operations: parking_lot::Mutex<Vec<(String, Option<OperationDescriptor>)>>,
     next_txn: AtomicU64,
 }
 
@@ -146,11 +154,15 @@ impl CursorEngine for RecordingEngine {
         _txid: u64,
         settings: &ConnectionSettings,
         source: Option<&StatementSource>,
+        operation: Option<&OperationDescriptor>,
         _cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         self.seen
             .lock()
             .push((query.to_string(), (settings.clone(), source.cloned())));
+        self.operations
+            .lock()
+            .push((query.to_string(), operation.copied()));
         Ok(Box::new(MockCursor {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -162,7 +174,14 @@ impl CursorEngine for RecordingEngine {
         Ok(self.next_txn.fetch_add(1, AtomicOrdering::Relaxed) + 1)
     }
 
-    fn commit_transaction(&self, _txid: u64) -> Result<CommitReceipt, EngineError> {
+    fn commit_transaction(
+        &self,
+        txid: u64,
+        operation: Option<&OperationDescriptor>,
+    ) -> Result<CommitReceipt, EngineError> {
+        self.operations
+            .lock()
+            .push((format!("commit {txid}"), operation.copied()));
         Ok(MOCK_RECEIPT)
     }
 
@@ -207,6 +226,7 @@ async fn a_statement_failing_after_its_first_rows_ends_with_the_error() {
             _txid: u64,
             _settings: &ConnectionSettings,
             _source: Option<&StatementSource>,
+            _operation: Option<&OperationDescriptor>,
             _cancel: &coordinode_core::budget::CancelFlag,
         ) -> Result<Box<dyn QueryCursor>, EngineError> {
             Ok(Box::new(FailsOnSecondPage { pages: 0 }))
@@ -214,7 +234,11 @@ async fn a_statement_failing_after_its_first_rows_ends_with_the_error() {
         fn begin_transaction(&self) -> Result<u64, EngineError> {
             Ok(1)
         }
-        fn commit_transaction(&self, _txid: u64) -> Result<CommitReceipt, EngineError> {
+        fn commit_transaction(
+            &self,
+            _txid: u64,
+            _operation: Option<&OperationDescriptor>,
+        ) -> Result<CommitReceipt, EngineError> {
             Ok(MOCK_RECEIPT)
         }
         fn rollback_transaction(&self, _txid: u64) -> Result<(), EngineError> {
@@ -253,6 +277,7 @@ async fn a_session_set_changes_only_its_session() {
         nonce: 0,
         settings: ConnectionSettings::default(),
         source: None,
+        operation: None,
     };
 
     let by_id = run_session(engine(), vec![statement("SET exact"), statement("after")]).await;
@@ -296,6 +321,7 @@ async fn a_refused_set_is_an_error_and_changes_nothing() {
         nonce: 0,
         settings: ConnectionSettings::default(),
         source: None,
+        operation: None,
     };
 
     let by_id = run_session(
@@ -344,6 +370,7 @@ async fn a_statement_runs_under_its_session_settings_and_its_own() {
         nonce: 0,
         settings,
         source: None,
+        operation: None,
     };
     let here = StatementSource {
         file: "app.rs".to_string(),
@@ -382,11 +409,13 @@ async fn a_statement_runs_under_its_session_settings_and_its_own() {
                     write_concern: Some(WriteConcern::majority()),
                     ..ConnectionSettings::default()
                 },
-                source: Some(here.clone()),
+                source: Some(Box::new(here.clone())),
+                operation: None,
             },
             SessionOp::Commit {
                 txid: 1,
                 last_nonce: 0,
+                operation: None,
             },
         ],
     )
@@ -429,6 +458,66 @@ async fn a_statement_runs_under_its_session_settings_and_its_own() {
     );
 }
 
+/// The client operation of an autonomous statement and of a commit reaches
+/// the engine as sent; one named on a statement inside a transaction is
+/// refused before the engine sees the statement, since the transaction's
+/// operation is named on its commit.
+#[tokio::test]
+async fn operations_reach_the_engine_and_a_transaction_statement_names_none() {
+    use coordinode_core::group::DeploymentId;
+    use coordinode_core::txn::operation::{IssuerId, OperationId};
+
+    let op = |sequence| OperationDescriptor {
+        op: OperationId {
+            issuer: IssuerId([4; 16]),
+            incarnation: 1,
+            sequence,
+        },
+        deployment: DeploymentId([5; 16]),
+    };
+    let statement = |query: &str, txid, operation| SessionOp::Execute {
+        query: query.to_string(),
+        params: HashMap::new(),
+        txid,
+        nonce: 0,
+        settings: ConnectionSettings::default(),
+        source: None,
+        operation,
+    };
+    let recording = Arc::new(RecordingEngine::default());
+    let by_id = run_session(
+        Arc::clone(&recording) as Arc<dyn CursorEngine>,
+        vec![
+            statement("bound", 0, Some(op(1))),
+            statement("unbound", 0, None),
+            SessionOp::Begin {
+                ordering: Ordering::Unordered,
+                drain_timeout_ms: 0,
+            },
+            statement("inside", 1, Some(op(2))),
+            SessionOp::Commit {
+                txid: 1,
+                last_nonce: 0,
+                operation: Some(op(3)),
+            },
+        ],
+    )
+    .await;
+
+    match by_id[&4].as_slice() {
+        [SessionEvent::Error(failure)] => {
+            assert_eq!(failure.code, ErrorCode::InvalidArgument);
+        }
+        other => panic!("a transaction statement naming an operation is refused, got {other:?}"),
+    }
+    let seen: HashMap<String, Option<OperationDescriptor>> =
+        recording.operations.lock().iter().cloned().collect();
+    assert_eq!(seen["bound"], Some(op(1)));
+    assert_eq!(seen["unbound"], None);
+    assert!(!seen.contains_key("inside"), "the engine never saw it");
+    assert_eq!(seen["commit 1"], Some(op(3)));
+}
+
 /// Drive a fresh session with `ops` (request_id = index + 1) and collect every
 /// event grouped by request_id. Exercises the real `Session::run` path.
 async fn run_session(
@@ -465,6 +554,7 @@ impl CursorEngine for UntilCancelled {
         _txid: u64,
         _settings: &ConnectionSettings,
         _source: Option<&StatementSource>,
+        _operation: Option<&OperationDescriptor>,
         cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -485,7 +575,11 @@ impl CursorEngine for UntilCancelled {
         Ok(1)
     }
 
-    fn commit_transaction(&self, _txid: u64) -> Result<CommitReceipt, EngineError> {
+    fn commit_transaction(
+        &self,
+        _txid: u64,
+        _operation: Option<&OperationDescriptor>,
+    ) -> Result<CommitReceipt, EngineError> {
         Ok(MOCK_RECEIPT)
     }
 
@@ -624,6 +718,7 @@ async fn begin_then_commit_acknowledges_and_rollback_cancel_are_silent() {
             SessionOp::Commit {
                 txid: 1,
                 last_nonce: 0,
+                operation: None,
             },
             SessionOp::Rollback { txid: 1 },
             SessionOp::Cancel {
@@ -675,6 +770,7 @@ async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
                 nonce: 0,
                 settings: ConnectionSettings::default(),
                 source: None,
+                operation: None,
             },
             SessionOp::Execute {
                 query: "FAIL".to_string(),
@@ -683,6 +779,7 @@ async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
                 nonce: 0,
                 settings: ConnectionSettings::default(),
                 source: None,
+                operation: None,
             },
             SessionOp::Execute {
                 query: "after".to_string(),
@@ -691,10 +788,12 @@ async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
                 nonce: 0,
                 settings: ConnectionSettings::default(),
                 source: None,
+                operation: None,
             },
             SessionOp::Commit {
                 txid: 1,
                 last_nonce: 0,
+                operation: None,
             },
         ],
     )
@@ -761,6 +860,7 @@ async fn ordered_applies_statements_in_nonce_order_not_arrival_order() {
         nonce,
         settings: ConnectionSettings::default(),
         source: None,
+        operation: None,
     };
     let events = run_session_flat(
         engine,
@@ -774,6 +874,7 @@ async fn ordered_applies_statements_in_nonce_order_not_arrival_order() {
             SessionOp::Commit {
                 txid: 1,
                 last_nonce: 2,
+                operation: None,
             },
         ],
     )
@@ -811,6 +912,7 @@ async fn ordered_failed_statement_aborts_and_rejects_later_nonces() {
         nonce,
         settings: ConnectionSettings::default(),
         source: None,
+        operation: None,
     };
     let by_id = run_session(
         engine,
@@ -825,6 +927,7 @@ async fn ordered_failed_statement_aborts_and_rejects_later_nonces() {
             SessionOp::Commit {
                 txid: 1,
                 last_nonce: 3,
+                operation: None,
             },
         ],
     )
@@ -885,6 +988,7 @@ async fn ordered_commit_drain_times_out_on_a_missing_nonce() {
                 nonce: 2,
                 settings: ConnectionSettings::default(),
                 source: None,
+                operation: None,
             },
         ))
         .await
@@ -895,6 +999,7 @@ async fn ordered_commit_drain_times_out_on_a_missing_nonce() {
             SessionOp::Commit {
                 txid,
                 last_nonce: 2,
+                operation: None,
             },
         ))
         .await

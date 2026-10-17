@@ -174,11 +174,11 @@ fn unknown_flags_and_tags_are_refused() {
     assert_eq!(decode(&signed(body)), Err(FrameError::UnknownFlags(0x80)));
 
     for tag in [
-        6u8,
-        7,
+        7u8,
         KIND_PUT | (10 << 3),
         KIND_COMMAND | (1 << 3),
         KIND_DERIVE | (1 << 3),
+        KIND_OPERATION | (1 << 3),
     ] {
         let mut body = header(1);
         body.extend_from_slice(&[tag, 0, 0, 0]);
@@ -187,6 +187,72 @@ fn unknown_flags_and_tags_are_refused() {
             Err(FrameError::UnknownTag(tag)),
             "tag {tag:#04x}"
         );
+    }
+    // An operation command this build does not know.
+    let mut body = header(1);
+    body.extend_from_slice(&[KIND_OPERATION, 9, 0, 0]);
+    assert_eq!(
+        decode(&signed(body)),
+        Err(FrameError::UnknownTag(KIND_OPERATION))
+    );
+}
+
+/// Every operation command travels in a frame and comes back as it was, next
+/// to the data it binds.
+#[test]
+fn operation_commands_round_trip() {
+    use crate::txn::operation::{
+        BindMode, INTENT_DIGEST_LEN, ISSUER_ID_LEN, IntentDigest, IssuerId, OperationBinding,
+        OperationCommand, OperationId,
+    };
+    let issuer = IssuerId([3; ISSUER_ID_LEN]);
+    let op = OperationId {
+        issuer,
+        incarnation: 2,
+        sequence: 300,
+    };
+    for command in [
+        OperationCommand::Enroll {
+            issuer,
+            incarnation: 2,
+            window: 1 << 16,
+        },
+        OperationCommand::Bind(OperationBinding {
+            op,
+            intent: IntentDigest([5; INTENT_DIGEST_LEN]),
+            attempt: u64::MAX,
+            mode: BindMode::Commit,
+        }),
+        OperationCommand::Bind(OperationBinding {
+            op,
+            intent: IntentDigest([6; INTENT_DIGEST_LEN]),
+            attempt: 1,
+            mode: BindMode::Admit,
+        }),
+        OperationCommand::Exclude(op),
+        OperationCommand::Release(op),
+        OperationCommand::Retire {
+            issuer,
+            incarnation: 2,
+            below: 301,
+        },
+    ] {
+        let proposal = RaftProposal {
+            id: ProposalId::from_raw(4),
+            mutations: vec![
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:1:7".to_vec(),
+                    value: b"record".to_vec(),
+                },
+                Mutation::Operation(command),
+            ],
+            commit_ts: Timestamp::from_raw(10),
+            start_ts: Timestamp::from_raw(9),
+            bypass_rate_limiter: false,
+        };
+        let frame = encode_proposal(&proposal).expect("encode");
+        assert_eq!(decode(&frame), Ok(proposal), "{command:?}");
     }
 }
 

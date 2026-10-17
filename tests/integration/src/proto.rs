@@ -50,6 +50,11 @@ pub mod session {
 }
 
 #[allow(clippy::all, dead_code)]
+pub mod operation {
+    include!(concat!(env!("OUT_DIR"), "/coordinode.v1.operation.rs"));
+}
+
+#[allow(clippy::all, dead_code)]
 pub mod internode {
     include!(concat!(env!("OUT_DIR"), "/coordinode.internode.rs"));
 }

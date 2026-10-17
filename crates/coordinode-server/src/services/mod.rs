@@ -5,6 +5,7 @@ pub mod cypher;
 pub mod error_details;
 pub mod graph;
 pub mod health;
+pub mod operation;
 pub mod schema;
 pub mod session;
 pub mod statement;
@@ -61,6 +62,30 @@ pub fn db_err_to_status(context: &str, err: DatabaseError) -> Status {
     }
     if let Some(inner) = out_of_space_inner(&err) {
         return out_of_space_status(context, inner);
+    }
+    match &err {
+        DatabaseError::OperationSettled {
+            outcome,
+            intent_differs,
+            ..
+        }
+        | DatabaseError::Execution(
+            coordinode_query::executor::runner::ExecutionError::OperationSettled {
+                outcome,
+                intent_differs,
+                ..
+            },
+        ) => {
+            return operation::settled_status(
+                format!("{context}: {err}"),
+                *outcome,
+                *intent_differs,
+            );
+        }
+        DatabaseError::ForeignOperation { descriptor } => {
+            return operation::foreign_status(format!("{context}: {err}"), *descriptor);
+        }
+        _ => {}
     }
     Status::internal(format!("{context}: {err}"))
 }

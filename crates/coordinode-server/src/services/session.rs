@@ -345,12 +345,18 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
     Ok(match op {
         client_frame::Op::Execute(e) => SessionOp::Execute {
             settings: statement_settings(&e)?,
-            source: e.source.map(|s| StatementSource {
-                file: s.file,
-                line: s.line,
-                function: s.function,
-                app: client.app.clone(),
-                version: client.version.clone(),
+            operation: super::operation::optional_descriptor(
+                "execute.operation",
+                e.operation.as_ref(),
+            )?,
+            source: e.source.map(|s| {
+                Box::new(StatementSource {
+                    file: s.file,
+                    line: s.line,
+                    function: s.function,
+                    app: client.app.clone(),
+                    version: client.version.clone(),
+                })
             }),
             query: e.query,
             params: e
@@ -370,6 +376,10 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
             drain_timeout_ms: b.drain_timeout_ms,
         },
         client_frame::Op::Commit(c) => SessionOp::Commit {
+            operation: super::operation::optional_descriptor(
+                "commit.operation",
+                c.operation.as_ref(),
+            )?,
             txid: c.txid,
             last_nonce: c.last_nonce,
         },

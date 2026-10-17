@@ -85,6 +85,10 @@ impl fmt::Display for DeploymentId {
 /// Schema-partition key of the deployment's identity record.
 pub const DEPLOYMENT_KEY: &[u8] = b"meta:deployment";
 
+/// Schema-partition key recording the deployment a joining store is bound
+/// to, before or without the deployment's own record reaching it.
+pub const ENROLLED_DEPLOYMENT_KEY: &[u8] = b"raft:enrolled_deployment";
+
 /// Schema-partition prefix of retired node identities; the key ends with
 /// the identity's canonical encoding.
 pub const RETIRED_IDENTITY_KEY_PREFIX: &[u8] = b"meta:retired_identity:";

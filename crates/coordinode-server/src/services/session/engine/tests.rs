@@ -56,6 +56,7 @@ fn keyset_cursor_drains_every_row_across_small_batches() {
             0,
             &unset(),
             None,
+            None,
             &CancelFlag::new(),
         )
         .expect("open");
@@ -86,6 +87,7 @@ fn keyset_cursor_with_filter_still_drains_all_matches() {
             HashMap::new(),
             0,
             &unset(),
+            None,
             None,
             &CancelFlag::new(),
         )
@@ -120,6 +122,7 @@ fn blocking_plan_routes_to_materialize_and_still_returns_all_rows() {
             0,
             &unset(),
             None,
+            None,
             &CancelFlag::new(),
         )
         .expect("open");
@@ -149,6 +152,7 @@ fn a_cancelled_statement_answers_with_a_cancellation() {
             0,
             &unset(),
             None,
+            None,
             &cancelled,
         )
         .err()
@@ -162,6 +166,7 @@ fn a_cancelled_statement_answers_with_a_cancellation() {
             HashMap::new(),
             txid,
             &unset(),
+            None,
             None,
             &cancelled,
         )
@@ -179,6 +184,7 @@ fn keyset_cursor_empty_label_yields_no_rows() {
             HashMap::new(),
             0,
             &unset(),
+            None,
             None,
             &CancelFlag::new(),
         )
@@ -222,6 +228,7 @@ async fn run_execute_with(
                 nonce: 0,
                 settings,
                 source: None,
+                operation: None,
             },
         ))
         .await
@@ -359,6 +366,7 @@ fn a_session_statement_is_counted_where_it_was_issued() {
                 0,
                 &unset(),
                 Some(&source),
+                None,
                 &CancelFlag::new(),
             )
             .expect("open");
@@ -409,6 +417,7 @@ async fn a_cypher_set_changes_its_session_not_the_database() {
                 nonce: 0,
                 settings: unset(),
                 source: None,
+                operation: None,
             },
         ))
         .await
@@ -555,7 +564,7 @@ async fn a_cancel_stops_a_statement_waiting_on_the_leader() {
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
             engine
-                .forwarded(1, "RETURN 1 AS one", None, &unset(), None, &cancel)
+                .forwarded(1, "RETURN 1 AS one", None, &unset(), None, None, &cancel)
                 .err()
         })
     };
