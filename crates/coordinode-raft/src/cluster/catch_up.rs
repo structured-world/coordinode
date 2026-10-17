@@ -109,6 +109,7 @@ fn caught_up(local_committed: Option<u64>, reported: Option<u64>, lost: u64) -> 
 pub(crate) fn spawn_lift(
     raft: Arc<RaftInstance>,
     engine: Arc<StorageEngine>,
+    work: crate::storage::EngineWork,
     guard: CatchUp,
     elect: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -131,7 +132,16 @@ pub(crate) fn spawn_lift(
         }
         // Forgotten on disk only now that the entries are back: a member that
         // stops before this finds the loss still recorded when it restarts.
-        let cleared = tokio::task::spawn_blocking(move || clear_catch_up(&engine)).await;
+        // A shutdown aborts this task but not the blocking write, which holds
+        // the engine until it ends: counted as work the shutdown waits out.
+        let running = work.start();
+        let cleared = tokio::task::spawn_blocking(move || {
+            // Locals drop in reverse: the engine before the guard.
+            let _running = running;
+            let engine = engine;
+            clear_catch_up(&engine)
+        })
+        .await;
         match cleared {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {

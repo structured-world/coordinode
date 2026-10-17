@@ -2233,7 +2233,10 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         let snapshots = Arc::clone(&self.snapshots);
         let published_meta = meta.clone();
         let published = tokio::task::spawn_blocking(move || {
+            // Locals drop in reverse: the engine and the store go before the
+            // guard on every return, the early ones included.
             let _work = work;
+            let engine = engine;
             let snapshots = snapshots;
             if snapshot.size()? == 0 {
                 return snapshots.publish(&published_meta, &mut snapshot);

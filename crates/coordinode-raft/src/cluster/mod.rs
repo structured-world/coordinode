@@ -1183,6 +1183,7 @@ impl RaftNode {
                 catch_up::spawn_lift(
                     Arc::clone(&raft),
                     Arc::clone(&engine),
+                    engine_work.clone(),
                     catch_up.clone(),
                     elect,
                 )
