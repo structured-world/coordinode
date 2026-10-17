@@ -132,6 +132,19 @@ impl Database {
                 p.name, schema.name
             )));
         }
+        if existing == ExistingDefinition::Replace {
+            // A definition equal to the current one changes nothing: no
+            // revision, no commit, no pass over the label's nodes. The call
+            // takes effect at this read.
+            let current = LocalSchemaStore::new(&self.engine)
+                .load_label(&schema.name)
+                .map_err(ExecutionError::from)?;
+            if let Some(current) = current {
+                if !current.is_table() && unchanged_label(&schema, &current) {
+                    return Ok(current.schema_revision);
+                }
+            }
+        }
         self.commit_catalog(|txn| self.stage_label_definition(txn, &mut schema, existing))?;
         Ok(schema.schema_revision)
     }
@@ -244,6 +257,15 @@ impl Database {
         use coordinode_core::schema::definition::encode_edge_type_current_revision_key;
         use coordinode_storage::engine::partition::Partition;
         resolve_edge_identity(&mut schema)?;
+        // An equal definition changes nothing, as for a label.
+        if let Some(current) = LocalSchemaStore::new(&self.engine).load_edge_type(&schema.name)? {
+            let mut carried = schema.clone();
+            carried.placement = current.placement;
+            carried.schema_revision = current.schema_revision;
+            if carried == current {
+                return Ok(current.schema_revision);
+            }
+        }
         self.commit_catalog(|txn| -> Result<(), DatabaseError> {
             let store = LocalSchemaStore::new(&self.engine);
             let pointer = encode_edge_type_current_revision_key(&schema.name);
@@ -487,6 +509,20 @@ fn resolve_edge_identity(schema: &mut EdgeTypeSchema) -> Result<(), DatabaseErro
         schema.resolve_identity(None).map_err(refused)?;
     }
     Ok(())
+}
+
+/// Whether replacing `current` with `schema` would publish `current` itself:
+/// `schema`, completed with what a replacement keeps from `current`
+/// (placement, shard keys, constraints and the revision), equals it.
+fn unchanged_label(schema: &LabelSchema, current: &LabelSchema) -> bool {
+    let mut carried = schema.clone();
+    carried.placement = current.placement.clone();
+    carried.shard_keys = current.shard_keys.clone();
+    for constraint in current.constraints() {
+        carried.add_constraint(constraint.clone());
+    }
+    carried.schema_revision = current.schema_revision;
+    carried == *current
 }
 
 #[cfg(test)]

@@ -107,6 +107,62 @@ fn replacing_a_definition_keeps_its_constraints_and_their_indexes() {
     assert_eq!(schema.schema_revision, revision);
 }
 
+/// A definition equal to the label's current one publishes nothing: the call
+/// returns the current revision and the catalog keeps it as the current one,
+/// constraints included. Declaring the same schema on every open must not
+/// grow the catalog by a revision each time.
+#[test]
+fn an_identical_label_definition_publishes_nothing() {
+    let (db, _dir) = open();
+    let first = db.create_label_schema(user_definition()).expect("define");
+    db.create_constraint(declare("user_age", "age", ConstraintKind::NotNull))
+        .expect("not null");
+    let with_constraint = db
+        .label_schemas()
+        .expect("labels")
+        .into_iter()
+        .find(|s| s.name == "User")
+        .expect("User");
+    assert!(with_constraint.schema_revision > first);
+
+    let again = db
+        .create_label_schema(user_definition())
+        .expect("declare again");
+
+    assert_eq!(again, with_constraint.schema_revision, "no new revision");
+    let schema = db
+        .label_schemas()
+        .expect("labels")
+        .into_iter()
+        .find(|s| s.name == "User")
+        .expect("User");
+    assert_eq!(
+        schema, with_constraint,
+        "the stored definition is untouched"
+    );
+}
+
+/// The same for an edge type: an equal definition returns the current
+/// revision and publishes none.
+#[test]
+fn an_identical_edge_type_definition_publishes_nothing() {
+    let (db, _dir) = open();
+    let mut knows = EdgeTypeSchema::new("KNOWS");
+    knows.add_property(PropertyDef::new("since", PropertyType::Int));
+    let first = db.create_edge_type_schema(knows.clone()).expect("define");
+
+    let again = db.create_edge_type_schema(knows).expect("declare again");
+
+    assert_eq!(again, first, "no new revision");
+    let stored = db
+        .edge_type_schemas()
+        .expect("edge types")
+        .into_iter()
+        .find(|s| s.name == "KNOWS")
+        .expect("KNOWS");
+    assert_eq!(stored.schema_revision, first);
+}
+
 /// A definition replaced while a constraint is created concurrently does not
 /// publish over it: the replacement read the definition the constraint's
 /// commit changed, so its own commit is refused and the constraint stays.
