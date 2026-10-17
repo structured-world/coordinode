@@ -3,8 +3,7 @@
 
 use coordinode_core::group::DeploymentId;
 use coordinode_core::txn::operation::{
-    DEFAULT_ADMISSION_WINDOW, IntentDigest, IssuerId, OperationCommand, OperationDescriptor,
-    OperationOutcome,
+    IntentDigest, IssuerId, OperationCommand, OperationDescriptor, OperationOutcome,
 };
 use coordinode_core::txn::proposal::{MetadataCommand, Mutation, ProposalError, RaftProposal};
 use coordinode_core::txn::timestamp::Timestamp;
@@ -45,7 +44,7 @@ impl Database {
             self.propose_operation(OperationCommand::Enroll {
                 issuer,
                 incarnation,
-                window: DEFAULT_ADMISSION_WINDOW,
+                window: self.operation_admission_window.get(),
             })?;
             if let Some(record) = records::incarnation_record(&self.engine, &issuer, incarnation)? {
                 if record.open {

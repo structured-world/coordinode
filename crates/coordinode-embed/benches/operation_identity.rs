@@ -1,8 +1,9 @@
 //! The cost of client operation identity on the durable write path: a bound
 //! autocommit write against the same write unbound, an outcome lookup, an
 //! acknowledgement and a retirement, and the bytes the records retain before
-//! and after retirement. The bound and unbound arms alternate so neither is
-//! always measured after the other.
+//! and after retirement, then a refusal past a full admission window and a
+//! retry of a settled write. The bound and unbound arms alternate so neither
+//! is always measured after the other.
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
 use std::time::{Duration, Instant};
@@ -108,4 +109,50 @@ fn main() {
     println!("retire {} numbers: {:?}", done.len(), start.elapsed());
     let (records, bytes) = retained(&db);
     println!("retained after retirement: records={records} bytes={bytes}");
+
+    pressure(db);
+}
+
+/// A window this small fills within the setup, so every write measured
+/// after it is refused.
+const PRESSURE_WINDOW: u64 = 64;
+
+/// What a client pays when its window is full: a write past the window is
+/// refused without running, and a retry of a settled write is answered with
+/// its outcome. Both should cost no more than a bound write.
+fn pressure(mut db: Database) {
+    db.set_operation_admission_window(
+        std::num::NonZeroU64::new(PRESSURE_WINDOW).expect("non-zero window"),
+    );
+    let issuer = db.enroll_issuer(IssuerId([0x43; 16])).expect("enroll");
+    let mut admitted = Vec::with_capacity(PRESSURE_WINDOW as usize);
+    for _ in 0..PRESSURE_WINDOW {
+        let op = issuer.next().expect("number");
+        write(&db, Some(op));
+        admitted.push(op);
+    }
+
+    let mut refused = Vec::with_capacity(ROUNDS);
+    let mut settled = Vec::with_capacity(ROUNDS);
+    for round in 0..ROUNDS {
+        let options = StatementOptions {
+            operation: Some(issuer.next().expect("number")),
+            ..StatementOptions::default()
+        };
+        let start = Instant::now();
+        db.execute_cypher_shared_with("CREATE (:Bench {k: 1})", None, None, &options)
+            .expect_err("a write past the window is refused");
+        refused.push(start.elapsed());
+
+        let options = StatementOptions {
+            operation: Some(admitted[round % admitted.len()]),
+            ..StatementOptions::default()
+        };
+        let start = Instant::now();
+        db.execute_cypher_shared_with("CREATE (:Bench {k: 1})", None, None, &options)
+            .expect_err("a settled write is answered with its outcome");
+        settled.push(start.elapsed());
+    }
+    report("refused past a full window", refused);
+    report("retry of a settled write", settled);
 }

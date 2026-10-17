@@ -622,3 +622,176 @@ async fn a_session_read_is_fenced_and_says_where_it_was_served() {
 
     node.shutdown().await.expect("shutdown");
 }
+
+/// A session is driven one request at a time: each op is sent and every event
+/// up to the one that ends it is collected before the next.
+struct Driver {
+    ops: tokio::sync::mpsc::Sender<(u64, SessionOp)>,
+    events: tokio::sync::mpsc::Receiver<(u64, SessionEvent)>,
+    next_id: u64,
+}
+
+impl Driver {
+    fn open(engine: DatabaseCursorEngine) -> Self {
+        let registry = Arc::new(coordinode_session::SessionRegistry::new(
+            std::time::Duration::from_secs(30),
+        ));
+        let manager = SessionManager::new(Arc::new(engine), registry);
+        let (ops, op_rx) = tokio::sync::mpsc::channel(8);
+        let (ev_tx, events) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+        Self {
+            ops,
+            events,
+            next_id: 1,
+        }
+    }
+
+    /// Send `op` and collect its answer; a request left unanswered fails the
+    /// test naming it rather than hanging the run.
+    async fn send(&mut self, op: SessionOp) -> Vec<SessionEvent> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let asked = format!("{op:?}");
+        self.ops.send((id, op)).await.expect("send");
+        let mut out = Vec::new();
+        loop {
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(30), self.events.recv()).await;
+            let Ok(next) = received else {
+                panic!("request {id} unanswered after 30 s: {asked}; got so far {out:?}");
+            };
+            let Some((request_id, event)) = next else {
+                break;
+            };
+            if request_id != id {
+                continue;
+            }
+            let last = matches!(
+                event,
+                SessionEvent::CursorEnd { .. }
+                    | SessionEvent::Error(_)
+                    | SessionEvent::Committed { .. }
+                    | SessionEvent::Begun { .. }
+            );
+            out.push(event);
+            if last {
+                return out;
+            }
+        }
+        panic!("the session ended before request {id} was answered: {out:?}");
+    }
+
+    async fn execute(
+        &mut self,
+        query: &str,
+        txid: u64,
+        operation: Option<coordinode_embed::operation::OperationDescriptor>,
+    ) -> Vec<SessionEvent> {
+        self.send(SessionOp::Execute {
+            query: query.to_string(),
+            params: HashMap::new(),
+            txid,
+            nonce: 0,
+            settings: unset(),
+            source: None,
+            operation,
+        })
+        .await
+    }
+}
+
+/// The reason and metadata a session failure carries in its details.
+fn settled_reason(events: &[SessionEvent]) -> (String, std::collections::HashMap<String, String>) {
+    use tonic_types::StatusExt;
+    let [SessionEvent::Error(failure)] = events else {
+        panic!("expected one refusal, got {events:?}");
+    };
+    assert_eq!(
+        failure.code,
+        coordinode_session::ErrorCode::FailedPrecondition
+    );
+    let status = tonic::Status::with_details(
+        tonic::Code::FailedPrecondition,
+        failure.message.clone(),
+        failure.details.clone().into(),
+    );
+    let info = status
+        .get_details_error_info()
+        .expect("a refusal carries ErrorInfo");
+    (info.reason, info.metadata)
+}
+
+/// A session write carrying its operation runs once: a statement sent again
+/// and a commit repeated after its transaction is gone are both answered
+/// with the outcome of the first attempt, and nothing is written twice. This
+/// is the path a client on a session takes after a lost reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_write_retried_with_its_operation_runs_once() {
+    use coordinode_embed::operation::IssuerId;
+
+    let database = seeded_db(0);
+    let issuer = database
+        .read()
+        .enroll_issuer(IssuerId([0x17; 16]))
+        .expect("enroll");
+    let statement_op = issuer.next().expect("number");
+    let commit_op = issuer.next().expect("number");
+    let mut session = Driver::open(DatabaseCursorEngine::new(Arc::clone(&database)));
+
+    let first = session
+        .execute("CREATE (:Paid {k: 1})", 0, Some(statement_op))
+        .await;
+    let Some(SessionEvent::CursorEnd { stats }) = first.last() else {
+        panic!("expected the write to run, got {first:?}");
+    };
+    let statement_ts = stats.commit_ts;
+    let again = session
+        .execute("CREATE (:Paid {k: 1})", 0, Some(statement_op))
+        .await;
+    let (why, metadata) = settled_reason(&again);
+    assert_eq!(why, "OPERATION_SETTLED");
+    assert_eq!(metadata["outcome"], "COMMITTED");
+    assert_eq!(metadata["commit_ts"], statement_ts.to_string());
+
+    let begun = session
+        .send(SessionOp::Begin {
+            ordering: coordinode_session::Ordering::Unordered,
+            drain_timeout_ms: 0,
+        })
+        .await;
+    let [SessionEvent::Begun { txid }] = begun.as_slice() else {
+        panic!("expected a transaction, got {begun:?}");
+    };
+    let txid = *txid;
+    let inside = session.execute("CREATE (:Basket {k: 1})", txid, None).await;
+    assert!(
+        matches!(inside.last(), Some(SessionEvent::CursorEnd { .. })),
+        "{inside:?}"
+    );
+    let commit = SessionOp::Commit {
+        txid,
+        last_nonce: 0,
+        operation: Some(commit_op),
+    };
+    let committed = session.send(commit.clone()).await;
+    let [SessionEvent::Committed { receipt }] = committed.as_slice() else {
+        panic!("expected the commit, got {committed:?}");
+    };
+    let commit_ts = receipt.commit_ts.as_raw();
+    let repeated = session.send(commit).await;
+    let (why, metadata) = settled_reason(&repeated);
+    assert_eq!(why, "OPERATION_SETTLED");
+    assert_eq!(metadata["outcome"], "COMMITTED");
+    assert_eq!(metadata["commit_ts"], commit_ts.to_string());
+
+    drop(session);
+    for (label, expected) in [("Paid", 1), ("Basket", 1)] {
+        let rows = database
+            .try_write_for(std::time::Duration::from_secs(30))
+            .expect("nothing holds the database once the session is idle")
+            .execute_cypher(&format!("MATCH (n:{label}) RETURN n"))
+            .expect("count");
+        assert_eq!(rows.len(), expected, "{label}");
+    }
+}

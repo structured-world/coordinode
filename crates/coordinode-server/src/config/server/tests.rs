@@ -464,6 +464,25 @@ fn autocommit_retry_parses_from_the_config_file() {
     assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
 }
 
+/// The client operation admission window is a config-file setting with the
+/// engine's default; zero is refused at parse, since a window of nothing
+/// would refuse every bound write.
+#[test]
+fn operation_admission_window_parses_from_the_config_file() {
+    assert_eq!(
+        ServerConfig::default().operation_admission_window.get(),
+        65_536
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "operation_admission_window: 128\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.operation_admission_window.get(), 128);
+
+    std::fs::write(&path, "operation_admission_window: 0\n").unwrap();
+    assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
+}
+
 /// The change-stream pacing is a config-file setting; zero is refused at
 /// parse, since a zero batch never reads and a zero heartbeat interval spins.
 #[test]

@@ -198,6 +198,7 @@ pub(crate) async fn serve(
         interactive_txn_max_bytes,
         autocommit_retry_attempts,
         autocommit_retry_backoff_ms,
+        operation_admission_window,
         peers: peers_vec,
         membership_change_timeout_secs,
         join_readiness_lag_entries,
@@ -787,6 +788,7 @@ pub(crate) async fn serve(
             autocommit_retry_attempts,
             std::time::Duration::from_millis(autocommit_retry_backoff_ms),
         );
+        db.set_operation_admission_window(operation_admission_window);
         // AFTER COMMIT trigger dispatch knobs from the config file.
         // The same setter is the runtime `setParameters` seam.
         db.set_trigger_dispatch_config(trigger_dispatch_cfg);

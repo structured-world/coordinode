@@ -131,6 +131,7 @@ the key is unset.
 | `interactive_txn_max_bytes` | `268435456` (256 MiB) | restart | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping leader memory a client can hold without committing. |
 | `autocommit_retry_attempts` | `6` | restart | Runs, in all, of a statement executed without `BEGIN` whose commit is refused for contention, before the conflict is returned. A refused run applied nothing, so the server runs it again from a fresh snapshot. At least `1`; `1` returns the first refusal. Statements of an explicit transaction, ones pinned to a named timestamp and cursor pages always run once. |
 | `autocommit_retry_backoff_ms` | `2` | restart | Wait before the second run of a refused auto-commit statement, in ms; each later run waits twice as long as the one before. With the defaults the runs wait about 60 ms in all. |
+| `operation_admission_window` | `65536` | restart | How many client operations an issuer incarnation enrolled from now on may hold above its retired prefix (see [safe retries](./transactions#retrying-a-write-safely)). A bound write numbered past the window is refused, and runs nothing, until the client acknowledges or retires outcomes below it. It bounds the operation records one client can make the database keep, about 100 bytes each. An incarnation keeps the window it was enrolled with. Zero is refused. Embedded: `Database::set_operation_admission_window`. |
 | `peer_connect_timeout_ms` | `5000` | restart | How long a member's dial to a peer may take, the TCP connection and the TLS handshake together, in ms. A dial that runs out fails, and the call that needed it fails with it; the next call dials again. Raise it on distant or lossy links where a handshake takes longer. Zero is refused. |
 | `peer_call_timeout_ms` | `30000` | restart | How long one call from a member to a peer (a consensus message, a version handshake, a forwarded write, a segment piece) may take, in ms, before it fails. Zero is refused. |
 | `peer_handshake_timeout_ms` | `10000` | restart | How long a connection accepted on a member's gRPC port has to complete its TLS handshake, in ms. A connection that opens one and stalls is dropped at this bound, freeing what it held. Zero is refused. |
@@ -388,6 +389,9 @@ interactive_txn_max_bytes: 268435456
 # Re-execution of an auto-commit statement refused at commit.
 autocommit_retry_attempts: 6
 autocommit_retry_backoff_ms: 2
+
+# Client operations an issuer incarnation may hold above its retired prefix.
+operation_admission_window: 65536
 
 # Inter-node gRPC transport zstd level for wire traffic.
 wire_compression_level: 3

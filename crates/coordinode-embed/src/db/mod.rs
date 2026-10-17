@@ -453,6 +453,9 @@ pub struct Database {
     autocommit_attempts: core::num::NonZeroU32,
     /// Wait before the second run, doubled for each later one.
     autocommit_backoff: Duration,
+    /// Operations an incarnation enrolled from now on may hold above its
+    /// retired prefix ([`Self::set_operation_admission_window`]).
+    operation_admission_window: core::num::NonZeroU64,
     /// Max buffered (uncommitted) bytes per interactive transaction before it
     /// is aborted — caps leader memory a client can hold without committing.
     /// Set by the server from the `--interactive-txn-max-bytes` flag (passed
@@ -1354,6 +1357,7 @@ impl Database {
             interactive_idle_timeout: Self::DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT,
             autocommit_attempts: Self::DEFAULT_AUTOCOMMIT_ATTEMPTS,
             autocommit_backoff: Self::DEFAULT_AUTOCOMMIT_BACKOFF,
+            operation_admission_window: Self::DEFAULT_OPERATION_ADMISSION_WINDOW,
             max_interactive_txn_bytes: Self::DEFAULT_MAX_INTERACTIVE_TXN_BYTES,
             interactive_begun: None,
         };
@@ -2428,6 +2432,12 @@ impl Database {
     /// Default wait before the second run of a refused auto-commit statement.
     pub const DEFAULT_AUTOCOMMIT_BACKOFF: Duration = Duration::from_millis(2);
 
+    /// Default admission window of a new incarnation: 65 536 operations above
+    /// its retired prefix, about 6 MiB of records at most per incarnation.
+    pub const DEFAULT_OPERATION_ADMISSION_WINDOW: core::num::NonZeroU64 =
+        core::num::NonZeroU64::new(crate::operation::DEFAULT_ADMISSION_WINDOW)
+            .expect("the default window is not zero");
+
     /// Default max buffered bytes per interactive transaction (256 MiB).
     pub const DEFAULT_MAX_INTERACTIVE_TXN_BYTES: usize = 256 * 1024 * 1024;
 
@@ -2555,6 +2565,20 @@ impl Database {
     pub fn set_autocommit_retry(&mut self, attempts: core::num::NonZeroU32, backoff: Duration) {
         self.autocommit_attempts = attempts;
         self.autocommit_backoff = backoff;
+    }
+
+    /// The admission window of incarnations enrolled from now on: how many
+    /// operations above its retired prefix an incarnation admits before it
+    /// refuses new ones until the client acknowledges or retires outcomes.
+    /// It bounds the operation records a client can make the database keep.
+    /// An incarnation keeps the window it was enrolled with.
+    pub fn set_operation_admission_window(&mut self, window: core::num::NonZeroU64) {
+        self.operation_admission_window = window;
+    }
+
+    /// The admission window [`Self::enroll_issuer`] gives a new incarnation.
+    pub fn operation_admission_window(&self) -> core::num::NonZeroU64 {
+        self.operation_admission_window
     }
 
     /// Set the per-interactive-transaction buffered-bytes ceiling (server

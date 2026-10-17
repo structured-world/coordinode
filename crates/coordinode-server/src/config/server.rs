@@ -467,6 +467,9 @@ pub struct ServerConfig {
     /// Wait in ms before the second run of a refused auto-commit statement,
     /// doubled for each later one.
     pub autocommit_retry_backoff_ms: u64,
+    /// Client operations an issuer incarnation enrolled from now on may hold
+    /// above its retired prefix before new ones are refused.
+    pub operation_admission_window: std::num::NonZeroU64,
     /// Inter-node gRPC transport zstd compression level (C-zstd numbering:
     /// positive 1..=22 trade speed for ratio). Applied to inter-node wire
     /// traffic. Default 3 — zstd's standard speed/ratio default and the lowest
@@ -618,6 +621,8 @@ impl Default for ServerConfig {
             interactive_txn_max_bytes: 256 * 1024 * 1024,
             autocommit_retry_attempts: coordinode_embed::Database::DEFAULT_AUTOCOMMIT_ATTEMPTS,
             autocommit_retry_backoff_ms: 2,
+            operation_admission_window:
+                coordinode_embed::Database::DEFAULT_OPERATION_ADMISSION_WINDOW,
             wire_compression_level: 3,
             tls_cert: None,
             tls_key: None,

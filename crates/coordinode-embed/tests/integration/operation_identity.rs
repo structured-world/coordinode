@@ -142,6 +142,68 @@ fn a_descriptor_from_another_database_is_refused() {
     assert!(fresh.resume_issuer(ISSUER, 1, 1).is_err());
 }
 
+/// A logical backup carries the data a write left, never its operation
+/// record: a store restored from one is a new domain, so a descriptor
+/// issued before the backup is refused there rather than run again or
+/// reported with an outcome the restored store never recorded.
+#[test]
+fn a_logical_restore_refuses_descriptors_issued_before_it() {
+    use coordinode_embed::backup::restore::RestoreOptions;
+    use coordinode_embed::backup::{BackupFormat, export};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let issuer = enrolled(&db);
+    let op = issuer.next().unwrap();
+    run(&db, &op, "CREATE (:Purchase {k: 1})").unwrap();
+    let interner = db.interner().unwrap();
+
+    for format in [
+        BackupFormat::Binary,
+        BackupFormat::Json,
+        BackupFormat::Cypher,
+    ] {
+        let mut dump = Vec::new();
+        let snapshot = db.engine().snapshot();
+        match format {
+            BackupFormat::Binary => {
+                export::export_binary(db.engine(), &interner, 1, &snapshot, &mut dump)
+            }
+            BackupFormat::Json => {
+                export::export_json(db.engine(), &interner, 1, &snapshot, &mut dump)
+            }
+            _ => export::export_cypher(db.engine(), &interner, 1, &snapshot, &mut dump),
+        }
+        .unwrap();
+        let restored_dir = tempfile::tempdir().unwrap();
+        let mut restored = Database::open(restored_dir.path()).unwrap();
+        restored
+            .restore(format, &dump, &RestoreOptions::default())
+            .unwrap();
+
+        assert_eq!(count(&mut restored, "Purchase"), 1, "{format:?}");
+        assert!(
+            matches!(
+                restored.resolve_operation(&op, Resolve::Lookup),
+                Err(DatabaseError::ForeignOperation { .. })
+            ),
+            "{format:?}"
+        );
+        assert!(
+            matches!(
+                run(&restored, &op, "CREATE (:Purchase {k: 1})"),
+                Err(DatabaseError::ForeignOperation { .. })
+            ),
+            "{format:?}"
+        );
+        assert_eq!(count(&mut restored, "Purchase"), 1, "{format:?}");
+        // The restored store issues descriptors of its own.
+        let fresh = enrolled(&restored).next().unwrap();
+        assert_ne!(fresh.deployment, op.deployment, "{format:?}");
+        run(&restored, &fresh, "CREATE (:Purchase {k: 2})").unwrap();
+    }
+}
+
 /// One number used for two different writes: the second is refused and
 /// told the first meant something else; nothing of it applies.
 #[test]
@@ -292,6 +354,42 @@ fn an_excluded_operation_never_takes_effect() {
     let (outcome, _) = settled(run(&db, &op, "CREATE (:Late)"));
     assert_eq!(outcome, OperationOutcome::Aborted);
     assert_eq!(count(&mut db, "Late"), 0);
+}
+
+/// The admission window bounds what one incarnation can make the database
+/// keep: a write numbered past it is refused and runs nothing; releasing
+/// single outcomes does not move it, retiring the prefix below does; and an
+/// incarnation keeps the window it was enrolled with when the setting
+/// changes.
+#[test]
+fn a_full_admission_window_refuses_until_the_prefix_is_retired() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.set_operation_admission_window(core::num::NonZeroU64::new(4).unwrap());
+    let issuer = enrolled(&db);
+    let ops: Vec<_> = (0..6).map(|_| issuer.next().unwrap()).collect();
+    for (i, op) in ops.iter().take(4).enumerate() {
+        run(&db, op, &format!("CREATE (:W {{k: {i}}})")).unwrap();
+    }
+    let (outcome, differs) = settled(run(&db, &ops[4], "CREATE (:W {k: 4})"));
+    assert_eq!(outcome, OperationOutcome::Unknown, "past the window");
+    assert!(!differs);
+    assert_eq!(count(&mut db, "W"), 4, "the refused write ran nothing");
+
+    // Releasing outcomes one by one keeps the prefix where it is.
+    db.acknowledge_operation(&ops[3]).unwrap();
+    settled(run(&db, &ops[4], "CREATE (:W {k: 4})"));
+
+    // A window enrolled under a larger setting is not this incarnation's.
+    db.set_operation_admission_window(core::num::NonZeroU64::new(1000).unwrap());
+    settled(run(&db, &ops[4], "CREATE (:W {k: 4})"));
+
+    // Retiring below the third number moves the window over the fifth and
+    // the sixth.
+    db.retire_operations(&ops[2]).unwrap();
+    run(&db, &ops[4], "CREATE (:W {k: 4})").unwrap();
+    run(&db, &ops[5], "CREATE (:W {k: 5})").unwrap();
+    assert_eq!(count(&mut db, "W"), 6);
 }
 
 /// Retired numbers report retired and admit nothing, numbers never used

@@ -633,6 +633,164 @@ async fn descriptors_issued_standalone_stay_valid_in_the_grown_group() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A host's append-only journal writer, as a host retries it: each entry is
+/// one record written in an interactive transaction under the entry's
+/// operation. A commit that fails or goes unanswered is never written again
+/// blindly: the writer resolves the same operation at whoever leads, and
+/// writes the entry again, under a new number, only once the first is proven
+/// never to take effect. Driven through the faults that leave a commit's
+/// outcome unknown (its leader cut off mid-commit, a lost reply, a change of
+/// leader before the retry), every entry is in the history exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_journal_writer_resolves_an_unknown_commit_instead_of_writing_again() {
+    use coordinode_embed::operation::{
+        IssuerId, OperationDescriptor, OperationIssuer, OperationOutcome, Resolve,
+    };
+
+    /// Write entry `k` under `op` at `member`: begin, create, commit.
+    fn write(
+        member: &ReplicatedDatabase,
+        k: i64,
+        op: &OperationDescriptor,
+    ) -> Result<(), DatabaseError> {
+        let db = member.database().write();
+        let txn = db.begin_transaction();
+        db.execute_in_transaction(txn, &format!("CREATE (:Entry {{k: {k}}})"), None)?;
+        db.commit_transaction_as(txn, op).map(drop)
+    }
+
+    /// The member that leads now, once one does.
+    async fn leading(members: &[ReplicatedDatabase]) -> &ReplicatedDatabase {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(m) = members.iter().find(|m| m.leader() == Some(m.node_id())) {
+                return m;
+            }
+            assert!(Instant::now() < deadline, "no member leads");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The writer's retry after a failed commit of entry `k` under `op`:
+    /// resolve the operation at the leader; write again under a new number
+    /// only when it is proven aborted.
+    async fn recover(
+        members: &[ReplicatedDatabase],
+        issuer: &OperationIssuer,
+        k: i64,
+        op: OperationDescriptor,
+    ) {
+        let mut op = op;
+        loop {
+            let leader = leading(members).await;
+            let resolved = leader
+                .database()
+                .write()
+                .resolve_operation(&op, Resolve::Exclude);
+            match resolved {
+                Ok(OperationOutcome::Committed { .. }) => return,
+                Ok(OperationOutcome::Aborted) => {
+                    op = issuer.next().unwrap();
+                    match write(leader, k, &op) {
+                        Ok(()) => return,
+                        // Lost to a change of leader: resolve that one too.
+                        Err(_) => continue,
+                    }
+                }
+                Ok(other) => panic!("an exclusion answers finally, got {other:?}"),
+                // The leader moved under the call: ask the next one.
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    }
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        let issuer = members[0]
+            .database()
+            .write()
+            .enroll_issuer(IssuerId([0x6a; 16]))
+            .unwrap();
+        // A bounded wait, so a commit its leader cannot get acknowledged
+        // fails instead of hanging; the write may still commit afterwards.
+        for m in &members {
+            m.database()
+                .write()
+                .set_write_concern(WriteConcern::majority_with_timeout(2000));
+        }
+
+        // Entry 1: the leader is cut off while it commits. The outcome is
+        // unknown to the writer; it resolves instead of writing again.
+        let op = issuer.next().unwrap();
+        nemesis::isolate(1, &[2, 3]);
+        let failed = write(&members[0], 1, &op);
+        nemesis::heal();
+        assert!(
+            failed.is_err(),
+            "a leader cut off from its group cannot have a commit acknowledged"
+        );
+        recover(&members, &issuer, 1, op).await;
+
+        // Entry 2: committed, but the reply is lost. The writer runs the
+        // whole write again under the same operation: nothing runs, and the
+        // answer is the commit the first attempt made.
+        let leader = leading(&members).await;
+        let op = issuer.next().unwrap();
+        write(leader, 2, &op).unwrap();
+        match write(leader, 2, &op) {
+            Err(DatabaseError::OperationSettled {
+                outcome: OperationOutcome::Committed { .. },
+                intent_differs: false,
+                ..
+            }) => {}
+            other => panic!("a retry of a committed entry runs nothing, got {other:?}"),
+        }
+
+        // Entry 3: committed, then leadership moves before the retry, which
+        // reaches the new leader under the same operation.
+        let leader = leading(&members).await;
+        let op = issuer.next().unwrap();
+        write(leader, 3, &op).unwrap();
+        let next = members
+            .iter()
+            .map(|m| m.node_id())
+            .find(|&id| id != leader.node_id())
+            .unwrap();
+        leader.transfer_leadership(next).await.unwrap();
+        let leader = leading(&members).await;
+        assert!(matches!(
+            write(leader, 3, &op),
+            Err(DatabaseError::OperationSettled {
+                outcome: OperationOutcome::Committed { .. },
+                ..
+            })
+        ));
+
+        for m in &members {
+            for k in 1..=3 {
+                wait_until("every member holds each entry", || {
+                    m.database()
+                        .write()
+                        .execute_cypher(&format!("MATCH (e:Entry {{k: {k}}}) RETURN e"))
+                        .map(|rows| rows.len())
+                        .unwrap_or(0)
+                        >= 1
+                })
+                .await;
+            }
+            assert_eq!(count(m, "Entry"), 3, "each entry is in the history once");
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    nemesis::heal();
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A bound write's outcome lives in the group's history, not with the member
 /// that led when it ran: after leadership moves, the new leader reports the
 /// commit, answers a retry without running it, and excludes a number the old
