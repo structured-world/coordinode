@@ -723,6 +723,21 @@ async fn a_follower_checks_its_own_index_copy_after_a_crash() {
 
     // Killed with its copy in use: its guard stays open.
     let n2 = n2.restart_member(2, &[p1, p3], &[], true).await;
+    // A local read serves what this member has applied, and a member killed
+    // applies its log again after it starts: until it has, it holds neither
+    // the record nor its index entry. Wait for the record, read by a scan
+    // that uses no index, before asking what the lookup answers.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !local_read(&n2, "MATCH (g:G) RETURN g.code")
+        .await
+        .is_ok_and(|rows| rows.len() == 1)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the follower never applied its log again"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         assert_eq!(
