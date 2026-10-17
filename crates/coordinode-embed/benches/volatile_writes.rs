@@ -16,8 +16,14 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 
 /// Writes per acknowledgement arm.
 const ROUNDS: usize = 2000;
-/// Writes per burst.
-const BURST: usize = 5000;
+/// Writes per burst, unless `VOLATILE_BURST` names another count: a longer
+/// burst gives a profiler time to sample it.
+fn burst_size() -> usize {
+    std::env::var("VOLATILE_BURST")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(5000)
+}
 
 fn report(label: &str, mut times: Vec<Duration>) {
     times.sort_unstable();
@@ -109,22 +115,24 @@ fn acknowledgements() {
 fn burst(concern: WriteConcern, name: &str) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open(dir.path());
+    let n = burst_size();
+    let mut retained = 0;
     let start = Instant::now();
-    for k in 0..BURST {
+    for k in 0..n {
         write(&db, concern, "Burst", k);
+        retained = retained.max(db.volatile_buffered_bytes());
     }
     let acked = start.elapsed();
-    let mut retained = db.volatile_buffered_bytes();
-    while landed(&db, "Burst") < BURST as u64 {
+    while landed(&db, "Burst") < n as u64 {
         retained = retained.max(db.volatile_buffered_bytes());
         std::thread::sleep(Duration::from_millis(1));
     }
     let committed = start.elapsed();
     println!(
-        "burst {name}: n={BURST} acked={acked:?} committed={committed:?} drain_lag={:?} \
+        "burst {name}: n={n} acked={acked:?} committed={committed:?} drain_lag={:?} \
          throughput={:.0}/s retained_peak_bytes={retained}",
         committed - acked,
-        BURST as f64 / committed.as_secs_f64(),
+        n as f64 / committed.as_secs_f64(),
     );
 }
 

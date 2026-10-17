@@ -48,6 +48,50 @@ struct Admitted {
     guards: Vec<(Partition, Vec<u8>)>,
 }
 
+/// The registered commits holding one key, by identity.
+#[derive(Debug, Default)]
+struct Holders {
+    /// Commits that write the key.
+    writers: Vec<u64>,
+    /// Commits conditioned on the key without writing it.
+    conditions: Vec<u64>,
+}
+
+impl Table {
+    /// Index `commit`'s keys under `id`.
+    fn index(&mut self, id: u64, commit: &Admitted) {
+        for key in &commit.scope {
+            self.by_key.entry(key.clone()).or_default().writers.push(id);
+        }
+        for key in &commit.guards {
+            self.by_key
+                .entry(key.clone())
+                .or_default()
+                .conditions
+                .push(id);
+        }
+    }
+
+    /// Remove `commit`'s keys indexed under `id`.
+    fn unindex(&mut self, id: u64, commit: &Admitted) {
+        let keys = commit.scope.iter().chain(commit.guards.iter());
+        for key in keys {
+            if let Some(holders) = self.by_key.get_mut(key) {
+                holders.writers.retain(|h| *h != id);
+                holders.conditions.retain(|h| *h != id);
+                if holders.writers.is_empty() && holders.conditions.is_empty() {
+                    self.by_key.remove(key);
+                }
+            }
+        }
+    }
+
+    /// The timestamp registered commit `id` lands at; 0 for a staged one.
+    fn holder_ts(&self, id: u64) -> u64 {
+        self.admitted.get(&id).map_or(0, |a| a.commit_ts)
+    }
+}
+
 /// The admitted commits and the keys reserved by commits waiting to be.
 #[derive(Debug, Default)]
 struct Table {
@@ -68,6 +112,13 @@ struct Table {
     /// timestamp yet and hold back neither snapshots nor the closed bound:
     /// they land at one taken when they are drained.
     staged: HashMap<u64, Admitted>,
+    /// The admitted and staged commits that write or condition on each key,
+    /// by identity: an overlap check looks up its own keys instead of
+    /// reading every commit registered. Staged commits stay for a drain
+    /// window, so there can be many of them, and the check runs on every
+    /// commit. Keys hashed with the default, collision-resistant hasher: they
+    /// carry user values.
+    by_key: HashMap<(Partition, Vec<u8>), Holders>,
     /// Timestamps allocated for log entries that are not in the log yet, by
     /// the same identity: a commit applied locally and drained to the log
     /// later, or metadata proposed outside a commit. They do not hold back
@@ -286,25 +337,33 @@ impl PendingCommits {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        table.index(id, &candidate);
         table.admitted.insert(id, candidate);
         Ok((commit_ts, Admission { pending: self, id }))
     }
 
-    /// The first admitted commit `candidate` collides with: a key it writes
-    /// that the other writes or conditions on, or a key it conditions on that
-    /// the other writes.
+    /// The first admitted or staged commit `candidate` collides with: a key
+    /// it writes that the other writes or conditions on, or a key it
+    /// conditions on that the other writes.
     fn overlap(table: &Table, candidate: &Admitted) -> Option<Refusal> {
-        table
-            .admitted
-            .values()
-            .chain(table.staged.values())
-            .find_map(|other| {
-                Self::colliding_key(candidate, other).map(|(partition, key)| Refusal::Overlap {
-                    partition,
-                    key,
-                    holder_ts: other.commit_ts,
-                })
-            })
+        let refusal = |key: &(Partition, Vec<u8>), holder: u64| Refusal::Overlap {
+            partition: key.0,
+            key: key.1.clone(),
+            holder_ts: table.holder_ts(holder),
+        };
+        for key in &candidate.scope {
+            if let Some(holders) = table.by_key.get(key) {
+                if let Some(holder) = holders.writers.first().or(holders.conditions.first()) {
+                    return Some(refusal(key, *holder));
+                }
+            }
+        }
+        for key in &candidate.guards {
+            if let Some(holder) = table.by_key.get(key).and_then(|h| h.writers.first()) {
+                return Some(refusal(key, *holder));
+            }
+        }
+        None
     }
 
     /// Keep `admission`'s keys registered past its commit: a volatile commit
@@ -345,11 +404,12 @@ impl PendingCommits {
 
     fn withdraw_staged(&self, id: u64) {
         let mut table = self.inner.lock();
-        if table.staged.remove(&id).is_none() {
-            if let Some(admitted) = table.admitted.remove(&id) {
-                table.max_released = table.max_released.max(admitted.commit_ts);
-                table.withdrawals += 1;
-            }
+        if let Some(staged) = table.staged.remove(&id) {
+            table.unindex(id, &staged);
+        } else if let Some(admitted) = table.admitted.remove(&id) {
+            table.unindex(id, &admitted);
+            table.max_released = table.max_released.max(admitted.commit_ts);
+            table.withdrawals += 1;
         }
         drop(table);
         self.finished.notify_all();
@@ -541,6 +601,7 @@ impl PendingCommits {
     fn withdraw(&self, id: u64) {
         let mut table = self.inner.lock();
         if let Some(admitted) = table.admitted.remove(&id) {
+            table.unindex(id, &admitted);
             table.max_released = table.max_released.max(admitted.commit_ts);
             table.withdrawals += 1;
         }
