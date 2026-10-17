@@ -313,6 +313,83 @@ fn database_open_auto_repairs_corrupt_partition() {
     );
 }
 
+/// The operation records are rebuilt with the rest of the Schema partition:
+/// a repair from the checkpoint base plus the journal keeps every outcome and
+/// fence, those written after the checkpoint included, so a retry after the
+/// repair still runs nothing and an excluded number still admits nothing.
+#[test]
+fn a_repaired_schema_keeps_operation_outcomes_and_fences() {
+    use crate::Database;
+    use crate::db::StatementOptions;
+    use crate::operation::{IssuerId, OperationOutcome, Resolve};
+
+    let dir = TempDir::new().expect("tempdir");
+    let bound = |op| StatementOptions {
+        operation: Some(op),
+        ..StatementOptions::default()
+    };
+    let (before, after, excluded) = {
+        let db = Database::open(dir.path()).expect("open");
+        let issuer = db.enroll_issuer(IssuerId([0x33; 16])).expect("enroll");
+        let before = issuer.next().expect("number");
+        db.execute_cypher_shared_with("CREATE (:Op {k: 1})", None, None, &bound(before))
+            .expect("bound write");
+        db.checkpoint(3).expect("checkpoint");
+        let after = issuer.next().expect("number");
+        db.execute_cypher_shared_with("CREATE (:Op {k: 2})", None, None, &bound(after))
+            .expect("bound write after the checkpoint");
+        let excluded = issuer.next().expect("number");
+        assert_eq!(
+            db.resolve_operation(&excluded, Resolve::Exclude)
+                .expect("exclude"),
+            OperationOutcome::Aborted
+        );
+        db.persist()
+            .expect("flush the records written after the checkpoint");
+        (before, after, excluded)
+    };
+
+    let root = checkpoint_root(dir.path());
+    let corrupted = corrupt_post_checkpoint_tables(
+        &dir.path().join(Partition::Schema.name()).join("tables"),
+        &root,
+    );
+    assert!(
+        corrupted > 0,
+        "test must corrupt a post-checkpoint Schema table"
+    );
+
+    let mut db = Database::open(dir.path()).expect("reopen auto-repairs");
+    for op in [&before, &after] {
+        assert!(matches!(
+            db.resolve_operation(op, Resolve::Lookup).expect("lookup"),
+            OperationOutcome::Committed { .. }
+        ));
+    }
+    assert_eq!(
+        db.resolve_operation(&excluded, Resolve::Lookup)
+            .expect("lookup"),
+        OperationOutcome::Aborted
+    );
+    for (op, k) in [(after, 2), (excluded, 3)] {
+        assert!(matches!(
+            db.execute_cypher_shared_with(
+                &format!("CREATE (:Op {{k: {k}}})"),
+                None,
+                None,
+                &bound(op)
+            ),
+            Err(crate::DatabaseError::OperationSettled { .. })
+        ));
+    }
+    assert_eq!(
+        db.execute_cypher("MATCH (n:Op) RETURN n")
+            .expect("count")
+            .len(),
+        2
+    );
+}
+
 #[test]
 fn scheduler_starts_and_stops_cleanly() {
     let dir = TempDir::new().expect("tempdir");

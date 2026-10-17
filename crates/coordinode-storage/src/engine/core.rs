@@ -2086,22 +2086,46 @@ impl StorageEngine {
         // 1. Open the checkpoint read-only and export the partition base, with
         //    the record of which journal entries the base holds. The
         //    checkpoint engine is dropped before we mutate the live engine.
-        let (base, held): (Rows, TreeCoverage) = {
+        let (base, held, checkpoint_local): (Rows, TreeCoverage, Rows) = {
             let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
             let snapshot = ckpt.snapshot();
             // Every key of the partition, whatever family wrote it; this
             // node's own records (its consensus state) are newer in the live
-            // store than in any checkpoint and are not taken back from it.
-            let rows = ckpt
+            // store than in any checkpoint and are not taken back from it,
+            // unless the live store cannot give them.
+            let (rows, local): (Rows, Rows) = ckpt
                 .snapshot_prefix_scan(&snapshot, partition, &[])?
                 .into_iter()
-                .filter(|(k, _)| !raft_coverage::is_node_local(partition, k))
                 .map(|(k, v)| (k, v.to_vec()))
-                .collect();
+                .partition(|(k, _)| !raft_coverage::is_node_local(partition, k));
             (
                 rows,
                 TreeCoverage::read(ckpt.tree(partition)?, Domain::Journal)?,
+                local,
             )
+        };
+        // The clear below removes this node's own records with the rest of
+        // the tree, so they are read first and put back after the base. A
+        // live tree that cannot give them (the corruption reaches them) gives
+        // way to the checkpoint's copy, the newest one left, except for the
+        // consensus state (vote, log): an older vote would let this node vote
+        // twice in one term, so none is reinstated.
+        let local = match self.node_local_rows(partition) {
+            Ok(local) => local,
+            Err(e) => {
+                let reinstated = partition != Partition::Raft;
+                tracing::warn!(
+                    partition = partition.name(),
+                    error = %e,
+                    reinstated,
+                    "this node's own records could not be read from the damaged tree"
+                );
+                if reinstated {
+                    checkpoint_local
+                } else {
+                    Rows::new()
+                }
+            }
         };
 
         // 2. Physically clear the live (corrupt) tables, reinstall the base.
@@ -2113,7 +2137,7 @@ impl StorageEngine {
         self.begin_rebuild(partition)?;
         self.clear_partition(partition)?;
         let base_len = base.len();
-        for (key, value) in &base {
+        for (key, value) in base.iter().chain(&local) {
             self.put(partition, key, value)?;
         }
 
@@ -2138,6 +2162,24 @@ impl StorageEngine {
         self.rebind_coverage(partition)?;
         self.finish_rebuild(partition)?;
         Ok(base_len)
+    }
+
+    /// This node's own records in `partition` (see
+    /// [`raft_coverage::is_node_local`]), read from the live tree.
+    fn node_local_rows(&self, partition: Partition) -> StorageResult<Rows> {
+        let prefixes: &[&[u8]] = match partition {
+            Partition::Raft => &[b""],
+            Partition::Schema => &[b"meta:", b"raft:"],
+            _ => &[],
+        };
+        let mut rows = Rows::new();
+        for prefix in prefixes {
+            for guard in self.prefix_scan(partition, prefix)? {
+                let (key, value) = guard.into_owned()?;
+                rows.push((key, value.to_vec()));
+            }
+        }
+        Ok(rows)
     }
 
     /// After a rebuild replayed the journal into `partition` up to its end,
