@@ -288,6 +288,9 @@ echo doc=\$? >> ../status.txt
 echo embedded=\$? >> ../status.txt
 echo done >> ../status.txt" || true
 
+# The run takes long enough for a local `cargo clean` to remove this
+# directory meanwhile; recreate it so the results are not lost.
+mkdir -p "$out"
 for f in status.txt clippy.log build.log test.log doctest.log doc.log embedded.log; do
   ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
 done

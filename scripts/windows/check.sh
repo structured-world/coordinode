@@ -126,6 +126,9 @@ logs='status.txt clippy.log build.log test.log doctest.log'
 if [ -n "${COORDINODE_CHECK_NEXTEST:-}" ]; then
   logs='status.txt test.log'
 fi
+# The run takes long enough for a local `cargo clean` to remove this
+# directory meanwhile; recreate it so the results are not lost.
+mkdir -p "$out"
 for f in $logs; do
   scp -q "$host:$remote_scp/$f" "$out/$f" || true
 done
