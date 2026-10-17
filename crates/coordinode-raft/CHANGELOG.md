@@ -2,6 +2,17 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-17
+
+### Added
+
+- *(operation)* apply each client write once
+- *(embed)* replicated embedded database behind a feature
+
+### Fixed
+
+- *(raft)* count blocking work holding the engine at shutdown
+
 ## v0.7.2 - 2026-10-15
 
 ### Added
