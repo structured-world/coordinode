@@ -113,19 +113,26 @@ impl DrainEntry {
         }
     }
 
+    /// Approximate bytes the entry holds, what a [`DrainBuffer`] counts.
+    pub fn size_bytes(&self) -> usize {
+        self.size_bytes
+    }
+
+    /// Add `mark` to what the entry writes, in the same unit as its effects
+    /// and ahead of the binding that ends a client operation's unit: the
+    /// evidence that the entry was applied, written exactly when it is.
+    pub fn mark(&mut self, mark: Mutation) {
+        self.size_bytes += mark.size_estimate();
+        let at = match self.mutations.last() {
+            Some(Mutation::Operation(_)) => self.mutations.len() - 1,
+            _ => self.mutations.len(),
+        };
+        self.mutations.insert(at, mark);
+    }
+
     /// This entry, keeping `hold` until it is handed to the log.
     #[must_use]
     pub fn holding(mut self, hold: Box<dyn DrainHold>) -> Self {
-        self.hold = Some(hold);
-        self
-    }
-
-    /// This entry at a new commit timestamp held by `hold`: an entry
-    /// recovered after a crash, whose old timestamp a closed bound handed out
-    /// since may have passed.
-    #[must_use]
-    pub fn restamped(mut self, commit_ts: Timestamp, hold: Box<dyn DrainHold>) -> Self {
-        self.commit_ts = commit_ts;
         self.hold = Some(hold);
         self
     }
@@ -170,40 +177,50 @@ impl DrainBuffer {
     /// the buffer capacity. The caller should propagate this as a write
     /// error to the client.
     pub fn append(&self, entry: DrainEntry) -> Result<(), DrainBufferFull> {
-        let entry_bytes = entry.size_bytes as u64;
-
-        // Optimistic capacity check (no lock needed for the common path).
-        let current = self.used_bytes.load(Ordering::Relaxed);
-        if current + entry_bytes > self.capacity_bytes {
-            return Err(DrainBufferFull {
-                used_bytes: current,
-                capacity_bytes: self.capacity_bytes,
-            });
-        }
-
-        // Lock, re-check, and insert.
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let current = self.used_bytes.load(Ordering::Relaxed);
-        if current + entry_bytes > self.capacity_bytes {
-            return Err(DrainBufferFull {
-                used_bytes: current,
-                capacity_bytes: self.capacity_bytes,
-            });
-        }
-
-        self.used_bytes.fetch_add(entry_bytes, Ordering::Relaxed);
-        entries.push(entry);
-        drop(entries);
-        self.wake.notify();
+        self.reserve(entry.size_bytes as u64)?.fill(entry);
         Ok(())
     }
 
-    /// Take all buffered entries, clearing the buffer.
-    /// Returns the entries and resets the used bytes counter.
+    /// Room for `bytes` of entry, taken now and given back unless filled:
+    /// a caller that has to do something else before the entry is in the
+    /// buffer (persist it for crash recovery) learns first that it fits.
+    pub fn reserve(&self, bytes: u64) -> Result<DrainSlot<'_>, DrainBufferFull> {
+        let mut used = self.used_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(after) = used
+                .checked_add(bytes)
+                .filter(|after| *after <= self.capacity_bytes)
+            else {
+                return Err(DrainBufferFull {
+                    used_bytes: used,
+                    capacity_bytes: self.capacity_bytes,
+                });
+            };
+            match self.used_bytes.compare_exchange_weak(
+                used,
+                after,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => used = now,
+            }
+        }
+        Ok(DrainSlot {
+            buffer: self,
+            bytes,
+            filled: false,
+        })
+    }
+
+    /// Take all buffered entries, clearing the buffer, and give back the room
+    /// they held. Room reserved and not filled yet stays reserved.
     pub fn take_all(&self) -> Vec<DrainEntry> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        self.used_bytes.store(0, Ordering::Relaxed);
-        std::mem::take(&mut *entries)
+        let taken = std::mem::take(&mut *entries);
+        let held: u64 = taken.iter().map(|e| e.size_bytes as u64).sum();
+        self.used_bytes.fetch_sub(held, Ordering::AcqRel);
+        taken
     }
 
     /// Current number of buffered entries.
@@ -219,6 +236,55 @@ impl DrainBuffer {
     /// Current used capacity in bytes.
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Room reserved in a [`DrainBuffer`] (see [`DrainBuffer::reserve`]); given
+/// back on drop unless filled.
+pub struct DrainSlot<'b> {
+    buffer: &'b DrainBuffer,
+    bytes: u64,
+    filled: bool,
+}
+
+impl DrainSlot<'_> {
+    /// Put `entry` in the room reserved for it. An entry larger than the
+    /// room takes the difference too: the reservation was for its size, so
+    /// only a caller's mistake makes them differ.
+    pub fn fill(mut self, entry: DrainEntry) {
+        debug_assert_eq!(
+            entry.size_bytes as u64, self.bytes,
+            "filled with another size"
+        );
+        let mut entries = self
+            .buffer
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let size = entry.size_bytes as u64;
+        if size > self.bytes {
+            self.buffer
+                .used_bytes
+                .fetch_add(size - self.bytes, Ordering::AcqRel);
+        } else {
+            self.buffer
+                .used_bytes
+                .fetch_sub(self.bytes - size, Ordering::AcqRel);
+        }
+        entries.push(entry);
+        drop(entries);
+        self.filled = true;
+        self.buffer.wake.notify();
+    }
+}
+
+impl Drop for DrainSlot<'_> {
+    fn drop(&mut self) {
+        if !self.filled {
+            self.buffer
+                .used_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
     }
 }
 

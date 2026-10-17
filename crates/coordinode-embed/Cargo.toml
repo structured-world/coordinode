@@ -108,5 +108,9 @@ harness = false
 name = "operation_identity"
 harness = false
 
+[[bench]]
+name = "volatile_writes"
+harness = false
+
 [lints]
 workspace = true

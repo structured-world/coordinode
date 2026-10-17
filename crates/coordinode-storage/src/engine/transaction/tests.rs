@@ -1809,6 +1809,99 @@ fn a_volatile_commit_is_invisible_until_drained_and_lands_once() {
     );
 }
 
+/// A volatile commit the full drain buffer refuses holds nothing afterwards:
+/// its keys are free for the next writer at once, nothing of it is visible,
+/// and the pending table has nothing left of it. A refusal that kept the keys
+/// registered would block every later writer of them for good.
+#[test]
+fn a_volatile_commit_refused_by_a_full_buffer_holds_nothing() {
+    use crate::engine::local_pipeline::OwnedLocalProposalPipeline;
+    use coordinode_core::txn::drain::DrainBuffer;
+    use coordinode_core::txn::proposal::ProposalIdGenerator;
+
+    let (engine, oracle, _d) = test_engine();
+    let pipeline = OwnedLocalProposalPipeline::new(&engine);
+    let ids = ProposalIdGenerator::new();
+    let full = DrainBuffer::new(1);
+    let memory = WriteConcern::memory();
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, b"full:node", b"v").unwrap();
+    let refused = txn
+        .commit(&CommitContext {
+            write_concern: &memory,
+            pipeline: Some(&pipeline),
+            id_gen: Some(&ids),
+            drain_buffer: Some(&full),
+            nvme_write_buffer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            CommitError::VolatileBufferFull {
+                capacity_bytes: 1,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(full.is_empty());
+
+    let majority = WriteConcern::majority();
+    let mut next = mvcc_txn(&engine, &oracle);
+    next.put(Partition::Node, b"full:node", b"w").unwrap();
+    next.commit(&CommitContext {
+        write_concern: &majority,
+        pipeline: Some(&pipeline),
+        id_gen: Some(&ids),
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    })
+    .expect("the refused commit's keys were released");
+    assert_eq!(
+        mvcc_txn(&engine, &oracle)
+            .get(Partition::Node, b"full:node")
+            .unwrap()
+            .as_deref(),
+        Some(b"w".as_slice())
+    );
+    assert_eq!(engine.pending_commits().in_flight(), 0);
+}
+
+/// j:cache promises the write survives a process crash before its drain,
+/// which only the NVMe write buffer can keep. Without one configured the
+/// concern is refused, never quietly served as j:memory.
+#[test]
+fn a_cache_commit_without_a_write_buffer_is_refused() {
+    use crate::engine::local_pipeline::OwnedLocalProposalPipeline;
+    use coordinode_core::txn::drain::DrainBuffer;
+    use coordinode_core::txn::proposal::ProposalIdGenerator;
+
+    let (engine, oracle, _d) = test_engine();
+    let pipeline = OwnedLocalProposalPipeline::new(&engine);
+    let ids = ProposalIdGenerator::new();
+    let drain = DrainBuffer::new(1 << 20);
+    let cache = WriteConcern::cache();
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, b"cache:node", b"v").unwrap();
+    let refused = txn
+        .commit(&CommitContext {
+            write_concern: &cache,
+            pipeline: Some(&pipeline),
+            id_gen: Some(&ids),
+            drain_buffer: Some(&drain),
+            nvme_write_buffer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(&refused, CommitError::ConcernUnavailable(m) if m.contains("write buffer")),
+        "{refused:?}"
+    );
+    assert!(drain.is_empty(), "nothing buffered");
+    assert_eq!(engine.pending_commits().in_flight(), 0);
+}
+
 /// Unique values taken while an index is being built, several in one commit.
 mod unique_while_building {
     use super::*;

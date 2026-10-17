@@ -492,6 +492,8 @@ fn a_provisional_write_is_admitted_then_completed_by_its_drain() {
             .map(drop)
         };
         provisional("CREATE (:Early {k: 1})").unwrap();
+        // Accepted, not committed: nothing of it is in committed state yet.
+        assert_eq!(db.label_counts().unwrap().get("Early"), None);
         // Admitted at once; committed once the drain has run.
         assert!(matches!(
             db.resolve_operation(&op, Resolve::Lookup).unwrap(),
@@ -513,6 +515,51 @@ fn a_provisional_write_is_admitted_then_completed_by_its_drain() {
         "{outcome:?}"
     );
     assert_eq!(count(&mut db, "Early"), 1);
+    // The label count is an additive operand: it shows a second application.
+    assert_eq!(db.label_counts().unwrap().get("Early").copied(), Some(1));
+}
+
+/// A volatile write of a client operation whose payload was lost before its
+/// drain stays admitted; excluding it is the proof it never takes effect, and
+/// the drain arriving after the exclusion applies nothing. Reproduced with
+/// the drain still to come: the exclusion is resolved while the entry waits.
+#[test]
+fn an_excluded_volatile_write_is_not_applied_by_its_late_drain() {
+    use coordinode_core::txn::write_concern::WriteConcern;
+
+    let dir = tempfile::tempdir().unwrap();
+    let op = {
+        let db = Database::open(dir.path()).unwrap();
+        let op = enrolled(&db).next().unwrap();
+        db.execute_cypher_shared_with(
+            "CREATE (:Late {k: 1})",
+            None,
+            None,
+            &StatementOptions {
+                operation: Some(op),
+                write_concern: Some(WriteConcern::memory()),
+                ..StatementOptions::default()
+            },
+        )
+        .unwrap();
+        // Before the drain lands it: the batching window holds it back.
+        let excluded = db.resolve_operation(&op, Resolve::Exclude).unwrap();
+        assert!(
+            matches!(
+                excluded,
+                OperationOutcome::Aborted | OperationOutcome::Committed { .. }
+            ),
+            "{excluded:?}"
+        );
+        op
+    };
+    let mut db = Database::open(dir.path()).unwrap();
+    match db.resolve_operation(&op, Resolve::Lookup).unwrap() {
+        OperationOutcome::Aborted => assert_eq!(count(&mut db, "Late"), 0),
+        // The drain won the race: then it is in the store, once.
+        OperationOutcome::Committed { .. } => assert_eq!(count(&mut db, "Late"), 1),
+        other => panic!("an exclusion answers finally, got {other:?}"),
+    }
 }
 
 /// A bound write with parameters: the same values under the same

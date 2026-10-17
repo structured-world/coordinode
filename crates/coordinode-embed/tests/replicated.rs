@@ -791,6 +791,129 @@ async fn a_journal_writer_resolves_an_unknown_commit_instead_of_writing_again() 
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// How many `label` nodes `db`'s label counts hold: an additive operand, so
+/// it shows a second application.
+fn label_count(db: &ReplicatedDatabase, label: &str) -> u64 {
+    db.database()
+        .read()
+        .label_counts()
+        .unwrap()
+        .get(label)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// A j:memory write on the leader is accepted, not committed: no member,
+/// the leader included, sees it before its drain, and once drained it is on
+/// every member exactly once, its label count included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_memory_write_reaches_every_member_once_and_only_after_its_drain() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        {
+            let mut leader = members[0].database().write();
+            leader.set_write_concern(WriteConcern::memory());
+            leader.execute_cypher("CREATE (:Volatile {k: 1})").unwrap();
+        }
+        // The drain waits out its batching window before it proposes.
+        for m in &members {
+            assert_eq!(count(m, "Volatile"), 0, "visible before the drain");
+        }
+        for m in &members {
+            wait_until("the drained write reaches the member", || {
+                count(m, "Volatile") == 1
+            })
+            .await;
+            assert_eq!(label_count(m, "Volatile"), 1);
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// The leader loses the group while a j:memory write of a client operation
+/// waits for its drain. The write is lost with that leadership, as the
+/// concern allows, and the operation is resolved, not re-run: the new leader
+/// excludes it, and then no member ever holds its effect. Had the drain won
+/// the race, the operation resolves committed and every member holds the
+/// effect once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_memory_write_lost_with_its_leader_is_excluded_not_rerun() {
+    use coordinode_embed::db::StatementOptions;
+    use coordinode_embed::operation::{IssuerId, OperationOutcome, Resolve};
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        let op = {
+            let leader = members[0].database().write();
+            let op = leader
+                .enroll_issuer(IssuerId([0x5c; 16]))
+                .unwrap()
+                .next()
+                .unwrap();
+            leader
+                .execute_cypher_shared_with(
+                    "CREATE (:Orphan {k: 1})",
+                    None,
+                    None,
+                    &StatementOptions {
+                        operation: Some(op),
+                        write_concern: Some(WriteConcern::memory()),
+                        ..StatementOptions::default()
+                    },
+                )
+                .unwrap();
+            op
+        };
+        nemesis::isolate(1, &[2, 3]);
+        let survivors = &members[1..];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let leader = loop {
+            if let Some(m) = survivors.iter().find(|m| m.leader() == Some(m.node_id())) {
+                break m;
+            }
+            assert!(Instant::now() < deadline, "no survivor leads");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let outcome = leader
+            .database()
+            .write()
+            .resolve_operation(&op, Resolve::Exclude)
+            .unwrap();
+        nemesis::heal();
+        let expected = match outcome {
+            OperationOutcome::Aborted => 0,
+            OperationOutcome::Committed { .. } => 1,
+            other => panic!("an exclusion answers finally, got {other:?}"),
+        };
+        // A marker written after the exclusion reaches every member last, so
+        // a late drain of the old leader would have landed before it.
+        leader
+            .database()
+            .write()
+            .execute_cypher("CREATE (:After {k: 1})")
+            .unwrap();
+        for m in &members {
+            wait_until("the marker reaches the member", || count(m, "After") == 1).await;
+            assert_eq!(count(m, "Orphan"), expected, "{outcome:?}");
+            assert_eq!(label_count(m, "Orphan"), expected as u64, "{outcome:?}");
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    nemesis::heal();
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A bound write's outcome lives in the group's history, not with the member
 /// that led when it ran: after leadership moves, the new leader reports the
 /// commit, answers a retry without running it, and excludes a number the old

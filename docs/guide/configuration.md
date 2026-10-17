@@ -585,6 +585,31 @@ change stream resuming at an entry the log has dropped is refused with
 `RETENTION_LOST` rather than resumed past the gap. Zero sizes and unknown keys
 are refused when the file is read.
 
+### Volatile writes
+
+Writes under the `MEMORY` and `CACHE` journals ([durability](./transactions#durability))
+are accepted into a buffer and reach the log in batches. The settings sit
+under `storage.volatile`; every key is optional and changing one requires a
+restart:
+
+```yaml
+storage:
+  volatile:
+    drain_interval_ms: 100                 # default
+    drain_batch_max: 10000                 # default
+    drain_buffer_capacity_bytes: 104857600 # 100 MiB, default
+    nvme_write_buffer_path: /var/lib/coordinode/write-buffer   # unset by default
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `drain_interval_ms` | `100` | Batching window of the drain: writes accepted together go in one log entry. Shorter puts less accepted data at risk and lands it sooner, at the cost of more, smaller entries. |
+| `drain_batch_max` | `10000` | Mutations per drained log entry at most. A write bound to a client operation, or one with derived index work, is always an entry of its own. |
+| `drain_buffer_capacity_bytes` | `104857600` | What the buffer holds before new volatile writes are refused with `RESOURCE_EXHAUSTED` / `VOLATILE_BUFFER_FULL` (retry after the advised delay). Nothing of a refused write is kept. |
+| `nvme_write_buffer_path` | unset | Directory of the write buffer that keeps `CACHE` writes across a process crash. Without it a `CACHE` write is refused with `FAILED_PRECONDITION` / `WRITE_CONCERN_UNAVAILABLE`, never served as `MEMORY`. On restart a standalone node applies every buffered write the crash left undrained, each once; a cluster member that restarted is no longer the leader it was, and its undrained writes are lost with that leadership. A buffer written by an earlier release, whose entries carry no numbers, stops the node from opening and is kept: move it away to open. |
+
+Embedded, the same settings are fields of `StorageConfig`.
+
 ### Compression
 
 The storage tables compress their data blocks per LSM level: the levels above

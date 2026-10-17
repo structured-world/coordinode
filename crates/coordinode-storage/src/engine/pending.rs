@@ -576,8 +576,6 @@ impl Drop for Unlogged {
     }
 }
 
-impl coordinode_core::txn::drain::DrainHold for Unlogged {}
-
 /// An admitted commit's registration. Withdraws it on drop, so a commit that
 /// fails after admission holds nothing, and one that succeeds holds nothing
 /// once its writes are the state everyone else validates against.

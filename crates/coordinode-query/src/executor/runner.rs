@@ -181,6 +181,25 @@ pub enum ExecutionError {
     )]
     Backpressure,
 
+    /// This node cannot serve the write concern the write asked for (see
+    /// the engine's `CommitError::ConcernUnavailable`). Nothing was applied,
+    /// and it is never served under another concern instead.
+    #[error("write concern unavailable: {0}; nothing was applied")]
+    ConcernUnavailable(String),
+
+    /// The buffer of writes accepted under a memory or cache concern is
+    /// full. Nothing was applied; retry once it drains.
+    #[error(
+        "volatile write buffer full: {used_bytes} of {capacity_bytes} bytes; \
+         nothing was applied, retry once it drains"
+    )]
+    VolatileBufferFull {
+        /// Bytes the buffer holds.
+        used_bytes: u64,
+        /// Bytes it holds at most.
+        capacity_bytes: u64,
+    },
+
     /// The write reached a node that is not the leader, so it could not be
     /// replicated. Nothing was applied; the same write succeeds at the leader.
     /// Its identifiers too: a lease refused for want of the lead lands here.
@@ -20508,6 +20527,14 @@ fn commit_err_to_execution(
         CommitError::Storage(e) => ExecutionError::Storage(e),
         CommitError::Serialization(msg) => ExecutionError::Serialization(msg),
         CommitError::Backpressure => ExecutionError::Backpressure,
+        CommitError::ConcernUnavailable(why) => ExecutionError::ConcernUnavailable(why),
+        CommitError::VolatileBufferFull {
+            used_bytes,
+            capacity_bytes,
+        } => ExecutionError::VolatileBufferFull {
+            used_bytes,
+            capacity_bytes,
+        },
         CommitError::NotLeader { leader_id } => ExecutionError::NotLeader { leader_id },
         CommitError::Mismatched(m) => ExecutionError::Mismatched(m),
         // A caller error, not a transient one: retrying the same statement

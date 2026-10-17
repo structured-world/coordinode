@@ -2937,11 +2937,13 @@ async fn grpc_write_concern_journal_with_timeout_accepted() {
     assert_eq!(stats.nodes_created, 1);
 }
 
-/// `w:1, j:cache`: the same wire-through invariant as the memory level.
+/// `w:1, j:cache` on a server with no write buffer configured is refused: the
+/// concern promises the write survives a process crash, which nothing would
+/// keep, and it is never served as `j:memory` instead.
 #[tokio::test]
-async fn grpc_write_concern_cache_accepted() {
+async fn grpc_write_concern_cache_without_a_write_buffer_is_refused() {
     let (svc, _dir) = test_service();
-    let resp = svc
+    let refused = svc
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "CREATE (n:Analytics {id: 1})".to_string(),
             parameters: std::collections::HashMap::new(),
@@ -2956,9 +2958,13 @@ async fn grpc_write_concern_cache_accepted() {
             ..Default::default()
         }))
         .await
-        .expect("cache write should succeed");
-    let stats = resp.into_inner().stats.expect("stats");
-    assert_eq!(stats.nodes_created, 1);
+        .expect_err("a cache write without a write buffer is refused");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
+    assert!(refused.message().contains("write buffer"), "{refused:?}");
 }
 
 /// End-to-end capacity propagation through the gRPC handler:

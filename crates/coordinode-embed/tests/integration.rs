@@ -10,6 +10,7 @@ mod integration {
     mod background_workers;
     mod backup_restore;
     mod btree_index;
+    mod cache_recovery;
     mod capacity_tracking;
     mod compound_queries;
     mod computed;

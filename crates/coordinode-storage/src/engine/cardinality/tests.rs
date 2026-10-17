@@ -687,7 +687,7 @@ fn a_volatile_commit_without_a_drain_is_refused() {
     add(&mut t, 1, 2, Some(b"a"));
     let refused = commit_with(&mut t, WriteConcern::memory()).unwrap_err();
     assert!(
-        matches!(refused, CommitError::Serialization(_)),
+        matches!(refused, CommitError::ConcernUnavailable(_)),
         "{refused:?}"
     );
     assert_eq!(kept(&f, &ds[0]), BTreeMap::new());

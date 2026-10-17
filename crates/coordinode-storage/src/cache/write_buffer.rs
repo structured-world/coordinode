@@ -2,12 +2,22 @@
 //!
 //! `w:cache` writes are acknowledged after landing in RAM (DrainBuffer) and
 //! this NVMe-backed file. If the process crashes before the background drain
-//! thread flushes the entry to Raft, the entry can be recovered from the NVMe
-//! file on restart.
+//! thread hands an entry to the log, the entry can be recovered from the file
+//! on restart.
+//!
+//! # Exactly once
+//!
+//! Each buffer has an identity, and each entry a sequence number within it.
+//! Appending an entry adds a mark to what it writes: [`DRAINED_KEY`] set to
+//! the buffer identity and the entry's number, in the same unit as its
+//! effects. The log applies the mark exactly when it applies the entry, so
+//! on recovery every entry at or below the recorded number is known applied
+//! and is skipped, and every entry above it is known not applied. A crash
+//! between the drain's apply and the file cleanup cannot apply an entry twice.
 //!
 //! # Atomic rotation protocol
 //!
-//! Two files live in the write buffer directory:
+//! Two kinds of files live in the write buffer directory:
 //!
 //! - `write_buffer_current.bin` — active writes being appended.
 //! - `write_buffer_draining.NNN.bin` — checkpoint being drained (N = generation).
@@ -18,30 +28,24 @@
 //! On `complete_drain(token)`: the draining file is deleted. Crash between
 //! begin and complete → draining file survives for replay.
 //!
-//! # Crash recovery
-//!
-//! `NvmeWriteBuffer::recover(dir)` reads both files (if present) and returns
-//! their entries as `DrainEntry` values to be re-injected into the RAM
-//! `DrainBuffer` before the drain thread starts.
-//!
-//! # File format (per entry)
+//! # File format
 //!
 //! ```text
-//! [entry_size: u32]    total bytes of this entry including the size field
-//! [mut_count: u32]     number of mutations
-//! [commit_ts: u64]
-//! [start_ts: u64]
-//! for each mutation:
-//!   [kind: u8]         0 = Put, 1 = Delete, 2 = Merge
-//!   [partition: u8]    PartitionId ordinal
-//!   [key_len: u32]
-//!   [key: bytes]
-//!   if kind != Delete:
-//!     [value_len: u32]
-//!     [value: bytes]
+//! header: [magic: "CNVB"] [format: u16 = 2] [buffer id: u64]
+//! entry:
+//!   [entry_size: u32]  total bytes of this entry including the size field
+//!   [seq: u64]         the entry's number within the buffer
+//!   [mut_count: u32]
+//!   [commit_ts: u64]
+//!   [start_ts: u64]
+//!   for each mutation:
+//!     [kind: u8] [partition: u8] [key_len: u32] [key] ([value_len: u32] [value])
 //! ```
 //!
-//! A partial trailing entry (truncated on crash) is silently skipped.
+//! A partial trailing entry (truncated on crash) is skipped. A file without
+//! this header was written before entries carried a number, so whether its
+//! entries were applied cannot be told: it is kept and refused, never
+//! replayed or deleted.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -49,16 +53,43 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use coordinode_core::txn::drain::{DrainEntry, WriteBufferHook};
+use coordinode_core::txn::drain::{DrainBuffer, DrainBufferFull, DrainEntry, WriteBufferHook};
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
 use coordinode_core::txn::timestamp::Timestamp;
 use tracing::{debug, info, warn};
 
-// ── File names ────────────────────────────────────────────────────
+// ── File names and header ─────────────────────────────────────────
 
 const CURRENT_FILE: &str = "write_buffer_current.bin";
 const DRAINING_PREFIX: &str = "write_buffer_draining.";
 const DRAINING_SUFFIX: &str = ".bin";
+
+const MAGIC: [u8; 4] = *b"CNVB";
+const FORMAT: u16 = 2;
+const HEADER_LEN: usize = 4 + 2 + 8;
+
+/// Schema key recording the last entry of a write buffer the log applied:
+/// the buffer identity and the entry's number, eight bytes each, big-endian.
+/// This node's own record, like the rest of `meta:`.
+pub const DRAINED_KEY: &[u8] = b"meta:volatile_drained";
+
+/// The entry number of buffer `id` recorded under [`DRAINED_KEY`] as
+/// `value`, when the record is about that buffer.
+pub fn drained_through(value: &[u8], id: u64) -> Option<u64> {
+    let recorded: [u8; 16] = value.try_into().ok()?;
+    let (buffer, seq) = recorded.split_at(8);
+    if u64::from_be_bytes(buffer.try_into().ok()?) != id {
+        return None;
+    }
+    Some(u64::from_be_bytes(seq.try_into().ok()?))
+}
+
+fn drained_value(id: u64, seq: u64) -> Vec<u8> {
+    let mut value = Vec::with_capacity(16);
+    value.extend_from_slice(&id.to_be_bytes());
+    value.extend_from_slice(&seq.to_be_bytes());
+    value
+}
 
 // ── Mutation kind bytes ───────────────────────────────────────────
 
@@ -73,6 +104,57 @@ const KIND_DERIVE: u8 = 5;
 /// An operation command, MessagePack-encoded under the Schema partition tag.
 const KIND_OPERATION: u8 = 6;
 
+// ── Recovery ──────────────────────────────────────────────────────
+
+/// What a write buffer directory holds after a crash.
+#[derive(Debug)]
+pub struct RecoveredBuffer {
+    /// The buffer the entries belong to.
+    pub id: u64,
+    /// Its entries with their numbers, in number order.
+    pub entries: Vec<(u64, DrainEntry)>,
+}
+
+/// Why a write buffer directory cannot be recovered automatically. Its
+/// files are left as they are.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoverError {
+    /// A file without the numbered format: whether its entries were applied
+    /// cannot be told, so it is neither replayed nor deleted.
+    #[error(
+        "write buffer file {path} predates numbered entries; it is kept, and the \
+         store does not open until it is moved away"
+    )]
+    Unnumbered {
+        /// The file.
+        path: PathBuf,
+    },
+    /// Files of two different buffers: one recovery was interrupted by
+    /// another buffer's writes, which this store never does.
+    #[error("write buffer files of two buffers ({first} and {second}) in one directory")]
+    MixedBuffers {
+        /// One buffer identity found.
+        first: u64,
+        /// Another buffer identity found.
+        second: u64,
+    },
+    /// The files could not be read.
+    #[error("write buffer I/O: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// Why a cache-concern write was not accepted. Nothing of it is in the file
+/// or the drain buffer.
+#[derive(Debug, thiserror::Error)]
+pub enum AppendError {
+    /// The drain buffer has no room for it.
+    #[error(transparent)]
+    Full(DrainBufferFull),
+    /// The file could not be written.
+    #[error("write buffer I/O: {0}")]
+    Io(#[from] io::Error),
+}
+
 // ── NvmeWriteBuffer ───────────────────────────────────────────────
 
 /// Persistent write buffer for `w:cache` crash recovery.
@@ -83,136 +165,143 @@ const KIND_OPERATION: u8 = 6;
 /// Thread-safe: `Mutex<File>` for append serialization.
 pub struct NvmeWriteBuffer {
     dir: PathBuf,
+    id: u64,
     current: Mutex<File>,
     generation: AtomicU64,
+    /// The number of the last entry appended.
+    last_seq: AtomicU64,
 }
 
 impl NvmeWriteBuffer {
-    /// Open or create the write buffer in the given directory.
-    ///
-    /// Creates `write_buffer_current.bin` if absent.
-    pub fn open(dir: &Path) -> io::Result<Self> {
+    /// Start a fresh buffer `id` in `dir`, replacing a current file. Run
+    /// [`Self::recover`] and dispose of what it returns first: this does
+    /// not look at what the directory held. `id` must not have been used
+    /// by this store before; a timestamp of its clock taken at open is one.
+    pub fn open(dir: &Path, id: u64) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join(CURRENT_FILE);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-
-        info!(path = %path.display(), "nvme write buffer opened");
-
+        let file = create_buffer_file(&dir.join(CURRENT_FILE), id)?;
+        info!(dir = %dir.display(), id, "nvme write buffer opened");
         Ok(Self {
             dir: dir.to_owned(),
+            id,
             current: Mutex::new(file),
             generation: AtomicU64::new(0),
+            last_seq: AtomicU64::new(0),
         })
     }
 
-    /// Append a `DrainEntry` to the current NVMe write buffer file.
+    /// This buffer's identity.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Number `entry`, add its applied mark (see the module docs), append it
+    /// to the current file and put it in `drain`, the drain buffer.
     ///
-    /// Called synchronously during `w:cache` write path — latency should be
-    /// ~100µs (NVMe sequential write + fsync). If the NVMe path is absent
-    /// (no cache configured), this buffer should not be created.
-    pub fn append(&self, entry: &DrainEntry) -> io::Result<()> {
-        let encoded = encode_entry(entry)?;
+    /// Called synchronously on the `w:cache` write path before the write is
+    /// acknowledged. Written through to the OS, which is what survives a
+    /// process crash. All of it under one lock, so entries reach the drain in
+    /// number order, which is what makes a recorded number mean that every
+    /// entry below it was applied; and the room in `drain` is taken first, so
+    /// a write refused for want of room is not in the file to be replayed.
+    pub fn append(&self, mut entry: DrainEntry, drain: &DrainBuffer) -> Result<(), AppendError> {
         let mut file = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = self.last_seq.load(Ordering::Relaxed) + 1;
+        entry.mark(Mutation::Put {
+            partition: PartitionId::Schema,
+            key: DRAINED_KEY.to_vec(),
+            value: drained_value(self.id, seq),
+        });
+        let slot = drain
+            .reserve(entry.size_bytes() as u64)
+            .map_err(AppendError::Full)?;
+        let encoded = encode_entry(seq, &entry)?;
         file.seek(SeekFrom::End(0))?;
         file.write_all(&encoded)?;
         file.flush()?;
+        self.last_seq.store(seq, Ordering::Relaxed);
         debug!(
+            seq,
             mutations = entry.mutations.len(),
             "nvme write buffer appended"
         );
+        slot.fill(entry);
         Ok(())
     }
 
-    /// Recover all entries from existing write buffer files (current + draining).
+    /// Read every entry the directory holds (current and draining files),
+    /// without changing anything. `None` when it holds none.
     ///
-    /// Called once on startup **before** the drain thread starts. Returns all
-    /// un-drained `DrainEntry` values from crash-surviving files.
-    ///
-    /// After successful recovery, both files are truncated (entries will be
-    /// re-injected into the RAM `DrainBuffer` and drained normally).
-    pub fn recover(dir: &Path) -> io::Result<Vec<DrainEntry>> {
-        let mut all_entries = Vec::new();
-
-        // Recover draining files first (they were being drained when crash happened).
-        let draining = find_draining_files(dir)?;
-        for path in &draining {
-            let entries = read_entries_from_file(path)?;
-            let n = entries.len();
-            all_entries.extend(entries);
-            // Delete after reading — entries will be re-drained from DrainBuffer.
-            if let Err(e) = std::fs::remove_file(path) {
-                warn!(path = %path.display(), error = %e, "failed to remove draining file");
-            } else {
-                info!(path = %path.display(), entries = n, "recovered and removed draining file");
+    /// Called on startup before the buffer is opened.
+    pub fn recover(dir: &Path) -> Result<Option<RecoveredBuffer>, RecoverError> {
+        let mut paths = find_draining_files(dir)?;
+        let current = dir.join(CURRENT_FILE);
+        if current.exists() {
+            paths.push(current);
+        }
+        let mut found: Option<RecoveredBuffer> = None;
+        for path in &paths {
+            let Some(RecoveredBuffer { id, entries }) = read_buffer_file(path)? else {
+                continue;
+            };
+            match &mut found {
+                None => found = Some(RecoveredBuffer { id, entries }),
+                Some(buffer) if buffer.id == id => buffer.entries.extend(entries),
+                Some(buffer) => {
+                    return Err(RecoverError::MixedBuffers {
+                        first: buffer.id,
+                        second: id,
+                    });
+                }
             }
         }
+        Ok(found
+            .map(|mut buffer| {
+                buffer.entries.sort_by_key(|(seq, _)| *seq);
+                buffer
+            })
+            .filter(|buffer| !buffer.entries.is_empty()))
+    }
 
-        // Recover current file.
-        let current_path = dir.join(CURRENT_FILE);
-        if current_path.exists() {
-            let entries = read_entries_from_file(&current_path)?;
-            let n = entries.len();
-            if n > 0 {
-                all_entries.extend(entries);
-                info!(entries = n, "recovered entries from current write buffer");
-            }
-            // Truncate current file — entries will be re-appended if w:cache writes
-            // happen before drain. We truncate here so we don't double-replay on
-            // a second restart if the process crashes again before drain.
-            truncate_file(&current_path)?;
+    /// Remove every buffer file of `dir`: what [`Self::recover`] returned is
+    /// in the log now, or is lost by the concern's contract.
+    pub fn discard(dir: &Path) -> io::Result<()> {
+        for path in find_draining_files(dir)? {
+            std::fs::remove_file(&path)?;
         }
-
-        Ok(all_entries)
+        let current = dir.join(CURRENT_FILE);
+        if current.exists() {
+            std::fs::remove_file(&current)?;
+        }
+        Ok(())
     }
 }
 
 impl WriteBufferHook for NvmeWriteBuffer {
     /// Checkpoint: atomically rename current file → `draining.<token>.bin`.
     ///
-    /// New `w:cache` writes after this point go to a fresh current file
-    /// (created lazily on next `append()`). Returns the generation token
-    /// for `complete_drain()`.
+    /// New `w:cache` writes after this point go to a fresh current file of
+    /// the same buffer. Returns the generation token for `complete_drain()`.
     fn begin_drain(&self) -> u64 {
         let token = self.generation.fetch_add(1, Ordering::Relaxed);
-
+        // Held across the rename, so no append lands in a file being moved.
+        let mut guard = self.current.lock().unwrap_or_else(|e| e.into_inner());
         let current_path = self.dir.join(CURRENT_FILE);
-        if !current_path.exists() {
-            // Nothing in current file — no-op checkpoint.
-            debug!(token, "nvme write buffer: nothing to checkpoint");
-            return token;
-        }
-
         let draining_path = draining_file_path(&self.dir, token);
         match std::fs::rename(&current_path, &draining_path) {
-            Ok(()) => {
-                // Re-open/create fresh current file for new writes.
-                let mut guard = self.current.lock().unwrap_or_else(|e| e.into_inner());
-                match OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(self.dir.join(CURRENT_FILE))
-                {
-                    Ok(f) => {
-                        *guard = f;
-                        debug!(token, "nvme write buffer: checkpoint created");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "failed to create fresh current file after rename");
-                    }
+            Ok(()) => match create_buffer_file(&current_path, self.id) {
+                Ok(f) => {
+                    *guard = f;
+                    debug!(token, "nvme write buffer: checkpoint created");
                 }
-            }
+                Err(e) => {
+                    warn!(error = %e, "failed to create fresh current file after rename");
+                }
+            },
             Err(e) => {
                 warn!(token, error = %e, "nvme write buffer: rename failed during begin_drain");
             }
         }
-
         token
     }
 
@@ -234,6 +323,23 @@ impl WriteBufferHook for NvmeWriteBuffer {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
+/// A new, empty buffer file holding only the header of buffer `id`.
+fn create_buffer_file(path: &Path, id: u64) -> io::Result<File> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    header.extend_from_slice(&MAGIC);
+    header.extend_from_slice(&FORMAT.to_le_bytes());
+    header.extend_from_slice(&id.to_le_bytes());
+    file.write_all(&header)?;
+    file.flush()?;
+    Ok(file)
+}
+
 fn draining_file_path(dir: &Path, token: u64) -> PathBuf {
     dir.join(format!("{DRAINING_PREFIX}{token}{DRAINING_SUFFIX}"))
 }
@@ -254,15 +360,11 @@ fn find_draining_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn truncate_file(path: &Path) -> io::Result<()> {
-    OpenOptions::new().write(true).truncate(true).open(path)?;
-    Ok(())
-}
-
-/// Encode a `DrainEntry` to bytes for NVMe storage.
-fn encode_entry(entry: &DrainEntry) -> io::Result<Vec<u8>> {
+/// Encode entry `seq` for NVMe storage.
+fn encode_entry(seq: u64, entry: &DrainEntry) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
 
+    body.extend_from_slice(&seq.to_le_bytes());
     let mut_count = entry.mutations.len() as u32;
     body.extend_from_slice(&mut_count.to_le_bytes());
     body.extend_from_slice(&entry.commit_ts.as_raw().to_le_bytes());
@@ -344,17 +446,17 @@ fn write_bytes(data: &[u8], buf: &mut Vec<u8>) {
 }
 
 fn read_bytes(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
-    if *pos + 4 > buf.len() {
-        return None;
-    }
-    let len = u32::from_le_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]]) as usize;
+    let len = u32::from_le_bytes(buf.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
     *pos += 4;
-    if *pos + len > buf.len() {
-        return None;
-    }
-    let data = buf[*pos..*pos + len].to_vec();
+    let data = buf.get(*pos..pos.checked_add(len)?)?.to_vec();
     *pos += len;
     Some(data)
+}
+
+fn read_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let value = u64::from_le_bytes(buf.get(*pos..*pos + 8)?.try_into().ok()?);
+    *pos += 8;
+    Some(value)
 }
 
 fn partition_to_u8(p: PartitionId) -> u8 {
@@ -388,76 +490,61 @@ fn u8_to_partition(b: u8) -> Option<PartitionId> {
     }
 }
 
-/// Read all valid `DrainEntry` values from a file.
-/// Partial trailing entries (truncated on crash) are silently ignored.
-fn read_entries_from_file(path: &Path) -> io::Result<Vec<DrainEntry>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut file = File::open(path)?;
+/// Read a buffer file: its buffer identity and numbered entries. `None` for
+/// an empty file. A partial trailing entry (truncated on crash) ends the
+/// read; a file without the header is refused.
+fn read_buffer_file(path: &Path) -> Result<Option<RecoveredBuffer>, RecoverError> {
     let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    File::open(path)?.read_to_end(&mut data)?;
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let unnumbered = || RecoverError::Unnumbered {
+        path: path.to_owned(),
+    };
+    let header = data.get(..HEADER_LEN).ok_or_else(unnumbered)?;
+    if header[..4] != MAGIC || u16::from_le_bytes([header[4], header[5]]) != FORMAT {
+        return Err(unnumbered());
+    }
+    let mut id_pos = 6;
+    let id = read_u64(header, &mut id_pos).ok_or_else(unnumbered)?;
 
     let mut entries = Vec::new();
-    let mut pos = 0;
-
-    while pos + 4 <= data.len() {
+    let mut pos = HEADER_LEN;
+    while let Some(size_bytes) = data.get(pos..pos + 4) {
         let entry_size =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-
-        // Validate: entry_size must cover at least the size field.
-        if entry_size < 4 || pos + entry_size > data.len() {
+            u32::from_le_bytes(size_bytes.try_into().map_err(|_| unnumbered())?) as usize;
+        let Some(entry_data) = data
+            .get(pos + 4..pos + entry_size)
+            .filter(|_| entry_size >= 4)
+        else {
             // Partial entry at end of file — truncated on crash, skip.
             break;
-        }
-
-        let entry_data = &data[pos + 4..pos + entry_size];
+        };
         match decode_entry(entry_data) {
             Some(entry) => entries.push(entry),
             None => {
-                warn!(
-                    path = %path.display(),
-                    "corrupt entry in write buffer — skipping remaining"
-                );
+                warn!(path = %path.display(), "corrupt entry in write buffer, skipping the rest");
                 break;
             }
         }
-
         pos += entry_size;
     }
-
-    Ok(entries)
+    Ok(Some(RecoveredBuffer { id, entries }))
 }
 
-fn decode_entry(data: &[u8]) -> Option<DrainEntry> {
+fn decode_entry(data: &[u8]) -> Option<(u64, DrainEntry)> {
     let mut pos = 0;
-
-    if pos + 4 > data.len() {
-        return None;
-    }
-    let mut_count =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+    let seq = read_u64(data, &mut pos)?;
+    let mut_count = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
     pos += 4;
+    let commit_ts = read_u64(data, &mut pos)?;
+    let start_ts = read_u64(data, &mut pos)?;
 
-    if pos + 8 > data.len() {
-        return None;
-    }
-    let commit_ts = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
-    pos += 8;
-
-    if pos + 8 > data.len() {
-        return None;
-    }
-    let start_ts = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
-    pos += 8;
-
-    let mut mutations = Vec::with_capacity(mut_count);
+    let mut mutations = Vec::with_capacity(mut_count.min(data.len()));
     for _ in 0..mut_count {
-        if pos + 2 > data.len() {
-            return None;
-        }
-        let kind = data[pos];
-        let partition = u8_to_partition(data[pos + 1])?;
+        let kind = *data.get(pos)?;
+        let partition = u8_to_partition(*data.get(pos + 1)?)?;
         pos += 2;
 
         let mutation = match kind {
@@ -509,10 +596,13 @@ fn decode_entry(data: &[u8]) -> Option<DrainEntry> {
         mutations.push(mutation);
     }
 
-    Some(DrainEntry::new(
-        mutations,
-        Timestamp::from_raw(commit_ts),
-        Timestamp::from_raw(start_ts),
+    Some((
+        seq,
+        DrainEntry::new(
+            mutations,
+            Timestamp::from_raw(commit_ts),
+            Timestamp::from_raw(start_ts),
+        ),
     ))
 }
 

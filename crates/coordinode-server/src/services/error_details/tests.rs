@@ -64,6 +64,25 @@ fn a_retryable_reason_says_so_and_the_rest_do_not() {
         retry.retry_delay.unwrap_or_default() > std::time::Duration::ZERO,
         "backpressure must advise waiting, not retry-now"
     );
+
+    // A full volatile buffer frees with the next drain pass: wait, then retry.
+    // A concern the server cannot serve fails the same way every time.
+    let full = status_with_reason(
+        Code::ResourceExhausted,
+        "full",
+        Reason::VolatileBufferFull,
+        [],
+    );
+    let details = full.get_error_details();
+    let retry = details.retry_info().expect("a full buffer drains");
+    assert!(retry.retry_delay.unwrap_or_default() > std::time::Duration::ZERO);
+    let unavailable = status_with_reason(
+        Code::FailedPrecondition,
+        "no buffer",
+        Reason::WriteConcernUnavailable,
+        [],
+    );
+    assert!(unavailable.get_error_details().retry_info().is_none());
 }
 
 #[test]
@@ -89,6 +108,8 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::NotLeader,
         Reason::OutsideRetention,
         Reason::InvalidWriteConcern,
+        Reason::WriteConcernUnavailable,
+        Reason::VolatileBufferFull,
         Reason::DuplicateKey,
         Reason::KeyImmutable,
         Reason::ConstraintViolation,

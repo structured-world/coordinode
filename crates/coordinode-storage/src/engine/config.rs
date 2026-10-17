@@ -769,7 +769,8 @@ pub struct StorageConfig {
     /// - `write_buffer_current.bin` — active write buffer being appended
     /// - `write_buffer_draining.NNN.bin` — checkpoint in progress (drain thread)
     ///
-    /// When `None` (default), `w:cache` is treated identically to `w:memory`.
+    /// When `None` (default), a `w:cache` write is refused: nothing would
+    /// keep the promise that it survives a process crash.
     pub nvme_write_buffer_path: Option<PathBuf>,
 
     /// The store was gathered into these endpoints from a layout it was not

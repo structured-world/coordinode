@@ -15,9 +15,24 @@ use tempfile::tempdir;
 /// A volatile write under `concern` is not seen by a committed read before
 /// the drain, and is seen once after it.
 fn invisible_until_drained(concern: WriteConcern) {
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     let dir = tempdir().unwrap();
+    // A cache concern needs its write buffer; a memory one ignores it.
+    let config = || {
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path().join("data"),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        config.nvme_write_buffer_path = Some(dir.path().join("nvme"));
+        config
+    };
     {
-        let mut db = Database::open(dir.path()).unwrap();
+        let mut db = Database::open_with_config(config()).unwrap();
         db.set_write_concern(concern);
         let results = db
             .execute_cypher("CREATE (n:User {name: 'alice'}) RETURN n.name")
@@ -28,7 +43,7 @@ fn invisible_until_drained(concern: WriteConcern) {
         let read = db.execute_cypher("MATCH (n:User) RETURN n.name").unwrap();
         assert!(read.is_empty(), "visible before the drain: {read:?}");
     }
-    let mut db = Database::open(dir.path()).unwrap();
+    let mut db = Database::open_with_config(config()).unwrap();
     let read = db.execute_cypher("MATCH (n:User) RETURN n.name").unwrap();
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].get("n.name").unwrap().as_str(), Some("alice"));
@@ -44,6 +59,22 @@ fn a_memory_write_is_invisible_until_drained() {
 #[test]
 fn a_cache_write_is_invisible_until_drained() {
     invisible_until_drained(WriteConcern::cache());
+}
+
+/// A cache-concern write on a store without a write buffer is refused, not
+/// served as a memory-concern one, and nothing of it lands.
+#[test]
+fn a_cache_write_without_a_write_buffer_is_refused() {
+    let dir = tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).unwrap();
+        db.set_write_concern(WriteConcern::cache());
+        let refused = db.execute_cypher("CREATE (n:Unbuffered {k: 1})");
+        assert!(refused.is_err(), "{refused:?}");
+    }
+    let mut db = Database::open(dir.path()).unwrap();
+    let read = db.execute_cypher("MATCH (n:Unbuffered) RETURN n").unwrap();
+    assert!(read.is_empty());
 }
 
 /// Several j:memory writes drain into the log, each once.

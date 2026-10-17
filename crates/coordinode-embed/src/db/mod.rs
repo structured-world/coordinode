@@ -998,6 +998,26 @@ impl Database {
         oracle: Arc<TimestampOracle>,
         pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
     ) -> Result<Self, DatabaseError> {
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            path.as_ref(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        Self::from_engine_with_config(config, engine, oracle, pipeline)
+    }
+
+    /// [`Self::from_engine`] under the storage configuration the engine was
+    /// opened with, so the database takes its settings from it (the drain of
+    /// volatile writes and their write buffer among them) instead of the
+    /// defaults.
+    pub fn from_engine_with_config(
+        config: StorageConfig,
+        engine: Arc<StorageEngine>,
+        oracle: Arc<TimestampOracle>,
+        pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
+    ) -> Result<Self, DatabaseError> {
         // The engine stamps log entries with a bound read from its clock, and
         // the database takes commit timestamps from `oracle`: two clocks would
         // let a bound pass over a commit the other one just took.
@@ -1010,16 +1030,10 @@ impl Database {
                     .to_string(),
             ));
         }
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            path.as_ref(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
+        let path = config.data_dir().to_path_buf();
         // Cluster mode (RaftProposalPipeline): the state machine applies writes,
         // so the oplog-tailing worker maintains HNSW (no inline index path).
-        Self::finish_open(path.as_ref(), config, oracle, engine, pipeline, true)
+        Self::finish_open(&path, config, oracle, engine, pipeline, true)
     }
 
     /// Create a checkpoint (repair base + oplog copy) under
@@ -1246,30 +1260,37 @@ impl Database {
         ));
 
         // Open the NVMe write buffer for w:cache crash recovery (if configured).
-        // Recovery runs first: any entries from a previous crash are re-injected
-        // into the DrainBuffer before the drain thread starts, ensuring they are
-        // drained to Raft in the next drain cycle.
+        // What a previous process accepted and did not drain is dealt with
+        // first, before anything is served: nothing can write in between.
         let nvme_write_buffer = if let Some(ref nvme_path) = config.nvme_write_buffer_path {
-            let recovered =
-                coordinode_storage::cache::write_buffer::NvmeWriteBuffer::recover(nvme_path)
-                    .map_err(|e| {
-                        DatabaseError::Other(format!("NVMe write buffer recovery failed: {e}"))
-                    })?;
-            for entry in recovered {
-                // A fresh timestamp, held until the entry is drained: bounds
-                // handed out since the crash may have passed the old one, and
-                // the entry was never in the log, only in this node's
-                // volatile state.
-                let (commit_ts, hold) =
-                    engine.pending_commits().obligate(|| oracle.next().as_raw());
-                let entry = entry.restamped(Timestamp::from_raw(commit_ts), Box::new(hold));
-                drain_buffer.append(entry).map_err(|e| {
-                    DatabaseError::Other(format!(
-                        "failed to re-inject recovered w:cache entry: {e}"
-                    ))
+            use coordinode_storage::cache::write_buffer::NvmeWriteBuffer;
+            let recovered = NvmeWriteBuffer::recover(nvme_path).map_err(|e| {
+                DatabaseError::Other(format!("NVMe write buffer recovery refused: {e}"))
+            })?;
+            if let Some(buffer) = recovered {
+                if follow_raft_applies {
+                    // A member that restarted is not the leader it was: under
+                    // a cache concern, what it had not drained is lost with
+                    // its leadership. An entry bound to a client operation
+                    // stays admitted until the host resolves it.
+                    tracing::warn!(
+                        entries = buffer.entries.len(),
+                        "w:cache writes not drained before the restart are lost with leadership"
+                    );
+                } else {
+                    replay_cache_buffer(
+                        &engine,
+                        &oracle,
+                        pipeline.as_ref(),
+                        &proposal_id_gen,
+                        buffer,
+                    )?;
+                }
+                NvmeWriteBuffer::discard(nvme_path).map_err(|e| {
+                    DatabaseError::Other(format!("NVMe write buffer cleanup failed: {e}"))
                 })?;
             }
-            let wb = coordinode_storage::cache::write_buffer::NvmeWriteBuffer::open(nvme_path)
+            let wb = NvmeWriteBuffer::open(nvme_path, oracle.next().as_raw())
                 .map_err(|e| DatabaseError::Other(format!("NVMe write buffer open failed: {e}")))?;
             Some(Arc::new(wb))
         } else {
@@ -2209,6 +2230,21 @@ impl Database {
             // Retryable like a conflict, but with a delay: the engine sheds
             // writes until compaction drains its debt.
             CommitError::Backpressure => DatabaseError::WriteBackpressure,
+            // The concern cannot be served here; carried in the executor's
+            // spelling, which every layer above already reads.
+            CommitError::ConcernUnavailable(why) => DatabaseError::Execution(
+                coordinode_query::executor::runner::ExecutionError::ConcernUnavailable(why),
+            ),
+            // Retryable once the drain makes room.
+            CommitError::VolatileBufferFull {
+                used_bytes,
+                capacity_bytes,
+            } => DatabaseError::Execution(
+                coordinode_query::executor::runner::ExecutionError::VolatileBufferFull {
+                    used_bytes,
+                    capacity_bytes,
+                },
+            ),
             // Retryable at a different address: the leader.
             CommitError::NotLeader { leader_id } => DatabaseError::NotLeader { leader_id },
             // Retryable at the leader, or here once this member is updated.
@@ -2574,6 +2610,14 @@ impl Database {
     /// An incarnation keeps the window it was enrolled with.
     pub fn set_operation_admission_window(&mut self, window: core::num::NonZeroU64) {
         self.operation_admission_window = window;
+    }
+
+    /// Bytes of writes accepted under a memory or cache concern and not yet
+    /// handed to the log. Writes are refused once it reaches the configured
+    /// `drain_buffer_capacity_bytes`, so a host watching it sees the pressure
+    /// before it refuses anything.
+    pub fn volatile_buffered_bytes(&self) -> u64 {
+        self.drain_buffer.used_bytes()
     }
 
     /// The admission window [`Self::enroll_issuer`] gives a new incarnation.
@@ -4336,6 +4380,8 @@ fn query_memory_limit_from_mib(text: &str) -> Result<u64, SessionSettingRefused>
 }
 
 mod after_commit;
+mod cache_recovery;
+use cache_recovery::replay_cache_buffer;
 mod catalog;
 mod client_ops;
 mod fields;

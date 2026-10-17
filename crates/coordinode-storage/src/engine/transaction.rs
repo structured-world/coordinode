@@ -99,6 +99,25 @@ pub enum CommitError {
          retry after compaction catches up"
     )]
     Backpressure,
+    /// This node cannot serve the write concern the commit asked for: a
+    /// memory or cache concern with no drain, a cache concern with no write
+    /// buffer configured, or a schema change under either. Nothing was
+    /// applied; the same commit is refused again until that changes, and it
+    /// is never served under another concern instead.
+    #[error("write concern unavailable: {0}; nothing was applied")]
+    ConcernUnavailable(String),
+    /// The buffer of writes accepted under a memory or cache concern and not
+    /// drained yet is full. Nothing was applied; retry once it drains.
+    #[error(
+        "volatile write buffer full: {used_bytes} of {capacity_bytes} bytes; \
+         nothing was applied, retry once it drains"
+    )]
+    VolatileBufferFull {
+        /// Bytes the buffer holds.
+        used_bytes: u64,
+        /// Bytes it holds at most.
+        capacity_bytes: u64,
+    },
     /// This node is not the leader, so it cannot replicate the write. Nothing
     /// was applied. `leader_id` is the node the cluster last named leader, when
     /// one is known: an election in flight leaves it `None` for a moment.
@@ -2211,21 +2230,35 @@ impl<'a> Transaction<'a> {
         // Crash before drain = data lost (explicit contract).
         if ctx.write_concern.is_volatile() {
             let Some(drain_buf) = ctx.drain_buffer else {
-                return Err(CommitError::Serialization(
+                return Err(CommitError::ConcernUnavailable(
                     "a memory or cache concern needs the drain that hands the write to the log"
                         .into(),
                 ));
             };
             let Some(clock) = self.engine.oracle() else {
-                return Err(CommitError::Serialization(
+                return Err(CommitError::ConcernUnavailable(
                     "a memory or cache concern needs the store's clock to land the drained write"
                         .into(),
                 ));
             };
+            // j:cache promises the write survives a process crash before its
+            // drain, which only the NVMe write buffer keeps: without one the
+            // concern is refused, not served as j:memory.
+            let cache_buffer = match (ctx.write_concern.journal, ctx.nvme_write_buffer) {
+                (Journal::Cache, None) => {
+                    return Err(CommitError::ConcernUnavailable(
+                        "a cache concern needs the NVMe write buffer configured \
+                         (storage.volatile.nvme_write_buffer_path)"
+                            .into(),
+                    ));
+                }
+                (Journal::Cache, buffer) => buffer,
+                _ => None,
+            };
             // A catalog change is visible to every attempt as soon as it is
             // published, which a buffered unit cannot be.
             if self.schema_changed {
-                return Err(CommitError::Serialization(
+                return Err(CommitError::ConcernUnavailable(
                     "a schema change cannot be written under a memory or cache concern".into(),
                 ));
             }
@@ -2259,20 +2292,24 @@ impl<'a> Transaction<'a> {
                 oracle: clock,
             };
             let entry = DrainEntry::new(mutations, commit_ts, self.read_ts).holding(Box::new(hold));
-
-            // j:cache: persist to NVMe before ACK for process-crash recovery.
-            // j:memory skips this: data loss on crash is the explicit contract.
-            if ctx.write_concern.journal == Journal::Cache {
-                if let Some(nvme) = ctx.nvme_write_buffer {
-                    nvme.append(&entry).map_err(|e| {
-                        CommitError::Serialization(format!("w:cache NVMe write failed: {e}"))
-                    })?;
-                }
+            let full =
+                |e: coordinode_core::txn::drain::DrainBufferFull| CommitError::VolatileBufferFull {
+                    used_bytes: e.used_bytes,
+                    capacity_bytes: e.capacity_bytes,
+                };
+            // j:cache: persisted to NVMe before ACK for process-crash
+            // recovery, numbered and marked so a recovered entry is applied
+            // once. j:memory skips this: data loss on crash is the explicit
+            // contract.
+            match cache_buffer {
+                Some(nvme) => nvme.append(entry, drain_buf).map_err(|e| match e {
+                    crate::cache::write_buffer::AppendError::Full(e) => full(e),
+                    crate::cache::write_buffer::AppendError::Io(e) => {
+                        CommitError::Storage(StorageError::Io(format!("w:cache write buffer: {e}")))
+                    }
+                })?,
+                None => drain_buf.append(entry).map_err(full)?,
             }
-
-            drain_buf.append(entry).map_err(|e| {
-                CommitError::Serialization(format!("volatile write backpressure: {e}"))
-            })?;
 
             // Accepted, not committed: there is no commit timestamp to report
             // until the drain lands it.

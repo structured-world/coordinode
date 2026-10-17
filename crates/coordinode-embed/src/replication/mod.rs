@@ -166,7 +166,6 @@ impl Member {
         storage: &StorageConfig,
         options: MemberOptions,
     ) -> Result<Self, ReplicationError> {
-        let data_dir = storage.data_dir().to_path_buf();
         // A store the non-replicated build wrote keeps its history in a
         // journal where the consensus log is about to live: its entries are
         // brought into the store first, the cut the group starts from.
@@ -235,7 +234,12 @@ impl Member {
         let node = Arc::new(node);
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(node.pipeline());
-        let database = Database::from_engine(&data_dir, Arc::clone(&engine), oracle, pipeline)?;
+        let database = Database::from_engine_with_config(
+            storage.clone(),
+            Arc::clone(&engine),
+            oracle,
+            pipeline,
+        )?;
         // A copy of an index found damaged on this member alone is replaced
         // from a peer's copy; a member without peers answers from its records
         // instead.

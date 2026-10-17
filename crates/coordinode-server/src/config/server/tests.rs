@@ -1045,6 +1045,54 @@ fn bad_compression_settings_are_refused() {
     }
 }
 
+/// The volatile drain section reaches the storage config; unset keys keep
+/// the engine defaults, and no write buffer is configured unless named, so a
+/// cache-concern write is refused by default rather than served as memory.
+/// Zero sizes and unknown keys are refused when the file is read.
+#[test]
+fn volatile_settings_parse_and_reach_the_storage_config() {
+    let defaults = ServerConfig::default()
+        .resolve_storage_config()
+        .expect("valid");
+    assert_eq!(defaults.drain_interval_ms, 100);
+    assert_eq!(defaults.drain_batch_max, 10_000);
+    assert_eq!(defaults.drain_buffer_capacity_bytes, 100 * 1024 * 1024);
+    assert_eq!(defaults.nvme_write_buffer_path, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "storage:\n  volatile:\n    drain_interval_ms: 20\n    drain_batch_max: 500\n    \
+         drain_buffer_capacity_bytes: 4096\n    nvme_write_buffer_path: /nvme/wb\n",
+    )
+    .unwrap();
+    let sc = ServerConfig::load(Some(path.to_str().unwrap()))
+        .unwrap()
+        .resolve_storage_config()
+        .expect("valid topology");
+    assert_eq!(sc.drain_interval_ms, 20);
+    assert_eq!(sc.drain_batch_max, 500);
+    assert_eq!(sc.drain_buffer_capacity_bytes, 4096);
+    assert_eq!(
+        sc.nvme_write_buffer_path,
+        Some(std::path::PathBuf::from("/nvme/wb"))
+    );
+
+    for body in [
+        "storage:\n  volatile:\n    drain_interval_ms: 0\n",
+        "storage:\n  volatile:\n    drain_batch_max: 0\n",
+        "storage:\n  volatile:\n    drain_buffer_capacity_bytes: 0\n",
+        "storage:\n  volatile:\n    drain_every: 5\n",
+    ] {
+        std::fs::write(&path, body).unwrap();
+        assert!(
+            ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
+            "accepted: {body}"
+        );
+    }
+}
+
 /// A sync method the engine does not have, a zero-sized segment and an
 /// unknown key are refused when the file is read, not met at the first write.
 #[test]

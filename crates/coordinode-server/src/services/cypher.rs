@@ -553,6 +553,30 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
+        // A valid concern this server cannot serve: the request is fine, the
+        // server's configuration (or the kind of write) does not allow it.
+        DatabaseError::Execution(ExecutionError::ConcernUnavailable(_)) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::WriteConcernUnavailable,
+                [],
+            );
+        }
+        DatabaseError::Execution(ExecutionError::VolatileBufferFull {
+            used_bytes,
+            capacity_bytes,
+        }) => {
+            return status_with_reason(
+                Code::ResourceExhausted,
+                rendered,
+                Reason::VolatileBufferFull,
+                [
+                    ("used_bytes", used_bytes.to_string()),
+                    ("capacity_bytes", capacity_bytes.to_string()),
+                ],
+            );
+        }
         // Both spellings again, for a write that reached a node which is not
         // the leader. FAILED_PRECONDITION rather than UNAVAILABLE: the server
         // is perfectly available, it is the request that came to the wrong
