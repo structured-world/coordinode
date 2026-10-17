@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.7.2 - 2026-10-15
+
+### Added
+
+- *(cluster)* authenticate every inter-node call by node identity
+- *(raft)* record each member's node identity
+- *(wire)* per-database inter-node security context
+- *(wire)* establish inter-node peer identities
+- *(storage)* store index generations under local installations
+- *(migrate)* add the node sizes report module
+- *(migrate)* catalog record migrations, check and journal stats
+- *(migrate)* offline tool to bring a data directory current
+
+### Fixed
+
+- *(server)* send timestamps as timestamps, signed
+- *(cdc)* age a consumer's lag from committed work only
+- *(cluster)* admit foreign-domain SVIDs as clients
+- *(backup)* restore JSON floats bit for bit
+- *(raft)* a member that lost committed entries rejoins without a vote
+- *(storage)* recover oplog segments that lost writes mid-log
+- *(storage)* keep oplog segments inside the retention window
+- *(migrate)* find every marked store, Raft snapshot captures too
+
+### Performance
+
+- *(query)* bound property delta chains with whole writes
+
+### Testing
+
+- *(cluster)* move a member only once it holds the log
+
 ## v0.7.1 - 2026-10-13
 
 ### Added

@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.2 - 2026-10-15
+
+### Added
+
+- *(cluster)* authenticate every inter-node call by node identity
+
+### Fixed
+
+- *(cluster)* admit foreign-domain SVIDs as clients
+
 ## v0.7.1 - 2026-10-13
 
 ### Fixed

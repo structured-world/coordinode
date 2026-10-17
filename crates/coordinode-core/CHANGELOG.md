@@ -2,6 +2,13 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.2 - 2026-10-15
+
+### Added
+
+- *(cluster)* authenticate every inter-node call by node identity
+- *(raft)* record each member's node identity
+
 ## v0.7.1 - 2026-10-13
 
 ### Added

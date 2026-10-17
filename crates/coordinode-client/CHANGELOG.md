@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.2 - 2026-10-15
+
+### Fixed
+
+- *(server)* send timestamps as timestamps, signed
+
 ## v0.7.1 - 2026-10-13
 
 ### Added
