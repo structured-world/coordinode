@@ -538,3 +538,51 @@ fn a_withdrawal_wakes_its_waiter() {
     drop(held);
     assert_eq!(waiter.join().expect("waiter"), 1);
 }
+
+/// A volatile commit accepted and waiting for its drain keeps refusing a
+/// writer of its keys, so nothing overwrites what it was validated against,
+/// while it holds back neither a snapshot nor the closed bound: it has no
+/// timestamp until the drain gives it one. A writer of other keys passes.
+#[test]
+fn a_staged_commit_keeps_its_keys_but_holds_back_no_snapshot() {
+    let pending = Arc::new(table());
+    let admission = admit_at(&pending, 10, key(Partition::Node, b"a")).expect("admitted");
+    let staged = pending.stage(admission);
+
+    assert_eq!(pending.snapshot_floor(|| 50), 50);
+    assert_eq!(pending.stamp_closed_below(|| 50), 51);
+    assert_eq!(pending.in_flight(), 0);
+    let refused = admit_at(&pending, 20, key(Partition::Node, b"a")).unwrap_err();
+    assert!(matches!(refused, Refusal::Overlap { .. }), "{refused:?}");
+    let other = admit_at(&pending, 21, key(Partition::Node, b"b")).expect("disjoint");
+    drop(other);
+
+    drop(staged);
+    admit_at(&pending, 22, key(Partition::Node, b"a")).expect("released on drop");
+}
+
+/// The drain lands a staged commit at the timestamp it takes then, above
+/// every snapshot served while it waited, and from then on it is a commit
+/// applying: snapshots wait for it like for any other until it is released.
+#[test]
+fn a_staged_commit_lands_at_the_timestamp_its_drain_takes() {
+    let pending = Arc::new(table());
+    let admission = admit_at(&pending, 10, key(Partition::Node, b"a")).expect("admitted");
+    let mut staged = pending.stage(admission);
+    assert_eq!(
+        pending.snapshot_floor(|| 40),
+        40,
+        "a snapshot served meanwhile"
+    );
+
+    assert_eq!(staged.admit(|| 41), Some(41));
+    assert_eq!(staged.admit(|| 42), None, "a timestamp is taken once");
+    assert_eq!(pending.in_flight(), 1);
+    assert_eq!(pending.snapshot_floor(|| 45), 41);
+    let refused = admit_at(&pending, 43, key(Partition::Node, b"a")).unwrap_err();
+    assert_eq!(holder_of(&refused), 41);
+
+    drop(staged);
+    assert_eq!(pending.in_flight(), 0);
+    assert_eq!(pending.snapshot_floor(|| 45), 45);
+}

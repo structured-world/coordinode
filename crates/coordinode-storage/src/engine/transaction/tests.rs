@@ -1728,6 +1728,87 @@ fn a_fire_and_forget_commit_never_writes_outside_the_pipeline() {
     );
 }
 
+/// A volatile commit (j:memory) is not committed state: until it is drained
+/// through the log a committed read does not see it, and once drained it has
+/// exactly one effect. Applying it to the engine at acceptance and again at
+/// drain made it visible to committed reads before it was durable anywhere
+/// and counted an additive operand twice.
+#[test]
+fn a_volatile_commit_is_invisible_until_drained_and_lands_once() {
+    use crate::engine::local_pipeline::OwnedLocalProposalPipeline;
+    use coordinode_core::txn::drain::DrainBuffer;
+    use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline, RaftProposal};
+
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::memory();
+    let pipeline = OwnedLocalProposalPipeline::new(&engine);
+    let ids = ProposalIdGenerator::new();
+    // No drain thread: the buffer is drained below, by hand, once the
+    // committed reads before the drain have been made.
+    let drain = DrainBuffer::new(1 << 20);
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: Some(&pipeline),
+        id_gen: Some(&ids),
+        drain_buffer: Some(&drain),
+        nvme_write_buffer: None,
+    };
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, b"vol:node", b"v").unwrap();
+    txn.push_counter_delta(b"vol:count", 1);
+    txn.commit(&ctx).unwrap();
+
+    let counter = |engine: &StorageEngine, oracle: &TimestampOracle| -> i64 {
+        mvcc_txn(engine, oracle)
+            .get(Partition::Counter, b"vol:count")
+            .unwrap()
+            .map_or(0, |bytes| {
+                crate::engine::merge::decode_counter(&bytes).unwrap()
+            })
+    };
+
+    // A committed read before the drain.
+    assert_eq!(
+        mvcc_txn(&engine, &oracle)
+            .get(Partition::Node, b"vol:node")
+            .unwrap(),
+        None,
+        "an undrained volatile write is visible to a committed read"
+    );
+    assert_eq!(
+        counter(&engine, &oracle),
+        0,
+        "an undrained volatile operand is visible to a committed read"
+    );
+
+    // The drain, as the drain thread performs it.
+    for entry in drain.take_all() {
+        pipeline
+            .propose_and_wait(&RaftProposal {
+                id: ids.next(),
+                mutations: entry.mutations,
+                commit_ts: entry.commit_ts,
+                start_ts: entry.start_ts,
+                bypass_rate_limiter: true,
+            })
+            .unwrap();
+    }
+
+    assert_eq!(
+        mvcc_txn(&engine, &oracle)
+            .get(Partition::Node, b"vol:node")
+            .unwrap()
+            .as_deref(),
+        Some(b"v".as_slice())
+    );
+    assert_eq!(
+        counter(&engine, &oracle),
+        1,
+        "the drained operand must land exactly once"
+    );
+}
+
 /// Unique values taken while an index is being built, several in one commit.
 mod unique_while_building {
     use super::*;

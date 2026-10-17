@@ -2186,7 +2186,7 @@ impl<'a> Transaction<'a> {
 
         // Drain the buffered point writes; each write-concern branch below
         // applies / replicates them.
-        let mut wb = std::mem::take(&mut self.write_buffer);
+        let wb = std::mem::take(&mut self.write_buffer);
 
         // A write concern the group cannot honour is refused before anything is
         // written; the member count is checked at the pipeline, which knows it.
@@ -2200,137 +2200,84 @@ impl<'a> Transaction<'a> {
         // other member ever sees, on a follower and on the leader alike.
 
         // Volatile journal (j:memory / j:cache with the leader as the one
-        // acknowledging member):
-        // 1. Apply locally for immediate read visibility
-        // 2. Buffer mutations in DrainBuffer for background Raft replication
-        // 3. Return immediately — drain thread handles durability
+        // acknowledging member): the validated unit is buffered, not applied.
+        // It becomes committed state only when the drain hands it to the log,
+        // so no committed read sees it before then and the log applies it
+        // once. Until then the keys it was validated on stay registered and
+        // its claims reserved, so no other commit overwrites what it was
+        // validated against; it lands at a timestamp the drain takes, above
+        // every snapshot served while it waited.
         //
         // Crash before drain = data lost (explicit contract).
-        // Drained entries preserve original commit_ts for CDC fidelity.
         if ctx.write_concern.is_volatile() {
-            // A provisional effect of a client operation is exposed only once
+            let Some(drain_buf) = ctx.drain_buffer else {
+                return Err(CommitError::Serialization(
+                    "a memory or cache concern needs the drain that hands the write to the log"
+                        .into(),
+                ));
+            };
+            let Some(clock) = self.engine.oracle() else {
+                return Err(CommitError::Serialization(
+                    "a memory or cache concern needs the store's clock to land the drained write"
+                        .into(),
+                ));
+            };
+            // A catalog change is visible to every attempt as soon as it is
+            // published, which a buffered unit cannot be.
+            if self.schema_changed {
+                return Err(CommitError::Serialization(
+                    "a schema change cannot be written under a memory or cache concern".into(),
+                ));
+            }
+            // A provisional effect of a client operation is accepted only once
             // the operation is admitted durably, through the log: its drain
             // completes that admitted attempt, and a payload lost before the
             // drain leaves the operation admitted until the host excludes it.
             let admitted = match self.operation {
-                Some((op, intent)) => {
-                    if ctx.drain_buffer.is_none() {
-                        return Err(CommitError::Serialization(
-                            "a client operation under a memory or cache concern needs the \
-                             drain that completes it"
-                                .into(),
-                        ));
-                    }
-                    Some(self.admit_provisional(ctx, oracle, op, intent)?)
-                }
+                Some((op, intent)) => Some(self.admit_provisional(ctx, oracle, op, intent)?),
                 None => None,
             };
-            // Step 1: Apply locally for read visibility.
-            for (part, start, end) in &self.range_removals {
-                self.engine.remove_range(*part, start, end)?;
-            }
-            for ((part, key), value) in &wb {
-                match value {
-                    Some(v) => self.engine.put(*part, key, v)?,
-                    None => self.engine.delete(*part, key)?,
-                }
-            }
-            for (key, operand) in encode_staged_adj(&self.merge_adj_ops) {
-                self.engine.merge(Partition::Adj, key, &operand)?;
-            }
-            for (key, operand) in &self.merge_node_deltas {
-                self.engine.merge(Partition::Node, key, operand)?;
-            }
-            for (key, delta) in self
-                .merge_counter_deltas
-                .iter()
-                .chain(self.kept_counts.iter())
-                .filter(|(_, d)| **d != 0)
-            {
-                self.engine
-                    .merge(Partition::Counter, key, &encode_counter_delta(*delta))?;
-            }
 
-            // The entry reaches the log only when it is drained: until then
-            // its timestamp stays registered as not yet logged, taken while
-            // the admission still holds it, so no closed bound passes over it.
-            // An admitted operation completes at a timestamp taken after its
-            // admission: the drain's record of the outcome must be a later
-            // version than the admission's, and the commit timestamp taken
-            // before the admission is not a reservation for it.
-            let (drain_ts, unlogged) = match (admitted, ctx.drain_buffer) {
-                (Some(_), Some(_)) => {
-                    let (ts, held) = self
-                        .engine
-                        .pending_commits()
-                        .obligate(|| oracle.next().as_raw());
-                    (Timestamp::from_raw(ts), Some(held))
-                }
-                (None, Some(_)) => (
-                    commit_ts,
-                    Some(self.engine.pending_commits().hold(commit_ts.as_raw())),
-                ),
-                (_, None) => (commit_ts, None),
+            let mut mutations = self.seal_unit(wb);
+            // The drain completes the admitted attempt: last in its unit,
+            // after the sealed DERIVED work.
+            if let (Some((op, intent)), Some(attempt)) = (self.operation, admitted) {
+                mutations.push(Mutation::Operation(
+                    coordinode_core::txn::operation::OperationCommand::Bind(
+                        coordinode_core::txn::operation::OperationBinding {
+                            op,
+                            intent,
+                            attempt,
+                            mode: coordinode_core::txn::operation::BindMode::Commit,
+                        },
+                    ),
+                ));
+            }
+            let hold = crate::engine::volatile::VolatileHold {
+                staged: self.engine.pending_commits().stage(admission),
+                _claims: reservation.map(|r| r.into_owned(self.engine.claim_registry())),
+                oracle: clock,
             };
+            let entry = DrainEntry::new(mutations, commit_ts, self.read_ts).holding(Box::new(hold));
 
-            // The writes are local state now, so the registration has done its
-            // work: from here a validating writer finds them by reading, and a
-            // reader's snapshot may cover this timestamp. What remains is
-            // durability, which is not what the floor is about. The claims go
-            // with it: an attempt after this one is judged against the state
-            // these writes left.
-            drop(admission);
-            drop(reservation);
-
-            // Step 2: Buffer for drain (if drain buffer is available).
-            if let Some(drain_buf) = ctx.drain_buffer {
-                let mut mutations = self.seal_unit(wb);
-                // The drain completes the admitted attempt: last in its unit,
-                // after the sealed DERIVED work.
-                if let (Some((op, intent)), Some(attempt)) = (self.operation, admitted) {
-                    mutations.push(Mutation::Operation(
-                        coordinode_core::txn::operation::OperationCommand::Bind(
-                            coordinode_core::txn::operation::OperationBinding {
-                                op,
-                                intent,
-                                attempt,
-                                mode: coordinode_core::txn::operation::BindMode::Commit,
-                            },
-                        ),
-                    ));
+            // j:cache: persist to NVMe before ACK for process-crash recovery.
+            // j:memory skips this: data loss on crash is the explicit contract.
+            if ctx.write_concern.journal == Journal::Cache {
+                if let Some(nvme) = ctx.nvme_write_buffer {
+                    nvme.append(&entry).map_err(|e| {
+                        CommitError::Serialization(format!("w:cache NVMe write failed: {e}"))
+                    })?;
                 }
-                let mut entry = DrainEntry::new(mutations, drain_ts, self.read_ts);
-                if let Some(unlogged) = unlogged {
-                    entry = entry.holding(Box::new(unlogged));
-                }
-
-                // j:cache: persist to NVMe before ACK for process-crash recovery.
-                // j:memory skips this: data loss on crash is the explicit contract.
-                if ctx.write_concern.journal == Journal::Cache {
-                    if let Some(nvme) = ctx.nvme_write_buffer {
-                        nvme.append(&entry).map_err(|e| {
-                            CommitError::Serialization(format!("w:cache NVMe write failed: {e}"))
-                        })?;
-                    }
-                }
-
-                drain_buf.append(entry).map_err(|e| {
-                    CommitError::Serialization(format!("volatile write backpressure: {e}"))
-                })?;
-            } else {
-                // No drain buffer — clear write buffers (local writes already applied).
-                wb.clear();
-                self.range_removals.clear();
-                self.merge_adj_ops.clear();
-                self.merge_node_deltas.clear();
-                self.merge_counter_deltas.clear();
-                self.kept_counts.clear();
-                self.derived = derived::DerivedLedger::default();
             }
 
-            self.publish_schema_change();
+            drain_buf.append(entry).map_err(|e| {
+                CommitError::Serialization(format!("volatile write backpressure: {e}"))
+            })?;
+
+            // Accepted, not committed: there is no commit timestamp to report
+            // until the drain lands it.
             return Ok(CommitOutcome {
-                commit_ts: Some(drain_ts),
+                commit_ts: None,
                 applied_index: None,
             });
         }

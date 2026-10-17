@@ -61,19 +61,18 @@ fn from_engine_volatile_write_drains() {
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(OwnedLocalProposalPipeline::new(&engine));
 
-    let mut db = Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap();
-    db.set_write_concern(WriteConcern::memory());
+    {
+        let mut db = Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap();
+        db.set_write_concern(WriteConcern::memory());
+        db.execute_cypher("CREATE (n:Sensor {id: 's1'}) RETURN n")
+            .unwrap();
+        // Accepted, not committed: the drain has not handed it to the log.
+        let results = db.execute_cypher("MATCH (n:Sensor) RETURN n.id").unwrap();
+        assert!(results.is_empty(), "{results:?}");
+        // Closing the database drains through the provided pipeline.
+    }
 
-    // j:memory write: locally visible immediately
-    db.execute_cypher("CREATE (n:Sensor {id: 's1'}) RETURN n")
-        .unwrap();
-    let results = db.execute_cypher("MATCH (n:Sensor) RETURN n.id").unwrap();
-    assert_eq!(results.len(), 1);
-
-    // Wait for drain thread to process (default 100ms interval)
-    std::thread::sleep(std::time::Duration::from_millis(250));
-
-    // Data still readable after drain
+    let mut db = Database::open(dir.path()).unwrap();
     let results = db.execute_cypher("MATCH (n:Sensor) RETURN n.id").unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].get("n.id").unwrap().as_str(), Some("s1"));

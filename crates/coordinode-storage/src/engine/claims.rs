@@ -183,6 +183,43 @@ impl Drop for Reservation<'_> {
     }
 }
 
+impl Reservation<'_> {
+    /// This reservation, held past the borrow it was taken under: a volatile
+    /// commit keeps its claims until it is drained. `registry` is the one it
+    /// was taken from.
+    pub fn into_owned(self, registry: &std::sync::Arc<ClaimRegistry>) -> OwnedReservation {
+        debug_assert!(core::ptr::eq(self.registry, registry.as_ref()));
+        let attempt = self.attempt;
+        // Its own drop would release what is handed over.
+        core::mem::forget(self);
+        OwnedReservation {
+            registry: std::sync::Arc::clone(registry),
+            attempt,
+        }
+    }
+}
+
+/// A reservation that owns its registry; see [`Reservation::into_owned`].
+/// Releases it on drop.
+pub struct OwnedReservation {
+    registry: std::sync::Arc<ClaimRegistry>,
+    attempt: u64,
+}
+
+impl core::fmt::Debug for OwnedReservation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OwnedReservation")
+            .field("attempt", &self.attempt)
+            .finish()
+    }
+}
+
+impl Drop for OwnedReservation {
+    fn drop(&mut self) {
+        self.registry.release(self.attempt);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests;

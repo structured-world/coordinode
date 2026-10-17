@@ -62,6 +62,12 @@ struct Table {
     /// same identity. Their keys turn away newcomers, so a waiter is not
     /// overtaken forever by writers that keep arriving.
     reserved: HashMap<u64, Admitted>,
+    /// Volatile commits accepted and not drained yet, by the same identity.
+    /// Their keys collide like an admitted commit's, so nothing overwrites
+    /// what they were validated against before they land, but they have no
+    /// timestamp yet and hold back neither snapshots nor the closed bound:
+    /// they land at one taken when they are drained.
+    staged: HashMap<u64, Admitted>,
     /// Timestamps allocated for log entries that are not in the log yet, by
     /// the same identity: a commit applied locally and drained to the log
     /// later, or metadata proposed outside a commit. They do not hold back
@@ -288,13 +294,65 @@ impl PendingCommits {
     /// that the other writes or conditions on, or a key it conditions on that
     /// the other writes.
     fn overlap(table: &Table, candidate: &Admitted) -> Option<Refusal> {
-        table.admitted.values().find_map(|other| {
-            Self::colliding_key(candidate, other).map(|(partition, key)| Refusal::Overlap {
-                partition,
-                key,
-                holder_ts: other.commit_ts,
+        table
+            .admitted
+            .values()
+            .chain(table.staged.values())
+            .find_map(|other| {
+                Self::colliding_key(candidate, other).map(|(partition, key)| Refusal::Overlap {
+                    partition,
+                    key,
+                    holder_ts: other.commit_ts,
+                })
             })
-        })
+    }
+
+    /// Keep `admission`'s keys registered past its commit: a volatile commit
+    /// accepted now and drained later. Its timestamp is withdrawn, so neither
+    /// snapshots nor the closed bound wait for the drain, while its keys keep
+    /// refusing an overlapping writer until it lands, at a timestamp taken by
+    /// [`Staged::admit`]. Moved under one lock, so no writer finds the keys
+    /// free in between.
+    pub fn stage(self: &Arc<Self>, admission: Admission<'_>) -> Staged {
+        let id = admission.id;
+        // The admission's own drop would withdraw what was just moved.
+        core::mem::forget(admission);
+        let mut table = self.inner.lock();
+        if let Some(mut admitted) = table.admitted.remove(&id) {
+            table.max_released = table.max_released.max(admitted.commit_ts);
+            table.withdrawals += 1;
+            admitted.commit_ts = 0;
+            table.staged.insert(id, admitted);
+        }
+        drop(table);
+        self.finished.notify_all();
+        Staged {
+            pending: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// A staged commit's keys, re-registered under a fresh timestamp; see
+    /// [`Staged::admit`].
+    fn admit_staged(&self, id: u64, allocate: impl FnOnce() -> u64) -> Option<u64> {
+        let mut table = self.inner.lock();
+        let mut staged = table.staged.remove(&id)?;
+        staged.commit_ts = allocate();
+        let commit_ts = staged.commit_ts;
+        table.admitted.insert(id, staged);
+        Some(commit_ts)
+    }
+
+    fn withdraw_staged(&self, id: u64) {
+        let mut table = self.inner.lock();
+        if table.staged.remove(&id).is_none() {
+            if let Some(admitted) = table.admitted.remove(&id) {
+                table.max_released = table.max_released.max(admitted.commit_ts);
+                table.withdrawals += 1;
+            }
+        }
+        drop(table);
+        self.finished.notify_all();
     }
 
     /// Refuse `candidate` when a waiter reserved a key it collides with.
@@ -532,6 +590,32 @@ pub struct Admission<'p> {
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
         self.pending.withdraw(self.id);
+    }
+}
+
+/// A volatile commit's keys, registered from its acceptance until it lands
+/// (see [`PendingCommits::stage`]). Withdraws them on drop: hand the drained
+/// entry to the log first.
+#[derive(Debug)]
+pub struct Staged {
+    pending: Arc<PendingCommits>,
+    id: u64,
+}
+
+impl Staged {
+    /// Take the timestamp the drained commit lands at, from `allocate`, and
+    /// register it as an admitted commit: from here snapshots wait for it as
+    /// for any commit applying. Taken at the drain, not at acceptance, so the
+    /// commit never lands beneath a snapshot served while it waited. `None`
+    /// when it was taken already.
+    pub fn admit(&mut self, allocate: impl FnOnce() -> u64) -> Option<u64> {
+        self.pending.admit_staged(self.id, allocate)
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        self.pending.withdraw_staged(self.id);
     }
 }
 

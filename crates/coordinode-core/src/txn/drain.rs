@@ -1,15 +1,20 @@
 //! Volatile write drain buffer for `w:memory` and `w:cache` write concerns.
 //!
-//! Volatile writes are applied to local storage for immediate read visibility,
-//! then buffered here for background drain into Raft proposals. The drain
-//! thread periodically batches buffered mutations into [`RaftProposal`]s and
-//! submits them through the [`ProposalPipeline`].
+//! A volatile commit is validated as any commit is, then buffered here
+//! instead of applied: it is not committed state until the drain hands it to
+//! the log, so no committed read sees it before then. The drain thread
+//! batches buffered entries into [`RaftProposal`]s and submits them through
+//! the [`ProposalPipeline`], and the log applies each once.
 //!
 //! ## Invariants
 //!
-//! - Every write EVENTUALLY enters the oplog (no permanent "holes")
-//! - CDC consumers see all writes, including drained volatile ones
-//! - Drained entries preserve the original client timestamp, not drain timestamp
+//! - A drained entry enters the log and is applied exactly once
+//! - Until then the keys it was validated on stay registered (its
+//!   [`DrainHold`]), so no other commit overwrites them in between
+//! - It lands at a timestamp taken at the drain, above every snapshot served
+//!   while it waited
+//! - An entry bound to a client operation is proposed on its own, with its
+//!   binding, so its outcome is never merged with another's
 //! - Crash before drain = data lost (explicit `w:memory`/`w:cache` contract)
 //! - Graceful shutdown flushes all drain buffers before exit
 //!
@@ -17,11 +22,10 @@
 //!
 //! ```text
 //! Client write (w:memory)
-//!   → engine.put/delete (local, immediate visibility)
-//!   → DrainBuffer.append(entry) → ACK to client (~1µs)
+//!   → validation, keys registered → DrainBuffer.append(entry) → ACK
 //!   ... background drain (100ms interval):
-//!   → batch entries → RaftProposal → pipeline.propose_and_wait()
-//!   → oplog → replicas → durable
+//!   → timestamp taken → batch entries → RaftProposal
+//!   → pipeline.propose_and_wait() → oplog → applied once, keys released
 //! ```
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,26 +63,34 @@ impl Default for DrainConfig {
     }
 }
 
-/// What keeps a drained entry's commit timestamp from being passed over by
-/// a closed bound until the entry is handed to the log: the store registers
-/// the timestamp as not yet logged for as long as this lives.
+/// The protection a buffered entry keeps until it is handed to the log: the
+/// keys it was validated on stay registered, so no writer overwrites what it
+/// was validated against before it lands, and the timestamp it lands at.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` does not hold a timestamp as not yet logged",
+    message = "`{Self}` does not protect a buffered entry until it is logged",
     label = "not a drain hold",
-    note = "the store's pending-commit table hands one out (`PendingCommits::hold`)"
+    note = "the store hands one out when it accepts a volatile commit"
 )]
-pub trait DrainHold: Send + Sync + core::fmt::Debug {}
+pub trait DrainHold: Send + Sync + core::fmt::Debug {
+    /// The timestamp the entry lands at, taken now and registered as a
+    /// commit applying, so it is above every snapshot served while the entry
+    /// waited. `None` when the entry keeps the timestamp it was built with,
+    /// which this hold then keeps from being passed over.
+    fn land(&mut self) -> Option<Timestamp> {
+        None
+    }
+}
 
 /// A buffered volatile write entry waiting for drain.
 ///
-/// Contains the mutations from one transaction, already applied to local
-/// storage. The drain thread will package these into a Raft proposal.
+/// Contains the mutations from one transaction, validated and not applied
+/// anywhere yet. The drain thread will package these into a Raft proposal.
 #[derive(Debug)]
 pub struct DrainEntry {
     /// Mutations from the original transaction (Put/Delete/Merge).
     pub mutations: Vec<Mutation>,
-    /// Commit timestamp assigned by the oracle at transaction time.
-    /// Preserved through drain for CDC timestamp fidelity.
+    /// The timestamp the entry lands at when its hold takes none at the
+    /// drain (see [`DrainHold::land`]).
     pub commit_ts: Timestamp,
     /// Start timestamp of the original transaction.
     pub start_ts: Timestamp,
@@ -418,16 +430,23 @@ fn drain_once(
     let mut all_ok = true;
 
     for mut entry in entries {
-        let hold = entry.hold.take();
+        let mut hold = entry.hold.take();
+        // Taken now, at the drain: the entry lands above every snapshot
+        // served while it waited.
+        if let Some(ts) = hold.as_mut().and_then(|h| h.land()) {
+            entry.commit_ts = ts;
+        }
         // A unit with DERIVED index work is proposed on its own: its record
         // sources are positions within the unit, and the entries it derives
         // apply after the unit's other writes, so joined to another unit it
         // would derive from the wrong record, or land after a later unit's
-        // write of the same entry.
+        // write of the same entry. So is a unit bound to a client operation:
+        // its binding decides the unit it ends, and a refused binding must
+        // not take another operation's effects with it.
         let derives = entry
             .mutations
             .iter()
-            .any(|m| matches!(m, Mutation::Derive(_)));
+            .any(|m| matches!(m, Mutation::Derive(_) | Mutation::Operation(_)));
         // If this entry would exceed batch size, flush current batch first.
         if !current_mutations.is_empty()
             && (derives || current_mutations.len() + entry.mutations.len() > batch_max as usize)

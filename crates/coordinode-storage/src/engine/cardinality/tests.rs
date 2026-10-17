@@ -627,10 +627,57 @@ fn counts_survive_a_reopen() {
     assert_eq!(kept(&f, &ds[3]), BTreeMap::from([(node(2), 1)]));
 }
 
-/// A commit answered before it is in the log applies its writes on its own
-/// branch; the counts it derived land there with them.
+/// A commit answered before it is in the log carries the counts it derived
+/// in its buffered unit: none of them is kept before the drain, and each lands
+/// once with the writes when the drain hands the unit to the log.
 #[test]
 fn a_volatile_commit_keeps_its_counts() {
+    use crate::engine::local_pipeline::OwnedLocalProposalPipeline;
+    use coordinode_core::txn::drain::DrainBuffer;
+    use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline, RaftProposal};
+
+    let f = fixture();
+    let ds = all_descriptors();
+    declare(&f, true, &ds);
+    cover(&f, &ds);
+
+    let wc = WriteConcern::memory();
+    let pipeline = OwnedLocalProposalPipeline::new(&f.engine);
+    let ids = ProposalIdGenerator::new();
+    let drain = DrainBuffer::new(1 << 20);
+    let mut t = txn(&f);
+    add(&mut t, 1, 2, Some(b"a"));
+    add(&mut t, 1, 2, Some(b"b"));
+    t.commit(&CommitContext {
+        write_concern: &wc,
+        pipeline: Some(&pipeline),
+        id_gen: Some(&ids),
+        drain_buffer: Some(&drain),
+        nvme_write_buffer: None,
+    })
+    .unwrap();
+    assert_eq!(kept(&f, &ds[0]), BTreeMap::new(), "kept before the drain");
+
+    for entry in drain.take_all() {
+        pipeline
+            .propose_and_wait(&RaftProposal {
+                id: ids.next(),
+                mutations: entry.mutations,
+                commit_ts: f.oracle.next(),
+                start_ts: entry.start_ts,
+                bypass_rate_limiter: true,
+            })
+            .unwrap();
+    }
+    assert_eq!(kept(&f, &ds[0]), BTreeMap::from([(node(1), 2)]));
+    assert_eq!(kept(&f, &ds[1]), BTreeMap::from([(node(1), 1)]));
+    assert_eq!(kept(&f, &ds[3]), BTreeMap::from([(node(2), 1)]));
+}
+
+/// A volatile commit has nowhere to go without a drain: it is refused, not
+/// applied to this member alone outside the log.
+#[test]
+fn a_volatile_commit_without_a_drain_is_refused() {
     let f = fixture();
     let ds = all_descriptors();
     declare(&f, true, &ds);
@@ -638,12 +685,12 @@ fn a_volatile_commit_keeps_its_counts() {
 
     let mut t = txn(&f);
     add(&mut t, 1, 2, Some(b"a"));
-    add(&mut t, 1, 2, Some(b"b"));
-    commit_with(&mut t, WriteConcern::memory()).unwrap();
-
-    assert_eq!(kept(&f, &ds[0]), BTreeMap::from([(node(1), 2)]));
-    assert_eq!(kept(&f, &ds[1]), BTreeMap::from([(node(1), 1)]));
-    assert_eq!(kept(&f, &ds[3]), BTreeMap::from([(node(2), 1)]));
+    let refused = commit_with(&mut t, WriteConcern::memory()).unwrap_err();
+    assert!(
+        matches!(refused, CommitError::Serialization(_)),
+        "{refused:?}"
+    );
+    assert_eq!(kept(&f, &ds[0]), BTreeMap::new());
 }
 
 /// An interactive transaction is parked between statements and resumed for

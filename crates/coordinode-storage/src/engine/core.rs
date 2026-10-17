@@ -102,7 +102,9 @@ pub struct StorageEngine {
     /// Invariant claims of the attempts running against this engine. Shared
     /// by every transaction, because a condition is only protected if the
     /// attempt that would break it is looking at the same table.
-    claim_registry: crate::engine::claims::ClaimRegistry,
+    /// Shared ownership: a volatile commit keeps its reservation until it is
+    /// drained, past the transaction that took it.
+    claim_registry: Arc<crate::engine::claims::ClaimRegistry>,
     /// Counts the schema changes this process has applied. A claim carries the
     /// value it read, so a predicate evaluated before a definition changed is
     /// not taken as evidence about the graph after it.
@@ -1120,7 +1122,9 @@ impl StorageEngine {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
             coordinator,
-            claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
+            claim_registry: Arc::new(crate::engine::claims::ClaimRegistry::new(
+                config.max_invariant_claims,
+            )),
             schema_generation: AtomicU64::new(0),
             node_delta_runs: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             metadata_decisions: parking_lot::Mutex::new(()),
@@ -3436,7 +3440,7 @@ impl StorageEngine {
     ///
     /// Shared rather than per-transaction: a condition is only protected if
     /// the attempt that would break it consults the same table.
-    pub fn claim_registry(&self) -> &crate::engine::claims::ClaimRegistry {
+    pub fn claim_registry(&self) -> &Arc<crate::engine::claims::ClaimRegistry> {
         &self.claim_registry
     }
 
