@@ -2,6 +2,24 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-17
+
+### Added
+
+- *(operation)* apply each client write once
+- *(embed)* replicated embedded database behind a feature
+
+### Fixed
+
+- *(storage)* apply each recovered cache write once
+- *(query)* report the outcome an index check recorded
+- *(query)* register a vector index generation once
+- *(query)* register a text index generation once
+
+### Testing
+
+- *(query)* run the N+1 window tests on given instants
+
 ## v0.7.1 - 2026-10-13
 
 ### Added

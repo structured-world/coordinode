@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.7.3 - 2026-10-17
+
+### Added
+
+- *(operation)* configurable admission window
+- *(operation)* apply each client write once
+- *(embed)* replicated embedded database behind a feature
+- *(storage)* store index generations under local installations
+- *(migrate)* add the node sizes report module
+- *(migrate)* catalog record migrations, check and journal stats
+- *(migrate)* offline tool to bring a data directory current
+
+### Fixed
+
+- *(storage)* apply each recovered cache write once
+- *(storage)* land a volatile write once, through the log
+- *(storage)* keep a node's own records across a rebuild
+- *(query)* register a vector index generation once
+- *(query)* report the outcome an index check recorded
+- *(query)* register a text index generation once
+- *(raft)* count blocking work holding the engine at shutdown
+- *(session)* answer a commit repeated while it resolves
+- *(migrate)* find every marked store, Raft snapshot captures too
+
+### Performance
+
+- *(storage)* index registered commits by key
+- *(embed)* publish nothing for an unchanged schema definition
+- *(query)* bound property delta chains with whole writes
+
+### Testing
+
+- *(cluster)* wait for a killed follower's replay
+- *(query)* run the N+1 window tests on given instants
+
 ## v0.7.2 - 2026-10-15
 
 ### Added

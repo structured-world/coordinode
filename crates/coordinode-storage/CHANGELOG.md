@@ -2,6 +2,23 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-17
+
+### Added
+
+- *(operation)* apply each client write once
+- *(embed)* replicated embedded database behind a feature
+
+### Fixed
+
+- *(storage)* apply each recovered cache write once
+- *(storage)* land a volatile write once, through the log
+- *(storage)* keep a node's own records across a rebuild
+
+### Performance
+
+- *(storage)* index registered commits by key
+
 ## v0.7.2 - 2026-10-15
 
 ### Added

@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-17
+
+### Added
+
+- *(embed)* replicated embedded database behind a feature
+
 ## v0.7.1 - 2026-10-13
 
 ### Added

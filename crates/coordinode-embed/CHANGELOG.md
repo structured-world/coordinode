@@ -2,6 +2,26 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-17
+
+### Added
+
+- *(operation)* configurable admission window
+- *(operation)* apply each client write once
+- *(embed)* replicated embedded database behind a feature
+
+### Fixed
+
+- *(storage)* apply each recovered cache write once
+- *(storage)* land a volatile write once, through the log
+- *(storage)* keep a node's own records across a rebuild
+- *(query)* register a vector index generation once
+
+### Performance
+
+- *(storage)* index registered commits by key
+- *(embed)* publish nothing for an unchanged schema definition
+
 ## v0.7.2 - 2026-10-15
 
 ### Fixed
