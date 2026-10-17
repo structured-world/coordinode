@@ -668,6 +668,53 @@ fn a_record_write_that_keeps_the_check_does_not_cost_the_check() {
     assert_eq!(env.holders(&def, "b@x"), vec![2], "repaired by this check");
 }
 
+/// A new check admitted right after a check concluded (a report of the
+/// damage it just repaired, recorded late, admits one) leaves the outcome the
+/// first check recorded: its waiter is told that outcome, not a cancellation
+/// read off the new check's state.
+#[test]
+fn a_check_followed_at_once_by_another_reports_its_own_outcome() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    let generation = def.generation;
+    // Weak: the hook lives in the environment it writes through.
+    let member = Arc::downgrade(&env);
+    env.after_catalog_commit(move |engine| {
+        let Some(member) = member.upgrade() else {
+            return true;
+        };
+        let store = LocalIndexStore::new(engine);
+        let Some((mut record, version)) = store.load_integrity(generation).expect("read") else {
+            return false;
+        };
+        if record
+            .check
+            .as_ref()
+            .is_none_or(|c| c.state != coordinode_modality::CheckState::Done)
+        {
+            return false;
+        }
+        record.check = Some(coordinode_modality::IndexCheck::accepted(
+            record.evidence_revision,
+        ));
+        let mut txn = member.begin();
+        store
+            .put_integrity_txn(&mut txn, &record, Some(version))
+            .expect("stage");
+        commit(&mut txn).expect("admit the next check");
+        true
+    });
+    let operation = builds.request_check(def.id).expect("check");
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { repaired: 1, .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(env.holders(&def, "b@x"), vec![2], "repaired");
+}
+
 /// Settle the catalog's versions as a bottommost compaction does to records
 /// it keeps no older version of: renumbered to zero, unwritten. Returns the
 /// version `def`'s record is left at.

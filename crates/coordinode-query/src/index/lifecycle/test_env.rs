@@ -21,8 +21,13 @@ pub(crate) struct TestEnv {
     pub(crate) registry: IndexRegistry,
     fault: parking_lot::Mutex<Option<Fault>>,
     hold: PageHold,
+    after_catalog: parking_lot::Mutex<Option<AfterCatalog>>,
     _dir: Option<tempfile::TempDir>,
 }
+
+/// Run after each catalog commit, on the committing thread, until it
+/// returns `true`.
+type AfterCatalog = Box<dyn FnMut(&StorageEngine) -> bool + Send>;
 
 /// Backfill pages held before they commit, once a number of them has.
 #[derive(Default)]
@@ -75,6 +80,7 @@ impl TestEnv {
             registry: IndexRegistry::new(),
             fault: parking_lot::Mutex::new(None),
             hold: PageHold::default(),
+            after_catalog: parking_lot::Mutex::new(None),
             _dir: Some(dir),
         })
     }
@@ -91,6 +97,7 @@ impl TestEnv {
             registry: IndexRegistry::new(),
             fault: parking_lot::Mutex::new(None),
             hold: PageHold::default(),
+            after_catalog: parking_lot::Mutex::new(None),
             _dir: None,
         })
     }
@@ -114,6 +121,16 @@ impl TestEnv {
     pub(crate) fn release_pages(&self) {
         self.hold.state.lock().1 = None;
         self.hold.moved.notify_all();
+    }
+
+    /// Run `hook` after each catalog commit of this member, on the thread
+    /// that committed and before that commit returns, until it returns
+    /// `true`: a write that lands between two steps of a mover.
+    pub(crate) fn after_catalog_commit(
+        &self,
+        hook: impl FnMut(&StorageEngine) -> bool + Send + 'static,
+    ) {
+        *self.after_catalog.lock() = Some(Box::new(hook));
     }
 
     /// Make `fields` the dictionary builds resolve properties through.
@@ -230,7 +247,16 @@ impl BuildEnvironment for TestEnv {
         if matches!(*self.fault.lock(), Some(Fault::NotLeader)) {
             return Err(CommitError::NotLeader { leader_id: None });
         }
-        commit(txn)
+        commit(txn)?;
+        // Taken out while it runs: the hook commits through `commit`, not
+        // through this method, and must not hold the lock across it.
+        let hook = self.after_catalog.lock().take();
+        if let Some(mut hook) = hook {
+            if !hook(&self.engine) {
+                *self.after_catalog.lock() = Some(hook);
+            }
+        }
+        Ok(())
     }
 
     fn statement_log(

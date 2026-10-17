@@ -802,7 +802,11 @@ pub enum CheckRequestError {
 
 /// The waiter's view of a record's latest check, `None` while it runs.
 fn terminal_outcome(record: &IndexIntegrityRecord) -> Option<CheckOutcome> {
-    let check = record.check.as_ref()?;
+    check_outcome(record, record.check.as_ref()?)
+}
+
+/// The waiter's view of `check` on `record`, `None` while it runs.
+fn check_outcome(record: &IndexIntegrityRecord, check: &IndexCheck) -> Option<CheckOutcome> {
     match &check.state {
         CheckState::Accepted | CheckState::Running { .. } => None,
         CheckState::Cancelled => Some(CheckOutcome::Cancelled),
@@ -1667,9 +1671,14 @@ impl Shared {
         mut update: impl FnMut(&mut IndexIntegrityRecord, &mut IndexCheck),
     ) -> Result<Executed, String> {
         let now = wall_clock_ms();
+        // The outcome as this commit records it. Read back afterwards, the
+        // record may already carry the next check, admitted by a report that
+        // arrived meanwhile, and say nothing of this one.
+        let mut recorded = None;
         let landed = self.checkpoint(generation, taken, |record, check| {
             update(record, check);
             check.finished_at_ms = Some(now);
+            recorded = check_outcome(record, check);
         })?;
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
@@ -1678,12 +1687,12 @@ impl Shared {
         if !landed {
             return self.lost_check(generation, taken);
         }
-        let record = store.load_integrity(generation).map_err(text)?;
-        Ok(Executed::Outcome(
-            record
-                .and_then(|(record, _)| terminal_outcome(&record))
-                .unwrap_or(CheckOutcome::Cancelled),
-        ))
+        recorded.map(Executed::Outcome).ok_or_else(|| {
+            format!(
+                "the check of generation {} concluded without an outcome",
+                generation.as_raw()
+            )
+        })
     }
 
     /// Record that the held check failed with `reason`.
