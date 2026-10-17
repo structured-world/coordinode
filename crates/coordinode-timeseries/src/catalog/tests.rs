@@ -45,8 +45,6 @@ fn ts_write<R>(
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit ts test write");
     out

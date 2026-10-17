@@ -41,6 +41,7 @@ fn start(
         max_age_secs,
         Arc::clone(&wake),
         Arc::new(Wake::default()),
+        None,
     )
     .expect("start FlushManager");
     (mgr, wake)

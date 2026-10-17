@@ -323,8 +323,6 @@ fn two_writers_on_one_key_cannot_both_commit_from_the_same_base() {
         pipeline: Some(&pipeline),
         id_gen: Some(&ids),
         write_concern: &concern,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     let key = b"node:\0\x01:counter".to_vec();
 
@@ -412,8 +410,6 @@ fn a_reader_sees_a_thousand_write_commit_whole_or_not_at_all() {
             pipeline: Some(&pipeline),
             id_gen: Some(&ids),
             write_concern: &concern,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         for batch in 0..BATCHES {
             let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());

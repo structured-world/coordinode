@@ -40,8 +40,6 @@ fn commit(t: &mut Transaction) {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     t.commit(&ctx).expect("commit");
 }
@@ -915,8 +913,6 @@ fn an_edge_cannot_attach_to_a_node_that_was_deleted_under_it() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     let err = attach
         .commit(&ctx)

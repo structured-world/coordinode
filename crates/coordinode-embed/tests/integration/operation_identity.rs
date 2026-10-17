@@ -466,19 +466,19 @@ fn a_cloned_allocator_cannot_apply_a_number_twice() {
     assert_eq!(count(&mut db, "Theirs"), 0);
 }
 
-/// A provisional write (memory concern) carrying a descriptor is admitted
-/// durably before it is acknowledged, and its drain completes the same
-/// operation: a retry runs nothing, before or after the drain, and after a
-/// restart the write stands committed, once.
+/// A volatile write (memory concern) carrying a descriptor binds its
+/// operation in the same entry as its effects: it stands committed the
+/// moment it returns, a retry runs nothing, and after a restart the write
+/// stands committed, once.
 #[test]
-fn a_provisional_write_is_admitted_then_completed_by_its_drain() {
+fn a_volatile_write_binds_its_operation_with_its_effects() {
     use coordinode_core::txn::write_concern::WriteConcern;
 
     let dir = tempfile::tempdir().unwrap();
     let op = {
         let db = Database::open(dir.path()).unwrap();
         let op = enrolled(&db).next().unwrap();
-        let provisional = |query: &str| {
+        let volatile = |query: &str| {
             db.execute_cypher_shared_with(
                 query,
                 None,
@@ -491,21 +491,16 @@ fn a_provisional_write_is_admitted_then_completed_by_its_drain() {
             )
             .map(drop)
         };
-        provisional("CREATE (:Early {k: 1})").unwrap();
-        // Accepted, not committed: nothing of it is in committed state yet.
-        assert_eq!(db.label_counts().unwrap().get("Early"), None);
-        // Admitted at once; committed once the drain has run.
+        volatile("CREATE (:Early {k: 1})").unwrap();
+        assert_eq!(db.label_counts().unwrap().get("Early").copied(), Some(1));
         assert!(matches!(
             db.resolve_operation(&op, Resolve::Lookup).unwrap(),
-            OperationOutcome::Admitted { .. } | OperationOutcome::Committed { .. }
+            OperationOutcome::Committed { .. }
         ));
-        let (outcome, differs) = settled(provisional("CREATE (:Early {k: 1})"));
-        assert!(matches!(
-            outcome,
-            OperationOutcome::Admitted { .. } | OperationOutcome::Committed { .. }
-        ));
+        let (outcome, differs) = settled(volatile("CREATE (:Early {k: 1})"));
+        assert!(matches!(outcome, OperationOutcome::Committed { .. }));
         assert!(!differs);
-        // Closing the database drains what is buffered.
+        // Closing the database syncs the journal.
         op
     };
     let mut db = Database::open(dir.path()).unwrap();
@@ -519,12 +514,11 @@ fn a_provisional_write_is_admitted_then_completed_by_its_drain() {
     assert_eq!(db.label_counts().unwrap().get("Early").copied(), Some(1));
 }
 
-/// A volatile write of a client operation whose payload was lost before its
-/// drain stays admitted; excluding it is the proof it never takes effect, and
-/// the drain arriving after the exclusion applies nothing. Reproduced with
-/// the drain still to come: the exclusion is resolved while the entry waits.
+/// Excluding the operation of a volatile write that returned answers with
+/// its commit: the write is committed state from its answer on, so there is
+/// nothing left to exclude, and it stays in the store once.
 #[test]
-fn an_excluded_volatile_write_is_not_applied_by_its_late_drain() {
+fn excluding_a_returned_volatile_write_answers_its_commit() {
     use coordinode_core::txn::write_concern::WriteConcern;
 
     let dir = tempfile::tempdir().unwrap();
@@ -542,24 +536,89 @@ fn an_excluded_volatile_write_is_not_applied_by_its_late_drain() {
             },
         )
         .unwrap();
-        // Before the drain lands it: the batching window holds it back.
         let excluded = db.resolve_operation(&op, Resolve::Exclude).unwrap();
         assert!(
-            matches!(
-                excluded,
-                OperationOutcome::Aborted | OperationOutcome::Committed { .. }
-            ),
+            matches!(excluded, OperationOutcome::Committed { .. }),
             "{excluded:?}"
         );
         op
     };
     let mut db = Database::open(dir.path()).unwrap();
-    match db.resolve_operation(&op, Resolve::Lookup).unwrap() {
-        OperationOutcome::Aborted => assert_eq!(count(&mut db, "Late"), 0),
-        // The drain won the race: then it is in the store, once.
-        OperationOutcome::Committed { .. } => assert_eq!(count(&mut db, "Late"), 1),
-        other => panic!("an exclusion answers finally, got {other:?}"),
-    }
+    assert!(matches!(
+        db.resolve_operation(&op, Resolve::Lookup).unwrap(),
+        OperationOutcome::Committed { .. }
+    ));
+    assert_eq!(count(&mut db, "Late"), 1);
+}
+
+/// Exclusion is the final proof a host acts on, so the committed outcome it
+/// reports for a volatile write is made durable first, with the write's
+/// effects: a majority read sees the write once the exclusion returns,
+/// though the journal's flusher never ran. A lookup reports what it observes
+/// and syncs nothing.
+#[test]
+fn excluding_a_volatile_write_makes_its_commit_durable() {
+    use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path().join("data"),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    config.volatile_flush_interval_ms = 600_000;
+    let mut db = Database::open_with_config(config).unwrap();
+    let op = enrolled(&db).next().unwrap();
+    let written = db
+        .execute_cypher_shared_with(
+            "CREATE (:Late {k: 1})",
+            None,
+            None,
+            &StatementOptions {
+                operation: Some(op),
+                write_concern: Some(WriteConcern::memory()),
+                ..StatementOptions::default()
+            },
+        )
+        .unwrap()
+        .commit_ts()
+        .unwrap();
+    let durable = |db: &mut Database| {
+        db.execute_cypher_with_read_concern(
+            "MATCH (n:Late) RETURN n",
+            ReadConcern {
+                level: ReadConcernLevel::Majority,
+                ..ReadConcern::default()
+            },
+        )
+        .unwrap()
+        .len()
+    };
+    assert!(matches!(
+        db.resolve_operation(&op, Resolve::Lookup).unwrap(),
+        OperationOutcome::Committed { .. }
+    ));
+    // A background flush may sync the journal on its own; a majority read
+    // sees the write only once something did.
+    let synced = |db: &Database| db.engine().pending_commits().durable_ceiling() > written;
+    let seen = durable(&mut db);
+    assert!(
+        seen == 0 || synced(&db),
+        "a majority read saw an unsynced write"
+    );
+
+    let excluded = db.resolve_operation(&op, Resolve::Exclude).unwrap();
+    assert!(
+        matches!(excluded, OperationOutcome::Committed { .. }),
+        "{excluded:?}"
+    );
+    assert_eq!(durable(&mut db), 1, "the reported commit is not durable");
 }
 
 /// A bound write with parameters: the same values under the same

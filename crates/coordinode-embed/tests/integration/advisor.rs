@@ -1308,8 +1308,6 @@ fn stats_cache_ttl_zero_always_recomputes() {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx).expect("commit direct writes");
     }
@@ -1374,8 +1372,6 @@ fn stats_cache_ttl_max_stays_stale_until_invalidation() {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx).expect("commit direct writes");
     }

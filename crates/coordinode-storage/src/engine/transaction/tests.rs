@@ -43,8 +43,6 @@ fn two_attempts_deciding_one_bound_cannot_both_commit() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let bound = || {
@@ -100,8 +98,6 @@ fn a_condition_broken_by_committed_state_refuses_the_commit() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     // Somebody already made the pair adjacent.
@@ -147,8 +143,6 @@ fn an_attempt_with_no_claims_commits_as_before() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let mut txn = mvcc_txn(&engine, &oracle);
@@ -219,8 +213,6 @@ fn concurrent_writers_on_one_key_lose_no_update() {
                             write_concern: &wc,
                             pipeline: None,
                             id_gen: None,
-                            drain_buffer: None,
-                            nvme_write_buffer: None,
                         };
                         match txn.commit(&ctx) {
                             Ok(_) => {
@@ -312,8 +304,6 @@ fn a_reader_never_sees_part_of_a_batch() {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx).expect("commit");
         done.store(true, Ordering::Relaxed);
@@ -364,8 +354,6 @@ fn commits_that_only_merge_do_not_exclude_each_other() {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx)
             .expect("a merge operand competes with nobody");
@@ -400,8 +388,6 @@ fn node_deltas_on_one_record_conflict_like_whole_writes() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     let key = b"node:\x00\x00:\x00\x00\x00\x00\x00\x00\x00\x01";
     let set = |v: i64| {
@@ -467,8 +453,6 @@ fn deltas_of_a_node_written_whole_in_the_same_attempt_fold_into_it() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     let created = b"node:\x00\x00:\x00\x00\x00\x00\x00\x00\x00\x07";
     let deleted = b"node:\x00\x00:\x00\x00\x00\x00\x00\x00\x00\x08";
@@ -555,8 +539,6 @@ fn a_conditional_write_lands_only_at_the_version_it_named() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     // Create-if-absent: the condition with nothing on the other side.
@@ -633,8 +615,6 @@ fn two_claimers_of_one_record_produce_one_winner() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let mut first = mvcc_txn(&engine, &oracle);
@@ -679,8 +659,6 @@ fn a_condition_without_a_write_is_still_checked() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let mut create = mvcc_txn(&engine, &oracle);
@@ -727,8 +705,6 @@ fn a_condition_on_a_record_being_written_by_another_commit_is_refused() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let mut create = mvcc_txn(&engine, &oracle);
@@ -808,8 +784,6 @@ fn composing_the_deltas_preserves_the_claims_they_carried() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let mut txn = mvcc_txn(&engine, &oracle);
@@ -858,8 +832,6 @@ fn attempts_sharing_a_read_timestamp_do_not_share_a_reservation() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let mut txn = mvcc_txn(&engine, &oracle);
@@ -905,8 +877,6 @@ fn a_refused_attempt_leaves_neither_writes_nor_reservations() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let mut txn = mvcc_txn(&engine, &oracle);
@@ -967,8 +937,6 @@ fn a_counter_that_would_leave_the_range_is_refused_before_it_is_written() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let mut txn = mvcc_txn(&engine, &oracle);
@@ -1015,8 +983,6 @@ fn adjacency_operands_keep_the_order_they_were_staged_in() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     // Add, then remove: the member is gone at the end.
@@ -1144,8 +1110,6 @@ fn a_staged_range_removal_lands_with_the_commit() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     engine.put(Partition::Idx, b"idx:a:1", b"").unwrap();
     engine.put(Partition::Idx, b"idx:a:2", b"").unwrap();
@@ -1187,8 +1151,6 @@ fn a_commit_of_only_a_range_removal_writes() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     engine.put(Partition::Idx, b"idx:a:1", b"").unwrap();
     let mut txn = mvcc_txn(&engine, &oracle);
@@ -1622,8 +1584,6 @@ fn commit_rejects_writes_under_stop_pressure() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     engine.force_write_pressure(2); // Stop
 
@@ -1701,8 +1661,6 @@ fn a_fire_and_forget_commit_never_writes_outside_the_pipeline() {
         write_concern: &wc,
         pipeline: Some(&pipeline),
         id_gen: Some(&ids),
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
 
     let mut txn = mvcc_txn(&engine, &oracle);
@@ -1728,178 +1686,84 @@ fn a_fire_and_forget_commit_never_writes_outside_the_pipeline() {
     );
 }
 
-/// A volatile commit (j:memory) is not committed state: until it is drained
-/// through the log a committed read does not see it, and once drained it has
-/// exactly one effect. Applying it to the engine at acceptance and again at
-/// drain made it visible to committed reads before it was durable anywhere
-/// and counted an additive operand twice.
+/// A volatile commit takes the one commit path: it is committed state the
+/// moment `commit` returns, has exactly one effect, reports its commit
+/// timestamp and releases its keys like any commit, under both levels.
 #[test]
-fn a_volatile_commit_is_invisible_until_drained_and_lands_once() {
+fn a_volatile_commit_is_committed_at_once_and_lands_once() {
     use crate::engine::local_pipeline::OwnedLocalProposalPipeline;
-    use coordinode_core::txn::drain::DrainBuffer;
-    use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline, RaftProposal};
+    use coordinode_core::txn::proposal::ProposalIdGenerator;
 
     let (engine, oracle, _d) = test_engine();
-    let wc = WriteConcern::memory();
     let pipeline = OwnedLocalProposalPipeline::new(&engine);
     let ids = ProposalIdGenerator::new();
-    // No drain thread: the buffer is drained below, by hand, once the
-    // committed reads before the drain have been made.
-    let drain = DrainBuffer::new(1 << 20);
-    let ctx = CommitContext {
-        write_concern: &wc,
-        pipeline: Some(&pipeline),
-        id_gen: Some(&ids),
-        drain_buffer: Some(&drain),
-        nvme_write_buffer: None,
-    };
+    for (i, wc) in [WriteConcern::memory(), WriteConcern::cache()]
+        .iter()
+        .enumerate()
+    {
+        let ctx = CommitContext {
+            write_concern: wc,
+            pipeline: Some(&pipeline),
+            id_gen: Some(&ids),
+        };
+        let key = format!("vol:node:{i}");
+        let mut txn = mvcc_txn(&engine, &oracle);
+        txn.put(Partition::Node, key.as_bytes(), b"v").unwrap();
+        txn.push_counter_delta(b"vol:count", 1);
+        let outcome = txn.commit(&ctx).unwrap();
+        assert!(outcome.commit_ts.is_some(), "{wc}: {outcome:?}");
 
-    let mut txn = mvcc_txn(&engine, &oracle);
-    txn.put(Partition::Node, b"vol:node", b"v").unwrap();
-    txn.push_counter_delta(b"vol:count", 1);
-    txn.commit(&ctx).unwrap();
-
-    let counter = |engine: &StorageEngine, oracle: &TimestampOracle| -> i64 {
-        mvcc_txn(engine, oracle)
+        assert_eq!(
+            mvcc_txn(&engine, &oracle)
+                .get(Partition::Node, key.as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(b"v".as_slice()),
+            "{wc}: a committed read sees the write once it returns"
+        );
+        let counter = mvcc_txn(&engine, &oracle)
             .get(Partition::Counter, b"vol:count")
             .unwrap()
             .map_or(0, |bytes| {
                 crate::engine::merge::decode_counter(&bytes).unwrap()
-            })
-    };
-
-    // A committed read before the drain.
-    assert_eq!(
-        mvcc_txn(&engine, &oracle)
-            .get(Partition::Node, b"vol:node")
-            .unwrap(),
-        None,
-        "an undrained volatile write is visible to a committed read"
-    );
-    assert_eq!(
-        counter(&engine, &oracle),
-        0,
-        "an undrained volatile operand is visible to a committed read"
-    );
-
-    // The drain, as the drain thread performs it.
-    for entry in drain.take_all() {
-        pipeline
-            .propose_and_wait(&RaftProposal {
-                id: ids.next(),
-                mutations: entry.mutations,
-                commit_ts: entry.commit_ts,
-                start_ts: entry.start_ts,
-                bypass_rate_limiter: true,
-            })
-            .unwrap();
+            });
+        assert_eq!(counter, i as i64 + 1, "{wc}: the operand landed once");
+        assert_eq!(engine.pending_commits().in_flight(), 0, "{wc}");
     }
 
-    assert_eq!(
-        mvcc_txn(&engine, &oracle)
-            .get(Partition::Node, b"vol:node")
-            .unwrap()
-            .as_deref(),
-        Some(b"v".as_slice())
-    );
-    assert_eq!(
-        counter(&engine, &oracle),
-        1,
-        "the drained operand must land exactly once"
-    );
-}
-
-/// A volatile commit the full drain buffer refuses holds nothing afterwards:
-/// its keys are free for the next writer at once, nothing of it is visible,
-/// and the pending table has nothing left of it. A refusal that kept the keys
-/// registered would block every later writer of them for good.
-#[test]
-fn a_volatile_commit_refused_by_a_full_buffer_holds_nothing() {
-    use crate::engine::local_pipeline::OwnedLocalProposalPipeline;
-    use coordinode_core::txn::drain::DrainBuffer;
-    use coordinode_core::txn::proposal::ProposalIdGenerator;
-
-    let (engine, oracle, _d) = test_engine();
-    let pipeline = OwnedLocalProposalPipeline::new(&engine);
-    let ids = ProposalIdGenerator::new();
-    let full = DrainBuffer::new(1);
-    let memory = WriteConcern::memory();
-
-    let mut txn = mvcc_txn(&engine, &oracle);
-    txn.put(Partition::Node, b"full:node", b"v").unwrap();
-    let refused = txn
-        .commit(&CommitContext {
-            write_concern: &memory,
-            pipeline: Some(&pipeline),
-            id_gen: Some(&ids),
-            drain_buffer: Some(&full),
-            nvme_write_buffer: None,
-        })
-        .unwrap_err();
-    assert!(
-        matches!(
-            refused,
-            CommitError::VolatileBufferFull {
-                capacity_bytes: 1,
-                ..
-            }
-        ),
-        "{refused:?}"
-    );
-    assert!(full.is_empty());
-
+    // The keys are free for the next writer at once.
     let majority = WriteConcern::majority();
     let mut next = mvcc_txn(&engine, &oracle);
-    next.put(Partition::Node, b"full:node", b"w").unwrap();
+    next.put(Partition::Node, b"vol:node:0", b"w").unwrap();
     next.commit(&CommitContext {
         write_concern: &majority,
         pipeline: Some(&pipeline),
         id_gen: Some(&ids),
-        drain_buffer: None,
-        nvme_write_buffer: None,
     })
-    .expect("the refused commit's keys were released");
-    assert_eq!(
-        mvcc_txn(&engine, &oracle)
-            .get(Partition::Node, b"full:node")
-            .unwrap()
-            .as_deref(),
-        Some(b"w".as_slice())
-    );
-    assert_eq!(engine.pending_commits().in_flight(), 0);
+    .expect("a volatile commit holds its keys no longer than any commit");
 }
 
-/// j:cache promises the write survives a process crash before its drain,
-/// which only the NVMe write buffer can keep. Without one configured the
-/// concern is refused, never quietly served as j:memory.
+/// A volatile commit that writes the catalog is published like any other:
+/// the one write path has no level it cannot serve.
 #[test]
-fn a_cache_commit_without_a_write_buffer_is_refused() {
-    use crate::engine::local_pipeline::OwnedLocalProposalPipeline;
-    use coordinode_core::txn::drain::DrainBuffer;
-    use coordinode_core::txn::proposal::ProposalIdGenerator;
-
+fn a_volatile_commit_may_change_the_schema() {
     let (engine, oracle, _d) = test_engine();
-    let pipeline = OwnedLocalProposalPipeline::new(&engine);
-    let ids = ProposalIdGenerator::new();
-    let drain = DrainBuffer::new(1 << 20);
-    let cache = WriteConcern::cache();
+    let wc = WriteConcern::memory();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    let generation = engine.schema_generation();
     let mut txn = mvcc_txn(&engine, &oracle);
-    txn.put(Partition::Node, b"cache:node", b"v").unwrap();
-    let refused = txn
-        .commit(&CommitContext {
-            write_concern: &cache,
-            pipeline: Some(&pipeline),
-            id_gen: Some(&ids),
-            drain_buffer: Some(&drain),
-            nvme_write_buffer: None,
-        })
-        .unwrap_err();
+    txn.put(Partition::Schema, b"schema:label:Volatile", b"{}")
+        .unwrap();
+    txn.note_schema_change();
+    txn.commit(&ctx).expect("a schema write under j:memory");
     assert!(
-        matches!(&refused, CommitError::ConcernUnavailable(m) if m.contains("write buffer")),
-        "{refused:?}"
+        engine.schema_generation() > generation,
+        "the change was published"
     );
-    assert!(drain.is_empty(), "nothing buffered");
-    assert_eq!(engine.pending_commits().in_flight(), 0);
 }
 
 /// Unique values taken while an index is being built, several in one commit.
@@ -1970,8 +1834,6 @@ mod unique_while_building {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         let mut txn = mvcc_txn(engine, oracle);
         for (id, value, covered) in users {

@@ -1726,9 +1726,10 @@ async fn test_service_raft() -> (CypherServiceImpl, Arc<RaftNode>, tempfile::Tem
     );
     // Single-node Raft needs a moment to elect itself leader.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> = Arc::new(
-        coordinode_raft::proposal::RaftProposalPipeline::new(Arc::clone(node.raft())),
-    );
+    // The node's own pipeline, as the server wires it: it sees the leader's
+    // append, so a write that asks for less than a commit is answered early.
+    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+        Arc::new(node.pipeline());
     let db = Database::from_engine(dir.path(), engine, oracle, pipeline).expect("from_engine");
     let svc = CypherServiceImpl::new(
         Arc::new(RwLock::new(db)),
@@ -2852,10 +2853,10 @@ async fn grpc_snapshot_without_at_timestamp_returns_latest() {
     );
 }
 
-/// `w:1, j:memory` reaches the executor without silent rewriting: the
-/// volatile overlay path engages and the operation succeeds. The journal
-/// value must NOT be coerced to JOURNAL on entry, otherwise the drain
-/// behaviour would never engage in cluster mode.
+/// `w:1, j:memory` reaches the executor without silent rewriting and the
+/// write succeeds like any other. The journal value must NOT be coerced to
+/// JOURNAL on entry, or the answer would wait for the sync the caller
+/// declined.
 #[tokio::test]
 async fn grpc_write_concern_memory_accepted() {
     let (svc, _dir) = test_service();
@@ -2877,6 +2878,38 @@ async fn grpc_write_concern_memory_accepted() {
         .expect("memory write should succeed");
     let stats = resp.into_inner().stats.expect("stats");
     assert_eq!(stats.nodes_created, 1);
+}
+
+/// A write answered before its commit (`j:memory` on a Raft-backed service)
+/// carries no causal index: it has none of its own yet, and the node's
+/// applied index sampled before it would name a position that does not
+/// cover it. `0` means "no token" to every client.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_early_answered_write_carries_no_causal_index() {
+    let (svc, node, _dir) = test_service_raft().await;
+    // Give the node an applied index a fallback could report.
+    svc.execute_cypher(cypher_request("CREATE (n:Before {v: 1})"))
+        .await
+        .expect("journaled write");
+    let resp = svc
+        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+            query: "CREATE (n:Telemetry {id: 1})".to_string(),
+            write_concern: Some(crate::proto::replication::WriteConcern {
+                w: Some(replication::write_concern::W::Acks(1)),
+                journal: replication::Journal::Memory as i32,
+                timeout_ms: 0,
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("memory write");
+    let stats = resp.into_inner().stats.expect("stats");
+    assert_eq!(stats.nodes_created, 1);
+    assert_eq!(
+        stats.applied_index, 0,
+        "an early answer named a causal index"
+    );
+    node.shutdown().await.expect("shutdown");
 }
 
 /// after_index + at_timestamp are mutually exclusive: a snapshot pin is
@@ -2937,13 +2970,13 @@ async fn grpc_write_concern_journal_with_timeout_accepted() {
     assert_eq!(stats.nodes_created, 1);
 }
 
-/// `w:1, j:cache` on a server with no write buffer configured is refused: the
-/// concern promises the write survives a process crash, which nothing would
-/// keep, and it is never served as `j:memory` instead.
+/// `w:1, j:cache` needs nothing configured: the journal hands the entry to
+/// the operating system before the answer, and the write is committed and
+/// visible like any other.
 #[tokio::test]
-async fn grpc_write_concern_cache_without_a_write_buffer_is_refused() {
+async fn grpc_write_concern_cache_accepted() {
     let (svc, _dir) = test_service();
-    let refused = svc
+    let resp = svc
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "CREATE (n:Analytics {id: 1})".to_string(),
             parameters: std::collections::HashMap::new(),
@@ -2958,13 +2991,9 @@ async fn grpc_write_concern_cache_without_a_write_buffer_is_refused() {
             ..Default::default()
         }))
         .await
-        .expect_err("a cache write without a write buffer is refused");
-    assert_eq!(
-        refused.code(),
-        tonic::Code::FailedPrecondition,
-        "{refused:?}"
-    );
-    assert!(refused.message().contains("write buffer"), "{refused:?}");
+        .expect("cache write should succeed");
+    let stats = resp.into_inner().stats.expect("stats");
+    assert_eq!(stats.nodes_created, 1);
 }
 
 /// End-to-end capacity propagation through the gRPC handler:

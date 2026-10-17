@@ -202,7 +202,7 @@ fn unknown_flags_and_tags_are_refused() {
 #[test]
 fn operation_commands_round_trip() {
     use crate::txn::operation::{
-        BindMode, INTENT_DIGEST_LEN, ISSUER_ID_LEN, IntentDigest, IssuerId, OperationBinding,
+        INTENT_DIGEST_LEN, ISSUER_ID_LEN, IntentDigest, IssuerId, OperationBinding,
         OperationCommand, OperationId,
     };
     let issuer = IssuerId([3; ISSUER_ID_LEN]);
@@ -221,13 +221,11 @@ fn operation_commands_round_trip() {
             op,
             intent: IntentDigest([5; INTENT_DIGEST_LEN]),
             attempt: u64::MAX,
-            mode: BindMode::Commit,
         }),
         OperationCommand::Bind(OperationBinding {
             op,
             intent: IntentDigest([6; INTENT_DIGEST_LEN]),
             attempt: 1,
-            mode: BindMode::Admit,
         }),
         OperationCommand::Exclude(op),
         OperationCommand::Release(op),

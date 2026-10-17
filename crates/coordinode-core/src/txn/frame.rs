@@ -26,8 +26,8 @@
 use rustc_hash::FxHashMap;
 
 use super::operation::{
-    BindMode, INTENT_DIGEST_LEN, ISSUER_ID_LEN, IntentDigest, IssuerId, OperationBinding,
-    OperationCommand, OperationId,
+    INTENT_DIGEST_LEN, ISSUER_ID_LEN, IntentDigest, IssuerId, OperationBinding, OperationCommand,
+    OperationId,
 };
 use super::proposal::{
     DerivedIndexWork, DerivedSource, IndexBinding, Mutation, PartitionId, ProposalId, RaftProposal,
@@ -57,9 +57,6 @@ const OPERATION_BIND: u8 = 1;
 const OPERATION_EXCLUDE: u8 = 2;
 const OPERATION_RETIRE: u8 = 3;
 const OPERATION_RELEASE: u8 = 4;
-
-const BIND_COMMIT: u8 = 0;
-const BIND_ADMIT: u8 = 1;
 
 const SOURCE_UNIT_RECORD: u8 = 0;
 const SOURCE_VALUES: u8 = 1;
@@ -479,10 +476,6 @@ fn encode_operation(command: &OperationCommand, out: &mut Vec<u8>) {
             put_operation_id(&binding.op, out);
             out.extend_from_slice(&binding.intent.0);
             put_varint(binding.attempt, out);
-            out.push(match binding.mode {
-                BindMode::Commit => BIND_COMMIT,
-                BindMode::Admit => BIND_ADMIT,
-            });
         }
         OperationCommand::Exclude(op) => {
             out.push(OPERATION_EXCLUDE);
@@ -842,16 +835,10 @@ impl<'a> Decoder<'a> {
                 let mut intent = [0u8; INTENT_DIGEST_LEN];
                 intent.copy_from_slice(self.reader.take(INTENT_DIGEST_LEN)?);
                 let attempt = self.reader.varint()?;
-                let mode = match self.reader.u8()? {
-                    BIND_COMMIT => BindMode::Commit,
-                    BIND_ADMIT => BindMode::Admit,
-                    _ => return Err(FrameError::UnknownTag(KIND_OPERATION)),
-                };
                 OperationCommand::Bind(OperationBinding {
                     op,
                     intent: IntentDigest(intent),
                     attempt,
-                    mode,
                 })
             }
             OPERATION_EXCLUDE => OperationCommand::Exclude(self.operation_id()?),

@@ -217,8 +217,6 @@ fn attempt(
         read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
         // A build's writes are durable whatever a session writes at.
         write_concern: WriteConcern::majority(),
-        drain_buffer: None,
-        nvme_write_buffer: None,
         mvcc_snapshot: None,
         cascade_depth: 0,
         cascade_depth_limit: 10,

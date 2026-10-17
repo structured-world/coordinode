@@ -530,7 +530,9 @@ impl GcWatermarkController {
     /// of a reader that was just handed it. Lock order is `pins` then the
     /// pending table; nothing holding the pending table takes `pins`.
     fn recompute(&self, pins: &BTreeMap<u64, usize>) {
-        let current = self.pending.snapshot_floor(|| self.seqno.get());
+        // A durable read can stand below the latest complete snapshot, behind
+        // what the journal has not synced yet; its history stays too.
+        let current = self.pending.durable_floor(self.seqno.get());
         let pin_floor = pins.keys().next().copied().unwrap_or(current);
         self.system_watermark.store(pin_floor, Ordering::Release);
         let mut watermark = pin_floor.min(self.external_floor.load(Ordering::Acquire));

@@ -4,6 +4,7 @@ use coordinode_storage::engine::config::SyncMethod;
 use openraft::type_config::TypeConfigExt;
 
 use super::*;
+use crate::storage::LogReach;
 
 /// A handle that syncs a real file in `dir`.
 fn file_handle(dir: &std::path::Path) -> SyncHandle {
@@ -45,8 +46,8 @@ async fn appends_are_answered_once_durable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let notifier = Arc::new(AppendNotifier::default());
     let sync = LogSync::start(Arc::clone(&notifier)).expect("start");
-    let first = notifier.subscribe(ProposalId::from_raw(1));
-    let second = notifier.subscribe(ProposalId::from_raw(2));
+    let first = notifier.subscribe(ProposalId::from_raw(1), LogReach::Durable);
+    let second = notifier.subscribe(ProposalId::from_raw(2), LogReach::Durable);
 
     let handle = file_handle(dir.path());
     let (a, a_rx) = append(vec![(ProposalId::from_raw(1), 4)]);
@@ -70,7 +71,7 @@ async fn a_failed_sync_answers_every_queued_append_with_the_error() {
 
     let notifier = Arc::new(AppendNotifier::default());
     let sync = LogSync::start(Arc::clone(&notifier)).expect("start");
-    let mut writer_told = notifier.subscribe(ProposalId::from_raw(9));
+    let mut writer_told = notifier.subscribe(ProposalId::from_raw(9), LogReach::Durable);
 
     // A pipe cannot be synced, so the sync fails.
     let (_reader, writer) = std::io::pipe().expect("pipe");
@@ -86,6 +87,30 @@ async fn a_failed_sync_answers_every_queued_append_with_the_error() {
         writer_told.try_recv().is_err(),
         "no writer hears its proposal is durable"
     );
+}
+
+/// A writer under a volatile `j` is answered at the write, before any sync;
+/// a durable waiter beside it is not, and the sync answers it later.
+#[tokio::test]
+async fn a_written_waiter_is_answered_before_the_sync() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let notifier = Arc::new(AppendNotifier::default());
+    let sync = LogSync::start(Arc::clone(&notifier)).expect("start");
+    let mut written = notifier.subscribe(ProposalId::from_raw(1), LogReach::Written);
+    let mut durable = notifier.subscribe(ProposalId::from_raw(2), LogReach::Durable);
+
+    let proposals = vec![(ProposalId::from_raw(1), 7), (ProposalId::from_raw(2), 8)];
+    notifier.notify_written(&proposals);
+    assert_eq!(written.try_recv().expect("answered at the write"), 7);
+    assert!(
+        durable.try_recv().is_err(),
+        "a durable waiter waits for the sync"
+    );
+
+    let (a, a_rx) = append(proposals);
+    sync.submit(Some(file_handle(dir.path())), a);
+    answer(a_rx).await.expect("durable");
+    assert_eq!(durable.await.expect("answered at the sync"), 8);
 }
 
 /// `wait_idle` returns only once every queued append has been answered, so a

@@ -12,11 +12,11 @@ use coordinode_core::txn::frame::check_proposal;
 use coordinode_core::txn::proposal::{
     PartitionId, ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
 };
-use coordinode_core::txn::write_concern::WriteAck;
+use coordinode_core::txn::write_concern::{WriteAck, WriteConcern};
 pub(crate) use coordinode_storage::engine::local_pipeline::storage_to_proposal_err;
 use coordinode_storage::engine::partition::Partition;
 
-use crate::storage::{AppendNotifier, CoordinodeStateMachine, Request, TypeConfig};
+use crate::storage::{AppendNotifier, CoordinodeStateMachine, LogReach, Request, TypeConfig};
 
 /// Base timeout for Raft proposal (first attempt).
 /// Doubles on each retry: 4s → 8s → 16s.
@@ -338,19 +338,20 @@ impl RaftProposalPipeline {
         Ok(ProposalOutcome::local())
     }
 
-    /// Submit `proposal` and return once `n` members hold it durably, the
-    /// leader counted first.
+    /// Submit `proposal` and return once `n` members hold it, the leader
+    /// counted first: the leader's copy as far as `reach`, followers' durably.
     ///
     /// The leader's own copy is known from the log store's append notifier;
     /// followers' copies from openraft's replication metrics (a follower's
     /// matched index covers the entry once its own log store has fsynced it).
     /// The commit itself is spawned and completes on its own, so returning
     /// early never cancels the write. `applied_index` is reported only once a
-    /// majority holds the entry, since only then is it committed.
+    /// majority holds the entry durably, since only then is it committed.
     async fn propose_acks(
         &self,
         proposal: &RaftProposal,
         n: u32,
+        reach: LogReach,
         notifier: &AppendNotifier,
     ) -> Result<ProposalOutcome, ProposalError> {
         use openraft::rt::watch::WatchReceiver;
@@ -376,7 +377,7 @@ impl RaftProposalPipeline {
 
         // Subscribe before submitting: the append may fire before the future
         // below is even polled.
-        let mut appended = notifier.subscribe(proposal.id);
+        let mut appended = notifier.subscribe(proposal.id, reach);
         let _permit = self.admit(proposal, 0).await?;
         let raft = Arc::clone(&self.raft);
         let (request, hold) = self.entry(proposal, 0).await?;
@@ -406,15 +407,14 @@ impl RaftProposalPipeline {
         };
 
         loop {
-            let held = {
+            let followers = {
                 let m = metrics_rx.borrow_watched();
                 if !m.state.is_leader() {
                     return Err(ProposalError::NotLeader {
                         leader_id: m.current_leader,
                     });
                 }
-                let followers = m
-                    .replication
+                m.replication
                     .as_ref()
                     .map(|r| {
                         r.iter()
@@ -423,16 +423,11 @@ impl RaftProposalPipeline {
                             })
                             .count()
                     })
-                    .unwrap_or(0);
-                1 + followers as u32
+                    .unwrap_or(0) as u32
             };
-            if held >= n {
+            if let Some(outcome) = acks_outcome(index, followers, n, majority, reach) {
                 metrics::counter!("coordinode_raft_proposals_total", "status" => "ok").increment(1);
-                return Ok(if held >= majority {
-                    ProposalOutcome::replicated(index)
-                } else {
-                    ProposalOutcome::local()
-                });
+                return Ok(outcome);
             }
             metrics_rx.changed().await.map_err(|_| {
                 ProposalError::Raft(
@@ -447,7 +442,7 @@ impl RaftProposalPipeline {
     /// Two kinds of caller reach the sync `ProposalPipeline` methods, and they
     /// need different bridges. A gRPC handler already runs on a runtime worker,
     /// where `block_in_place` is required so the runtime can move other tasks
-    /// off this thread. The volatile-write drain runs on its own `std::thread`,
+    /// off this thread. An embedded host calls from its own `std::thread`,
     /// where there is no current runtime at all and `block_in_place` would
     /// panic; there we block on the handle captured at construction.
     fn block_on_runtime<F>(&self, fut: F) -> Result<ProposalOutcome, ProposalError>
@@ -598,13 +593,21 @@ impl ProposalPipeline for RaftProposalPipeline {
         })
     }
 
-    fn propose_with_ack(
+    fn propose_with_concern(
         &self,
         proposal: &RaftProposal,
-        ack: WriteAck,
-        timeout: Option<Duration>,
+        concern: &WriteConcern,
     ) -> Result<ProposalOutcome, ProposalError> {
-        let n = match ack {
+        let timeout =
+            (concern.timeout_ms > 0).then(|| Duration::from_millis(u64::from(concern.timeout_ms)));
+        // A volatile `j` answers at the leader's write; the commit still
+        // waits for the durable log, as every commit does.
+        let reach = if concern.journal.is_volatile() {
+            LogReach::Written
+        } else {
+            LogReach::Durable
+        };
+        let n = match concern.w {
             WriteAck::Majority => {
                 return match timeout {
                     Some(t) => self.propose_with_timeout(proposal, t),
@@ -627,7 +630,8 @@ impl ProposalPipeline for RaftProposalPipeline {
         self.block_on_runtime(async {
             match timeout {
                 Some(t) => {
-                    match tokio::time::timeout(t, self.propose_acks(proposal, n, notifier)).await {
+                    let acks = self.propose_acks(proposal, n, reach, notifier);
+                    match tokio::time::timeout(t, acks).await {
                         Ok(result) => result,
                         Err(_elapsed) => {
                             metrics::counter!("coordinode_raft_write_concern_timeouts_total")
@@ -638,10 +642,35 @@ impl ProposalPipeline for RaftProposalPipeline {
                         }
                     }
                 }
-                None => self.propose_acks(proposal, n, notifier).await,
+                None => self.propose_acks(proposal, n, reach, notifier).await,
             }
         })
     }
+}
+
+/// The answer to a `w:n` proposal whose entry sits at `index`, once the
+/// leader holds it as far as `reach` and `followers` followers hold it
+/// durably; `None` while fewer than `n` members hold it. The leader's copy
+/// counts toward `n` as far as `reach`, and toward the committing majority
+/// only once durable: an answer carries the committed index only when a
+/// majority holds the entry durably.
+fn acks_outcome(
+    index: u64,
+    followers: u32,
+    n: u32,
+    majority: u32,
+    reach: LogReach,
+) -> Option<ProposalOutcome> {
+    // Members of a group number far below u32::MAX.
+    if 1 + followers < n {
+        return None;
+    }
+    let durable = u32::from(reach == LogReach::Durable) + followers;
+    Some(if durable >= majority {
+        ProposalOutcome::replicated(index)
+    } else {
+        ProposalOutcome::local()
+    })
 }
 
 #[cfg(test)]

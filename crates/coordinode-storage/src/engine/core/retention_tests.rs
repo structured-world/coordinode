@@ -1632,8 +1632,6 @@ fn a_read_that_missed_a_commit_in_flight_is_refused_when_it_writes() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     assert!(
         txn.commit(&ctx).is_err(),

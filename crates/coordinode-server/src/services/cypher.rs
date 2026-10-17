@@ -553,30 +553,6 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
-        // A valid concern this server cannot serve: the request is fine, the
-        // server's configuration (or the kind of write) does not allow it.
-        DatabaseError::Execution(ExecutionError::ConcernUnavailable(_)) => {
-            return status_with_reason(
-                Code::FailedPrecondition,
-                rendered,
-                Reason::WriteConcernUnavailable,
-                [],
-            );
-        }
-        DatabaseError::Execution(ExecutionError::VolatileBufferFull {
-            used_bytes,
-            capacity_bytes,
-        }) => {
-            return status_with_reason(
-                Code::ResourceExhausted,
-                rendered,
-                Reason::VolatileBufferFull,
-                [
-                    ("used_bytes", used_bytes.to_string()),
-                    ("capacity_bytes", capacity_bytes.to_string()),
-                ],
-            );
-        }
         // Both spellings again, for a write that reached a node which is not
         // the leader. FAILED_PRECONDITION rather than UNAVAILABLE: the server
         // is perfectly available, it is the request that came to the wrong
@@ -624,6 +600,19 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 Reason::OutsideRetention,
                 [("oldest_readable_ts", oldest_readable.to_string())],
             );
+        }
+        // A read at a timestamp whose commits have not landed or are not
+        // durable yet. UNAVAILABLE: the same read succeeds shortly, and the
+        // server does not wait for it on the caller's behalf.
+        DatabaseError::ReadNotReady {
+            requested,
+            ready_through,
+        } => {
+            let mut metadata = vec![("requested_ts", requested.to_string())];
+            if let Some(ts) = ready_through {
+                metadata.push(("ready_through_ts", ts.to_string()));
+            }
+            return status_with_reason(Code::Unavailable, rendered, Reason::ReadNotReady, metadata);
         }
         // The engine's own guard on a snapshot read below the watermark:
         // the same condition reached through a storage-level read.
@@ -1097,9 +1086,14 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         // Causal operationTime: a replicated write reports its OWN committed
         // Raft index, not the node's applied index sampled by the read fence,
-        // which is not this write's index. Reads keep the fence value; `None`
-        // (embedded, non-replicated) falls back to it too.
-        let applied_index = write_stats.applied_index.unwrap_or(applied_index);
+        // which does not cover this write. A write answered before its commit
+        // (a volatile journal, fewer acks than a majority) has no index of its
+        // own yet and reports none. Reads keep the fence value.
+        let applied_index = match (write_stats.applied_index, write_stats.commit_ts) {
+            (Some(own), _) => own,
+            (None, Some(_)) => 0,
+            (None, None) => applied_index,
+        };
 
         let duration_ms = start.elapsed().as_millis() as u64;
         self.executor.record(&req.query, source_ctx.as_ref(), start);

@@ -120,8 +120,6 @@ fn a_label_read_during_revision_commits_sees_a_whole_revision() {
                     write_concern: &wc,
                     pipeline: None,
                     id_gen: None,
-                    drain_buffer: None,
-                    nvme_write_buffer: None,
                 })
                 .expect("commit revision");
             }

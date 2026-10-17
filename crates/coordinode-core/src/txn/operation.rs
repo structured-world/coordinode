@@ -57,18 +57,9 @@ pub struct OperationId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IntentDigest(pub [u8; INTENT_DIGEST_LEN]);
 
-/// How a bound write takes effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum BindMode {
-    /// The write's effects commit with the binding.
-    Commit,
-    /// The binding is recorded ahead of effects that become durable later
-    /// (a provisional write): the operation is admitted and excluded from any
-    /// other attempt, and the later commit of the same attempt completes it.
-    Admit,
-}
-
-/// The binding a bound write carries in its proposal.
+/// The binding a bound write carries in its proposal, in the same unit as
+/// its effects: the two commit together, under every write concern, or not
+/// at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct OperationBinding {
     /// The operation.
@@ -77,8 +68,6 @@ pub struct OperationBinding {
     pub intent: IntentDigest,
     /// The attempt carrying it: the proposal's id.
     pub attempt: u64,
-    /// Whether its effects commit now.
-    pub mode: BindMode,
 }
 
 /// A change to the operation records, decided where it is applied.
@@ -98,20 +87,18 @@ pub enum OperationCommand {
     /// Bind the proposal's effects to an operation.
     Bind(OperationBinding),
     /// Exclude an operation no attempt has committed, so none ever will: the
-    /// proof that it does not take effect. An admitted operation is excluded
-    /// too, and its admitted attempt then never completes. Leaves a committed
-    /// operation as it is.
+    /// proof that it does not take effect. Leaves a committed operation as it
+    /// is.
     Exclude(OperationId),
     /// Release the outcome of one operation the caller no longer needs, above
     /// the retired prefix and out of number order: a committed or excluded
     /// operation keeps only the evidence that it is settled, and no attempt
-    /// of it is admitted again. Leaves an admitted operation, and a number
-    /// nothing is recorded of, as they are.
+    /// of it is admitted again. Leaves a number nothing is recorded of as it
+    /// is.
     Release(OperationId),
     /// Retire every operation of `issuer`'s `incarnation` numbered below
-    /// `below`, up to the first one admitted and not complete: their records
-    /// are released, and the retired prefix refuses them for good, including
-    /// numbers never used.
+    /// `below`: their records are released, and the retired prefix refuses
+    /// them for good, including numbers never used.
     Retire {
         /// The issuer.
         issuer: IssuerId,
@@ -173,14 +160,6 @@ pub enum OperationState {
         /// Its commit timestamp.
         commit_ts: u64,
         /// The unit that applied it.
-        at: LogPosition,
-    },
-    /// `attempt` is admitted by the unit at `at`; its effects are not
-    /// committed yet.
-    Admitted {
-        /// The admitted attempt.
-        attempt: u64,
-        /// The unit that admitted it.
         at: LogPosition,
     },
     /// No attempt will ever bind it.
@@ -245,16 +224,10 @@ pub fn decide_binding(
 ) -> BindDecision {
     let bound = OperationRecord {
         intent: binding.intent,
-        state: match binding.mode {
-            BindMode::Commit => OperationState::Committed {
-                attempt: binding.attempt,
-                commit_ts,
-                at,
-            },
-            BindMode::Admit => OperationState::Admitted {
-                attempt: binding.attempt,
-                at,
-            },
+        state: OperationState::Committed {
+            attempt: binding.attempt,
+            commit_ts,
+            at,
         },
     };
     let logged = at != LogPosition::LOCAL;
@@ -262,14 +235,6 @@ pub fn decide_binding(
         Some(existing) if existing.intent != binding.intent => BindDecision::Skip,
         // This very unit applied it: a re-delivery.
         Some(existing) if logged && *existing == bound => BindDecision::Apply(bound),
-        // The admitted attempt completes; any other attempt of an admitted
-        // operation is excluded by the admission.
-        Some(OperationRecord {
-            state: OperationState::Admitted { attempt, .. },
-            ..
-        }) if *attempt == binding.attempt && binding.mode == BindMode::Commit => {
-            BindDecision::Apply(bound)
-        }
         Some(_) => BindDecision::Skip,
         None => {
             let admissible = incarnation.is_some_and(|inc| {
@@ -299,11 +264,6 @@ pub enum OperationOutcome {
     /// It is proven not to take effect: excluded before any attempt
     /// committed it.
     Aborted,
-    /// An attempt is admitted and its effects are not committed yet.
-    Admitted {
-        /// The admitted attempt.
-        attempt: u64,
-    },
     /// Nothing is recorded: an attempt may still be on its way. Not a proof
     /// that it was never submitted; excluding it gives one.
     Unknown,
@@ -323,7 +283,6 @@ pub fn outcome_of(
         Some(OperationState::Committed {
             attempt, commit_ts, ..
         }) => OperationOutcome::Committed { attempt, commit_ts },
-        Some(OperationState::Admitted { attempt, .. }) => OperationOutcome::Admitted { attempt },
         Some(OperationState::Excluded) => OperationOutcome::Aborted,
         Some(OperationState::Released) => OperationOutcome::Retired,
         None => match incarnation {
@@ -400,7 +359,6 @@ pub fn decode_operation_key(key: &[u8]) -> Option<OperationId> {
 }
 
 const STATE_COMMITTED: u8 = 1;
-const STATE_ADMITTED: u8 = 2;
 const STATE_EXCLUDED: u8 = 3;
 const STATE_RELEASED: u8 = 4;
 
@@ -438,11 +396,6 @@ impl OperationRecord {
                 out.extend_from_slice(&commit_ts.to_be_bytes());
                 put_position(at, &mut out);
             }
-            OperationState::Admitted { attempt, at } => {
-                out.push(STATE_ADMITTED);
-                out.extend_from_slice(&attempt.to_be_bytes());
-                put_position(at, &mut out);
-            }
             OperationState::Excluded => out.push(STATE_EXCLUDED),
             OperationState::Released => out.push(STATE_RELEASED),
         }
@@ -465,17 +418,6 @@ impl OperationRecord {
                 OperationState::Committed {
                     attempt: u64::from_be_bytes(*attempt),
                     commit_ts: u64::from_be_bytes(*commit_ts),
-                    at,
-                }
-            }
-            STATE_ADMITTED => {
-                let (attempt, rest) = rest.split_first_chunk::<8>()?;
-                let (at, rest) = take_position(rest)?;
-                if !rest.is_empty() {
-                    return None;
-                }
-                OperationState::Admitted {
-                    attempt: u64::from_be_bytes(*attempt),
                     at,
                 }
             }

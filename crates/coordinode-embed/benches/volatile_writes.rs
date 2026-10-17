@@ -1,13 +1,15 @@
 //! The volatile write path end to end: how long a write under the memory
 //! and cache concerns waits for its acknowledgement against a journaled one,
-//! how long a burst waits until it is committed (the drain lag), the burst's
-//! throughput into the log, and the bytes the buffer retains meanwhile.
-//! Each concern runs on its own store; the arms of the acknowledgement
-//! comparison alternate so neither is always measured after the other.
+//! how long one write waits until a committed read sees it, and how long a
+//! burst waits until every write is acknowledged and committed, with its
+//! throughput. Each concern runs on its own store; the arms of the
+//! acknowledgement comparison alternate so neither is always measured after
+//! the other.
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
 use std::time::{Duration, Instant};
 
+use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_embed::Database;
 use coordinode_embed::db::StatementOptions;
@@ -16,6 +18,8 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 
 /// Writes per acknowledgement arm.
 const ROUNDS: usize = 2000;
+/// Writes per commit-latency arm.
+const COMMITS: usize = 200;
 /// Writes per burst, unless `VOLATILE_BURST` names another count: a longer
 /// burst gives a profiler time to sample it.
 fn burst_size() -> usize {
@@ -45,7 +49,14 @@ fn open(dir: &std::path::Path) -> Database {
         Durability::Durable,
         Tier::Warm,
     )]);
-    config.nvme_write_buffer_path = Some(dir.join("nvme"));
+    // `VOLATILE_FLUSH_MS` moves the journal's flush interval: past the end
+    // of a burst, it shows what the burst costs with no sync beside it.
+    if let Some(ms) = std::env::var("VOLATILE_FLUSH_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        config.volatile_flush_interval_ms = ms;
+    }
     Database::open_with_config(config).expect("open")
 }
 
@@ -110,34 +121,127 @@ fn acknowledgements() {
     report("ack memory with an operation", bound);
 }
 
-/// A burst under `concern`: the time until every write is acknowledged, the
-/// time until every write is committed, and the most bytes buffered between.
+/// How long one write under `concern`, sent alone, takes until a committed
+/// read sees it. Measured from the send, write after write.
+fn commit_latency(concern: WriteConcern, name: &str) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path());
+    let mut times = Vec::with_capacity(COMMITS);
+    for k in 0..COMMITS {
+        let start = Instant::now();
+        write(&db, concern, "Lone", k);
+        while landed(&db, "Lone") < k as u64 + 1 {
+            std::thread::yield_now();
+        }
+        times.push(start.elapsed());
+    }
+    report(&format!("commit {name}"), times);
+}
+
+fn read_concern(level: ReadConcernLevel) -> ReadConcern {
+    ReadConcern {
+        level,
+        ..ReadConcern::default()
+    }
+}
+
+fn count_at(db: &mut Database, level: ReadConcernLevel, label: &str) -> usize {
+    db.execute_cypher_with_read_concern(
+        &format!("MATCH (n:{label}) RETURN n.k"),
+        read_concern(level),
+    )
+    .expect("read")
+    .len()
+}
+
+/// How long one write under `concern`, sent alone, takes until a majority
+/// read sees it: for a volatile concern, until the journal has synced it.
+fn durable_latency(concern: WriteConcern, name: &str) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    let mut times = Vec::with_capacity(COMMITS);
+    for k in 0..COMMITS {
+        let start = Instant::now();
+        write(&db, concern, "Lone", k);
+        while count_at(&mut db, ReadConcernLevel::Majority, "Lone") < k + 1 {
+            std::thread::yield_now();
+        }
+        times.push(start.elapsed());
+    }
+    report(&format!("durable {name}"), times);
+}
+
+/// Ordinary read latency at each read concern while a volatile write sits
+/// unsynced (run with a long `VOLATILE_FLUSH_MS` to hold the flusher off):
+/// choosing the durable view costs no sync and no wait.
+fn reads_over_an_unsynced_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    for k in 0..100 {
+        write(&db, WriteConcern::majority(), "Seen", k);
+    }
+    write(&db, WriteConcern::memory(), "Seen", 100);
+    for (level, name) in [
+        (ReadConcernLevel::Local, "local"),
+        (ReadConcernLevel::Majority, "majority"),
+    ] {
+        let mut times = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            let start = Instant::now();
+            count_at(&mut db, level, "Seen");
+            times.push(start.elapsed());
+        }
+        report(&format!("read {name} over an unsynced write"), times);
+    }
+}
+
+/// A burst under `concern`: the time until every write is acknowledged and
+/// the time until every write is committed.
 fn burst(concern: WriteConcern, name: &str) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open(dir.path());
     let n = burst_size();
-    let mut retained = 0;
     let start = Instant::now();
     for k in 0..n {
         write(&db, concern, "Burst", k);
-        retained = retained.max(db.volatile_buffered_bytes());
     }
     let acked = start.elapsed();
     while landed(&db, "Burst") < n as u64 {
-        retained = retained.max(db.volatile_buffered_bytes());
         std::thread::sleep(Duration::from_millis(1));
     }
     let committed = start.elapsed();
     println!(
-        "burst {name}: n={n} acked={acked:?} committed={committed:?} drain_lag={:?} \
-         throughput={:.0}/s retained_peak_bytes={retained}",
+        "burst {name}: n={n} acked={acked:?} committed={committed:?} lag={:?} \
+         throughput={:.0}/s",
         committed - acked,
         n as f64 / committed.as_secs_f64(),
     );
 }
 
 fn main() {
-    acknowledgements();
+    // `VOLATILE_PARTS` picks parts by name (`ack`, `commit`, `durable`,
+    // `read`, `burst`); all run when it is unset.
+    let parts = std::env::var("VOLATILE_PARTS").unwrap_or_default();
+    let runs = |part: &str| parts.is_empty() || parts.split(',').any(|p| p == part);
+    if runs("ack") {
+        acknowledgements();
+    }
+    if runs("commit") {
+        commit_latency(WriteConcern::majority(), "journal");
+        commit_latency(WriteConcern::memory(), "memory");
+        commit_latency(WriteConcern::cache(), "cache");
+    }
+    if runs("durable") {
+        durable_latency(WriteConcern::majority(), "journal");
+        durable_latency(WriteConcern::memory(), "memory");
+        durable_latency(WriteConcern::cache(), "cache");
+    }
+    if runs("read") {
+        reads_over_an_unsynced_tail();
+    }
+    if !runs("burst") {
+        return;
+    }
     burst(WriteConcern::majority(), "journal");
     burst(WriteConcern::memory(), "memory");
     burst(WriteConcern::cache(), "cache");

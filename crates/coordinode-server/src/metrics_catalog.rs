@@ -194,6 +194,21 @@ fn register_graph_metrics() {
 }
 
 fn register_replication_metrics() {
+    // The standalone journal's deferred tail (volatile write concerns)
+    metrics::describe_counter!("coordinode_journal_syncs_total", "Journal syncs completed");
+    metrics::describe_counter!(
+        "coordinode_journal_sync_failures_total",
+        "Journal syncs that failed; the journal refuses writes after one"
+    );
+    metrics::describe_counter!(
+        "coordinode_journal_appender_syncs_total",
+        "Volatile writes that synced the journal themselves past the unsynced cap"
+    );
+    metrics::describe_gauge!(
+        "coordinode_journal_unsynced_bytes",
+        "Journal bytes appended under a volatile concern and not yet synced"
+    );
+
     // Raft (populated in distributed mode)
     metrics::describe_gauge!("coordinode_raft_term", "Current Raft term");
     metrics::describe_gauge!("coordinode_raft_commit_index", "Committed log index");

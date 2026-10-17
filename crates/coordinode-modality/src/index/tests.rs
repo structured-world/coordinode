@@ -17,8 +17,6 @@ fn commit(t: &mut Transaction) -> Result<(), CommitError> {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     t.commit(&ctx).map(|_| ())
 }

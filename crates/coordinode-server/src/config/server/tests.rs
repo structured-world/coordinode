@@ -1045,45 +1045,51 @@ fn bad_compression_settings_are_refused() {
     }
 }
 
-/// The volatile drain section reaches the storage config; unset keys keep
-/// the engine defaults, and no write buffer is configured unless named, so a
-/// cache-concern write is refused by default rather than served as memory.
-/// Zero sizes and unknown keys are refused when the file is read.
+/// The journal's flush interval for volatile writes reaches the storage
+/// config: unset keeps the engine default (MongoDB's 100 ms), `0` is a valid
+/// "sync at once", and the removed drain section is refused as unknown.
 #[test]
-fn volatile_settings_parse_and_reach_the_storage_config() {
+fn the_volatile_flush_interval_reaches_the_storage_config() {
     let defaults = ServerConfig::default()
         .resolve_storage_config()
         .expect("valid");
-    assert_eq!(defaults.drain_interval_ms, 100);
-    assert_eq!(defaults.drain_batch_max, 10_000);
-    assert_eq!(defaults.drain_buffer_capacity_bytes, 100 * 1024 * 1024);
-    assert_eq!(defaults.nvme_write_buffer_path, None);
+    assert_eq!(defaults.volatile_flush_interval_ms, 100);
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.yaml");
+    for (body, expected) in [
+        (
+            "storage:\n  oplog:\n    volatile_flush_interval_ms: 20\n",
+            20,
+        ),
+        ("storage:\n  oplog:\n    volatile_flush_interval_ms: 0\n", 0),
+    ] {
+        std::fs::write(&path, body).unwrap();
+        let sc = ServerConfig::load(Some(path.to_str().unwrap()))
+            .unwrap()
+            .resolve_storage_config()
+            .expect("valid topology");
+        assert_eq!(sc.volatile_flush_interval_ms, expected, "{body}");
+    }
+
+    // The flush size bounds the unsynced tail: the default is PostgreSQL's
+    // 1 MiB, and an operator's value replaces it.
+    assert_eq!(defaults.volatile_flush_bytes, 1024 * 1024);
     std::fs::write(
         &path,
-        "storage:\n  volatile:\n    drain_interval_ms: 20\n    drain_batch_max: 500\n    \
-         drain_buffer_capacity_bytes: 4096\n    nvme_write_buffer_path: /nvme/wb\n",
+        "storage:\n  oplog:\n    volatile_flush_bytes: 65536\n",
     )
     .unwrap();
     let sc = ServerConfig::load(Some(path.to_str().unwrap()))
         .unwrap()
         .resolve_storage_config()
         .expect("valid topology");
-    assert_eq!(sc.drain_interval_ms, 20);
-    assert_eq!(sc.drain_batch_max, 500);
-    assert_eq!(sc.drain_buffer_capacity_bytes, 4096);
-    assert_eq!(
-        sc.nvme_write_buffer_path,
-        Some(std::path::PathBuf::from("/nvme/wb"))
-    );
+    assert_eq!(sc.volatile_flush_bytes, 65536);
 
     for body in [
-        "storage:\n  volatile:\n    drain_interval_ms: 0\n",
-        "storage:\n  volatile:\n    drain_batch_max: 0\n",
-        "storage:\n  volatile:\n    drain_buffer_capacity_bytes: 0\n",
-        "storage:\n  volatile:\n    drain_every: 5\n",
+        "storage:\n  oplog:\n    volatile_flush_bytes: -1\n",
+        "storage:\n  oplog:\n    volatile_flush_interval_ms: -1\n",
+        "storage:\n  volatile:\n    drain_interval_ms: 20\n",
     ] {
         std::fs::write(&path, body).unwrap();
         assert!(

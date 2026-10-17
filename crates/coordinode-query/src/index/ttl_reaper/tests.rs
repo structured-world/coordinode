@@ -62,8 +62,6 @@ fn seed_node_record(engine: &StorageEngine, shard_id: u16, node_id: NodeId, reco
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit node");
 }
@@ -118,8 +116,6 @@ fn commit_now(txn: &mut Transaction<'_>) -> Result<(), CommitError> {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).map(|_| ())
 }
@@ -843,8 +839,6 @@ fn seed_table_key(engine: &StorageEngine, table: &str, key: &[Value], node_id: N
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit key");
 }

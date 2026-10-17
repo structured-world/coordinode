@@ -192,24 +192,11 @@ fn decide_enrollment(
     Ok(effects)
 }
 
-/// Exclude `op` when no attempt committed it: one nothing is recorded of and
-/// that could still be admitted, or one admitted and not completed (a
-/// provisional write whose drain is delayed or whose payload was lost), so
-/// the admitted attempt never completes either. Nothing otherwise.
+/// Exclude `op` when nothing is recorded of it and it could still be
+/// admitted, so no attempt ever binds it. Nothing otherwise.
 fn decide_exclusion(engine: &StorageEngine, op: &OperationId) -> StorageResult<Vec<Mutation>> {
-    match operation_record(engine, op)? {
-        Some(OperationRecord {
-            intent,
-            state: OperationState::Admitted { .. },
-        }) => {
-            let excluded = OperationRecord {
-                intent,
-                state: OperationState::Excluded,
-            };
-            return Ok(vec![schema_put(operation_key(op), excluded.encode())]);
-        }
-        Some(_) => return Ok(Vec::new()),
-        None => {}
+    if operation_record(engine, op)?.is_some() {
+        return Ok(Vec::new());
     }
     let Some(incarnation) = incarnation_record(engine, &op.issuer, op.incarnation)? else {
         return Ok(Vec::new());
@@ -229,9 +216,8 @@ fn decide_exclusion(engine: &StorageEngine, op: &OperationId) -> StorageResult<V
 }
 
 /// Release the outcome of `op` when it is settled (committed or excluded),
-/// keeping its intent and the evidence that it is settled. An admitted
-/// operation is still owed its outcome, and a number nothing is recorded of
-/// may still be on its way: neither is released.
+/// keeping its intent and the evidence that it is settled. A number nothing
+/// is recorded of may still be on its way: it is not released.
 fn decide_release(engine: &StorageEngine, op: &OperationId) -> StorageResult<Vec<Mutation>> {
     match operation_record(engine, op)? {
         Some(OperationRecord {
@@ -248,8 +234,8 @@ fn decide_release(engine: &StorageEngine, op: &OperationId) -> StorageResult<Vec
     }
 }
 
-/// Retire the incarnation's numbers below `below`, up to its first admitted
-/// operation: release their records and move the retired prefix.
+/// Retire the incarnation's numbers below `below`: release their records and
+/// move the retired prefix.
 fn decide_retirement(
     engine: &StorageEngine,
     issuer: &IssuerId,
@@ -263,7 +249,6 @@ fn decide_retirement(
         return Ok(Vec::new());
     }
     let mut effects = Vec::new();
-    let mut retired_below = below;
     let prefix = incarnation_operations_prefix(issuer, incarnation);
     for guard in engine.prefix_scan(Partition::Schema, &prefix)? {
         let (key, value) = guard.into_inner()?;
@@ -271,26 +256,17 @@ fn decide_retirement(
         if op.sequence >= below {
             break;
         }
-        let state = OperationRecord::decode(&value)
-            .ok_or_else(|| malformed("operation record"))?
-            .state;
-        if matches!(state, OperationState::Admitted { .. }) {
-            // Still owed its commit: the prefix stops in front of it.
-            retired_below = op.sequence;
-            break;
-        }
+        // A record that does not decode is not released blind.
+        OperationRecord::decode(&value).ok_or_else(|| malformed("operation record"))?;
         effects.push(Mutation::Delete {
             partition: PartitionId::Schema,
             key: key.to_vec(),
         });
     }
-    if retired_below <= record.retired_below {
-        return Ok(Vec::new());
-    }
     effects.push(schema_put(
         incarnation_key(issuer, incarnation),
         IncarnationRecord {
-            retired_below,
+            retired_below: below,
             ..record
         }
         .encode(),

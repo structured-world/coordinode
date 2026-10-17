@@ -181,25 +181,6 @@ pub enum ExecutionError {
     )]
     Backpressure,
 
-    /// This node cannot serve the write concern the write asked for (see
-    /// the engine's `CommitError::ConcernUnavailable`). Nothing was applied,
-    /// and it is never served under another concern instead.
-    #[error("write concern unavailable: {0}; nothing was applied")]
-    ConcernUnavailable(String),
-
-    /// The buffer of writes accepted under a memory or cache concern is
-    /// full. Nothing was applied; retry once it drains.
-    #[error(
-        "volatile write buffer full: {used_bytes} of {capacity_bytes} bytes; \
-         nothing was applied, retry once it drains"
-    )]
-    VolatileBufferFull {
-        /// Bytes the buffer holds.
-        used_bytes: u64,
-        /// Bytes it holds at most.
-        capacity_bytes: u64,
-    },
-
     /// The write reached a node that is not the leader, so it could not be
     /// replicated. Nothing was applied; the same write succeeds at the leader.
     /// Its identifiers too: a lease refused for want of the lead lands here.
@@ -1014,27 +995,14 @@ pub struct ExecutionContext<'a> {
     /// - Linearizable: verify leadership + read (strongest)
     /// - Snapshot: pinned to explicit timestamp
     pub read_concern: coordinode_core::txn::read_concern::ReadConcernLevel,
-    /// Write concern for mutations. Controls durability:
-    /// - W0: fire-and-forget (direct local write, no pipeline)
-    /// - Memory: RAM only (~1µs), drain to Raft in background
-    /// - Cache: RAM + NVMe (~100µs), drain to Raft in background
-    /// - W1: leader WAL fsync
-    /// - Majority: Raft quorum acknowledgement (production default)
-    /// - journal: force WAL fsync after commit
-    /// - timeout_ms: proposal timeout (0 = no timeout)
+    /// Write concern for mutations: when the caller is answered, never how
+    /// the write is applied.
+    /// - `w`: how many members hold the write (0 = nobody waits, 1 = the
+    ///   leader, majority = the production default)
+    /// - `j`: in what state: synced (journal), handed to the operating
+    ///   system (cache) or in process memory (memory), synced later
+    /// - timeout_ms: how long to wait for `w` (0 = no timeout)
     pub write_concern: coordinode_core::txn::write_concern::WriteConcern,
-    /// Volatile write drain buffer for w:memory and w:cache writes.
-    /// When set, volatile writes are buffered here for background
-    /// Raft replication instead of going through the synchronous
-    /// proposal pipeline.
-    pub drain_buffer: Option<&'a coordinode_core::txn::drain::DrainBuffer>,
-    /// NVMe-backed write buffer for `w:cache` crash recovery.
-    ///
-    /// When set and write concern is `Cache`, mutations are persisted to this
-    /// NVMe file before ACK so they survive process crashes. The drain thread's
-    /// checkpoint protocol (`begin_drain` / `complete_drain`) ensures entries
-    /// are cleaned up after successful Raft commit.
-    pub nvme_write_buffer: Option<&'a coordinode_storage::cache::write_buffer::NvmeWriteBuffer>,
     /// MVCC snapshot for point-in-time reads (native seqno MVCC).
     ///
     /// When MVCC is enabled, this snapshot is created at `mvcc_read_ts` via
@@ -2100,8 +2068,6 @@ impl<'a> ExecutionContext<'a> {
                 write_concern: &write_concern,
                 pipeline: self.proposal_pipeline,
                 id_gen: self.proposal_id_gen,
-                drain_buffer: self.drain_buffer,
-                nvme_write_buffer: self.nvme_write_buffer,
             })
             .map_err(catalog_commit_error)?;
         if let Some(index) = outcome.applied_index {
@@ -3188,8 +3154,6 @@ impl<'a> ExecutionContext<'a> {
             write_concern: &write_concern,
             pipeline: self.proposal_pipeline,
             id_gen: self.proposal_id_gen,
-            drain_buffer: self.drain_buffer,
-            nvme_write_buffer: self.nvme_write_buffer,
         };
         let outcome = match self.txn.commit(&ctx) {
             Ok(outcome) => outcome,
@@ -20527,14 +20491,6 @@ fn commit_err_to_execution(
         CommitError::Storage(e) => ExecutionError::Storage(e),
         CommitError::Serialization(msg) => ExecutionError::Serialization(msg),
         CommitError::Backpressure => ExecutionError::Backpressure,
-        CommitError::ConcernUnavailable(why) => ExecutionError::ConcernUnavailable(why),
-        CommitError::VolatileBufferFull {
-            used_bytes,
-            capacity_bytes,
-        } => ExecutionError::VolatileBufferFull {
-            used_bytes,
-            capacity_bytes,
-        },
         CommitError::NotLeader { leader_id } => ExecutionError::NotLeader { leader_id },
         CommitError::Mismatched(m) => ExecutionError::Mismatched(m),
         // A caller error, not a transient one: retrying the same statement

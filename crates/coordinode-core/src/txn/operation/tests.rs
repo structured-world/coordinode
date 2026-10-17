@@ -18,12 +18,11 @@ fn open(retired_below: u64, window: u64) -> IncarnationRecord {
     }
 }
 
-fn binding(sequence: u64, intent: u8, attempt: u64, mode: BindMode) -> OperationBinding {
+fn binding(sequence: u64, intent: u8, attempt: u64) -> OperationBinding {
     OperationBinding {
         op: op(sequence),
         intent: IntentDigest([intent; INTENT_DIGEST_LEN]),
         attempt,
-        mode,
     }
 }
 
@@ -38,7 +37,7 @@ fn at(index: u64) -> LogPosition {
 #[test]
 fn only_the_first_attempt_of_an_operation_applies() {
     let inc = open(1, 10);
-    let first = binding(3, 1, 100, BindMode::Commit);
+    let first = binding(3, 1, 100);
     let BindDecision::Apply(record) = decide_binding(&first, Some(&inc), None, 50, at(7)) else {
         panic!("the first attempt applies");
     };
@@ -52,9 +51,8 @@ fn only_the_first_attempt_of_an_operation_applies() {
     );
     for (later, position) in [
         (first, at(8)),
-        (binding(3, 1, 101, BindMode::Commit), at(9)),
-        (binding(3, 2, 102, BindMode::Commit), at(10)),
-        (binding(3, 1, 103, BindMode::Admit), at(11)),
+        (binding(3, 1, 101), at(9)),
+        (binding(3, 2, 102), at(10)),
     ] {
         assert_eq!(
             decide_binding(&later, Some(&inc), Some(&record), 50, position),
@@ -79,7 +77,7 @@ fn only_the_first_attempt_of_an_operation_applies() {
 #[test]
 fn the_applying_unit_delivered_again_applies_again() {
     let inc = open(1, 10);
-    let first = binding(3, 1, 100, BindMode::Commit);
+    let first = binding(3, 1, 100);
     let BindDecision::Apply(record) = decide_binding(&first, Some(&inc), None, 50, at(7)) else {
         panic!("the first attempt applies");
     };
@@ -89,56 +87,12 @@ fn the_applying_unit_delivered_again_applies_again() {
     );
 }
 
-/// An admitted attempt completes once, with the same intent; another attempt
-/// of the admitted operation is excluded by the admission.
-#[test]
-fn an_admitted_attempt_and_only_it_completes() {
-    let inc = open(1, 10);
-    let admit = binding(4, 1, 7, BindMode::Admit);
-    let BindDecision::Apply(admitted) = decide_binding(&admit, Some(&inc), None, 10, at(3)) else {
-        panic!("admission applies");
-    };
-    assert_eq!(
-        admitted.state,
-        OperationState::Admitted {
-            attempt: 7,
-            at: at(3)
-        }
-    );
-    assert_eq!(
-        decide_binding(
-            &binding(4, 1, 7, BindMode::Commit),
-            Some(&inc),
-            Some(&admitted),
-            20,
-            at(5)
-        ),
-        BindDecision::Apply(OperationRecord {
-            intent: admit.intent,
-            state: OperationState::Committed {
-                attempt: 7,
-                commit_ts: 20,
-                at: at(5),
-            },
-        })
-    );
-    for other in [
-        binding(4, 1, 8, BindMode::Commit),
-        binding(4, 2, 7, BindMode::Commit),
-    ] {
-        assert_eq!(
-            decide_binding(&other, Some(&inc), Some(&admitted), 20, at(6)),
-            BindDecision::Skip
-        );
-    }
-}
-
 /// An operation binds only inside its incarnation's admission window: not
 /// without an enrolled incarnation, not once it is closed, not below the
 /// retired prefix and not past the window.
 #[test]
 fn admission_is_bounded_by_the_incarnation() {
-    let attempt = |sequence| binding(sequence, 1, 1, BindMode::Commit);
+    let attempt = |sequence| binding(sequence, 1, 1);
     let decide = |sequence, inc: Option<&IncarnationRecord>| {
         decide_binding(&attempt(sequence), inc, None, 1, at(1))
     };
@@ -202,18 +156,10 @@ fn a_released_operation_binds_nothing() {
         intent: IntentDigest([7; INTENT_DIGEST_LEN]),
         state: OperationState::Released,
     };
-    for mode in [BindMode::Commit, BindMode::Admit] {
-        assert_eq!(
-            decide_binding(
-                &binding(3, 7, 4, mode),
-                Some(&inc),
-                Some(&released),
-                20,
-                at(9)
-            ),
-            BindDecision::Skip
-        );
-    }
+    assert_eq!(
+        decide_binding(&binding(3, 7, 4), Some(&inc), Some(&released), 20, at(9)),
+        BindDecision::Skip
+    );
 }
 
 /// An attempt differs in intent from a recorded one only when the record
@@ -242,10 +188,6 @@ fn encodings_round_trip_and_refuse_malformed_bytes() {
             attempt: 9,
             commit_ts: 11,
             at: LogPosition { index: 5, sub: 2 },
-        },
-        OperationState::Admitted {
-            attempt: 3,
-            at: at(4),
         },
         OperationState::Excluded,
         OperationState::Released,

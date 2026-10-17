@@ -36,8 +36,6 @@ impl DatabaseBuilds {
             write_concern: &wc,
             pipeline: Some(self.pipeline.as_ref()),
             id_gen: Some(&self.proposal_id_gen),
-            drain_buffer: None,
-            nvme_write_buffer: None,
         })
         .map(|_| ())
     }

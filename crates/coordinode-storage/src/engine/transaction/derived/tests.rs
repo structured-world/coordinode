@@ -256,8 +256,6 @@ fn a_commit_journals_the_work_and_applies_the_entry() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     })
     .expect("commit");
 

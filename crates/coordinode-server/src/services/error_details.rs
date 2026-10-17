@@ -118,16 +118,12 @@ pub enum Reason {
     /// level asked of more than one member. Terminal for that request; the
     /// message names the offending combination.
     InvalidWriteConcern,
-    /// A valid write concern this server cannot serve as asked: a cache
-    /// journal with no write buffer configured, or a memory or cache journal
-    /// for a schema change. Nothing was applied, and it is never served
-    /// under another concern instead. Terminal until the configuration or
-    /// the request changes.
-    WriteConcernUnavailable,
-    /// The buffer of writes accepted under a memory or cache journal and not
-    /// drained yet is full. Nothing was applied. Metadata carries
-    /// `used_bytes` and `capacity_bytes`. Retry after the advised delay.
-    VolatileBufferFull,
+    /// A read at a named timestamp covers a commit that has not landed, or
+    /// is not durable yet, and the server does not wait for it. Nothing was
+    /// read. Metadata carries `requested_ts` and, when there is one,
+    /// `ready_through_ts`, the latest timestamp answerable now. Retry after
+    /// the advised delay, or read at `ready_through_ts`.
+    ReadNotReady,
     /// A write gave a unique key a second holder: a table's key, or a value of
     /// a unique index. Nothing was written. Metadata carries `key` and
     /// `element_id` (the node that holds it), plus `table` for a table key or
@@ -195,7 +191,7 @@ pub enum Reason {
     IndexUnresolved,
     /// The client operation the write carries out already stands settled, or
     /// cannot be admitted: this attempt ran and applied nothing. Metadata
-    /// carries `outcome` (COMMITTED, ABORTED, ADMITTED, UNKNOWN or RETIRED,
+    /// carries `outcome` (COMMITTED, ABORTED, UNKNOWN or RETIRED,
     /// as `OperationState` names them), `commit_ts` for a committed one, and
     /// `intent_differs` ("true" when the operation's number was used for
     /// another write). Terminal: a COMMITTED outcome is the write's answer;
@@ -231,8 +227,7 @@ impl Reason {
             Reason::MemberReadOnly => "MEMBER_READ_ONLY",
             Reason::OutsideRetention => "OUTSIDE_RETENTION",
             Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
-            Reason::WriteConcernUnavailable => "WRITE_CONCERN_UNAVAILABLE",
-            Reason::VolatileBufferFull => "VOLATILE_BUFFER_FULL",
+            Reason::ReadNotReady => "READ_NOT_READY",
             Reason::DuplicateKey => "DUPLICATE_KEY",
             Reason::UniquenessUnresolved => "UNIQUENESS_UNRESOLVED",
             Reason::KeyImmutable => "KEY_IMMUTABLE",
@@ -286,8 +281,9 @@ impl Reason {
             | Reason::NotLeader
             | Reason::MemberReadOnly => Some(std::time::Duration::ZERO),
             Reason::WriteBackpressure => Some(std::time::Duration::from_millis(500)),
-            // Room comes back with the next drain pass, a batching window away.
-            Reason::VolatileBufferFull => Some(std::time::Duration::from_millis(100)),
+            // The commits a named timestamp covers land within microseconds
+            // and become durable within the journal's flush interval.
+            Reason::ReadNotReady => Some(std::time::Duration::from_millis(50)),
             // Space comes back when someone frees it, not soon: a floor that
             // keeps clients from hammering a node that only serves reads.
             Reason::StorageFull => Some(std::time::Duration::from_secs(5)),

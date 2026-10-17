@@ -461,6 +461,22 @@ impl OplogManager {
             .transpose()
     }
 
+    /// The active segment's path and the length a power cut leaves it at
+    /// when no entry from `index` on was synced; `None` when it holds none.
+    #[cfg(test)]
+    pub(crate) fn power_cut_at(&self, index: u64) -> Option<(PathBuf, u64)> {
+        self.current.as_ref()?.power_cut_at(index)
+    }
+
+    /// The active segment's path and the length a killed process leaves it
+    /// at; `None` when no segment is active.
+    #[cfg(test)]
+    pub(crate) fn kill_point(&self) -> Option<(PathBuf, u64)> {
+        self.current
+            .as_ref()
+            .map(crate::oplog::SegmentWriter::kill_point)
+    }
+
     /// Seal and close the active segment.
     ///
     /// The sealed file is added to the manager's sealed list. The next

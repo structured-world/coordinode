@@ -76,7 +76,6 @@ pub(crate) fn outcome_to_proto(outcome: OperationOutcome) -> (wire::OperationSta
             (wire::OperationState::Committed, commit_ts)
         }
         OperationOutcome::Aborted => (wire::OperationState::Aborted, 0),
-        OperationOutcome::Admitted { .. } => (wire::OperationState::Admitted, 0),
         OperationOutcome::Unknown => (wire::OperationState::Unknown, 0),
         OperationOutcome::Retired => (wire::OperationState::Retired, 0),
     }

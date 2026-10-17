@@ -14,6 +14,9 @@
 //! - `partition_minority_cannot_commit_majority_can`: isolate the leader into a
 //!   minority; the majority elects a new leader and commits, the minority leader
 //!   cannot commit, and on heal the minority converges with no split-brain.
+//! - `an_early_answered_volatile_write_is_lost_whole_on_failover`: a `j:memory`
+//!   write the isolated leader answered carries no committed index and is lost
+//!   with its uncommitted suffix.
 //! - `isolated_leader_refuses_a_linearizable_read_within_the_timeout`: the
 //!   isolated old leader serves no stale linearizable read.
 //! - `change_stream_never_delivers_what_an_isolated_leader_cannot_commit`: the
@@ -469,6 +472,76 @@ async fn partition_minority_cannot_commit_majority_can() {
             leaked.is_none(),
             "minority's uncommitted write leaked to the majority (split-brain!)"
         );
+
+        nemesis::heal();
+        n1.node.shutdown().await.ok();
+        n2.node.shutdown().await.ok();
+        n3.node.shutdown().await.ok();
+    })
+    .await;
+    nemesis::heal();
+    assert!(result.is_ok(), "TIMED OUT after {TEST_TIMEOUT:?}");
+}
+
+/// A volatile write answered early by a leader cut off from its quorum is
+/// answered with no committed index, and is lost with that leader's
+/// uncommitted suffix when the majority moves on: it never reaches the new
+/// leader, and the old one converges to the majority's history.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_early_answered_volatile_write_is_lost_whole_on_failover() {
+    use coordinode_core::txn::write_concern::WriteConcern;
+    nemesis::heal();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3) = bootstrap_3_node().await;
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        write(&n1, &id_gen, 100, "node:1:v-base", "base").expect("baseline commit");
+
+        nemesis::isolate(1, &[2, 3]);
+        let pipeline = n1.node.pipeline();
+        let volatile = RaftProposal {
+            id: ProposalIdGenerator::with_base(9u64 << 48).next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:v-early".to_vec(),
+                value: b"early".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(300),
+            start_ts: Timestamp::from_raw(299),
+            bypass_rate_limiter: false,
+        };
+        let answered = tokio::time::timeout(
+            Duration::from_secs(8),
+            tokio::task::spawn_blocking(move || {
+                pipeline.propose_with_concern(&volatile, &WriteConcern::memory())
+            }),
+        )
+        .await
+        .expect("the early answer does not wait for a quorum")
+        .expect("propose task")
+        .expect("answered at the leader's write");
+        assert!(
+            answered.applied_index.is_none(),
+            "an early answer named a committed index: {answered:?}"
+        );
+
+        let survivors = [&n2, &n3];
+        let new_leader = await_new_leader(&survivors, 1).await;
+        let id_gen_maj = ProposalIdGenerator::with_base(new_leader << 48);
+        commit_on_majority(&survivors, 1, &id_gen_maj, 400, "node:1:v-maj", "majority").await;
+        nemesis::heal();
+
+        let v = await_value_eq(&n1.engine, "node:1:v-maj", b"majority").await;
+        assert_eq!(v.as_deref(), Some(b"majority".as_slice()));
+        for node in [&n1, &n2, &n3] {
+            assert!(
+                node.engine
+                    .get(Partition::Node, b"node:1:v-early")
+                    .expect("read")
+                    .is_none(),
+                "the early-answered write outlived the leader that held it"
+            );
+        }
 
         nemesis::heal();
         n1.node.shutdown().await.ok();

@@ -100,19 +100,20 @@ impl Database {
     }
 
     /// How the operation `descriptor` names stands. With
-    /// [`Resolve::Exclude`], an operation not committed (nothing recorded, or
-    /// a provisional write admitted and not yet drained) is excluded through
-    /// the log first, so the answer is final: committed, or aborted and never
-    /// taking effect.
+    /// [`Resolve::Exclude`], an operation nothing is recorded of is excluded
+    /// through the log first, so the answer is final: committed, or aborted
+    /// and never taking effect.
     ///
-    /// A lookup reads what this member applied; [`Resolve::Exclude`] is
-    /// decided by the group's log, and refused on a member that is not the
-    /// leader.
+    /// A lookup reports what this member applied, which under a volatile
+    /// write concern can still be lost with the unsynced end of the journal.
+    /// [`Resolve::Exclude`] is decided by the group's log, refused on a
+    /// member that is not the leader, and answers only once the outcome it
+    /// reports, with the effects it travels with, is durable.
     ///
     /// # Errors
     ///
-    /// The descriptor names another deployment, or the exclusion could not
-    /// be committed.
+    /// The descriptor names another deployment, the exclusion could not be
+    /// committed, or the journal could not be synced.
     pub fn resolve_operation(
         &self,
         descriptor: &OperationDescriptor,
@@ -121,23 +122,24 @@ impl Database {
         self.check_deployment(descriptor)?;
         let op = descriptor.op;
         let outcome = records::operation_outcome(&self.engine, &op)?;
-        if resolve == Resolve::Exclude
-            && matches!(
-                outcome,
-                OperationOutcome::Unknown | OperationOutcome::Admitted { .. }
-            )
-        {
+        if resolve == Resolve::Lookup {
+            return Ok(outcome);
+        }
+        if outcome == OperationOutcome::Unknown {
+            // A journaled commit: it syncs every entry before it as well.
             self.propose_operation(OperationCommand::Exclude(op))?;
             return Ok(records::operation_outcome(&self.engine, &op)?);
         }
+        // Recorded under a volatile concern, the outcome may not be durable
+        // yet; the sync covers it and its effects, which share its entry.
+        self.engine.sync_applied()?;
         Ok(outcome)
     }
 
     /// Release the records of the operations of `below`'s incarnation
     /// numbered below it, once the host no longer needs their outcomes: a
     /// later lookup of one reports it retired, and no attempt of one takes
-    /// effect, numbers never used included. Retirement stops in front of an
-    /// operation admitted and not complete.
+    /// effect, numbers never used included.
     ///
     /// # Errors
     ///
@@ -155,8 +157,8 @@ impl Database {
     /// Release the outcome of the operation `descriptor` names, once the host
     /// no longer needs it, without waiting for the numbers below it: a later
     /// lookup reports it retired, and no attempt of it takes effect. Only a
-    /// settled operation (committed or aborted) is released; one admitted
-    /// and not complete, or one nothing is recorded of, stays as it is.
+    /// settled operation (committed or aborted) is released; one nothing is
+    /// recorded of stays as it is.
     ///
     /// # Errors
     ///

@@ -36,8 +36,6 @@ fn commit(t: &mut Transaction) {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     t.commit(&ctx).expect("commit");
 }

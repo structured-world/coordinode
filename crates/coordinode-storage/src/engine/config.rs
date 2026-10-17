@@ -76,7 +76,7 @@ pub enum Durability {
 pub enum Tier {
     /// In-process RAM. Only `Volatile` endpoints belong here.
     Memory,
-    /// NVMe-as-cache (`Volatile`). Drain-through cache files live here.
+    /// NVMe-as-cache (`Volatile`). Cache files live here.
     HotCache,
     /// Hot data (NVMe or SSD typically, `Durable` or `Degraded`).
     Hot,
@@ -747,31 +747,19 @@ pub struct StorageConfig {
     /// constructed after the engine is open.
     pub node_shard: u16,
 
-    /// Background drain thread polling interval in milliseconds.
-    /// Controls how frequently volatile writes (w:memory/w:cache) are
-    /// batched into Raft proposals. Lower = less data at risk.
-    /// Default: 100ms.
-    pub drain_interval_ms: u64,
+    /// The interval, in milliseconds, at which the journal syncs entries
+    /// written under a volatile write concern (`j: memory` / `j: cache`):
+    /// the window a crash normally loses. A journaled commit or a table flush
+    /// syncs them sooner. A scheduling interval, not a guarantee that a sync
+    /// succeeds in time. `0` syncs as soon as the journal's flusher wakes.
+    /// Default: 100, MongoDB's `journalCommitIntervalMs`.
+    pub volatile_flush_interval_ms: u64,
 
-    /// Maximum number of mutations per drain Raft proposal batch.
-    /// Default: 10,000.
-    pub drain_batch_max: u32,
-
-    /// Maximum drain buffer capacity in bytes. When full, new volatile
-    /// writes are rejected with backpressure. Default: 100 MB.
-    pub drain_buffer_capacity_bytes: u64,
-
-    /// Directory for the NVMe-backed write buffer used by `w:cache` write concern.
-    ///
-    /// When set, `w:cache` writes are persisted to this directory before ACK,
-    /// enabling recovery of undraiend entries after a process crash (not power
-    /// failure). Two files are managed in this directory:
-    /// - `write_buffer_current.bin` — active write buffer being appended
-    /// - `write_buffer_draining.NNN.bin` — checkpoint in progress (drain thread)
-    ///
-    /// When `None` (default), a `w:cache` write is refused: nothing would
-    /// keep the promise that it survives a process crash.
-    pub nvme_write_buffer_path: Option<PathBuf>,
+    /// Unsynced volatile bytes past which the journal syncs without waiting
+    /// out [`Self::volatile_flush_interval_ms`]; past sixteen times this, the
+    /// writer syncs before it is answered, which bounds the unsynced tail.
+    /// Default: 1 MiB, PostgreSQL's `wal_writer_flush_after`.
+    pub volatile_flush_bytes: u64,
 
     /// The store was gathered into these endpoints from a layout it was not
     /// written under (a checkpoint collects every table into one
@@ -949,10 +937,8 @@ impl StorageConfig {
             max_commits_in_flight: 10_000,
             snapshot_wait_ms: 5,
             node_shard: 0,
-            drain_interval_ms: 100,
-            drain_batch_max: 10_000,
-            drain_buffer_capacity_bytes: 100 * 1024 * 1024,
-            nvme_write_buffer_path: None,
+            volatile_flush_interval_ms: 100,
+            volatile_flush_bytes: 1024 * 1024,
             relocated: false,
             min_free_bytes: crate::engine::space::DEFAULT_MIN_FREE_BYTES,
             resume_free_bytes: crate::engine::space::DEFAULT_RESUME_FREE_BYTES,

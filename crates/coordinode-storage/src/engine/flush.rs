@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use lsm_tree::AbstractTree;
 
 use crate::engine::coordinator::GcWatermarks;
+use crate::engine::oplog_journal::{EmbeddedOplog, sync_journal};
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 use coordinode_core::txn::wake::Wake;
@@ -110,6 +111,10 @@ impl FlushManager {
     /// # Errors
     ///
     /// Returns `Err` if any background thread fails to spawn (OS resource limit).
+    ///
+    /// `journal` is the engine's journal, when it keeps one: a worker syncs it
+    /// before it writes a sealed memtable, so no table holds an effect of an
+    /// entry the journal could still lose.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         trees: &HashMap<Partition, lsm_tree::AnyTree>,
@@ -120,6 +125,7 @@ impl FlushManager {
         max_memtable_age_secs: u64,
         wake: Arc<Wake>,
         compaction_wake: Arc<Wake>,
+        journal: Option<Arc<Mutex<EmbeddedOplog>>>,
     ) -> StorageResult<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -133,9 +139,10 @@ impl FlushManager {
             let rx = receiver.clone();
             let flushed = Arc::clone(&wake);
             let compaction = Arc::clone(&compaction_wake);
+            let journal = journal.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("coord-flush-worker-{i}"))
-                .spawn(move || flush_worker_loop(rx, &flushed, &compaction))
+                .spawn(move || flush_worker_loop(rx, &flushed, &compaction, journal.as_deref()))
                 .map_err(|e| StorageError::InvalidConfig(format!("flush worker spawn: {e}")))?;
             workers.push(handle);
         }
@@ -293,7 +300,12 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
 ///
 /// Blocks on the channel with no timeout: the manager's drop closes the
 /// channel, which is what ends the loop.
-fn flush_worker_loop(receiver: flume::Receiver<FlushRequest>, flushed: &Wake, compaction: &Wake) {
+fn flush_worker_loop(
+    receiver: flume::Receiver<FlushRequest>,
+    flushed: &Wake,
+    compaction: &Wake,
+    journal: Option<&Mutex<EmbeddedOplog>>,
+) {
     while let Ok(FlushRequest {
         tree,
         partition,
@@ -303,7 +315,14 @@ fn flush_worker_loop(receiver: flume::Receiver<FlushRequest>, flushed: &Wake, co
     {
         // get_flush_lock() is not Send: it is acquired and used in this thread.
         let flush_lock = tree.get_flush_lock();
-        let result = tree.flush(&flush_lock, gc_watermark);
+        // Every entry a sealed memtable holds was journaled before it was
+        // applied, so a sync now covers them all.
+        let result = match journal.map_or(Ok(()), sync_journal) {
+            Ok(()) => tree.flush(&flush_lock, gc_watermark),
+            Err(e) => Err(lsm_tree::Error::Io(lsm_tree::io::Error::other(
+                e.to_string(),
+            ))),
+        };
         drop(flush_lock);
         // Before the wake below, so the pass it starts may ask again.
         queued.store(false, Ordering::Release);

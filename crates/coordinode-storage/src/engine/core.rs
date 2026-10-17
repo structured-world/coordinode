@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 use coordinode_core::txn::proposal::Mutation;
+use coordinode_core::txn::write_concern::Journal;
 use lsm_tree::AbstractTree;
 use tracing::info;
 
@@ -102,9 +103,7 @@ pub struct StorageEngine {
     /// Invariant claims of the attempts running against this engine. Shared
     /// by every transaction, because a condition is only protected if the
     /// attempt that would break it is looking at the same table.
-    /// Shared ownership: a volatile commit keeps its reservation until it is
-    /// drained, past the transaction that took it.
-    claim_registry: Arc<crate::engine::claims::ClaimRegistry>,
+    claim_registry: crate::engine::claims::ClaimRegistry,
     /// Counts the schema changes this process has applied. A claim carries the
     /// value it read, so a predicate evaluated before a definition changed is
     /// not taken as evidence about the graph after it.
@@ -199,6 +198,9 @@ pub struct StorageEngine {
     /// replay forward). In cluster mode this is `None` — the Raft log is the
     /// equivalent retained oplog.
     oplog: Option<Arc<Mutex<EmbeddedOplog>>>,
+    /// Syncs what volatile commits left unsynced in `oplog`. `Some` exactly
+    /// when `oplog` is.
+    journal_flusher: Option<crate::engine::oplog_journal::JournalFlusher>,
     /// Which journal indices are applied, and the last fold of them into the
     /// partition trees' coverage records. `Some` exactly when `oplog` is.
     coverage: Option<Coverage>,
@@ -717,7 +719,12 @@ impl StorageEngine {
             Some(jcfg) => match config.select_oplog_endpoint(0) {
                 Ok(endpoint) => {
                     let dir = endpoint.path.join("oplog").join("0");
-                    let mut journal = EmbeddedOplog::open(&dir, 0, &jcfg)?;
+                    let mut journal = EmbeddedOplog::open(
+                        &dir,
+                        0,
+                        &jcfg,
+                        pending_commits.durable_ceiling_cell(),
+                    )?;
                     let entries = journal.read_all()?;
                     let mut covered: HashMap<Partition, TreeCoverage> =
                         HashMap::with_capacity(trees.len());
@@ -875,12 +882,17 @@ impl StorageEngine {
                 tree.flush_active_memtable(0)?;
             }
         }
-        let (oplog, coverage) = match oplog {
+        let (oplog, journal_flusher, coverage) = match oplog {
             Some(journal) => {
                 let coverage = Coverage::new(journal.next_index());
-                (Some(Arc::new(Mutex::new(journal))), Some(coverage))
+                let journal = Arc::new(Mutex::new(journal));
+                let flusher = crate::engine::oplog_journal::JournalFlusher::start(
+                    &journal,
+                    std::time::Duration::from_millis(config.volatile_flush_interval_ms),
+                )?;
+                (Some(journal), Some(flusher), Some(coverage))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
 
         // Open tiered cache if configured.
@@ -914,6 +926,7 @@ impl StorageEngine {
             config.max_memtable_age_secs,
             flush_wake,
             Arc::clone(&compaction_wake),
+            oplog.clone(),
         )?;
 
         // Feed the backpressure thresholds to every partition tree so the
@@ -1122,9 +1135,7 @@ impl StorageEngine {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
             coordinator,
-            claim_registry: Arc::new(crate::engine::claims::ClaimRegistry::new(
-                config.max_invariant_claims,
-            )),
+            claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             schema_generation: AtomicU64::new(0),
             node_delta_runs: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             metadata_decisions: parking_lot::Mutex::new(()),
@@ -1145,6 +1156,7 @@ impl StorageEngine {
             capacity_scanner,
             partition_l0_endpoint,
             oplog,
+            journal_flusher,
             coverage,
             oracle,
             #[cfg(feature = "columnar")]
@@ -1313,9 +1325,8 @@ impl StorageEngine {
     /// Returns [`StorageError::Engine`] if the flush fails.
     #[cfg(feature = "columnar")]
     pub fn flush_columnar_table(&self, table_id: &str) -> StorageResult<()> {
-        use lsm_tree::AbstractTree;
         if let Some(tree) = self.columnar_tables.get(table_id) {
-            tree.flush_active_memtable(0)?;
+            self.flush_memtables(&tree)?;
         }
         Ok(())
     }
@@ -1709,7 +1720,7 @@ impl StorageEngine {
             self.next_seqno(),
             self.next_seqno(),
         )?;
-        tree.flush_active_memtable(0)?;
+        self.flush_memtables(tree)?;
         // Cached values were read from the old copy.
         self.write_taps.replaced(Partition::Idx);
         if let Some(cache) = &self.tiered_cache {
@@ -2006,7 +2017,7 @@ impl StorageEngine {
             // This also makes the per-partition checkpoint directory appear
             // deterministically (previously it depended on whether a
             // background flush happened to have run before the checkpoint).
-            tree.flush_active_memtable(0).map_err(|e| {
+            self.flush_memtables(tree).map_err(|e| {
                 StorageError::Io(format!("flush before checkpoint {}: {e}", part.name()))
             })?;
             let info = tree
@@ -2030,7 +2041,7 @@ impl StorageEngine {
                 let Some(tree) = self.columnar_tables.get(&table_id) else {
                     continue;
                 };
-                tree.flush_active_memtable(0)?;
+                self.flush_memtables(&tree)?;
                 let info = tree
                     .create_checkpoint(&tables.join(&table_id))
                     .map_err(|e| {
@@ -2244,8 +2255,7 @@ impl StorageEngine {
 
     /// Persist the rebuilt tree of `partition`, then drop its intent.
     fn finish_rebuild(&self, partition: Partition) -> StorageResult<()> {
-        use lsm_tree::AbstractTree;
-        self.tree(partition)?.flush_active_memtable(0)?;
+        self.flush_memtables(self.tree(partition)?)?;
         if partition == Partition::Schema {
             // The dictionary was rebuilt: views read before it reread it.
             self.note_field_dictionary_change();
@@ -2566,6 +2576,13 @@ impl StorageEngine {
         self.pin_new_snapshot(|| self.snapshot())
     }
 
+    /// [`Self::pin_latest_snapshot`] for a read that must not see a write a
+    /// crash can still take back: the latest complete snapshot, lowered to
+    /// [`Self::durable_view`].
+    pub fn pin_durable_snapshot(&self) -> (lsm_tree::SeqNo, Option<SnapshotPin>) {
+        self.pin_new_snapshot(|| self.durable_view(self.snapshot()))
+    }
+
     /// Record a transaction as open until the returned marker drops.
     /// [`Self::await_transactions_through`] waits for the ones opened before
     /// a boundary.
@@ -2573,6 +2590,20 @@ impl StorageEngine {
         use crate::engine::coordinator::MultiModalCoordinator as _;
         self.open_transactions
             .open(|| self.coordinator.current_seqno())
+    }
+
+    /// The highest snapshot at or below `view` that holds only durable
+    /// effects: below every commit still in flight and below every journal
+    /// entry not yet synced. A read that must not see a write a crash can
+    /// still take back (`majority`, `snapshot`, `linearizable`) reads here;
+    /// `local` reads `view`. Chosen from what memory already holds: no sync,
+    /// no wait. A store whose log is a consensus log applies only what is
+    /// durable, so for it the answer is `view`.
+    pub fn durable_view(&self, view: lsm_tree::SeqNo) -> lsm_tree::SeqNo {
+        if self.oplog.is_none() {
+            return view;
+        }
+        self.pending_commits.durable_floor(view)
     }
 
     /// Choose a snapshot that is not behind the present and pin it in the same
@@ -3184,6 +3215,23 @@ impl StorageEngine {
     /// journalled but failed to apply stays uncovered and is replayed on the
     /// next open.
     pub fn commit_journaled(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
+        self.commit_logged(mutations, commit_ts, Journal::Journal)
+    }
+
+    /// [`Self::commit_journaled`] with the journal entry taken only as far as
+    /// `level` before the commit returns: a volatile level leaves its sync to
+    /// the journal's flusher, a journaled commit or a table flush, whichever
+    /// comes first. The commit is applied and visible either way.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::commit_journaled`].
+    pub fn commit_logged(
+        &self,
+        mutations: &[Mutation],
+        commit_ts: u64,
+        level: Journal,
+    ) -> StorageResult<()> {
         // Refused before the journal append, which is the write a full disk
         // would fail in.
         self.space.admit()?;
@@ -3201,9 +3249,11 @@ impl StorageEngine {
                 coordinode_core::txn::operation::LogPosition::LOCAL,
             )?;
             if decided.effects.is_empty() {
-                return Ok(());
+                // The caller is answered from the record this decision read,
+                // which a volatile write may have left unsynced.
+                return self.sync_for(level);
             }
-            return self.journal_and_apply(&decided.effects, commit_ts);
+            return self.journal_and_apply(&decided.effects, commit_ts, level);
         }
         if mutations.iter().any(|m| matches!(m, Mutation::Command(_))) {
             // The decision, the journal append and the apply happen under one
@@ -3212,20 +3262,48 @@ impl StorageEngine {
             let _decisions = self.metadata_exclusive();
             let (effects, dictionary) = self.decide_commands(mutations)?;
             // Nothing decided (names already bound, or a refusal) leaves the
-            // state as it is, so there is nothing to journal or replay.
+            // state as it is, so there is nothing to journal or replay; the
+            // bindings it found may still be unsynced.
             if effects.is_empty() {
-                return Ok(());
+                return self.sync_for(level);
             }
-            self.journal_and_apply(&effects, commit_ts)?;
+            self.journal_and_apply(&effects, commit_ts, level)?;
             self.note_dictionary(dictionary);
             return Ok(());
         }
-        self.journal_and_apply(mutations, commit_ts)
+        self.journal_and_apply(mutations, commit_ts, level)
     }
 
-    /// Journal `mutations`, then apply them at `commit_ts` with their coverage
-    /// marker. None of them is a metadata command.
-    fn journal_and_apply(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
+    /// Make the journal as durable as `level` promises for a commit that
+    /// appended nothing: under `journal`, every entry it may have read from.
+    fn sync_for(&self, level: Journal) -> StorageResult<()> {
+        match (&self.oplog, level) {
+            (Some(oplog), Journal::Journal) => crate::engine::oplog_journal::sync_journal(oplog),
+            _ => Ok(()),
+        }
+    }
+
+    /// Make every write applied here durable before an answer that promises
+    /// it, such as a final operation outcome, without writing anything. A
+    /// store whose log is a consensus log applies only what is durable, so
+    /// for it this does nothing.
+    ///
+    /// # Errors
+    ///
+    /// The journal's sync fails, now or earlier.
+    pub fn sync_applied(&self) -> StorageResult<()> {
+        self.sync_for(Journal::Journal)
+    }
+
+    /// Journal `mutations` as far as `level` asks, then apply them at
+    /// `commit_ts` with their coverage marker. None of them is a metadata
+    /// command.
+    fn journal_and_apply(
+        &self,
+        mutations: &[Mutation],
+        commit_ts: u64,
+        level: Journal,
+    ) -> StorageResult<()> {
         let (Some(oplog), Some(coverage)) = (&self.oplog, &self.coverage) else {
             return Err(StorageError::InvalidConfig(
                 "commit_journaled on an engine without a retained journal".into(),
@@ -3235,7 +3313,7 @@ impl StorageEngine {
             let mut guard = oplog
                 .lock()
                 .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
-            guard.append(mutations, commit_ts)?
+            guard.append(mutations, commit_ts, level)?
         };
         let mark = coverage::Mark {
             domain: Domain::Journal,
@@ -3440,7 +3518,7 @@ impl StorageEngine {
     ///
     /// Shared rather than per-transaction: a condition is only protected if
     /// the attempt that would break it consults the same table.
-    pub fn claim_registry(&self) -> &Arc<crate::engine::claims::ClaimRegistry> {
+    pub fn claim_registry(&self) -> &crate::engine::claims::ClaimRegistry {
         &self.claim_registry
     }
 
@@ -3603,12 +3681,12 @@ impl StorageEngine {
     /// that was in the WAL is now in SST, so the journal can be truncated.
     pub fn persist(&self) -> StorageResult<()> {
         for tree in self.coordinator.trees().values() {
-            tree.flush_active_memtable(0)?;
+            self.flush_memtables(tree)?;
         }
         #[cfg(feature = "columnar")]
         for table_id in self.columnar_tables.table_ids() {
             if let Some(tree) = self.columnar_tables.get(&table_id) {
-                tree.flush_active_memtable(0)?;
+                self.flush_memtables(&tree)?;
             }
         }
         // The retained oplog journal is NOT truncated on flush — it must survive
@@ -3625,7 +3703,22 @@ impl StorageEngine {
     ///
     /// The partition does not exist or its flush fails.
     pub fn persist_partition(&self, part: Partition) -> StorageResult<()> {
-        self.tree(part)?.flush_active_memtable(0)?;
+        self.flush_memtables(self.tree(part)?)
+    }
+
+    /// Write `tree`'s memtables to tables, the journal synced first: the
+    /// memtables are sealed, then every journal entry they can hold (each
+    /// was appended before it was applied) is made durable, and only then
+    /// are the tables written. A table never holds an effect of an entry a
+    /// crash could still take from the journal, so a crash loses whole
+    /// entries from the end of the log and never part of one.
+    pub(crate) fn flush_memtables<T: AbstractTree + ?Sized>(&self, tree: &T) -> StorageResult<()> {
+        let lock = tree.get_flush_lock();
+        tree.rotate_memtable();
+        if let Some(oplog) = &self.oplog {
+            crate::engine::oplog_journal::sync_journal(oplog)?;
+        }
+        tree.flush(&lock, 0)?;
         Ok(())
     }
 
@@ -3644,9 +3737,23 @@ impl StorageEngine {
                 let mut guard = oplog
                     .lock()
                     .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
-                let index = guard.append(mutations, commit_ts)?;
+                let index = guard.append(mutations, commit_ts, Journal::Journal)?;
                 Ok(Some(index))
             }
+        }
+    }
+
+    /// Where a crash now cuts the journal's active segment: its path and the
+    /// length it is left at, by a power cut (`power`, every unsynced entry
+    /// lost) or by a killed process (what was handed to the operating
+    /// system kept). `None` when the cut would take nothing.
+    #[cfg(test)]
+    pub(crate) fn journal_crash_point(&self, power: bool) -> Option<(PathBuf, u64)> {
+        let guard = self.oplog.as_ref()?.lock().ok()?;
+        if power {
+            guard.power_cut_point()
+        } else {
+            guard.kill_point()
         }
     }
 
@@ -3712,7 +3819,7 @@ impl StorageEngine {
     pub fn force_compaction(&self, part: Partition) -> StorageResult<()> {
         let tree = self.tree(part)?;
         // Flush memtable so compaction sees the latest data.
-        tree.flush_active_memtable(0)?;
+        self.flush_memtables(tree)?;
         // Compact/GC up to the CURRENT watermark only — never advance it here.
         // The watermark is the seqno below which no reader needs history; an
         // unpinned time-travel / AS OF read holds an older seqno the controller
@@ -4872,8 +4979,9 @@ fn load_or_init_partition_routing(
 ///
 /// 1. Stop `FlushManager` — joins monitor + worker threads.
 /// 2. Stop `CompactionScheduler` — joins monitor + worker threads.
-/// 3. Flush active memtables — best-effort final flush.
-/// 4. Remaining fields (`trees`, `cache`, etc.) drop naturally after this.
+/// 3. Stop the journal flusher, which syncs the journal's tail.
+/// 4. Flush active memtables: best-effort final flush.
+/// 5. Remaining fields (`trees`, `cache`, etc.) drop naturally after this.
 impl Drop for StorageEngine {
     fn drop(&mut self) {
         // Step 0: stop the background capacity scanner. Joins the
@@ -4888,9 +4996,16 @@ impl Drop for StorageEngine {
         // Step 2: stop background compaction workers.
         drop(self.compaction_scheduler.take());
 
-        // Step 3: best-effort final flush of any remaining active memtable data.
+        // Step 3: a clean shutdown keeps every volatile commit.
+        drop(self.journal_flusher.take());
+
+        // Step 4: best-effort final flush of any remaining active memtable
+        // data. A tree whose flush fails (the journal could not be synced
+        // among others) keeps its data in the journal for the next open.
         for tree in self.coordinator.trees().values() {
-            let _ = tree.flush_active_memtable(0);
+            if let Err(e) = self.flush_memtables(tree) {
+                tracing::debug!(error = %e, "final memtable flush skipped");
+            }
         }
     }
 }

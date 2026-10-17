@@ -120,13 +120,14 @@ pub struct IssuerExhausted;
 pub enum Resolve {
     /// Report what is recorded: an operation with nothing recorded is
     /// [`OperationOutcome::Unknown`], since an attempt may still be on its
-    /// way.
+    /// way. What is observed, not a durable proof: a commit made under a
+    /// volatile write concern is reported before the journal syncs it.
     Lookup,
     /// Exclude it, through the log, so no attempt ever takes effect, and
     /// report [`OperationOutcome::Aborted`]; one that committed first reports
-    /// its outcome. A provisional write admitted and not yet drained is
-    /// excluded too: its drain then applies nothing. The proof a host needs
-    /// before it gives the operation up or retries the work as a new one.
+    /// its outcome. Either answer is durable when it is given: the proof a
+    /// host needs before it gives the operation up or retries the work as a
+    /// new one.
     Exclude,
 }
 

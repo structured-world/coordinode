@@ -393,18 +393,44 @@ impl PowerRig {
     }
 
     fn config(&self) -> StorageConfig {
-        durable_cfg(&self.dir).with_fs(Arc::clone(&self.fs))
+        let mut config = durable_cfg(&self.dir).with_fs(Arc::clone(&self.fs));
+        // Volatile commits stay unsynced until a test syncs them, so a cut
+        // finds them where the test left them.
+        config.volatile_flush_interval_ms = 60_000;
+        config
     }
 
     fn open(&self) -> (StorageEngine, Arc<TimestampOracle>) {
+        self.open_with(&self.config())
+    }
+
+    fn open_with(&self, config: &StorageConfig) -> (StorageEngine, Arc<TimestampOracle>) {
         let oracle = Arc::new(TimestampOracle::new());
-        let engine = StorageEngine::open_embedded(&self.config(), oracle.clone()).expect("open");
+        let engine = StorageEngine::open_embedded(config, oracle.clone()).expect("open");
         (engine, oracle)
     }
 
     /// Lose power: nothing written from now on is durable, the engine goes
-    /// away, and every file falls back to what was fsynced before the cut.
+    /// away, and every file falls back to what was fsynced before the cut,
+    /// the journal's unsynced tail included.
     fn cut(&self, engine: StorageEngine) {
+        let journal = engine.journal_crash_point(true);
+        self.stop(engine);
+        cut_journal(journal);
+        self.crash.crash();
+    }
+
+    /// Kill the process: what it handed to the operating system stays, its
+    /// own buffers (the journal's among them) are lost.
+    fn kill(&self, engine: StorageEngine) {
+        let journal = engine.journal_crash_point(false);
+        self.stop(engine);
+        cut_journal(journal);
+    }
+
+    /// Take `engine` away with every table write refused, so the flush its
+    /// drop attempts never lands.
+    fn stop(&self, engine: StorageEngine) {
         use lsm_tree::fs::{Fault, FaultOp, FaultRule};
         let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
         for op in [
@@ -418,7 +444,19 @@ impl PowerRig {
         }
         drop(engine);
         self.faults.clear();
-        self.crash.crash();
+    }
+}
+
+/// Cut the journal segment a crash leaves short back to `point`, after the
+/// engine that wrote it is gone (its drop syncs and seals the segment, which
+/// the crash never let happen).
+fn cut_journal(point: Option<(std::path::PathBuf, u64)>) {
+    if let Some((path, len)) = point {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_len(len))
+            .expect("cut the journal segment");
     }
 }
 
@@ -710,8 +748,6 @@ fn kept_cardinality_counts_are_replayed_once_after_a_power_cut() {
             write_concern: &wc,
             pipeline: Some(&pipeline),
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx).map(|_| ())
     };
@@ -1408,6 +1444,336 @@ fn a_power_cut_at_any_write_leaves_every_commit_once() {
     // A failed write leaves a torn record or table behind; recovery must
     // read past it exactly as past a cut at a sync.
     assert!(cut_at_every(lsm_tree::fs::FaultOp::Write) > 0);
+}
+
+/// A commit writing `name` into the node tree and an edge numbered `n` into
+/// the adjacency tree: one entry, two trees.
+fn two_tree_commit(name: &str, n: u64) -> Vec<Mutation> {
+    vec![
+        Mutation::Put {
+            partition: PartitionId::Node,
+            key: format!("node:00:{name}").into_bytes(),
+            value: name.as_bytes().to_vec(),
+        },
+        Mutation::Merge {
+            partition: PartitionId::Adj,
+            key: b"adj:V:out:1".to_vec(),
+            operand: crate::engine::merge::encode_add(n),
+        },
+    ]
+}
+
+/// Whether `name`'s node row is there, and the edges the adjacency tree holds.
+fn two_tree_state(engine: &StorageEngine, name: &str) -> (bool, Vec<u64>) {
+    let node = engine
+        .get(Partition::Node, format!("node:00:{name}").as_bytes())
+        .expect("get node")
+        .is_some();
+    let edges = engine
+        .get(Partition::Adj, b"adj:V:out:1")
+        .expect("get adj")
+        .map(|v| {
+            coordinode_core::graph::edge::PostingList::from_bytes(&v)
+                .expect("posting list")
+                .iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    (node, edges)
+}
+
+fn commit_at(engine: &StorageEngine, oracle: &TimestampOracle, m: &[Mutation], level: Journal) {
+    engine
+        .commit_logged(m, oracle.next().as_raw(), level)
+        .expect("commit");
+}
+
+/// A volatile commit is visible as soon as it returns, and a power cut
+/// before its sync takes it, never the journaled commit before it.
+#[test]
+fn a_volatile_commit_is_visible_at_once_and_a_power_cut_takes_only_it() {
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Journal);
+        commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Memory);
+        assert_eq!(
+            two_tree_state(&engine, "b"),
+            (true, vec![1, 2]),
+            "a volatile commit reads back the moment it returns"
+        );
+        rig.cut(engine);
+    }
+    let (engine, _) = rig.open();
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1]));
+    assert!(
+        !two_tree_state(&engine, "b").0,
+        "the unsynced commit is lost"
+    );
+}
+
+/// A journaled commit syncs the journal up to itself, so the volatile
+/// commits before it survive a power cut with it.
+#[test]
+fn a_journaled_commit_makes_the_volatile_commits_before_it_durable() {
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Memory);
+        commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Cache);
+        commit_at(&engine, &oracle, &two_tree_commit("c", 3), Journal::Journal);
+        rig.cut(engine);
+    }
+    let (engine, _) = rig.open();
+    for name in ["a", "b", "c"] {
+        assert!(two_tree_state(&engine, name).0, "{name} must survive");
+    }
+    assert_eq!(two_tree_state(&engine, "c").1, vec![1, 2, 3]);
+}
+
+/// Log before data: flushing one tree syncs the journal first. Without that,
+/// a volatile commit's node row reached a table while its journal entry, and
+/// so its edge in the other tree, was lost to the cut: half a commit.
+#[test]
+fn a_table_flush_syncs_the_journal_before_it_writes() {
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Memory);
+        engine
+            .persist_partition(Partition::Node)
+            .expect("flush the node tree");
+        commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Memory);
+        rig.cut(engine);
+    }
+    let (engine, _) = rig.open();
+    let (a, edges) = two_tree_state(&engine, "a");
+    assert!(
+        a && edges.first() == Some(&1),
+        "the commit whose row reached a table is whole: {edges:?}"
+    );
+    // A background flush may have synced the later commit too; either way it
+    // is whole or absent.
+    let (b, _) = two_tree_state(&engine, "b");
+    assert_eq!(
+        edges,
+        if b { vec![1, 2] } else { vec![1] },
+        "a commit is never half there"
+    );
+}
+
+/// The background flusher syncs a volatile commit within its interval with
+/// no other write to do it.
+#[test]
+fn the_flusher_syncs_a_volatile_commit_within_its_interval() {
+    let rig = PowerRig::new();
+    let mut config = rig.config();
+    config.volatile_flush_interval_ms = 10;
+    {
+        let (engine, oracle) = rig.open_with(&config);
+        commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Memory);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while engine.journal_crash_point(true).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the flusher never synced the commit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        rig.cut(engine);
+    }
+    let (engine, _) = rig.open();
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1]));
+}
+
+/// A killed process keeps what `cache` handed to the operating system and
+/// loses what `memory` left in its own buffer, in log order.
+#[test]
+fn a_killed_process_keeps_cache_commits_and_loses_memory_ones() {
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Cache);
+        commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Memory);
+        rig.kill(engine);
+    }
+    let (engine, _) = rig.open();
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1]));
+    assert!(
+        !two_tree_state(&engine, "b").0,
+        "the buffered commit is lost"
+    );
+}
+
+/// A durable view stops below a volatile commit until the journal syncs it,
+/// and choosing the view syncs nothing: the commit is still unsynced after
+/// any number of choices, and a journaled commit, which syncs everything
+/// before it, brings it into the view.
+#[test]
+fn a_durable_view_excludes_an_unsynced_commit_without_syncing() {
+    let rig = PowerRig::new();
+    let (engine, oracle) = rig.open();
+    let ts = oracle.next().as_raw();
+    engine
+        .commit_logged(&two_tree_commit("a", 1), ts, Journal::Memory)
+        .expect("commit");
+    let fresh = oracle.next().as_raw();
+    for _ in 0..3 {
+        assert!(
+            engine.durable_view(fresh) <= ts,
+            "a durable view reaches past an unsynced commit"
+        );
+    }
+    assert!(
+        engine.journal_crash_point(true).is_some(),
+        "choosing a view synced the journal"
+    );
+    commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Journal);
+    let fresh = oracle.next().as_raw();
+    assert_eq!(
+        engine.durable_view(fresh),
+        fresh,
+        "everything is durable now"
+    );
+    rig.cut(engine);
+}
+
+/// Commit timestamps need not follow journal order: an unsynced commit
+/// stamped lower than an earlier unsynced one bounds the view, and a sync
+/// lifts the bound past both.
+#[test]
+fn a_durable_view_follows_the_lowest_unsynced_timestamp() {
+    let rig = PowerRig::new();
+    let (engine, oracle) = rig.open();
+    let low = oracle.next().as_raw();
+    let high = oracle.next().as_raw();
+    engine
+        .commit_logged(&two_tree_commit("high", 2), high, Journal::Memory)
+        .expect("high");
+    assert!(engine.durable_view(oracle.next().as_raw()) <= high);
+    engine
+        .commit_logged(&two_tree_commit("low", 1), low, Journal::Cache)
+        .expect("low");
+    assert!(engine.durable_view(oracle.next().as_raw()) <= low);
+    crate::engine::oplog_journal::sync_journal(engine.oplog.as_ref().expect("journal"))
+        .expect("sync");
+    let fresh = oracle.next().as_raw();
+    assert_eq!(engine.durable_view(fresh), fresh);
+    rig.cut(engine);
+}
+
+/// The unsynced tail is bounded: past sixteen times the flush size the
+/// writer syncs before it is answered, with the flusher held off.
+#[test]
+fn the_unsynced_tail_is_bounded() {
+    let rig = PowerRig::new();
+    let mut config = rig.config();
+    config.volatile_flush_bytes = 1;
+    let (engine, oracle) = rig.open_with(&config);
+    commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Memory);
+    assert!(
+        engine.journal_crash_point(true).is_none(),
+        "a write past the cap left the tail unsynced"
+    );
+    rig.cut(engine);
+    let (engine, _) = rig.open();
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1]));
+}
+
+/// A journaled retry of an operation a volatile write already bound applies
+/// nothing, and answers with the recorded commit: that answer promises the
+/// binding is durable, so the retry syncs the journal before it returns.
+/// Without that, a power cut lost the operation the retry reported
+/// committed.
+#[test]
+fn a_journaled_retry_of_a_volatile_operation_makes_it_durable() {
+    use coordinode_core::txn::operation::{
+        DEFAULT_ADMISSION_WINDOW, INTENT_DIGEST_LEN, ISSUER_ID_LEN, IntentDigest, IssuerId,
+        OperationBinding, OperationCommand, OperationId, OperationOutcome,
+    };
+    let issuer = IssuerId([0x6b; ISSUER_ID_LEN]);
+    let op = OperationId {
+        issuer,
+        incarnation: 1,
+        sequence: 1,
+    };
+    let bound = |attempt| {
+        vec![
+            Mutation::Merge {
+                partition: PartitionId::Counter,
+                key: b"counter:retry".to_vec(),
+                operand: crate::engine::merge::encode_counter_delta(1),
+            },
+            Mutation::Operation(OperationCommand::Bind(OperationBinding {
+                op,
+                intent: IntentDigest([7; INTENT_DIGEST_LEN]),
+                attempt,
+            })),
+        ]
+    };
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        let enroll = Mutation::Operation(OperationCommand::Enroll {
+            issuer,
+            incarnation: 1,
+            window: DEFAULT_ADMISSION_WINDOW,
+        });
+        commit_at(&engine, &oracle, &[enroll], Journal::Journal);
+        commit_at(&engine, &oracle, &bound(1), Journal::Memory);
+        commit_at(&engine, &oracle, &bound(2), Journal::Journal);
+        assert!(matches!(
+            crate::engine::operations::operation_outcome(&engine, &op).expect("outcome"),
+            OperationOutcome::Committed { attempt: 1, .. }
+        ));
+        rig.cut(engine);
+    }
+    let (engine, _) = rig.open();
+    assert!(
+        matches!(
+            crate::engine::operations::operation_outcome(&engine, &op).expect("outcome"),
+            OperationOutcome::Committed { attempt: 1, .. }
+        ),
+        "the outcome the journaled retry reported survives"
+    );
+    let counter = engine
+        .get(Partition::Counter, b"counter:retry")
+        .expect("get")
+        .map(|v| crate::engine::merge::decode_counter(&v).expect("decode"))
+        .unwrap_or(0);
+    assert_eq!(counter, 1, "applied once");
+}
+
+/// After a failed sync the journal takes no write and no table flush runs:
+/// a later sync reporting success would not prove the lost pages durable.
+#[test]
+fn a_failed_journal_sync_refuses_every_later_write_and_flush() {
+    let rig = PowerRig::new();
+    let (engine, oracle) = rig.open();
+    commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Memory);
+    {
+        let oplog = engine.oplog.as_ref().expect("journal");
+        let mut journal = oplog.lock().expect("lock");
+        let through = journal.next_index();
+        assert!(
+            journal
+                .note_sync(through, Err(StorageError::Io("injected".into())))
+                .is_err()
+        );
+    }
+    for level in [Journal::Journal, Journal::Cache, Journal::Memory] {
+        assert!(
+            engine
+                .commit_logged(&two_tree_commit("b", 2), oracle.next().as_raw(), level)
+                .is_err(),
+            "{level} write accepted after a failed sync"
+        );
+    }
+    assert!(
+        engine.persist().is_err(),
+        "a table flush ran with the journal not durable"
+    );
+    rig.cut(engine);
 }
 
 #[test]

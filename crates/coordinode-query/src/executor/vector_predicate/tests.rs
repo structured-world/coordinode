@@ -187,8 +187,6 @@ fn evaluate_predicate_via_engine_round_trip() {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx).expect("commit node");
     }

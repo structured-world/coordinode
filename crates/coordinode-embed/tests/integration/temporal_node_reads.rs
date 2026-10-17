@@ -73,8 +73,6 @@ fn seed_version(db: &Database, id: u64, name: &str, valid_from: i64, valid_to: O
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     })
     .expect("commit version");
 }

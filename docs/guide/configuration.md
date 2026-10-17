@@ -126,7 +126,7 @@ the key is unset.
 | `cdc_buffer_bytes` | `67108864` (64 MiB) | restart | Memory for log entries shared by every CDC change stream of the shard. The log is read once for all streams; an entry stays in this buffer until every stream reading from it has passed it. A stream that falls behind more than this reads the gap from the log itself and rejoins the buffer. Retention of the log on disk is unaffected: it still follows the consumers' acknowledgements. |
 | `default_read_concern` | `local` | restart | Read concern of a statement that names none and whose session set none: `local`, `majority`, `linearizable` or `snapshot`. A statement's own setting wins, then its session's, then this. A causal read (one that names an index to wait for) needs `majority` or `snapshot`, so with `local` here every causal read must name its level. |
 | `default_read_preference` | `primary` | restart | Which member serves a read that names no preference and whose session set none: `primary`, `primary_preferred`, `secondary`, `secondary_preferred` or `nearest`. A `primary` read that reaches a follower is forwarded to the leader. |
-| `default_write_concern` | `{ w: majority, journal: journal, timeout_ms: 0 }` | restart | When a write that names no concern, and whose session set none, is acknowledged. `w` is `majority` or a member count, the leader included (`0` answers at once); `journal` is the state each of those members holds the write in: `journal` (fsynced), `cache` (RAM plus the NVMe write cache) or `memory` (RAM). `cache` and `memory` are honoured for `w: 1` only; any other combination with them fails the start. `timeout_ms` bounds the wait for `w` (`0` = none); a write that times out is not rolled back and may still commit. A causal session refuses writes under anything weaker than `w: majority, journal: journal`, including this default. |
+| `default_write_concern` | `{ w: majority, journal: journal, timeout_ms: 0 }` | restart | When a write that names no concern, and whose session set none, is acknowledged. `w` is `majority` or a member count, the leader included (`0` answers at once); `journal` is the state each of those members holds the write's log entry in: `journal` (fsynced), `cache` (handed to the operating system, synced later) or `memory` (in the process, synced later). `cache` and `memory` are honoured for `w: 1` only; any other combination with them fails the start. `timeout_ms` bounds the wait for `w` (`0` = none); a write that times out is not rolled back and may still commit. A causal session refuses writes under anything weaker than `w: majority, journal: journal`, including this default. |
 | `interactive_txn_idle_timeout_secs` | `30` | restart | Idle timeout for an interactive transaction (a `BeginTransaction` left open without commit/rollback), in seconds. An open transaction pins an MVCC snapshot and buffers writes; one idle this long is auto-rolled-back. |
 | `interactive_txn_max_bytes` | `268435456` (256 MiB) | restart | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping leader memory a client can hold without committing. |
 | `autocommit_retry_attempts` | `6` | restart | Runs, in all, of a statement executed without `BEGIN` whose commit is refused for contention, before the conflict is returned. A refused run applied nothing, so the server runs it again from a fresh snapshot. At least `1`; `1` returns the first refusal. Statements of an explicit transaction, ones pinned to a named timestamp and cursor pages always run once. |
@@ -587,28 +587,48 @@ are refused when the file is read.
 
 ### Volatile writes
 
-Writes under the `MEMORY` and `CACHE` journals ([durability](./transactions#durability))
-are accepted into a buffer and reach the log in batches. The settings sit
-under `storage.volatile`; every key is optional and changing one requires a
-restart:
+A write under the `MEMORY` or `CACHE` journal ([durability](./transactions#durability))
+is logged, applied and visible like any other; only its answer does not wait
+for the oplog append to be synced. Two keys set how the journal of a
+standalone node or an embedded database syncs such entries, under
+`storage.oplog` with the other oplog settings (restart to change):
 
 ```yaml
 storage:
-  volatile:
-    drain_interval_ms: 100                 # default
-    drain_batch_max: 10000                 # default
-    drain_buffer_capacity_bytes: 104857600 # 100 MiB, default
-    nvme_write_buffer_path: /var/lib/coordinode/write-buffer   # unset by default
+  oplog:
+    volatile_flush_interval_ms: 100      # default
+    volatile_flush_bytes: 1048576        # default, 1 MiB
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `drain_interval_ms` | `100` | Batching window of the drain: writes accepted together go in one log entry. Shorter puts less accepted data at risk and lands it sooner, at the cost of more, smaller entries. |
-| `drain_batch_max` | `10000` | Mutations per drained log entry at most. A write bound to a client operation, or one with derived index work, is always an entry of its own. |
-| `drain_buffer_capacity_bytes` | `104857600` | What the buffer holds before new volatile writes are refused with `RESOURCE_EXHAUSTED` / `VOLATILE_BUFFER_FULL` (retry after the advised delay). Nothing of a refused write is kept. |
-| `nvme_write_buffer_path` | unset | Directory of the write buffer that keeps `CACHE` writes across a process crash. Without it a `CACHE` write is refused with `FAILED_PRECONDITION` / `WRITE_CONCERN_UNAVAILABLE`, never served as `MEMORY`. On restart a standalone node applies every buffered write the crash left undrained, each once; a cluster member that restarted is no longer the leader it was, and its undrained writes are lost with that leadership. A buffer written by an earlier release, whose entries carry no numbers, stops the node from opening and is kept: move it away to open. |
+| `volatile_flush_interval_ms` | `100` | The interval at which the journal syncs entries written under `MEMORY` or `CACHE`: normally the window of writes a crash can lose. A schedule, not a promise: a slow or failing disk can stretch it. A journaled write syncs every entry before it at once, and so does every flush of a storage table, which never holds a write the journal could still lose. `0` syncs as soon as the journal's flusher wakes. The same default as MongoDB's `journalCommitIntervalMs`. |
+| `volatile_flush_bytes` | `1048576` | Unsynced bytes past which the journal syncs without waiting out the interval. Past sixteen times this, a volatile write syncs the journal itself before it is answered, so the unsynced tail stays bounded however fast writes come. `0` syncs every volatile write. The same default as PostgreSQL's `wal_writer_flush_after`. |
 
-Embedded, the same settings are fields of `StorageConfig`.
+A read under the `local` read concern sees a volatile write as soon as it
+is answered. A read under `majority`, `snapshot` or `linearizable` sees
+only writes a crash cannot take back, on a standalone node too: it reads
+the latest state below the oldest entry not yet synced. It does not wait
+for a sync and does not cause one. A read at a named timestamp that covers
+an unsynced or not yet applied write is refused with `UNAVAILABLE` and
+reason `READ_NOT_READY` rather than kept waiting; the metadata carries the
+latest timestamp readable now.
+
+A crash loses the unsynced tail of the journal as a whole, in log order:
+never part of a write, and never a write whose successor survived. A
+`MEMORY` entry stays in the process until its sync, so a killed process
+loses it; a `CACHE` entry is handed to the operating system first, so only
+a power loss does. A failed sync leaves the journal refusing every later
+write until the store is reopened: after a failed `fsync` the operating
+system may have dropped the unwritten pages, and a later sync could report
+success without them.
+
+On a cluster member the Raft log syncs every batch as it arrives (see the
+oplog above); there `MEMORY` and `CACHE` only answer the writer at the
+leader's append, before that sync, and the write commits once a majority
+holds it synced, as every write does.
+
+Embedded, the setting is the `StorageConfig` field of the same name.
 
 ### Compression
 

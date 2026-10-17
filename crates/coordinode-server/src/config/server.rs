@@ -70,28 +70,6 @@ pub struct StorageTopology {
     /// Block compression of the storage partitions' tables.
     #[serde(default)]
     pub compression: CompressionSettings,
-    /// The drain of writes under the memory and cache write concerns.
-    #[serde(default)]
-    pub volatile: VolatileSettings,
-}
-
-/// The drain of writes accepted under the memory and cache write concerns,
-/// from the config file; an unset key keeps the engine default.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct VolatileSettings {
-    /// Batching window of the drain, in milliseconds (`None` = 100). Shorter
-    /// puts less accepted data at risk and lands it sooner, at the cost of
-    /// more, smaller log entries.
-    pub drain_interval_ms: Option<NonZeroU64>,
-    /// Mutations per drained log entry at most (`None` = 10000).
-    pub drain_batch_max: Option<NonZeroU32>,
-    /// Bytes of accepted writes the drain buffer holds before new ones are
-    /// refused as backpressure (`None` = 100 MiB).
-    pub drain_buffer_capacity_bytes: Option<NonZeroU64>,
-    /// Directory of the write buffer that keeps cache-concern writes across a
-    /// process crash. Without it a cache-concern write is refused.
-    pub nvme_write_buffer_path: Option<std::path::PathBuf>,
 }
 
 /// Block compression of the storage partitions, from the config file; an
@@ -237,6 +215,16 @@ pub struct OplogSettings {
     /// How an append is made durable: `full`, `fsync` or `open_datasync`
     /// (`None` = `full`).
     pub sync_method: Option<SyncMethod>,
+    /// The longest a standalone node's journal leaves an entry written under
+    /// the memory or cache write concern unsynced, in milliseconds: the
+    /// window a crash can lose (`None` = 100, `0` = sync as soon as the
+    /// flusher wakes). A Raft log syncs every batch as it comes; there these
+    /// concerns only answer before the sync.
+    pub volatile_flush_interval_ms: Option<u64>,
+    /// Unsynced volatile bytes past which the journal syncs without waiting
+    /// out the interval; past sixteen times this the writer syncs before it
+    /// is answered (`None` = 1 MiB, `0` = every volatile write syncs).
+    pub volatile_flush_bytes: Option<u64>,
 }
 
 /// The identity a node with peers proves on the inter-node channel, and the
@@ -963,18 +951,11 @@ impl ServerConfig {
         if let Some(sync) = oplog.sync_method {
             cfg.oplog_sync_method = sync;
         }
-        let volatile = &self.storage.volatile;
-        if let Some(ms) = volatile.drain_interval_ms {
-            cfg.drain_interval_ms = ms.get();
+        if let Some(ms) = oplog.volatile_flush_interval_ms {
+            cfg.volatile_flush_interval_ms = ms;
         }
-        if let Some(max) = volatile.drain_batch_max {
-            cfg.drain_batch_max = max.get();
-        }
-        if let Some(bytes) = volatile.drain_buffer_capacity_bytes {
-            cfg.drain_buffer_capacity_bytes = bytes.get();
-        }
-        if let Some(path) = &volatile.nvme_write_buffer_path {
-            cfg.nvme_write_buffer_path = Some(path.clone());
+        if let Some(bytes) = oplog.volatile_flush_bytes {
+            cfg.volatile_flush_bytes = bytes;
         }
         // The MVCC time-travel window is an engine setting: the engine holds
         // its GC watermark back by it on every node, registry or not.

@@ -53,8 +53,6 @@ fn bench_write(engine: &StorageEngine, body: impl FnOnce(&mut Transaction)) {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).unwrap();
 }
@@ -83,8 +81,6 @@ fn bench_node_put(c: &mut Criterion) {
                 write_concern: &wc,
                 pipeline: None,
                 id_gen: None,
-                drain_buffer: None,
-                nvme_write_buffer: None,
             };
             txn.commit(&ctx).unwrap();
             id = id.wrapping_add(1);
@@ -147,8 +143,6 @@ fn bench_edge_put(c: &mut Criterion) {
                 write_concern: &wc,
                 pipeline: None,
                 id_gen: None,
-                drain_buffer: None,
-                nvme_write_buffer: None,
             };
             txn.commit(&ctx).unwrap();
             peer = 2 + (peer - 1) % PEERS;
@@ -181,8 +175,6 @@ fn bench_edge_scan(c: &mut Criterion) {
                 write_concern: &wc,
                 pipeline: None,
                 id_gen: None,
-                drain_buffer: None,
-                nvme_write_buffer: None,
             };
             txn.commit(&ctx).unwrap();
         }
@@ -440,8 +432,6 @@ fn bench_document_set_path(c: &mut Criterion) {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx).unwrap();
     }
@@ -466,8 +456,6 @@ fn bench_document_set_path(c: &mut Criterion) {
                 write_concern: &wc,
                 pipeline: None,
                 id_gen: None,
-                drain_buffer: None,
-                nvme_write_buffer: None,
             };
             txn.commit(&ctx).unwrap();
             i = i.wrapping_add(1);

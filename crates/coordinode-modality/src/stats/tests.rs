@@ -36,8 +36,6 @@ fn commit(txn: &mut Transaction<'_>) {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).unwrap();
 }

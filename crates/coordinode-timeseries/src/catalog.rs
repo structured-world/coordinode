@@ -285,8 +285,6 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx)
             .map_err(|e| CatalogError::Commit(e.to_string()))?;

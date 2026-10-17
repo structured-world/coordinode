@@ -575,8 +575,6 @@ fn a_transaction_across_the_switch_keeps_its_reads_and_conflicts() {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     for (switch, write_while_prepared) in [(false, true), (true, true), (true, false)] {
         let dir = tempfile::tempdir().expect("tempdir");

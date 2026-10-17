@@ -74,8 +74,6 @@ fn make_test_ctx<'a>(
         proposal_id_gen: None,
         read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Local,
         write_concern: coordinode_core::txn::write_concern::WriteConcern::majority(),
-        drain_buffer: None,
-        nvme_write_buffer: None,
         mvcc_snapshot: None,
         cascade_depth: 0,
         cascade_depth_limit: 10,
@@ -172,8 +170,6 @@ fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_i
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit edge");
     register_schema_edge_type(engine, edge_type);
@@ -210,8 +206,6 @@ fn put_node_committed(engine: &StorageEngine, shard: u16, id: u64, record: &Node
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit node");
 }

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use coordinode_core::txn::proposal::{
     ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
 };
+use coordinode_core::txn::write_concern::{Journal, WriteConcern};
 
 use crate::engine::config::FlushPolicy;
 use crate::engine::core::StorageEngine;
@@ -87,18 +88,35 @@ impl ProposalPipeline for LocalProposalPipeline<'_> {
 }
 
 /// Owned form of [`LocalProposalPipeline`] over an `Arc<StorageEngine>`, for
-/// the contexts that need a `'static` pipeline (the database handle, the
-/// drain thread).
+/// the contexts that need a `'static` pipeline (the database handle).
 ///
 /// ## Durability
 ///
 /// An engine opened with a journal (`StorageEngine::open_embedded`) appends
 /// each proposal to its retained journal, applies it at `commit_ts` and marks
 /// the partitions it touched, in one engine call; recovery replays the
-/// journal. An engine without one applies and then, under
-/// [`FlushPolicy::SyncPerBatch`], persists the memtables before returning.
+/// journal. The journal entry is synced before the call returns unless the
+/// write concern's `j` is volatile. An engine without one applies and then,
+/// under [`FlushPolicy::SyncPerBatch`] and `j: journal`, persists the
+/// memtables before returning.
 pub struct OwnedLocalProposalPipeline {
     engine: Arc<StorageEngine>,
+}
+
+impl ProposalPipeline for OwnedLocalProposalPipeline {
+    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
+        self.apply(proposal, Journal::Journal)
+    }
+
+    /// One member, so every `w` is the local apply; `j` decides how far the
+    /// journal entry gets before this returns.
+    fn propose_with_concern(
+        &self,
+        proposal: &RaftProposal,
+        concern: &WriteConcern,
+    ) -> Result<ProposalOutcome, ProposalError> {
+        self.apply(proposal, concern.journal)
+    }
 }
 
 impl OwnedLocalProposalPipeline {
@@ -108,14 +126,17 @@ impl OwnedLocalProposalPipeline {
             engine: Arc::clone(engine),
         }
     }
-}
 
-impl ProposalPipeline for OwnedLocalProposalPipeline {
-    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
+    /// Apply `proposal`, its journal entry taken as far as `level`.
+    fn apply(
+        &self,
+        proposal: &RaftProposal,
+        level: Journal,
+    ) -> Result<ProposalOutcome, ProposalError> {
         if self.engine.has_journal() {
-            // `commit_journaled` checks free space for itself.
+            // `commit_logged` checks free space for itself.
             self.engine
-                .commit_journaled(&proposal.mutations, proposal.commit_ts.as_raw())
+                .commit_logged(&proposal.mutations, proposal.commit_ts.as_raw(), level)
                 .map_err(storage_to_proposal_err)?;
         } else {
             // Refused before the apply and the flush that would hit a full
@@ -129,8 +150,10 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
                 .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
                 .map_err(storage_to_proposal_err)?;
             // Without a journal a flush after every proposal is what makes the
-            // write survive a crash: expensive, but correct.
-            if self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
+            // write survive a crash: expensive, but correct. A volatile level
+            // asked not to wait for it.
+            if level == Journal::Journal && self.engine.flush_policy() == FlushPolicy::SyncPerBatch
+            {
                 self.engine
                     .persist()
                     .map_err(|e| ProposalError::Storage(format!("persist failed: {e}")))?;

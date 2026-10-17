@@ -185,7 +185,7 @@ async fn rate_limiter_bypass_holds_below_majority() {
     let acked = bypass(b"node:1:w1", 200);
     tokio::time::timeout(
         Duration::from_secs(5),
-        pipeline.propose_acks(&acked, 1, &notifier),
+        pipeline.propose_acks(&acked, 1, LogReach::Durable, &notifier),
     )
     .await
     .expect("a w:1 bypass proposal must not wait on the exhausted limiter")
@@ -344,10 +344,10 @@ fn write_concern_timeout_error_display() {
     );
 }
 
-/// The volatile-write drain runs on a plain `std::thread`, where there is no
-/// current tokio runtime. Reaching openraft from there used to panic with
-/// "there is no reactor running", killing the drain thread and, with it, every
-/// `w:memory` and `w:cache` write the server had already acknowledged.
+/// Background workers (the TTL reaper, the NodeId lease worker) propose from
+/// a plain `std::thread`, where there is no current tokio runtime. Reaching
+/// openraft from there used to panic with "there is no reactor running",
+/// killing the worker.
 #[tokio::test(flavor = "multi_thread")]
 async fn propose_and_wait_works_from_a_plain_thread() {
     let (_dir, engine) = test_engine();
@@ -433,4 +433,28 @@ async fn a_retry_below_the_closed_bound_is_not_a_refusal() {
         "a retry below the bound has an unknown outcome: {retry:?}"
     );
     node.shutdown().await.expect("shutdown");
+}
+
+/// An early answer proves where the entry is, not that it committed: the
+/// leader's copy written but not synced counts toward `w`, never toward the
+/// majority that commits it, so such an answer carries no committed index a
+/// caller could wait on or hand out as a causal position.
+#[test]
+fn an_unsynced_leader_copy_does_not_make_a_committed_answer() {
+    use crate::storage::LogReach;
+
+    // One member: the written copy answers w:1, and is not a commit.
+    let alone = acks_outcome(7, 0, 1, 1, LogReach::Written).expect("w:1 is held");
+    assert_eq!(alone.applied_index, None);
+    // Three members, one follower synced: two hold it, but only one durably.
+    let two = acks_outcome(7, 1, 2, 2, LogReach::Written).expect("w:2 is held");
+    assert_eq!(two.applied_index, None);
+    // Two synced followers are a majority without the leader.
+    let followers = acks_outcome(7, 2, 1, 2, LogReach::Written).expect("held");
+    assert_eq!(followers.applied_index, Some(7));
+    // A durable leader copy counts toward the majority as before.
+    let durable = acks_outcome(7, 1, 2, 2, LogReach::Durable).expect("held");
+    assert_eq!(durable.applied_index, Some(7));
+    // Fewer members than w hold it: no answer yet.
+    assert!(acks_outcome(7, 0, 2, 2, LogReach::Durable).is_none());
 }

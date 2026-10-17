@@ -293,8 +293,6 @@ pub fn reap_pass(
         write_concern: &write_concern,
         pipeline: Some(pipeline),
         id_gen: Some(id_gen),
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     Ok(reap_computed_ttl_committed(
         engine,
@@ -314,8 +312,6 @@ fn direct_commit(txn: &mut Transaction<'_>) -> Result<(), CommitError> {
         write_concern: &write_concern,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).map(|_| ())
 }

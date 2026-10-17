@@ -4239,8 +4239,6 @@ async fn cluster_write_concern_w0_vs_majority() {
                 write_concern: &wc,
                 pipeline: Some(&pipeline),
                 id_gen: Some(&id_gen),
-                drain_buffer: None,
-                nvme_write_buffer: None,
             };
             txn.commit(&ctx).expect("w0 commit on the leader");
         }
@@ -4269,14 +4267,15 @@ async fn cluster_write_concern_w0_vs_majority() {
 /// `w:N` counts members, the leader first, and is honoured as asked on a
 /// three-member group.
 ///
-/// `w:1` returns once the leader's own log holds the entry and reports no
-/// applied index (the write is not yet committed); `w:2` is a majority here
-/// and reports the index; `w:3` waits for every member's log; `w:4` is refused
-/// up front because the group has three members. Every write, waited for or
-/// not, reaches both followers' state.
+/// `w:1` returns once the leader's own log holds the entry (synced, or only
+/// written under `j:memory`) and reports no applied index (the write is not
+/// yet committed); `w:2` is a majority here and reports the index; `w:3`
+/// waits for every member's log; `w:4` is refused up front because the group
+/// has three members. Every write, waited for or not, reaches both followers'
+/// state.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_write_concern_acks_counts_members() {
-    use coordinode_core::txn::write_concern::WriteAck;
+    use coordinode_core::txn::write_concern::WriteConcern;
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter("coordinode_raft=info,openraft=off")
@@ -4365,7 +4364,7 @@ async fn cluster_write_concern_acks_counts_members() {
 
         // w:4 on a three-member group is refused before anything is written.
         let too_many = proposal(b"node:0:w4", b"never", 200);
-        let refused = pipeline.propose_with_ack(&too_many, WriteAck::Acks(4), None);
+        let refused = pipeline.propose_with_concern(&too_many, &WriteConcern::acks(4));
         assert!(
             matches!(&refused, Err(ProposalError::InvalidWriteConcern(msg)) if msg.contains("w:4")),
             "w:4 must be refused as an invalid write concern naming it, got {refused:?}"
@@ -4383,7 +4382,7 @@ async fn cluster_write_concern_acks_counts_members() {
         // may, and a write a majority holds reports its index, rightly.
         let leader_only = proposal(b"node:0:w1", b"leader", 201);
         coordinode_raft::cluster::nemesis::block(&[(1, 2), (1, 3)]);
-        let outcome = pipeline.propose_with_ack(&leader_only, WriteAck::Acks(1), None);
+        let outcome = pipeline.propose_with_concern(&leader_only, &WriteConcern::w1());
         coordinode_raft::cluster::nemesis::heal();
         let outcome = outcome.expect("w:1 write");
         assert!(
@@ -4392,10 +4391,21 @@ async fn cluster_write_concern_acks_counts_members() {
              report an applied index: {outcome:?}"
         );
 
+        // w:1, j:memory: answered at the leader's write, the same way.
+        let volatile = proposal(b"node:0:w1-memory", b"volatile", 205);
+        coordinode_raft::cluster::nemesis::block(&[(1, 2), (1, 3)]);
+        let outcome = pipeline.propose_with_concern(&volatile, &WriteConcern::memory());
+        coordinode_raft::cluster::nemesis::heal();
+        let outcome = outcome.expect("w:1 j:memory write");
+        assert!(
+            outcome.applied_index.is_none(),
+            "w:1 j:memory is answered before a majority holds the entry: {outcome:?}"
+        );
+
         // w:2 is a majority of three: committed, index reported.
         let two = proposal(b"node:0:w2", b"two", 202);
         let outcome = pipeline
-            .propose_with_ack(&two, WriteAck::Acks(2), None)
+            .propose_with_concern(&two, &WriteConcern::acks(2))
             .expect("w:2 write");
         assert!(
             outcome.applied_index.is_some(),
@@ -4407,7 +4417,13 @@ async fn cluster_write_concern_acks_counts_members() {
         // member's state follows the commit and is not what w:N waits for.
         let all = proposal(b"node:0:w3", b"three", 203);
         let outcome = pipeline
-            .propose_with_ack(&all, WriteAck::Acks(3), Some(Duration::from_secs(10)))
+            .propose_with_concern(
+                &all,
+                &WriteConcern {
+                    timeout_ms: 10_000,
+                    ..WriteConcern::acks(3)
+                },
+            )
             .expect("w:3 write");
         assert!(
             outcome.applied_index.is_some(),
@@ -4417,6 +4433,7 @@ async fn cluster_write_concern_acks_counts_members() {
         // Whatever was waited for, every write reaches both followers.
         for (key, value) in [
             (&b"node:0:w1"[..], &b"leader"[..]),
+            (b"node:0:w1-memory", b"volatile"),
             (b"node:0:w2", b"two"),
             (b"node:0:w3", b"three"),
         ] {
@@ -4437,8 +4454,13 @@ async fn cluster_write_concern_acks_counts_members() {
         // remaining majority and reaches the surviving follower.
         n3.shutdown().await.expect("s3");
         let short_one = proposal(b"node:0:w3-timeout", b"still-commits", 204);
-        let timed_out =
-            pipeline.propose_with_ack(&short_one, WriteAck::Acks(3), Some(Duration::from_secs(2)));
+        let timed_out = pipeline.propose_with_concern(
+            &short_one,
+            &WriteConcern {
+                timeout_ms: 2_000,
+                ..WriteConcern::acks(3)
+            },
+        );
         assert!(
             matches!(timed_out, Err(ProposalError::WriteConcernTimeout { .. })),
             "w:3 with a member down must time out, got {timed_out:?}"
@@ -5651,8 +5673,6 @@ async fn kept_cardinality_counts_are_the_same_on_every_member() {
             write_concern: &wc,
             pipeline: Some(&pipeline),
             id_gen: Some(&id_gen),
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         let begin = || {
             let snap = n1.engine.snapshot();

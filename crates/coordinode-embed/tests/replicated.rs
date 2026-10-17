@@ -803,11 +803,11 @@ fn label_count(db: &ReplicatedDatabase, label: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// A j:memory write on the leader is accepted, not committed: no member,
-/// the leader included, sees it before its drain, and once drained it is on
-/// every member exactly once, its label count included.
+/// A j:memory write on the leader is answered once the leader's log holds
+/// it, and goes through the group's log like any write: it reaches every
+/// member exactly once, its label count included.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_memory_write_reaches_every_member_once_and_only_after_its_drain() {
+async fn a_memory_write_reaches_every_member_once() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
         let (members, _ports) = group(&dirs, None).await;
@@ -816,15 +816,8 @@ async fn a_memory_write_reaches_every_member_once_and_only_after_its_drain() {
             leader.set_write_concern(WriteConcern::memory());
             leader.execute_cypher("CREATE (:Volatile {k: 1})").unwrap();
         }
-        // The drain waits out its batching window before it proposes.
         for m in &members {
-            assert_eq!(count(m, "Volatile"), 0, "visible before the drain");
-        }
-        for m in &members {
-            wait_until("the drained write reaches the member", || {
-                count(m, "Volatile") == 1
-            })
-            .await;
+            wait_until("the write reaches the member", || count(m, "Volatile") == 1).await;
             assert_eq!(label_count(m, "Volatile"), 1);
         }
 
@@ -836,12 +829,12 @@ async fn a_memory_write_reaches_every_member_once_and_only_after_its_drain() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
-/// The leader loses the group while a j:memory write of a client operation
-/// waits for its drain. The write is lost with that leadership, as the
-/// concern allows, and the operation is resolved, not re-run: the new leader
-/// excludes it, and then no member ever holds its effect. Had the drain won
-/// the race, the operation resolves committed and every member holds the
-/// effect once.
+/// The leader loses the group right after it answered a j:memory write of a
+/// client operation, which no majority may hold yet. If the write is lost
+/// with that leadership, as the concern allows, the operation is resolved,
+/// not re-run: the new leader excludes it, and then no member ever holds its
+/// effect. If a majority got it first, the operation resolves committed and
+/// every member holds the effect once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_memory_write_lost_with_its_leader_is_excluded_not_rerun() {
     use coordinode_embed::db::StatementOptions;
@@ -893,7 +886,7 @@ async fn a_memory_write_lost_with_its_leader_is_excluded_not_rerun() {
             other => panic!("an exclusion answers finally, got {other:?}"),
         };
         // A marker written after the exclusion reaches every member last, so
-        // a late drain of the old leader would have landed before it.
+        // the old leader's entry, had it survived, would have landed before it.
         leader
             .database()
             .write()

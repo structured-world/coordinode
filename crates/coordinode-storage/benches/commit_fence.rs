@@ -101,8 +101,6 @@ fn increment(
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         let started = Instant::now();
         match txn.commit(&ctx) {

@@ -28,8 +28,6 @@ fn definition_txn_round_trip() {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         t.commit(&ctx).expect("commit");
     };

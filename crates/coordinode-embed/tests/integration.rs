@@ -10,7 +10,6 @@ mod integration {
     mod background_workers;
     mod backup_restore;
     mod btree_index;
-    mod cache_recovery;
     mod capacity_tracking;
     mod compound_queries;
     mod computed;
@@ -22,7 +21,6 @@ mod integration {
     mod crud;
     mod cypher;
     mod document;
-    mod drain;
     mod duplicate_repair;
     mod encrypted_search;
     mod field_dictionary;
@@ -61,4 +59,5 @@ mod integration {
     mod validated_extra;
     mod vector_index_build_lifecycle;
     mod vector_index_ddl;
+    mod volatile;
 }

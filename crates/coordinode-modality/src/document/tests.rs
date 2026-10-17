@@ -25,8 +25,6 @@ fn run_committed(engine: &StorageEngine, body: impl FnOnce(&mut Transaction)) {
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit txn");
 }
@@ -602,8 +600,6 @@ fn concurrent_set_path_distinct_keys_converges() {
                     write_concern: &wc,
                     pipeline: None,
                     id_gen: None,
-                    drain_buffer: None,
-                    nvme_write_buffer: None,
                 };
                 loop {
                     let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());

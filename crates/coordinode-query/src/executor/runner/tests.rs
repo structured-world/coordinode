@@ -64,8 +64,6 @@ fn seed_node_record(engine: &StorageEngine, shard_id: u16, node_id: NodeId, reco
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit node");
 }
@@ -253,8 +251,6 @@ fn seed_node_temporal(
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit node");
 }
@@ -406,8 +402,6 @@ fn make_ctx<'a>(
         proposal_id_gen: None,
         read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Local,
         write_concern: coordinode_core::txn::write_concern::WriteConcern::majority(),
-        drain_buffer: None,
-        nvme_write_buffer: None,
         mvcc_snapshot: None,
         // L1/L2 cascade tracking — counters start at zero per originating
         // user mutation; limits match the cluster setting defaults.
@@ -4251,8 +4245,6 @@ fn mvcc_get_edge_props_leaves_no_occ_scope() {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx).expect("commit seed");
     }
@@ -4316,8 +4308,6 @@ fn mvcc_get_edge_props_temporal_tracks_25byte_key_not_short() {
             write_concern: &wc,
             pipeline: None,
             id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.commit(&ctx).expect("commit seed");
     }

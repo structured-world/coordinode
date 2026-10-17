@@ -236,8 +236,6 @@ impl RegistryCore {
             write_concern: &write_concern,
             pipeline: Some(self.pipeline.as_ref()),
             id_gen: Some(&self.id_gen),
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         match txn.commit(&ctx) {
             Ok(_) => Ok(true),

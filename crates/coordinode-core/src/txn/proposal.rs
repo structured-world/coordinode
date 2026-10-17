@@ -669,29 +669,31 @@ pub trait ProposalPipeline: Send + Sync {
         self.propose_and_wait(proposal)
     }
 
-    /// Propose mutations and return once `ack` members hold them.
+    /// Propose mutations and return once the members `concern` asks for hold
+    /// them in the state it asks for.
     ///
-    /// `WriteAck::Majority` is [`propose_and_wait`](Self::propose_and_wait).
-    /// `WriteAck::Acks(0)` returns as soon as the proposal is on its way
-    /// through the leader; `Acks(1)` once the leader's log holds it;
-    /// `Acks(n)` once `n` members do. A `timeout` bounds the wait for the
-    /// acknowledgement, never the write itself.
+    /// `w: majority` is [`propose_and_wait`](Self::propose_and_wait).
+    /// `w: 0` returns as soon as the proposal is on its way through the
+    /// leader; `w: 1` once the leader's log holds it, `w: n` once `n`
+    /// members' logs do. `j` says what "holds" means: synced for `journal`,
+    /// written and not yet synced for `memory` and `cache`. The write itself
+    /// commits and applies the same way under every concern. A nonzero
+    /// `timeout_ms` bounds the wait for the acknowledgement, never the write.
     ///
     /// ## Default implementation
     ///
     /// Applies through [`propose_and_wait`](Self::propose_and_wait) /
     /// [`propose_with_timeout`](Self::propose_with_timeout): a local pipeline
-    /// has one member, so every `ack` is satisfied by the local apply.
-    fn propose_with_ack(
+    /// has one member, so every `w` is satisfied by the local apply, and the
+    /// apply is durable.
+    fn propose_with_concern(
         &self,
         proposal: &RaftProposal,
-        ack: crate::txn::write_concern::WriteAck,
-        timeout: Option<std::time::Duration>,
+        concern: &crate::txn::write_concern::WriteConcern,
     ) -> Result<ProposalOutcome, ProposalError> {
-        let _ = ack;
-        match timeout {
-            Some(t) => self.propose_with_timeout(proposal, t),
-            None => self.propose_and_wait(proposal),
+        match concern.timeout_ms {
+            0 => self.propose_and_wait(proposal),
+            ms => self.propose_with_timeout(proposal, std::time::Duration::from_millis(ms.into())),
         }
     }
 }

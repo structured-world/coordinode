@@ -5,19 +5,20 @@
 //! - [`WriteAck`] (`w`): how many members must hold the write before the
 //!   caller is answered. A number is always a count of members, the leader
 //!   included; [`WriteAck::Majority`] is a rule, not a count.
-//! - [`Journal`] (`j`): the state each of those members holds the write in
-//!   when it counts: fsynced in its journal, in RAM plus the NVMe write cache,
-//!   or in RAM alone.
+//! - [`Journal`] (`j`): the state each of those members holds the write's
+//!   log entry in when it counts: synced, handed to the operating system, or
+//!   in process memory.
 //!
 //! Neither axis expresses the other, and nothing is silently rewritten
 //! between them. `w: 0` is answered at once whatever `j` says.
 //!
-//! A write concern decides when the caller is answered, never whether the
-//! write is replicated: every write enters the group's log through the leader
-//! and is applied on every member. The volatile journal levels ([`Journal::Memory`],
-//! [`Journal::Cache`]) keep the write in a separate overlay until the drain
-//! proposes it; a crash before the drain loses it, which is the contract the
-//! caller accepted.
+//! A write concern decides when the caller is answered, never whether or how
+//! the write is applied: every write enters the group's log through the
+//! leader and is applied on every member. The volatile journal levels
+//! ([`Journal::Memory`], [`Journal::Cache`]) answer before the log entry is
+//! synced, as MongoDB's `j: false` does; the write is committed and visible
+//! all the same, and a crash before the sync loses it with the rest of the
+//! unsynced tail, which is the contract the caller accepted.
 
 /// How many members must hold the write before the caller is answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -57,16 +58,17 @@ pub enum Journal {
     /// Fsynced in the member's journal (MongoDB `j: true`). The default.
     #[default]
     Journal,
-    /// In RAM plus the member's NVMe write cache, drained to the log later.
-    /// Survives a process crash, not a power failure before the drain.
+    /// Written to the member's journal and handed to the operating system,
+    /// synced later. Survives a process crash, not a power failure before
+    /// the sync.
     Cache,
-    /// In RAM only, drained to the log later (MongoDB `j: false`). Lost on
-    /// process crash before the drain.
+    /// Appended to the member's journal in process memory, synced later
+    /// (MongoDB `j: false`). Lost on a process crash before the sync.
     Memory,
 }
 
 impl Journal {
-    /// Whether the write may be answered before it is in the log.
+    /// Whether the write may be answered before its log entry is synced.
     pub fn is_volatile(&self) -> bool {
         !matches!(self, Self::Journal)
     }
@@ -83,8 +85,8 @@ pub enum WriteConcernError {
         /// The group's member count.
         members: u32,
     },
-    /// A volatile journal level with more than one acknowledging member: the
-    /// log store acknowledges an append only after the batch fsync, so no
+    /// A volatile journal level with more than one acknowledging member: a
+    /// follower acknowledges an append only after its batch fsync, so no
     /// member but the leader can hold a write "in memory" for the caller.
     #[error(
         "write concern {0} is not supported: a journal level below `journal` \
@@ -135,7 +137,8 @@ impl WriteConcern {
         Self::default()
     }
 
-    /// `w: 1, j: memory`: the leader holds the write in RAM, drained later.
+    /// `w: 1, j: memory`: the leader holds the write's log entry in process
+    /// memory, synced later.
     pub fn memory() -> Self {
         Self {
             w: WriteAck::LEADER,
@@ -144,8 +147,8 @@ impl WriteConcern {
         }
     }
 
-    /// `w: 1, j: cache`: the leader holds the write in RAM and its NVMe write
-    /// cache, drained later.
+    /// `w: 1, j: cache`: the leader holds the write's log entry handed to the
+    /// operating system, synced later.
     pub fn cache() -> Self {
         Self {
             w: WriteAck::LEADER,
@@ -162,10 +165,9 @@ impl WriteConcern {
         }
     }
 
-    /// Whether the write is answered before it is in the log and kept in the
-    /// volatile overlay until the drain: a volatile journal level, and a caller
-    /// that waits for something (`w: 0` takes the ordinary log path and is
-    /// simply not waited for).
+    /// Whether the write is answered before its log entry is synced: a
+    /// volatile journal level, and a caller that waits for something (`w: 0`
+    /// is simply not waited for).
     pub fn is_volatile(&self) -> bool {
         self.journal.is_volatile() && !self.w.is_fire_and_forget()
     }

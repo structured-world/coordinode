@@ -285,43 +285,106 @@ pub fn rebuild_partition_from_checkpoint(
 
 // ── Log Store ─────────────────────────────────────────────────
 
-/// Tells a waiting writer at which log index its proposal became durable in
-/// this member's log.
+/// Tells a waiting writer at which log index its proposal reached this
+/// member's log: written, or durable.
 ///
-/// The proposal pipeline subscribes by proposal id before it submits; the
-/// log's sync thread fires once the batch holding the proposal is durable.
-/// This is what a write concern of `w:1` waits for, and what `w:N` counts
-/// from: the leader's own copy is the first of the N.
+/// The proposal pipeline subscribes by proposal id before it submits. The log
+/// store fires a [`LogReach::Written`] waiter once the batch holding the
+/// proposal is handed to the operating system, and the log's sync thread
+/// fires every remaining waiter once the batch is durable. This is what a
+/// write concern of `w:1` waits for (written for a volatile `j`, durable for
+/// `j: journal`), and what `w:N` counts from: the leader's own copy is the
+/// first of the N.
 #[derive(Default)]
 pub struct AppendNotifier {
-    waiters: Mutex<
-        HashMap<coordinode_core::txn::proposal::ProposalId, tokio::sync::oneshot::Sender<u64>>,
-    >,
+    waiters: Mutex<HashMap<coordinode_core::txn::proposal::ProposalId, Waiter>>,
+    /// Waiters subscribed for [`LogReach::Written`], so an append with none
+    /// skips the lookup. Counts registrations, so it can only overstate.
+    written: std::sync::atomic::AtomicUsize,
+}
+
+/// How far a proposal must reach this member's log before its waiter fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogReach {
+    /// Handed to the operating system, not yet synced: a volatile `j`.
+    Written,
+    /// Synced: `j: journal`.
+    Durable,
+}
+
+struct Waiter {
+    tx: tokio::sync::oneshot::Sender<u64>,
+    reach: LogReach,
 }
 
 impl AppendNotifier {
-    /// Wait for `id` to be durable in this member's log; resolves to its
-    /// log index. Subscribe before submitting the proposal, or the append may
-    /// fire first and the receiver never resolves.
+    /// Wait for `id` to reach this member's log as far as `reach`; resolves
+    /// to its log index. Subscribe before submitting the proposal, or the
+    /// append may fire first and the receiver never resolves.
     pub fn subscribe(
         &self,
         id: coordinode_core::txn::proposal::ProposalId,
+        reach: LogReach,
     ) -> tokio::sync::oneshot::Receiver<u64> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Ok(mut waiters) = self.waiters.lock() {
-            waiters.insert(id, tx);
+            if reach == LogReach::Written {
+                self.written
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            waiters.insert(id, Waiter { tx, reach });
         }
         rx
     }
 
+    /// `proposals` were written to the log: answer the waiters that asked
+    /// for no more.
+    pub(crate) fn notify_written(
+        &self,
+        proposals: &[(coordinode_core::txn::proposal::ProposalId, u64)],
+    ) {
+        if self.written.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return;
+        }
+        let Ok(mut waiters) = self.waiters.lock() else {
+            return;
+        };
+        for &(id, index) in proposals {
+            if waiters
+                .get(&id)
+                .is_some_and(|w| w.reach == LogReach::Written)
+            {
+                if let Some(waiter) = waiters.remove(&id) {
+                    self.written
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    waiter.answer(index);
+                }
+            }
+        }
+    }
+
+    /// `id` is durable in the log at `index`: answer its waiter, whatever it
+    /// asked for.
     pub(crate) fn notify(&self, id: coordinode_core::txn::proposal::ProposalId, index: u64) {
         let waiter = match self.waiters.lock() {
             Ok(mut waiters) => waiters.remove(&id),
             Err(_) => None,
         };
-        if let Some(tx) = waiter {
-            // A receiver that gave up (timeout) is not an error here.
-            let _ = tx.send(index);
+        if let Some(waiter) = waiter {
+            if waiter.reach == LogReach::Written {
+                self.written
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            waiter.answer(index);
+        }
+    }
+}
+
+impl Waiter {
+    fn answer(self, index: u64) {
+        if self.tx.send(index).is_err() {
+            // The writer stopped waiting (its write concern timed out).
+            tracing::trace!(index, "append notified after its waiter gave up");
         }
     }
 }
@@ -984,6 +1047,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                 .lock()
                 .map_err(|_| io::Error::other("last_log_id mutex poisoned"))? = Some(log_id);
         }
+        // A writer under a volatile `j` is answered now, at the write; the
+        // commit still waits for the sync below, as every commit does.
+        self.append_notifier.notify_written(&appended);
         self.sync.submit(
             handle,
             crate::log_sync::Append {

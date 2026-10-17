@@ -310,8 +310,8 @@ pub struct Database {
     /// MVCC timestamp oracle — allocates monotonic timestamps for
     /// snapshot isolation reads and commit ordering.
     oracle: Arc<TimestampOracle>,
-    /// Proposal ID generator for the Raft proposal pipeline.
-    /// Arc-shared with the drain thread's pipeline.
+    /// Proposal ID generator for the Raft proposal pipeline, shared with the
+    /// background workers that propose through it.
     proposal_id_gen: Arc<ProposalIdGenerator>,
     /// The write pipeline every mutation must flow through. In embedded
     /// mode this is a local pipeline applying straight to the engine; in
@@ -393,16 +393,6 @@ pub struct Database {
     /// Feedback cache for known super-node fan-out degrees.
     /// Shared across queries within the same Database session via Arc.
     feedback_cache: FeedbackCache,
-    /// Volatile write drain buffer for w:memory and w:cache write concerns.
-    /// Shared between all ExecutionContext instances. The background drain
-    /// thread batches buffered mutations into proposal pipeline calls.
-    drain_buffer: Arc<coordinode_core::txn::drain::DrainBuffer>,
-    /// NVMe-backed write buffer for `w:cache` crash recovery.
-    /// `None` when `nvme_write_buffer_path` is not configured in `StorageConfig`.
-    nvme_write_buffer: Option<Arc<coordinode_storage::cache::write_buffer::NvmeWriteBuffer>>,
-    /// Handle to the background drain thread. Dropped on Database::drop,
-    /// which flushes remaining entries (graceful shutdown).
-    _drain_handle: coordinode_core::txn::drain::DrainHandle,
     /// Handle to the COMPUTED TTL background reaper thread. Scans label
     /// schemas for TTL properties and deletes expired nodes/fields/subtrees.
     /// Dropped on Database::drop (graceful shutdown).
@@ -820,6 +810,27 @@ pub enum DatabaseError {
         oldest_readable: u64,
     },
 
+    /// A snapshot read (`ReadConcern.at_timestamp`) whose timestamp covers a
+    /// commit not yet applied, or not yet durable in the store's journal. The
+    /// read does not wait for it and is not answered at another timestamp:
+    /// nothing was read. The same read succeeds once the commits it covers
+    /// have landed, usually within the journal's flush interval; a read at
+    /// `ready_through` or earlier is answerable now.
+    #[error(
+        "snapshot timestamp {requested} is not ready: a commit it covers has not \
+         landed or is not durable yet{}",
+        match ready_through {
+            Some(ts) => format!("; readable through timestamp {ts} now"),
+            None => String::new(),
+        }
+    )]
+    ReadNotReady {
+        /// The timestamp the read asked for.
+        requested: u64,
+        /// The latest timestamp a read is answerable at now, when there is one.
+        ready_through: Option<u64>,
+    },
+
     /// The client operation a write carries out already stands as
     /// `outcome`, or cannot be admitted: this attempt ran or applied nothing.
     /// A committed outcome is the operation's answer, reached by an earlier
@@ -944,7 +955,7 @@ impl Database {
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
         // Embedded: HNSW updated inline, no oplog-tailing worker.
-        Self::finish_open(&path, config, oracle, engine, pipeline, false)
+        Self::finish_open(&path, oracle, engine, pipeline, false)
     }
 
     /// Open an in-memory database backed by `lsm_tree::fs::MemFs`.
@@ -983,37 +994,17 @@ impl Database {
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
         // Embedded in-memory: HNSW updated inline, no oplog-tailing worker.
-        Self::finish_open(&virtual_path, config, oracle, engine, pipeline, false)
+        Self::finish_open(&virtual_path, oracle, engine, pipeline, false)
     }
 
     /// Initialize a database from pre-opened engine, oracle, and pipeline.
     ///
     /// Used by the server binary in cluster mode: the server creates
     /// a shared `StorageEngine` + `TimestampOracle` for the `RaftNode`, then
-    /// passes the same engine + a `RaftProposalPipeline` here. The DrainBuffer
-    /// and TTL reaper submit mutations through Raft for replication.
+    /// passes the same engine + a `RaftProposalPipeline` here. The TTL reaper
+    /// submits mutations through Raft for replication.
     pub fn from_engine(
         path: impl AsRef<Path>,
-        engine: Arc<StorageEngine>,
-        oracle: Arc<TimestampOracle>,
-        pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
-    ) -> Result<Self, DatabaseError> {
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            path.as_ref(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        Self::from_engine_with_config(config, engine, oracle, pipeline)
-    }
-
-    /// [`Self::from_engine`] under the storage configuration the engine was
-    /// opened with, so the database takes its settings from it (the drain of
-    /// volatile writes and their write buffer among them) instead of the
-    /// defaults.
-    pub fn from_engine_with_config(
-        config: StorageConfig,
         engine: Arc<StorageEngine>,
         oracle: Arc<TimestampOracle>,
         pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
@@ -1030,10 +1021,9 @@ impl Database {
                     .to_string(),
             ));
         }
-        let path = config.data_dir().to_path_buf();
         // Cluster mode (RaftProposalPipeline): the state machine applies writes,
         // so the oplog-tailing worker maintains HNSW (no inline index path).
-        Self::finish_open(&path, config, oracle, engine, pipeline, true)
+        Self::finish_open(path.as_ref(), oracle, engine, pipeline, true)
     }
 
     /// Create a checkpoint (repair base + oplog copy) under
@@ -1078,7 +1068,6 @@ impl Database {
     /// Shared initialization logic for both `open()` and `open_with_pipeline()`.
     fn finish_open(
         path: &Path,
-        config: StorageConfig,
         oracle: Arc<TimestampOracle>,
         engine: Arc<StorageEngine>,
         pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
@@ -1247,66 +1236,6 @@ impl Database {
         .map_err(|e| DatabaseError::Other(format!("start the NodeId lease worker: {e}")))?;
         let allocator = NodeIdAllocator::leased(0, Arc::new(reserver));
 
-        // Create drain buffer and background drain thread for volatile writes.
-        // The pipeline is either OwnedLocalProposalPipeline (embedded) or
-        // RaftProposalPipeline (cluster mode, via open_with_pipeline).
-        let drain_config = coordinode_core::txn::drain::DrainConfig {
-            interval_ms: config.drain_interval_ms,
-            batch_max: config.drain_batch_max,
-            capacity_bytes: config.drain_buffer_capacity_bytes,
-        };
-        let drain_buffer = Arc::new(coordinode_core::txn::drain::DrainBuffer::new(
-            drain_config.capacity_bytes,
-        ));
-
-        // Open the NVMe write buffer for w:cache crash recovery (if configured).
-        // What a previous process accepted and did not drain is dealt with
-        // first, before anything is served: nothing can write in between.
-        let nvme_write_buffer = if let Some(ref nvme_path) = config.nvme_write_buffer_path {
-            use coordinode_storage::cache::write_buffer::NvmeWriteBuffer;
-            let recovered = NvmeWriteBuffer::recover(nvme_path).map_err(|e| {
-                DatabaseError::Other(format!("NVMe write buffer recovery refused: {e}"))
-            })?;
-            if let Some(buffer) = recovered {
-                if follow_raft_applies {
-                    // A member that restarted is not the leader it was: under
-                    // a cache concern, what it had not drained is lost with
-                    // its leadership. An entry bound to a client operation
-                    // stays admitted until the host resolves it.
-                    tracing::warn!(
-                        entries = buffer.entries.len(),
-                        "w:cache writes not drained before the restart are lost with leadership"
-                    );
-                } else {
-                    replay_cache_buffer(
-                        &engine,
-                        &oracle,
-                        pipeline.as_ref(),
-                        &proposal_id_gen,
-                        buffer,
-                    )?;
-                }
-                NvmeWriteBuffer::discard(nvme_path).map_err(|e| {
-                    DatabaseError::Other(format!("NVMe write buffer cleanup failed: {e}"))
-                })?;
-            }
-            let wb = NvmeWriteBuffer::open(nvme_path, oracle.next().as_raw())
-                .map_err(|e| DatabaseError::Other(format!("NVMe write buffer open failed: {e}")))?;
-            Some(Arc::new(wb))
-        } else {
-            None
-        };
-
-        let drain_handle = coordinode_core::txn::drain::DrainHandle::start(
-            Arc::clone(&drain_buffer),
-            Arc::clone(&pipeline),
-            Arc::clone(&proposal_id_gen),
-            drain_config,
-            nvme_write_buffer
-                .as_ref()
-                .map(|wb| Arc::clone(wb) as Arc<dyn coordinode_core::txn::drain::WriteBufferHook>),
-        );
-
         // Start COMPUTED TTL background reaper (default: 60s interval, 1000 batch).
         let ttl_reaper_config = coordinode_query::index::ttl_reaper::TtlReaperConfig::default();
         let ttl_reaper_handle = if ttl_reaper_config.enabled {
@@ -1362,9 +1291,6 @@ impl Database {
             procedure_registry: ProcedureRegistry::with_builtins(),
             adaptive_config: AdaptiveConfig::default(),
             feedback_cache: FeedbackCache::default(),
-            drain_buffer,
-            nvme_write_buffer,
-            _drain_handle: drain_handle,
             _ttl_reaper_handle: ttl_reaper_handle,
             cluster_mode: follow_raft_applies,
             trigger_dispatch_config: after_commit::TriggerDispatchConfig::default(),
@@ -1993,11 +1919,23 @@ impl Database {
     /// allocated. The pin goes into `hold`, which the caller keeps for the
     /// statement; pinned later, at the first read, the watermark can already
     /// have passed it and the read would be refused.
+    ///
+    /// A read concern that must not see a write a crash can still take back
+    /// (`majority`, `snapshot`, `linearizable`) reads the durable view below
+    /// it: chosen from what is in memory, with no sync and no wait.
     fn fresh_pinned_read_ts(
         &self,
         hold: &mut Option<coordinode_storage::engine::coordinator::SnapshotPin>,
+        durable: bool,
     ) -> Timestamp {
-        let (seqno, pin) = self.engine.pin_new_snapshot(|| self.oracle.next().as_raw());
+        let (seqno, pin) = self.engine.pin_new_snapshot(|| {
+            let fresh = self.oracle.next().as_raw();
+            if durable {
+                self.engine.durable_view(fresh)
+            } else {
+                fresh
+            }
+        });
         *hold = pin;
         Timestamp::from_raw(seqno)
     }
@@ -2020,12 +1958,22 @@ impl Database {
         // allocated: a fresh number from the clock can already cover a commit
         // that has not applied, and a transaction starting there would see
         // neither that write nor any sign of it. `read_ts` stays the
-        // allocated value because it identifies this attempt.
-        let mut txn = coordinode_storage::engine::transaction::Transaction::begin(
-            &self.engine,
-            Some(&self.oracle),
-            read_ts,
-        );
+        // allocated value because it identifies this attempt. A read concern
+        // that must not see a write a crash can still take back reads the
+        // durable view.
+        let mut txn = if self.read_concern.is_durable() {
+            coordinode_storage::engine::transaction::Transaction::begin_durable(
+                &self.engine,
+                Some(&self.oracle),
+                read_ts,
+            )
+        } else {
+            coordinode_storage::engine::transaction::Transaction::begin(
+                &self.engine,
+                Some(&self.oracle),
+                read_ts,
+            )
+        };
         let state = txn.take_state();
         self.interactive_txns
             .lock()
@@ -2208,8 +2156,6 @@ impl Database {
             write_concern: &wc,
             pipeline: Some(self.pipeline.as_ref()),
             id_gen: Some(&self.proposal_id_gen),
-            drain_buffer: Some(&self.drain_buffer),
-            nvme_write_buffer: self.nvme_write_buffer.as_deref(),
         };
         // Split by variant, because the three failures call for opposite
         // reactions. Only an OCC conflict is worth retrying: the read-set was
@@ -2230,21 +2176,6 @@ impl Database {
             // Retryable like a conflict, but with a delay: the engine sheds
             // writes until compaction drains its debt.
             CommitError::Backpressure => DatabaseError::WriteBackpressure,
-            // The concern cannot be served here; carried in the executor's
-            // spelling, which every layer above already reads.
-            CommitError::ConcernUnavailable(why) => DatabaseError::Execution(
-                coordinode_query::executor::runner::ExecutionError::ConcernUnavailable(why),
-            ),
-            // Retryable once the drain makes room.
-            CommitError::VolatileBufferFull {
-                used_bytes,
-                capacity_bytes,
-            } => DatabaseError::Execution(
-                coordinode_query::executor::runner::ExecutionError::VolatileBufferFull {
-                    used_bytes,
-                    capacity_bytes,
-                },
-            ),
             // Retryable at a different address: the leader.
             CommitError::NotLeader { leader_id } => DatabaseError::NotLeader { leader_id },
             // Retryable at the leader, or here once this member is updated.
@@ -2612,14 +2543,6 @@ impl Database {
         self.operation_admission_window = window;
     }
 
-    /// Bytes of writes accepted under a memory or cache concern and not yet
-    /// handed to the log. Writes are refused once it reaches the configured
-    /// `drain_buffer_capacity_bytes`, so a host watching it sees the pressure
-    /// before it refuses anything.
-    pub fn volatile_buffered_bytes(&self) -> u64 {
-        self.drain_buffer.used_bytes()
-    }
-
     /// The admission window [`Self::enroll_issuer`] gives a new incarnation.
     pub fn operation_admission_window(&self) -> core::num::NonZeroU64 {
         self.operation_admission_window
@@ -2866,8 +2789,19 @@ impl Database {
         resume: Option<Vec<u8>>,
         limit: usize,
     ) -> Result<PagedCypherResult, DatabaseError> {
-        // Pin the snapshot once; later pages re-pin to the same timestamp.
-        let pinned = read_ts.unwrap_or_else(|| self.oracle.next().as_raw());
+        // Pin the snapshot once; later pages re-pin to the same timestamp. A
+        // new cursor chooses the latest view that is complete and durable
+        // rather than naming a fresh timestamp, which a commit in flight or
+        // an unsynced write below it would refuse. A view at S holds what is
+        // stamped below S, and a timestamp names what it covers, so the
+        // cursor's timestamp is S - 1. Saturating by design: a store with
+        // nothing in it has S = 0, and timestamp 0, never assigned to a
+        // commit, reads nothing too.
+        let pinned = read_ts.unwrap_or_else(|| {
+            self.engine
+                .durable_view(self.engine.snapshot())
+                .saturating_sub(1)
+        });
         let session = QuerySession {
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Snapshot,
             snapshot_read_ts: Some(pinned),
@@ -3135,11 +3069,11 @@ impl Database {
             // ProposalPipeline at commit_ts.
             //
             // Read concern affects snapshot selection:
-            // - Local/Majority/Linearizable: use oracle.next() (latest applied)
-            //   In embedded single-node mode, these are equivalent since there's
-            //   no replication lag. In cluster mode (coordinode-server), Majority
-            //   and Linearizable use Raft commit_index / lease check.
-            // - Snapshot with at_timestamp: pin to explicit MVCC timestamp.
+            // - Local: the latest applied state, volatile writes included.
+            // - Majority/Linearizable/Snapshot: the latest state a crash
+            //   cannot take back, below the oldest unsynced journal entry.
+            // - Snapshot with at_timestamp: that timestamp, or refused as not
+            //   ready while a write it covers is in flight or unsynced.
             use coordinode_core::txn::read_concern::ReadConcernLevel;
             // GC-watermark pin for an explicit historical snapshot, held for the
             // statement so compaction cannot collect the history it reads.
@@ -3165,22 +3099,19 @@ impl Database {
                         // to include, so the top snapshot is the right bound, not
                         // an overflow.
                         let seqno = ts.saturating_add(1);
-                        // A named timestamp is preserved, not lowered, so the
-                        // only way to make it complete is to let the commits
-                        // under it land. Answering before they do would read a
-                        // state missing a write the caller's own timestamp
-                        // covers; answering at another timestamp would silently
-                        // give them a different read than the one they asked for.
-                        if let Err(blocking) = self
-                            .engine
-                            .pending_commits()
-                            .await_complete_at(ts, READ_TIMEOUT)
-                        {
-                            return Err(DatabaseError::Other(format!(
-                                "read at timestamp {ts} timed out waiting for the commit at \
-                             {blocking} to land; it is covered by this timestamp and the \
-                             read cannot be answered without it"
-                            )));
+                        // A named timestamp is preserved, not lowered, and the
+                        // read does not wait: it is answered when every commit
+                        // it covers has landed and is durable, and refused as
+                        // not ready otherwise. Answering earlier would read a
+                        // state missing a write the timestamp covers, or one a
+                        // crash can still take back; answering at another
+                        // timestamp would give a different read than asked for.
+                        let ready_below = self.engine.pending_commits().durable_floor(seqno);
+                        if ready_below < seqno {
+                            return Err(DatabaseError::ReadNotReady {
+                                requested: ts,
+                                ready_through: ready_below.checked_sub(1),
+                            });
                         }
                         // Refused when the seqno is already below the GC
                         // watermark: that history may be collected, and a read
@@ -3205,10 +3136,12 @@ impl Database {
                         named_read_ts = Some(i64::try_from(ts).unwrap_or(i64::MAX));
                         Timestamp::from_raw(seqno)
                     } else {
-                        self.fresh_pinned_read_ts(&mut retention_pin)
+                        self.fresh_pinned_read_ts(&mut retention_pin, true)
                     }
                 }
-                TxnMode::AutoCommit => self.fresh_pinned_read_ts(&mut retention_pin),
+                TxnMode::AutoCommit => {
+                    self.fresh_pinned_read_ts(&mut retention_pin, session.read_concern.is_durable())
+                }
             };
             let _retention_pin = retention_pin.take();
             // Build the transaction up front: a fresh one for auto-commit, or
@@ -3309,8 +3242,6 @@ impl Database {
                 proposal_id_gen: Some(&self.proposal_id_gen),
                 read_concern: session.read_concern,
                 write_concern: session.write_concern,
-                drain_buffer: Some(&self.drain_buffer),
-                nvme_write_buffer: self.nvme_write_buffer.as_deref(),
                 mvcc_snapshot: None,
                 // Cascade tracking — cluster defaults for trigger cycle protection.
                 cascade_depth: 0,
@@ -3726,8 +3657,6 @@ impl Database {
             write_concern: &wc,
             pipeline: Some(self.pipeline.as_ref()),
             id_gen: Some(&self.proposal_id_gen),
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         txn.note_schema_change();
         txn.commit(&commit_ctx)
@@ -4104,8 +4033,6 @@ impl Database {
             write_concern: &wc,
             pipeline: Some(self.pipeline.as_ref()),
             id_gen: Some(&self.proposal_id_gen),
-            drain_buffer: None,
-            nvme_write_buffer: None,
         };
         match txn.commit(&commit_ctx) {
             Ok(_) => Ok(()),
@@ -4380,8 +4307,6 @@ fn query_memory_limit_from_mib(text: &str) -> Result<u64, SessionSettingRefused>
 }
 
 mod after_commit;
-mod cache_recovery;
-use cache_recovery::replay_cache_buffer;
 mod catalog;
 mod client_ops;
 mod fields;

@@ -34,8 +34,6 @@ fn seed_node_record(engine: &StorageEngine, shard: u16, id: NodeId, record: &Nod
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit node");
 }

@@ -378,7 +378,7 @@ impl StorageEngine {
     pub fn capture_partition(&self, partition: Partition, target: &Path) -> StorageResult<()> {
         claim_checkpoint_dir(target)?;
         let tree = self.tree(partition)?;
-        tree.flush_active_memtable(0)?;
+        self.flush_memtables(tree)?;
         tree.create_checkpoint(&target.join(partition.name()))
             .map_err(|e| {
                 StorageError::Io(format!("capture partition {}: {e}", partition.name()))
@@ -689,7 +689,7 @@ impl StorageEngine {
             coverage::write_fold(tree, Domain::Raft, 0, next, payload, at);
         }
         for tree in self.coordinator.trees().values() {
-            tree.flush_active_memtable(0)?;
+            self.flush_memtables(tree)?;
         }
         // A snapshot now stands in the store in place of whatever the
         // applies had built: followers of the applies read it afresh.
@@ -712,7 +712,7 @@ impl StorageEngine {
             .resume_point()
             .map_or(0, |(next, _)| next);
         for tree in self.coordinator.trees().values() {
-            tree.flush_active_memtable(0)?;
+            self.flush_memtables(tree)?;
         }
         // A rebuild from the latest checkpoint replays the log from what its
         // trees lack, so the log keeps that too.

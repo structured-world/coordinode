@@ -23,8 +23,6 @@ fn write_blob(engine: &StorageEngine, body: impl FnOnce(&LocalBlobStore, &mut Tr
         write_concern: &wc,
         pipeline: None,
         id_gen: None,
-        drain_buffer: None,
-        nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit blob");
 }

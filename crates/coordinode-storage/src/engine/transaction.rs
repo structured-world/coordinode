@@ -26,7 +26,6 @@
 use std::collections::HashMap;
 
 use coordinode_core::graph::edge::PostingList;
-use coordinode_core::txn::drain::{DrainBuffer, DrainEntry};
 use coordinode_core::txn::invariant::{Claim, ClaimSet};
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
@@ -34,7 +33,6 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::{Journal, WriteConcern};
 
-use crate::cache::write_buffer::NvmeWriteBuffer;
 use crate::engine::StorageSnapshot;
 use crate::engine::coordinator::{MultiModalCoordinator, OccScope, SnapshotPin};
 use crate::engine::core::StorageEngine;
@@ -54,15 +52,11 @@ pub struct CommitContext<'b> {
     /// Write concern: how many members hold the write (`w`) and in what state
     /// (`journal`) before the caller is answered.
     pub write_concern: &'b WriteConcern,
-    /// Raft proposal pipeline for durable application. `None` in
-    /// legacy / embedded single-node mode (writes go straight to the engine).
+    /// Raft proposal pipeline for durable application. `None` when writes go
+    /// straight to the engine.
     pub pipeline: Option<&'b dyn ProposalPipeline>,
     /// Monotonic proposal-id source, paired with `pipeline`.
     pub id_gen: Option<&'b ProposalIdGenerator>,
-    /// Volatile-durability drain buffer for background Raft replication.
-    pub drain_buffer: Option<&'b DrainBuffer>,
-    /// NVMe persistence buffer for `w:cache` pre-ACK durability.
-    pub nvme_write_buffer: Option<&'b NvmeWriteBuffer>,
 }
 
 /// Result of a successful [`Transaction::commit`].
@@ -99,25 +93,6 @@ pub enum CommitError {
          retry after compaction catches up"
     )]
     Backpressure,
-    /// This node cannot serve the write concern the commit asked for: a
-    /// memory or cache concern with no drain, a cache concern with no write
-    /// buffer configured, or a schema change under either. Nothing was
-    /// applied; the same commit is refused again until that changes, and it
-    /// is never served under another concern instead.
-    #[error("write concern unavailable: {0}; nothing was applied")]
-    ConcernUnavailable(String),
-    /// The buffer of writes accepted under a memory or cache concern and not
-    /// drained yet is full. Nothing was applied; retry once it drains.
-    #[error(
-        "volatile write buffer full: {used_bytes} of {capacity_bytes} bytes; \
-         nothing was applied, retry once it drains"
-    )]
-    VolatileBufferFull {
-        /// Bytes the buffer holds.
-        used_bytes: u64,
-        /// Bytes it holds at most.
-        capacity_bytes: u64,
-    },
     /// This node is not the leader, so it cannot replicate the write. Nothing
     /// was applied. `leader_id` is the node the cluster last named leader, when
     /// one is known: an election in flight leaves it `None` for a moment.
@@ -595,6 +570,18 @@ impl<'a> Transaction<'a> {
         Self::with_pin(engine, oracle, read_ts, Some(snapshot), pin)
     }
 
+    /// [`Self::begin`] reading a view that holds only durable effects
+    /// ([`StorageEngine::durable_view`]), for a transaction under a read
+    /// concern that must not see a write a crash can still take back.
+    pub fn begin_durable(
+        engine: &'a StorageEngine,
+        oracle: Option<&'a TimestampOracle>,
+        read_ts: Timestamp,
+    ) -> Self {
+        let (snapshot, pin) = engine.pin_durable_snapshot();
+        Self::with_pin(engine, oracle, read_ts, Some(snapshot), pin)
+    }
+
     fn with_pin(
         engine: &'a StorageEngine,
         oracle: Option<&'a TimestampOracle>,
@@ -668,9 +655,7 @@ impl<'a> Transaction<'a> {
         if let Some(record) = record.as_ref() {
             if matches!(
                 record.state,
-                OperationState::Committed { attempt: theirs, .. }
-                    | OperationState::Admitted { attempt: theirs, .. }
-                    if theirs == attempt
+                OperationState::Committed { attempt: theirs, .. } if theirs == attempt
             ) {
                 return Ok(());
             }
@@ -690,68 +675,6 @@ impl<'a> Transaction<'a> {
             outcome,
             intent_differs: record.is_some_and(|r| r.intent_differs(&intent)),
         })
-    }
-
-    /// Admit client operation `op`, meaning `intent`, through the log ahead
-    /// of the provisional effect this attempt exposes: the admission is
-    /// durable before the effect is, and excludes every other attempt of the
-    /// operation. Returns the admitted attempt, which the drain completes.
-    ///
-    /// # Errors
-    ///
-    /// The admission could not be committed, or another attempt of the
-    /// operation took effect or was admitted first
-    /// ([`CommitError::OperationSettled`]).
-    fn admit_provisional(
-        &self,
-        ctx: &CommitContext<'_>,
-        oracle: &TimestampOracle,
-        op: coordinode_core::txn::operation::OperationId,
-        intent: coordinode_core::txn::operation::IntentDigest,
-    ) -> Result<u64, CommitError> {
-        use coordinode_core::txn::operation::{BindMode, OperationBinding, OperationCommand};
-
-        let unit = |attempt: u64| {
-            vec![Mutation::Operation(OperationCommand::Bind(
-                OperationBinding {
-                    op,
-                    intent,
-                    attempt,
-                    mode: BindMode::Admit,
-                },
-            ))]
-        };
-        // Held as not yet logged until the admission is applied, so no
-        // closed bound passes over its timestamp meanwhile.
-        let (ts, _held) = self
-            .engine
-            .pending_commits()
-            .obligate(|| oracle.next().as_raw());
-        let attempt = if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
-            let id = id_gen.next();
-            let proposal = RaftProposal {
-                id,
-                mutations: unit(id.as_raw()),
-                commit_ts: Timestamp::from_raw(ts),
-                start_ts: self.read_ts,
-                bypass_rate_limiter: false,
-            };
-            pipeline
-                .propose_with_ack(&proposal, ctx.write_concern.w, None)
-                .map_err(proposal_err_to_commit)?;
-            id.as_raw()
-        } else {
-            // Without a pipeline the admission's timestamp names the attempt.
-            let mutations = unit(ts);
-            if self.engine.has_journal() {
-                self.engine.commit_journaled(&mutations, ts)?;
-            } else {
-                self.engine.apply_proposal_at(&mutations, ts)?;
-            }
-            ts
-        };
-        self.check_operation(op, intent, attempt)?;
-        Ok(attempt)
     }
 
     /// The change this transaction has staged to the counter `key` and not
@@ -1831,14 +1754,6 @@ impl<'a> Transaction<'a> {
         std::mem::take(&mut self.merge_node_deltas)
     }
 
-    /// Clear all buffered merge operands (commit path's volatile no-drain
-    /// branch: local writes already applied, nothing to replicate).
-    pub fn clear_merges(&mut self) {
-        self.merge_adj_ops.clear();
-        self.merge_node_deltas.clear();
-        self.merge_counter_deltas.clear();
-    }
-
     /// Drop any buffered adjacency adds/removes for `adj_key`. Used when a
     /// node-delete cascade tombstones the posting list — pending merge
     /// operands must not resurrect it.
@@ -2203,8 +2118,8 @@ impl<'a> Transaction<'a> {
             }
         }
 
-        // Drain the buffered point writes; each write-concern branch below
-        // applies / replicates them.
+        // Take the buffered point writes; the commit below applies and
+        // replicates them.
         let wb = std::mem::take(&mut self.write_buffer);
 
         // A write concern the group cannot honour is refused before anything is
@@ -2213,122 +2128,22 @@ impl<'a> Transaction<'a> {
             .validate(None)
             .map_err(|e| CommitError::Serialization(e.to_string()))?;
 
-        // w:0 takes the same path as every other commit below. A write concern
-        // decides when the caller is answered, never whether the write is
-        // replicated: a commit applied to this member alone would be a record no
-        // other member ever sees, on a follower and on the leader alike.
-
-        // Volatile journal (j:memory / j:cache with the leader as the one
-        // acknowledging member): the validated unit is buffered, not applied.
-        // It becomes committed state only when the drain hands it to the log,
-        // so no committed read sees it before then and the log applies it
-        // once. Until then the keys it was validated on stay registered and
-        // its claims reserved, so no other commit overwrites what it was
-        // validated against; it lands at a timestamp the drain takes, above
-        // every snapshot served while it waited.
-        //
-        // Crash before drain = data lost (explicit contract).
-        if ctx.write_concern.is_volatile() {
-            let Some(drain_buf) = ctx.drain_buffer else {
-                return Err(CommitError::ConcernUnavailable(
-                    "a memory or cache concern needs the drain that hands the write to the log"
-                        .into(),
-                ));
-            };
-            let Some(clock) = self.engine.oracle() else {
-                return Err(CommitError::ConcernUnavailable(
-                    "a memory or cache concern needs the store's clock to land the drained write"
-                        .into(),
-                ));
-            };
-            // j:cache promises the write survives a process crash before its
-            // drain, which only the NVMe write buffer keeps: without one the
-            // concern is refused, not served as j:memory.
-            let cache_buffer = match (ctx.write_concern.journal, ctx.nvme_write_buffer) {
-                (Journal::Cache, None) => {
-                    return Err(CommitError::ConcernUnavailable(
-                        "a cache concern needs the NVMe write buffer configured \
-                         (storage.volatile.nvme_write_buffer_path)"
-                            .into(),
-                    ));
-                }
-                (Journal::Cache, buffer) => buffer,
-                _ => None,
-            };
-            // A catalog change is visible to every attempt as soon as it is
-            // published, which a buffered unit cannot be.
-            if self.schema_changed {
-                return Err(CommitError::ConcernUnavailable(
-                    "a schema change cannot be written under a memory or cache concern".into(),
-                ));
-            }
-            // A provisional effect of a client operation is accepted only once
-            // the operation is admitted durably, through the log: its drain
-            // completes that admitted attempt, and a payload lost before the
-            // drain leaves the operation admitted until the host excludes it.
-            let admitted = match self.operation {
-                Some((op, intent)) => Some(self.admit_provisional(ctx, oracle, op, intent)?),
-                None => None,
-            };
-
-            let mut mutations = self.seal_unit(wb);
-            // The drain completes the admitted attempt: last in its unit,
-            // after the sealed DERIVED work.
-            if let (Some((op, intent)), Some(attempt)) = (self.operation, admitted) {
-                mutations.push(Mutation::Operation(
-                    coordinode_core::txn::operation::OperationCommand::Bind(
-                        coordinode_core::txn::operation::OperationBinding {
-                            op,
-                            intent,
-                            attempt,
-                            mode: coordinode_core::txn::operation::BindMode::Commit,
-                        },
-                    ),
-                ));
-            }
-            let hold = crate::engine::volatile::VolatileHold {
-                staged: self.engine.pending_commits().stage(admission),
-                _claims: reservation.map(|r| r.into_owned(self.engine.claim_registry())),
-                oracle: clock,
-            };
-            let entry = DrainEntry::new(mutations, commit_ts, self.read_ts).holding(Box::new(hold));
-            let full =
-                |e: coordinode_core::txn::drain::DrainBufferFull| CommitError::VolatileBufferFull {
-                    used_bytes: e.used_bytes,
-                    capacity_bytes: e.capacity_bytes,
-                };
-            // j:cache: persisted to NVMe before ACK for process-crash
-            // recovery, numbered and marked so a recovered entry is applied
-            // once. j:memory skips this: data loss on crash is the explicit
-            // contract.
-            match cache_buffer {
-                Some(nvme) => nvme.append(entry, drain_buf).map_err(|e| match e {
-                    crate::cache::write_buffer::AppendError::Full(e) => full(e),
-                    crate::cache::write_buffer::AppendError::Io(e) => {
-                        CommitError::Storage(StorageError::Io(format!("w:cache write buffer: {e}")))
-                    }
-                })?,
-                None => drain_buf.append(entry).map_err(full)?,
-            }
-
-            // Accepted, not committed: there is no commit timestamp to report
-            // until the drain lands it.
-            return Ok(CommitOutcome {
-                commit_ts: None,
-                applied_index: None,
-            });
-        }
-
-        // Journaled path (and w:0): apply through the proposal pipeline, or
-        // write directly when none is configured.
+        // Every write concern takes this one path. It decides when the caller
+        // is answered, never whether or how the write is applied: w:0 is not
+        // waited for, and a volatile `j` (memory, cache) is answered before
+        // its log entry is synced, but the write is logged, applied and
+        // replicated like any other. A commit applied to this member alone
+        // would be a record no other member ever sees, on a follower and on
+        // the leader alike.
         //
         // When a pipeline is configured, mutations are packaged into a
         // RaftProposal and sent through the pipeline; `w` decides how many
-        // members must hold the entry before the pipeline returns. In
-        // single-node mode every `w` is satisfied by the local apply.
+        // members must hold the entry before the pipeline returns, `j` in
+        // what state. In single-node mode every `w` is satisfied by the local
+        // apply.
         //
-        // When no pipeline is configured (legacy/test mode), mutations are
-        // written directly to the engine.
+        // When no pipeline is configured, mutations are written directly to
+        // the engine.
         // One mutation list for both application paths below: proposed
         // through the pipeline, or applied directly at commit_ts.
         let mut mutations = self.seal_unit(wb);
@@ -2342,7 +2157,6 @@ impl<'a> Transaction<'a> {
                             op,
                             intent,
                             attempt,
-                            mode: coordinode_core::txn::operation::BindMode::Commit,
                         },
                     ),
                 ));
@@ -2367,10 +2181,8 @@ impl<'a> Transaction<'a> {
             // on timeout the data is NOT rolled back, the proposal may still
             // commit after the timeout fires. In embedded/single-node mode the
             // default pipeline applies at once and the timeout is moot.
-            let timeout = (ctx.write_concern.timeout_ms > 0)
-                .then(|| std::time::Duration::from_millis(u64::from(ctx.write_concern.timeout_ms)));
             let outcome = pipeline
-                .propose_with_ack(&proposal, ctx.write_concern.w, timeout)
+                .propose_with_concern(&proposal, ctx.write_concern)
                 .map_err(proposal_err_to_commit)?;
             // Record the committed Raft index of this write so the gRPC layer
             // can return it as the causal operationTime token. `None` in
@@ -2379,13 +2191,17 @@ impl<'a> Transaction<'a> {
         } else {
             // Direct-write path (no pipeline configured): the same single-seqno
             // apply the pipelines perform, at this transaction's commit_ts,
-            // journalled first when the engine keeps a journal. The commit
-            // timestamp is unique to this attempt, so it names it.
+            // journalled first, as far as `j` asks, when the engine keeps a
+            // journal. The commit timestamp is unique to this attempt, so it
+            // names it.
             attempt = commit_ts.as_raw();
             bind(&mut mutations, attempt);
             if self.engine.has_journal() {
-                self.engine
-                    .commit_journaled(&mutations, commit_ts.as_raw())?;
+                self.engine.commit_logged(
+                    &mutations,
+                    commit_ts.as_raw(),
+                    ctx.write_concern.journal,
+                )?;
             } else {
                 self.engine
                     .apply_proposal_at(&mutations, commit_ts.as_raw())?;
@@ -2403,14 +2219,17 @@ impl<'a> Transaction<'a> {
         drop(admission);
         drop(reservation);
 
-        // j:journal on a member without a Raft log (legacy / embedded direct
-        // write): force the fsync after commit. With FlushPolicy::SyncPerBatch
-        // this is already done by WriteBatch; with Periodic/Manual policies the
-        // explicit persist is what makes the journal promise true. A caller
-        // that waits for nobody (w:0) is not held for it.
+        // j:journal on a member with neither a Raft log nor a journal (a store
+        // opened without one, written directly): force the fsync after
+        // commit. With
+        // FlushPolicy::SyncPerBatch this is already done by WriteBatch; with
+        // Periodic/Manual policies the explicit persist is what makes the
+        // journal promise true. A journal already synced the commit above. A
+        // caller that waits for nobody (w:0) is not held for it.
         if ctx.write_concern.journal == Journal::Journal
             && !ctx.write_concern.w.is_fire_and_forget()
             && ctx.pipeline.is_none()
+            && !self.engine.has_journal()
             && self.engine.flush_policy() != crate::engine::config::FlushPolicy::SyncPerBatch
         {
             self.engine
