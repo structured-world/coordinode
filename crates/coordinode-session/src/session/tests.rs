@@ -742,6 +742,45 @@ async fn begin_then_commit_acknowledges_and_rollback_cancel_are_silent() {
     assert!(!by_id.contains_key(&4));
 }
 
+/// A commit repeated right behind the first, before its answer, lands in the
+/// mailbox of a transaction that is resolving. It is answered as a commit of
+/// a handle the session no longer routes to (the engine reports the outcome
+/// of a bound commit), never dropped with the mailbox: a client retrying a
+/// commit whose reply it lost would otherwise wait forever.
+#[tokio::test]
+async fn a_commit_repeated_while_the_first_resolves_is_answered() {
+    for ordering in [Ordering::Unordered, Ordering::Ordered] {
+        let commit = SessionOp::Commit {
+            txid: 1,
+            last_nonce: 0,
+            operation: None,
+        };
+        let by_id = run_session(
+            engine(&[], vec![]),
+            vec![
+                SessionOp::Begin {
+                    ordering,
+                    drain_timeout_ms: 0,
+                },
+                commit.clone(),
+                commit.clone(),
+                commit,
+            ],
+        )
+        .await;
+        for rid in [2u64, 3, 4] {
+            assert!(
+                matches!(
+                    by_id.get(&rid).map(Vec::as_slice),
+                    Some([SessionEvent::Committed { .. }])
+                ),
+                "{ordering:?} req {rid}: {:?}",
+                by_id.get(&rid)
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
     // UNORDERED first-failure semantics: once a statement fails, the transaction

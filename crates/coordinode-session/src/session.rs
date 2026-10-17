@@ -258,24 +258,15 @@ impl Session {
                         cancel: self.cancels.register(request_id),
                     },
                 };
-                // A send error means the task just resolved (rx dropped) before
-                // its `done` was processed; fall back to the engine's
-                // unknown-transaction error.
+                // A send error means the task resolved and closed its mailbox
+                // before its `done` was processed: the statement runs against
+                // the handle as one naming an unknown transaction does, and
+                // the engine answers it.
                 if let Some(tx) = txns.get(&txid) {
-                    if tx.send(msg).await.is_err() {
-                        self.spawn_autonomous(
-                            Statement {
-                                request_id,
-                                query: String::new(),
-                                params: HashMap::new(),
-                                settings: ConnectionSettings::default(),
-                                source: None,
-                                operation: None,
-                                cancel: self.cancels.register(request_id),
-                            },
-                            txid,
-                            out,
-                        );
+                    if let Err(mpsc::error::SendError(TxnMsg::Statement { statement, .. })) =
+                        tx.send(msg).await
+                    {
+                        self.spawn_autonomous(statement, txid, out);
                     }
                 }
             }
@@ -317,14 +308,20 @@ impl Session {
             } => match txns.get(&txid) {
                 // Keep the entry: the task removes itself via `done` once it has
                 // drained and resolved.
+                // A send error means the task resolved and closed its mailbox
+                // before its `done` was processed: answered as an unknown
+                // handle, which reports the outcome of a bound commit.
                 Some(tx) => {
-                    let _ = tx
+                    let sent = tx
                         .send(TxnMsg::Commit {
                             request_id,
                             last_nonce,
                             operation,
                         })
                         .await;
+                    if let Err(mpsc::error::SendError(TxnMsg::Commit { operation, .. })) = sent {
+                        self.spawn_commit_unknown(request_id, txid, operation, out);
+                    }
                 }
                 None => self.spawn_commit_unknown(request_id, txid, operation, out),
             },
@@ -607,7 +604,43 @@ async fn run_unordered(
     if !resolved && !aborted {
         rollback(engine, txid).await;
     }
+    answer_after_resolution(engine, registry, session_id, txid, &mut rx, out).await;
     aborted
+}
+
+/// Answer what reached the mailbox after the transaction resolved, as the
+/// session answers a request naming a transaction it no longer routes to.
+/// Closing the mailbox first makes a later send fail, which the session
+/// answers the same way, so no request is left without a reply: a client that
+/// repeats a commit whose reply it lost is answered with its outcome.
+async fn answer_after_resolution(
+    engine: &Arc<dyn CursorEngine>,
+    registry: &Arc<SessionRegistry>,
+    session_id: u64,
+    txid: u64,
+    rx: &mut mpsc::Receiver<TxnMsg>,
+    out: &mpsc::Sender<OutEvent>,
+) {
+    rx.close();
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            TxnMsg::Statement { statement, .. } => {
+                registry.request_started(session_id);
+                let _ = execute(engine, statement, txid, out).await;
+                registry.request_finished(session_id);
+            }
+            TxnMsg::Commit {
+                request_id,
+                operation,
+                ..
+            } => {
+                registry.request_started(session_id);
+                commit(engine, request_id, txid, operation, out).await;
+                registry.request_finished(session_id);
+            }
+            TxnMsg::Rollback => {}
+        }
+    }
 }
 
 /// ORDERED loop: buffer statements by nonce and apply the contiguous run from
@@ -704,6 +737,7 @@ async fn run_ordered(
         rollback(engine, txid).await;
         finish_buffered(registry, session_id, &mut buffer);
     }
+    answer_after_resolution(engine, registry, session_id, txid, &mut rx, out).await;
     aborted
 }
 
