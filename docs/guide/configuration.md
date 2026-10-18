@@ -585,6 +585,18 @@ change stream resuming at an entry the log has dropped is refused with
 `RETENTION_LOST` rather than resumed past the gap. Zero sizes and unknown keys
 are refused when the file is read.
 
+A server node (standalone or cluster member) also keeps a small journal of
+its own in `local-journal/`, in the storage endpoint that holds the Raft
+log (the data directory unless endpoints are configured): the records that
+belong to this member and are not replicated, such as its vote, its log
+bounds and the guards of the indexes it serves. It uses the same
+`sync_method` and segment limits, syncs only where a record is about to be
+relied on, and is replayed at the next start. It is part of the node's
+state: back it up and restore it together with the rest of the data
+directory, never on its own. When the directory is later opened as an
+embedded database, its records move into the database's journal and the
+directory is removed.
+
 ### Volatile writes
 
 A write under the `MEMORY` or `CACHE` journal ([durability](./transactions#durability))

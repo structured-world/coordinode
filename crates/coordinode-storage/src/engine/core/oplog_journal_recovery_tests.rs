@@ -1426,6 +1426,215 @@ fn a_compaction_shortens_the_member_local_journal_and_keeps_every_record() {
     rig.cut(engine);
 }
 
+/// Files under `root`, at any depth.
+fn files_under(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .map(|e| {
+                let path = e.path();
+                if path.is_dir() { files_under(&path) } else { 1 }
+            })
+            .sum()
+    })
+}
+
+/// With the journal on one device and the tables on another, a table flush
+/// still syncs the journal first and a power cut loses only what neither
+/// device made durable: each device's own sync is what counts, never the
+/// other's.
+#[test]
+fn a_journal_and_tables_on_different_devices_recover_together() {
+    let rig = PowerRig::new();
+    let journal_dir = rig.dir.path().join("journal");
+    let tables_dir = rig.dir.path().join("fast");
+    let mut config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "journal",
+            &journal_dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        ),
+        EndpointConfig::new(
+            "fast",
+            &tables_dir,
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+    ])
+    .with_fs(Arc::clone(&rig.fs));
+    config.volatile_flush_interval_ms = 60_000;
+    let (engine, oracle) = rig.open_with(&config);
+    commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Journal);
+    commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Cache);
+    // Level-0 tables go to the hot endpoint, the journal to the first one.
+    let before = files_under(&tables_dir);
+    engine.persist_partition(Partition::Node).expect("flush");
+    engine.persist_partition(Partition::Adj).expect("flush");
+    assert!(
+        files_under(&tables_dir) > before,
+        "the flush wrote no table on the second device"
+    );
+    commit_at(&engine, &oracle, &two_tree_commit("c", 3), Journal::Cache);
+    assert!(
+        journal_segments(&journal_dir) > 0 && journal_segments(&tables_dir) == 0,
+        "the journal is not on its own device"
+    );
+    rig.cut(engine);
+    let (engine, _) = rig.open_with(&config);
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1, 2]));
+    assert!(
+        two_tree_state(&engine, "b").0,
+        "the flushed volatile commit was lost"
+    );
+    assert!(
+        !two_tree_state(&engine, "c").0,
+        "a commit neither device synced survived"
+    );
+    rig.cut(engine);
+}
+
+/// A node's own record in the journal of a store that has one is replayed
+/// after a crash like any entry, but subscribers that follow the store's
+/// commits never see it: it is this node's recovery state, not the data.
+#[test]
+fn a_node_record_in_the_store_journal_is_recovered_but_never_published() {
+    let rig = PowerRig::new();
+    let (engine, oracle) = rig.open();
+    let sub = engine.subscribe_applied(Partition::Node, 16);
+    engine
+        .commit_local(
+            vec![LocalWrite::Put {
+                partition: Partition::Node,
+                key: b"node:00:own".to_vec(),
+                value: b"o".to_vec(),
+            }],
+            LocalSync::BeforeUse,
+        )
+        .expect("commit the node's record");
+    commit_at(
+        &engine,
+        &oracle,
+        &two_tree_commit("shared", 1),
+        Journal::Journal,
+    );
+    let mut published = Vec::new();
+    while let Some(event) = sub.try_next() {
+        if let crate::engine::applied::AppliedEvent::Keys { keys, .. } = event {
+            published.extend(keys.iter().map(|k| k.to_vec()));
+        }
+    }
+    assert!(
+        published.contains(&b"node:00:shared".to_vec()),
+        "the shared commit was not published: {published:?}"
+    );
+    assert!(
+        !published.contains(&b"node:00:own".to_vec()),
+        "the node's own record reached a subscriber"
+    );
+    rig.cut(engine);
+    let (engine, _) = rig.open();
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:00:own")
+            .expect("get")
+            .as_deref(),
+        Some(b"o".as_slice()),
+        "the node's record was lost to the crash"
+    );
+    rig.cut(engine);
+}
+
+/// A crash inside a compaction, after the trees holding member records were
+/// flushed but before (or while) the covered segments were removed, leaves
+/// the store openable with every record: the segments still on disk replay
+/// over trees that already hold them, and the removed ones were covered.
+#[test]
+fn a_crash_inside_a_member_local_compaction_keeps_every_record() {
+    // 0: crash before the first removal; 1: after the oldest segment went.
+    for removed_before_crash in [0usize, 1] {
+        let rig = PowerRig::new();
+        let mut config = rig.config();
+        config.oplog_segment_max_entries = 256;
+        let dir = local_journal_dir(&config);
+        let engine = rig.open_group(&config).expect("open");
+        // Below the count that compacts on its own; the last syncs them all.
+        let records = 2000;
+        for i in 0..records {
+            let sync = if i + 1 == records {
+                LocalSync::BeforeUse
+            } else {
+                LocalSync::Deferred
+            };
+            engine
+                .commit_local(vec![member_put(format!("r{i}").as_bytes(), b"x")], sync)
+                .expect("commit");
+        }
+        // The journal as the compaction finds it: every record synced.
+        let mut saved: Vec<(std::path::PathBuf, Vec<u8>)> = std::fs::read_dir(&dir)
+            .expect("journal dir")
+            .filter_map(Result::ok)
+            .map(|e| {
+                let path = e.path();
+                let bytes = std::fs::read(&path).expect("read segment");
+                (path, bytes)
+            })
+            .collect();
+        saved.sort();
+        assert!(
+            saved.len() > 2,
+            "segments before compaction: {}",
+            saved.len()
+        );
+        engine
+            .local_journal
+            .as_ref()
+            .expect("a member-local journal")
+            .compact(engine.coordinator.trees(), engine.next_seqno(), |tree| {
+                engine.flush_memtables(tree)
+            })
+            .expect("compact");
+        assert!(
+            saved.iter().all(|(path, _)| !path.exists()),
+            "the compaction left a covered segment"
+        );
+        rig.cut(engine);
+        // Put back the segments the compaction removed, except the ones a
+        // crash part-way through the removal would already have taken.
+        for (path, bytes) in saved.iter().skip(removed_before_crash) {
+            if !path.exists() {
+                std::fs::write(path, bytes).expect("restore segment");
+            }
+        }
+        let engine = rig
+            .open_group(&config)
+            .unwrap_or_else(|e| panic!("reopen after {removed_before_crash} removals: {e:?}"));
+        for key in ["r0".to_owned(), format!("r{}", records - 1)] {
+            assert!(
+                engine
+                    .get(Partition::Raft, key.as_bytes())
+                    .expect("get")
+                    .is_some(),
+                "{key} lost after {removed_before_crash} removals"
+            );
+        }
+        engine
+            .commit_local(vec![member_put(b"after", b"a")], LocalSync::BeforeUse)
+            .expect("commit after the reopen");
+        rig.cut(engine);
+        let engine = rig.open_group(&config).expect("reopen again");
+        assert!(
+            engine
+                .get(Partition::Raft, b"after")
+                .expect("get")
+                .is_some()
+        );
+        rig.cut(engine);
+    }
+}
+
 /// A segment lost from the middle of the member-local journal takes records
 /// no tree covers: the open refuses rather than replay around the hole.
 #[test]

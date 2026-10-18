@@ -351,8 +351,11 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
   any other `WHERE` is refused, never widened to every node.
 - **Building.** `CREATE INDEX` publishes the index and admits its build in one
   commit, then waits for the build, which indexes the nodes already stored,
-  and returns once the index is ready. The build runs on the engine, not on
-  the statement: a client that times out or disconnects leaves it running, a
+  and returns once the index is ready. The answer waits for one journal sync
+  covering the publication and the build's bookkeeping, so a power cut after
+  `CREATE INDEX` returns cannot take the index back to building; a read at a
+  timestamp before the index was published does not use it. The build runs
+  on the engine, not on the statement: a client that times out or disconnects leaves it running, a
   restart resumes it, and after a change of leader the new leader resumes it.
   Writes made meanwhile maintain the index themselves. The build first waits
   for transactions opened before the index existed to end, then indexes the

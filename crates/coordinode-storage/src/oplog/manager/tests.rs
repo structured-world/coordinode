@@ -88,6 +88,69 @@ fn truncate_from_cuts_in_place_and_survives_a_reopen() {
     assert_eq!(after.iter().map(|e| e.ts).collect::<Vec<_>>(), vec![999]);
 }
 
+/// Indices left in the log at `dir` after a reopen.
+fn reopened_indices(dir: &Path) -> Vec<u64> {
+    let mut mgr = OplogManager::open(dir, 0, 64 * 1024 * 1024, 3, 3600).expect("reopen");
+    mgr.read_range(0, 100)
+        .expect("read")
+        .iter()
+        .map(|e| e.index)
+        .collect()
+}
+
+/// A log of entries 1..=10 in segments of three: [1-3] [4-6] [7-9] [10].
+fn three_per_segment(dir: &Path) {
+    let mut mgr = OplogManager::open(dir, 0, 64 * 1024 * 1024, 3, 3600).expect("open");
+    for i in 1..=10u64 {
+        mgr.append(&make_entry(i, i * 10)).expect("append");
+    }
+    mgr.flush().expect("flush");
+}
+
+/// A crash after the cut removed the newer segments but before it shortened
+/// the one the cut falls in leaves an unbroken prefix with part of the
+/// removed suffix after it, never a gap; cutting again finishes the job.
+#[test]
+fn a_crash_before_the_boundary_cut_leaves_a_prefix_the_next_cut_finishes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    three_per_segment(dir.path());
+    // The removals truncate_from(5) makes first, newest first.
+    std::fs::remove_file(segment_path(dir.path(), 10)).expect("remove [10]");
+    std::fs::remove_file(segment_path(dir.path(), 7)).expect("remove [7-9]");
+    assert_eq!(reopened_indices(dir.path()), vec![1, 2, 3, 4, 5, 6]);
+
+    let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 3, 3600).expect("open");
+    mgr.truncate_from(5).expect("cut again");
+    drop(mgr);
+    assert_eq!(reopened_indices(dir.path()), vec![1, 2, 3, 4]);
+}
+
+/// A crash while the boundary segment is re-sealed, after it was shortened
+/// but before its footer is whole, leaves a segment the open recovers as one
+/// cut off mid-write: the entries below the cut stay, nothing above returns.
+#[test]
+fn a_crash_while_resealing_the_boundary_keeps_the_entries_below_the_cut() {
+    for footer_written in [0, FOOTER_SIZE / 2] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        three_per_segment(dir.path());
+        let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 3, 3600).expect("open");
+        mgr.truncate_from(5).expect("truncate");
+        drop(mgr);
+        let boundary = segment_path(dir.path(), 4);
+        let sealed_len = std::fs::metadata(&boundary).expect("stat").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&boundary)
+            .and_then(|f| f.set_len(sealed_len - FOOTER_SIZE + footer_written))
+            .expect("tear the footer");
+        assert_eq!(
+            reopened_indices(dir.path()),
+            vec![1, 2, 3, 4],
+            "footer bytes written before the crash: {footer_written}"
+        );
+    }
+}
+
 fn test_manager(dir: &Path) -> OplogManager {
     OplogManager::open(
         dir,
