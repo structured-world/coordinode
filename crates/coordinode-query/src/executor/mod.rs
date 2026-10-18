@@ -3,6 +3,7 @@
 //! Implements the iterator model for read operations:
 //! NodeScan → Traverse → Filter → Project → Aggregate → Sort → Limit/Skip.
 
+pub mod constraint_plan;
 pub mod eval;
 pub mod eval_neutral;
 pub mod row;

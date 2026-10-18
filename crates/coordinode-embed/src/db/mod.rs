@@ -4332,9 +4332,15 @@ mod fields;
 mod id_lease;
 mod index_builds;
 mod index_maintenance;
+mod package;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
 pub use fields::FieldDictionary;
+pub use package::{
+    Disposition, EdgeTypeDeclaration, Intent, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,
+    PackageConstraint, PublishedObject, Readiness, SchemaPackage, SchemaPublication,
+    SchemaReadiness,
+};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

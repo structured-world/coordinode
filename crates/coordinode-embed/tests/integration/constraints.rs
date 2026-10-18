@@ -571,9 +571,27 @@ fn names_and_if_not_exists() {
         names_existing(&err, CatalogObject::Constraint, "c1"),
         "{err}"
     );
-    let rows = db
+    // IF NOT EXISTS answers for the constraint asked for, not for the name:
+    // the name holding another requirement on another label is a conflict.
+    let err = db
         .execute_cypher("CREATE CONSTRAINT c1 IF NOT EXISTS FOR (o:Org) REQUIRE o.name IS NOT NULL")
-        .expect("if not exists");
+        .expect_err("the name holds another constraint");
+    assert!(
+        matches!(
+            err,
+            DatabaseError::Execution(ExecutionError::CatalogObjectDiffers {
+                object: CatalogObject::Constraint,
+                ref name,
+                ..
+            }) if name == "c1"
+        ),
+        "{err}"
+    );
+    let rows = db
+        .execute_cypher(
+            "CREATE CONSTRAINT c1 IF NOT EXISTS FOR (u:User) REQUIRE u.email IS NOT NULL",
+        )
+        .expect("the same constraint again");
     assert_eq!(rows[0].get("created"), Some(&Value::Bool(false)));
 
     let err = db

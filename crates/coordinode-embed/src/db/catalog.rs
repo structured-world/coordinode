@@ -18,6 +18,7 @@ use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
 use coordinode_query::index::GenerationId;
 use coordinode_query::planner::logical::{LogicalOp, LogicalPlan};
 
+use super::package::Existing;
 use super::{Database, DatabaseError, QuerySession, Statement, TxnMode};
 
 /// A constraint to create, as `CREATE CONSTRAINT` declares one.
@@ -68,16 +69,6 @@ pub struct LabelConstraint {
     pub operation: Option<GenerationId>,
 }
 
-/// What a label definition does to a label that already has one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExistingDefinition {
-    /// Refuse it.
-    Refuse,
-    /// Replace its type facts, keeping its constraints, placement and
-    /// temporal flag.
-    Replace,
-}
-
 impl Database {
     /// Define label `schema`. A label that already has a definition is
     /// refused. Returns the published schema revision.
@@ -89,7 +80,7 @@ impl Database {
     /// [`Self::create_constraint`]); stored nodes of the label break it; or
     /// the catalog could not be written.
     pub fn define_label(&self, schema: LabelSchema) -> Result<u64, DatabaseError> {
-        self.publish_label_definition(schema, ExistingDefinition::Refuse)
+        self.publish_label_definition(schema, Existing::Refuse)
     }
 
     /// Define label `schema`, or replace the type facts of its definition.
@@ -104,115 +95,24 @@ impl Database {
     /// cannot hold under it; stored nodes of the label break it; or the
     /// catalog could not be written.
     pub fn create_label_schema(&self, schema: LabelSchema) -> Result<u64, DatabaseError> {
-        self.publish_label_definition(schema, ExistingDefinition::Replace)
+        self.publish_label_definition(schema, Existing::Replace)
     }
 
-    /// Publish a label definition in one catalog transaction that reads the
-    /// label's current definition, so a constraint created or dropped
-    /// concurrently is neither lost nor brought back: that transaction's
-    /// commit refuses this one instead.
+    /// Publish one label definition through the package core, in one
+    /// catalog transaction that reads the label's current definition, so a
+    /// constraint created or dropped concurrently is neither lost nor
+    /// brought back: that transaction's commit refuses this one instead. A
+    /// definition equal to the current one changes nothing: no revision, no
+    /// commit, no pass over the label's nodes.
     fn publish_label_definition(
         &self,
-        mut schema: LabelSchema,
-        existing: ExistingDefinition,
+        schema: LabelSchema,
+        existing: Existing,
     ) -> Result<u64, DatabaseError> {
-        if !schema.constraints().is_empty() {
-            return Err(refused(format!(
-                "the definition of :{} declares constraints; a type definition carries none, \
-                 create them with create_constraint",
-                schema.name
-            )));
-        }
-        if let Some(p) = schema.properties.values().find(|p| {
-            coordinode_core::schema::definition::TEMPORAL_ENGINE_FIELDS.contains(&p.name.as_str())
-        }) {
-            return Err(refused(format!(
-                "property `{}` of :{} is reserved: the engine writes it into every version of a \
-                 temporal node",
-                p.name, schema.name
-            )));
-        }
-        if existing == ExistingDefinition::Replace {
-            // A definition equal to the current one changes nothing: no
-            // revision, no commit, no pass over the label's nodes. The call
-            // takes effect at this read.
-            let current = LocalSchemaStore::new(&self.engine)
-                .load_label(&schema.name)
-                .map_err(ExecutionError::from)?;
-            if let Some(current) = current {
-                if !current.is_table() && unchanged_label(&schema, &current) {
-                    return Ok(current.schema_revision);
-                }
-            }
-        }
-        self.commit_catalog(|txn| self.stage_label_definition(txn, &mut schema, existing))?;
-        Ok(schema.schema_revision)
-    }
-
-    /// Stage label definition `schema` in `txn`, against the label's current
-    /// definition as `txn` reads it: a replacement takes over the label's
-    /// constraints, placement and the next revision from there.
-    fn stage_label_definition(
-        &self,
-        txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
-        schema: &mut LabelSchema,
-        existing: ExistingDefinition,
-    ) -> Result<(), DatabaseError> {
-        let store = LocalSchemaStore::new(&self.engine);
-        let name = schema.name.clone();
-        if let Some(current) = store.load_label_for_update_txn(txn, &name)? {
-            if existing == ExistingDefinition::Refuse {
-                return Err(ExecutionError::CatalogObjectExists {
-                    object: CatalogObject::Label,
-                    name,
-                }
-                .into());
-            }
-            if current.is_table() {
-                return Err(refused(format!(
-                    ":{name} is a TABLE; its definition changes through table DDL"
-                )));
-            }
-            if current.temporal != schema.temporal {
-                return Err(refused(format!(
-                    "whether :{name} is temporal is fixed when it is created"
-                )));
-            }
-            schema.placement = current.placement.clone();
-            schema.shard_keys = current.shard_keys.clone();
-            for constraint in current.constraints() {
-                if let Some(conflict) = schema.constraint_conflict(constraint) {
-                    return Err(refused(format!(
-                        "constraint '{}' cannot hold under the new definition: {conflict}",
-                        constraint.name
-                    )));
-                }
-                schema.add_constraint(constraint.clone());
-            }
-            schema.schema_revision = current
-                .schema_revision
-                .checked_add(1)
-                .ok_or_else(|| refused(format!("label '{name}' has no schema revision left")))?;
-        }
-        // The commit decides this authoritatively; checking here as well
-        // names the node that refuses it.
-        let staged = std::collections::HashMap::new();
-        if let Some(violation) =
-            coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
-                &self.engine,
-                schema,
-                &staged,
-            )?
-        {
-            return Err(ExecutionError::SchemaViolation(format!(
-                "the definition of :{name} is not published: node {} breaks it ({})",
-                violation.node.to_element_id(),
-                violation.reason
-            ))
-            .into());
-        }
-        store.save_label_txn(txn, schema)?;
-        Ok(())
+        check_label_declaration(&schema)?;
+        let published =
+            self.publish_declarations(vec![(schema, existing)], Vec::new(), Vec::new())?;
+        Ok(only_revision(&published))
     }
 
     /// Define edge type `schema`. An edge type that already has a
@@ -222,22 +122,10 @@ impl Database {
     /// # Errors
     ///
     /// The edge type already exists, or the catalog could not be written.
-    pub fn define_edge_type(&self, mut schema: EdgeTypeSchema) -> Result<u64, DatabaseError> {
-        resolve_edge_identity(&mut schema)?;
-        let name = schema.name.clone();
-        self.commit_catalog(|txn| -> Result<(), DatabaseError> {
-            let store = LocalSchemaStore::new(&self.engine);
-            if store.edge_type_exists(txn, &name)? {
-                return Err(ExecutionError::CatalogObjectExists {
-                    object: CatalogObject::EdgeType,
-                    name: name.clone(),
-                }
-                .into());
-            }
-            store.save_edge_type_txn(txn, &schema)?;
-            Ok(())
-        })?;
-        Ok(schema.schema_revision)
+    pub fn define_edge_type(&self, schema: EdgeTypeSchema) -> Result<u64, DatabaseError> {
+        let published =
+            self.publish_declarations(Vec::new(), vec![(schema, Existing::Refuse)], Vec::new())?;
+        Ok(only_revision(&published))
     }
 
     /// Define edge type `schema`, or replace its definition at the next
@@ -250,55 +138,10 @@ impl Database {
     ///
     /// The definition changes the temporal flag or the discriminator, or the
     /// catalog could not be written.
-    pub fn create_edge_type_schema(
-        &self,
-        mut schema: EdgeTypeSchema,
-    ) -> Result<u64, DatabaseError> {
-        use coordinode_core::schema::definition::encode_edge_type_current_revision_key;
-        use coordinode_storage::engine::partition::Partition;
-        resolve_edge_identity(&mut schema)?;
-        // An equal definition changes nothing, as for a label.
-        if let Some(current) = LocalSchemaStore::new(&self.engine).load_edge_type(&schema.name)? {
-            let mut carried = schema.clone();
-            carried.placement = current.placement;
-            carried.schema_revision = current.schema_revision;
-            if carried == current {
-                return Ok(current.schema_revision);
-            }
-        }
-        self.commit_catalog(|txn| -> Result<(), DatabaseError> {
-            let store = LocalSchemaStore::new(&self.engine);
-            let pointer = encode_edge_type_current_revision_key(&schema.name);
-            // Version first, then the definition: a change landing between
-            // the two refuses this commit instead of passing under it.
-            let version = txn.record_version(Partition::Schema, &pointer)?;
-            if let Some(current) = store.load_edge_type(&schema.name)? {
-                if current.temporal != schema.temporal {
-                    return Err(refused(format!(
-                        "whether edge type '{}' is temporal is fixed when it is created",
-                        schema.name
-                    )));
-                }
-                if current.discriminator() != schema.discriminator() {
-                    return Err(refused(format!(
-                        "what identifies an edge of type '{}' is fixed when it is created",
-                        schema.name
-                    )));
-                }
-                schema.placement = current.placement;
-                schema.schema_revision =
-                    current.schema_revision.checked_add(1).ok_or_else(|| {
-                        refused(format!(
-                            "edge type '{}' has no schema revision left",
-                            schema.name
-                        ))
-                    })?;
-            }
-            txn.expect_version(Partition::Schema, &pointer, version)?;
-            store.save_edge_type_txn(txn, &schema)?;
-            Ok(())
-        })?;
-        Ok(schema.schema_revision)
+    pub fn create_edge_type_schema(&self, schema: EdgeTypeSchema) -> Result<u64, DatabaseError> {
+        let published =
+            self.publish_declarations(Vec::new(), vec![(schema, Existing::Replace)], Vec::new())?;
+        Ok(only_revision(&published))
     }
 
     /// Every label with a definition, ordered by name.
@@ -496,16 +339,43 @@ impl Database {
     }
 }
 
+/// The revision of the one object a single-object call published.
+fn only_revision(published: &super::SchemaPublication) -> u64 {
+    published.objects.first().map_or(0, |o| o.revision)
+}
+
 /// A catalog change refused by the catalog's current state.
-fn refused(reason: String) -> DatabaseError {
+pub(super) fn refused(reason: String) -> DatabaseError {
     DatabaseError::Execution(ExecutionError::CatalogRefused(reason))
+}
+
+/// Refuse a label definition that is not a type definition alone: one
+/// declaring constraints, or a property the engine reserves.
+pub(super) fn check_label_declaration(schema: &LabelSchema) -> Result<(), DatabaseError> {
+    if !schema.constraints().is_empty() {
+        return Err(refused(format!(
+            "the definition of :{} declares constraints; a type definition carries none, \
+             create them with create_constraint",
+            schema.name
+        )));
+    }
+    if let Some(p) = schema.properties.values().find(|p| {
+        coordinode_core::schema::definition::TEMPORAL_ENGINE_FIELDS.contains(&p.name.as_str())
+    }) {
+        return Err(refused(format!(
+            "property `{}` of :{} is reserved: the engine writes it into every version of a \
+             temporal node",
+            p.name, schema.name
+        )));
+    }
+    Ok(())
 }
 
 /// Give `schema` its identity when the caller left it unresolved: a
 /// temporal type naming no discriminator is identified by `valid_from`. A
 /// caller declaring a discriminator resolves it with
 /// [`EdgeTypeSchema::resolve_identity`] before handing the schema over.
-fn resolve_edge_identity(schema: &mut EdgeTypeSchema) -> Result<(), DatabaseError> {
+pub(super) fn resolve_edge_identity(schema: &mut EdgeTypeSchema) -> Result<(), DatabaseError> {
     if schema.discriminator().is_none() {
         schema.resolve_identity(None).map_err(refused)?;
     }
@@ -515,7 +385,7 @@ fn resolve_edge_identity(schema: &mut EdgeTypeSchema) -> Result<(), DatabaseErro
 /// Whether replacing `current` with `schema` would publish `current` itself:
 /// `schema`, completed with what a replacement keeps from `current`
 /// (placement, shard keys, constraints and the revision), equals it.
-fn unchanged_label(schema: &LabelSchema, current: &LabelSchema) -> bool {
+pub(super) fn unchanged_label(schema: &LabelSchema, current: &LabelSchema) -> bool {
     let mut carried = schema.clone();
     carried.placement = current.placement.clone();
     carried.shard_keys = current.shard_keys.clone();

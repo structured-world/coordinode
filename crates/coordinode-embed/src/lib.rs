@@ -27,8 +27,11 @@ pub mod text_worker;
 pub mod vector_worker;
 
 pub use coordinode_core::txn::transaction::CommitReceipt;
+pub use coordinode_query::executor::runner::CatalogObject;
 pub use db::{
     AfterCommitDispatchReport, ConstraintDeclaration, DEFAULT_VECTOR_BUILD_WAIT, Database,
-    DatabaseError, LabelConstraint, ResumedIndexBuilds, TriggerDispatchConfig,
+    DatabaseError, Disposition, EdgeTypeDeclaration, Intent, LabelConstraint, LabelDeclaration,
+    MAX_SCHEMA_PACKAGE_DECLARATIONS, PackageConstraint, PublishedObject, Readiness,
+    ResumedIndexBuilds, SchemaPackage, SchemaPublication, SchemaReadiness, TriggerDispatchConfig,
 };
 pub use repair::RepairReport;

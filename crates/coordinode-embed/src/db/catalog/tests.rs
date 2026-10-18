@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::package::Existing;
 use coordinode_core::schema::definition::{ConstraintState, PropertyDef, PropertyType, SchemaMode};
 
 fn open() -> (Database, tempfile::TempDir) {
@@ -173,7 +174,14 @@ fn a_replacement_racing_a_constraint_creation_does_not_lose_it() {
 
     let mut txn = db.begin_catalog_txn();
     let mut replacement = user_definition();
-    db.stage_label_definition(&mut txn, &mut replacement, ExistingDefinition::Replace)
+    replacement.add_property(PropertyDef::new("nick", PropertyType::String));
+    let staged = db
+        .stage_declarations(
+            &mut txn,
+            vec![(replacement, Existing::Replace)],
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("stage the replacement");
     // NOT NULL: a uniqueness constraint's backfill would wait for the staged
     // transaction above to end, which is the point of that wait.
@@ -181,7 +189,7 @@ fn a_replacement_racing_a_constraint_creation_does_not_lose_it() {
         .expect("the concurrent constraint commits first");
 
     assert!(matches!(
-        catalog_error(db.commit_catalog_txn(txn).unwrap_err()),
+        catalog_error(db.finish_publication(txn, staged).unwrap_err()),
         ExecutionError::Conflict(_)
     ));
     assert_eq!(constraint_names(&db), vec!["user_age".to_string()]);
@@ -198,16 +206,24 @@ fn a_replacement_racing_a_constraint_drop_does_not_bring_it_back() {
 
     let mut txn = db.begin_catalog_txn();
     let mut replacement = user_definition();
-    db.stage_label_definition(&mut txn, &mut replacement, ExistingDefinition::Replace)
+    replacement.add_property(PropertyDef::new("nick", PropertyType::String));
+    let staged = db
+        .stage_declarations(
+            &mut txn,
+            vec![(replacement, Existing::Replace)],
+            Vec::new(),
+            Vec::new(),
+        )
         .expect("stage the replacement");
-    assert!(
-        replacement.constraint("user_age").is_some(),
-        "the staged replacement carries the constraint it read"
+    assert_eq!(
+        staged.objects[0].disposition,
+        super::super::Disposition::Changed,
+        "the replacement is staged over the definition carrying the constraint"
     );
     assert!(db.drop_constraint("user_age", false).expect("drop"));
 
     assert!(matches!(
-        catalog_error(db.commit_catalog_txn(txn).unwrap_err()),
+        catalog_error(db.finish_publication(txn, staged).unwrap_err()),
         ExecutionError::Conflict(_)
     ));
     assert!(constraint_names(&db).is_empty());
@@ -266,10 +282,11 @@ fn a_replacement_stored_nodes_break_leaves_the_previous_definition() {
 
     let mut replacement = user_definition();
     replacement.add_property(PropertyDef::new("age", PropertyType::Int).not_null());
-    assert!(matches!(
-        catalog_error(db.create_label_schema(replacement).unwrap_err()),
-        ExecutionError::SchemaViolation(_)
-    ));
+    let refused = catalog_error(db.create_label_schema(replacement).unwrap_err());
+    assert!(
+        matches!(refused, ExecutionError::SchemaViolation(_)),
+        "{refused:?}"
+    );
 
     let after_schema = db
         .label_schemas()

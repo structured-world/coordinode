@@ -314,6 +314,39 @@ pub enum ExecutionError {
         name: String,
     },
 
+    /// A catalog object of the name exists with another definition than the
+    /// one declared, and the declaration asked for no change. Nothing
+    /// changed.
+    #[error(
+        "{object} '{name}' exists at revision {revision} with another definition; \
+         changing it needs an explicit change naming that revision"
+    )]
+    CatalogObjectDiffers {
+        /// What kind of object holds the name.
+        object: CatalogObject,
+        /// The name.
+        name: String,
+        /// The revision the object is at.
+        revision: u64,
+    },
+
+    /// An explicit change named a revision the object is no longer at (or
+    /// an object that does not exist, as revision `None`). Nothing changed.
+    #[error(
+        "{object} '{name}' is at revision {current:?}, not the expected {expected}; \
+         read it again before changing it"
+    )]
+    CatalogRevisionMismatch {
+        /// What kind of object the change targets.
+        object: CatalogObject,
+        /// The name.
+        name: String,
+        /// The revision the change expected.
+        expected: u64,
+        /// The revision the object is at, `None` when it does not exist.
+        current: Option<u64>,
+    },
+
     /// No catalog object of the name exists. Nothing changed.
     #[error("{object} '{name}' not found")]
     CatalogObjectMissing {
@@ -19524,60 +19557,6 @@ fn name_taken(ctx: &ExecutionContext<'_>, e: ExecutionError) -> ExecutionError {
     }
 }
 
-/// The repair `ON DUPLICATE RENAME target` lets the build of a unique index
-/// over `properties` of `label` make, refused before anything is published
-/// unless the build can make it: the target is one of the properties, and a
-/// string the label lets be rewritten in place.
-fn duplicate_repair(
-    target: Option<&str>,
-    label: &str,
-    properties: &[String],
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<Option<crate::index::DuplicateRepair>, ExecutionError> {
-    let Some(target) = target else {
-        return Ok(None);
-    };
-    let refused = |why: String| {
-        Err(ExecutionError::CatalogRefused(format!(
-            "ON DUPLICATE RENAME {target}: {why}"
-        )))
-    };
-    if !properties.iter().any(|p| p == target) {
-        return refused(format!(
-            "the repaired property must be one the uniqueness covers ({})",
-            properties.join(", ")
-        ));
-    }
-    if let Some(schema) = ctx.load_current_label_schema(label)? {
-        if schema.temporal {
-            // Every version a temporal node held keeps its value, so a
-            // rewrite of the current one leaves the duplicate in the history
-            // the index covers.
-            return refused(format!(
-                ":{label} is temporal; a repair cannot rewrite the versions it keeps"
-            ));
-        }
-        if schema.is_columnar() {
-            return refused(format!(":{label} is a COLUMNAR table"));
-        }
-        match schema.properties.get(target).map(|p| &p.property_type) {
-            None | Some(PropertyType::String) => {}
-            Some(PropertyType::Computed(_)) => {
-                return refused(format!("`{target}` of :{label} is computed and read-only"));
-            }
-            Some(other) => {
-                return refused(format!(
-                    "`{target}` of :{label} is declared {other}; a repair appends a suffix to \
-                     a string"
-                ));
-            }
-        }
-    }
-    Ok(Some(crate::index::DuplicateRepair {
-        property: target.to_string(),
-    }))
-}
-
 /// Publish B-tree index `descriptor` as building, with its build admitted,
 /// in one catalog commit together with `with`: the catalog gives it a new
 /// identity and generation and binds its name, on the condition that no
@@ -19585,7 +19564,7 @@ fn duplicate_repair(
 /// entry of a dropped index can be under it. Writers maintain the index from
 /// this commit on; the build belongs to the engine's executor.
 fn publish_index_build(
-    mut descriptor: crate::index::IndexDescriptor,
+    descriptor: crate::index::IndexDescriptor,
     maintenance: Option<crate::index::IndexProfile>,
     repair: Option<crate::index::DuplicateRepair>,
     ctx: &mut ExecutionContext<'_>,
@@ -19593,7 +19572,6 @@ fn publish_index_build(
         &mut coordinode_storage::engine::transaction::Transaction<'_>,
     ) -> Result<(), coordinode_modality::StoreError>,
 ) -> Result<crate::index::IndexDefinition, ExecutionError> {
-    use coordinode_modality::{IndexStore as _, LocalIndexStore};
     let Some(registry) = ctx.btree_index_registry else {
         return Err(ExecutionError::Unsupported(
             "CREATE INDEX requires btree_index_registry in ExecutionContext".into(),
@@ -19606,30 +19584,16 @@ fn publish_index_build(
     }
 
     let engine = ctx.engine;
-    let store = LocalIndexStore::new(engine);
-    // The binding is resolved once, here, and recorded: a later change of
-    // the namespace default does not reinterpret this index.
-    let (policy, _) = store.index_policy()?;
-    descriptor.maintenance = policy.resolve(maintenance, 1);
-    descriptor.state = IndexState::Building {
-        written: 0,
-        estimated_total: 0,
-    };
-
     let mut published = None;
     // Made durable with the statement's answer, once the build it admits
     // has an outcome or the wait for one ran out ([`await_index_build`]).
     ctx.commit_catalog_change_at(CatalogSync::AtAnswer, |txn| {
-        let def = store.publish_definition_txn(txn, descriptor)?;
-        store.put_build_txn(
+        let def = super::constraint_plan::stage_index_build(
+            engine,
             txn,
-            &crate::index::IndexBuildRecord::accepted(
-                def.id,
-                def.generation,
-                crate::index::BuildFailure::Withdraw,
-            )
-            .repairing(repair.clone()),
-            None,
+            descriptor,
+            maintenance,
+            repair,
         )?;
         published = Some(def);
         with(txn)
@@ -19965,23 +19929,6 @@ fn stored_definition(
     Ok(def.map(|d| (d, version)))
 }
 
-/// The name a constraint created without one gets: its label, properties and
-/// kind, so repeating the statement names the same constraint.
-fn derived_constraint_name(
-    label: &str,
-    properties: &[String],
-    kind: &coordinode_core::schema::definition::ConstraintKind,
-) -> String {
-    use coordinode_core::schema::definition::ConstraintKind;
-    let suffix = match kind {
-        ConstraintKind::Unique => "unique",
-        ConstraintKind::NotNull => "not_null",
-        ConstraintKind::NodeKey => "node_key",
-        ConstraintKind::Type(_) => "type",
-    };
-    format!("{label}_{}_{suffix}", properties.join("_"))
-}
-
 /// The result row of constraint DDL.
 fn constraint_row(
     constraint: &coordinode_core::schema::definition::NodeConstraint,
@@ -20079,42 +20026,43 @@ fn execute_create_constraint(
     shape: OwnedIndexShape,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    use coordinode_core::schema::definition::{ConstraintKind, ConstraintState, NodeConstraint};
+    use super::constraint_plan::{ConstraintRequest, plan_constraint};
+    use coordinode_core::schema::definition::ConstraintState;
     use coordinode_modality::{LocalSchemaStore, SchemaStore as _, StoreError};
 
-    let constraint = NodeConstraint {
-        name: name.map_or_else(
-            || derived_constraint_name(label, properties, kind),
-            str::to_string,
-        ),
+    let request = ConstraintRequest {
+        name: name.map(str::to_string),
+        label: label.to_string(),
         properties: properties.to_vec(),
         kind: kind.clone(),
-        state: ConstraintState::Validating,
         scope: shape.scope.clone(),
+        on_duplicate_rename: shape.on_duplicate_rename.clone(),
+        sparse: shape.sparse,
+        maintenance: shape.maintenance,
     };
-    // A scope narrows which nodes are compared with each other; a key also
-    // requires its values of every node, which a scope cannot narrow.
-    if constraint.scope.is_some() && constraint.kind != ConstraintKind::Unique {
-        return Err(ExecutionError::CatalogRefused(format!(
-            "only a uniqueness can hold among the nodes a predicate admits, not an IS {kind} \
-             constraint"
-        )));
-    }
-    if shape.on_duplicate_rename.is_some() && !constraint.owns_index() {
-        return Err(ExecutionError::CatalogRefused(format!(
-            "ON DUPLICATE RENAME repairs duplicates of a UNIQUE or NODE KEY constraint, not of \
-             an IS {kind} one"
-        )));
-    }
-    let repair = duplicate_repair(shape.on_duplicate_rename.as_deref(), label, properties, ctx)?;
+    let schema = ctx.load_current_label_schema(label)?;
+    let planned = plan_constraint(&request, schema.as_ref())?;
+    let constraint = planned.constraint.clone();
 
     if let Some(holder) = ctx.constraint_label(&constraint.name)? {
         if if_not_exists {
-            let existing = ctx
-                .load_current_label_schema(&holder)?
+            let held = ctx.load_current_label_schema(&holder)?;
+            let existing = held
+                .as_ref()
                 .and_then(|s| s.constraint(&constraint.name).cloned());
-            let existing = existing.as_ref().unwrap_or(&constraint);
-            let mut row = constraint_row(existing, &holder, ("created", false));
+            // The name answers for the constraint asked for only when it
+            // holds that requirement over that label; another one under the
+            // name is a conflict, not the constraint asked for.
+            let Some(existing) = existing
+                .filter(|existing| holder == label && existing.same_requirement(&constraint))
+            else {
+                return Err(ExecutionError::CatalogObjectDiffers {
+                    object: CatalogObject::Constraint,
+                    name: constraint.name,
+                    revision: held.map_or(0, |s| s.schema_revision),
+                });
+            };
+            let mut row = constraint_row(&existing, &holder, ("created", false));
             row.insert(
                 "operation".to_string(),
                 owned_build_operation(&existing.name, ctx),
@@ -20125,7 +20073,6 @@ fn execute_create_constraint(
         }
         return Err(ctx.object_exists(CatalogObject::Constraint, constraint.name));
     }
-    let schema = ctx.load_current_label_schema(label)?;
     if let Some(existing) = schema.as_ref().and_then(|s| {
         s.constraints()
             .iter()
@@ -20141,23 +20088,6 @@ fn execute_create_constraint(
             return Ok(vec![row]);
         }
         return Err(ctx.object_exists(CatalogObject::Constraint, existing.name.clone()));
-    }
-    // The rows of a COLUMNAR table are written outside the transaction a
-    // schema revision binds, so nothing could hold them to the constraint
-    // while it is enabled.
-    if schema.as_ref().is_some_and(LabelSchema::is_columnar) {
-        return Err(ExecutionError::CatalogRefused(format!(
-            "constraints on the COLUMNAR table '{label}' are not supported"
-        )));
-    }
-    if let Some(conflict) = schema
-        .as_ref()
-        .and_then(|s| s.constraint_conflict(&constraint))
-    {
-        return Err(ExecutionError::CatalogRefused(format!(
-            "constraint '{}' cannot hold: {conflict}",
-            constraint.name
-        )));
     }
     if constraint.owns_index()
         && ctx
@@ -20182,9 +20112,6 @@ fn execute_create_constraint(
         }
     };
     let mut published = constraint.clone();
-    if !constraint.owns_index() {
-        published.state = ConstraintState::Active;
-    }
     next.add_constraint(published.clone());
 
     // The commit decides this authoritatively; checking here as well names
@@ -20222,7 +20149,7 @@ fn execute_create_constraint(
             store.claim_constraint_name_txn(txn, &constraint.name, label)
         };
 
-    if !constraint.owns_index() {
+    let Some(owned) = planned.owned_index else {
         let committed = ctx.commit_catalog_change(stage_constraint);
         ctx.label_schema_cache.remove(label);
         committed?;
@@ -20230,27 +20157,11 @@ fn execute_create_constraint(
         let mut row = constraint_row(&published, label, ("created", true));
         row.insert("operation".to_string(), Value::Null);
         return Ok(vec![row]);
-    }
-
-    let mut descriptor =
-        crate::index::IndexDescriptor::compound(&constraint.name, label, properties.to_vec())
-            .unique()
-            .owned_by(&constraint.name);
-    // A node missing a value is not constrained by uniqueness; a key
-    // requires the values, which its per-node part enforces.
-    if shape
-        .sparse
-        .unwrap_or(constraint.kind == ConstraintKind::Unique)
-    {
-        descriptor = descriptor.sparse();
-    }
-    if let Some(scope) = &constraint.scope {
-        descriptor = descriptor.with_filter(scope.clone());
-    }
+    };
     let def = publish_index_build(
-        descriptor,
-        shape.maintenance,
-        repair,
+        owned.descriptor,
+        owned.maintenance,
+        owned.repair,
         ctx,
         &mut stage_constraint,
     );
