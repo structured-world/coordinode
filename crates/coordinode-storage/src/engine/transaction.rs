@@ -1953,14 +1953,17 @@ impl<'a> Transaction<'a> {
             None
         } else {
             let engine: &'a StorageEngine = self.engine;
-            Some(
-                engine
-                    .claim_registry()
-                    .reserve_attempt(&self.claims)
-                    .map_err(|refusal| CommitError::InvariantRefused {
-                        reason: format!("{refusal:?}"),
-                    })?,
-            )
+            let registry = engine.claim_registry();
+            // A commit that waits for one in flight on its keys waits for one
+            // in flight on its claims too: that commit's effect can already
+            // be visible while its reservation is still held.
+            let reserved = match self.overlap_wait {
+                Some(wait) => registry.reserve_attempt_waiting(&self.claims, wait),
+                None => registry.reserve_attempt(&self.claims),
+            };
+            Some(reserved.map_err(|refusal| CommitError::InvariantRefused {
+                reason: format!("{refusal:?}"),
+            })?)
         };
 
         // The scope this commit is about to write, registered together with

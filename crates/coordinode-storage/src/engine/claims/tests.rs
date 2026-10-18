@@ -91,6 +91,41 @@ fn a_destroy_waits_for_the_references_to_go() {
         .expect("with the reference gone the destroy is admissible");
 }
 
+/// A waiting attempt is admitted once the incompatible claim it met is
+/// released within its wait.
+#[test]
+fn a_waiting_attempt_is_admitted_once_the_conflict_is_released() {
+    let reg = ClaimRegistry::new(64);
+    let held = reg.reserve_attempt(&bound_on(7)).expect("first attempt");
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        reg.reserve_attempt_waiting(&bound_on(7), std::time::Duration::from_secs(10))
+            .expect("admitted after the release");
+    });
+}
+
+/// A waiting attempt whose conflict outlives its wait is refused, naming the
+/// holder, as an attempt that does not wait is refused at once.
+#[test]
+fn a_waiting_attempt_is_refused_when_the_conflict_outlives_the_wait() {
+    let reg = ClaimRegistry::new(64);
+    let _held = reg.reserve_attempt(&bound_on(7)).expect("first attempt");
+    let started = std::time::Instant::now();
+    let refusal = reg
+        .reserve_attempt_waiting(&bound_on(7), std::time::Duration::from_millis(100))
+        .err()
+        .expect("the conflict is still there");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+    assert!(
+        matches!(*refusal, ClaimRefusal::Incompatible { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(reg.attempts(), 1, "the refused attempt holds nothing");
+}
+
 /// Releasing returns the budget, so a long-running leader does not leak the
 /// claims of attempts that ended.
 #[test]

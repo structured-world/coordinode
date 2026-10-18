@@ -1012,6 +1012,51 @@ fn a_nested_write_is_judged_by_the_state_it_leaves() {
     );
 }
 
+/// A schema change whose claims meet those of another commit still in flight
+/// on the same label waits for it to finish, as it waits for an overlapping
+/// write, instead of being refused: that commit's effect may already be
+/// visible while its reservation is still held, a window a busy machine
+/// stretches.
+#[test]
+fn a_schema_change_waits_for_a_conflicting_commit_in_flight() {
+    use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, ClaimSet};
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:User {name: 'a'})")
+        .expect("seed");
+
+    // A commit activating the label's schema, between its apply and the
+    // release of its claims.
+    let mut claims = ClaimSet::new();
+    claims.insert(Claim::new(
+        ClaimScope::LabelSchema("User".to_string()),
+        ClaimPredicate::SchemaActivated { revision: 1 },
+        0,
+    ));
+    let in_flight = db
+        .engine()
+        .claim_registry()
+        .reserve_attempt(&claims)
+        .expect("the commit in flight reserves");
+    let released = std::thread::scope(|s| {
+        s.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(in_flight);
+        });
+        db.execute_cypher_shared(
+            "CREATE CONSTRAINT user_name FOR (u:User) REQUIRE u.name IS NOT NULL",
+            None,
+            None,
+            None,
+            None,
+        )
+    });
+    released.expect("the schema change waits for the commit in flight");
+    assert_eq!(
+        stored_state(&db, "User", "user_name"),
+        Some(ConstraintState::Active)
+    );
+}
+
 /// A build that fails over stored duplicates withdraws only its own
 /// constraint: another constraint of the label created while it was being
 /// validated stays active, and the failed one's name is free again.

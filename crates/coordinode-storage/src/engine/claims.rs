@@ -54,6 +54,9 @@ pub enum ClaimRefusal {
 /// edge holds few, and what has to stay bounded is the memory.
 pub struct ClaimRegistry {
     inner: Mutex<Registry>,
+    /// Signalled whenever an attempt releases its claims, for attempts
+    /// waiting on one ([`Self::reserve_attempt_waiting`]).
+    released: parking_lot::Condvar,
     max_claims: usize,
     /// Source of attempt identities for [`Self::reserve_attempt`]. Starts in
     /// the upper half of the range so it never meets an identity a caller
@@ -72,6 +75,7 @@ impl ClaimRegistry {
     pub fn new(max_claims: usize) -> Self {
         Self {
             inner: Mutex::new(Registry::default()),
+            released: parking_lot::Condvar::new(),
             max_claims,
             next_attempt: core::sync::atomic::AtomicU64::new(1 << 63),
         }
@@ -91,6 +95,46 @@ impl ClaimRegistry {
         self.reserve_held(attempt, claims)
     }
 
+    /// [`Self::reserve_attempt`], waiting up to `wait` for the attempts that
+    /// hold an incompatible claim to release theirs, as a commit waits for
+    /// one in flight on its keys. A reservation lasts only while its commit
+    /// runs, so the wait is short; past `wait` the attempt is refused as
+    /// [`Self::reserve_attempt`] would refuse it at once. A full table is
+    /// refused at once.
+    ///
+    /// # Errors
+    ///
+    /// The conflict is still there at the deadline, or the table is full.
+    pub fn reserve_attempt_waiting(
+        &self,
+        claims: &ClaimSet,
+        wait: std::time::Duration,
+    ) -> Result<Reservation<'_>, Box<ClaimRefusal>> {
+        let attempt = self
+            .next_attempt
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + wait;
+        let mut reg = self.inner.lock();
+        loop {
+            match Self::admit(&mut reg, self.max_claims, attempt, claims) {
+                Err(refusal) if matches!(*refusal, ClaimRefusal::Incompatible { .. }) => {
+                    if self.released.wait_until(&mut reg, deadline).timed_out() {
+                        Self::admit(&mut reg, self.max_claims, attempt, claims)?;
+                        break;
+                    }
+                }
+                other => {
+                    other?;
+                    break;
+                }
+            }
+        }
+        Ok(Reservation {
+            registry: self,
+            attempt,
+        })
+    }
+
     /// Reserve `claims` for `attempt`, or say what refused it.
     ///
     /// An attempt that reserves twice replaces its own entry rather than
@@ -100,14 +144,24 @@ impl ClaimRegistry {
         if claims.is_empty() {
             return Ok(());
         }
-        let mut reg = self.inner.lock();
+        Self::admit(&mut self.inner.lock(), self.max_claims, attempt, claims)
+    }
 
+    /// Enter `claims` for `attempt` into the locked table, or say what
+    /// refused them.
+    fn admit(
+        reg: &mut Registry,
+        max_claims: usize,
+        attempt: u64,
+        claims: &ClaimSet,
+    ) -> Result<(), Box<ClaimRefusal>> {
+        if claims.is_empty() {
+            return Ok(());
+        }
         let held_by_this = reg.by_attempt.get(&attempt).map_or(0, ClaimSet::len);
         let would_total = reg.total_claims - held_by_this + claims.len();
-        if would_total > self.max_claims {
-            return Err(Box::new(ClaimRefusal::AtCapacity {
-                limit: self.max_claims,
-            }));
+        if would_total > max_claims {
+            return Err(Box::new(ClaimRefusal::AtCapacity { limit: max_claims }));
         }
 
         for (holder, other) in reg.by_attempt.iter() {
@@ -135,6 +189,7 @@ impl ClaimRegistry {
         let mut reg = self.inner.lock();
         if let Some(set) = reg.by_attempt.remove(&attempt) {
             reg.total_claims -= set.len();
+            self.released.notify_all();
         }
     }
 

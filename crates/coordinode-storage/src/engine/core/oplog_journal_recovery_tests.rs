@@ -1483,16 +1483,24 @@ fn a_journal_and_tables_on_different_devices_recover_together() {
         journal_segments(&journal_dir) > 0 && journal_segments(&tables_dir) == 0,
         "the journal is not on its own device"
     );
+    // Any sync of the journal makes `c` durable too (a background table
+    // flush syncs it first), so whether `c` may survive is read from the
+    // durable view the cut comes down on, not assumed.
+    let now = engine.current_seqno();
+    let c_synced = engine.durable_view(now) == now;
     rig.cut(engine);
     let (engine, _) = rig.open_with(&config);
-    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1, 2]));
+    let edges = if c_synced { vec![1, 2, 3] } else { vec![1, 2] };
+    assert_eq!(two_tree_state(&engine, "a"), (true, edges.clone()));
     assert!(
         two_tree_state(&engine, "b").0,
         "the flushed volatile commit was lost"
     );
-    assert!(
-        !two_tree_state(&engine, "c").0,
-        "a commit neither device synced survived"
+    // Whole or not at all, and only if a device synced it.
+    assert_eq!(
+        two_tree_state(&engine, "c"),
+        (c_synced, edges),
+        "c synced before the cut: {c_synced}"
     );
     rig.cut(engine);
 }
