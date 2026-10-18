@@ -8,7 +8,6 @@ use std::sync::Arc;
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::TimestampOracle;
-use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_query::index::{BuildEnvironment, IndexRegistry, TextIndexRegistry};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
@@ -28,10 +27,12 @@ pub(super) struct DatabaseBuilds {
 }
 
 impl DatabaseBuilds {
-    /// Commit `txn` through the pipeline at majority: a build's writes are
-    /// durable whatever concern a session writes its own data at.
+    /// Commit `txn` through the pipeline at the store's bookkeeping concern,
+    /// whatever concern a session writes its own data at: no answer depends
+    /// on one build step, and a step a crash takes is redone when the build
+    /// resumes.
     fn commit(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError> {
-        let wc = WriteConcern::majority();
+        let wc = self.engine.bookkeeping_concern();
         txn.commit(&CommitContext {
             write_concern: &wc,
             pipeline: Some(self.pipeline.as_ref()),

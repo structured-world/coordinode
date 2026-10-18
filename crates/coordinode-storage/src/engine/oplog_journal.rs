@@ -121,6 +121,16 @@ pub(crate) struct DeferredState {
     /// applied, raised only by a completed sync. The cell belongs to the
     /// engine's pending-commit table, where views and the GC watermark read it.
     durable_ceiling: Arc<AtomicU64>,
+    /// Device flushes the journal completed, for operators and for tests
+    /// that bound how many a workload costs.
+    syncs: AtomicU64,
+}
+
+impl DeferredState {
+    /// See [`Self::syncs`].
+    pub(crate) fn syncs(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
+    }
 }
 
 /// One appended entry not yet durable.
@@ -185,6 +195,7 @@ impl EmbeddedOplog {
                 wake: Wake::default(),
                 urgent: AtomicBool::new(false),
                 durable_ceiling,
+                syncs: AtomicU64::new(0),
             }),
             unsynced: std::collections::VecDeque::new(),
             unsynced_bytes: 0,
@@ -245,7 +256,7 @@ impl EmbeddedOplog {
 
     /// Append `ops`, about `bytes` long, as the next entry and take it as far
     /// as `level` asks.
-    fn append_ops(
+    pub(crate) fn append_ops(
         &mut self,
         ops: Vec<OplogOp>,
         commit_ts: u64,
@@ -378,6 +389,7 @@ impl EmbeddedOplog {
         match synced {
             Ok(()) => {
                 metrics::counter!("coordinode_journal_syncs_total").increment(1);
+                self.deferred.syncs.fetch_add(1, Ordering::Relaxed);
                 self.durable_below = self.durable_below.max(through);
                 while self.unsynced.front().is_some_and(|u| u.index < through) {
                     if let Some(done) = self.unsynced.pop_front() {
@@ -419,14 +431,14 @@ impl EmbeddedOplog {
 
     /// The active segment's path and the length a power cut leaves it at:
     /// every entry not yet durable is cut off. `None` when nothing would be.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn power_cut_point(&self) -> Option<(std::path::PathBuf, u64)> {
         self.manager.power_cut_at(self.durable_below)
     }
 
     /// The active segment's path and the length a killed process leaves it
     /// at; `None` when no segment is active.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn kill_point(&self) -> Option<(std::path::PathBuf, u64)> {
         self.manager.kill_point()
     }
@@ -440,6 +452,17 @@ impl EmbeddedOplog {
     /// the journal forward from a checkpoint's cursor.
     pub(crate) fn read_since(&mut self, from_index: u64) -> StorageResult<Vec<OplogEntry>> {
         self.manager.read_range(from_index, u64::MAX)
+    }
+
+    /// Delete the sealed segments whose every entry is below `below`.
+    pub(crate) fn purge_before(&mut self, below: u64) -> StorageResult<usize> {
+        self.manager.purge_before(below)
+    }
+
+    /// Seal the active segment, so a later [`Self::purge_before`] can take
+    /// it once every entry in it is covered.
+    pub(crate) fn rotate(&mut self) -> StorageResult<()> {
+        self.manager.rotate()
     }
 
     /// Delete segments outside the retention window, except those still
@@ -605,6 +628,7 @@ pub(crate) fn apply_oplog_ops_at(
     ops: &[&OplogOp],
     seqno: u64,
     index: u64,
+    domain: coverage::Domain,
 ) -> StorageResult<()> {
     let mut addressing = crate::engine::installation::Addressing::new(installations, tree, seqno);
     let mut batch = lsm_tree::WriteBatch::with_capacity(ops.len() + 1);
@@ -654,10 +678,7 @@ pub(crate) fn apply_oplog_ops_at(
             }
         }
     }
-    batch.insert(
-        coverage::Domain::Journal.marker_key(index, 0).as_slice(),
-        &[][..],
-    );
+    batch.insert(domain.marker_key(index, 0).as_slice(), &[][..]);
     tree.apply_batch(batch, seqno)?;
     Ok(())
 }

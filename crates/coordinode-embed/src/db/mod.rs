@@ -3743,7 +3743,12 @@ impl Database {
     ) -> Result<u64, DatabaseError> {
         use coordinode_query::index::{BuildError, IndexBuildOutcome};
         match self.index_builds.wait(def.generation, None)? {
-            Some(IndexBuildOutcome::Published { indexed }) => Ok(indexed.unwrap_or(0)),
+            Some(IndexBuildOutcome::Published { indexed }) => {
+                // The build committed unsynced; the caller is told the index
+                // is published only once that is durable, in one sync.
+                self.engine.sync_applied()?;
+                Ok(indexed.unwrap_or(0))
+            }
             Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => {
                 Err(DatabaseError::Execution(v.into()))
             }

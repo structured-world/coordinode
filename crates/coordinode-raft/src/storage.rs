@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use coordinode_core::txn::frame::{DecodeLimits, decode_proposal, encode_proposal};
 use coordinode_core::txn::proposal::{MetadataCommand, Mutation, RaftProposal};
 use coordinode_storage::engine::core::{
-    RaftApplyFence, RaftApplyState, RaftCoverage, StorageEngine,
+    LocalSync, LocalWrite, RaftApplyFence, RaftApplyState, RaftCoverage, StorageEngine,
 };
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
@@ -199,11 +199,16 @@ pub(crate) fn has_other_voters(engine: &StorageEngine, node_id: u64) -> Result<b
 ///
 /// The write or its flush fails.
 pub fn clear_catch_up(engine: &StorageEngine) -> Result<(), io::Error> {
+    // One synced append to the member-local journal replaces the flush of the
+    // whole Raft tree.
     engine
-        .delete(Partition::Raft, KEY_CATCH_UP)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    engine
-        .persist_partition(Partition::Raft)
+        .commit_local(
+            vec![LocalWrite::Delete {
+                partition: Partition::Raft,
+                key: KEY_CATCH_UP.to_vec(),
+            }],
+            LocalSync::BeforeUse,
+        )
         .map_err(|e| io::Error::other(format!("persist the caught-up member: {e}")))
 }
 
@@ -600,23 +605,28 @@ impl LogStore {
         let mut catch_up = recorded;
         if let Some(lost) = committed.filter(|c| Some(*c) > last_log_id) {
             catch_up = catch_up.max(Some(lost));
-            let write = |key: &[u8], id: &LogId| -> Result<(), io::Error> {
-                let bytes = rmp_serde::to_vec(id).map_err(|e| io::Error::other(e.to_string()))?;
-                engine
-                    .put(Partition::Raft, key, &bytes)
-                    .map_err(|e| io::Error::other(e.to_string()))
+            let put = |key: &[u8], id: &LogId| -> Result<LocalWrite, io::Error> {
+                Ok(LocalWrite::Put {
+                    partition: Partition::Raft,
+                    key: key.to_vec(),
+                    value: rmp_serde::to_vec(id).map_err(|e| io::Error::other(e.to_string()))?,
+                })
             };
+            let mut writes = Vec::with_capacity(2);
             if let Some(through) = &catch_up {
-                write(KEY_CATCH_UP, through)?;
+                writes.push(put(KEY_CATCH_UP, through)?);
             }
-            match &last_log_id {
-                Some(end) => write(KEY_COMMITTED, end)?,
-                None => engine
-                    .delete(Partition::Raft, KEY_COMMITTED)
-                    .map_err(|e| io::Error::other(e.to_string()))?,
-            }
+            writes.push(match &last_log_id {
+                Some(end) => put(KEY_COMMITTED, end)?,
+                None => LocalWrite::Delete {
+                    partition: Partition::Raft,
+                    key: KEY_COMMITTED.to_vec(),
+                },
+            });
+            // Both records in one synced journal append, in place of a flush
+            // of the whole Raft tree.
             engine
-                .persist_partition(Partition::Raft)
+                .commit_local(writes, LocalSync::BeforeUse)
                 .map_err(|e| io::Error::other(format!("persist the lost entries: {e}")))?;
             tracing::error!(
                 lost_through = lost.index,
@@ -966,13 +976,19 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
         let bytes = rmp_serde::to_vec(vote).map_err(|e| io::Error::other(e.to_string()))?;
-        self.put(KEY_VOTE, &bytes)?;
         // openraft answers the candidate once this returns; a vote lost in a
-        // crash would let this node grant a second one in the same term. No
-        // journal covers the Raft partition, so its memtable is flushed here.
-        // Votes change once per election, so the flush is rare.
+        // crash would let this node grant a second one in the same term. One
+        // synced append to the member-local journal makes it durable, in place
+        // of a flush of the whole Raft tree.
         self.engine
-            .persist_partition(Partition::Raft)
+            .commit_local(
+                vec![LocalWrite::Put {
+                    partition: Partition::Raft,
+                    key: KEY_VOTE.to_vec(),
+                    value: bytes,
+                }],
+                LocalSync::BeforeUse,
+            )
             .map_err(|e| io::Error::other(format!("persist the vote: {e}")))
     }
 
@@ -1069,35 +1085,14 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         // No append may be answered after the entries it covered are gone.
         self.sync.wait_idle();
 
-        // Read entries to keep before wiping the oplog.
-        let to_keep = if keep_exclusive > 0 {
-            self.oplog
-                .lock()
-                .map_err(|_| io::Error::other("oplog mutex poisoned"))?
-                .read_range(0, keep_exclusive)
-                .map_err(|e| io::Error::other(e.to_string()))?
-        } else {
-            Vec::new()
-        };
-
-        // Delete all segments, then re-append the kept entries.
-        {
-            let mut oplog = self
-                .oplog
-                .lock()
-                .map_err(|_| io::Error::other("oplog mutex poisoned"))?;
-            oplog
-                .truncate_all()
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            for oe in to_keep {
-                oplog
-                    .append(&oe)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-            }
-            // The kept entries were durable before the wipe and must be again
-            // before openraft counts on them.
-            oplog.flush().map_err(|e| io::Error::other(e.to_string()))?;
-        }
+        // Cut the suffix in place: the kept entries are never rewritten, so a
+        // crash midway cannot take any of them (openraft counts on a durable
+        // prefix through every step of a truncation).
+        self.oplog
+            .lock()
+            .map_err(|_| io::Error::other("oplog mutex poisoned"))?
+            .truncate_from(keep_exclusive)
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         *self
             .last_log_id
@@ -1153,11 +1148,19 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 
         // Recorded durably before any segment goes: a crash between the two
         // then leaves segments the record says are purged (skipped on read),
-        // never a record that promises entries already deleted.
+        // never a record that promises entries already deleted. A synced
+        // append to the member-local journal makes it durable, in place of a
+        // flush of the whole Raft tree.
         let bytes = rmp_serde::to_vec(&purged_to).map_err(|e| io::Error::other(e.to_string()))?;
-        self.put(KEY_PURGED, &bytes)?;
         self.engine
-            .persist_partition(Partition::Raft)
+            .commit_local(
+                vec![LocalWrite::Put {
+                    partition: Partition::Raft,
+                    key: KEY_PURGED.to_vec(),
+                    value: bytes,
+                }],
+                LocalSync::BeforeUse,
+            )
             .map_err(|e| io::Error::other(format!("persist the purge point: {e}")))?;
         *self
             .last_purged

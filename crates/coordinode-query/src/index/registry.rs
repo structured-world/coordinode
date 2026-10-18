@@ -217,6 +217,21 @@ struct Registered {
     armed: Arc<AtomicBool>,
 }
 
+/// An index in force, as a lookup through it needs it.
+#[derive(Debug, Clone)]
+pub struct GuardedIndex {
+    /// The definition as registered.
+    pub def: IndexDefinition,
+    /// Whether the use guard of this member's copy of its generation is
+    /// stored in this run. A copy is used as evidence only once it is: see
+    /// [`IndexRegistry::arm_copy`].
+    pub armed: bool,
+    /// The version of the stored definition: a snapshot older than it may
+    /// read a generation its build had not filled yet. `None` for one
+    /// registered without a stored record.
+    pub published: Option<u64>,
+}
+
 /// A unique value a statement claimed. Kept until the statement commits, so
 /// a claim that loses a race can name the node that won it.
 #[derive(Debug, Clone)]
@@ -1146,16 +1161,15 @@ impl IndexRegistry {
             .map(|r| IndexDefinition::clone(&r.def))
     }
 
-    /// The index `id` (owned clone), with whether the use guard of this
-    /// member's copy of its generation is stored in this run. A copy is used
-    /// as evidence only once it is: see [`Self::arm_copy`].
-    pub fn get_guarded(&self, id: IndexId) -> Option<(IndexDefinition, bool)> {
+    /// The index `id` as a lookup uses it: see [`GuardedIndex`].
+    pub fn get_guarded(&self, id: IndexId) -> Option<GuardedIndex> {
         let catalog = self.indexes.read();
         let registered = catalog.by_id.get(&id)?;
-        Some((
-            IndexDefinition::clone(&registered.def),
-            registered.armed.load(Ordering::Acquire),
-        ))
+        Some(GuardedIndex {
+            def: IndexDefinition::clone(&registered.def),
+            armed: registered.armed.load(Ordering::Acquire),
+            published: registered.version,
+        })
     }
 
     /// Store the use guard of this member's copy of `generation`, together

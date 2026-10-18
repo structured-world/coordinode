@@ -53,6 +53,41 @@ fn segment_filename_is_canonical_contract() {
     );
 }
 
+/// A cut in the middle of a sealed segment keeps exactly the entries below
+/// it, across a reopen, removes the segments above it, and takes appends at
+/// the cut index afterwards.
+#[test]
+fn truncate_from_cuts_in_place_and_survives_a_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 3, 3600).expect("open");
+        for i in 1..=10u64 {
+            mgr.append(&make_entry(i, i * 10)).expect("append");
+        }
+        mgr.flush().expect("flush");
+        mgr.truncate_from(5).expect("truncate");
+        let kept: Vec<u64> = mgr
+            .read_range(0, 100)
+            .expect("read")
+            .iter()
+            .map(|e| e.index)
+            .collect();
+        assert_eq!(kept, vec![1, 2, 3, 4]);
+    }
+    let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 3, 3600).expect("reopen");
+    let kept: Vec<u64> = mgr
+        .read_range(0, 100)
+        .expect("read")
+        .iter()
+        .map(|e| e.index)
+        .collect();
+    assert_eq!(kept, vec![1, 2, 3, 4]);
+    mgr.append(&make_entry(5, 999)).expect("append at the cut");
+    mgr.flush().expect("flush");
+    let after = mgr.read_range(5, 6).expect("read");
+    assert_eq!(after.iter().map(|e| e.ts).collect::<Vec<_>>(), vec![999]);
+}
+
 fn test_manager(dir: &Path) -> OplogManager {
     OplogManager::open(
         dir,

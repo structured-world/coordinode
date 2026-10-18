@@ -40,7 +40,7 @@ use coordinode_core::index::encoding::{
 };
 use coordinode_core::index::identity::IdentityAllocator;
 use coordinode_core::txn::proposal::Mutation;
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::core::{LocalSync, LocalWrite, StorageEngine};
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::error::StorageError;
@@ -1624,27 +1624,31 @@ impl IndexStore for LocalIndexStore<'_> {
     }
 
     fn mark_unfit_here(&self, copy: LocalCopy) -> StoreResult<()> {
-        // No journal carries a node-local record: the flush makes it durable.
-        // Written and flushed every time: a key present in memory proves
-        // nothing about an earlier flush that failed.
-        self.engine.put(
-            Partition::Schema,
-            &unfit_here_key(copy.generation),
-            &copy.installation.to_be_bytes(),
+        // Durable before the call returns, every time: a finding is rare, and
+        // a copy whose mark a crash took and that no armed guard covers
+        // would be trusted again on reopen.
+        self.engine.commit_local(
+            vec![LocalWrite::Put {
+                partition: Partition::Schema,
+                key: unfit_here_key(copy.generation),
+                value: copy.installation.to_be_bytes().to_vec(),
+            }],
+            LocalSync::BeforeUse,
         )?;
-        self.engine.persist_partition(Partition::Schema)?;
         Ok(())
     }
 
     fn clear_unfit_here(&self, generations: &[GenerationId]) -> StoreResult<()> {
-        if generations.is_empty() {
-            return Ok(());
-        }
-        for generation in generations {
-            self.engine
-                .delete(Partition::Schema, &unfit_here_key(*generation))?;
-        }
-        self.engine.persist_partition(Partition::Schema)?;
+        // Deferred: a clearing a crash takes leaves the copy marked unfit, so
+        // it is verified again; nothing comes to be trusted early.
+        let writes = generations
+            .iter()
+            .map(|generation| LocalWrite::Delete {
+                partition: Partition::Schema,
+                key: unfit_here_key(*generation),
+            })
+            .collect();
+        self.engine.commit_local(writes, LocalSync::Deferred)?;
         Ok(())
     }
 
@@ -1675,14 +1679,22 @@ impl IndexStore for LocalIndexStore<'_> {
         generation: GenerationId,
         qualification: CopyQualification,
     ) -> StoreResult<()> {
-        self.engine
-            .delete(Partition::Schema, &unfit_here_key(generation))?;
-        self.engine.put(
-            Partition::Schema,
-            &qualified_here_key(generation),
-            &encode("copy qualification", &qualification)?,
+        // Deferred: a qualification a crash takes leaves the copy unqualified
+        // (and any old mark in place), so it is verified again on reopen.
+        self.engine.commit_local(
+            vec![
+                LocalWrite::Delete {
+                    partition: Partition::Schema,
+                    key: unfit_here_key(generation),
+                },
+                LocalWrite::Put {
+                    partition: Partition::Schema,
+                    key: qualified_here_key(generation),
+                    value: encode("copy qualification", &qualification)?,
+                },
+            ],
+            LocalSync::Deferred,
         )?;
-        self.engine.persist_partition(Partition::Schema)?;
         Ok(())
     }
 
@@ -1691,35 +1703,41 @@ impl IndexStore for LocalIndexStore<'_> {
         qualified: &[(GenerationId, CopyQualification)],
         unfit: &[LocalCopy],
     ) -> StoreResult<()> {
+        let mut writes = Vec::new();
         for (generation, _) in self.list_qualified_here()? {
             if !qualified.iter().any(|(g, _)| *g == generation) {
-                self.engine
-                    .delete(Partition::Schema, &qualified_here_key(generation))?;
+                writes.push(LocalWrite::Delete {
+                    partition: Partition::Schema,
+                    key: qualified_here_key(generation),
+                });
             }
         }
         for (generation, qualification) in qualified {
-            self.engine.put(
-                Partition::Schema,
-                &qualified_here_key(*generation),
-                &encode("copy qualification", qualification)?,
-            )?;
+            writes.push(LocalWrite::Put {
+                partition: Partition::Schema,
+                key: qualified_here_key(*generation),
+                value: encode("copy qualification", qualification)?,
+            });
         }
         for copy in unfit {
-            self.engine
-                .delete(Partition::Schema, &qualified_here_key(copy.generation))?;
-            self.engine.put(
-                Partition::Schema,
-                &unfit_here_key(copy.generation),
-                &copy.installation.to_be_bytes(),
-            )?;
+            writes.push(LocalWrite::Delete {
+                partition: Partition::Schema,
+                key: qualified_here_key(copy.generation),
+            });
+            writes.push(LocalWrite::Put {
+                partition: Partition::Schema,
+                key: unfit_here_key(copy.generation),
+                value: copy.installation.to_be_bytes().to_vec(),
+            });
         }
-        // A flush persists the tree's writes as a prefix: the record's
-        // removal, written last, reaches the disk no earlier than the rest.
-        self.engine.delete(
-            Partition::Schema,
-            coordinode_storage::engine::index_copies::INDEX_TRANSFER_KEY,
-        )?;
-        self.engine.persist_partition(Partition::Schema)?;
+        // One entry, so the record's removal reaches the disk with the rest
+        // or not at all. Durable at once: transfers are rare, and the marks
+        // it carries over are findings.
+        writes.push(LocalWrite::Delete {
+            partition: Partition::Schema,
+            key: coordinode_storage::engine::index_copies::INDEX_TRANSFER_KEY.to_vec(),
+        });
+        self.engine.commit_local(writes, LocalSync::BeforeUse)?;
         Ok(())
     }
 
@@ -1750,26 +1768,31 @@ impl IndexStore for LocalIndexStore<'_> {
     }
 
     fn arm_here(&self, copies: &[LocalCopy]) -> StoreResult<()> {
-        if copies.is_empty() {
-            return Ok(());
-        }
-        for copy in copies {
-            self.engine
-                .put(Partition::Schema, &armed_here_key(*copy), &[])?;
-        }
-        self.engine.persist_partition(Partition::Schema)?;
+        // Durable before the copies are used: a use whose finding a crash
+        // takes must leave an armed guard behind.
+        let writes = copies
+            .iter()
+            .map(|copy| LocalWrite::Put {
+                partition: Partition::Schema,
+                key: armed_here_key(*copy),
+                value: Vec::new(),
+            })
+            .collect();
+        self.engine.commit_local(writes, LocalSync::BeforeUse)?;
         Ok(())
     }
 
     fn disarm_here(&self, copies: &[LocalCopy]) -> StoreResult<()> {
-        if copies.is_empty() {
-            return Ok(());
-        }
-        for copy in copies {
-            self.engine
-                .delete(Partition::Schema, &armed_here_key(*copy))?;
-        }
-        self.engine.persist_partition(Partition::Schema)?;
+        // Deferred: a clean shutdown syncs the journal, and a closure a crash
+        // takes leaves the guard armed, so the copy is verified again.
+        let writes = copies
+            .iter()
+            .map(|copy| LocalWrite::Delete {
+                partition: Partition::Schema,
+                key: armed_here_key(*copy),
+            })
+            .collect();
+        self.engine.commit_local(writes, LocalSync::Deferred)?;
         Ok(())
     }
 
@@ -1786,24 +1809,30 @@ impl IndexStore for LocalIndexStore<'_> {
             return Ok(Vec::new());
         }
         let marked: Vec<LocalCopy> = armed.iter().copied().filter(installed).collect();
-        // A flush persists the tree's writes as a prefix: the guards' removal,
-        // written after the marks, reaches the disk no earlier than they do.
+        let mut writes = Vec::new();
         for generation in &stale_marks {
-            self.engine
-                .delete(Partition::Schema, &unfit_here_key(*generation))?;
+            writes.push(LocalWrite::Delete {
+                partition: Partition::Schema,
+                key: unfit_here_key(*generation),
+            });
         }
         for copy in &marked {
-            self.engine.put(
-                Partition::Schema,
-                &unfit_here_key(copy.generation),
-                &copy.installation.to_be_bytes(),
-            )?;
+            writes.push(LocalWrite::Put {
+                partition: Partition::Schema,
+                key: unfit_here_key(copy.generation),
+                value: copy.installation.to_be_bytes().to_vec(),
+            });
         }
         for copy in &armed {
-            self.engine
-                .delete(Partition::Schema, &armed_here_key(*copy))?;
+            writes.push(LocalWrite::Delete {
+                partition: Partition::Schema,
+                key: armed_here_key(*copy),
+            });
         }
-        self.engine.persist_partition(Partition::Schema)?;
+        // One entry: the guards go only with the marks that replace them.
+        // Deferred: an entry a crash takes leaves the guards armed, and the
+        // next open recovers them the same way.
+        self.engine.commit_local(writes, LocalSync::Deferred)?;
         Ok(marked)
     }
 

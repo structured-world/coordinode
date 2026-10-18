@@ -13,6 +13,7 @@ pub(crate) mod coverage;
 pub(crate) mod flush;
 pub mod index_copies;
 pub mod installation;
+pub(crate) mod local_journal;
 pub mod local_pipeline;
 pub mod merge;
 pub mod metadata;

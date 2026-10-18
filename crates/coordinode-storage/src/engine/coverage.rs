@@ -29,6 +29,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 
+use crate::engine::partition::Partition;
 use crate::engine::{StorageGuard, StorageIter};
 use crate::error::{StorageError, StorageResult};
 
@@ -50,6 +51,9 @@ pub(crate) enum Domain {
     Journal,
     /// The Raft log index; `sub` is the proposal's position in its entry.
     Raft,
+    /// The member-local journal's entry index: this member's own recovery
+    /// records on a store whose log is a consensus log.
+    Local,
 }
 
 impl Domain {
@@ -57,6 +61,7 @@ impl Domain {
         match self {
             Self::Journal => b'j',
             Self::Raft => b'r',
+            Self::Local => b'l',
         }
     }
 
@@ -279,6 +284,26 @@ pub(crate) struct Coverage {
     /// Per `STORAGE COLUMNAR` table, the indices marked in its tree and not
     /// folded yet: a table fold removes them by name.
     table_markers: parking_lot::Mutex<HashMap<String, Vec<u64>>>,
+    /// Per partition ([`Partition::position`]), one past the highest index
+    /// applied to it in this process; 0 when none was. A fold writes only the
+    /// trees an index in its range reached: a tree no entry of the range
+    /// touched holds no marker there to fold, and a base for it would only
+    /// make a table to flush.
+    touched: [AtomicU64; Partition::COUNT],
+    /// Per partition, the base this process last wrote to its tree; 0 before
+    /// the first. A fold removes the tree's markers from here up.
+    based: [AtomicU64; Partition::COUNT],
+}
+
+/// Which trees a fold writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldScope {
+    /// The trees an entry of the folded range reached: the routine fold that
+    /// keeps markers from piling up.
+    Touched,
+    /// Every tree: before a purge, whose bound must hold in every tree, and
+    /// before a checkpoint, whose replay floor is the lowest base.
+    All,
 }
 
 impl Coverage {
@@ -291,7 +316,32 @@ impl Coverage {
             folded: parking_lot::Mutex::new(0),
             folded_hint: AtomicU64::new(0),
             table_markers: parking_lot::Mutex::new(HashMap::new()),
+            touched: core::array::from_fn(|_| AtomicU64::new(0)),
+            based: core::array::from_fn(|_| AtomicU64::new(0)),
         }
+    }
+
+    /// The base this process last wrote to `partition`'s tree.
+    pub(crate) fn based(&self, partition: Partition) -> u64 {
+        self.based[partition.position()].load(Ordering::Acquire)
+    }
+
+    /// Record that `partition`'s tree now carries the base `next`.
+    pub(crate) fn note_based(&self, partition: Partition, next: u64) {
+        self.based[partition.position()].fetch_max(next, Ordering::AcqRel);
+    }
+
+    /// Record that entry `index` applied effects to `partition`. Called
+    /// before the entry is marked applied, so a fold that covers `index`
+    /// sees it.
+    pub(crate) fn note_touched(&self, partition: Partition, index: u64) {
+        // Indices are far below u64::MAX: one per commit.
+        self.touched[partition.position()].fetch_max(index + 1, Ordering::AcqRel);
+    }
+
+    /// Whether an entry at or above `from` reached `partition`.
+    pub(crate) fn touched_since(&self, partition: Partition, from: u64) -> bool {
+        self.touched[partition.position()].load(Ordering::Acquire) > from
     }
 
     /// Record that `table`'s tree now holds the marker for `index`.

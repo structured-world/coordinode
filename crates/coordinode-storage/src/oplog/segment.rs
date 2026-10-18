@@ -861,7 +861,7 @@ impl SegmentWriter {
     /// This segment's path, and the file length a power cut leaves when
     /// every entry from `index` on was never synced: the offset of the first
     /// such frame. `None` when the segment holds none of them.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn power_cut_at(&self, index: u64) -> Option<(PathBuf, u64)> {
         let first = self.frames.partition_point(|&(i, _)| i < index);
         self.frames
@@ -871,7 +871,7 @@ impl SegmentWriter {
 
     /// This segment's path, and the file length a killed process leaves:
     /// what the writer handed to the operating system, without its buffer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn kill_point(&self) -> (PathBuf, u64) {
         let logical = HEADER_SIZE + self.total_bytes;
         (self.path.clone(), logical - self.file.buffer().len() as u64)

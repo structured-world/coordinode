@@ -316,9 +316,9 @@ fn a_finding_survives_power_loss_before_any_maintenance() {
     assert!(reg.is_suspect(index.generation));
 }
 
-/// A mark whose write or flush failed has unknown durability: the statement
+/// A mark whose write or sync failed has unknown durability: the statement
 /// that found it goes on (it answers from the records), the copy stays unfit
-/// here, nothing writes the mark again (a retry after a failed flush proves
+/// here, nothing writes the mark again (a retry after a failed sync proves
 /// nothing), and the copy's use guard is not closed, so the next open still
 /// finds the copy unfit.
 #[test]
@@ -330,9 +330,9 @@ fn a_mark_whose_flush_failed_is_not_retried_and_keeps_the_guard() {
         let reg = IndexRegistry::new();
         existing_copy(&engine, index.generation);
         assert!(reg.arm_copy(&engine, index.generation), "armed before use");
-        // Every open fails from here: a single failure could be taken by the
-        // engine's own background work instead of the mark's flush.
-        rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
+        // The mark is made durable by the journal's sync, which fails from
+        // here on, as on a disk that stopped taking writes.
+        engine.fail_journal_syncs();
         report(&reg, &engine, &index, 7);
         assert!(reg.is_suspect(index.generation), "unfit here regardless");
         // Whatever follows must not ask for the mark to be written, removed
@@ -369,14 +369,15 @@ fn a_finding_whose_mark_failed_is_among_the_findings() {
     let index = btree("user_email", "email", 1);
     existing_copy(&engine, index.generation);
     assert!(reg.findings().is_empty());
-    rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
+    // The mark's journal sync fails.
+    engine.fail_journal_syncs();
     report(&reg, &engine, &index, 7);
     let findings = reg.findings();
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].0, index.generation);
 }
 
-/// A removal whose flush failed may or may not have reached the disk: the
+/// A removal whose sync failed may or may not have reached the disk: the
 /// mark is no longer taken as stored, nothing writes or removes it again,
 /// and the copy stays unfit here under its open guard.
 #[test]
@@ -388,12 +389,12 @@ fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
     assert!(reg.arm_copy(&engine, index.generation));
     report(&reg, &engine, &index, 7);
     let started = reg.local_revision(index.generation);
-    // Every open fails from here: a single failure could be taken by the
-    // engine's own background work instead of the removal's flush.
-    rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
+    // The removal is made durable by the journal's sync, which fails from
+    // here on.
+    engine.fail_journal_syncs();
     assert!(
         reg.verified_here(&engine, &index, started, 0).is_err(),
-        "the removal's flush failed"
+        "the removal's sync failed"
     );
     assert!(reg.is_suspect(index.generation), "unfit here regardless");
     // Whatever follows must not ask for the mark to be written or removed.
@@ -411,17 +412,13 @@ fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
     assert!(reg.is_suspect(index.generation));
 }
 
-/// The same holds when the flush itself is refused at its sync, not at
-/// opening its file: a mark whose sync failed, or a removal whose sync
-/// failed, leaves the mark of unknown state, with no further I/O for it and
-/// the guard left open. A memtable flush syncs its table with `sync_all`,
-/// so that is the sync failed here. Every sync fails from that point: a
-/// single failure could be taken by the engine's own background flush or
-/// compaction instead of the step under test, and nothing after it may
-/// touch the disk anyway.
+/// A mark whose sync failed, or a removal whose sync failed, leaves the mark
+/// of unknown state, with no further I/O for it and the guard left open, and
+/// the copy unfit after a power cut and a restart. The journal's sync is the
+/// one that makes either durable; it fails from that point on, so nothing
+/// after it may touch the disk anyway.
 #[test]
 fn a_failed_sync_leaves_the_mark_of_unknown_durability() {
-    use coordinode_test_fixtures::FaultOp;
     let index = btree("user_email", "email", 1);
     for removal in [false, true] {
         let rig = coordinode_test_fixtures::PowerRig::new();
@@ -433,13 +430,13 @@ fn a_failed_sync_leaves_the_mark_of_unknown_durability() {
             if removal {
                 report(&reg, &engine, &index, 7);
                 let started = reg.local_revision(index.generation);
-                rig.fail_from(FaultOp::SyncAll, 0);
+                engine.fail_journal_syncs();
                 assert!(
                     reg.verified_here(&engine, &index, started, 0).is_err(),
                     "the removal's sync failed"
                 );
             } else {
-                rig.fail_from(FaultOp::SyncAll, 0);
+                engine.fail_journal_syncs();
                 report(&reg, &engine, &index, 7);
             }
             assert!(reg.is_suspect(index.generation));
@@ -467,8 +464,9 @@ fn a_failed_sync_leaves_the_mark_of_unknown_durability() {
 }
 
 /// Marks are recovery state the free-space reserve exists for: a disk below
-/// the reserve, where client writes are refused, still takes the mark, so
-/// a restart finds the copy unfit whatever space is free then.
+/// the reserve, where client writes are refused, still takes the mark (out
+/// of the reserve's upper half), so a restart finds the copy unfit whatever
+/// space is free then.
 #[test]
 fn a_mark_is_written_below_the_free_space_reserve() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -476,7 +474,8 @@ fn a_mark_is_written_below_the_free_space_reserve() {
     {
         let engine = test_engine(dir.path());
         let reg = IndexRegistry::new();
-        engine.space().set_reserve(u64::MAX, u64::MAX);
+        let free = engine.space().available_bytes();
+        engine.space().set_reserve(free + (64 << 20), u64::MAX);
         assert!(engine.space().is_paused(), "client writes are refused");
         assert!(reg.arm_copy(&engine, index.generation), "the guard too");
         report(&reg, &engine, &index, 7);
@@ -500,13 +499,12 @@ fn a_copy_is_armed_once_per_run() {
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
     reg.register_in_memory(index.clone());
-    let (_, armed) = reg.get_guarded(index.id).expect("registered");
+    let armed = reg.get_guarded(index.id).expect("registered").armed;
     assert!(!armed, "not armed before its first use");
     assert!(reg.arm_copy(&engine, index.generation));
     assert_eq!(reg.recovery_flushes(), 1);
     for _ in 0..1000 {
-        let (_, armed) = reg.get_guarded(index.id).expect("registered");
-        assert!(armed);
+        assert!(reg.get_guarded(index.id).expect("registered").armed);
     }
     assert!(reg.arm_copy(&engine, index.generation));
     assert_eq!(
@@ -519,7 +517,7 @@ fn a_copy_is_armed_once_per_run() {
     // definition's.
     reg.load_all(&engine).expect("load");
     reg.register_in_memory(index.clone());
-    assert!(reg.get_guarded(index.id).expect("registered").1);
+    assert!(reg.get_guarded(index.id).expect("registered").armed);
 }
 
 /// Copies first used at the same time share one flush: each waits for its
@@ -614,18 +612,18 @@ fn a_clean_stop_closes_the_guards() {
 /// the run, without trying the write again on every use.
 #[test]
 fn a_copy_whose_guard_cannot_be_stored_never_serves() {
-    use coordinode_test_fixtures::FaultOp;
     let rig = coordinode_test_fixtures::PowerRig::new();
     let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
     reg.register_in_memory(index.clone());
-    rig.fail_from(FaultOp::SyncAll, 0);
+    // The guard is stored by the journal's sync, which fails.
+    engine.fail_journal_syncs();
     assert!(!reg.arm_copy(&engine, index.generation), "not armed");
     let flushes = reg.recovery_flushes();
     for _ in 0..10 {
         assert!(!reg.arm_copy(&engine, index.generation));
-        assert!(!reg.get_guarded(index.id).expect("registered").1);
+        assert!(!reg.get_guarded(index.id).expect("registered").armed);
     }
     assert_eq!(reg.recovery_flushes(), flushes, "the write is not retried");
 }

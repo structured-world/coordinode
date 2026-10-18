@@ -188,6 +188,72 @@ async fn log_store_truncate_after() {
     assert_eq!(remaining[0].log_id.index, 1);
 }
 
+/// Truncating the log after an index leaves the segments holding the kept
+/// entries in place: the kept prefix is durable at every step, so a crash in
+/// the middle of a truncation cannot take entries openraft relies on. Only
+/// the segments wholly above the cut go, and the one the cut falls in is cut
+/// short; the log reopens with the prefix and takes new entries after it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_truncation_never_removes_the_kept_prefix() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    config.oplog_segment_max_entries = 3;
+    let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+    let mut store = LogStore::open(Arc::clone(&engine)).expect("log store");
+    let entries: Vec<Entry> = (1..=10).map(|i| make_entry(i, 1, "row")).collect();
+    store
+        .append(entries, IOFlushed::noop())
+        .await
+        .expect("append");
+
+    let first_segment = {
+        let oplog = store.oplog.lock().expect("lock");
+        oplog.sealed_segment_paths()[0].to_path_buf()
+    };
+    let inode = std::fs::metadata(&first_segment).expect("stat").ino();
+
+    store
+        .truncate_after(Some(log_id(1, 5)))
+        .await
+        .expect("truncate");
+    assert_eq!(
+        std::fs::metadata(&first_segment)
+            .expect("the kept segment is still there")
+            .ino(),
+        inode,
+        "the segment of the kept prefix was removed and written again"
+    );
+    let kept = store.try_get_log_entries(0..=20).await.expect("read");
+    assert_eq!(
+        kept.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+    drop(store);
+
+    let mut store = LogStore::open(engine).expect("reopen");
+    let kept = store.try_get_log_entries(0..=20).await.expect("read");
+    assert_eq!(kept.len(), 5);
+    store
+        .append(vec![make_entry(6, 2, "after")], IOFlushed::noop())
+        .await
+        .expect("append after the cut");
+    let all = store.try_get_log_entries(0..=20).await.expect("read");
+    assert_eq!(
+        all.last()
+            .map(|e| (e.log_id.index, e.log_id.leader_id.term)),
+        Some((6, 2))
+    );
+}
+
 /// A change stream reports each entry's commit timestamp and the term of the
 /// leader that wrote it; both come from the oplog record, so a record that
 /// left them at zero sent every CDC event with `ts = 0, term = 0`.

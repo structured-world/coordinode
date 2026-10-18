@@ -305,6 +305,11 @@ impl PowerRig {
     pub fn cut(&self, engine: Arc<StorageEngine>) {
         use lsm_tree::fs::{Fault, FaultOp, FaultRule};
         let engine = Arc::into_inner(engine).expect("the cut engine must have no other owner");
+        // The journal is written past the rig's filesystem: its unsynced
+        // tail is cut by hand once the engine is gone (its drop syncs and
+        // seals the segment, which the power cut never let happen).
+        let journal =
+            engine.journal_crash_point(coordinode_storage::engine::core::CrashKind::PowerCut);
         let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
         // The first rule matching an operation owns it even once exhausted,
         // so a spent rule from the test would let that operation through.
@@ -320,6 +325,13 @@ impl PowerRig {
         }
         drop(engine);
         self.faults.clear();
+        if let Some((path, len)) = journal {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(len))
+                .expect("cut the journal segment");
+        }
         self.crash.crash();
     }
 }

@@ -1900,7 +1900,12 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(Err(IndexUnanswered::NotServing));
         };
-        let Some((index, armed)) = registry.get_guarded(id) else {
+        let Some(crate::index::registry::GuardedIndex {
+            def: index,
+            armed,
+            published,
+        }) = registry.get_guarded(id)
+        else {
             return Ok(Err(IndexUnanswered::NotServing));
         };
         // The snapshot this statement reads: a named timestamp, or its own.
@@ -1914,6 +1919,11 @@ impl<'a> ExecutionContext<'a> {
             || index.layout != ENTRY_LAYOUT
         {
             return Ok(Err(IndexUnanswered::NotServing));
+        }
+        // A snapshot before the index was published may read a generation
+        // its build had not filled yet; the records answer it.
+        if published.is_some_and(|at| read_ts < at) {
+            return Ok(Err(IndexUnanswered::Unproved));
         }
         // A copy is evidence only under its stored use guard: one that cannot
         // be guarded answers from the records, as an unproved one does.
@@ -2050,6 +2060,22 @@ impl<'a> ExecutionContext<'a> {
     where
         ExecutionError: From<E>,
     {
+        self.commit_catalog_change_at(CatalogSync::WithCommit, stage)
+    }
+
+    /// [`Self::commit_catalog_change`], made durable where `sync` says: with
+    /// the commit, or by the statement's answer, which syncs once for every
+    /// commit before it ([`Self::sync_for_answer`]).
+    pub fn commit_catalog_change_at<E>(
+        &mut self,
+        sync: CatalogSync,
+        stage: impl FnOnce(
+            &mut coordinode_storage::engine::transaction::Transaction<'_>,
+        ) -> Result<(), E>,
+    ) -> Result<(), ExecutionError>
+    where
+        ExecutionError: From<E>,
+    {
         use coordinode_storage::engine::transaction::{CommitContext, Transaction};
         let mut txn = match self.mvcc_oracle {
             Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
@@ -2062,7 +2088,13 @@ impl<'a> ExecutionContext<'a> {
         // registration lasts from validation to apply) and makes later ones
         // queue behind it.
         txn.wait_for_overlapping_commits(CATALOG_ADMISSION_WAIT);
-        let write_concern = self.write_concern;
+        let write_concern = match sync {
+            CatalogSync::WithCommit => self.write_concern,
+            // The concern the work it starts commits at (unsynced on a store
+            // with its own journal, a majority in a group); the answer then
+            // makes all of it as durable as the statement asked.
+            CatalogSync::AtAnswer => self.engine.bookkeeping_concern(),
+        };
         let outcome = txn
             .commit(&CommitContext {
                 write_concern: &write_concern,
@@ -2072,6 +2104,22 @@ impl<'a> ExecutionContext<'a> {
             .map_err(catalog_commit_error)?;
         if let Some(index) = outcome.applied_index {
             self.write_stats.applied_index = self.write_stats.applied_index.max(Some(index));
+        }
+        Ok(())
+    }
+
+    /// Make what the statement committed so far as durable as its write
+    /// concern asks, before an answer that depends on it: one sync covers its
+    /// [`CatalogSync::AtAnswer`] commits and the internal commits they led to
+    /// (an index build's pages and published record).
+    ///
+    /// # Errors
+    ///
+    /// The journal's sync fails.
+    pub fn sync_for_answer(&self) -> Result<(), ExecutionError> {
+        use coordinode_core::txn::write_concern::Journal;
+        if self.write_concern.journal == Journal::Journal {
+            self.engine.sync_applied()?;
         }
         Ok(())
     }
@@ -2256,15 +2304,18 @@ impl<'a> ExecutionContext<'a> {
     /// statement transaction: the catalog gives it its identities and binds
     /// its name in that commit, so the index exists for every member before
     /// anything is built for it. A name another index holds is refused as
-    /// [`ExecutionError::CatalogObjectExists`].
+    /// [`ExecutionError::CatalogObjectExists`]. `sync` says where the commit
+    /// is made durable: a statement that waits for the build answers with
+    /// [`CatalogSync::AtAnswer`].
     pub fn publish_index_in_catalog(
         &mut self,
         descriptor: crate::index::IndexDescriptor,
+        sync: CatalogSync,
     ) -> Result<crate::index::IndexDefinition, ExecutionError> {
         use coordinode_modality::{IndexStore as _, LocalIndexStore};
         let store = LocalIndexStore::new(self.engine);
         let mut published = None;
-        self.commit_catalog_change(|txn| {
+        self.commit_catalog_change_at(sync, |txn| {
             published = Some(store.publish_definition_txn(txn, descriptor)?);
             Ok::<(), coordinode_modality::StoreError>(())
         })
@@ -19008,12 +19059,11 @@ fn execute_create_text_index(
     };
     // Publish the definition as its own catalog commit, which gives it its
     // identities, so every member sees the index before anything is built.
-    let def = ctx.publish_index_in_catalog(crate::index::IndexDescriptor::text(
-        name,
-        label,
-        properties.clone(),
-        config,
-    ))?;
+    // Made durable with the answer, after the build below commits.
+    let def = ctx.publish_index_in_catalog(
+        crate::index::IndexDescriptor::text(name, label, properties.clone(), config),
+        CatalogSync::AtAnswer,
+    )?;
     let generation = def.generation;
 
     // Register in text index registry (creates tantivy directory + empty index).
@@ -19043,6 +19093,9 @@ fn execute_create_text_index(
             )));
         }
     };
+    // The answer names the index published: the definition, the build and
+    // its published record are made durable first, in one sync.
+    ctx.sync_for_answer()?;
 
     let props_str = properties.join(", ");
     let mut row = Row::new();
@@ -19194,8 +19247,9 @@ fn execute_create_vector_index(
     // applied stream and run their own local backfill (the HNSW graph itself
     // is never replicated, only the data is). The commit's log index is
     // folded into operationTime, so a causal read after a CREATE VECTOR INDEX
-    // fences past the definition's replication.
-    let def = ctx.publish_index_in_catalog(descriptor)?;
+    // fences past the definition's replication. The statement answers once
+    // the build has started, so the definition is durable with its commit.
+    let def = ctx.publish_index_in_catalog(descriptor, CatalogSync::WithCommit)?;
 
     // Register the empty HNSW graph in memory with its tier handle,
     // keyed by the ids bound above. This member's catalog follower may have
@@ -19572,7 +19626,9 @@ fn publish_index_build(
     };
 
     let mut published = None;
-    ctx.commit_catalog_change(|txn| {
+    // Made durable with the statement's answer, once the build it admits
+    // has an outcome or the wait for one ran out ([`await_index_build`]).
+    ctx.commit_catalog_change_at(CatalogSync::AtAnswer, |txn| {
         let def = store.publish_definition_txn(txn, descriptor)?;
         store.put_build_txn(
             txn,
@@ -19628,19 +19684,28 @@ fn await_index_build(
         .submit(def.generation)
         .map_err(ExecutionError::Unsupported)?;
     let wait = wait.unwrap_or_else(|| builds.config().statement_wait);
-    match builds.wait(def.generation, Some(wait))? {
+    let waited = match builds.wait(def.generation, Some(wait))? {
         Some(IndexBuildOutcome::Published { indexed }) => {
-            Ok(BuildWait::Published(indexed.unwrap_or(0)))
+            BuildWait::Published(indexed.unwrap_or(0))
         }
-        Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => Err(unique_violation(v)),
+        Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => {
+            return Err(unique_violation(v));
+        }
         Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
-            Err(ExecutionError::Unsupported(reason))
+            return Err(ExecutionError::Unsupported(reason));
         }
-        Some(IndexBuildOutcome::Cancelled) => Err(ExecutionError::Unsupported(format!(
-            "the build of index '{def}' was cancelled"
-        ))),
-        None => Ok(BuildWait::Running),
-    }
+        Some(IndexBuildOutcome::Cancelled) => {
+            return Err(ExecutionError::Unsupported(format!(
+                "the build of index '{def}' was cancelled"
+            )));
+        }
+        None => BuildWait::Running,
+    };
+    // The answer names the index ready or building: what the statement
+    // committed for it, and the build's records up to its outcome, are made
+    // durable first, in one sync.
+    ctx.sync_for_answer()?;
+    Ok(waited)
 }
 
 /// The result columns naming the build of an index a statement created:
@@ -20452,6 +20517,18 @@ fn execute_procedure_call(
 /// majority write, so this covers a slow replica rather than a stuck one; past
 /// it the change is refused as before.
 pub(crate) const CATALOG_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Where a catalog commit of a statement is made as durable as the
+/// statement's write concern asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogSync {
+    /// With the commit itself: the statement may answer right after it.
+    WithCommit,
+    /// By the statement's answer, after the work the commit starts (an index
+    /// build) has committed too: one sync then covers all of it, and the
+    /// answer is never given from a record a crash could still take.
+    AtAnswer,
+}
 
 /// The error a catalog change fails with when its commit is refused: a record
 /// it was conditioned on, or a key it wrote, changed concurrently, which a

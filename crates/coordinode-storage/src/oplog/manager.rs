@@ -463,14 +463,14 @@ impl OplogManager {
 
     /// The active segment's path and the length a power cut leaves it at
     /// when no entry from `index` on was synced; `None` when it holds none.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn power_cut_at(&self, index: u64) -> Option<(PathBuf, u64)> {
         self.current.as_ref()?.power_cut_at(index)
     }
 
     /// The active segment's path and the length a killed process leaves it
     /// at; `None` when no segment is active.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn kill_point(&self) -> Option<(PathBuf, u64)> {
         self.current
             .as_ref()
@@ -776,8 +776,8 @@ impl OplogManager {
     /// segments (including the newly sealed one) are removed. The manager is
     /// left in a clean empty state, ready for new appends.
     ///
-    /// Used during Raft log truncation: `truncate_after(index)` reads the
-    /// entries to keep, calls `truncate_all`, then re-appends the kept entries.
+    /// Used when the whole log is retired; a log that keeps a prefix is cut
+    /// with [`Self::truncate_from`] instead.
     pub fn truncate_all(&mut self) -> StorageResult<()> {
         if self.current.is_some() {
             self.rotate()?;
@@ -796,6 +796,80 @@ impl OplogManager {
         self.publish_floor();
         Ok(())
     }
+
+    /// Remove every entry from index `from` on, in place: the segments
+    /// wholly at or above it are deleted, newest first, and the segment the
+    /// cut falls in is cut short and sealed again. The entries below `from`
+    /// are never rewritten, so a crash at any step leaves them all, possibly
+    /// with part of the removed suffix still after them; the next call
+    /// removes that too. Returns once the removal is durable, so entries
+    /// appended afterwards at the same indices cannot be overtaken by old
+    /// ones a crash brings back.
+    ///
+    /// # Errors
+    ///
+    /// Reading, cutting or removing a segment fails, or a directory cannot be
+    /// synced.
+    pub fn truncate_from(&mut self, from: u64) -> StorageResult<()> {
+        self.rotate()?;
+        let mut touched_dirs: Vec<PathBuf> = Vec::new();
+        let mut note_dir = |path: &Path| {
+            if let Some(dir) = path.parent() {
+                if !touched_dirs.iter().any(|d| d == dir) {
+                    touched_dirs.push(dir.to_path_buf());
+                }
+            }
+        };
+        // Newest first: what remains is the log's prefix at every step.
+        while let Some((first, path)) = self.sealed.last() {
+            if *first < from {
+                break;
+            }
+            std::fs::remove_file(path)
+                .map_err(|e| StorageError::Io(format!("remove truncated segment {path:?}: {e}")))?;
+            note_dir(path);
+            self.sealed.pop();
+        }
+        if let Some((_, path)) = self.sealed.last() {
+            let frames = crate::oplog::segment::read_frames_from(path, 0)?;
+            if frames.iter().any(|(entry, _)| entry.index >= from) {
+                let kept: Vec<&(OplogEntry, u64)> = frames
+                    .iter()
+                    .take_while(|(entry, _)| entry.index < from)
+                    .collect();
+                let end = kept
+                    .last()
+                    .map_or(crate::oplog::segment::HEADER_SIZE, |&(_, end)| *end);
+                let footer = crate::oplog::segment::SegmentFooter {
+                    entry_count: u32::try_from(kept.len()).map_err(|_| {
+                        StorageError::Io(format!("segment {path:?} holds too many entries"))
+                    })?,
+                    first_ts: kept.first().map_or(0, |(entry, _)| entry.ts),
+                    last_ts: kept.last().map_or(0, |(entry, _)| entry.ts),
+                    total_bytes: end - crate::oplog::segment::HEADER_SIZE,
+                };
+                SegmentWriter::seal_at(path, end, &footer)?;
+                note_dir(path);
+            }
+        }
+        for dir in &touched_dirs {
+            sync_dir(dir)?;
+        }
+        self.publish_floor();
+        Ok(())
+    }
+}
+
+/// Make the removals and length changes in `dir` durable. Windows has no
+/// directory sync; there a removal is as durable as the file system makes it.
+fn sync_dir(dir: &Path) -> StorageResult<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| StorageError::Io(format!("sync oplog dir {dir:?}: {e}")))?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 #[cfg(test)]

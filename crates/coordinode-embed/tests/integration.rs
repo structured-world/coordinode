@@ -25,6 +25,7 @@ mod integration {
     mod encrypted_search;
     mod field_dictionary;
     mod from_engine;
+    mod fsync_budget;
     mod helpers;
     mod historical_index;
     mod hnsw;

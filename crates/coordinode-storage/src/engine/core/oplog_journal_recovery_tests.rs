@@ -410,11 +410,17 @@ impl PowerRig {
         (engine, oracle)
     }
 
+    /// Open the store as a group member opens it: its log is a consensus
+    /// log, so its own records go to the member-local journal.
+    fn open_group(&self, config: &StorageConfig) -> StorageResult<StorageEngine> {
+        StorageEngine::open_with_oracle(config, Arc::new(TimestampOracle::new()))
+    }
+
     /// Lose power: nothing written from now on is durable, the engine goes
     /// away, and every file falls back to what was fsynced before the cut,
     /// the journal's unsynced tail included.
     fn cut(&self, engine: StorageEngine) {
-        let journal = engine.journal_crash_point(true);
+        let journal = engine.journal_crash_point(CrashKind::PowerCut);
         self.stop(engine);
         cut_journal(journal);
         self.crash.crash();
@@ -423,7 +429,7 @@ impl PowerRig {
     /// Kill the process: what it handed to the operating system stays, its
     /// own buffers (the journal's among them) are lost.
     fn kill(&self, engine: StorageEngine) {
-        let journal = engine.journal_crash_point(false);
+        let journal = engine.journal_crash_point(CrashKind::Kill);
         self.stop(engine);
         cut_journal(journal);
     }
@@ -1022,49 +1028,497 @@ fn folded_coverage_survives_a_crash_and_later_entries_replay_once() {
     }
 }
 
+/// Every partition tree of `engine` holds no table: nothing it applied has
+/// been written to disk outside the journal.
+fn holds_no_table(engine: &StorageEngine) -> bool {
+    use lsm_tree::AbstractTree;
+    Partition::all()
+        .iter()
+        .all(|&part| engine.tree(part).expect("tree").table_count() == 0)
+}
+
+/// Opening a fresh store writes no table: its coverage base waits in the
+/// trees' memtables for their first flush, and a store whose trees hold no
+/// table has nothing on disk the journal could disagree with.
 #[test]
-fn a_journal_without_a_coverage_record_is_refused_untouched() {
-    // A store whose journal holds entries but whose trees carry no coverage
-    // record (what a release before apply coverage leaves behind) cannot say
-    // which entries are on disk. Opening it must fail without writing.
-    let dir = TempDir::new().expect("temp dir");
-    {
-        let oracle = Arc::new(TimestampOracle::new());
-        let engine =
-            StorageEngine::open_embedded(&durable_cfg(&dir), oracle.clone()).expect("open");
-        write_batch(
+fn a_fresh_store_opens_without_writing_a_table() {
+    let rig = PowerRig::new();
+    let (engine, _) = rig.open();
+    assert!(
+        holds_no_table(&engine),
+        "opening a fresh store wrote tables"
+    );
+    rig.cut(engine);
+}
+
+/// A power cut before a fresh store's first table flush keeps every
+/// journaled commit: with no table and no coverage record anywhere, the
+/// whole journal replays exactly.
+#[test]
+fn a_power_cut_before_a_fresh_stores_first_flush_keeps_its_commits() {
+    let rig = PowerRig::new();
+    let (engine, oracle) = rig.open();
+    commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Journal);
+    rig.cut(engine);
+    let (engine, oracle) = rig.open();
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1]));
+    commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Journal);
+    rig.cut(engine);
+    let (engine, _) = rig.open();
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1]));
+    assert_eq!(two_tree_state(&engine, "b"), (true, vec![2]));
+    rig.cut(engine);
+}
+
+/// Entries replayed at open are not flushed at open: the journal still
+/// holds them, so a second power cut replays them again, each once.
+#[test]
+fn entries_replayed_at_open_stay_in_the_journal() {
+    let rig = PowerRig::new();
+    let (engine, oracle) = rig.open();
+    commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Journal);
+    rig.cut(engine);
+    let (engine, _) = rig.open();
+    assert!(holds_no_table(&engine), "the replay was flushed at open");
+    rig.cut(engine);
+    let (engine, _) = rig.open();
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1]));
+    rig.cut(engine);
+}
+
+/// Writes that land in two partitions make a persist write tables for those
+/// two trees only: coverage bookkeeping for the journal entries is no reason
+/// to write a table for every other partition.
+#[test]
+fn a_persist_writes_tables_only_for_trees_that_took_writes() {
+    use lsm_tree::AbstractTree;
+    let rig = PowerRig::new();
+    let (engine, oracle) = rig.open();
+    let tables = |engine: &StorageEngine| -> Vec<usize> {
+        Partition::all()
+            .iter()
+            .map(|&part| engine.tree(part).expect("tree").table_count())
+            .collect()
+    };
+    engine.persist().expect("persist");
+    let before = tables(&engine);
+    for i in 0..300u64 {
+        commit_at(
             &engine,
             &oracle,
-            &[Mutation::Put {
-                partition: PartitionId::Node,
-                key: b"node:00:0001".to_vec(),
-                value: b"v".to_vec(),
-            }],
+            &two_tree_commit(&format!("k{i}"), i),
+            Journal::Journal,
         );
-        // Strip the record the way a legacy store never had it.
-        let at = engine.next_seqno();
-        for &part in Partition::all() {
-            let tree = engine.tree(part).expect("tree");
-            let domain = coverage::Domain::Journal;
-            tree.remove(domain.base_key(), at);
-            tree.remove_range(
-                domain.marker_key(0, 0).to_vec(),
-                domain.marker_key(u64::MAX, u32::MAX).to_vec(),
-                at,
-            );
-        }
-        engine.persist().expect("persist");
     }
-    let oracle = Arc::new(TimestampOracle::new());
-    let refused = StorageEngine::open_embedded(&durable_cfg(&dir), oracle);
+    engine.persist().expect("persist");
+    let after = tables(&engine);
+    let written = before.iter().zip(&after).filter(|(b, a)| a > b).count();
+    assert_eq!(
+        written,
+        2,
+        "trees that got a table: {written} of {}",
+        after.len()
+    );
+    rig.cut(engine);
+}
+
+/// A routine coverage fold writes only the trees its entries reached, so the
+/// persist after it writes tables for those trees alone; the fold before a
+/// purge brings every other tree's base up, and the store reopens over the
+/// purged journal with every commit once.
+#[test]
+fn a_routine_fold_writes_only_the_trees_its_entries_reached() {
+    use lsm_tree::AbstractTree;
+    let rig = PowerRig::new();
+    let mut config = rig.config();
+    config.oplog_segment_max_entries = 512;
+    config.oplog_retention_secs = 1;
+    let (engine, oracle) = rig.open_with(&config);
+    let tables = |engine: &StorageEngine| -> Vec<usize> {
+        Partition::all()
+            .iter()
+            .map(|&part| engine.tree(part).expect("tree").table_count())
+            .collect()
+    };
+    engine.persist().expect("persist");
+    let before = tables(&engine);
+    let commits = crate::engine::coverage::FOLD_EVERY + 100;
+    for i in 0..commits {
+        commit_at(
+            &engine,
+            &oracle,
+            &two_tree_commit(&format!("k{i}"), i),
+            Journal::Cache,
+        );
+    }
+    engine.persist().expect("persist");
+    let after = tables(&engine);
+    let written = before.iter().zip(&after).filter(|(b, a)| a > b).count();
+    assert_eq!(written, 2, "a fold wrote tables for untouched trees");
+
+    let purged = engine
+        .oplog_purge_expired(4_000_000_000, u64::MAX)
+        .expect("purge");
+    assert!(purged > 0, "the journal kept every segment");
+    rig.cut(engine);
+    let (engine, _) = rig.open_with(&config);
+    assert!(two_tree_state(&engine, "k0").0, "the first commit lost");
     assert!(
-        matches!(
-            refused,
-            Err(StorageError::CoverageUnprovable { entries: 1, .. })
-        ),
-        "a journal with no coverage record must be refused, got {:?}",
+        two_tree_state(&engine, &format!("k{}", commits - 1)).0,
+        "the last commit lost"
+    );
+    rig.cut(engine);
+}
+
+/// A tree lost whole (its folder gone, recreated empty on open) while the
+/// journal still holds every entry from the first one is rebuilt by
+/// replaying all of them into it; the tree that kept its tables and record
+/// takes none of them a second time.
+#[test]
+fn a_lost_tree_is_rebuilt_from_a_complete_journal() {
+    let rig = PowerRig::new();
+    let (engine, oracle) = rig.open();
+    commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Journal);
+    engine.persist().expect("persist");
+    commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Journal);
+    let adj = rig.config().endpoints[0].path.join(Partition::Adj.name());
+    rig.cut(engine);
+    std::fs::remove_dir_all(&adj).expect("remove the adjacency tree");
+    let (engine, _) = rig.open();
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1, 2]));
+    assert_eq!(two_tree_state(&engine, "b"), (true, vec![1, 2]));
+    rig.cut(engine);
+}
+
+/// A journal segment lost from the middle takes entries no tree covers: the
+/// open refuses rather than replay the entries around the hole as if it were
+/// not there.
+#[test]
+fn a_segment_lost_from_the_middle_of_the_journal_is_refused() {
+    let rig = PowerRig::new();
+    let mut config = rig.config();
+    config.oplog_segment_max_entries = 2;
+    let (engine, oracle) = rig.open_with(&config);
+    for i in 0..6u64 {
+        commit_at(
+            &engine,
+            &oracle,
+            &two_tree_commit(&format!("k{i}"), i),
+            Journal::Journal,
+        );
+    }
+    rig.cut(engine);
+    let journal = config.endpoints[0].path.join("oplog").join("0");
+    let mut segments: Vec<std::path::PathBuf> = std::fs::read_dir(&journal)
+        .expect("journal dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("oplog-") && n.ends_with(".bin"))
+        })
+        .collect();
+    segments.sort();
+    assert!(segments.len() >= 3, "segments: {segments:?}");
+    std::fs::remove_file(&segments[1]).expect("remove a middle segment");
+    let oracle = Arc::new(TimestampOracle::new());
+    let refused = StorageEngine::open_embedded(&config, oracle);
+    assert!(
+        matches!(refused, Err(StorageError::CoverageUnprovable { .. })),
+        "a hole in the journal must be refused, got {:?}",
         refused.err()
     );
+}
+
+/// A tree lost whole after the journal was purged cannot be rebuilt from
+/// what the journal still holds: the open refuses rather than replay part of
+/// its history into an empty tree.
+#[test]
+fn a_lost_tree_behind_a_purged_journal_is_refused() {
+    let rig = PowerRig::new();
+    let mut config = rig.config();
+    config.oplog_segment_max_entries = 2;
+    config.oplog_retention_secs = 1;
+    let (engine, oracle) = rig.open_with(&config);
+    for i in 0..6u64 {
+        commit_at(
+            &engine,
+            &oracle,
+            &two_tree_commit(&format!("k{i}"), i),
+            Journal::Journal,
+        );
+    }
+    let purged = engine
+        .oplog_purge_expired(4_000_000_000, u64::MAX)
+        .expect("purge");
+    assert!(purged > 0, "the journal kept every segment");
+    let adj = config.endpoints[0].path.join(Partition::Adj.name());
+    rig.cut(engine);
+    std::fs::remove_dir_all(&adj).expect("remove the adjacency tree");
+    let oracle = Arc::new(TimestampOracle::new());
+    let refused = StorageEngine::open_embedded(&config, oracle);
+    assert!(
+        matches!(refused, Err(StorageError::CoverageUnprovable { .. })),
+        "a lost tree behind a purged journal must be refused, got {:?}",
+        refused.err()
+    );
+}
+
+/// A group member's own record, put into the Raft tree.
+fn member_put(key: &[u8], value: &[u8]) -> LocalWrite {
+    LocalWrite::Put {
+        partition: Partition::Raft,
+        key: key.to_vec(),
+        value: value.to_vec(),
+    }
+}
+
+/// The member-local journal's segment directory under `config`.
+fn local_journal_dir(config: &StorageConfig) -> std::path::PathBuf {
+    crate::engine::local_journal::LocalJournal::dir(&config.endpoints[0].path)
+}
+
+/// A group member's record needed before use (a vote) costs one sync of the
+/// member-local journal and no table, and a power cut right after keeps it.
+#[test]
+fn a_member_record_before_use_costs_one_journal_sync_and_survives_a_power_cut() {
+    let rig = PowerRig::new();
+    let config = rig.config();
+    let engine = rig.open_group(&config).expect("open");
+    let syncs = engine.journal_syncs().expect("a member-local journal");
+    let flushes = engine.memtable_flushes();
+    engine
+        .commit_local(vec![member_put(b"vote", b"v1")], LocalSync::BeforeUse)
+        .expect("commit");
+    assert_eq!(engine.journal_syncs(), Some(syncs + 1), "journal syncs");
+    assert_eq!(engine.memtable_flushes(), flushes, "tables written");
+    rig.cut(engine);
+    let engine = rig.open_group(&config).expect("reopen");
+    assert_eq!(
+        engine
+            .get(Partition::Raft, b"vote")
+            .expect("get")
+            .as_deref(),
+        Some(b"v1".as_slice())
+    );
+    rig.cut(engine);
+}
+
+/// A deferred record a power cut takes is gone and the store reopens; the
+/// records written after it reuse no index and survive the next cut.
+#[test]
+fn a_deferred_member_record_lost_to_a_power_cut_leaves_the_store_openable() {
+    let rig = PowerRig::new();
+    let config = rig.config();
+    let engine = rig.open_group(&config).expect("open");
+    engine
+        .commit_local(vec![member_put(b"mark", b"m")], LocalSync::Deferred)
+        .expect("commit");
+    rig.cut(engine);
+    let engine = rig.open_group(&config).expect("reopen");
+    assert_eq!(engine.get(Partition::Raft, b"mark").expect("get"), None);
+    engine
+        .commit_local(vec![member_put(b"vote", b"v2")], LocalSync::BeforeUse)
+        .expect("commit");
+    rig.cut(engine);
+    let engine = rig.open_group(&config).expect("reopen");
+    assert_eq!(
+        engine
+            .get(Partition::Raft, b"vote")
+            .expect("get")
+            .as_deref(),
+        Some(b"v2".as_slice())
+    );
+    rig.cut(engine);
+}
+
+/// A flush of a tree holding a deferred record syncs the member-local journal
+/// first: a table never holds an entry the journal lost, which would leave
+/// the tree covering an index no journal holds and refuse every later open.
+#[test]
+fn a_tree_flush_syncs_the_member_local_journal_first() {
+    let rig = PowerRig::new();
+    let config = rig.config();
+    let engine = rig.open_group(&config).expect("open");
+    // A durable record first, so the deferred one sits in the middle of the
+    // journal, where an index lost from it is a hole every tree must cover.
+    engine
+        .commit_local(vec![member_put(b"z", b"0")], LocalSync::BeforeUse)
+        .expect("commit");
+    engine
+        .commit_local(vec![member_put(b"a", b"1")], LocalSync::Deferred)
+        .expect("commit");
+    engine.persist_partition(Partition::Raft).expect("flush");
+    rig.cut(engine);
+    let engine = rig.open_group(&config).expect("reopen");
+    assert_eq!(
+        engine.get(Partition::Raft, b"a").expect("get").as_deref(),
+        Some(b"1".as_slice())
+    );
+    engine
+        .commit_local(vec![member_put(b"b", b"2")], LocalSync::BeforeUse)
+        .expect("commit");
+    rig.cut(engine);
+    let engine = rig
+        .open_group(&config)
+        .expect("reopen after a later record");
+    assert_eq!(
+        engine.get(Partition::Raft, b"b").expect("get").as_deref(),
+        Some(b"2".as_slice())
+    );
+    rig.cut(engine);
+}
+
+/// Compaction folds and flushes only the trees holding member records, drops
+/// the journal segments they cover, and the store reopens over the shortened
+/// journal with every record.
+#[test]
+fn a_compaction_shortens_the_member_local_journal_and_keeps_every_record() {
+    use lsm_tree::AbstractTree;
+    let rig = PowerRig::new();
+    let mut config = rig.config();
+    config.oplog_segment_max_entries = 256;
+    let engine = rig.open_group(&config).expect("open");
+    let tables = |engine: &StorageEngine| -> Vec<usize> {
+        Partition::all()
+            .iter()
+            .map(|&part| engine.tree(part).expect("tree").table_count())
+            .collect()
+    };
+    let before = tables(&engine);
+    let records = 4096 + 10;
+    for i in 0..records {
+        let key = format!("r{i}");
+        engine
+            .commit_local(vec![member_put(key.as_bytes(), b"x")], LocalSync::Deferred)
+            .expect("commit");
+    }
+    let after = tables(&engine);
+    let written = before.iter().zip(&after).filter(|(b, a)| a > b).count();
+    assert_eq!(
+        written, 1,
+        "compaction wrote tables for trees without records"
+    );
+    let segments = std::fs::read_dir(local_journal_dir(&config))
+        .expect("journal dir")
+        .filter_map(Result::ok)
+        .count();
+    assert!(segments <= 2, "the compaction left {segments} segments");
+    engine
+        .commit_local(vec![member_put(b"last", b"y")], LocalSync::BeforeUse)
+        .expect("commit");
+    rig.cut(engine);
+    let engine = rig.open_group(&config).expect("reopen");
+    for key in [
+        "r0".to_owned(),
+        format!("r{}", records - 1),
+        "last".to_owned(),
+    ] {
+        assert!(
+            engine
+                .get(Partition::Raft, key.as_bytes())
+                .expect("get")
+                .is_some(),
+            "{key} lost"
+        );
+    }
+    rig.cut(engine);
+}
+
+/// A segment lost from the middle of the member-local journal takes records
+/// no tree covers: the open refuses rather than replay around the hole.
+#[test]
+fn a_segment_lost_from_the_middle_of_the_member_local_journal_is_refused() {
+    let rig = PowerRig::new();
+    let mut config = rig.config();
+    config.oplog_segment_max_entries = 2;
+    let engine = rig.open_group(&config).expect("open");
+    for i in 0..6u8 {
+        engine
+            .commit_local(vec![member_put(&[b'k', i], b"x")], LocalSync::BeforeUse)
+            .expect("commit");
+    }
+    rig.cut(engine);
+    let mut segments: Vec<std::path::PathBuf> = std::fs::read_dir(local_journal_dir(&config))
+        .expect("journal dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    segments.sort();
+    assert!(segments.len() >= 3, "segments: {segments:?}");
+    std::fs::remove_file(&segments[1]).expect("remove a middle segment");
+    let refused = rig.open_group(&config);
+    assert!(
+        matches!(refused, Err(StorageError::CoverageUnprovable { .. })),
+        "a hole in the member-local journal must be refused, got {:?}",
+        refused.err()
+    );
+}
+
+/// A store that ran in a group and is opened with its own journal keeps the
+/// records the member-local journal still held, and retires that journal.
+#[test]
+fn a_store_leaving_a_group_keeps_the_member_records_and_retires_their_journal() {
+    let rig = PowerRig::new();
+    let config = rig.config();
+    let engine = rig.open_group(&config).expect("open");
+    engine
+        .commit_local(vec![member_put(b"vote", b"v3")], LocalSync::BeforeUse)
+        .expect("commit");
+    rig.cut(engine);
+    let (engine, _) = rig.open_with(&config);
+    assert_eq!(
+        engine
+            .get(Partition::Raft, b"vote")
+            .expect("get")
+            .as_deref(),
+        Some(b"v3".as_slice())
+    );
+    assert!(
+        !local_journal_dir(&config).exists(),
+        "the member-local journal was left behind"
+    );
+    rig.cut(engine);
+    let (engine, _) = rig.open_with(&config);
+    assert_eq!(
+        engine
+            .get(Partition::Raft, b"vote")
+            .expect("get")
+            .as_deref(),
+        Some(b"v3".as_slice())
+    );
+    rig.cut(engine);
+}
+
+/// A member's own record is written while client writes are refused for
+/// space, out of the upper half of the reserve; once free space falls into
+/// the lower half, which the flushes retiring those records need, it is
+/// refused too.
+#[test]
+fn member_records_use_the_upper_half_of_the_space_reserve() {
+    let rig = PowerRig::new();
+    let config = rig.config();
+    let engine = rig.open_group(&config).expect("open");
+    let space = engine.space();
+    let free = space.available_bytes();
+    // Free space just under the reserve: client writes stop, records go on.
+    space.set_reserve(free + (64 << 20), u64::MAX);
+    assert!(space.admit().is_err(), "client writes are admitted");
+    engine
+        .commit_local(vec![member_put(b"vote", b"v")], LocalSync::BeforeUse)
+        .expect("a record within the recovery half");
+    // Free space under half the reserve: the rest is the flushes' to use.
+    space.set_reserve(free.checked_mul(3).expect("a measured disk"), u64::MAX);
+    assert!(
+        matches!(
+            engine.commit_local(vec![member_put(b"vote", b"w")], LocalSync::BeforeUse),
+            Err(StorageError::OutOfSpace { .. })
+        ),
+        "a record took the space its retirement needs"
+    );
+    space.set_reserve(0, 0);
+    rig.cut(engine);
 }
 
 #[test]
@@ -1573,7 +2027,7 @@ fn the_flusher_syncs_a_volatile_commit_within_its_interval() {
         let (engine, oracle) = rig.open_with(&config);
         commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Memory);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while engine.journal_crash_point(true).is_some() {
+        while engine.journal_crash_point(CrashKind::PowerCut).is_some() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the flusher never synced the commit"
@@ -1625,7 +2079,7 @@ fn a_durable_view_excludes_an_unsynced_commit_without_syncing() {
         );
     }
     assert!(
-        engine.journal_crash_point(true).is_some(),
+        engine.journal_crash_point(CrashKind::PowerCut).is_some(),
         "choosing a view synced the journal"
     );
     commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Journal);
@@ -1672,7 +2126,7 @@ fn the_unsynced_tail_is_bounded() {
     let (engine, oracle) = rig.open_with(&config);
     commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Memory);
     assert!(
-        engine.journal_crash_point(true).is_none(),
+        engine.journal_crash_point(CrashKind::PowerCut).is_none(),
         "a write past the cap left the tail unsynced"
     );
     rig.cut(engine);

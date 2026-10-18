@@ -7,6 +7,9 @@
 //! after it are read from the store at the timestamp and evaluated exactly, so
 //! the answer is the one the named snapshot gives, the same as the exact path
 //! (`vector_consistency('exact')`) that evaluates every vector.
+//!
+//! A B-tree index answers only a snapshot that sees it published: an older
+//! one is answered from the records.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -317,6 +320,29 @@ fn as_of_text_match_answers_the_snapshot_of_a_temporal_label() {
     assert_eq!(at(&mut db, "rust", Some(before)), ["x", "y"]);
     assert!(at(&mut db, "golang", Some(before)).is_empty());
     assert!(at(&mut db, "newcomer", Some(before)).is_empty());
+}
+
+/// A B-tree index created after a timestamp does not answer a read at it:
+/// its entries were written by its build, after that timestamp, so at it the
+/// index holds none of them, while the records already hold the node.
+#[test]
+fn a_btree_index_published_after_a_timestamp_does_not_answer_it() {
+    let (mut db, _dir) = open_db();
+    commit(&mut db, "CREATE (:User {name: 'a', email: 'a@x'})");
+    let before = commit(&mut db, "CREATE (:User {name: 'b', email: 'b@x'})");
+    db.execute_cypher("CREATE INDEX user_email ON :User(email)")
+        .expect("create index");
+    let read = |db: &mut Database, as_of: Option<u64>| -> Vec<String> {
+        let as_of = as_of.map_or(String::new(), |ts| format!(" AS OF TIMESTAMP {ts}"));
+        names(
+            &db.execute_cypher(&format!(
+                "MATCH (u:User {{email: 'a@x'}}) RETURN u.name AS name{as_of}"
+            ))
+            .expect("lookup"),
+        )
+    };
+    assert_eq!(read(&mut db, None), ["a"]);
+    assert_eq!(read(&mut db, Some(before)), ["a"]);
 }
 
 /// Each document's BM25 score for `word`, by name, as `db` answers

@@ -143,14 +143,20 @@ impl FieldDictionary {
             .engine
             .pending_commits()
             .obligate(|| self.oracle.next().as_raw());
+        // A registration promises nothing on its own: it is logged ahead of
+        // every entry that uses its ids, so the sync those entries wait for
+        // covers it, and a crash before that loses it together with them.
         self.pipeline
-            .propose_and_wait(&RaftProposal {
-                id: self.proposal_ids.next(),
-                mutations: vec![Mutation::Command(command)],
-                commit_ts: Timestamp::from_raw(commit_ts),
-                start_ts: Timestamp::from_raw(0),
-                bypass_rate_limiter: false,
-            })
+            .propose_with_concern(
+                &RaftProposal {
+                    id: self.proposal_ids.next(),
+                    mutations: vec![Mutation::Command(command)],
+                    commit_ts: Timestamp::from_raw(commit_ts),
+                    start_ts: Timestamp::from_raw(0),
+                    bypass_rate_limiter: false,
+                },
+                &self.engine.bookkeeping_concern(),
+            )
             .map(|_| ())
             .map_err(|e| DictionaryError::Registration(e.to_string()))
     }

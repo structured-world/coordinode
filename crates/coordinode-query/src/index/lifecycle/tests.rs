@@ -395,8 +395,10 @@ fn a_member_that_takes_no_writes_checks_its_own_copy() {
     ));
     env.inject(Some(Fault::NotLeader));
 
+    // The check may end before the admission returns, so it is proved by
+    // what it leaves: the mark lifted with no shared integrity record, which
+    // only a check of this member's own copy does.
     mark_and_admit(&env, &builds, def.generation);
-    assert!(builds.local_check_running(def.generation), "checked here");
     await_local_check(&builds, def.generation);
     assert!(
         !env.registry.is_suspect(def.generation),
@@ -407,6 +409,13 @@ fn a_member_that_takes_no_writes_checks_its_own_copy() {
             .list_unfit_here()
             .expect("marks")
             .is_empty()
+    );
+    assert!(
+        LocalIndexStore::new(&env.engine)
+            .load_integrity(def.generation)
+            .expect("read")
+            .is_none(),
+        "checked here: no shared integrity record"
     );
 
     // b's entry lost on this member alone: its copy disagrees.

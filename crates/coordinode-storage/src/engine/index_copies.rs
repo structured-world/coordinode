@@ -102,8 +102,16 @@ impl StorageEngine {
     ///
     /// The write or its flush failed.
     pub fn begin_index_transfer(&self) -> StorageResult<()> {
-        self.put(Partition::Schema, INDEX_TRANSFER_KEY, &[])?;
-        self.persist_partition(Partition::Schema)
+        // Durable before the transfer replaces anything: a crash midway must
+        // find the record and treat every copy as unqualified.
+        self.commit_local(
+            vec![crate::engine::core::LocalWrite::Put {
+                partition: Partition::Schema,
+                key: INDEX_TRANSFER_KEY.to_vec(),
+                value: Vec::new(),
+            }],
+            crate::engine::core::LocalSync::BeforeUse,
+        )
     }
 
     /// Whether an index transfer was begun and its inventory not taken.

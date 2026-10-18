@@ -167,6 +167,27 @@ impl Partition {
             .is_some_and(|prefix| key.starts_with(prefix))
     }
 
+    /// This partition's position in [`Self::all`], for tables indexed by
+    /// partition.
+    pub(crate) const fn position(self) -> usize {
+        match self {
+            Self::Node => 0,
+            Self::Adj => 1,
+            Self::EdgeProp => 2,
+            Self::Blob => 3,
+            Self::BlobRef => 4,
+            Self::Schema => 5,
+            Self::Idx => 6,
+            Self::Raft => 7,
+            Self::Counter => 8,
+            Self::VectorF32 => 9,
+            Self::Registry => 10,
+        }
+    }
+
+    /// The number of partitions.
+    pub(crate) const COUNT: usize = 11;
+
     /// All partitions in creation order.
     pub fn all() -> &'static [Partition] {
         &[

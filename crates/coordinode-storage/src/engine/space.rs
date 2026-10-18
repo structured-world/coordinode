@@ -86,6 +86,28 @@ impl SpaceGuard {
         Ok(())
     }
 
+    /// Admit a write of the store's own recovery records (index use guards,
+    /// the consensus vote and log bounds), which go on while client writes
+    /// are refused: out of the upper half of the reserve only. The lower half
+    /// is left to the flushes and compactions that retire those records from
+    /// their journal, so recovery never takes the room its own completion
+    /// needs.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::OutOfSpace`] while free space is below half the
+    /// reserve.
+    pub fn admit_recovery(&self) -> StorageResult<()> {
+        if self.is_stale() {
+            self.refresh();
+        }
+        if self.available_bytes() < self.min_free_bytes() / 2 {
+            metrics::counter!("coordinode_storage_out_of_space_refusals_total").increment(1);
+            return Err(self.refusal());
+        }
+        Ok(())
+    }
+
     /// Whether writes are paused, reading free space again if the last
     /// reading is stale.
     pub fn is_paused(&self) -> bool {

@@ -258,16 +258,19 @@ fn window_comes_from_storage_config() {
     let db = Database::open_with_config(config).expect("open");
     assert_eq!(db.retention_window(), Duration::from_secs(42));
     // Republish against the current clock: opening allocated timestamps
-    // after the last recompute. The watermark is taken from the snapshot at
-    // the moment of the republish, so it is compared with a snapshot no
-    // background commit moved while it was computed.
+    // after the last recompute. The window counts back from the durable view
+    // of the snapshot at the moment of the republish (a durable read stands
+    // behind what the journal has not synced yet, and keeps its history), so
+    // it is compared with a durable view no background commit or sync moved
+    // while it was computed.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let (now, oldest) = loop {
         let before = db.engine().snapshot();
+        let durable = db.engine().durable_view(before);
         db.engine().advance_gc_watermark();
         let oldest = db.oldest_readable_timestamp().as_raw();
-        if db.engine().snapshot() == before {
-            break (before, oldest);
+        if db.engine().snapshot() == before && db.engine().durable_view(before) == durable {
+            break (durable, oldest);
         }
         assert!(
             std::time::Instant::now() < deadline,
