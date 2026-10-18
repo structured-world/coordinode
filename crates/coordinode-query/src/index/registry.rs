@@ -1045,11 +1045,18 @@ impl IndexRegistry {
         engine: &StorageEngine,
         index: IndexDefinition,
     ) -> Result<(), StorageError> {
+        // Read under the lock a DROP's `unregister` takes after its commit:
+        // a DROP committed before this read leaves no record and the index
+        // is not brought back; one committed after it removes the entry.
+        let mut indexes = self.indexes.write();
         let version = engine.record_version(
             coordinode_storage::engine::partition::Partition::Schema,
             &index.schema_key(),
         )?;
-        self.insert(index, version);
+        if version.is_none() {
+            return Ok(());
+        }
+        indexes.insert(self.registered(index, version));
         Ok(())
     }
 

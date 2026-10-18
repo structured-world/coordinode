@@ -963,6 +963,32 @@ fn a_vector_index_in_the_registry_gets_no_entries() {
     assert!(all_ids(&engine, &vector).is_empty());
 }
 
+/// A definition dropped between its publication and its registration here
+/// is not brought back: the statement that published it registers it only
+/// while it is still stored, so a DROP that committed first wins.
+#[test]
+fn a_definition_dropped_before_its_registration_is_not_registered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let def = LocalIndexStore::new(&engine)
+        .publish_definition_txn(
+            &mut txn(&engine),
+            crate::index::IndexDescriptor::btree("idx1", "User", "email").unique(),
+        )
+        .expect("publish");
+    engine
+        .delete(
+            coordinode_storage::engine::partition::Partition::Schema,
+            &def.schema_key(),
+        )
+        .expect("the DROP removes the definition");
+
+    let reg = IndexRegistry::new();
+    reg.register_published(&engine, def)
+        .expect("registering a dropped definition is not an error");
+    assert_eq!(reg.get("idx1"), None, "the dropped index came back");
+}
+
 #[test]
 fn load_all_from_storage() {
     let dir = tempfile::tempdir().expect("tempdir");
