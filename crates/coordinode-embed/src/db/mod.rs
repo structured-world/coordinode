@@ -3634,7 +3634,21 @@ impl Database {
         DatabaseError: From<E>,
     {
         let mut txn = self.begin_catalog_txn();
-        stage(&mut txn)?;
+        if let Err(refused) = stage(&mut txn) {
+            let refused = DatabaseError::from(refused);
+            // An answer that the object exists is read as "created" by a
+            // caller retrying after a lost reply: it waits for the records
+            // it rests on, which a weaker creating call may not have synced.
+            if matches!(
+                refused,
+                DatabaseError::Execution(ExecutionError::CatalogObjectExists { .. })
+            ) && self.write_concern.journal
+                == coordinode_core::txn::write_concern::Journal::Journal
+            {
+                self.engine.sync_applied()?;
+            }
+            return Err(refused);
+        }
         self.commit_catalog_txn(txn)
     }
 

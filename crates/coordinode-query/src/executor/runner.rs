@@ -2124,6 +2124,18 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
+    /// The answer that catalog `object` `name` already exists, given once
+    /// the records it rests on are as durable as the statement asked
+    /// ([`Self::sync_for_answer`]): a client that retries after a lost reply
+    /// reads it as "created", though the statement that created it may not
+    /// have waited for a sync. A failed sync is the answer instead.
+    pub fn object_exists(&self, object: CatalogObject, name: String) -> ExecutionError {
+        match self.sync_for_answer() {
+            Ok(()) => ExecutionError::CatalogObjectExists { object, name },
+            Err(failed) => failed,
+        }
+    }
+
     /// Commit `mutations` as one log entry of their own, outside the
     /// statement transaction: DDL whose effects land together or not at all,
     /// such as an index definition and the range tombstone clearing the
@@ -2319,7 +2331,7 @@ impl<'a> ExecutionContext<'a> {
             published = Some(store.publish_definition_txn(txn, descriptor)?);
             Ok::<(), coordinode_modality::StoreError>(())
         })
-        .map_err(name_taken)?;
+        .map_err(|e| name_taken(self, e))?;
         published.ok_or_else(|| {
             ExecutionError::Unsupported("the index publication staged no definition".into())
         })
@@ -18085,10 +18097,7 @@ fn execute_create_node_type(
     // Reject if the label already has a schema; a concurrent definition of
     // the same label refuses this commit.
     if ctx.load_label_schema_for_update(name)?.is_some() {
-        return Err(ExecutionError::CatalogObjectExists {
-            object: CatalogObject::Label,
-            name: name.to_string(),
-        });
+        return Err(ctx.object_exists(CatalogObject::Label, name.to_string()));
     }
 
     // Reject reserved engine-internal property names. `__ingestion_ts__`
@@ -18184,10 +18193,7 @@ fn execute_create_table(
     };
 
     if ctx.load_label_schema_for_update(name)?.is_some() {
-        return Err(ExecutionError::CatalogObjectExists {
-            object: CatalogObject::Label,
-            name: name.to_string(),
-        });
+        return Err(ctx.object_exists(CatalogObject::Label, name.to_string()));
     }
     // Uniqueness of a column is a constraint the table would have to own, not
     // a flag of the column, and a TABLE cannot own one yet: the declaration is
@@ -18320,10 +18326,7 @@ fn execute_create_edge_type(
     //  2. legacy unparametrised existence marker at revision 1 → set by
     //     implicit edge registration in `create_edges_for_correlated_row`.
     if ctx.mvcc_edge_type_exists(name)? {
-        return Err(ExecutionError::CatalogObjectExists {
-            object: CatalogObject::EdgeType,
-            name: name.to_string(),
-        });
+        return Err(ctx.object_exists(CatalogObject::EdgeType, name.to_string()));
     }
 
     let mut schema = EdgeTypeSchema::new(name);
@@ -18484,10 +18487,7 @@ fn execute_create_trigger(
         .get_definition(&mut ctx.txn, &c.name)?
         .is_some()
     {
-        return Err(ExecutionError::CatalogObjectExists {
-            object: CatalogObject::Trigger,
-            name: c.name.clone(),
-        });
+        return Err(ctx.object_exists(CatalogObject::Trigger, c.name.clone()));
     }
 
     validate_trigger_body_source(&c.name, &c.body_source)?;
@@ -19440,10 +19440,7 @@ fn execute_create_btree_index(
     // Indexes and constraints share one namespace: a uniqueness constraint's
     // index carries the constraint's name.
     if ctx.constraint_label(name)?.is_some() {
-        return Err(ExecutionError::CatalogObjectExists {
-            object: CatalogObject::Constraint,
-            name: name.to_string(),
-        });
+        return Err(ctx.object_exists(CatalogObject::Constraint, name.to_string()));
     }
     // A unique index declares the invariant a uniqueness constraint does, so
     // it is that constraint, owning the index: the constraint catalog shows
@@ -19518,13 +19515,10 @@ fn execute_create_btree_index(
 
 /// The error a catalog commit that lost the name race fails with: the
 /// index exists, as when the name was found taken before the commit.
-fn name_taken(e: ExecutionError) -> ExecutionError {
+fn name_taken(ctx: &ExecutionContext<'_>, e: ExecutionError) -> ExecutionError {
     match e {
         ExecutionError::Modality(coordinode_modality::StoreError::IndexNameTaken(name)) => {
-            ExecutionError::CatalogObjectExists {
-                object: CatalogObject::Index,
-                name,
-            }
+            ctx.object_exists(CatalogObject::Index, name)
         }
         other => other,
     }
@@ -19607,10 +19601,7 @@ fn publish_index_build(
     };
     if let Some(name) = &descriptor.name {
         if registry.get(name).is_some() {
-            return Err(ExecutionError::CatalogObjectExists {
-                object: CatalogObject::Index,
-                name: name.clone(),
-            });
+            return Err(ctx.object_exists(CatalogObject::Index, name.clone()));
         }
     }
 
@@ -19643,7 +19634,7 @@ fn publish_index_build(
         published = Some(def);
         with(txn)
     })
-    .map_err(name_taken)?;
+    .map_err(|e| name_taken(ctx, e))?;
     let def = published.ok_or_else(|| {
         ExecutionError::Unsupported("the index publication staged no definition".into())
     })?;
@@ -20128,12 +20119,11 @@ fn execute_create_constraint(
                 "operation".to_string(),
                 owned_build_operation(&existing.name, ctx),
             );
+            // Read as "created" like the answer of the statement that was.
+            ctx.sync_for_answer()?;
             return Ok(vec![row]);
         }
-        return Err(ExecutionError::CatalogObjectExists {
-            object: CatalogObject::Constraint,
-            name: constraint.name,
-        });
+        return Err(ctx.object_exists(CatalogObject::Constraint, constraint.name));
     }
     let schema = ctx.load_current_label_schema(label)?;
     if let Some(existing) = schema.as_ref().and_then(|s| {
@@ -20147,12 +20137,10 @@ fn execute_create_constraint(
                 "operation".to_string(),
                 owned_build_operation(&existing.name, ctx),
             );
+            ctx.sync_for_answer()?;
             return Ok(vec![row]);
         }
-        return Err(ExecutionError::CatalogObjectExists {
-            object: CatalogObject::Constraint,
-            name: existing.name.clone(),
-        });
+        return Err(ctx.object_exists(CatalogObject::Constraint, existing.name.clone()));
     }
     // The rows of a COLUMNAR table are written outside the transaction a
     // schema revision binds, so nothing could hold them to the constraint
@@ -20176,10 +20164,7 @@ fn execute_create_constraint(
             .btree_index_registry
             .is_some_and(|r| r.get(&constraint.name).is_some())
     {
-        return Err(ExecutionError::CatalogObjectExists {
-            object: CatalogObject::Index,
-            name: constraint.name,
-        });
+        return Err(ctx.object_exists(CatalogObject::Index, constraint.name));
     }
 
     let read_revision = schema.as_ref().map(|s| s.schema_revision);
@@ -20380,6 +20365,9 @@ fn execute_drop_constraint(
 
     let Some(label) = ctx.constraint_label(name)? else {
         if if_exists {
+            // Read as "dropped" by a retry after a lost reply, so the drop
+            // it rests on is made durable first.
+            ctx.sync_for_answer()?;
             let mut row = Row::new();
             row.insert("constraint".to_string(), Value::String(name.to_string()));
             row.insert("dropped".to_string(), Value::Bool(false));

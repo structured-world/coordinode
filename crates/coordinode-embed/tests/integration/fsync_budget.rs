@@ -89,6 +89,49 @@ fn creating_an_index_syncs_the_journal_once() {
     assert_eq!(syncs(&db) - before, 1);
 }
 
+/// A repeated CREATE that finds the object answers from durable records:
+/// a client retrying after a lost reply reads `exists` (or the IF NOT EXISTS
+/// row) as "created", so that answer waits for the sync a weaker creating
+/// statement skipped, as a power cut would otherwise take the object back.
+#[test]
+fn an_answer_that_an_object_exists_is_durable() {
+    use coordinode_core::txn::write_concern::WriteConcern;
+    let statements = [
+        (
+            "CREATE INDEX user_email ON :User(email)",
+            "CREATE INDEX user_email ON :User(email)",
+        ),
+        (
+            "CREATE CONSTRAINT user_key FOR (u:User) REQUIRE u.email IS UNIQUE",
+            "CREATE CONSTRAINT user_key IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE",
+        ),
+        (
+            "CREATE CONSTRAINT user_key FOR (u:User) REQUIRE u.email IS UNIQUE",
+            "CREATE CONSTRAINT user_key FOR (u:User) REQUIRE u.email IS UNIQUE",
+        ),
+    ];
+    for (create, repeat) in statements {
+        let dir = tempdir().unwrap();
+        let mut db = open_flusher_held(dir.path());
+        db.execute_cypher("CREATE (:User {email: 'a@x'})").unwrap();
+        db.set_write_concern(WriteConcern::cache());
+        db.execute_cypher(create).unwrap();
+        let now = db.engine().current_seqno();
+        assert!(
+            db.engine().durable_view(now) < now,
+            "setup: `{create}` under a cache concern synced"
+        );
+        db.set_write_concern(WriteConcern::majority());
+        let _answer = db.execute_cypher(repeat);
+        let now = db.engine().current_seqno();
+        assert_eq!(
+            db.engine().durable_view(now),
+            now,
+            "`{repeat}` answered about an object a power cut could still take"
+        );
+    }
+}
+
 /// A statement that answers an index ready answers from a durable
 /// publication: when CREATE INDEX returns, nothing it wrote, the build's
 /// published record included, waits unsynced in the journal, so a power cut
