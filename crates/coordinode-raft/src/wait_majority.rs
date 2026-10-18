@@ -337,7 +337,23 @@ async fn submit_batch(
             }
         }
 
-        let result = tokio::time::timeout(timeout, raft.client_write(request)).await;
+        let leading = crate::authority::leading_term(raft);
+        let write = tokio::time::timeout(timeout, raft.client_write(request));
+        let result = match leading {
+            // A definite answer wins a tie with the loss of authority.
+            Some(term) => tokio::select! {
+                biased;
+                result = write => result,
+                lost = crate::authority::lost(raft, term) => {
+                    for entry in batch {
+                        let _ = entry.response_tx.send(Err(lost.clone()));
+                    }
+                    return;
+                }
+            },
+            // Not leading: the batch is refused at once and says where to.
+            None => write.await,
+        };
 
         match result {
             Ok(Ok(response)) => {
@@ -365,8 +381,16 @@ async fn submit_batch(
                 return;
             }
             Ok(Err(raft_err)) => {
-                // Raft error — check if retryable
-                let proposal_err = convert_raft_error(&raft_err);
+                // A Raft error: check whether it is retryable. A refusal of
+                // a retry says nothing was written by it; the earlier attempt
+                // is in the log, where it may commit, so its outcome is
+                // unknown.
+                let proposal_err = match convert_raft_error(&raft_err) {
+                    ProposalError::NotLeader { .. } if attempt > 0 => {
+                        ProposalError::Timeout { retries: attempt }
+                    }
+                    e => e,
+                };
                 match &proposal_err {
                     ProposalError::NotLeader { .. } => {
                         // Not retryable — forward immediately

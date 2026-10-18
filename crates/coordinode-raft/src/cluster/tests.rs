@@ -200,6 +200,26 @@ async fn single_node_bootstrap_becomes_leader() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A leader that is its own quorum never loses it: a write waiting on it
+/// longer than the lease is not answered as if the leadership were lost,
+/// though no other member ever acknowledges anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_voter_leader_keeps_its_authority_past_the_lease() {
+    let (_dir, engine) = test_engine();
+    let node = RaftNode::single_node(engine).await.expect("bootstrap");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let term = crate::authority::leading_term(node.raft()).expect("the single node leads");
+    let lease = std::time::Duration::from_millis(node.raft().config().election_timeout_max);
+
+    let lost = tokio::time::timeout(lease * 3, crate::authority::lost(node.raft(), term)).await;
+    assert!(
+        lost.is_err(),
+        "a self-quorum leader lost its authority: {lost:?}"
+    );
+
+    node.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn single_node_propose_and_read() {
     let (_dir, engine) = test_engine();

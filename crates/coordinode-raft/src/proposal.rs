@@ -359,7 +359,7 @@ impl RaftProposalPipeline {
         check_proposal(proposal)?;
         self.check_admission()?;
         let mut metrics_rx = self.raft.metrics();
-        let (members, majority) = {
+        let (members, majority, term) = {
             let m = metrics_rx.borrow_watched();
             if !m.state.is_leader() {
                 return Err(ProposalError::NotLeader {
@@ -367,7 +367,7 @@ impl RaftProposalPipeline {
                 });
             }
             let members = m.membership_config.membership().voter_ids().count() as u32;
-            (members, members / 2 + 1)
+            (members, members / 2 + 1, m.current_term)
         };
         if n > members {
             return Err(ProposalError::InvalidWriteConcern(format!(
@@ -406,34 +406,43 @@ impl RaftProposalPipeline {
             },
         };
 
-        loop {
-            let followers = {
-                let m = metrics_rx.borrow_watched();
-                if !m.state.is_leader() {
-                    return Err(ProposalError::NotLeader {
-                        leader_id: m.current_leader,
-                    });
+        // The entry is in this leader's log from here on, where it may commit
+        // under another leader too: a lost leadership leaves its outcome
+        // unknown, never "not written".
+        let acks = async {
+            loop {
+                let followers = {
+                    let m = metrics_rx.borrow_watched();
+                    if !m.state.is_leader() || m.current_term != term {
+                        return Err(ProposalError::LeadershipLost { term });
+                    }
+                    m.replication
+                        .as_ref()
+                        .map(|r| {
+                            r.iter()
+                                .filter(|(id, matched)| {
+                                    **id != m.id && matched.is_some_and(|l| l.index >= index)
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0) as u32
+                };
+                if let Some(outcome) = acks_outcome(index, followers, n, majority, reach) {
+                    metrics::counter!("coordinode_raft_proposals_total", "status" => "ok")
+                        .increment(1);
+                    return Ok(outcome);
                 }
-                m.replication
-                    .as_ref()
-                    .map(|r| {
-                        r.iter()
-                            .filter(|(id, matched)| {
-                                **id != m.id && matched.is_some_and(|l| l.index >= index)
-                            })
-                            .count()
-                    })
-                    .unwrap_or(0) as u32
-            };
-            if let Some(outcome) = acks_outcome(index, followers, n, majority, reach) {
-                metrics::counter!("coordinode_raft_proposals_total", "status" => "ok").increment(1);
-                return Ok(outcome);
+                metrics_rx.changed().await.map_err(|_| {
+                    ProposalError::Raft(
+                        "raft metrics channel closed while waiting for acks".to_string(),
+                    )
+                })?;
             }
-            metrics_rx.changed().await.map_err(|_| {
-                ProposalError::Raft(
-                    "raft metrics channel closed while waiting for acks".to_string(),
-                )
-            })?;
+        };
+        tokio::select! {
+            biased;
+            outcome = acks => outcome,
+            lost = crate::authority::lost(&self.raft, term) => Err(lost),
         }
     }
 
@@ -487,7 +496,18 @@ impl RaftProposalPipeline {
             // Stamped per attempt: a retry is a new hand-over. The caller's
             // own hold covers the timestamp until this returns.
             let (request, _hold) = self.entry(proposal, attempt).await?;
-            let result = tokio::time::timeout(timeout, self.raft.client_write(request)).await;
+            let leading = crate::authority::leading_term(&self.raft);
+            let write = tokio::time::timeout(timeout, self.raft.client_write(request));
+            let result = match leading {
+                // A definite answer wins a tie with the loss of authority.
+                Some(term) => tokio::select! {
+                    biased;
+                    result = write => result,
+                    lost = crate::authority::lost(&self.raft, term) => return Err(lost),
+                },
+                // Not leading: the write is refused at once and says where to.
+                None => write.await,
+            };
 
             match result {
                 Ok(Ok(response)) => {
@@ -513,7 +533,12 @@ impl RaftProposalPipeline {
                     let elapsed = start.elapsed().as_secs_f64();
                     metrics::histogram!("coordinode_raft_proposal_duration_seconds")
                         .record(elapsed);
-                    // Check if it's a ForwardToLeader error
+                    // Check if it's a ForwardToLeader error. For a retry it
+                    // says only that the retry wrote nothing: the earlier
+                    // attempt is in the log, where it may commit.
+                    if attempt > 0 && extract_forward_leader(&raft_err).is_some() {
+                        return Err(ProposalError::Timeout { retries: attempt });
+                    }
                     if let Some(leader) = extract_forward_leader(&raft_err) {
                         metrics::counter!(
                             "coordinode_raft_proposals_total",

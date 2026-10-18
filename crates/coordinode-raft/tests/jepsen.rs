@@ -553,6 +553,47 @@ async fn an_early_answered_volatile_write_is_lost_whole_on_failover() {
     assert!(result.is_ok(), "TIMED OUT after {TEST_TIMEOUT:?}");
 }
 
+/// A write an isolated leader accepted while its quorum lease still held is
+/// answered once that lease runs out, as of unknown outcome, the way a MongoDB
+/// primary answers the writes waiting on it when it steps down: waiting out
+/// the retries for a commit it cannot make would hang the writer for half a
+/// minute and more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_pending_on_an_isolated_leader_is_answered_when_its_lease_ends() {
+    nemesis::heal();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3) = bootstrap_3_node().await;
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        write(&n1, &id_gen, 100, "node:1:pend-base", "base").expect("baseline commit");
+        let lease = Duration::from_millis(n1.node.raft().config().election_timeout_max);
+
+        // Cut off while its lease from the baseline commit still holds, so
+        // the write below is accepted and then can never commit here.
+        nemesis::isolate(1, &[2, 3]);
+        let started = Instant::now();
+        let pending = write(&n1, &id_gen, 110, "node:1:pending", "unknown");
+        let took = started.elapsed();
+        assert!(
+            matches!(pending, Err(ProposalError::LeadershipLost { .. })),
+            "a write left without a quorum must be answered as of unknown outcome, got {pending:?} \
+             after {took:?} (lease {lease:?})"
+        );
+        assert!(
+            took < lease * 2 + Duration::from_secs(1),
+            "answered after {took:?}, though the lease is {lease:?}"
+        );
+
+        nemesis::heal();
+        n1.node.shutdown().await.ok();
+        n2.node.shutdown().await.ok();
+        n3.node.shutdown().await.ok();
+    })
+    .await;
+    nemesis::heal();
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A linearizable read on a leader cut off from its quorum must fail within the
 /// fence timeout: serving it would be a stale read once the majority has moved
 /// on, and waiting without a bound would hang the request for as long as the

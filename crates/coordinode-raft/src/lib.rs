@@ -1,3 +1,4 @@
+mod authority;
 pub mod closure;
 pub mod cluster;
 mod log_sync;

@@ -521,6 +521,15 @@ pub enum ProposalError {
     #[error("not leader, forward to {leader_id:?}")]
     NotLeader { leader_id: Option<u64> },
 
+    /// This node handed the proposal to its log while leading in `term`, and
+    /// can no longer be the one to commit it: it stopped leading, its term
+    /// moved on, or no quorum acknowledged it for a whole lease. Another
+    /// leader may still commit it, so the outcome is unknown, as with the
+    /// answer a MongoDB primary gives the writes waiting on it when it steps
+    /// down.
+    #[error("leadership in term {term} lost while the proposal waited; its outcome is unknown")]
+    LeadershipLost { term: u64 },
+
     /// Raft consensus error (e.g., network, quorum lost).
     #[error("raft error: {0}")]
     Raft(String),
