@@ -218,9 +218,62 @@ fn burst(concern: WriteConcern, name: &str) {
     );
 }
 
+/// Journaled writes the killed writer leaves for the next open to replay.
+const KILLED_WRITES: usize = 2000;
+/// Set to a directory, the bench runs as the killed writer there.
+const KILLED_WRITER: &str = "VOLATILE_KILLED_WRITER";
+
+/// The killed writer: journaled writes, then the process dies without
+/// closing the store, as a crash leaves it.
+fn killed_writer(dir: &std::path::Path) -> ! {
+    let db = open(dir);
+    for k in 0..KILLED_WRITES {
+        write(&db, WriteConcern::majority(), "Killed", k);
+    }
+    std::process::abort()
+}
+
+/// How long an open takes: of a new store, and of one a killed process left
+/// with its journal to replay.
+fn opens() {
+    let mut fresh = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let start = Instant::now();
+        let db = open(dir.path());
+        fresh.push(start.elapsed());
+        drop(db);
+    }
+    report("open new", fresh);
+    let mut recovered = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = std::process::Command::new(std::env::current_exe().expect("own path"))
+            .env(KILLED_WRITER, dir.path())
+            .status()
+            .expect("run the writer");
+        assert!(!status.success(), "the writer was not killed");
+        let start = Instant::now();
+        let db = open(dir.path());
+        recovered.push(start.elapsed());
+        assert_eq!(
+            landed(&db, "Killed"),
+            KILLED_WRITES as u64,
+            "an acknowledged write was lost"
+        );
+    }
+    report(
+        &format!("open after a kill with {KILLED_WRITES} writes"),
+        recovered,
+    );
+}
+
 fn main() {
+    if let Some(dir) = std::env::var_os(KILLED_WRITER) {
+        killed_writer(std::path::Path::new(&dir));
+    }
     // `VOLATILE_PARTS` picks parts by name (`ack`, `commit`, `durable`,
-    // `read`, `burst`); all run when it is unset.
+    // `read`, `burst`, `open`); all run when it is unset.
     let parts = std::env::var("VOLATILE_PARTS").unwrap_or_default();
     let runs = |part: &str| parts.is_empty() || parts.split(',').any(|p| p == part);
     if runs("ack") {
@@ -238,6 +291,9 @@ fn main() {
     }
     if runs("read") {
         reads_over_an_unsynced_tail();
+    }
+    if runs("open") {
+        opens();
     }
     if !runs("burst") {
         return;

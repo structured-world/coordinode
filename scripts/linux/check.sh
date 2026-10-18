@@ -199,6 +199,8 @@ if command -v sccache >/dev/null 2>&1; then sccache --stop-server >/dev/null 2>&
 cargo bench $only_bench > ../bench.log 2>&1
 echo bench=\$? >> ../status.txt
 echo done >> ../status.txt" || true
+  # A local `cargo clean` during the run removes this directory.
+  mkdir -p "$out"
   for f in status.txt bench-build.log bench.log; do
     ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
   done
@@ -242,6 +244,8 @@ if command -v inferno-collapse-perf >/dev/null 2>&1; then
   perf script -i ../perf.data 2>> ../perf.log | inferno-collapse-perf | inferno-flamegraph > ../profile.svg
 fi
 echo done >> ../status.txt" || true
+  # A local `cargo clean` during the run removes this directory.
+  mkdir -p "$out"
   for f in status.txt bench-build.log bench.log perf.log profile.txt profile.svg; do
     ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
   done
@@ -261,6 +265,8 @@ code=\$?
 if [ \$code = 0 ] && grep -Eq '^ *Summary .* [1-9][0-9]* failed' ../test.log; then code=1; fi
 echo nextest=\$code >> ../status.txt
 echo done >> ../status.txt" || true
+  # A local `cargo clean` during the run removes this directory.
+  mkdir -p "$out"
   for f in status.txt test.log; do
     ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
   done
