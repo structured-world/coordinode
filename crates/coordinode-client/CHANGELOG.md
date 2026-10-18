@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-18
+
+### Added
+
+- *(operation)* apply each client write once
+
 ## v0.7.2 - 2026-10-15
 
 ### Fixed

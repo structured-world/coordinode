@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-18
+
+### Performance
+
+- *(storage)* flush the device only where recovery needs it
+
 ## v0.7.2 - 2026-10-15
 
 ### Added

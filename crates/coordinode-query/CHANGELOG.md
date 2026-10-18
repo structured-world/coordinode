@@ -2,6 +2,31 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-18
+
+### Added
+
+- *(operation)* apply each client write once
+- *(embed)* replicated embedded database behind a feature
+
+### Fixed
+
+- *(index)* never register an index dropped since its publication
+- *(query)* answer that an object exists from durable records
+- *(storage)* apply each recovered cache write once
+- *(query)* report the outcome an index check recorded
+- *(query)* register a vector index generation once
+- *(query)* register a text index generation once
+
+### Performance
+
+- *(storage)* flush the device only where recovery needs it
+- *(storage)* defer the log sync of volatile writes, not the write
+
+### Testing
+
+- *(query)* run the N+1 window tests on given instants
+
 ## v0.7.1 - 2026-10-13
 
 ### Added

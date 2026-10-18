@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-18
+
+### Added
+
+- *(operation)* apply each client write once
+
+### Fixed
+
+- *(session)* answer a commit repeated while it resolves
+
 ## v0.7.1 - 2026-10-13
 
 ### Added
