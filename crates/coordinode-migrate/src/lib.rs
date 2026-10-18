@@ -79,9 +79,21 @@ impl Backup {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
-        if std::fs::hard_link(file, &kept).is_err() {
-            std::fs::copy(file, &kept)
-                .with_context(|| format!("keep {} as {}", file.display(), kept.display()))?;
+        match std::fs::hard_link(file, &kept) {
+            Ok(()) => {}
+            // Kept by an earlier pass of this run: that copy holds the
+            // original, and writing onto the name could truncate `file`
+            // itself through the shared link.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // No links on this filesystem: a copy, into a new file only.
+            Err(_) => {
+                let mut source = std::fs::File::open(file)
+                    .with_context(|| format!("open {}", file.display()))?;
+                let mut target = std::fs::File::create_new(&kept)
+                    .with_context(|| format!("create {}", kept.display()))?;
+                std::io::copy(&mut source, &mut target)
+                    .with_context(|| format!("keep {} as {}", file.display(), kept.display()))?;
+            }
         }
         Ok(kept)
     }

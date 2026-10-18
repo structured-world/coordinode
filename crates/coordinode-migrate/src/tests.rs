@@ -146,3 +146,29 @@ fn an_unknown_entry_stops_the_run_before_any_write() {
     assert_eq!(std::fs::read(&path).expect("read"), before);
     assert!(!data.join(BACKUP_DIR).exists());
 }
+
+/// A file kept again under the same run (a run redone after it stopped
+/// between keeping a file and replacing it) leaves both the file and its
+/// backup as they were: the backup already names the file's own bytes, and
+/// a copy onto that name would truncate the file through the shared link.
+#[test]
+fn keeping_a_file_twice_leaves_the_file_and_its_backup_intact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path();
+    let path = data.join("oplog/0/oplog-00000000000000000001.bin");
+    write_segment(&path, &[record(1, vec![0xc1])], true);
+    let before = std::fs::read(&path).expect("read");
+    let backup = crate::Backup::new(data, "run1");
+    let kept = backup.keep(&path).expect("keep");
+    backup.keep(&path).expect("keep again");
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        before,
+        "the file changed"
+    );
+    assert_eq!(
+        std::fs::read(&kept).expect("read"),
+        before,
+        "the backup changed"
+    );
+}

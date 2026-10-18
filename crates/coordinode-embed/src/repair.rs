@@ -73,13 +73,20 @@ pub fn latest_checkpoint(root: &Path) -> Option<PathBuf> {
 pub fn create_checkpoint(engine: &StorageEngine, root: &Path) -> StorageResult<PathBuf> {
     std::fs::create_dir_all(root)
         .map_err(|e| StorageError::Io(format!("create checkpoint root {root:?}: {e}")))?;
-    let next = list_checkpoints(root)?
-        .last()
-        .map(|(idx, _)| idx + 1)
-        .unwrap_or(0);
-    let target = root.join(format!("{CKPT_PREFIX}{next:020}"));
-    engine.create_checkpoint(&target)?;
-    Ok(target)
+    loop {
+        let next = list_checkpoints(root)?
+            .last()
+            .map(|(idx, _)| idx + 1)
+            .unwrap_or(0);
+        let target = root.join(format!("{CKPT_PREFIX}{next:020}"));
+        match engine.create_checkpoint(&target) {
+            Ok(_) => return Ok(target),
+            // A concurrent checkpoint took the name between the listing and
+            // the claim; the next listing sees it and moves past it.
+            Err(StorageError::TargetExists { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Delete all but the newest `keep` checkpoints under `root`. `keep == 0` is

@@ -5375,15 +5375,17 @@ pub struct CheckpointSummary {
     pub max_seqno: lsm_tree::SeqNo,
 }
 
-/// Capture the journal directory `src` into `dst`, returning the bytes
-/// copied. A sealed segment is never written again, so it is hard-linked
-/// (copied only where the link fails, across volumes); anything else, the
-/// active segment above all, is copied. A file that disappears between the
-/// listing and its capture is skipped: the journal purge removed it, and it
-/// held only entries already in the trees.
+/// Capture the journal directory `src` into `dst`, which must not exist,
+/// returning the bytes copied. A sealed segment is never written again, so
+/// it is hard-linked (copied only where the link fails, across volumes);
+/// anything else, the active segment above all, is copied. Nothing is ever
+/// written into an existing file: a name already taken in `dst` may be a
+/// hard link to a live segment, and a copy onto it would truncate the
+/// journal itself. A file that disappears between the listing and its
+/// capture is skipped: the journal purge removed it, and it held only
+/// entries already in the trees.
 fn capture_journal(src: &Path, dst: &Path) -> StorageResult<u64> {
-    std::fs::create_dir_all(dst)
-        .map_err(|e| StorageError::Io(format!("create dir {dst:?}: {e}")))?;
+    create_dir_new(dst)?;
     let mut bytes = 0u64;
     let entries =
         std::fs::read_dir(src).map_err(|e| StorageError::Io(format!("read dir {src:?}: {e}")))?;
@@ -5398,37 +5400,73 @@ fn capture_journal(src: &Path, dst: &Path) -> StorageResult<u64> {
         } else {
             let from = entry.path();
             match crate::oplog::segment::is_sealed(&from) {
-                Ok(true) => {
-                    if std::fs::hard_link(&from, &to).is_ok() {
-                        continue;
+                Ok(true) => match std::fs::hard_link(&from, &to) {
+                    Ok(()) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Err(StorageError::TargetExists {
+                            path: to.display().to_string(),
+                        });
                     }
-                }
+                    // Across volumes, or a file system without links.
+                    Err(_) => {}
+                },
                 Ok(false) => {}
                 Err(_) if !from.exists() => continue,
                 Err(e) => return Err(e),
             }
-            match std::fs::copy(&from, &to) {
+            match copy_new(&from, &to) {
                 Ok(copied) => bytes += copied,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(StorageError::Io(format!("copy {from:?}: {e}")));
-                }
+                Err(StorageError::Io(_)) if !from.exists() => {}
+                Err(e) => return Err(e),
             }
         }
     }
     Ok(bytes)
 }
 
+/// Copy `from` into a new file `to`, refusing an existing one, unlike
+/// `std::fs::copy`, which truncates whatever `to` names (the source itself,
+/// when `to` is a hard link to it).
+fn copy_new(from: &Path, to: &Path) -> StorageResult<u64> {
+    // The source first: one the purge removed leaves no empty copy behind.
+    let mut source =
+        std::fs::File::open(from).map_err(|e| StorageError::Io(format!("open {from:?}: {e}")))?;
+    let mut target = std::fs::File::create_new(to).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            StorageError::TargetExists {
+                path: to.display().to_string(),
+            }
+        } else {
+            StorageError::Io(format!("create {to:?}: {e}"))
+        }
+    })?;
+    std::io::copy(&mut source, &mut target)
+        .map_err(|e| StorageError::Io(format!("copy {from:?} to {to:?}: {e}")))
+}
+
+/// Create directory `dir`, whose parent exists, refusing one that already
+/// exists: the creation itself decides, so of two concurrent callers
+/// exactly one gets it.
+fn create_dir_new(dir: &Path) -> StorageResult<()> {
+    std::fs::create_dir(dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            StorageError::TargetExists {
+                path: dir.display().to_string(),
+            }
+        } else {
+            StorageError::Io(format!("create dir {dir:?}: {e}"))
+        }
+    })
+}
+
 /// Create the directory a checkpoint is written into, refusing one that
-/// already exists.
+/// already exists, a concurrent checkpoint's included.
 fn claim_checkpoint_dir(target: &Path) -> StorageResult<()> {
-    if target.exists() {
-        return Err(StorageError::Io(format!(
-            "checkpoint target {target:?} already exists; refusing to overwrite"
-        )));
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| StorageError::Io(format!("create checkpoint parent {parent:?}: {e}")))?;
     }
-    std::fs::create_dir_all(target)
-        .map_err(|e| StorageError::Io(format!("create checkpoint dir {target:?}: {e}")))
+    create_dir_new(target)
 }
 
 /// Write `bytes` to a new file at `path` and sync it.

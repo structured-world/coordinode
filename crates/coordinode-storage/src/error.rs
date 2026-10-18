@@ -32,6 +32,11 @@ pub enum StorageError {
     #[error("I/O error: {0}")]
     Io(String),
 
+    /// A checkpoint or capture target already exists, possibly claimed by a
+    /// concurrent call; nothing was written into it.
+    #[error("target {path} already exists; refusing to overwrite")]
+    TargetExists { path: String },
+
     /// CRC32 checksum mismatch — data corruption detected.
     #[error("checksum mismatch in {context}: expected {expected:#010x}, got {actual:#010x}")]
     ChecksumMismatch {

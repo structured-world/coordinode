@@ -154,6 +154,82 @@ fn checkpoint_create_latest_and_prune() {
     assert_eq!(latest_checkpoint(&root), Some(c2));
 }
 
+/// Every file under `dir` with its bytes, by path.
+fn files_with_bytes(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("read dir").flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.insert(p.clone(), std::fs::read(&p).expect("read"));
+            }
+        }
+    }
+    out
+}
+
+/// Two checkpoints taken at once under one root each get a directory of
+/// their own, and neither writes into the live journal: both name the next
+/// checkpoint the same way, and the second used to copy its sealed segments
+/// onto the first one's hard links, truncating the journal itself.
+#[test]
+fn concurrent_checkpoints_under_one_root_each_get_their_own() {
+    use coordinode_storage::engine::oplog_journal::OplogJournalConfig;
+    let dir = TempDir::new().expect("tempdir");
+    let journal = OplogJournalConfig {
+        max_segment_entries: 2,
+        ..OplogJournalConfig::default()
+    };
+    let engine = StorageEngine::open_embedded_with_journal(
+        &durable_cfg(&dir),
+        Arc::new(TimestampOracle::new()),
+        journal,
+    )
+    .expect("open");
+    for i in 0..9u64 {
+        put(
+            &engine,
+            i + 1,
+            PartitionId::Node,
+            format!("node:0:{i:04}").as_bytes(),
+            b"v",
+        );
+    }
+    engine.sync_applied().expect("sync");
+    let oplog = dir.path().join("oplog");
+    let before = files_with_bytes(&oplog);
+    let root = checkpoint_root(dir.path());
+    let barrier = std::sync::Barrier::new(2);
+    let taken: Vec<std::path::PathBuf> = std::thread::scope(|s| {
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                s.spawn(|| {
+                    barrier.wait();
+                    create_checkpoint(&engine, &root)
+                })
+            })
+            .collect();
+        racers
+            .into_iter()
+            .map(|r| r.join().expect("racer").expect("checkpoint"))
+            .collect()
+    });
+    assert_ne!(taken[0], taken[1], "both checkpoints took one directory");
+    let after = files_with_bytes(&oplog);
+    for (path, bytes) in &before {
+        if let Some(now) = after.get(path) {
+            assert!(
+                now.starts_with(bytes),
+                "{} lost bytes to a checkpoint",
+                path.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn verify_and_repair_is_clean_on_healthy_engine() {
     let dir = TempDir::new().expect("tempdir");

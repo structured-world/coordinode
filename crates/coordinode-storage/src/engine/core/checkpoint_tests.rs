@@ -372,3 +372,103 @@ fn checkpoint_of_more_than_255_l0_runs_opens_with_every_run() {
         );
     }
 }
+
+/// A journal directory holding one synthetic sealed segment; returns the
+/// directory and the segment's path.
+fn sealed_journal(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use crate::oplog::entry::{OplogEntry, OplogOp};
+    let src = root.join("oplog");
+    let mut log = crate::oplog::OplogManager::open(&src, 0, 64 * 1024 * 1024, 1000, 3600)
+        .expect("open journal");
+    for index in 1..=8u64 {
+        log.append(&OplogEntry {
+            ts: index,
+            term: 1,
+            index,
+            shard: 0,
+            ops: vec![OplogOp::Insert {
+                partition: 1,
+                key: format!("k{index}").into_bytes(),
+                value: vec![b'v'; 64],
+            }],
+            is_migration: false,
+            pre_images: None,
+        })
+        .expect("append");
+    }
+    log.rotate().expect("seal");
+    drop(log);
+    let segment = std::fs::read_dir(&src)
+        .expect("journal dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| crate::oplog::segment::is_sealed(p).unwrap_or(false))
+        .expect("a sealed segment");
+    (src, segment)
+}
+
+/// A second capture of the journal into a directory that already holds the
+/// first one is refused, and never writes into a sealed segment: there the
+/// target file is a hard link to the live segment, so a copy onto it would
+/// truncate the journal's own bytes.
+#[test]
+fn a_second_journal_capture_into_the_same_directory_leaves_the_segment_intact() {
+    let dir = TempDir::new().expect("tempdir");
+    let (src, segment) = sealed_journal(dir.path());
+    let before = std::fs::read(&segment).expect("read segment");
+    let target = dir.path().join("ckpt");
+    claim_checkpoint_dir(&target).expect("claim");
+    let dst = target.join("oplog");
+    capture_journal(&src, &dst).expect("first capture");
+    assert!(
+        capture_journal(&src, &dst).is_err(),
+        "a capture over an existing one was accepted"
+    );
+    assert_eq!(
+        std::fs::read(&segment).expect("read segment"),
+        before,
+        "the live sealed segment changed"
+    );
+}
+
+/// Two checkpoints into the same directory at once: exactly one gets the
+/// directory, the other is refused as `TargetExists`, and the journal's
+/// sealed segment keeps its bytes.
+#[test]
+fn concurrent_checkpoints_into_one_directory_claim_it_once() {
+    for _ in 0..50 {
+        let dir = TempDir::new().expect("tempdir");
+        let (src, segment) = sealed_journal(dir.path());
+        let before = std::fs::read(&segment).expect("read segment");
+        let target = dir.path().join("ckpt");
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes: Vec<StorageResult<u64>> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        claim_checkpoint_dir(&target)?;
+                        capture_journal(&src, &target.join("oplog"))
+                    })
+                })
+                .collect();
+            racers
+                .into_iter()
+                .map(|r| r.join().expect("racer"))
+                .collect()
+        });
+        let won = outcomes.iter().filter(|o| o.is_ok()).count();
+        assert_eq!(won, 1, "claims granted: {outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, Err(StorageError::TargetExists { .. }))),
+            "the loser was not refused as an existing target: {outcomes:?}"
+        );
+        assert_eq!(
+            std::fs::read(&segment).expect("read segment"),
+            before,
+            "the live sealed segment changed"
+        );
+    }
+}
