@@ -595,6 +595,67 @@ async fn registering_below_the_retained_source_is_refused() {
     f.node.shutdown().await.expect("shutdown");
 }
 
+/// Before every commit attempt of a registry transition, a heartbeat of the
+/// same consumer lands, as the background flush does under a slow log.
+fn heartbeat_before_every_commit(reg: &ShardConsumerRegistry, h: &RegisteredHandle, at: u64) {
+    let (again, h) = (reg.clone(), h.clone());
+    *reg.core.before_commit.lock() = Some(Box::new(move || {
+        again.core.clock_heartbeat(&h, at).expect("heartbeat");
+        heartbeat_before_every_commit(&again, &h, at);
+    }));
+}
+
+/// Heartbeats never make an acknowledgement lose: the batched flush writes
+/// liveness, not the position, so a consumer whose heartbeats keep landing
+/// while its acknowledgement commits still advances, and both stand. Sharing
+/// one conditioned record, every attempt of the acknowledgement met a newer
+/// heartbeat and the stream was ended after sixteen.
+#[test]
+fn heartbeats_landing_during_every_acknowledgement_do_not_end_the_stream() {
+    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
+    let h = reg
+        .register(registration("busy", 7, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    source.set_head(20);
+    clock.set(5_000);
+    heartbeat_before_every_commit(&reg, &h, 6_000);
+    let acked = reg.checkpoint(&h, 20);
+    *reg.core.before_commit.lock() = None;
+    acked.expect("an acknowledgement raced only by heartbeats lands");
+    assert_eq!(reg.shard_floor(), 20, "the acknowledgement stands");
+    let seen = reg
+        .list_consumers()
+        .into_iter()
+        .find(|c| c.consumer_id == "busy")
+        .expect("listed");
+    assert_eq!(seen.checkpoint_seqno, 20);
+    assert_eq!(seen.last_heartbeat_ts_ms, 6_000, "the heartbeats stand");
+}
+
+/// A heartbeat landing after the sweep judged a consumer silent and before
+/// its terminal write keeps the consumer: heartbeats write their own record,
+/// so the expiry is conditioned on that record too and reads again.
+#[test]
+fn a_heartbeat_racing_a_liveness_expiry_keeps_the_consumer() {
+    let (reg, clock, _source, _pipeline, _dir) = hooked_registry();
+    clock.set(1_000);
+    let h = reg
+        .register(registration(
+            "quiet",
+            7,
+            bounded(60_000, 1 << 30, Some(5_000)),
+        ))
+        .expect("register");
+    clock.set(6_001);
+    *reg.core.before_commit.lock() = Some(Box::new({
+        let (reg, h) = (reg.clone(), h.clone());
+        move || reg.core.clock_heartbeat(&h, 6_001).expect("heartbeat")
+    }));
+    let swept = reg.core.sweep_evictions().expect("sweep");
+    assert_eq!(swept.evicted, 0, "the expiry decided on a stale silence");
+    assert_eq!(ended_for(&reg, "quiet"), None);
+}
+
 /// An acknowledgement and an expiry racing over one record: whichever lands
 /// second decides against what the first left. Here the acknowledgement
 /// lands after the sweep read the lagging record and before its terminal
@@ -1094,26 +1155,6 @@ fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
     );
     assert_eq!(swept.next_deadline_ms, Some(1_000 + 400 + 1));
     assert_eq!(ended_for(&reg, "reader"), None);
-}
-
-/// Records of the format before retention policies are deleted by a sweep.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_sweep_deletes_records_of_the_old_format() {
-    let f = fixture(Arc::new(ManualClock::new(0))).await;
-    let mut legacy_key = LEGACY_KEY_PREFIX.to_vec();
-    legacy_key.extend_from_slice(b"cdc-0-7");
-    f.engine
-        .put(Partition::Registry, &legacy_key, b"old")
-        .expect("seed a legacy record");
-    f.reg.core.sweep_evictions().expect("sweep");
-    assert!(
-        f.engine
-            .get(Partition::Registry, &legacy_key)
-            .expect("read")
-            .is_none(),
-        "the legacy record is gone"
-    );
-    f.node.shutdown().await.expect("shutdown");
 }
 
 /// A pipeline that runs a one-shot hook inside the next proposal: what

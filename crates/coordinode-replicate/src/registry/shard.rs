@@ -40,7 +40,10 @@ use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transa
 use parking_lot::Mutex;
 
 use super::SeqnoConsumerRegistry;
-use super::entry::{LEGACY_KEY_PREFIX, REGISTRY_KEY_PREFIX, RegistryEntry, encode_registry_key};
+use super::entry::{
+    HEARTBEAT_KEY_PREFIX, Heartbeat, REGISTRY_KEY_PREFIX, RegistryEntry, encode_heartbeat_key,
+    encode_registry_key,
+};
 use super::source::RetentionSource;
 use super::types::{
     ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot, InitialSeqno,
@@ -175,7 +178,8 @@ impl RegistryCore {
         }
     }
 
-    /// The record of `consumer_id` and the version it carries.
+    /// The record of `consumer_id`, with the liveness its heartbeat record
+    /// shows, and the version of the registration record.
     fn read_entry(
         &self,
         consumer_id: &str,
@@ -189,25 +193,80 @@ impl RegistryCore {
             .engine
             .get(Partition::Registry, &key)
             .map_err(|e| RegistryError::Replication(e.to_string()))?;
-        match raw {
-            Some(bytes) => RegistryEntry::decode(&bytes)
-                .map(|entry| Some((entry, version)))
-                .map_err(|e| RegistryError::Replication(format!("decode registry entry: {e}"))),
-            None => Ok(None),
-        }
+        let Some(bytes) = raw else {
+            return Ok(None);
+        };
+        let entry = RegistryEntry::decode(&bytes)
+            .map_err(|e| RegistryError::Replication(format!("decode registry entry: {e}")))?;
+        let (heartbeat, _) = self.read_heartbeat(consumer_id)?;
+        Ok(Some((entry.with_heartbeat(heartbeat), version)))
+    }
+
+    /// The heartbeat record of `consumer_id` and its version, the version
+    /// read first: a heartbeat landing between the two reads moves the
+    /// version past what a commit conditioned on it expects.
+    fn read_heartbeat(
+        &self,
+        consumer_id: &str,
+    ) -> Result<(Option<Heartbeat>, Option<u64>), RegistryError> {
+        let key = encode_heartbeat_key(consumer_id);
+        let version = self
+            .engine
+            .record_version(Partition::Registry, &key)
+            .map_err(|e| RegistryError::Replication(e.to_string()))?;
+        let raw = self
+            .engine
+            .get(Partition::Registry, &key)
+            .map_err(|e| RegistryError::Replication(e.to_string()))?;
+        let heartbeat = match raw {
+            Some(bytes) => Some(Heartbeat::decode(&bytes).ok_or_else(|| {
+                RegistryError::Replication(format!(
+                    "decode heartbeat of {consumer_id:?}: {} bytes",
+                    bytes.len()
+                ))
+            })?),
+            None => None,
+        };
+        Ok((heartbeat, version))
     }
 
     /// Commit `writes` in one transaction, each conditioned on the version its
-    /// record had when read (`None` for a record that did not exist). `Ok(false)`
+    /// record had when read (`None` for a record that did not exist), and on
+    /// each record in `unchanged` still having the version given. `Ok(false)`
     /// when another writer moved one of them: the caller reads again.
     fn commit_writes(
         &self,
         writes: &[(RegistryEntry, Option<u64>)],
-        deletes: &[Vec<u8>],
+        unchanged: &[(Vec<u8>, Option<u64>)],
     ) -> Result<bool, RegistryError> {
-        if writes.is_empty() && deletes.is_empty() {
+        if writes.is_empty() {
             return Ok(true);
         }
+        self.commit_staged(|txn| {
+            for (entry, version) in writes {
+                let key = encode_registry_key(&entry.consumer_id);
+                let value = entry.encode().map_err(|e| {
+                    RegistryError::Replication(format!("encode registry entry: {e}"))
+                })?;
+                txn.expect_version(Partition::Registry, &key, *version)
+                    .map_err(|e| RegistryError::Replication(e.to_string()))?;
+                txn.put(Partition::Registry, &key, &value)
+                    .map_err(|e| RegistryError::Replication(e.to_string()))?;
+            }
+            for (key, version) in unchanged {
+                txn.expect_version(Partition::Registry, key, *version)
+                    .map_err(|e| RegistryError::Replication(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Commit what `stage` puts into one registry transaction. `Ok(false)`
+    /// when a condition it stated no longer holds.
+    fn commit_staged(
+        &self,
+        stage: impl FnOnce(&mut Transaction<'_>) -> Result<(), RegistryError>,
+    ) -> Result<bool, RegistryError> {
         let oracle = self.engine.oracle().ok_or_else(|| {
             RegistryError::Replication(
                 "the registry needs an engine with a timestamp oracle".into(),
@@ -217,20 +276,7 @@ impl RegistryCore {
         // Registry transitions release or record retention; holding them back
         // under storage pressure would keep the bytes that relieve it.
         txn.exempt_from_write_pressure();
-        for (entry, version) in writes {
-            let key = encode_registry_key(&entry.consumer_id);
-            let value = entry
-                .encode()
-                .map_err(|e| RegistryError::Replication(format!("encode registry entry: {e}")))?;
-            txn.expect_version(Partition::Registry, &key, *version)
-                .map_err(|e| RegistryError::Replication(e.to_string()))?;
-            txn.put(Partition::Registry, &key, &value)
-                .map_err(|e| RegistryError::Replication(e.to_string()))?;
-        }
-        for key in deletes {
-            txn.delete(Partition::Registry, key)
-                .map_err(|e| RegistryError::Replication(e.to_string()))?;
-        }
+        stage(&mut txn)?;
         let write_concern = WriteConcern::default();
         let ctx = CommitContext {
             write_concern: &write_concern,
@@ -249,15 +295,47 @@ impl RegistryCore {
 
     /// Run `decide` against the current record of `consumer_id` and commit
     /// what it chose, reading again whenever another writer got there first.
+    /// Heartbeats do not count as another writer: the record's liveness may
+    /// be a heartbeat older than the commit, which only a decision on
+    /// liveness cares about ([`Self::transition_on_liveness`]).
     fn transition<T>(
         &self,
         consumer_id: &str,
+        decide: impl FnMut(Option<RegistryEntry>) -> Result<Step<T>, RegistryError>,
+    ) -> Result<T, RegistryError> {
+        self.transition_with(consumer_id, false, decide)
+    }
+
+    /// [`Self::transition`] for a decision that depends on how long ago the
+    /// consumer was last heard from: a heartbeat landing before its commit
+    /// makes it read again, so a consumer alive at the commit is never ended
+    /// as silent.
+    fn transition_on_liveness<T>(
+        &self,
+        consumer_id: &str,
+        decide: impl FnMut(Option<RegistryEntry>) -> Result<Step<T>, RegistryError>,
+    ) -> Result<T, RegistryError> {
+        self.transition_with(consumer_id, true, decide)
+    }
+
+    fn transition_with<T>(
+        &self,
+        consumer_id: &str,
+        on_liveness: bool,
         mut decide: impl FnMut(Option<RegistryEntry>) -> Result<Step<T>, RegistryError>,
     ) -> Result<T, RegistryError> {
         for attempt in 0..TRANSITION_ATTEMPTS {
             if attempt > 0 {
                 std::thread::sleep(backoff(attempt));
             }
+            // Read before the record, so the heartbeat merged into it is no
+            // older than the version the commit then requires.
+            let heard = if on_liveness {
+                let (_, version) = self.read_heartbeat(consumer_id)?;
+                vec![(encode_heartbeat_key(consumer_id), version)]
+            } else {
+                Vec::new()
+            };
             let (current, version) = match self.read_entry(consumer_id)? {
                 Some((entry, version)) => (Some(entry), version),
                 None => (None, None),
@@ -290,7 +368,7 @@ impl RegistryCore {
                             seqno_space != entry.kind.is_seqno_space()
                                 || entry.checkpoint_seqno < checkpoint
                         });
-                    if self.commit_writes(&[(entry, version)], &[])? {
+                    if self.commit_writes(&[(entry, version)], &heard)? {
                         if lowers || !self.batching_on.load(Ordering::Acquire) {
                             self.recompute_floor()?;
                         }
@@ -371,8 +449,27 @@ impl RegistryCore {
         Ok(seqno_floor)
     }
 
-    /// Every registration record, live or ended.
+    /// Every registration record, live or ended, with the liveness its
+    /// heartbeat record shows.
     fn scan_entries(&self) -> Result<Vec<RegistryEntry>, RegistryError> {
+        let mut heartbeats: HashMap<Vec<u8>, Heartbeat> = HashMap::new();
+        let iter = self
+            .engine
+            .prefix_scan(Partition::Registry, HEARTBEAT_KEY_PREFIX)
+            .map_err(|e| RegistryError::Replication(e.to_string()))?;
+        for guard in iter {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| RegistryError::Replication(e.to_string()))?;
+            let heartbeat = Heartbeat::decode(&value).ok_or_else(|| {
+                RegistryError::Replication(format!(
+                    "decode heartbeat {key:?}: {} bytes",
+                    value.len()
+                ))
+            })?;
+            let id = key.get(HEARTBEAT_KEY_PREFIX.len()..).unwrap_or_default();
+            heartbeats.insert(id.to_vec(), heartbeat);
+        }
         let mut out = Vec::new();
         let iter = self
             .engine
@@ -382,29 +479,22 @@ impl RegistryCore {
             let (_, value) = guard
                 .into_inner()
                 .map_err(|e| RegistryError::Replication(e.to_string()))?;
-            out.push(
-                RegistryEntry::decode(&value).map_err(|e| {
-                    RegistryError::Replication(format!("decode registry entry: {e}"))
-                })?,
-            );
+            let entry = RegistryEntry::decode(&value)
+                .map_err(|e| RegistryError::Replication(format!("decode registry entry: {e}")))?;
+            let heartbeat = heartbeats.get(entry.consumer_id.as_bytes()).copied();
+            out.push(entry.with_heartbeat(heartbeat));
         }
         Ok(out)
     }
 
-    /// Keys of records in the format that predates retention policies.
-    fn legacy_keys(&self) -> Result<Vec<Vec<u8>>, RegistryError> {
-        let mut out = Vec::new();
-        let iter = self
-            .engine
-            .prefix_scan(Partition::Registry, LEGACY_KEY_PREFIX)
-            .map_err(|e| RegistryError::Replication(e.to_string()))?;
-        for guard in iter {
-            let (key, _) = guard
-                .into_inner()
-                .map_err(|e| RegistryError::Replication(e.to_string()))?;
-            out.push(key.to_vec());
-        }
-        Ok(out)
+    /// A heartbeat of `handle` at `at`, written as the background flush
+    /// writes it.
+    #[cfg(test)]
+    fn clock_heartbeat(&self, handle: &RegisteredHandle, at: u64) -> Result<(), RegistryError> {
+        self.pending_hb
+            .lock()
+            .insert((handle.consumer_id().to_string(), handle.incarnation()), at);
+        self.flush_pending_heartbeats()
     }
 
     /// Write the buffered heartbeats in one coalesced transaction.
@@ -425,20 +515,45 @@ impl RegistryCore {
                 }
                 pending.iter().map(|(k, ts)| (k.clone(), *ts)).collect()
             };
-            let mut writes = Vec::with_capacity(taken.len());
+            let mut beats = Vec::with_capacity(taken.len());
             let mut stale = Vec::new();
             for ((consumer_id, incarnation), ts) in &taken {
-                match self.read_entry(consumer_id)? {
-                    Some((mut entry, version))
-                        if entry.incarnation == *incarnation && entry.is_live() =>
-                    {
-                        entry.last_heartbeat_ts_ms = entry.last_heartbeat_ts_ms.max(*ts);
-                        writes.push((entry, version));
-                    }
-                    _ => stale.push((consumer_id.clone(), *incarnation)),
+                let live = self
+                    .read_entry(consumer_id)?
+                    .is_some_and(|(entry, _)| entry.incarnation == *incarnation && entry.is_live());
+                if !live {
+                    stale.push((consumer_id.clone(), *incarnation));
+                    continue;
                 }
+                // A time already stored for this incarnation is kept if later.
+                let (stored, _) = self.read_heartbeat(consumer_id)?;
+                let ts_ms = match stored {
+                    Some(hb) if hb.incarnation == *incarnation => hb.ts_ms.max(*ts),
+                    _ => *ts,
+                };
+                beats.push((
+                    encode_heartbeat_key(consumer_id),
+                    Heartbeat {
+                        incarnation: *incarnation,
+                        ts_ms,
+                    },
+                ));
             }
-            match self.commit_writes(&writes, &[]) {
+            // Unconditioned: a heartbeat writes only its own record, so a
+            // transition of the same consumer neither refuses it nor is
+            // refused by it.
+            let written = if beats.is_empty() {
+                Ok(true)
+            } else {
+                self.commit_staged(|txn| {
+                    for (key, hb) in &beats {
+                        txn.put(Partition::Registry, key, &hb.encode())
+                            .map_err(|e| RegistryError::Replication(e.to_string()))?;
+                    }
+                    Ok(())
+                })
+            };
+            match written {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(RegistryError::NotLeader { leader_id }) => {
@@ -457,7 +572,7 @@ impl RegistryCore {
                 Err(e) => return Err(e),
             }
             metrics::counter!("registry_heartbeat_batches_total").increment(1);
-            metrics::histogram!("registry_heartbeat_batch_size").record(writes.len() as f64);
+            metrics::histogram!("registry_heartbeat_batch_size").record(beats.len() as f64);
             let mut pending = self.pending_hb.lock();
             for (key, ts) in taken {
                 // A heartbeat buffered during the write is newer and stays.
@@ -476,8 +591,7 @@ impl RegistryCore {
     }
 
     /// End every live BOUNDED registration whose bound is crossed, durably and
-    /// one record at a time, delete records of the old format, then refresh
-    /// the floors.
+    /// one record at a time, then refresh the floors.
     fn sweep_evictions(&self) -> Result<Sweep, RegistryError> {
         // A buffered heartbeat is a sign of life the stored record does not
         // show yet: persist it before judging liveness.
@@ -485,15 +599,6 @@ impl RegistryCore {
         // A member that is not the leader decides no transition; it keeps the
         // deadlines so its sweep acts once it leads, and refreshes its floors.
         let mut leads = true;
-        let legacy = self.legacy_keys()?;
-        if !legacy.is_empty() {
-            match self.commit_writes(&[], &legacy) {
-                Err(RegistryError::NotLeader { .. }) => leads = false,
-                other => {
-                    other?;
-                }
-            }
-        }
         let mut evicted = 0usize;
         let mut next_deadline_ms: Option<u64> = None;
         let mut behind = false;
@@ -509,7 +614,7 @@ impl RegistryCore {
                 }
                 continue;
             }
-            let ended = match self.transition(&consumer_id, |current| {
+            let ended = match self.transition_on_liveness(&consumer_id, |current| {
                 let Some(mut current) = current else {
                     return Ok(Step::Keep(None));
                 };
@@ -981,11 +1086,20 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
             self.core.hb_buffered.notify_one();
             return Ok(());
         }
-        self.core.transition(handle.consumer_id(), |current| {
-            let mut entry = RegistryCore::live_for(current, handle)?;
-            entry.last_heartbeat_ts_ms = entry.last_heartbeat_ts_ms.max(now);
-            Ok(Step::Write(entry, ()))
-        })
+        // Unbatched: refuse a handle that no longer addresses a live
+        // registration, then write its heartbeat record at once.
+        let current = self
+            .core
+            .read_entry(handle.consumer_id())?
+            .map(|(entry, _)| entry);
+        RegistryCore::live_for(current, handle)?;
+        self.core
+            .pending_hb
+            .lock()
+            .entry((handle.consumer_id().to_string(), handle.incarnation()))
+            .and_modify(|t| *t = (*t).max(now))
+            .or_insert(now);
+        self.core.flush_pending_heartbeats()
     }
 
     fn unregister(&self, handle: RegisteredHandle) -> Result<(), RegistryError> {

@@ -3,7 +3,8 @@
 //! One [`RegistryEntry`] is stored per consumer id at key
 //! `consumer:<consumer_id>` and replicates through the shard's ordering
 //! group. A terminated registration keeps its record: the incarnation it
-//! carries is what refuses the ended handle and numbers the next one.
+//! carries is what refuses the ended handle and numbers the next one. Its
+//! latest heartbeat lives beside it at `heartbeat:<consumer_id>`.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,10 +16,11 @@ use super::types::{
 /// Key prefix for every registry record within `Partition::Registry`.
 pub(crate) const REGISTRY_KEY_PREFIX: &[u8] = b"consumer:";
 
-/// Key prefix of records written before registrations carried a retention
-/// policy and an incarnation. Those were all short-lived change-stream
-/// registrations; a sweep deletes whatever is left of them.
-pub(crate) const LEGACY_KEY_PREFIX: &[u8] = b"registry:";
+/// Key prefix of each consumer's heartbeat record, kept apart from its
+/// registration record: a heartbeat raises a time by `max` and conditions on
+/// nothing, so the batched flush never makes a transition of the same
+/// consumer lose its version check, however slow the log is.
+pub(crate) const HEARTBEAT_KEY_PREFIX: &[u8] = b"heartbeat:";
 
 /// The full replicated state of one registration on this shard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +108,16 @@ impl RegistryEntry {
         }
     }
 
+    /// This record with the liveness its heartbeat record shows, when that
+    /// heartbeat is of this incarnation: an acknowledgement and a heartbeat
+    /// are both signs of life, and the later one counts.
+    pub(crate) fn with_heartbeat(mut self, heartbeat: Option<Heartbeat>) -> Self {
+        if let Some(hb) = heartbeat.filter(|hb| hb.incarnation == self.incarnation) {
+            self.last_heartbeat_ts_ms = self.last_heartbeat_ts_ms.max(hb.ts_ms);
+        }
+        self
+    }
+
     /// Serialize to the replicated msgpack wire form.
     pub(crate) fn encode(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
         rmp_serde::to_vec(self)
@@ -119,10 +131,50 @@ impl RegistryEntry {
 
 /// Build the `Partition::Registry` key for a consumer id.
 pub(crate) fn encode_registry_key(consumer_id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(REGISTRY_KEY_PREFIX.len() + consumer_id.len());
-    k.extend_from_slice(REGISTRY_KEY_PREFIX);
+    prefixed(REGISTRY_KEY_PREFIX, consumer_id)
+}
+
+/// Build the `Partition::Registry` key of a consumer's heartbeat record.
+pub(crate) fn encode_heartbeat_key(consumer_id: &str) -> Vec<u8> {
+    prefixed(HEARTBEAT_KEY_PREFIX, consumer_id)
+}
+
+fn prefixed(prefix: &[u8], consumer_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(prefix.len() + consumer_id.len());
+    k.extend_from_slice(prefix);
     k.extend_from_slice(consumer_id.as_bytes());
     k
+}
+
+/// The latest heartbeat of one consumer: of which registration incarnation,
+/// and when. A heartbeat of another incarnation says nothing about the
+/// current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Heartbeat {
+    pub incarnation: u64,
+    pub ts_ms: u64,
+}
+
+impl Heartbeat {
+    const LEN: usize = 16;
+
+    /// Fixed 16-byte form: incarnation, then time, both big-endian.
+    pub(crate) fn encode(self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[..8].copy_from_slice(&self.incarnation.to_be_bytes());
+        out[8..].copy_from_slice(&self.ts_ms.to_be_bytes());
+        out
+    }
+
+    /// `None` for bytes of any other length.
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; Self::LEN] = bytes.try_into().ok()?;
+        let (incarnation, ts_ms) = bytes.split_at(8);
+        Some(Self {
+            incarnation: u64::from_be_bytes(incarnation.try_into().ok()?),
+            ts_ms: u64::from_be_bytes(ts_ms.try_into().ok()?),
+        })
+    }
 }
 
 #[cfg(test)]

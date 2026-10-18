@@ -56,6 +56,61 @@ const CAUGHT_UP: Fixed = Fixed {
     bytes: Some(0),
 };
 
+/// A heartbeat record round-trips through its fixed form, a record of any
+/// other length is refused, and its key stays apart from the registration's.
+#[test]
+fn a_heartbeat_record_round_trips_and_has_its_own_key() {
+    let hb = Heartbeat {
+        incarnation: 3,
+        ts_ms: 7_000,
+    };
+    assert_eq!(Heartbeat::decode(&hb.encode()), Some(hb));
+    assert_eq!(Heartbeat::decode(&[0u8; 15]), None);
+    assert_ne!(
+        encode_heartbeat_key("sink-1"),
+        encode_registry_key("sink-1")
+    );
+    assert!(!encode_heartbeat_key("sink-1").starts_with(REGISTRY_KEY_PREFIX));
+}
+
+/// Liveness counts a heartbeat of the record's own incarnation, the later
+/// of it and the record's own time, and never one of another incarnation.
+#[test]
+fn only_a_heartbeat_of_the_same_incarnation_counts() {
+    let live = entry(ConsumerRetentionPolicy::Strict);
+    let later = Heartbeat {
+        incarnation: 3,
+        ts_ms: 9_000,
+    };
+    let earlier = Heartbeat {
+        incarnation: 3,
+        ts_ms: 500,
+    };
+    let other = Heartbeat {
+        incarnation: 2,
+        ts_ms: 9_000,
+    };
+    assert_eq!(
+        live.clone()
+            .with_heartbeat(Some(later))
+            .last_heartbeat_ts_ms,
+        9_000
+    );
+    assert_eq!(
+        live.clone()
+            .with_heartbeat(Some(earlier))
+            .last_heartbeat_ts_ms,
+        1_000
+    );
+    assert_eq!(
+        live.clone()
+            .with_heartbeat(Some(other))
+            .last_heartbeat_ts_ms,
+        1_000
+    );
+    assert_eq!(live.with_heartbeat(None).last_heartbeat_ts_ms, 1_000);
+}
+
 #[test]
 fn entry_roundtrips_through_msgpack() {
     let mut e = entry(bounded(10, 20, Some(30)));
@@ -72,10 +127,6 @@ fn key_is_prefixed_and_recoverable() {
     let k = encode_registry_key("kafka-eu");
     assert!(k.starts_with(REGISTRY_KEY_PREFIX));
     assert_eq!(&k[REGISTRY_KEY_PREFIX.len()..], b"kafka-eu");
-    assert!(
-        !k.starts_with(LEGACY_KEY_PREFIX),
-        "a new record must not be swept as one of the old format"
-    );
 }
 
 /// STRICT never ends on its own, whatever the clock, lag or size.
