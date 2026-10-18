@@ -9,7 +9,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
@@ -56,6 +56,10 @@ pub struct SnapshotFile {
     /// The private hard-linked copy of a capture the bytes are still to be
     /// written from; removed once they are, or when this is dropped.
     capture: Option<PathBuf>,
+    /// The engine whose filesystem made the copy, which removes it. Weak: a
+    /// reader of a snapshot does not keep the engine open; once it is gone,
+    /// the next open removes the copy.
+    engine: Weak<StorageEngine>,
 }
 
 impl SnapshotFile {
@@ -77,6 +81,7 @@ impl SnapshotFile {
             path,
             staged: true,
             capture: None,
+            engine: Weak::new(),
         })
     }
 
@@ -87,17 +92,26 @@ impl SnapshotFile {
             path,
             staged: false,
             capture: None,
+            engine: Weak::new(),
         })
     }
 
-    /// The snapshot held by `capture`, a copy this value owns, serialized
-    /// into a staged file in `dir` on first access.
-    fn from_capture(capture: PathBuf, dir: &Path) -> Self {
+    /// The snapshot held by `capture`, a copy this value owns, made by
+    /// `engine`, serialized into a staged file in `dir` on first access.
+    fn from_capture(capture: PathBuf, dir: &Path, engine: &Arc<StorageEngine>) -> Self {
         Self {
             file: None,
             path: dir.join(format!("{}.{STAGED}", unique_stem())),
             staged: true,
             capture: Some(capture),
+            engine: Arc::downgrade(engine),
+        }
+    }
+
+    /// Remove the capture copy this value owns, through its engine.
+    fn remove_capture(&mut self) {
+        if let (Some(capture), Some(engine)) = (self.capture.take(), self.engine.upgrade()) {
+            remove_capture_quietly(&engine, &capture);
         }
     }
 
@@ -133,8 +147,7 @@ impl SnapshotFile {
         drop(captured);
         file.seek(SeekFrom::Start(0))?;
         self.file = Some(file);
-        self.capture = None;
-        remove_dir_quietly(&capture);
+        self.remove_capture();
         Ok(())
     }
 
@@ -210,9 +223,7 @@ impl Drop for SnapshotFile {
         if self.staged && self.file.is_some() {
             remove_quietly(&self.path);
         }
-        if let Some(capture) = &self.capture {
-            remove_dir_quietly(capture);
-        }
+        self.remove_capture();
     }
 }
 
@@ -242,7 +253,11 @@ impl SnapshotStore {
             let entry = entry?;
             if current.as_deref() != entry.file_name().to_str() {
                 if entry.file_type()?.is_dir() {
-                    fs::remove_dir_all(entry.path())?;
+                    // A capture: removed through the filesystem that wrote it.
+                    store
+                        .engine
+                        .remove_capture(&entry.path())
+                        .map_err(io::Error::other)?;
                 } else {
                     fs::remove_file(entry.path())?;
                 }
@@ -254,6 +269,20 @@ impl SnapshotStore {
     /// A new staged file for a snapshot about to be written.
     pub(crate) fn stage(&self) -> io::Result<SnapshotFile> {
         SnapshotFile::stage(&self.dir)
+    }
+
+    /// Where to capture the store for a snapshot about to be published with
+    /// [`Self::publish_capture`]: in this store's directory under the name it
+    /// is published as, so publishing moves nothing. One left unpublished is
+    /// removed with [`Self::remove_capture`], or by the next open.
+    pub(crate) fn capture_target(&self) -> PathBuf {
+        self.dir.join(format!("{}.{CAPTURED}", unique_stem()))
+    }
+
+    /// Remove a capture that was not published; a failure only leaves it for
+    /// the next open to remove.
+    pub(crate) fn remove_capture(&self, capture: &Path) {
+        remove_capture_quietly(&self.engine, capture);
     }
 
     /// The current snapshot, opened for reading from its start. A capture is
@@ -271,24 +300,27 @@ impl SnapshotStore {
             return Ok(Some((meta, SnapshotFile::open(path)?)));
         }
         let copy = self.dir.join(format!("{}.{READING}", unique_stem()));
-        match link_tree(&path, &copy) {
+        match self.engine.link_capture(&path, &copy) {
             Ok(()) => {
                 if let Err(e) = self.seal_inventory(&copy) {
-                    remove_dir_quietly(&copy);
+                    self.remove_capture(&copy);
                     return Err(e);
                 }
-                Ok(Some((meta, SnapshotFile::from_capture(copy, &self.dir))))
+                Ok(Some((
+                    meta,
+                    SnapshotFile::from_capture(copy, &self.dir, &self.engine),
+                )))
             }
             // A crash lost the capture the record names. Without a snapshot,
             // openraft builds a new one from the state machine, which holds
             // everything the lost one did.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                remove_dir_quietly(&copy);
+                self.remove_capture(&copy);
                 tracing::warn!(?path, "the recorded snapshot capture is missing");
                 Ok(None)
             }
             Err(e) => {
-                remove_dir_quietly(&copy);
+                self.remove_capture(&copy);
                 Err(e)
             }
         }
@@ -316,12 +348,21 @@ impl SnapshotStore {
         fs::write(copy.join(SEALED_INVENTORY_FILE), sealed)
     }
 
-    /// Make the store capture at `capture` the current snapshot, described
-    /// by `meta`, moving it into this store; the snapshot it replaces is
-    /// removed. Nothing is serialized: a peer that needs the snapshot gets
-    /// it from [`Self::current`]. A snapshot older than the current one is
-    /// not published: `false` is returned and `capture` stays where it is.
+    /// Make the store capture at `capture`, taken at a
+    /// [`Self::capture_target`], the current snapshot, described by `meta`;
+    /// the snapshot it replaces is removed. Nothing is serialized: a peer
+    /// that needs the snapshot gets it from [`Self::current`]. A snapshot
+    /// older than the current one is not published: `false` is returned and
+    /// `capture` stays for its owner to remove.
     pub(crate) fn publish_capture(&self, meta: &SnapshotMeta, capture: &Path) -> io::Result<bool> {
+        let name = capture
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|_| capture.parent() == Some(self.dir.as_path()))
+            .ok_or_else(|| {
+                io::Error::other(format!("{capture:?} is not a capture target of this store"))
+            })?
+            .to_owned();
         let _publishing = self.lock()?;
         let previous = self.record()?;
         if let Some((current, _)) = &previous {
@@ -329,14 +370,12 @@ impl SnapshotStore {
                 return Ok(false);
             }
         }
-        let name = format!("{}.{CAPTURED}", unique_stem());
-        let target = self.dir.join(&name);
-        fs::rename(capture, &target)?;
-        sync_dir(Some(&target))?;
+        // The capture's own entries were synced as it was taken; its name in
+        // this directory becomes durable before the record points at it.
         sync_dir(Some(&self.dir))?;
         self.record_current(meta, &name)?;
         if let Some((_, previous)) = previous {
-            remove_entry_quietly(&self.dir.join(previous));
+            self.remove_entry(&self.dir.join(previous));
         }
         Ok(true)
     }
@@ -369,9 +408,18 @@ impl SnapshotStore {
         }
         self.record_current(meta, file.name()?)?;
         if let Some((_, name)) = previous {
-            remove_entry_quietly(&self.dir.join(name));
+            self.remove_entry(&self.dir.join(name));
         }
         Ok(true)
+    }
+
+    /// Remove a published snapshot, a file or a capture directory.
+    fn remove_entry(&self, path: &Path) {
+        if path.is_dir() {
+            self.remove_capture(path);
+        } else {
+            remove_quietly(path);
+        }
     }
 
     /// Record `name` in this store's directory as the current snapshot,
@@ -453,40 +501,11 @@ fn sync_dir(dir: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
-/// Recreate the directory tree at `src` under `dst` (which must not exist)
-/// with every file hard-linked, not copied: the store never rewrites a file
-/// in place once written, so the copy reads what `src` held when linked.
-fn link_tree(src: &Path, dst: &Path) -> io::Result<()> {
-    let entries = fs::read_dir(src)?;
-    fs::create_dir(dst)?;
-    for entry in entries {
-        let entry = entry?;
-        let target = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            link_tree(&entry.path(), &target)?;
-        } else {
-            fs::hard_link(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
-
-/// Remove a published snapshot, a file or a capture directory.
-fn remove_entry_quietly(path: &Path) {
-    if path.is_dir() {
-        remove_dir_quietly(path);
-    } else {
-        remove_quietly(path);
-    }
-}
-
-/// Remove a directory tree nothing needs any more; a failure only leaves it
-/// for the next open to remove.
-fn remove_dir_quietly(path: &Path) {
-    if let Err(e) = fs::remove_dir_all(path) {
-        if e.kind() != io::ErrorKind::NotFound {
-            tracing::warn!(?path, %e, "could not remove a snapshot directory");
-        }
+/// Remove a capture nothing needs any more, through `engine`'s filesystem; a
+/// failure only leaves it for the next open to remove.
+fn remove_capture_quietly(engine: &StorageEngine, path: &Path) {
+    if let Err(e) = engine.remove_capture(path) {
+        tracing::warn!(?path, %e, "could not remove a snapshot capture");
     }
 }
 

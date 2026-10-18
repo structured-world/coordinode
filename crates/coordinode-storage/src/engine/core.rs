@@ -166,6 +166,9 @@ pub struct StorageEngine {
     /// Root data directory — exposed so subsystems (e.g. Raft oplog) can
     /// derive their own sub-directories without re-reading the config.
     data_dir: PathBuf,
+    /// The filesystem the trees write through, so what this engine removes
+    /// from its directories goes through the same one that wrote it.
+    fs: Arc<dyn lsm_tree::fs::Fs>,
     /// Configured endpoints — cloned from `StorageConfig.endpoints` at
     /// open time so subsystems (WAL/oplog placement, tier routing,
     /// hard-limit enforcement) can resolve target endpoints without
@@ -1243,13 +1246,15 @@ impl StorageEngine {
             }
         }
 
+        let fs: Arc<dyn lsm_tree::fs::Fs> = config
+            .fs
+            .clone()
+            .unwrap_or_else(|| Arc::new(lsm_tree::fs::StdFs));
         // A capture a crash left behind belongs to no copy.
-        let captures = config.data_dir().join(raft_coverage::PARTITION_CAPTURE_DIR);
-        match std::fs::remove_dir_all(&captures) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StorageError::Io(format!("clear {captures:?}: {e}"))),
-        }
+        remove_capture_with(
+            &*fs,
+            &config.data_dir().join(raft_coverage::PARTITION_CAPTURE_DIR),
+        )?;
 
         let coordinator = LocalMultiModalCoordinator::new(
             trees,
@@ -1285,6 +1290,7 @@ impl StorageEngine {
             tiered_cache,
             access_tracker: AccessTracker::new(),
             data_dir: config.data_dir().to_path_buf(),
+            fs,
             endpoints: config.endpoints.clone(),
             capacity: capacity_arc,
             capacity_scanner,
@@ -2161,6 +2167,41 @@ impl StorageEngine {
             write_synced(&path, &inventory)?;
         }
         Ok(summary)
+    }
+
+    /// Remove a capture [`Self::capture`] made, or what a crash left of one,
+    /// through the filesystem that wrote it. A capture already gone is fine.
+    ///
+    /// # Errors
+    ///
+    /// The directory exists and cannot be removed.
+    pub fn remove_capture(&self, dir: &Path) -> StorageResult<()> {
+        remove_capture_with(&*self.fs, dir)
+    }
+
+    /// Recreate the capture at `src` under `dst` (which must not exist) with
+    /// every file hard-linked, through the filesystem that wrote it: a
+    /// capture's files are never rewritten in place, so the copy reads what
+    /// `src` held when linked, whatever later removes `src`.
+    ///
+    /// # Errors
+    ///
+    /// `src` is missing (the error keeps [`std::io::ErrorKind::NotFound`]),
+    /// `dst` exists, or a link cannot be made.
+    pub fn link_capture(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+        let entries = self.fs.read_dir(src).map_err(std::io::Error::from)?;
+        self.fs.create_dir(dst).map_err(std::io::Error::from)?;
+        for entry in entries {
+            let target = dst.join(&entry.file_name);
+            if entry.is_dir {
+                self.link_capture(&entry.path, &target)?;
+            } else {
+                self.fs
+                    .hard_link(&entry.path, &target)
+                    .map_err(std::io::Error::from)?;
+            }
+        }
+        Ok(())
     }
 
     /// Flush and hard-link every partition tree and columnar table into
@@ -5510,6 +5551,16 @@ fn unresolved_unit() -> StorageError {
 }
 
 /// The partitions with a rebuild intent under `data_dir`.
+/// Remove `dir` and everything under it through `fs`; nothing to remove is
+/// fine.
+fn remove_capture_with(fs: &dyn lsm_tree::fs::Fs, dir: &Path) -> StorageResult<()> {
+    match fs.remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == lsm_tree::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StorageError::Io(format!("remove {dir:?}: {e}"))),
+    }
+}
+
 fn read_rebuild_intents(data_dir: &Path) -> StorageResult<Vec<Partition>> {
     let dir = data_dir.join(REBUILD_INTENT_DIR);
     let entries = match std::fs::read_dir(&dir) {

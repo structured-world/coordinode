@@ -1273,8 +1273,6 @@ pub struct CoordinodeStateMachine {
     skip_until: u64,
     /// The coverage base last written to every tree: all entries below it.
     folded: u64,
-    /// Captures taken for snapshot builds, naming each one's directory.
-    captures: u64,
     /// Where the applies stand, held while applying; registered with the
     /// engine as its Raft apply fence.
     gate: Arc<RaftApplyGate>,
@@ -1399,13 +1397,6 @@ impl RaftApplyFence for RaftApplyGate {
 pub(crate) static CAPTURE_DELAY_MS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// Where snapshot builds capture the store, under the engine's data
-/// directory. Nothing under it outlives the build that made it; a crash
-/// leaves it behind, and the next open clears it.
-fn snapshot_capture_root(engine: &StorageEngine) -> std::path::PathBuf {
-    engine.data_dir().join("snapshot-capture")
-}
-
 /// The consensus state stored at `key` in `partition`, `None` when nothing
 /// is. A read or decode failure is an error, never an absent value: the
 /// state it holds (a purge point, the applied membership) cannot be guessed.
@@ -1513,12 +1504,7 @@ impl CoordinodeStateMachine {
         if let (Some(oracle), Some(at)) = (&oracle, engine.closure_frontier().checked_sub(1)) {
             oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
         }
-        // A capture a crash left behind belongs to no build.
-        match std::fs::remove_dir_all(snapshot_capture_root(&engine)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io::Error::other(format!("clear snapshot captures: {e}"))),
-        }
+        // Opening the store removes every capture a crash left unpublished.
         let snapshots = Arc::new(
             SnapshotStore::open(Arc::clone(&engine))
                 .map_err(|e| io::Error::other(format!("open the snapshot store: {e}")))?,
@@ -1568,7 +1554,6 @@ impl CoordinodeStateMachine {
             replay_skip,
             skip_until,
             folded,
-            captures: 0,
             gate,
             _hold: engine_work.start(),
             engine_work,
@@ -2141,8 +2126,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         // applying, and the snapshot must hold exactly the entries up to
         // `last_applied`. No entry is applied while this runs, so a capture
         // taken now is that state; reading the live store later is not.
-        self.captures += 1;
-        let dir = snapshot_capture_root(&self.engine).join(format!("{:020}", self.captures));
+        let dir = self.snapshots.capture_target();
         // Counted from before the capture to the builder's end, so the work
         // never reads idle between the two.
         let builder_work = self.engine_work.start();
@@ -2156,12 +2140,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                 std::thread::sleep(std::time::Duration::from_millis(
                     CAPTURE_DELAY_MS.load(core::sync::atomic::Ordering::Relaxed),
                 ));
-                let captured = match target.parent() {
-                    Some(parent) => std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("create {parent:?}: {e}"))
-                        .and_then(|()| engine.capture(&target).map_err(|e| e.to_string())),
-                    None => engine.capture(&target).map_err(|e| e.to_string()),
-                };
+                let captured = engine.capture(&target).map_err(|e| e.to_string());
                 // The engine is released before the work is counted done.
                 drop(engine);
                 drop(work);
@@ -2295,8 +2274,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         // its own copies. An empty snapshot is kept as it arrived.
         // Counted as work holding the engine: openraft may stop waiting on
         // the task at a shutdown, and the task runs on regardless.
-        self.captures += 1;
-        let capture = snapshot_capture_root(&self.engine).join(format!("{:020}", self.captures));
+        let capture = self.snapshots.capture_target();
         let engine = Arc::clone(&self.engine);
         let work = self.engine_work.start();
         let snapshots = Arc::clone(&self.snapshots);
@@ -2311,18 +2289,13 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                 return snapshots.publish(&published_meta, &mut snapshot);
             }
             drop(snapshot);
-            if let Some(parent) = capture.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
             engine
                 .capture(&capture)
                 .map_err(|e| io::Error::other(format!("capture the installed store: {e}")))?;
             drop(engine);
             let published = snapshots.publish_capture(&published_meta, &capture)?;
             if !published {
-                if let Err(e) = std::fs::remove_dir_all(&capture) {
-                    tracing::warn!(?capture, %e, "could not remove an unpublished capture");
-                }
+                snapshots.remove_capture(&capture);
             }
             Ok(published)
         })
@@ -2385,11 +2358,7 @@ pub struct CoordinodeSnapshotBuilder {
 impl Drop for CoordinodeSnapshotBuilder {
     fn drop(&mut self) {
         if let Ok(dir) = &self.capture {
-            if let Err(e) = std::fs::remove_dir_all(dir) {
-                if e.kind() != io::ErrorKind::NotFound {
-                    tracing::warn!(?dir, %e, "could not remove a snapshot capture");
-                }
-            }
+            self.snapshots.remove_capture(dir);
         }
     }
 }
@@ -2429,7 +2398,8 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
             // openraft keeps only the metadata of what it built and asks
             // get_current_snapshot() for the bytes, so the build is
             // published before it is returned.
-            if !snapshots.publish_capture(&published_meta, &dir)? {
+            let published = snapshots.publish_capture(&published_meta, &dir)?;
+            if !published {
                 // An install overtook this build; openraft reads only the
                 // build's metadata, and the newer snapshot stays current.
                 tracing::warn!(
@@ -2437,13 +2407,20 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
                     "a newer snapshot was published while this one was built"
                 );
             }
-            snapshots
+            let current = snapshots
                 .current()?
                 .map(|(_, snapshot)| snapshot)
-                .ok_or_else(|| io::Error::other("the published snapshot is missing"))
+                .ok_or_else(|| io::Error::other("the published snapshot is missing"))?;
+            Ok::<_, io::Error>((published, current))
         })
         .await
         .map_err(|e| io::Error::other(format!("snapshot build task: {e}")))??;
+        let (published, snapshot) = snapshot;
+        if published {
+            // The store owns the capture now; the builder's drop must not
+            // remove the current snapshot.
+            self.capture = Err("published as the current snapshot".to_owned());
+        }
 
         tracing::info!("snapshot published");
         Ok(Snapshot { meta, snapshot })

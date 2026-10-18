@@ -1004,7 +1004,8 @@ fn captures_a_crash_left_behind_are_cleared_on_open() {
     // Captures are left in a directory an engine already opened.
     drop(StorageEngine::open(&config).expect("first open"));
     let partition_capture = dir.path().join("partition-capture").join("node-1");
-    let snapshot_capture = dir.path().join("snapshot-capture").join("1");
+    // A capture taken for a snapshot that was never published.
+    let snapshot_capture = dir.path().join("raft-snapshot").join("1.capt");
     std::fs::create_dir_all(&partition_capture).expect("mkdir");
     std::fs::create_dir_all(&snapshot_capture).expect("mkdir");
 
