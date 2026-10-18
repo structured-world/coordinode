@@ -2,6 +2,37 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-18
+
+### Added
+
+- *(operation)* configurable admission window
+- *(operation)* apply each client write once
+- *(embed)* replicated embedded database behind a feature
+
+### Fixed
+
+- *(storage)* let a catalog commit wait for a claim in flight
+- *(storage)* scrub blob files and tune local journal compaction
+- *(query)* answer that an object exists from durable records
+- *(storage)* never copy a checkpoint over a file it holds
+- *(storage)* apply each recovered cache write once
+- *(storage)* land a volatile write once, through the log
+- *(storage)* keep a node's own records across a rebuild
+- *(query)* register a vector index generation once
+
+### Performance
+
+- *(storage)* flush the device only where recovery needs it
+- *(storage)* defer the log sync of volatile writes, not the write
+- *(storage)* index registered commits by key
+- *(embed)* publish nothing for an unchanged schema definition
+
+### Testing
+
+- *(storage)* wait for capacity to recover after a cascade
+- *(embed)* measure how long a store takes to open
+
 ## v0.7.2 - 2026-10-15
 
 ### Fixed

@@ -2,6 +2,20 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.3 - 2026-10-18
+
+### Added
+
+- *(embed)* replicated embedded database behind a feature
+
+### Fixed
+
+- *(replicate)* keep heartbeats from ending change streams
+
+### Performance
+
+- *(storage)* defer the log sync of volatile writes, not the write
+
 ## v0.7.2 - 2026-10-15
 
 ### Added

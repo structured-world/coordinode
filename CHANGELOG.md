@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.7.3 - 2026-10-18
+
+### Added
+
+- *(operation)* configurable admission window
+- *(operation)* apply each client write once
+- *(embed)* replicated embedded database behind a feature
+- *(storage)* store index generations under local installations
+- *(migrate)* add the node sizes report module
+- *(migrate)* catalog record migrations, check and journal stats
+- *(migrate)* offline tool to bring a data directory current
+
+### Fixed
+
+- *(storage)* scrub blob files and tune local journal compaction
+- *(storage)* apply each recovered cache write once
+- *(raft)* answer writes a leader can no longer commit
+- *(storage)* land a volatile write once, through the log
+- *(storage)* let a catalog commit wait for a claim in flight
+- *(query)* answer that an object exists from durable records
+- *(storage)* never copy a checkpoint over a file it holds
+- *(storage)* keep a node's own records across a rebuild
+- *(query)* register a vector index generation once
+- *(index)* never register an index dropped since its publication
+- *(query)* report the outcome an index check recorded
+- *(query)* register a text index generation once
+- *(raft)* keep snapshot captures on the engine's filesystem
+- *(raft)* reopen an enrolled member as a member
+- *(raft)* count blocking work holding the engine at shutdown
+- *(replicate)* keep heartbeats from ending change streams
+- *(session)* answer a commit repeated while it resolves
+- *(migrate)* find every marked store, Raft snapshot captures too
+
+### Performance
+
+- *(storage)* defer the log sync of volatile writes, not the write
+- *(storage)* flush the device only where recovery needs it
+- *(storage)* index registered commits by key
+- *(embed)* publish nothing for an unchanged schema definition
+- *(query)* bound property delta chains with whole writes
+
+### Testing
+
+- *(cluster)* wait for a killed follower's replay
+- *(storage)* wait for capacity to recover after a cascade
+- *(embed)* measure how long a store takes to open
+- *(query)* run the N+1 window tests on given instants
+- *(storage)* cover crashes inside log truncation and compaction
+
 ## v0.7.2 - 2026-10-15
 
 ### Added
