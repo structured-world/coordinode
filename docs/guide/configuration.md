@@ -560,6 +560,7 @@ storage:
     segment_max_bytes: 67108864  # 64 MiB, default
     segment_max_entries: 50000   # default
     retention_secs: 604800       # 7 days, default
+    local_journal_compact_entries: 4096  # default, see below
 ```
 
 `sync_method` chooses how an append is made durable:
@@ -591,7 +592,11 @@ log (the data directory unless endpoints are configured): the records that
 belong to this member and are not replicated, such as its vote, its log
 bounds and the guards of the indexes it serves. It uses the same
 `sync_method` and segment limits, syncs only where a record is about to be
-relied on, and is replayed at the next start. It is part of the node's
+relied on, and is replayed at the next start. Every
+`local_journal_compact_entries` records (under `storage.oplog`, default
+`4096`, zero refused, restart to change) it is compacted: the tables holding
+its records are flushed and the segments they cover are dropped, so a lower
+value keeps the journal shorter at the cost of more table flushes. It is part of the node's
 state: back it up and restore it together with the rest of the data
 directory, never on its own. When the directory is later opened as an
 embedded database, its records move into the database's journal and the

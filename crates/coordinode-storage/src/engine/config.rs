@@ -761,6 +761,13 @@ pub struct StorageConfig {
     /// Default: 1 MiB, PostgreSQL's `wal_writer_flush_after`.
     pub volatile_flush_bytes: u64,
 
+    /// Records a member journals for itself (its vote, log bounds, index
+    /// guards) between compactions of that journal: each compaction flushes
+    /// the trees holding such records and drops the segments they cover.
+    /// Lower keeps the journal shorter at the cost of more flushes; `0`
+    /// compacts after every record, as `1` does. Default: 4096.
+    pub local_journal_compact_entries: u64,
+
     /// The store was gathered into these endpoints from a layout it was not
     /// written under (a checkpoint collects every table into one
     /// directory): the per-level routing it persisted names endpoints this
@@ -939,6 +946,7 @@ impl StorageConfig {
             node_shard: 0,
             volatile_flush_interval_ms: 100,
             volatile_flush_bytes: 1024 * 1024,
+            local_journal_compact_entries: 4096,
             relocated: false,
             min_free_bytes: crate::engine::space::DEFAULT_MIN_FREE_BYTES,
             resume_free_bytes: crate::engine::space::DEFAULT_RESUME_FREE_BYTES,
@@ -1232,7 +1240,7 @@ impl StorageConfig {
         // "value-dominated row" pattern that KV separation is designed
         // for (segregates large values into a separate file, keeps the
         // main LSM bloom-able and seek-efficient).
-        if matches!(part, Partition::Blob | Partition::VectorF32) {
+        if separates_values(part) {
             config = config.with_kv_separation(Some(lsm_tree::KvSeparationOptions::default()));
         }
 
@@ -1272,6 +1280,11 @@ impl StorageConfig {
 
         config
     }
+}
+
+/// Whether `part` keeps its large values in blob files beside its tables.
+pub(crate) fn separates_values(part: Partition) -> bool {
+    matches!(part, Partition::Blob | Partition::VectorF32)
 }
 
 /// Extracts prefixes at each ':' separator boundary for bloom filter indexing.

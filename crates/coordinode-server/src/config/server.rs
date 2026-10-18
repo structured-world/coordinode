@@ -225,6 +225,9 @@ pub struct OplogSettings {
     /// out the interval; past sixteen times this the writer syncs before it
     /// is answered (`None` = 1 MiB, `0` = every volatile write syncs).
     pub volatile_flush_bytes: Option<u64>,
+    /// Records the node journals for itself between compactions of its
+    /// member-local journal (`None` = 4096). Zero is refused.
+    pub local_journal_compact_entries: Option<NonZeroU64>,
 }
 
 /// The identity a node with peers proves on the inter-node channel, and the
@@ -956,6 +959,9 @@ impl ServerConfig {
         }
         if let Some(bytes) = oplog.volatile_flush_bytes {
             cfg.volatile_flush_bytes = bytes;
+        }
+        if let Some(entries) = oplog.local_journal_compact_entries {
+            cfg.local_journal_compact_entries = entries.get();
         }
         // The MVCC time-travel window is an engine setting: the engine holds
         // its GC watermark back by it on every node, registry or not.

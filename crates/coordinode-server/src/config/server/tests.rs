@@ -1099,6 +1099,37 @@ fn the_volatile_flush_interval_reaches_the_storage_config() {
     }
 }
 
+/// How often the member-local journal compacts reaches the storage config:
+/// unset keeps 4096, an operator's value replaces it, and zero is refused
+/// when the file is read.
+#[test]
+fn the_local_journal_compaction_reaches_the_storage_config() {
+    let defaults = ServerConfig::default()
+        .resolve_storage_config()
+        .expect("valid");
+    assert_eq!(defaults.local_journal_compact_entries, 4096);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "storage:\n  oplog:\n    local_journal_compact_entries: 512\n",
+    )
+    .unwrap();
+    let sc = ServerConfig::load(Some(path.to_str().unwrap()))
+        .unwrap()
+        .resolve_storage_config()
+        .expect("valid topology");
+    assert_eq!(sc.local_journal_compact_entries, 512);
+
+    std::fs::write(
+        &path,
+        "storage:\n  oplog:\n    local_journal_compact_entries: 0\n",
+    )
+    .unwrap();
+    assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
+}
+
 /// A sync method the engine does not have, a zero-sized segment and an
 /// unknown key are refused when the file is read, not met at the first write.
 #[test]

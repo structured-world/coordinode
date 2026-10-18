@@ -124,11 +124,10 @@ pub fn scrub_partition(
     part: Partition,
     config: &ScrubConfig,
 ) -> StorageResult<(u64, u64, Vec<VerifyError>)> {
-    let report = engine
-        .tree(part)?
-        .verify_checksum_with(&config.verify_options());
+    let tree = engine.tree(part)?;
+    let report = tree.verify_checksum_with(&config.verify_options());
 
-    let errors = report
+    let mut errors: Vec<VerifyError> = report
         .errors
         .iter()
         .map(|e| VerifyError {
@@ -136,6 +135,21 @@ pub fn scrub_partition(
             message: e.to_string(),
         })
         .collect();
+    // The block scrub reads tables only. A partition keeping its values in
+    // blob files has each of them checked against the digest its manifest
+    // records; its tables hold only keys and references, so hashing them
+    // again here costs little.
+    if crate::engine::config::separates_values(part) {
+        errors.extend(
+            lsm_tree::verify::verify_integrity(tree)
+                .errors
+                .iter()
+                .map(|e| VerifyError {
+                    partition: part,
+                    message: e.to_string(),
+                }),
+        );
+    }
 
     Ok((
         report.blocks_scanned as u64,

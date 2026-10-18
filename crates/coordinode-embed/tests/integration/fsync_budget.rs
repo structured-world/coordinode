@@ -132,6 +132,42 @@ fn an_answer_that_an_object_exists_is_durable() {
     }
 }
 
+/// A uniqueness constraint answered active answers from a durable
+/// activation: when CREATE CONSTRAINT returns, the constraint's activation,
+/// its index's publication and the build before them are synced, so a power
+/// cut right after cannot take the constraint back to validating and admit a
+/// duplicate the answer said was refused.
+#[test]
+fn a_constraint_answered_active_is_activated_durably() {
+    use coordinode_core::txn::write_concern::WriteConcern;
+    let dir = tempdir().unwrap();
+    let mut db = open_flusher_held(dir.path());
+    db.execute_cypher("CREATE (:User {email: 'a@x'}), (:User {email: 'b@x'})")
+        .unwrap();
+    // The data under the cheapest concern, so only the statement's own
+    // answer can have synced it.
+    db.set_write_concern(WriteConcern::cache());
+    db.execute_cypher("CREATE (:User {email: 'c@x'})").unwrap();
+    db.set_write_concern(WriteConcern::majority());
+    let rows = db
+        .execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .unwrap();
+    assert_eq!(
+        rows[0].get("state"),
+        Some(&coordinode_core::graph::types::Value::String(
+            coordinode_core::schema::definition::ConstraintState::Active.to_string()
+        )),
+        "{rows:?}"
+    );
+    let engine = db.engine();
+    let now = engine.current_seqno();
+    assert_eq!(
+        engine.durable_view(now),
+        now,
+        "the answer went out with part of the activation unsynced"
+    );
+}
+
 /// A statement that answers an index ready answers from a durable
 /// publication: when CREATE INDEX returns, nothing it wrote, the build's
 /// published record included, waits unsynced in the journal, so a power cut

@@ -111,13 +111,18 @@ fn checkpoint_table_names(
         .and_then(Path::file_name)
         .expect("tables dir inside a partition dir")
         .to_os_string();
+    // `tables` or `blobs`: a checkpoint links both under their live names.
+    let folder = tables_dir
+        .file_name()
+        .expect("a named files dir")
+        .to_os_string();
     let mut names = std::collections::HashSet::new();
     let mut stack = vec![checkpoint_root.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
             continue;
         };
-        let in_tables = d.file_name().is_some_and(|n| n == "tables")
+        let in_tables = d.file_name().is_some_and(|n| n == folder)
             && d.parent()
                 .and_then(Path::file_name)
                 .is_some_and(|n| n == partition);
@@ -332,6 +337,65 @@ fn repair_rebuilds_corrupt_partition_from_checkpoint_plus_oplog() {
         Some(b"tail-B".as_slice()),
         "post-checkpoint oplog tail must be replayed"
     );
+}
+
+/// A partition keeping its large values in blob files is rebuilt when one of
+/// them rots, as a table-only partition is: the scrub reads the blob files,
+/// and the rebuild restores both the checkpoint base and the journal tail.
+#[test]
+fn repair_rebuilds_a_partition_with_a_corrupt_blob_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = open(&dir);
+    let root = checkpoint_root(dir.path());
+    let big = |tag: u8| vec![tag; 16 * 1024];
+
+    for i in 0..8u64 {
+        put(
+            &engine,
+            i + 1,
+            PartitionId::Blob,
+            format!("blob:base:{i}").as_bytes(),
+            &big(0xA1),
+        );
+    }
+    engine.persist().expect("persist base");
+    create_checkpoint(&engine, &root).expect("checkpoint");
+    for i in 0..8u64 {
+        put(
+            &engine,
+            100 + i,
+            PartitionId::Blob,
+            format!("blob:tail:{i}").as_bytes(),
+            &big(0xB2),
+        );
+    }
+    engine.persist().expect("persist tail");
+
+    let corrupted = corrupt_post_checkpoint_tables(
+        &dir.path().join(Partition::Blob.name()).join("blobs"),
+        &root,
+    );
+    assert!(
+        corrupted > 0,
+        "test must corrupt a post-checkpoint blob file"
+    );
+
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert!(
+        report.repaired.contains(&Partition::Blob),
+        "the blob partition must be rebuilt: {report:?}"
+    );
+    assert!(report.is_clean(), "re-scrub after repair: {report:?}");
+    for (key, value) in [("blob:base:3", big(0xA1)), ("blob:tail:5", big(0xB2))] {
+        assert_eq!(
+            engine
+                .get(Partition::Blob, key.as_bytes())
+                .expect("read after repair")
+                .as_deref(),
+            Some(value.as_slice()),
+            "{key} after the repair"
+        );
+    }
 }
 
 #[test]

@@ -164,6 +164,36 @@ fn scrub_reports_disk_corruption_without_aborting() {
     );
 }
 
+/// A partition keeping large values in blob files has them checked too: bit
+/// rot in a blob file is reported like one in a table, so the repair that
+/// follows a scrub finds the partition damaged.
+#[test]
+fn scrub_reports_a_corrupt_blob_file() {
+    let (engine, dir) = test_engine();
+    let value = vec![0xA5u8; 16 * 1024];
+    for i in 0..32u32 {
+        engine
+            .put(Partition::Blob, &i.to_be_bytes(), &value)
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+
+    // The values went to the partition's blob files, not its tables.
+    let victim = largest_file(&dir.path().join(Partition::Blob.name()).join("blobs"));
+    let mut bytes = std::fs::read(&victim).expect("read blob file");
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&victim, &bytes).expect("write corrupted blob file");
+
+    let (_, _, errors) = scrub_partition(&engine, Partition::Blob, &ScrubConfig::default())
+        .expect("scrub must not abort");
+    assert!(
+        !errors.is_empty(),
+        "a corrupt blob file at {} scrubbed clean",
+        victim.display()
+    );
+}
+
 #[test]
 fn scrub_report_error_flag() {
     let with = ScrubReport {

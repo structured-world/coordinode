@@ -29,12 +29,6 @@ use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp};
 use crate::placement::partition_wire_tag;
 
-/// Local entries between compactions: a compaction folds the base of every
-/// tree holding local records, flushes those trees and drops the covered
-/// segments. Local records are few (an election, an index first used), so
-/// this bounds the journal without its flushes becoming a cost of their own.
-const COMPACT_EVERY: u64 = 4096;
-
 /// See the module docs.
 pub(crate) struct LocalJournal {
     log: Arc<Mutex<EmbeddedOplog>>,
@@ -42,6 +36,12 @@ pub(crate) struct LocalJournal {
     dir: PathBuf,
     /// Entries appended since the last compaction.
     since_compaction: AtomicU64,
+    /// Local entries between compactions: a compaction folds the base of
+    /// every tree holding local records, flushes those trees and drops the
+    /// covered segments. Local records are few (an election, an index first
+    /// used), so the default bounds the journal without its flushes becoming
+    /// a cost of their own.
+    compact_every: u64,
 }
 
 impl LocalJournal {
@@ -134,6 +134,7 @@ impl LocalJournal {
             coverage,
             dir: dir.to_path_buf(),
             since_compaction: AtomicU64::new(0),
+            compact_every: cfg.local_journal_compact_entries,
         })
     }
 
@@ -193,7 +194,7 @@ impl LocalJournal {
             }
         }
         // Counts entries, far below u64::MAX.
-        Ok(self.since_compaction.fetch_add(1, Ordering::Relaxed) + 1 >= COMPACT_EVERY)
+        Ok(self.since_compaction.fetch_add(1, Ordering::Relaxed) + 1 >= self.compact_every)
     }
 
     /// Fold the applied prefix into the base of every tree that holds local

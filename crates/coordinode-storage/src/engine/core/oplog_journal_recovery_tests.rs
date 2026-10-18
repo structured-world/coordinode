@@ -1065,8 +1065,9 @@ fn a_power_cut_before_a_fresh_stores_first_flush_keeps_its_commits() {
     commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Journal);
     rig.cut(engine);
     let (engine, _) = rig.open();
-    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1]));
-    assert_eq!(two_tree_state(&engine, "b"), (true, vec![2]));
+    // Both commits add to the one adjacency list, each exactly once.
+    assert_eq!(two_tree_state(&engine, "a"), (true, vec![1, 2]));
+    assert_eq!(two_tree_state(&engine, "b"), (true, vec![1, 2]));
     rig.cut(engine);
 }
 

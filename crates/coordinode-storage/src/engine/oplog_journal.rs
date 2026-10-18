@@ -72,6 +72,8 @@ pub struct OplogJournalConfig {
     /// interval; past sixteen times this, the appender syncs itself, so the
     /// unsynced tail stays bounded however fast volatile writes arrive.
     pub volatile_flush_bytes: u64,
+    /// Entries of a member-local journal between its compactions.
+    pub local_journal_compact_entries: u64,
 }
 
 impl Default for OplogJournalConfig {
@@ -83,6 +85,7 @@ impl Default for OplogJournalConfig {
             sync_method: SyncMethod::default(),
             volatile_flush_interval_ms: 100,
             volatile_flush_bytes: 1024 * 1024,
+            local_journal_compact_entries: 4096,
         }
     }
 }
@@ -98,6 +101,7 @@ impl From<&StorageConfig> for OplogJournalConfig {
             sync_method: config.oplog_sync_method,
             volatile_flush_interval_ms: config.volatile_flush_interval_ms,
             volatile_flush_bytes: config.volatile_flush_bytes,
+            local_journal_compact_entries: config.local_journal_compact_entries,
         }
     }
 }
