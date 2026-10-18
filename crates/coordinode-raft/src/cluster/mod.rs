@@ -494,6 +494,12 @@ async fn await_self_election(raft: &RaftInstance) -> Result<(), RaftNodeError> {
 /// to before the deployment's own record reaches it.
 const KEY_ENROLLED_DEPLOYMENT: &[u8] = coordinode_core::group::ENROLLED_DEPLOYMENT_KEY;
 
+/// Schema-partition key recording the members a joining store was
+/// provisioned to trust, kept with its enrollment: a store restarted before
+/// its group's membership reached it still knows whom to ask who the members
+/// are, and so admits the leader that brings it the log.
+const KEY_ENROLLED_AUTHORITIES: &[u8] = b"raft:enrolled_authorities";
+
 /// Bind this store to the deployment it is being enrolled in, or refuse an
 /// enrollment in another one: a store bootstrapping into a deployment, or
 /// already part of one, never takes in another's state. The binding is
@@ -514,23 +520,65 @@ fn bind_enrollment(
             return Err(refuse(recorded));
         }
     }
-    let enrolled = engine
-        .get(Partition::Schema, KEY_ENROLLED_DEPLOYMENT)
-        .map_err(|e| RaftNodeError::Init(format!("read the enrollment: {e}")))?;
-    match enrolled.as_deref().map(DeploymentId::from_slice) {
-        Some(Some(bound)) if bound != enrollment.deployment => Err(refuse(bound)),
-        Some(Some(_)) => Ok(()),
-        Some(None) => Err(RaftNodeError::Init(
-            "the store's enrollment record does not decode".to_owned(),
-        )),
-        None => engine
-            .put(
+    if let Some(bound) = enrolled_deployment(engine)? {
+        if bound != enrollment.deployment {
+            return Err(refuse(bound));
+        }
+    }
+    // The authorities first: a recorded deployment then always comes with
+    // the members to ask about it.
+    let authorities: Vec<MemberNode> = enrollment
+        .authorities
+        .iter()
+        .map(|t| MemberNode::new(t.addr.clone(), Some(MemberIdentity::from(&t.identity))))
+        .collect();
+    let authorities = rmp_serde::to_vec(&authorities)
+        .map_err(|e| RaftNodeError::Init(format!("encode the enrollment's authorities: {e}")))?;
+    engine
+        .put(Partition::Schema, KEY_ENROLLED_AUTHORITIES, &authorities)
+        .and_then(|()| {
+            engine.put(
                 Partition::Schema,
                 KEY_ENROLLED_DEPLOYMENT,
                 enrollment.deployment.as_bytes(),
             )
-            .and_then(|()| engine.persist())
-            .map_err(|e| RaftNodeError::Init(format!("record the enrollment: {e}"))),
+        })
+        .and_then(|()| engine.persist())
+        .map_err(|e| RaftNodeError::Init(format!("record the enrollment: {e}")))
+}
+
+/// The members a store enrolled as a joining member was provisioned to
+/// trust; none for a store never enrolled.
+fn enrolled_authorities(
+    engine: &StorageEngine,
+) -> Result<Vec<coordinode_wire::peer::PeerTarget>, RaftNodeError> {
+    use coordinode_storage::engine::partition::Partition;
+    let Some(bytes) = engine
+        .get(Partition::Schema, KEY_ENROLLED_AUTHORITIES)
+        .map_err(|e| RaftNodeError::Init(format!("read the enrollment's authorities: {e}")))?
+    else {
+        return Ok(Vec::new());
+    };
+    let nodes: Vec<MemberNode> = rmp_serde::from_slice(&bytes).map_err(|e| {
+        RaftNodeError::Init(format!("the enrollment's authorities do not decode: {e}"))
+    })?;
+    Ok(nodes.iter().filter_map(admission::member_target).collect())
+}
+
+/// The deployment this store was enrolled in as a joining member, if it
+/// was: such a store is a member of a group it did not found, whether or not
+/// the group's log has reached it yet.
+fn enrolled_deployment(engine: &StorageEngine) -> Result<Option<DeploymentId>, RaftNodeError> {
+    use coordinode_storage::engine::partition::Partition;
+    let enrolled = engine
+        .get(Partition::Schema, KEY_ENROLLED_DEPLOYMENT)
+        .map_err(|e| RaftNodeError::Init(format!("read the enrollment: {e}")))?;
+    match enrolled.as_deref().map(DeploymentId::from_slice) {
+        Some(Some(bound)) => Ok(Some(bound)),
+        Some(None) => Err(RaftNodeError::Init(
+            "the store's enrollment record does not decode".to_owned(),
+        )),
+        None => Ok(None),
     }
 }
 
@@ -1037,11 +1085,16 @@ impl RaftNode {
                 });
             }
         }
+        // A store enrolled earlier stays a member of the group it joined,
+        // however it is opened now and whether or not that group's log has
+        // reached it: it founds nothing, and speaks for the deployment it was
+        // enrolled in until the deployment's own record arrives.
+        let enrolled_in = enrolled_deployment(&engine)?;
         let version = version_gate(node_id, group, &state_machine, host_epoch);
         let mut deployment = state_machine.subscribe_deployment();
         let deployment_view = admission::DeploymentView::new(
             deployment.clone(),
-            enrollment.as_ref().map(|e| e.deployment),
+            enrollment.as_ref().map(|e| e.deployment).or(enrolled_in),
         );
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
@@ -1069,6 +1122,9 @@ impl RaftNode {
         let commands = Commands::new(Arc::clone(&raft), Arc::clone(&engine), engine.oracle());
 
         let advertise_addr = match &founding {
+            // An enrolled member resumes in its group: nothing to initialize
+            // or found, the group's leader brings it the log.
+            Founding::Form { advertise } if enrolled_in.is_some() => Some(advertise.clone()),
             Founding::Form { advertise } => {
                 // Try initialize — succeeds on fresh, NotAllowed on restart.
                 // The member is bound to the identity it proves from the
@@ -1111,7 +1167,12 @@ impl RaftNode {
             node_id,
             Arc::clone(&raft),
             deployment_view,
-            enrollment.map(|e| e.authorities).unwrap_or_default(),
+            // Reopened without its provisioning, an enrolled member trusts
+            // the authorities recorded with its enrollment.
+            match enrollment {
+                Some(enrollment) => enrollment.authorities,
+                None => enrolled_authorities(&engine)?,
+            },
             Arc::clone(&connections),
             Arc::clone(&version),
         ));

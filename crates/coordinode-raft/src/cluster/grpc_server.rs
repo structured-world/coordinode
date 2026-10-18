@@ -98,6 +98,25 @@ impl GroupReplica {
         Ok(caller)
     }
 
+    /// Admit a call open to members of any version: its caller must be a
+    /// member that `op` is open to and its record must speak for that
+    /// member, which is then learnt. Returns the member the caller is.
+    fn admit_any_version(
+        &self,
+        metadata: &MetadataMap,
+        extensions: &Extensions,
+        op: Operation,
+    ) -> Result<u64, Status> {
+        let caller = self
+            .admission
+            .admit(extensions.get::<PeerConnectInfo>(), metadata, op)?;
+        if let Ok(record) = read_handshake(metadata) {
+            Admission::same_member(caller, record.node_id)?;
+            self.gate.observe(&record);
+        }
+        Ok(caller)
+    }
+
     /// `body` as the call's response, carrying this member's record.
     fn answer<T>(&self, body: T) -> Response<T> {
         let mut response = Response::new(body);
@@ -705,7 +724,13 @@ impl RaftService for RaftGrpcHandler {
         &self,
         request: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
-        let (replica, _, _) = admitted(&self.groups, request, Operation::Members)?;
+        // Answered whatever version the caller runs, like the version
+        // exchange: a member updated before the group's log reached it must
+        // learn who the members are to admit the leader whose handshake tells
+        // it that it runs ahead.
+        let (metadata, extensions, payload) = request.into_parts();
+        let replica = self.groups.replica(GroupId(payload.group))?;
+        replica.admit_any_version(&metadata, &extensions, Operation::Members)?;
         let reply = MembersReply {
             deployment: replica.admission.deployment(),
             view: replica.admission.own_view(),

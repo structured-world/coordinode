@@ -231,6 +231,17 @@ async fn group_of_three(host_epoch: u64) -> [Member; 3] {
     ]
 }
 
+/// Wait until `node`, updated ahead of its group, knows it: stopped soon
+/// after it joined, it may hold none of the group's log yet and learns the
+/// pair its group runs from the leader's handshake.
+async fn learns_it_runs_ahead(node: &RaftNode) {
+    eventually(
+        "the updated member learns it runs ahead of its group",
+        || matches!(node.version().state(), MemberState::Mismatched(ref m) if !m.behind),
+    )
+    .await;
+}
+
 fn mismatch(result: Result<(), ProposalError>) -> coordinode_core::version::Mismatch {
     match result {
         Err(ProposalError::Mismatched(m)) => m,
@@ -252,6 +263,7 @@ async fn a_group_moves_by_majority_one_member_at_a_time() {
 
         // Member 3 first: ahead of its group, read-only, frozen.
         m3.update(1).await;
+        learns_it_runs_ahead(m3.node()).await;
         let ahead = mismatch(write(m3.node(), &ids, "node:on-3", 110));
         assert!(!ahead.behind);
         assert_eq!((ahead.own, ahead.group), (pair(1), pair(0)));
@@ -367,6 +379,135 @@ async fn a_group_moves_by_majority_one_member_at_a_time() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A member enrolled into a group and stopped before the group's log reached
+/// it holds no record of the deployment yet. Reopened, it is still that
+/// group's member: it founds no group of its own, waits for no election of a
+/// founder that cannot come, and opens at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_reopened_before_the_log_reached_it_opens_as_a_member() {
+    use openraft::async_runtime::watch::WatchReceiver as _;
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (d1, d3) = (
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d3"),
+        );
+        let (p1, p3) = (alloc_port(), alloc_port());
+        let e1 = open_engine(d1.path());
+        let e3 = open_engine(d3.path());
+        let n1 = RaftNode::open_cluster_with_options(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("addr"),
+            format!("http://127.0.0.1:{p1}"),
+            options(1, 0),
+        )
+        .await
+        .expect("open 1");
+        eventually("member 1 records its pair", || {
+            n1.version().group_pair().map(|r| r.pair) == Some(pair(0))
+        })
+        .await;
+        // Enrolled, never added: no entry of the group's log reaches it.
+        let n3 = RaftNode::open_joining_with_options(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("addr"),
+            joining(3, 0, &n1, p1),
+        )
+        .await
+        .expect("open 3");
+        n3.shutdown().await.expect("stop 3");
+
+        let started = std::time::Instant::now();
+        let n3 = RaftNode::open_cluster_with_options(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("addr"),
+            format!("http://127.0.0.1:{p3}"),
+            options(3, 0),
+        )
+        .await
+        .expect("reopen 3");
+        let took = started.elapsed();
+        let metrics = n3.raft().metrics().borrow_watched().clone();
+        assert!(
+            !metrics.state.is_leader(),
+            "an enrolled member founded a group of its own"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "the reopen waited {took:?} for a founder's election"
+        );
+
+        // Still without a membership of its own, it admits the members it
+        // was provisioned to trust, so the group can bring it the log.
+        let ids = ProposalIdGenerator::with_base(1u64 << 48);
+        write(&n1, &ids, "node:after-reopen", 100).expect("write on 1");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), PKI.identity(3))
+            .await
+            .expect("add 3");
+        eventually("member 3 receives the group's log", || {
+            holds(&e3, "node:after-reopen")
+        })
+        .await;
+
+        n3.shutdown().await.expect("stop 3");
+        n1.shutdown().await.expect("stop 1");
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// A member enrolled, stopped before the group's log reached it and reopened
+/// at a newer version learns who the members are from the member it was
+/// provisioned to trust, though that member runs the older version, and so
+/// learns from the leader's handshake that it runs ahead of its group.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_updated_before_the_log_reached_it_learns_it_runs_ahead() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (d1, d3) = (
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d3"),
+        );
+        let (p1, p3) = (alloc_port(), alloc_port());
+        let e1 = open_engine(d1.path());
+        let e3 = open_engine(d3.path());
+        let n1 = RaftNode::open_cluster_with_options(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("addr"),
+            format!("http://127.0.0.1:{p1}"),
+            options(1, 0),
+        )
+        .await
+        .expect("open 1");
+        eventually("member 1 records its pair", || {
+            n1.version().group_pair().map(|r| r.pair) == Some(pair(0))
+        })
+        .await;
+        let n3 = RaftNode::open_joining_with_options(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("addr"),
+            joining(3, 0, &n1, p1),
+        )
+        .await
+        .expect("open 3");
+        n3.shutdown().await.expect("stop 3");
+
+        let n3 = reopen(3, &e3, p3, 1).await;
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), PKI.identity(3))
+            .await
+            .expect("add 3");
+        learns_it_runs_ahead(&n3).await;
+
+        n3.shutdown().await.expect("stop 3");
+        n1.shutdown().await.expect("stop 1");
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A move abandoned before it reaches a majority: the updated member is
 /// removed (the removal committed first), its directory discarded after, and
 /// it is added back empty at the version the group runs. The group writes
@@ -379,6 +520,7 @@ async fn a_move_is_abandoned_by_removing_and_re_adding_the_updated_member() {
         write(m1.node(), &ids, "node:before", 100).expect("write before the move");
 
         m3.update(1).await;
+        learns_it_runs_ahead(m3.node()).await;
         mismatch(write(m3.node(), &ids, "node:on-3", 110));
         write(m1.node(), &ids, "node:during", 120).expect("the old side holds a majority");
 
