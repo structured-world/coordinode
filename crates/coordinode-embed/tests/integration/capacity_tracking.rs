@@ -1501,9 +1501,19 @@ fn writes_resume_after_cascade_eviction_frees_hot_endpoint() {
     // pushes the bottom-level SSTs to the Cold endpoint via the
     // per-LSM-level routing's L4+ → Cold mapping.
 
-    // Run a second refresh: the post-cascade SSTs should now be on
-    // Cold, freeing Hot.
-    engine.refresh_capacity();
+    // Refresh again, as the background scanner does on each pass: the
+    // post-cascade SSTs move to Cold, and the tables they replace leave Hot
+    // once no compaction still running reads them, which a busy machine
+    // delays. Recovery is promised without an operator, not within one pass.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        engine.refresh_capacity();
+        let writable = engine.capacity().get("ep-hot").expect("hot").is_writable();
+        if writable || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     let hot_usage = engine.capacity().get("ep-hot").expect("hot");
     let cold_usage = engine.capacity().get("ep-cold").expect("cold");
 
