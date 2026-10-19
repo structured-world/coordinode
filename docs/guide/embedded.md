@@ -55,8 +55,10 @@ let rows = db.execute_cypher_with_params(
 // snapshot pinned at begin; commit applies all writes atomically and
 // returns a CommitReceipt (commit_ts = the seqno every write landed at:
 // the `AS OF TIMESTAMP` anchor, and a change scan from it includes this
-// commit; applied_index = None in embedded mode).
-let tx = db.begin_transaction();
+// commit; applied_index = None in embedded mode). A member of a replicated
+// group that does not lead refuses BEGIN with `NotLeader`, and a transaction
+// ends if the lead moves before its commit (`TransactionAborted`).
+let tx = db.begin_transaction()?;
 db.execute_in_transaction(tx, "CREATE (n:Person {name: 'Bob'})", None)?;
 let receipt = db.commit_transaction(tx)?;
 let as_of = receipt.commit_ts.as_raw();

@@ -296,7 +296,7 @@ fn a_durable_transaction_starts_below_an_unsynced_write() {
     db.set_write_concern(WriteConcern::memory());
     let written = write_volatile(&mut db, "CREATE (n:Tick {k: 1})");
     db.set_read_concern(ReadConcernLevel::Majority);
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     let read = db
         .execute_in_transaction(txn, "MATCH (n:Tick) RETURN n.k", None)
         .unwrap();

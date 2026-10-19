@@ -196,6 +196,7 @@ pub(crate) async fn serve(
         default_write_concern: _,
         interactive_txn_idle_timeout_secs,
         interactive_txn_max_bytes,
+        interactive_txn_drain_timeout_ms,
         autocommit_retry_attempts,
         autocommit_retry_backoff_ms,
         operation_admission_window,
@@ -764,13 +765,10 @@ pub(crate) async fn serve(
 
     // Live session registry for operational introspection
     // (SHOW SESSIONS / SHOW TRANSACTIONS). Shared between the session
-    // binding (which updates it as sessions open and transactions
-    // begin/end) and the query engine (which reads a snapshot). Its
-    // transaction auto-abort countdown uses the same idle timeout as the
-    // interactive-transaction reaper.
-    let session_registry = Arc::new(coordinode_session::SessionRegistry::new(
-        std::time::Duration::from_secs(interactive_txn_idle_timeout_secs),
-    ));
+    // binding (which updates it as sessions open and attach to
+    // transactions) and the query engine (which reads a snapshot). The
+    // transactions themselves, with their countdowns, are the database's.
+    let session_registry = Arc::new(coordinode_session::SessionRegistry::new());
 
     // Interactive-transaction tunables. Always resolved (the
     // config gate carries the built-in defaults: 30s idle timeout,
@@ -784,6 +782,9 @@ pub(crate) async fn serve(
         let begun = Arc::clone(&interactive_begun);
         db.set_interactive_begun_hook(Arc::new(move || begun.notify_one()));
         db.set_max_interactive_txn_bytes(interactive_txn_max_bytes as usize);
+        db.set_interactive_drain_timeout(std::time::Duration::from_millis(
+            interactive_txn_drain_timeout_ms,
+        ));
         db.set_autocommit_retry(
             autocommit_retry_attempts,
             std::time::Duration::from_millis(autocommit_retry_backoff_ms),
@@ -820,7 +821,6 @@ pub(crate) async fn serve(
     // its snapshot) forever. Asleep while none is open.
     crate::txn_reaper::spawn(
         Arc::clone(&database),
-        Arc::clone(&session_registry),
         std::time::Duration::from_secs(interactive_txn_idle_timeout_secs),
         interactive_begun,
         std::time::Duration::from_secs(1),

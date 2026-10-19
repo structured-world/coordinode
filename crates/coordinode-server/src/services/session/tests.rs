@@ -6,28 +6,83 @@ fn anonymous() -> ClientApp {
     ClientApp::default()
 }
 
+/// A handle a server issued, and its wire form.
+fn issued() -> (coordinode_embed::TransactionHandle, Vec<u8>) {
+    let handle = coordinode_embed::TransactionHandle::new(None, 2, 3, 7);
+    (handle, handle.to_bytes().to_vec())
+}
+
 #[test]
 fn to_op_maps_execute_with_handles() {
+    let (handle, wire) = issued();
     let frame = ClientFrame {
         request_id: 1,
         op: Some(client_frame::Op::Execute(Execute {
             query: "RETURN 1".to_string(),
             parameters: Default::default(),
-            txid: 7,
+            transaction: wire,
             nonce: 3,
             ..Default::default()
         })),
     };
     match to_op(frame.op, &anonymous()) {
         Ok(SessionOp::Execute {
-            query, txid, nonce, ..
+            query,
+            transaction,
+            nonce,
+            ..
         }) => {
             assert_eq!(query, "RETURN 1");
-            assert_eq!(txid, 7);
+            assert_eq!(transaction, Some(handle));
             assert_eq!(nonce, 3);
         }
         other => panic!("expected Execute op, got {other:?}"),
     }
+}
+
+/// Bytes that are not a handle the server issued are refused at the frame,
+/// naming the field, before anything reaches the engine; no bytes is a
+/// statement of its own.
+#[test]
+fn to_op_refuses_bytes_that_are_not_a_handle() {
+    let execute = |transaction: Vec<u8>| {
+        Some(client_frame::Op::Execute(Execute {
+            query: "RETURN 1".to_string(),
+            transaction,
+            ..Default::default()
+        }))
+    };
+    for (op, field) in [
+        (execute(vec![9; 5]), "execute.transaction"),
+        (
+            Some(client_frame::Op::Commit(Commit {
+                transaction: vec![1, 2, 3],
+                ..Default::default()
+            })),
+            "commit.transaction",
+        ),
+        (
+            Some(client_frame::Op::Rollback(Rollback {
+                transaction: Vec::new(),
+            })),
+            "rollback.transaction",
+        ),
+    ] {
+        let refused = to_op(op, &anonymous()).expect_err("not a handle");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        let details = tonic_types::StatusExt::get_error_details(&refused);
+        assert_eq!(
+            details.bad_request().expect("BadRequest").field_violations[0].field,
+            field
+        );
+    }
+    assert!(matches!(
+        to_op(execute(Vec::new()), &anonymous()),
+        Ok(SessionOp::Execute {
+            transaction: None,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -44,7 +99,7 @@ fn to_op_maps_begin_ordering_with_unspecified_defaulting_to_ordered() {
             ordering,
             drain_timeout_ms,
         }) => {
-            assert_eq!(ordering, CoreOrdering::Unordered);
+            assert_eq!(ordering, TxnOrdering::Unordered);
             assert_eq!(drain_timeout_ms, 50);
         }
         other => panic!("expected Begin op, got {other:?}"),
@@ -59,7 +114,7 @@ fn to_op_maps_begin_ordering_with_unspecified_defaulting_to_ordered() {
     assert!(matches!(
         to_op(unspecified.op, &anonymous()),
         Ok(SessionOp::Begin {
-            ordering: CoreOrdering::Ordered,
+            ordering: TxnOrdering::Ordered,
             ..
         })
     ));
@@ -73,20 +128,21 @@ fn to_op_maps_commit_rollback_cancel() {
         sequence: 5,
         deployment: vec![8; 16],
     };
+    let (handle, wire) = issued();
     let commit = ClientFrame {
         request_id: 1,
         op: Some(client_frame::Op::Commit(Commit {
-            txid: 4,
+            transaction: wire.clone(),
             last_nonce: 9,
             operation: Some(reference.clone()),
         })),
     };
     match to_op(commit.op, &anonymous()) {
         Ok(SessionOp::Commit {
-            txid: 4,
+            transaction,
             last_nonce: 9,
             operation: Some(descriptor),
-        }) => assert_eq!(
+        }) if transaction == handle => assert_eq!(
             crate::services::operation::descriptor_to_proto(&descriptor),
             reference
         ),
@@ -96,7 +152,7 @@ fn to_op_maps_commit_rollback_cancel() {
     let stripped = ClientFrame {
         request_id: 1,
         op: Some(client_frame::Op::Commit(Commit {
-            txid: 4,
+            transaction: wire.clone(),
             last_nonce: 9,
             operation: Some(crate::proto::operation::OperationRef {
                 deployment: Vec::new(),
@@ -110,11 +166,11 @@ fn to_op_maps_commit_rollback_cancel() {
     );
     let rollback = ClientFrame {
         request_id: 1,
-        op: Some(client_frame::Op::Rollback(Rollback { txid: 4 })),
+        op: Some(client_frame::Op::Rollback(Rollback { transaction: wire })),
     };
     assert!(matches!(
         to_op(rollback.op, &anonymous()),
-        Ok(SessionOp::Rollback { txid: 4 })
+        Ok(SessionOp::Rollback { transaction }) if transaction == handle
     ));
     let cancel = ClientFrame {
         request_id: 1,
@@ -223,9 +279,17 @@ fn a_failure_keeps_its_code_and_reason_through_the_session() {
 
 #[test]
 fn event_to_frame_tags_the_request_id_and_maps_each_event() {
-    let begun = event_to_frame(5, SessionEvent::Begun { txid: 2 });
+    let (handle, wire) = issued();
+    let begun = event_to_frame(
+        5,
+        SessionEvent::Begun {
+            transaction: handle,
+        },
+    );
     assert_eq!(begun.request_id, 5);
-    assert!(matches!(begun.event, Some(Event::Begun(Begun { txid: 2 }))));
+    assert!(
+        matches!(begun.event, Some(Event::Begun(Begun { transaction })) if transaction == wire)
+    );
 
     let open = event_to_frame(
         6,
@@ -267,8 +331,6 @@ fn to_op_converts_execute_parameters_to_engine_values() {
         op: Some(client_frame::Op::Execute(Execute {
             query: "RETURN $n".to_string(),
             parameters,
-            txid: 0,
-            nonce: 0,
             ..Default::default()
         })),
     };

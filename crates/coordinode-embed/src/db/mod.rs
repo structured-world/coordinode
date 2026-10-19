@@ -413,25 +413,10 @@ pub struct Database {
     /// on a clone of the cached plan so they stay sensitive to live
     /// index registry state. See [`PlanCache`].
     plan_cache: Arc<PlanCache>,
-    /// Open interactive multi-statement transactions, keyed by a
-    /// server-allocated transaction id. Leader-local and ephemeral: parked
-    /// `TransactionState` (uncommitted writes + OCC read-set + pinned
-    /// snapshot), the last-touched instant for idle-timeout reaping, and the
-    /// intent of the statements run so far, which a commit carrying out a
-    /// client operation binds. Never replicated: durability happens only at
-    /// `commit_transaction`.
-    interactive_txns: Mutex<
-        std::collections::HashMap<
-            u64,
-            (
-                coordinode_storage::engine::transaction::TransactionState,
-                Instant,
-                crate::operation::IntentDigest,
-            ),
-        >,
-    >,
-    /// Monotonic source of interactive transaction ids.
-    next_txn_id: AtomicU64,
+    /// Open interactive multi-statement transactions held by this member, and
+    /// the leadership tenure they belong to. Ephemeral and never replicated:
+    /// durability happens only at the commit.
+    interactive: interactive::Registry,
     /// Idle timeout for interactive transactions: an open
     /// transaction with no activity for this long is auto-rolled-back (it pins
     /// an MVCC snapshot + buffers memory). Set by the server from the
@@ -615,6 +600,20 @@ pub struct StatementOptions {
     /// took effect runs nothing and reports
     /// [`DatabaseError::OperationSettled`]. See [`crate::operation`].
     pub operation: Option<crate::operation::OperationDescriptor>,
+    /// Who this statement acts for, as an authentication adapter or a
+    /// trusted host established it; `None` is the embedding host's own
+    /// trusted access. A statement of an open transaction must act for the
+    /// caller that began it.
+    pub actor: Option<coordinode_core::txn::handle::ActingContext>,
+    /// The statement's number within its transaction, kept by a client
+    /// across retransmissions: an ordered transaction applies its
+    /// statements by it, from 1, and in either order a repeat is refused
+    /// instead of applied twice. `None` (or 0) in an unordered transaction
+    /// is a statement without one. Not read outside a transaction.
+    pub nonce: Option<u64>,
+    /// Told when a statement of a transaction has its place in the
+    /// transaction's order. Not read outside a transaction.
+    pub admission: Option<coordinode_core::txn::handle::AdmissionSignal>,
 }
 
 #[derive(Debug, Clone)]
@@ -703,14 +702,60 @@ pub enum DatabaseError {
     #[error("semantic error: {0}")]
     Semantic(String),
 
-    /// No interactive transaction is held under this id.
+    /// No interactive transaction this caller may use is held under this
+    /// handle.
     ///
-    /// Either it was never opened, or it is already finished: committed,
+    /// Either it was never opened here, or it is already finished: committed,
     /// rolled back, aborted by a failed statement, or collected by the idle
-    /// sweep. A caller cannot tell those apart from the id alone, and does not
-    /// need to: in every case the server holds nothing for it.
-    #[error("unknown transaction id {0}")]
-    UnknownTransaction(u64),
+    /// sweep; or it acts for another caller, which the handle alone does not
+    /// reveal. In every case nothing is held for this caller under it. It is
+    /// not proof that a commit did not happen: an operation's outcome is
+    /// resolved by its descriptor.
+    #[error("unknown transaction {0}")]
+    UnknownTransaction(TransactionHandle),
+
+    /// The transaction's queue of commands waiting for their turn is full;
+    /// send this one once earlier ones have answered. Nothing was done and
+    /// the transaction stays open.
+    #[error("transaction {0} has too many commands waiting")]
+    TransactionBusy(TransactionHandle),
+
+    /// A statement with this nonce was already admitted to the transaction:
+    /// it is applied once, and its result is not kept to answer a repeat.
+    #[error(
+        "statement {nonce} of transaction {handle} was already admitted; its result is not retained"
+    )]
+    StatementAlreadyAdmitted {
+        /// The transaction.
+        handle: TransactionHandle,
+        /// The repeated nonce.
+        nonce: u64,
+    },
+
+    /// The nonce names a statement already admitted with different text or
+    /// parameters. Nothing was done; a new statement takes a new nonce.
+    #[error("nonce {nonce} of transaction {handle} names a different statement")]
+    StatementNonceReused {
+        /// The transaction.
+        handle: TransactionHandle,
+        /// The reused nonce.
+        nonce: u64,
+    },
+
+    /// A statement of an ordered transaction came without its nonce, which
+    /// numbers the chain from 1. Nothing was done.
+    #[error("a statement of ordered transaction {0} needs a nonce from 1")]
+    StatementNonceRequired(TransactionHandle),
+
+    /// The transaction ended before anything of it was submitted, so nothing
+    /// of it was applied. Running it again is a new transaction.
+    #[error("transaction {handle} was aborted: {end}")]
+    TransactionAborted {
+        /// The transaction.
+        handle: TransactionHandle,
+        /// Why it ended.
+        end: interactive::TransactionEnd,
+    },
 
     /// A commit refused by OCC validation: a key this transaction READ was
     /// modified by a concurrent writer after the snapshot was pinned at begin,
@@ -719,7 +764,10 @@ pub enum DatabaseError {
     /// intended response, and the only failure of the commit for which that
     /// helps.
     #[error("transaction {id} conflicts with a concurrent write: {source_message}")]
-    TransactionConflict { id: u64, source_message: String },
+    TransactionConflict {
+        id: TransactionHandle,
+        source_message: String,
+    },
 
     /// A commit refused by a declared condition: the state the transaction's
     /// result depends on no longer holds, or a concurrent transaction holds an
@@ -742,7 +790,7 @@ pub enum DatabaseError {
     )]
     RevisionMismatch {
         /// The transaction the refusal belongs to.
-        id: u64,
+        id: TransactionHandle,
         /// The version the write was conditioned on; `None` required absence.
         expected: Option<u64>,
         /// The version the record has now; `None` means it is absent.
@@ -752,7 +800,7 @@ pub enum DatabaseError {
     #[error("transaction {id} was refused by an invariant: {reason}")]
     InvariantRefused {
         /// The transaction the refusal belongs to.
-        id: u64,
+        id: TransactionHandle,
         /// Which condition refused it, in the words of the condition.
         reason: String,
     },
@@ -761,7 +809,7 @@ pub enum DatabaseError {
     /// was discarded. Splitting the work into smaller transactions is the fix.
     #[error("transaction {id} exceeded its buffer limit ({buffered} > {limit} bytes)")]
     TransactionTooLarge {
-        id: u64,
+        id: TransactionHandle,
         buffered: usize,
         limit: usize,
     },
@@ -1299,8 +1347,7 @@ impl Database {
             // bound prevents unbounded growth on adversarial inputs
             // that produce a fresh query string per call.
             plan_cache: Arc::new(PlanCache::new(1024)),
-            interactive_txns: Mutex::new(std::collections::HashMap::new()),
-            next_txn_id: AtomicU64::new(0),
+            interactive: interactive::Registry::new(Self::DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT),
             interactive_idle_timeout: Self::DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT,
             autocommit_attempts: Self::DEFAULT_AUTOCOMMIT_ATTEMPTS,
             autocommit_backoff: Self::DEFAULT_AUTOCOMMIT_BACKOFF,
@@ -1940,362 +1987,6 @@ impl Database {
         Timestamp::from_raw(seqno)
     }
 
-    /// Begin an interactive multi-statement transaction.
-    ///
-    /// Returns a server-allocated transaction id. Pass it to
-    /// [`Self::execute_in_transaction`] for each statement, then
-    /// [`Self::commit_transaction`] or [`Self::rollback_transaction`]. The
-    /// transaction pins an MVCC snapshot at its `start_ts`, so every statement
-    /// reads the same point-in-time (repeatable read). State is leader-local
-    /// and ephemeral — durability happens only at commit. Idle transactions
-    /// are reaped after the configured idle timeout
-    /// ([`Self::set_interactive_idle_timeout`]).
-    pub fn begin_transaction(&self) -> u64 {
-        self.reap_idle_transactions(self.interactive_idle_timeout);
-        let id = self.next_txn_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let read_ts = self.oracle.next();
-        // The view is the engine's complete snapshot, not the timestamp just
-        // allocated: a fresh number from the clock can already cover a commit
-        // that has not applied, and a transaction starting there would see
-        // neither that write nor any sign of it. `read_ts` stays the
-        // allocated value because it identifies this attempt. A read concern
-        // that must not see a write a crash can still take back reads the
-        // durable view.
-        let mut txn = if self.read_concern.is_durable() {
-            coordinode_storage::engine::transaction::Transaction::begin_durable(
-                &self.engine,
-                Some(&self.oracle),
-                read_ts,
-            )
-        } else {
-            coordinode_storage::engine::transaction::Transaction::begin(
-                &self.engine,
-                Some(&self.oracle),
-                read_ts,
-            )
-        };
-        let state = txn.take_state();
-        self.interactive_txns
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(id, (state, Instant::now(), crate::operation::EMPTY_CHAIN));
-        if let Some(begun) = &self.interactive_begun {
-            begun();
-        }
-        id
-    }
-
-    /// Call `begun` after every interactive transaction opens. The server's
-    /// idle reaper uses it to sleep while no transaction is open.
-    pub fn set_interactive_begun_hook(&mut self, begun: Arc<dyn Fn() + Send + Sync>) {
-        self.interactive_begun = Some(begun);
-    }
-
-    /// Run one statement of an interactive transaction.
-    ///
-    /// The statement reads at the transaction's pinned snapshot and its writes
-    /// buffer on the transaction without committing. A statement error aborts
-    /// the transaction (its parked state is dropped, matching SQL "current
-    /// transaction is aborted" semantics) — subsequent statements and commit
-    /// then fail with "unknown transaction id". A single client drives its
-    /// transaction serially, so the state is checked out for the statement.
-    pub fn execute_in_transaction(
-        &self,
-        txn_id: u64,
-        query: &str,
-        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
-    ) -> Result<Vec<Row>, DatabaseError> {
-        self.execute_in_transaction_with(txn_id, query, params, &StatementOptions::default())
-    }
-
-    /// [`Self::execute_in_transaction`] with the vector settings in `options`
-    /// in place of the database's. Its read and write concerns are the
-    /// transaction's, fixed when it began and when it commits, so those
-    /// fields of `options` are not read here.
-    pub fn execute_in_transaction_with(
-        &self,
-        txn_id: u64,
-        query: &str,
-        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
-        options: &StatementOptions,
-    ) -> Result<Vec<Row>, DatabaseError> {
-        let (state, chain) = {
-            let mut reg = self
-                .interactive_txns
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            match reg.remove(&txn_id) {
-                Some((state, _touched, chain)) => (state, chain),
-                None => return Err(DatabaseError::UnknownTransaction(txn_id)),
-            }
-        };
-        let session = QuerySession {
-            read_concern: self.read_concern,
-            snapshot_read_ts: None,
-            write_concern: self.write_concern,
-            vector_consistency: options.vector_consistency.or(self.vector_consistency),
-            vector_build_wait: options.vector_build_wait.unwrap_or(self.vector_build_wait),
-            after_commit_generation: 0,
-            budget: self.options_budget(options)?,
-            // The transaction's commit carries its operation.
-            operation: None,
-        };
-        let params = params.filter(|p| !p.is_empty());
-        // The chain a commit of the transaction binds as its intent: every
-        // statement it ran, in order.
-        let chain = crate::operation::chain_intent(
-            &chain,
-            &crate::operation::statement_intent(query, params.as_ref()),
-        );
-        // On error the state is intentionally NOT re-parked → transaction aborts.
-        let (rows, _stats, out_state) = self.execute_cypher_impl(
-            query,
-            None,
-            params,
-            &session,
-            TxnMode::Interactive(Box::new(state)),
-            &mut None,
-        )?;
-        if let Some(state) = out_state {
-            // Cap buffered (uncommitted) memory: a client that keeps writing
-            // without committing must not grow leader memory unbounded. On
-            // breach the transaction aborts (state dropped, handle consumed).
-            let buffered = state.buffered_bytes();
-            if buffered > self.max_interactive_txn_bytes {
-                return Err(DatabaseError::TransactionTooLarge {
-                    id: txn_id,
-                    buffered,
-                    limit: self.max_interactive_txn_bytes,
-                });
-            }
-            self.interactive_txns
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(txn_id, (state, Instant::now(), chain));
-        }
-        Ok(rows)
-    }
-
-    /// Commit an interactive transaction: validate the accumulated
-    /// write set, assign `commit_ts`, and persist every buffered mutation in a
-    /// single proposal. The handle is consumed (removed from the registry)
-    /// whether commit succeeds or fails; on a write conflict the client
-    /// retries the whole transaction from `begin`. Returns the
-    /// [`CommitReceipt`](coordinode_core::txn::transaction::CommitReceipt):
-    /// `commit_ts` (the HLC commit timestamp every mutation landed at: the
-    /// `AS OF TIMESTAMP` anchor for this write, and a changed-keys scan from it
-    /// includes this commit) plus the committed Raft index in cluster mode
-    /// (`None` in embedded mode, where there is no Raft log).
-    pub fn commit_transaction(
-        &self,
-        txn_id: u64,
-    ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
-        self.commit_transaction_inner(txn_id, None)
-    }
-
-    /// [`Self::commit_transaction`] carrying out client operation
-    /// `operation`, whose intent is the transaction's statements in the
-    /// order they ran: the writes take effect at most once however often
-    /// the operation is committed. When an attempt of it took effect already
-    /// or it cannot be admitted, this one applies nothing and the error is
-    /// [`DatabaseError::OperationSettled`] with how it stands; a lost reply
-    /// is resolved with [`Self::resolve_operation`], never by running the
-    /// statements again under a new operation.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::commit_transaction`], and the above.
-    pub fn commit_transaction_as(
-        &self,
-        txn_id: u64,
-        operation: &crate::operation::OperationDescriptor,
-    ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
-        self.commit_transaction_inner(txn_id, Some(operation))
-    }
-
-    fn commit_transaction_inner(
-        &self,
-        txn_id: u64,
-        operation: Option<&crate::operation::OperationDescriptor>,
-    ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
-        let parked = self
-            .interactive_txns
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&txn_id);
-        let Some((state, _touched, chain)) = parked else {
-            // A commit repeated after its reply was lost: the handle is gone
-            // with the attempt, and the operation's outcome is the answer.
-            // The attempt's intent went with its buffer, so it is not
-            // compared.
-            if let Some(descriptor) = operation {
-                return Err(DatabaseError::OperationSettled {
-                    op: descriptor.op,
-                    outcome: self
-                        .resolve_operation(descriptor, crate::operation::Resolve::Lookup)?,
-                    intent_differs: false,
-                });
-            }
-            return Err(DatabaseError::UnknownTransaction(txn_id));
-        };
-        let mut txn = coordinode_storage::engine::transaction::Transaction::resume(
-            &self.engine,
-            Some(&self.oracle),
-            state,
-        );
-        if let Some(descriptor) = operation {
-            self.admit_operation(descriptor, &chain)?;
-            txn.bind_operation(descriptor.op, chain);
-        }
-        // Constraints judge each node as the whole transaction leaves it,
-        // not as one of its statements did.
-        let fields = self.fields.current()?;
-        coordinode_query::executor::runner::check_post_state(&mut txn, &self.engine, &fields)?;
-        let wc = self.write_concern;
-        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
-            write_concern: &wc,
-            pipeline: Some(self.pipeline.as_ref()),
-            id_gen: Some(&self.proposal_id_gen),
-        };
-        // Split by variant, because the three failures call for opposite
-        // reactions. Only an OCC conflict is worth retrying: the read-set was
-        // invalidated by a concurrent writer and re-running the transaction
-        // resolves it. A storage or pipeline failure retried immediately just
-        // fails again, and telling the client otherwise would be a lie with a
-        // retry storm attached.
-        use coordinode_storage::engine::transaction::CommitError;
-        let outcome = txn.commit(&commit_ctx).map_err(|e| match e {
-            CommitError::Conflict(detail) => DatabaseError::TransactionConflict {
-                id: txn_id,
-                source_message: detail,
-            },
-            CommitError::Storage(s) => DatabaseError::Storage(s),
-            CommitError::Serialization(detail) => {
-                DatabaseError::Other(format!("commit failed: {detail}"))
-            }
-            // Retryable like a conflict, but with a delay: the engine sheds
-            // writes until compaction drains its debt.
-            CommitError::Backpressure => DatabaseError::WriteBackpressure,
-            // Retryable at a different address: the leader.
-            CommitError::NotLeader { leader_id } => DatabaseError::NotLeader { leader_id },
-            // Retryable at the leader, or here once this member is updated.
-            CommitError::Mismatched(m) => DatabaseError::Mismatched(m),
-            // Not retryable: the same statement stages the same deltas.
-            CommitError::CounterOverflow { key } => DatabaseError::Other(format!(
-                "counter '{key}' would leave the i64 range; nothing was written"
-            )),
-            // Not retryable either: the transaction has to change fewer entries.
-            e @ CommitError::IndexFanOut { .. } => DatabaseError::Other(e.to_string()),
-            // A statement of the transaction outgrew its budget: its writes
-            // were cut short, so the transaction cannot commit as staged.
-            CommitError::Budget(stop) => DatabaseError::Execution(
-                coordinode_query::executor::runner::ExecutionError::Budget(stop),
-            ),
-            // Retryable from begin, like a conflict, but for a different
-            // reason: the condition is re-evaluated against the state the
-            // retry reads.
-            CommitError::InvariantRefused { reason } => {
-                DatabaseError::InvariantRefused { id: txn_id, reason }
-            }
-            // Not retryable: the value is held, by the node named. The
-            // statements that claimed it are gone, so the index is found by
-            // the generation the refusal names.
-            CommitError::UniqueValueHeld {
-                generation,
-                values,
-                holder,
-            } => match self
-                .index_registry
-                .all()
-                .into_iter()
-                .find(|index| index.generation == generation)
-            {
-                Some(index) => DatabaseError::Execution(
-                    coordinode_query::index::UniqueViolation::new(&index, &values, holder).into(),
-                ),
-                None => DatabaseError::InvariantRefused {
-                    id: txn_id,
-                    reason: format!(
-                        "a unique value of {generation} is held by node {}",
-                        holder.to_element_id()
-                    ),
-                },
-            },
-            // Not retryable: the node written breaks a rule being certified.
-            e @ CommitError::CandidateViolation { .. } => DatabaseError::Execution(
-                coordinode_query::executor::runner::ExecutionError::SchemaViolation(e.to_string()),
-            ),
-            // Retryable once the build is done.
-            CommitError::UniquenessUnresolved { generation, limit } => {
-                let index = self
-                    .index_registry
-                    .all()
-                    .into_iter()
-                    .find(|index| index.generation == generation)
-                    .map_or_else(|| generation.to_string(), |index| index.to_string());
-                DatabaseError::Execution(
-                    coordinode_query::executor::runner::ExecutionError::UniquenessUnresolved {
-                        index,
-                        limit,
-                    },
-                )
-            }
-            // Retryable, but whether retrying is the right answer is the
-            // caller's to decide: the record moved, and what that means
-            // depends on what it was writing. The new version travels with
-            // the refusal so that decision needs no second read.
-            CommitError::RevisionMismatch { expected, current } => {
-                DatabaseError::RevisionMismatch {
-                    id: txn_id,
-                    expected,
-                    current,
-                }
-            }
-            // The operation the commit carries out stands already: the
-            // caller resolves it rather than running it again.
-            CommitError::OperationSettled {
-                op,
-                outcome,
-                intent_differs,
-            } => DatabaseError::OperationSettled {
-                op,
-                outcome,
-                intent_differs,
-            },
-        })?;
-        // An interactive transaction is always opened against the oracle
-        // (`begin_transaction`), so the storage commit is never on the legacy
-        // no-oracle path and always carries a commit timestamp. A missing one
-        // is an engine invariant violation, surfaced as an error rather than
-        // a made-up timestamp the host would then trust as a cursor.
-        let commit_ts = outcome.commit_ts.ok_or_else(|| {
-            DatabaseError::Other(format!(
-                "transaction {txn_id} committed without a commit timestamp"
-            ))
-        })?;
-        Ok(coordinode_core::txn::transaction::CommitReceipt {
-            commit_ts,
-            applied_index: outcome.applied_index,
-        })
-    }
-
-    /// Roll back an interactive transaction: discard all buffered
-    /// writes and the OCC read-set. No proposal is emitted (nothing was
-    /// durable). Errors only if the id is unknown.
-    pub fn rollback_transaction(&self, txn_id: u64) -> Result<(), DatabaseError> {
-        if self
-            .interactive_txns
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&txn_id)
-            .is_some()
-        {
-            Ok(())
-        } else {
-            Err(DatabaseError::UnknownTransaction(txn_id))
-        }
-    }
-
     /// The version of a node: the timestamp of the commit that last wrote it,
     /// or `None` when there is no such node.
     ///
@@ -2311,60 +2002,6 @@ impl Database {
         Ok(self
             .engine
             .record_version(coordinode_storage::engine::partition::Partition::Node, &key)?)
-    }
-
-    /// Commit this transaction only while the node is still at `expected`.
-    ///
-    /// `None` requires the node not to exist, which is the create-if-absent
-    /// form of the same condition. The condition is checked when the
-    /// transaction commits, against the state at that moment, and a mismatch
-    /// refuses the whole transaction with the version that is there instead.
-    ///
-    /// Stating it does not read the node or write anything by itself: it is
-    /// the caller saying what its statements were built on. A caller that
-    /// wants the ordinary read-modify-write pairs this with
-    /// [`Self::node_version`] before the statements that change the node.
-    pub fn expect_node_version(
-        &self,
-        txn_id: u64,
-        node_id: coordinode_core::graph::node::NodeId,
-        expected: Option<u64>,
-    ) -> Result<(), DatabaseError> {
-        let key = coordinode_core::graph::node::encode_node_key(self.shard_id, node_id);
-        let mut reg = self
-            .interactive_txns
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let Some((state, touched, _)) = reg.get_mut(&txn_id) else {
-            return Err(DatabaseError::UnknownTransaction(txn_id));
-        };
-        *touched = Instant::now();
-        state.expect_version(
-            coordinode_storage::engine::partition::Partition::Node,
-            &key,
-            expected,
-        )?;
-        Ok(())
-    }
-
-    /// Drop interactive transactions idle longer than `timeout`. An open
-    /// transaction pins an MVCC snapshot and buffers writes in memory, so an
-    /// abandoned one would leak retention and leader memory. Called
-    /// opportunistically on `begin`; the server's reaper also runs it at the
-    /// returned instant, so reaping does not wait for the next `begin`.
-    ///
-    /// Returns when the earliest transaction still open becomes idle for
-    /// `timeout`, or `None` when none is open.
-    pub fn reap_idle_transactions(&self, timeout: Duration) -> Option<Instant> {
-        let now = Instant::now();
-        let mut txns = self
-            .interactive_txns
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        txns.retain(|_, (_, touched, _)| now.duration_since(*touched) < timeout);
-        txns.values()
-            .map(|(_, touched, _)| *touched + timeout)
-            .min()
     }
 
     /// Run one pass of the COMPUTED TTL reaper now, as the background reaper
@@ -2525,6 +2162,7 @@ impl Database {
     /// Set the interactive-transaction idle timeout (server config wiring).
     pub fn set_interactive_idle_timeout(&mut self, timeout: Duration) {
         self.interactive_idle_timeout = timeout;
+        self.interactive.set_idle_timeout(timeout);
     }
 
     /// How an auto-commit statement refused at commit for contention is run
@@ -3200,6 +2838,7 @@ impl Database {
                 scan_paging: scan_paging.clone(),
                 scan_row_cap: None,
                 operations: self.operations.as_deref(),
+                transactions: Some(&self.interactive),
                 adaptive: self.adaptive_config.clone(),
                 dedup_varlen_targets: false,
                 snapshot_ts: named_read_ts,
@@ -4341,10 +3980,17 @@ mod fields;
 mod id_lease;
 mod index_builds;
 mod index_maintenance;
+mod interactive;
 mod package;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
+pub use coordinode_core::txn::handle::{
+    ActingContext, AdmissionSignal, Principal, TransactionHandle,
+};
 pub use fields::FieldDictionary;
+pub use interactive::{
+    CommitOptions, DEFAULT_DRAIN_TIMEOUT, RollbackOptions, TransactionEnd, TransactionOptions,
+};
 pub use package::{
     Disposition, EdgeTypeDeclaration, Intent, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,
     PackageConstraint, PublishedObject, Readiness, SchemaPackage, SchemaPublication,

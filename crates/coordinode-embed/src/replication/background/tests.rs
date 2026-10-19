@@ -143,7 +143,7 @@ fn create_index(
 /// the index. The executor on `from` stays fenced off; its statement learns
 /// the published outcome once the older transaction ends.
 async fn hand_over_a_held_build(from: &Member, to: &Member, name: &str, property: &str) {
-    let older = from.db.read().begin_transaction();
+    let older = from.db.read().begin_transaction().unwrap();
     let created = create_index(from, name, property);
     let held = await_build(from, name, |s| {
         s.phase == Some(BuildPhase::AwaitingOlderTransactions)

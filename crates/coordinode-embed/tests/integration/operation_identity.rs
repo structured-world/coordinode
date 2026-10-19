@@ -293,7 +293,7 @@ fn a_transaction_commit_carries_its_operation() {
     let mut db = Database::open(dir.path()).unwrap();
     let op = enrolled(&db).next().unwrap();
     let transaction = |statements: &[&str]| {
-        let txn = db.begin_transaction();
+        let txn = db.begin_transaction().expect("begin");
         for statement in statements {
             db.execute_in_transaction(txn, statement, None).unwrap();
         }
@@ -319,7 +319,7 @@ fn a_repeated_commit_resolves_its_operation() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Database::open(dir.path()).unwrap();
     let op = enrolled(&db).next().unwrap();
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     db.execute_in_transaction(txn, "CREATE (:Once {k: 1})", None)
         .unwrap();
     db.commit_transaction_as(txn, &op).unwrap();

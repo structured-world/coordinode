@@ -7,12 +7,27 @@
 //! [`QueryCursor`] into neutral events.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use coordinode_core::graph::types::Value;
+use coordinode_core::operations::TxnOrdering;
+use coordinode_core::txn::handle::{AdmissionSignal, TransactionHandle};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 
 use crate::types::{ConnectionSettings, Failure, SessionStats, StatementSource};
+
+/// The transaction a statement runs in, as the session hands it on.
+#[derive(Debug, Clone)]
+pub struct InTransaction {
+    /// The transaction.
+    pub handle: TransactionHandle,
+    /// The statement's number within it; zero for none.
+    pub nonce: u64,
+    /// Told when the statement has its place in the transaction's order; the
+    /// session sends this stream's next command for the transaction then.
+    pub admission: AdmissionSignal,
+}
 
 /// An error from the query engine, neutral over the engine implementation. It
 /// reaches the client as the request's failure, class and details intact.
@@ -38,8 +53,10 @@ impl std::error::Error for EngineError {}
 ///
 /// The binding injects an implementation backed by the query engine. `query` is
 /// opaque dialect text the core does not inspect; `params` are already in the
-/// engine's value space; `txid` is the interactive-transaction handle, or zero
-/// for an autonomous (auto-commit) statement. `settings` are the statement's
+/// engine's value space; `transaction` is the interactive transaction the
+/// statement runs in, `None` for an autonomous (auto-commit) statement. The
+/// transaction lives on its owner, not in the session: a session closing
+/// leaves it open. `settings` are the statement's
 /// own settings over its session's: a field still unset is the engine's
 /// default. `source` is where in the client's code the statement was issued.
 /// `operation` is the client operation an autonomous statement carries out:
@@ -58,7 +75,7 @@ pub trait CursorEngine: Send + Sync {
         &self,
         query: &str,
         params: HashMap<String, Value>,
-        txid: u64,
+        transaction: Option<&InTransaction>,
         settings: &ConnectionSettings,
         source: Option<&StatementSource>,
         operation: Option<&OperationDescriptor>,
@@ -75,26 +92,42 @@ pub trait CursorEngine: Send + Sync {
         None
     }
 
-    /// Open a new interactive transaction and return its handle. Subsequent
-    /// `open_cursor` calls carrying this `txid` run inside it, reading its pinned
-    /// snapshot and buffering writes until `commit_transaction`.
-    fn begin_transaction(&self) -> Result<u64, EngineError>;
+    /// Open a new interactive transaction ordering its statements as
+    /// `ordering` says and return its handle. Subsequent `open_cursor` calls
+    /// carrying this handle run inside it, reading its pinned snapshot and
+    /// buffering writes until `commit_transaction`. `drain` bounds how long
+    /// an ordered transaction waits for a missing statement; the engine's
+    /// default when `None`.
+    fn begin_transaction(
+        &self,
+        ordering: TxnOrdering,
+        drain: Option<Duration>,
+    ) -> Result<TransactionHandle, EngineError>;
 
-    /// Commit an interactive transaction, flushing its buffered writes in one
-    /// proposal and returning the commit receipt: the HLC commit timestamp plus
-    /// the applied Raft index (the causal token; `None` in embedded mode).
-    /// With `operation`, the commit carries out that client operation: it
-    /// takes effect at most once, and a repeat of one already settled is
-    /// refused with its outcome.
+    /// Commit an interactive transaction once every statement admitted to it
+    /// has run (an ordered chain up to `last_nonce`), flushing its buffered
+    /// writes in one proposal and returning the commit receipt: the HLC
+    /// commit timestamp plus the applied Raft index (the causal token; `None`
+    /// in embedded mode). With `operation`, the commit carries out that
+    /// client operation: it takes effect at most once, and a repeat of one
+    /// already settled is refused with its outcome. `admission` is told when
+    /// the commit has its place.
     fn commit_transaction(
         &self,
-        txid: u64,
+        transaction: TransactionHandle,
+        last_nonce: Option<u64>,
         operation: Option<&OperationDescriptor>,
+        admission: &AdmissionSignal,
     ) -> Result<CommitReceipt, EngineError>;
 
     /// Roll back an interactive transaction, discarding its buffered writes. No
-    /// proposal is emitted (nothing was durable).
-    fn rollback_transaction(&self, txid: u64) -> Result<(), EngineError>;
+    /// proposal is emitted (nothing was durable). `admission` is told when
+    /// the rollback has its place.
+    fn rollback_transaction(
+        &self,
+        transaction: TransactionHandle,
+        admission: &AdmissionSignal,
+    ) -> Result<(), EngineError>;
 }
 
 /// A live server-side cursor: a column header plus paged row batches.

@@ -112,20 +112,26 @@ fn a_refused_set_in_a_transaction_leaves_no_version() {
     let before = temporal_versions(&db, "Emp");
 
     for commit in [true, false] {
-        let tx = db.begin_transaction();
+        let tx = db.begin_transaction().expect("begin");
         db.execute_in_transaction(tx, "MATCH (n:Emp {name: 'a'}) SET n.name = 'b'", None)
             .expect("a declared property");
         db.execute_in_transaction(tx, "MATCH (n:Emp) SET n.unknown = 1", None)
             .expect_err("`unknown` is not declared on a STRICT label");
-        // A statement error aborts the transaction: its state is dropped and
-        // both a commit and a rollback find no transaction left.
+        // A statement error aborts the transaction: its state is dropped, and
+        // both a commit and a rollback are told it ended and why.
         let ended = if commit {
             db.commit_transaction(tx).map(drop)
         } else {
             db.rollback_transaction(tx)
         };
         assert!(
-            matches!(ended, Err(coordinode_embed::DatabaseError::UnknownTransaction(id)) if id == tx),
+            matches!(
+                ended,
+                Err(coordinode_embed::DatabaseError::TransactionAborted {
+                    handle,
+                    end: coordinode_embed::TransactionEnd::StatementFailed,
+                }) if handle == tx
+            ),
             "commit={commit}: {ended:?}"
         );
         assert_eq!(temporal_versions(&db, "Emp"), before, "commit={commit}");

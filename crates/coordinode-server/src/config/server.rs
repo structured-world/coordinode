@@ -474,6 +474,10 @@ pub struct ServerConfig {
     pub interactive_txn_idle_timeout_secs: u64,
     /// Max buffered (uncommitted) bytes per interactive transaction.
     pub interactive_txn_max_bytes: u64,
+    /// How long, in ms, an ordered interactive transaction waits for a
+    /// missing statement before it is aborted, when its BEGIN and session
+    /// name no bound.
+    pub interactive_txn_drain_timeout_ms: u64,
     /// Runs of an auto-commit statement refused at commit for contention
     /// before the refusal is returned to the client.
     pub autocommit_retry_attempts: NonZeroU32,
@@ -632,6 +636,7 @@ impl Default for ServerConfig {
             default_write_concern: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
+            interactive_txn_drain_timeout_ms: 5_000,
             autocommit_retry_attempts: coordinode_embed::Database::DEFAULT_AUTOCOMMIT_ATTEMPTS,
             autocommit_retry_backoff_ms: 2,
             operation_admission_window:

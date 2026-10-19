@@ -167,7 +167,7 @@ fn property_edits_and_rollbacks_leave_postings_alone() {
         "the edit wrote no posting"
     );
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (:Ghost {name: 'g'})", None)
         .expect("staged");
     db.rollback_transaction(tx).expect("rollback");
@@ -476,7 +476,7 @@ fn a_scan_at_an_older_snapshot_sees_the_members_of_then() {
 fn a_transaction_scans_its_own_label_changes() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (:Y {name: 'old'})").expect("old");
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (:Y {name: 'new'})", None)
         .expect("create");
     db.execute_in_transaction(tx, "MATCH (n:Y {name: 'old'}) REMOVE n:Y", None)

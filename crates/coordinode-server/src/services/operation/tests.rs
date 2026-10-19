@@ -172,12 +172,12 @@ async fn a_unary_write_retried_runs_once() {
         .await
         .unwrap()
         .into_inner()
-        .transaction_id;
+        .transaction;
     let refused = s
         .cypher
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "CREATE (:Inside)".to_string(),
-            transaction_id: txn,
+            transaction: txn,
             operation: Some(wire::OperationRef {
                 sequence: op.sequence + 1,
                 ..op.clone()
@@ -201,18 +201,18 @@ async fn a_repeated_commit_answers_with_the_outcome() {
         .await
         .unwrap()
         .into_inner()
-        .transaction_id;
+        .transaction;
     s.cypher
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "CREATE (:Purchase {k: 1})".to_string(),
-            transaction_id: txn,
+            transaction: txn.clone(),
             ..Default::default()
         }))
         .await
         .unwrap();
     let commit = || {
         Request::new(query::CommitTransactionRequest {
-            transaction_id: txn,
+            transaction: txn.clone(),
             expect: Vec::new(),
             operation: Some(op.clone()),
         })

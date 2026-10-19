@@ -10,7 +10,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use coordinode_core::graph::types::Value;
-use coordinode_embed::Database;
+use coordinode_embed::{Database, TransactionHandle};
 
 fn open_db() -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -127,7 +127,7 @@ fn text_match_over_one_label_reads_through_the_index() {
     );
 
     // An uncommitted article of the reading transaction is found.
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(
         tx,
         "CREATE (:Article {name: 'd', kind: 'post', body: 'rust draft'})",
@@ -154,7 +154,7 @@ fn a_rolled_back_text_change_is_not_searchable() {
     db.execute_cypher("CREATE (:Article {title: 'a', body: 'committed words'})")
         .expect("create");
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(
         tx,
         "MATCH (n:Article {title: 'a'}) SET n.body = 'discarded secret'",
@@ -258,7 +258,7 @@ fn a_transaction_searches_its_own_uncommitted_text() {
         found
     };
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(
         tx,
         "MATCH (n:Article {title: 'a'}) SET n.body = 'private words'",
@@ -558,7 +558,7 @@ const QUERIES: [&str; 8] = [
 /// transaction `tx` when given).
 fn doc_scores(
     db: &mut Database,
-    tx: Option<u64>,
+    tx: Option<TransactionHandle>,
     query: &str,
 ) -> std::collections::BTreeMap<String, f64> {
     let statement = format!(
@@ -589,7 +589,7 @@ fn doc_scores(
 /// with a database that holds only `live`, indexed from nothing.
 fn assert_ranks_as_built_from(
     db: &mut Database,
-    tx: Option<u64>,
+    tx: Option<TransactionHandle>,
     live: &std::collections::BTreeMap<String, String>,
 ) {
     let (mut model, model_dir) = open_db();
@@ -748,7 +748,7 @@ fn own_writes_rank_as_an_index_holding_them() {
         },
     );
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     churn(
         0xD1B5_4A32_D192_ED03,
         40,
@@ -774,8 +774,8 @@ fn a_refused_commit_is_not_searchable() {
     db.execute_cypher("CREATE (:Article {title: 'a', body: 'committed words'})")
         .expect("create");
 
-    let winner = db.begin_transaction();
-    let loser = db.begin_transaction();
+    let winner = db.begin_transaction().expect("begin");
+    let loser = db.begin_transaction().expect("begin");
     db.execute_in_transaction(
         winner,
         "MATCH (n:Article {title: 'a'}) SET n.body = 'fresh golang words'",

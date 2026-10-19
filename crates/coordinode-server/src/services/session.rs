@@ -15,12 +15,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use coordinode_core::operations::TxnOrdering;
 use coordinode_query::advisor::source::grpc_keys;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_session::{
-    ConnectionSettings, ConnectionState, ErrorCode, Failure, InOp, Ordering as CoreOrdering,
-    OutEvent, SessionEvent, SessionManager, SessionOp, SessionRegistry, SessionStats,
-    StatementSource,
+    ConnectionSettings, ConnectionState, ErrorCode, Failure, InOp, OutEvent, SessionEvent,
+    SessionManager, SessionOp, SessionRegistry, SessionStats, StatementSource,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -344,6 +344,11 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
     let op = op.ok_or_else(|| Status::invalid_argument("client frame had no op"))?;
     Ok(match op {
         client_frame::Op::Execute(e) => SessionOp::Execute {
+            transaction: (!e.transaction.is_empty())
+                .then(|| {
+                    super::error_details::transaction_handle("execute.transaction", &e.transaction)
+                })
+                .transpose()?,
             settings: statement_settings(&e)?,
             operation: super::operation::optional_descriptor(
                 "execute.operation",
@@ -364,14 +369,13 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
                 .iter()
                 .map(|(k, v)| (k.clone(), proto_to_value_pub(v)))
                 .collect(),
-            txid: e.txid,
             nonce: e.nonce,
         },
         client_frame::Op::Begin(b) => SessionOp::Begin {
             ordering: match b.ordering() {
-                ProtoOrdering::Unordered => CoreOrdering::Unordered,
+                ProtoOrdering::Unordered => TxnOrdering::Unordered,
                 // Unspecified and Ordered both mean ordered.
-                _ => CoreOrdering::Ordered,
+                _ => TxnOrdering::Ordered,
             },
             drain_timeout_ms: b.drain_timeout_ms,
         },
@@ -380,10 +384,18 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
                 "commit.operation",
                 c.operation.as_ref(),
             )?,
-            txid: c.txid,
+            transaction: super::error_details::transaction_handle(
+                "commit.transaction",
+                &c.transaction,
+            )?,
             last_nonce: c.last_nonce,
         },
-        client_frame::Op::Rollback(r) => SessionOp::Rollback { txid: r.txid },
+        client_frame::Op::Rollback(r) => SessionOp::Rollback {
+            transaction: super::error_details::transaction_handle(
+                "rollback.transaction",
+                &r.transaction,
+            )?,
+        },
         client_frame::Op::Cancel(c) => SessionOp::Cancel {
             target_request_id: c.target_request_id,
         },
@@ -540,7 +552,9 @@ fn settings_to_proto(s: &ConnectionSettings) -> Configure {
 /// Map a neutral event back to a gRPC server frame.
 fn event_to_frame(request_id: u64, event: SessionEvent) -> ServerFrame {
     let event = match event {
-        SessionEvent::Begun { txid } => Event::Begun(Begun { txid }),
+        SessionEvent::Begun { transaction } => Event::Begun(Begun {
+            transaction: transaction.to_bytes().to_vec(),
+        }),
         SessionEvent::CursorOpen { columns } => Event::CursorOpen(CursorOpen { columns }),
         SessionEvent::Rows { rows } => Event::Rows(RowBatch {
             rows: rows

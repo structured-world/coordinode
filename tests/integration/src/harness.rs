@@ -680,7 +680,7 @@ impl CoordinodeProcess {
                     read_preference: 0, // the server default
                     read_concern: None,
                     write_concern: None,
-                    transaction_id: 0, // auto-commit (no interactive transaction)
+                    // auto-commit: no interactive transaction
                     ..Default::default()
                 })
                 .await;

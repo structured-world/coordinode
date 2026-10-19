@@ -792,7 +792,7 @@ fn a_snapshot_older_than_a_repair_answers_from_the_records() {
         .delete(Partition::Idx, &entry_key(&db, "u_city", "oslo", a))
         .expect("lose a's entry");
     // b commits after the damage: its snapshot still lacks a's entry.
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (:U {name: 'b', city: 'oslo'})", None)
         .expect("b");
     let at = db
@@ -1164,7 +1164,7 @@ fn a_lookup_answered_by_the_records_sees_the_transactions_own_writes() {
     let z = id_of(&mut db, "z@x");
     misattribute(&db, "u_email", "a@x", z);
 
-    let txid = db.begin_transaction();
+    let txid = db.begin_transaction().expect("begin");
     for i in 0..200 {
         db.execute_in_transaction(txid, &format!("CREATE (:U {{email: 'own{i}@x'}})"), None)
             .expect("own write");
@@ -1320,7 +1320,7 @@ fn a_deep_history_is_answered_from_the_records_within_the_limit() {
     let owner = label_answered_by_its_records(&mut db, 8);
     let mut middle = 0;
     for i in 0..300 {
-        let tx = db.begin_transaction();
+        let tx = db.begin_transaction().expect("begin");
         db.execute_in_transaction(
             tx,
             &format!(

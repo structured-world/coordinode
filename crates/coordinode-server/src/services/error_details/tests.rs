@@ -36,7 +36,7 @@ fn a_retryable_reason_says_so_and_the_rest_do_not() {
         Code::Aborted,
         "conflict",
         Reason::TransactionConflict,
-        [("transaction_id", "7".to_string())],
+        [("transaction", "01ab".to_string())],
     );
     assert!(
         conflict.get_error_details().retry_info().is_some(),
@@ -79,6 +79,10 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::DivideByZero,
         Reason::LongOverflow,
         Reason::UnknownTransaction,
+        Reason::TransactionAborted,
+        Reason::TransactionBusy,
+        Reason::StatementAlreadyAdmitted,
+        Reason::StatementNonceReused,
         Reason::TransactionConflict,
         Reason::InvariantRefused,
         Reason::RevisionMismatch,

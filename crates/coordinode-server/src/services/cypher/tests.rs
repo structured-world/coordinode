@@ -108,21 +108,55 @@ fn cypher_request(q: &str) -> Request<query::ExecuteCypherRequest> {
         read_preference: 0,   // omitted → the server default (Primary here)
         read_concern: None,   // omitted → the server default (Local here)
         write_concern: None,  // omitted → the database default (majority here)
-        transaction_id: 0,    // auto-commit
-        ..Default::default()  // vector settings left to the server
+        ..Default::default()  // auto-commit, vector settings left to the server
     })
 }
 
-fn cypher_request_in_txn(q: &str, transaction_id: u64) -> Request<query::ExecuteCypherRequest> {
+fn cypher_request_in_txn(
+    q: &str,
+    transaction: coordinode_embed::TransactionHandle,
+) -> Request<query::ExecuteCypherRequest> {
     Request::new(query::ExecuteCypherRequest {
         query: q.to_string(),
         parameters: std::collections::HashMap::new(),
         read_preference: 0,
         read_concern: None,
         write_concern: None,
-        transaction_id,
+        transaction: transaction.to_bytes().to_vec(),
         ..Default::default()
     })
+}
+
+/// A client that still sends the numeric transaction field is refused at
+/// decoding: were the number dropped as an unknown field, its statement would
+/// run on its own, outside the transaction it was meant for.
+#[test]
+fn a_numeric_transaction_field_fails_to_decode() {
+    use prost::Message;
+    // Field 6 (1 for the commit and rollback), wire type varint, value 7.
+    assert!(query::ExecuteCypherRequest::decode(&[0x30, 0x07][..]).is_err());
+    assert!(query::CommitTransactionRequest::decode(&[0x08, 0x07][..]).is_err());
+    assert!(query::RollbackTransactionRequest::decode(&[0x08, 0x07][..]).is_err());
+    assert!(
+        crate::proto::session::Execute::decode(&[0x18, 0x07][..]).is_err(),
+        "the session's Execute keeps its number too"
+    );
+}
+
+/// The handle a BEGIN answered with, as the server issued it.
+trait Begun {
+    fn handle(&self) -> coordinode_embed::TransactionHandle;
+}
+
+impl Begun for query::BeginTransactionResponse {
+    fn handle(&self) -> coordinode_embed::TransactionHandle {
+        coordinode_embed::TransactionHandle::from_bytes(&self.transaction).expect("a handle")
+    }
+}
+
+/// The wire form of `handle`.
+fn wire(handle: coordinode_embed::TransactionHandle) -> Vec<u8> {
+    handle.to_bytes().to_vec()
 }
 
 /// A commit conditioned on a node's version over the wire: it lands at the
@@ -157,7 +191,7 @@ async fn grpc_commit_conditioned_on_a_node_version() {
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
+        .handle();
     svc.execute_cypher(cypher_request_in_txn(
         "MATCH (n:Account) SET n.balance = 500",
         tx,
@@ -167,7 +201,7 @@ async fn grpc_commit_conditioned_on_a_node_version() {
 
     let status = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
-            transaction_id: tx,
+            transaction: wire(tx),
             operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: account.as_raw(),
@@ -223,7 +257,7 @@ async fn grpc_commit_conditioned_on_a_node_version() {
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
+        .handle();
     svc.execute_cypher(cypher_request_in_txn(
         "MATCH (n:Account) SET n.balance = 500",
         retry,
@@ -231,7 +265,7 @@ async fn grpc_commit_conditioned_on_a_node_version() {
     .await
     .expect("statement");
     svc.commit_transaction(Request::new(query::CommitTransactionRequest {
-        transaction_id: retry,
+        transaction: wire(retry),
         operation: None,
         expect: vec![query::ExpectedNodeVersion {
             node_id: account.as_raw(),
@@ -269,7 +303,7 @@ async fn grpc_a_read_only_commit_still_checks_its_condition() {
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
+        .handle();
     svc.execute_cypher(cypher_request_in_txn(
         "MATCH (n:Guard) RETURN n.revision",
         tx,
@@ -278,7 +312,7 @@ async fn grpc_a_read_only_commit_still_checks_its_condition() {
     .expect("a read");
     let status = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
-            transaction_id: tx,
+            transaction: wire(tx),
             operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: guard.as_raw(),
@@ -306,9 +340,9 @@ async fn grpc_a_read_only_commit_still_checks_its_condition() {
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
+        .handle();
     svc.commit_transaction(Request::new(query::CommitTransactionRequest {
-        transaction_id: again,
+        transaction: wire(again),
         operation: None,
         expect: vec![query::ExpectedNodeVersion {
             node_id: guard.as_raw(),
@@ -343,7 +377,7 @@ async fn grpc_a_guard_condition_is_refused_beside_a_write_of_the_guard_in_flight
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
+        .handle();
     svc.execute_cypher(cypher_request_in_txn("CREATE (e:Event {seq: 1})", tx))
         .await
         .expect("a write beside the guard");
@@ -366,7 +400,7 @@ async fn grpc_a_guard_condition_is_refused_beside_a_write_of_the_guard_in_flight
 
     let status = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
-            transaction_id: tx,
+            transaction: wire(tx),
             operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: guard.as_raw(),
@@ -430,7 +464,7 @@ async fn grpc_a_self_committing_statement_reports_the_version_it_wrote() {
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
+        .handle();
     svc.execute_cypher(cypher_request_in_txn(
         "MATCH (n:Account) SET n.balance = 2",
         tx,
@@ -438,7 +472,7 @@ async fn grpc_a_self_committing_statement_reports_the_version_it_wrote() {
     .await
     .expect("statement");
     svc.commit_transaction(Request::new(query::CommitTransactionRequest {
-        transaction_id: tx,
+        transaction: wire(tx),
         operation: None,
         expect: vec![query::ExpectedNodeVersion {
             node_id: node.as_raw(),
@@ -461,7 +495,7 @@ async fn grpc_a_buffered_statement_reports_no_timestamp_of_its_own() {
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
+        .handle();
     let buffered = svc
         .execute_cypher(cypher_request_in_txn("CREATE (n:Buffered {id: 1})", tx))
         .await
@@ -475,7 +509,7 @@ async fn grpc_a_buffered_statement_reports_no_timestamp_of_its_own() {
 
     let receipt = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
-            transaction_id: tx,
+            transaction: wire(tx),
             operation: None,
             expect: vec![],
         }))
@@ -520,7 +554,7 @@ async fn grpc_a_claim_fences_the_writes_of_the_holder_it_replaced() {
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
+        .handle();
     svc.execute_cypher(cypher_request_in_txn("MATCH (d:Data) SET d.value = 1", tx))
         .await
         .expect("the protected write");
@@ -538,7 +572,7 @@ async fn grpc_a_claim_fences_the_writes_of_the_holder_it_replaced() {
 
     let status = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
-            transaction_id: tx,
+            transaction: wire(tx),
             operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: claim.as_raw(),
@@ -597,7 +631,7 @@ async fn grpc_a_retry_after_an_unheard_outcome_learns_which_way_it_went() {
                 .await
                 .expect("begin")
                 .into_inner()
-                .transaction_id;
+                .handle();
             svc.execute_cypher(cypher_request_in_txn(
                 &format!("MATCH (n:Counter) SET n.value = {value}"),
                 tx,
@@ -605,7 +639,7 @@ async fn grpc_a_retry_after_an_unheard_outcome_learns_which_way_it_went() {
             .await
             .expect("statement");
             svc.commit_transaction(Request::new(query::CommitTransactionRequest {
-                transaction_id: tx,
+                transaction: wire(tx),
                 operation: None,
                 expect: vec![query::ExpectedNodeVersion {
                     node_id: counter.as_raw(),
@@ -661,7 +695,7 @@ async fn grpc_two_claimers_of_one_record_produce_one_winner() {
             .await
             .expect("begin")
             .into_inner()
-            .transaction_id;
+            .handle();
         svc.execute_cypher(cypher_request_in_txn(
             &format!("MATCH (c:Lease) SET c.holder = '{holder}'"),
             tx,
@@ -671,9 +705,9 @@ async fn grpc_two_claimers_of_one_record_produce_one_winner() {
         claims.push(tx);
     }
 
-    let commit = |tx: u64| {
+    let commit = |tx: coordinode_embed::TransactionHandle| {
         svc.commit_transaction(Request::new(query::CommitTransactionRequest {
-            transaction_id: tx,
+            transaction: wire(tx),
             operation: None,
             expect: vec![query::ExpectedNodeVersion {
                 node_id: lease.as_raw(),
@@ -723,8 +757,7 @@ async fn grpc_interactive_transaction_commit() {
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
-    assert_ne!(tx, 0, "begin returns a non-zero transaction id");
+        .handle();
 
     svc.execute_cypher(cypher_request_in_txn("CREATE (n:TxNode {id: 1})", tx))
         .await
@@ -740,7 +773,7 @@ async fn grpc_interactive_transaction_commit() {
 
     let receipt = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
-            transaction_id: tx,
+            transaction: wire(tx),
             operation: None,
             expect: vec![],
         }))
@@ -771,7 +804,6 @@ async fn grpc_interactive_transaction_commit() {
                 at_timestamp,
             }),
             write_concern: None,
-            transaction_id: 0,
             ..Default::default()
         })
     };
@@ -807,14 +839,14 @@ async fn grpc_interactive_transaction_rollback() {
         .await
         .expect("begin")
         .into_inner()
-        .transaction_id;
+        .handle();
 
     svc.execute_cypher(cypher_request_in_txn("CREATE (n:TxNode {id: 2})", tx))
         .await
         .expect("statement in txn");
 
     svc.rollback_transaction(Request::new(query::RollbackTransactionRequest {
-        transaction_id: tx,
+        transaction: wire(tx),
     }))
     .await
     .expect("rollback");
@@ -829,7 +861,7 @@ async fn grpc_interactive_transaction_rollback() {
     // Handle consumed: commit on the rolled-back id is an error.
     assert!(
         svc.commit_transaction(Request::new(query::CommitTransactionRequest {
-            transaction_id: tx,
+            transaction: wire(tx),
             operation: None,
             expect: vec![],
         }))
@@ -1034,9 +1066,7 @@ async fn session_source_tracking_with_params_round_trip() {
         .with_advisor(Arc::clone(&registry), Arc::clone(&detector));
     let sessions = crate::services::session::SessionSvc::new(
         executor,
-        Arc::new(coordinode_session::SessionRegistry::new(
-            std::time::Duration::from_secs(30),
-        )),
+        Arc::new(coordinode_session::SessionRegistry::new()),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1363,22 +1393,53 @@ fn a_refused_call_names_the_procedure_and_the_part_at_fault() {
 }
 
 /// Transaction lifecycle failures a client must tell apart to act correctly:
-/// a gone transaction needs no cleanup, a conflict wants the whole transaction
-/// re-run, and an oversized one will fail again unless the work is split.
+/// a gone transaction needs no cleanup, an aborted one or a conflict wants the
+/// whole transaction re-run, a busy one wants the same command again, a
+/// repeated statement must not be sent again, and an oversized one will fail
+/// again unless the work is split.
 #[test]
 fn transaction_failures_carry_distinct_reasons() {
+    use coordinode_embed::{TransactionEnd, TransactionHandle};
     use tonic_types::StatusExt;
 
+    let handle = TransactionHandle::new(None, 2, 3, 7);
     let cases = [
         (
-            DatabaseError::UnknownTransaction(7),
+            DatabaseError::UnknownTransaction(handle),
             tonic::Code::NotFound,
             "UNKNOWN_TRANSACTION",
             false,
         ),
         (
+            DatabaseError::TransactionAborted {
+                handle,
+                end: TransactionEnd::LeaderChanged,
+            },
+            tonic::Code::Aborted,
+            "TRANSACTION_ABORTED",
+            true,
+        ),
+        (
+            DatabaseError::TransactionBusy(handle),
+            tonic::Code::Aborted,
+            "TRANSACTION_BUSY",
+            true,
+        ),
+        (
+            DatabaseError::StatementAlreadyAdmitted { handle, nonce: 4 },
+            tonic::Code::AlreadyExists,
+            "STATEMENT_ALREADY_ADMITTED",
+            false,
+        ),
+        (
+            DatabaseError::StatementNonceReused { handle, nonce: 4 },
+            tonic::Code::InvalidArgument,
+            "STATEMENT_NONCE_REUSED",
+            false,
+        ),
+        (
             DatabaseError::TransactionConflict {
-                id: 7,
+                id: handle,
                 source_message: "write-write".into(),
             },
             tonic::Code::Aborted,
@@ -1387,7 +1448,7 @@ fn transaction_failures_carry_distinct_reasons() {
         ),
         (
             DatabaseError::TransactionTooLarge {
-                id: 7,
+                id: handle,
                 buffered: 300,
                 limit: 200,
             },
@@ -1406,9 +1467,9 @@ fn transaction_failures_carry_distinct_reasons() {
             .unwrap_or_else(|| panic!("{reason} must carry ErrorInfo"));
         assert_eq!(info.reason, reason);
         assert_eq!(
-            info.metadata.get("transaction_id").map(String::as_str),
-            Some("7"),
-            "{reason} must name the transaction"
+            info.metadata.get("transaction").map(String::as_str),
+            Some(handle.to_string().as_str()),
+            "{reason} must name the transaction as the client carries it"
         );
         assert_eq!(
             details.retry_info().is_some(),
@@ -1560,7 +1621,7 @@ async fn causal_after_index_with_local_concern_rejected() {
                 at_timestamp: 0,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -1591,7 +1652,7 @@ async fn causal_after_index_with_linearizable_rejected() {
                 at_timestamp: 0,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -1628,7 +1689,7 @@ async fn causal_after_index_with_majority_standalone_succeeds() {
                 at_timestamp: 0,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -1676,7 +1737,7 @@ async fn causal_write_read_roundtrip_standalone() {
                 at_timestamp: 0,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -1783,7 +1844,7 @@ async fn raft_write_returns_own_committed_index() {
                 at_timestamp: 0,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await
@@ -1848,7 +1909,7 @@ async fn an_unnamed_read_concern_takes_the_server_default() {
                 at_timestamp: 0,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         })
     };
@@ -1891,7 +1952,7 @@ async fn an_unnamed_write_concern_is_checked_as_the_database_default() {
                 at_timestamp: 0,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await
@@ -1996,7 +2057,7 @@ async fn causal_after_index_zero_always_valid() {
                     at_timestamp: 0,
                 }),
                 write_concern: None,
-                transaction_id: 0,
+                transaction: Vec::new(),
                 ..Default::default()
             }))
             .await;
@@ -2029,7 +2090,7 @@ async fn causal_write_without_concern_uses_the_majority_default() {
                 at_timestamp: 0,
             }),
             write_concern: None, // omitted → the majority default
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -2065,7 +2126,7 @@ async fn causal_write_with_w1_rejected() {
                 journal: replication::Journal::Journal as i32,
                 timeout_ms: 0,
             }),
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -2103,7 +2164,7 @@ async fn causal_write_with_majority_accepted() {
                 journal: replication::Journal::Journal as i32,
                 timeout_ms: 0,
             }),
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -2161,7 +2222,7 @@ async fn causal_gate_classifies_a_call_by_its_procedure_mode() {
             journal: replication::Journal::Journal as i32,
             timeout_ms: 0,
         }),
-        transaction_id: 0,
+        transaction: Vec::new(),
         ..Default::default()
     };
 
@@ -2194,7 +2255,7 @@ async fn execute_cypher_lists_procedures_and_refuses_an_unknown_one() {
         read_preference: 0,
         read_concern: None,
         write_concern: None,
-        transaction_id: 0,
+        transaction: Vec::new(),
         ..Default::default()
     };
 
@@ -2240,7 +2301,7 @@ async fn causal_read_without_write_concern_accepted() {
                 at_timestamp: 0,
             }),
             write_concern: None, // read-only — write_concern irrelevant
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -2325,7 +2386,7 @@ async fn grpc_write_concern_majority_accepted_in_standalone() {
                 journal: replication::Journal::Journal as i32,
                 timeout_ms: 0,
             }),
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await
@@ -2420,7 +2481,7 @@ async fn grpc_at_timestamp_rejected_without_snapshot_level() {
                 at_timestamp: 1_700_000_000_000_000,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -2461,7 +2522,7 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
                 at_timestamp: 1,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await
@@ -2494,7 +2555,7 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
                 at_timestamp: ts,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         })
     };
@@ -2811,7 +2872,7 @@ async fn grpc_at_timestamp_max_sees_latest() {
                 at_timestamp: u64::MAX,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await
@@ -2840,7 +2901,7 @@ async fn grpc_snapshot_without_at_timestamp_returns_latest() {
                 at_timestamp: 0, // no pin → latest
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await
@@ -2871,7 +2932,7 @@ async fn grpc_write_concern_memory_accepted() {
                 journal: replication::Journal::Memory as i32,
                 timeout_ms: 0,
             }),
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await
@@ -2931,7 +2992,7 @@ async fn grpc_after_index_and_at_timestamp_mutually_exclusive() {
                 at_timestamp: 1_700_000_000_000_000,
             }),
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -2961,7 +3022,7 @@ async fn grpc_write_concern_journal_with_timeout_accepted() {
                 journal: replication::Journal::Journal as i32,
                 timeout_ms: 5_000,
             }),
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await
@@ -2987,7 +3048,7 @@ async fn grpc_write_concern_cache_accepted() {
                 journal: replication::Journal::Cache as i32,
                 timeout_ms: 0,
             }),
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await
@@ -3091,7 +3152,7 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         }))
         .await;
@@ -3219,7 +3280,7 @@ fn an_auto_commit_write_conflict_is_aborted_like_an_interactive_one() {
     let info = details.error_info().expect("must carry ErrorInfo");
     assert_eq!(info.reason, "TRANSACTION_CONFLICT");
     assert!(
-        !info.metadata.contains_key("transaction_id"),
+        !info.metadata.contains_key("transaction"),
         "an auto-commit statement has no transaction id to name"
     );
 }

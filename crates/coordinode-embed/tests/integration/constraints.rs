@@ -184,14 +184,14 @@ fn a_node_completed_before_commit_satisfies_the_constraint() {
     db.execute_cypher("UNWIND [{email: 'b@x'}, {email: 'c@x'}] AS r CREATE (u:User) SET u = r")
         .expect("the batch-create shape");
 
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     db.execute_in_transaction(txn, "CREATE (u:User {name: 'd'})", None)
         .expect("incomplete inside the transaction");
     db.execute_in_transaction(txn, "MATCH (u:User {name: 'd'}) SET u.email = 'd@x'", None)
         .expect("completed by a later statement");
     db.commit_transaction(txn).expect("complete at commit");
 
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     db.execute_in_transaction(txn, "CREATE (u:User {name: 'e'})", None)
         .expect("incomplete inside the transaction");
     let refused = db
@@ -746,7 +746,7 @@ fn a_presence_constraint_checked_past_the_wait_is_returned_validating() {
         statement_wait: Duration::from_millis(200),
         ..db.index_build_config()
     });
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
     db.execute_cypher("CREATE CONSTRAINT org_name FOR (o:Org) REQUIRE o.name IS UNIQUE")
         .expect("the blocking build");
 
@@ -801,7 +801,7 @@ fn a_writer_in_flight_cannot_slip_past_activation() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (u:User {email: 'seed@x'})")
         .expect("seed");
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     db.execute_in_transaction(txn, "CREATE (u:User {name: 'late'})", None)
         .expect("a write staged before the constraint");
 
@@ -918,7 +918,7 @@ fn create_while_held(
     name: &str,
     meanwhile: impl FnOnce(&Database),
 ) -> Result<(), String> {
-    let held = db.begin_transaction();
+    let held = db.begin_transaction().map_err(|e| e.to_string())?;
     std::thread::scope(|s| {
         let build = s.spawn(|| db.execute_cypher_shared(statement, None, None, None, None));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1199,7 +1199,7 @@ fn interrupted_child_publishes_a_constraint_then_aborts() {
     db.execute_cypher("CREATE (:User {email: 'a@x'})")
         .expect("seed");
     let db = &db;
-    let _held = db.begin_transaction();
+    let _held = db.begin_transaction().expect("begin");
     std::thread::scope(|s| {
         s.spawn(|| {
             let _ = db.execute_cypher_shared(

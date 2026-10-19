@@ -68,7 +68,7 @@ fn holders(db: &mut Database, email: &str) -> usize {
 #[test]
 fn a_running_build_is_inspectable_and_publishes_the_index() {
     let (mut db, _dir) = open_db();
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
 
     std::thread::scope(|s| {
         let created = s.spawn(|| create_index(&db, "CREATE INDEX user_email ON :User(email)"));
@@ -103,7 +103,7 @@ fn a_running_build_is_inspectable_and_publishes_the_index() {
 #[test]
 fn a_cancelled_build_withdraws_its_new_index() {
     let (mut db, _dir) = open_db();
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
     let mut operation = None;
 
     std::thread::scope(|s| {
@@ -136,7 +136,7 @@ fn a_cancelled_build_withdraws_its_new_index() {
 #[test]
 fn dropping_an_index_during_its_build_ends_the_build() {
     let (mut db, _dir) = open_db();
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
     let mut generation = None;
 
     std::thread::scope(|s| {
@@ -172,7 +172,7 @@ fn a_build_outwaited_by_an_older_transaction_fails() {
         older_transactions_wait: Duration::from_millis(100),
         ..db.index_build_config()
     });
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
 
     let error =
         create_index(&db, "CREATE INDEX user_email ON :User(email)").expect_err("outwaited");
@@ -247,7 +247,7 @@ fn concurrent_creates_of_one_index_name_have_one_winner() {
 /// for an older transaction: the index is registered with the writers, and
 /// none of the stored users has an entry yet. The build then finishes.
 fn while_unique_build_waits(db: &Database, body: impl FnOnce()) -> Result<(), String> {
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().map_err(|e| e.to_string())?;
     std::thread::scope(|s| {
         let created =
             s.spawn(|| create_index(db, "CREATE UNIQUE INDEX user_email ON :User(email)"));
@@ -338,7 +338,7 @@ fn an_interactive_commit_is_refused_like_a_statement_during_the_build() {
     let (db, _dir) = open_db();
 
     while_unique_build_waits(&db, || {
-        let txn = db.begin_transaction();
+        let txn = db.begin_transaction().expect("begin");
         db.execute_in_transaction(txn, "CREATE (:User {email: 'a@x'})", None)
             .expect("staged");
         let held = db.commit_transaction(txn).expect_err("held").to_string();
@@ -350,7 +350,7 @@ fn an_interactive_commit_is_refused_like_a_statement_during_the_build() {
             unique_admission_read_limit: 1,
             ..db.index_build_config()
         });
-        let txn = db.begin_transaction();
+        let txn = db.begin_transaction().expect("begin");
         db.execute_in_transaction(txn, "CREATE (:User {email: 'z@x'})", None)
             .expect("staged");
         let unresolved = db
@@ -376,7 +376,7 @@ fn a_partial_unique_index_holds_only_admitted_nodes_during_the_build() {
         "CREATE (:User {email: 'on@x', active: true}), (:User {email: 'off@x', active: false})",
     )
     .expect("seed");
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
 
     std::thread::scope(|s| {
         let created = s.spawn(|| {
@@ -432,7 +432,7 @@ fn a_writer_older_than_a_partial_unique_index_is_refused() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (:User {email: 'p@x', active: true})")
         .expect("the holder");
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
     db.execute_in_transaction(older, "CREATE (:User {email: 'p@x', active: true})", None)
         .expect("written before the index");
 
@@ -499,7 +499,7 @@ fn closing_a_database_with_a_held_build_releases_its_storage() {
         let mut db = Database::open(dir.path()).expect("open");
         db.execute_cypher("CREATE (:User {email: 'a@x'})")
             .expect("seed");
-        let _older = db.begin_transaction();
+        let _older = db.begin_transaction().expect("begin");
         db.create_constraint(email_constraint(Duration::ZERO, false))
             .expect("admitted");
         await_held(&db, "user_email");
@@ -548,7 +548,7 @@ fn email_constraint(wait: Duration, if_not_exists: bool) -> ConstraintDeclaratio
 #[test]
 fn a_constraint_that_outwaits_its_call_validates_on_as_an_operation() {
     let (mut db, _dir) = open_db();
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
 
     let created = db
         .create_constraint(email_constraint(Duration::ZERO, false))
@@ -606,7 +606,7 @@ fn a_constraint_that_outwaits_its_call_validates_on_as_an_operation() {
 #[test]
 fn cancelling_a_validating_constraint_build_withdraws_the_constraint() {
     let (db, _dir) = open_db();
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
     let operation = db
         .create_constraint(email_constraint(Duration::ZERO, false))
         .expect("admitted")
@@ -643,7 +643,7 @@ fn index_build_procedures_inspect_await_and_cancel() {
         statement_wait: Duration::ZERO,
         ..db.index_build_config()
     });
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().expect("begin");
     let rows = db
         .execute_cypher("CREATE INDEX user_email ON :User(email)")
         .expect("admitted");

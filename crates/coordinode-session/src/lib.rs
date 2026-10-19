@@ -14,10 +14,10 @@ mod registry;
 mod session;
 mod types;
 
-pub use engine::{CursorEngine, EngineError, QueryCursor};
+pub use engine::{CursorEngine, EngineError, InTransaction, QueryCursor};
 pub use registry::SessionRegistry;
 pub use session::{InOp, OutEvent, Session, SessionManager};
 pub use types::{
-    ConnectionSettings, ConnectionState, ErrorCode, Failure, Ordering, SessionEvent, SessionOp,
-    SessionStats, StatementSource,
+    ConnectionSettings, ConnectionState, ErrorCode, Failure, SessionEvent, SessionOp, SessionStats,
+    StatementSource,
 };

@@ -87,8 +87,6 @@ impl Session {
             client_frame::Op::Execute(Execute {
                 query: query.to_string(),
                 parameters: Default::default(),
-                txid: 0,
-                nonce: 0,
                 ..Default::default()
             }),
         )

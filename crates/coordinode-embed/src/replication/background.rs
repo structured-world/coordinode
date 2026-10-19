@@ -25,6 +25,36 @@ pub(super) async fn stopped(stop: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Keep the database's transaction tenure on `raft_node`'s leadership: each
+/// change of leader or term ends the transactions of the tenure before it,
+/// and only a member that leads opens new ones. Ends when the node is dropped
+/// or `stop` says so.
+pub(super) fn spawn_execution_tenure(
+    database: Arc<RwLock<Database>>,
+    raft_node: Arc<RaftNode>,
+    mut stop: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let node_id = raft_node.node_id();
+        // The first look returns the current pair.
+        let mut seen = (None, u64::MAX);
+        loop {
+            let next = tokio::select! {
+                next = raft_node.next_leadership_change(seen) => next,
+                () = stopped(&mut stop) => break,
+            };
+            if next == seen {
+                // Only a node shutting down repeats the pair it was given.
+                break;
+            }
+            seen = next;
+            database
+                .read()
+                .set_execution_tenure(node_id, next.0, next.1);
+        }
+    })
+}
+
 /// Watch `raft_node`'s leadership and, each time this member becomes the
 /// leader, finish the builds left unfinished: those a process left when it
 /// stopped, and those a former leader held when it lost the lead. Ends when

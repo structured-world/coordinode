@@ -952,7 +952,7 @@ fn a_transaction_with_writes_cut_short_by_the_budget_cannot_commit() {
     use coordinode_core::graph::types::Value;
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Database::open(dir.path()).expect("open");
-    let txid = db.begin_transaction();
+    let txid = db.begin_transaction().expect("begin");
     let small = StatementOptions {
         query_memory_limit: Some(64 << 10),
         ..StatementOptions::default()
@@ -2039,16 +2039,17 @@ fn paged_cursor_empty_label_is_exhausted_immediately() {
 
 // ----- operational introspection (SHOW SESSIONS / SHOW TRANSACTIONS) -----
 
+/// SHOW TRANSACTIONS lists the transactions the database holds, attached to
+/// a session or not; a session's attachment names its row's session, and an
+/// attachment to a transaction that is no longer open counts for nothing.
 #[test]
-fn show_sessions_and_transactions_render_the_injected_operations_view() {
+fn show_transactions_lists_held_transactions_with_their_attachments() {
     use coordinode_core::graph::types::Value;
-    use coordinode_core::operations::{
-        OperationsView, SessionSnapshot, TransactionSnapshot, TxnOrdering,
-    };
+    use coordinode_core::operations::{OperationsView, SessionSnapshot, TxnOrdering};
 
-    // A fixed snapshot stands in for the live session registry, so the test is
-    // deterministic and exercises planner + executor + embed wiring end to end.
-    struct MockOps;
+    struct MockOps {
+        attached: Vec<String>,
+    }
     impl OperationsView for MockOps {
         fn sessions(&self) -> Vec<SessionSnapshot> {
             vec![SessionSnapshot {
@@ -2056,19 +2057,25 @@ fn show_sessions_and_transactions_render_the_injected_operations_view() {
                 peer: "10.0.0.9:42".into(),
                 age_ms: 1234,
                 in_flight: 2,
-                transactions: vec![TransactionSnapshot {
-                    txid: 7,
-                    ordering: TxnOrdering::Ordered,
-                    age_ms: 500,
-                    auto_abort_in_ms: 29_500,
-                }],
+                attached: self.attached.clone(),
             }]
         }
     }
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
-    db.set_operations_view(Arc::new(MockOps));
+    let attached = db.begin_transaction().expect("begin");
+    let detached = db
+        .begin_transaction_with(&TransactionOptions {
+            ordering: TxnOrdering::Ordered,
+            ..TransactionOptions::trusted()
+        })
+        .expect("begin");
+    let ended = db.begin_transaction().expect("begin");
+    db.rollback_transaction(ended).expect("rollback");
+    db.set_operations_view(Arc::new(MockOps {
+        attached: vec![attached.to_string(), ended.to_string()],
+    }));
 
     let sessions = db.execute_cypher("SHOW SESSIONS").expect("show sessions");
     assert_eq!(sessions.len(), 1);
@@ -2076,29 +2083,48 @@ fn show_sessions_and_transactions_render_the_injected_operations_view() {
         sessions[0].get("session"),
         Some(&Value::String("s-1".into()))
     );
-    assert_eq!(
-        sessions[0].get("peer"),
-        Some(&Value::String("10.0.0.9:42".into()))
-    );
     assert_eq!(sessions[0].get("in_flight"), Some(&Value::Int(2)));
-    assert_eq!(sessions[0].get("open_transactions"), Some(&Value::Int(1)));
+    assert_eq!(
+        sessions[0].get("open_transactions"),
+        Some(&Value::Int(1)),
+        "the rolled-back transaction is not open"
+    );
 
     let txns = db
         .execute_cypher("SHOW TRANSACTIONS")
         .expect("show transactions");
-    assert_eq!(txns.len(), 1);
-    assert_eq!(txns[0].get("txid"), Some(&Value::Int(7)));
-    assert_eq!(txns[0].get("session"), Some(&Value::String("s-1".into())));
+    assert_eq!(txns.len(), 2, "{txns:?}");
+    let row = |handle: TransactionHandle| {
+        txns.iter()
+            .find(|r| r.get("txid") == Some(&Value::String(handle.to_string())))
+            .unwrap_or_else(|| panic!("no row for {handle}"))
+    };
     assert_eq!(
-        txns[0].get("ordering"),
+        row(attached).get("session"),
+        Some(&Value::String("s-1".into()))
+    );
+    assert_eq!(
+        row(attached).get("ordering"),
+        Some(&Value::String("unordered".into()))
+    );
+    assert_eq!(row(detached).get("session"), Some(&Value::Null));
+    assert_eq!(
+        row(detached).get("ordering"),
         Some(&Value::String("ordered".into()))
     );
-    assert_eq!(txns[0].get("auto_abort_in_ms"), Some(&Value::Int(29_500)));
+    match row(detached).get("auto_abort_in_ms") {
+        Some(Value::Int(ms)) => assert!(
+            *ms > 0 && *ms as u128 <= Database::DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT.as_millis(),
+            "{ms}"
+        ),
+        other => panic!("an idle transaction counts down: {other:?}"),
+    }
 }
 
 #[test]
-fn show_transactions_without_an_operations_view_is_empty() {
-    // Embedded use has no session layer: the statement is valid but lists nothing.
+fn show_sessions_without_an_operations_view_is_empty() {
+    // Embedded use has no session layer: no sessions, and the transactions
+    // the host holds are listed with no session.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
     assert!(
@@ -2107,6 +2133,13 @@ fn show_transactions_without_an_operations_view_is_empty() {
             .is_empty()
     );
     assert!(db.execute_cypher("SHOW SESSIONS").expect("show").is_empty());
+    db.begin_transaction().expect("begin");
+    let txns = db.execute_cypher("SHOW TRANSACTIONS").expect("show");
+    assert_eq!(txns.len(), 1);
+    assert_eq!(
+        txns[0].get("session"),
+        Some(&coordinode_core::graph::types::Value::Null)
+    );
 }
 
 /// A damaged planner counter makes the statistics unavailable rather than

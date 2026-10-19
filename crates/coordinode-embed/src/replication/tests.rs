@@ -205,7 +205,7 @@ async fn the_transition_keeps_answered_writes_and_drops_open_transactions() {
     alone.set_write_concern(WriteConcern::memory());
     alone.execute_cypher("CREATE (:Before {k: 0})").unwrap();
     alone.set_write_concern(WriteConcern::default());
-    let open = alone.begin_transaction();
+    let open = alone.begin_transaction().unwrap();
     alone
         .execute_in_transaction(open, "CREATE (:Unsubmitted {k: 1})", None)
         .unwrap();

@@ -18,16 +18,23 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
+use std::time::Duration;
+
 use coordinode_core::graph::types::Value;
+use coordinode_core::operations::TxnOrdering;
+use coordinode_core::txn::handle::{AdmissionSignal, TransactionHandle};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
-use coordinode_embed::db::{SessionSetting, StatementOptions};
+use coordinode_embed::db::{
+    CommitOptions, RollbackOptions, SessionSetting, StatementOptions, TransactionOptions,
+};
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::WriteStats;
 use coordinode_session::{
-    ConnectionSettings, CursorEngine, EngineError, QueryCursor, SessionStats, StatementSource,
+    ConnectionSettings, CursorEngine, EngineError, InTransaction, QueryCursor, SessionStats,
+    StatementSource,
 };
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
@@ -153,7 +160,7 @@ impl CursorEngine for DatabaseCursorEngine {
         &self,
         query: &str,
         params: HashMap<String, Value>,
-        txid: u64,
+        transaction: Option<&InTransaction>,
         settings: &ConnectionSettings,
         source: Option<&StatementSource>,
         operation: Option<&OperationDescriptor>,
@@ -169,18 +176,20 @@ impl CursorEngine for DatabaseCursorEngine {
         // pinned when it began and buffers its writes until the commit: no
         // fence and no commit of its own here. Its session's vector settings
         // still apply.
-        if txid != 0 {
+        if let Some(transaction) = transaction {
             let options = StatementOptions {
                 vector_consistency: settings.vector_consistency,
                 vector_build_wait: settings.vector_build_wait,
                 query_memory_limit: settings.query_memory_limit,
                 cancel: Some(cancel.clone()),
+                nonce: Some(transaction.nonce),
+                admission: Some(transaction.admission.clone()),
                 ..StatementOptions::default()
             };
             let rows = self
                 .database()
                 .read()
-                .execute_in_transaction_with(txid, query, params, &options)
+                .execute_in_transaction_with(transaction.handle, query, params, &options)
                 .map_err(engine_error)?;
             let (columns, rows) = rows_to_values(&rows);
             return Ok(Box::new(MaterializedCursor {
@@ -283,27 +292,56 @@ impl CursorEngine for DatabaseCursorEngine {
         }))
     }
 
-    fn begin_transaction(&self) -> Result<u64, EngineError> {
-        Ok(self.database().read().begin_transaction())
+    fn begin_transaction(
+        &self,
+        ordering: TxnOrdering,
+        drain: Option<Duration>,
+    ) -> Result<TransactionHandle, EngineError> {
+        self.database()
+            .read()
+            .begin_transaction_with(&TransactionOptions {
+                ordering,
+                drain_timeout: drain,
+                ..TransactionOptions::trusted()
+            })
+            .map_err(engine_error)
     }
 
     fn commit_transaction(
         &self,
-        txid: u64,
+        transaction: TransactionHandle,
+        last_nonce: Option<u64>,
         operation: Option<&OperationDescriptor>,
+        admission: &AdmissionSignal,
     ) -> Result<CommitReceipt, EngineError> {
-        let db = self.database().read();
-        match operation {
-            Some(operation) => db.commit_transaction_as(txid, operation),
-            None => db.commit_transaction(txid),
-        }
-        .map_err(engine_error)
-    }
-
-    fn rollback_transaction(&self, txid: u64) -> Result<(), EngineError> {
         self.database()
             .read()
-            .rollback_transaction(txid)
+            .commit_transaction_with(
+                transaction,
+                &CommitOptions {
+                    operation,
+                    last_nonce,
+                    admission: Some(admission),
+                    ..CommitOptions::default()
+                },
+            )
+            .map_err(engine_error)
+    }
+
+    fn rollback_transaction(
+        &self,
+        transaction: TransactionHandle,
+        admission: &AdmissionSignal,
+    ) -> Result<(), EngineError> {
+        self.database()
+            .read()
+            .rollback_transaction_with(
+                transaction,
+                &RollbackOptions {
+                    admission: Some(admission),
+                    ..RollbackOptions::default()
+                },
+            )
             .map_err(engine_error)
     }
 }
@@ -397,7 +435,8 @@ fn forwarded_request(
         read_preference: settings.read_preference.map_or(0, i32::from),
         read_concern,
         write_concern: settings.write_concern.as_ref().map(write_concern_to_proto),
-        transaction_id: 0,
+        // Autonomous: the session forwards no transaction's statement.
+        transaction: Vec::new(),
         vector_consistency: settings
             .vector_consistency
             .map_or(0, vector_consistency_to_proto),

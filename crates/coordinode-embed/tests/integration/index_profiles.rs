@@ -377,7 +377,7 @@ fn a_derived_index_sees_own_writes_and_rolls_back() {
     db.execute_cypher("CREATE INDEX d_name ON :U(name) OPTIONS {maintenance: 'derived'}")
         .expect("index");
 
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     db.execute_in_transaction(txn, "CREATE (:U {name: 'ann'})", None)
         .expect("create");
     let rows = db
@@ -456,7 +456,7 @@ fn a_transaction_staged_before_a_transition_is_refused_at_commit() {
     db.execute_cypher("CREATE INDEX d_name ON :U(name) OPTIONS {maintenance: 'derived'}")
         .expect("index");
 
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     db.execute_in_transaction(txn, "CREATE (:U {name: 'ann'})", None)
         .expect("stage under epoch 1");
     db.execute_cypher("ALTER INDEX d_name SET MAINTENANCE RESOLVED")

@@ -91,7 +91,7 @@ fn the_count_sees_its_own_transaction() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (:Project), (:Project)")
         .expect("committed");
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     db.execute_in_transaction(txn, "CREATE (:Project), (:Project), (:Project)", None)
         .expect("own writes");
     db.execute_in_transaction(txn, "MATCH (n:Project) WITH n LIMIT 1 DELETE n", None)
@@ -169,7 +169,7 @@ fn a_node_deleted_earlier_in_the_transaction_is_gone_for_it() {
         None,
     )
     .expect("committed");
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     db.execute_in_transaction(txn, "MATCH (n:Project {i: 1}) DELETE n", None)
         .expect("own delete");
     let ids = |rows: Vec<coordinode_query::executor::Row>| -> Vec<Value> {

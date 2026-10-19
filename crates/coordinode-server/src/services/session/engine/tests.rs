@@ -53,7 +53,7 @@ fn keyset_cursor_drains_every_row_across_small_batches() {
         .open_cursor(
             "MATCH (n:Page) RETURN n.k",
             HashMap::new(),
-            0,
+            None,
             &unset(),
             None,
             None,
@@ -85,7 +85,7 @@ fn keyset_cursor_with_filter_still_drains_all_matches() {
         .open_cursor(
             "MATCH (n:Page) WHERE n.k >= 30 RETURN n.k",
             HashMap::new(),
-            0,
+            None,
             &unset(),
             None,
             None,
@@ -119,7 +119,7 @@ fn blocking_plan_routes_to_materialize_and_still_returns_all_rows() {
         .open_cursor(
             "MATCH (n:Page) RETURN n.k ORDER BY n.k",
             HashMap::new(),
-            0,
+            None,
             &unset(),
             None,
             None,
@@ -149,7 +149,7 @@ fn a_cancelled_statement_answers_with_a_cancellation() {
         .open_cursor(
             "MATCH (n:Page) RETURN n.k ORDER BY n.k",
             HashMap::new(),
-            0,
+            None,
             &unset(),
             None,
             None,
@@ -159,12 +159,19 @@ fn a_cancelled_statement_answers_with_a_cancellation() {
         .expect("cancelled");
     assert_eq!(refused.0.code, coordinode_session::ErrorCode::Cancelled);
 
-    let txid = engine.begin_transaction().expect("begin");
+    let handle = engine
+        .begin_transaction(coordinode_core::operations::TxnOrdering::Unordered, None)
+        .expect("begin");
+    let transaction = coordinode_session::InTransaction {
+        handle,
+        nonce: 0,
+        admission: AdmissionSignal::new(|| {}),
+    };
     let refused = engine
         .open_cursor(
             "CREATE (:Page {k: 99})",
             HashMap::new(),
-            txid,
+            Some(&transaction),
             &unset(),
             None,
             None,
@@ -182,7 +189,7 @@ fn keyset_cursor_empty_label_yields_no_rows() {
         .open_cursor(
             "MATCH (n:Page) RETURN n.k",
             HashMap::new(),
-            0,
+            None,
             &unset(),
             None,
             None,
@@ -210,9 +217,7 @@ async fn run_execute_with(
 ) -> Vec<SessionEvent> {
     use tokio::sync::mpsc;
 
-    let registry = Arc::new(coordinode_session::SessionRegistry::new(
-        std::time::Duration::from_secs(30),
-    ));
+    let registry = Arc::new(coordinode_session::SessionRegistry::new());
     let manager = SessionManager::new(Arc::new(engine), registry);
     let (op_tx, op_rx) = mpsc::channel(64);
     let (ev_tx, mut ev_rx) = mpsc::channel(64);
@@ -224,7 +229,7 @@ async fn run_execute_with(
             SessionOp::Execute {
                 query: query.to_string(),
                 params: HashMap::new(),
-                txid: 0,
+                transaction: None,
                 nonce: 0,
                 settings,
                 source: None,
@@ -363,7 +368,7 @@ fn a_session_statement_is_counted_where_it_was_issued() {
             .open_cursor(
                 query,
                 HashMap::new(),
-                0,
+                None,
                 &unset(),
                 Some(&source),
                 None,
@@ -397,9 +402,7 @@ async fn a_cypher_set_changes_its_session_not_the_database() {
     use tokio::sync::mpsc;
 
     let database = seeded_db(0);
-    let registry = Arc::new(coordinode_session::SessionRegistry::new(
-        std::time::Duration::from_secs(30),
-    ));
+    let registry = Arc::new(coordinode_session::SessionRegistry::new());
     let manager = SessionManager::new(
         Arc::new(DatabaseCursorEngine::new(Arc::clone(&database))),
         registry,
@@ -413,7 +416,7 @@ async fn a_cypher_set_changes_its_session_not_the_database() {
             SessionOp::Execute {
                 query: "SET vector_consistency = 'exact'".to_string(),
                 params: HashMap::new(),
-                txid: 0,
+                transaction: None,
                 nonce: 0,
                 settings: unset(),
                 source: None,
@@ -633,10 +636,14 @@ struct Driver {
 
 impl Driver {
     fn open(engine: DatabaseCursorEngine) -> Self {
-        let registry = Arc::new(coordinode_session::SessionRegistry::new(
-            std::time::Duration::from_secs(30),
-        ));
-        let manager = SessionManager::new(Arc::new(engine), registry);
+        Self::open_shared(Arc::new(engine))
+    }
+
+    /// A session over `engine`, which other sessions may share: the streams
+    /// of one client reaching the same server.
+    fn open_shared(engine: Arc<DatabaseCursorEngine>) -> Self {
+        let registry = Arc::new(coordinode_session::SessionRegistry::new());
+        let manager = SessionManager::new(engine, registry);
         let (ops, op_rx) = tokio::sync::mpsc::channel(8);
         let (ev_tx, events) = tokio::sync::mpsc::channel(64);
         tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
@@ -682,23 +689,231 @@ impl Driver {
         panic!("the session ended before request {id} was answered: {out:?}");
     }
 
+    /// Send every op of `ops` without waiting between them, as a pipelining
+    /// client does, and collect each one's answer.
+    async fn send_all(&mut self, ops: Vec<SessionOp>) -> Vec<Vec<SessionEvent>> {
+        let first = self.next_id;
+        for op in ops {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.ops.send((id, op)).await.expect("send");
+        }
+        let count = (self.next_id - first) as usize;
+        let mut answers: Vec<Vec<SessionEvent>> = vec![Vec::new(); count];
+        let mut open = count;
+        while open > 0 {
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(30), self.events.recv()).await;
+            let Ok(Some((request_id, event))) = received else {
+                panic!("requests unanswered after 30 s: {answers:?}");
+            };
+            let Some(slot) = request_id
+                .checked_sub(first)
+                .and_then(|i| answers.get_mut(i as usize))
+            else {
+                continue;
+            };
+            let last = matches!(
+                event,
+                SessionEvent::CursorEnd { .. }
+                    | SessionEvent::Error(_)
+                    | SessionEvent::Committed { .. }
+                    | SessionEvent::Begun { .. }
+            );
+            slot.push(event);
+            if last {
+                open -= 1;
+            }
+        }
+        answers
+    }
+
     async fn execute(
         &mut self,
         query: &str,
-        txid: u64,
+        transaction: Option<TransactionHandle>,
+        operation: Option<coordinode_embed::operation::OperationDescriptor>,
+    ) -> Vec<SessionEvent> {
+        self.execute_numbered(query, transaction, 0, operation)
+            .await
+    }
+
+    async fn execute_numbered(
+        &mut self,
+        query: &str,
+        transaction: Option<TransactionHandle>,
+        nonce: u64,
         operation: Option<coordinode_embed::operation::OperationDescriptor>,
     ) -> Vec<SessionEvent> {
         self.send(SessionOp::Execute {
             query: query.to_string(),
             params: HashMap::new(),
-            txid,
-            nonce: 0,
+            transaction,
+            nonce,
             settings: unset(),
             source: None,
             operation,
         })
         .await
     }
+}
+
+/// The single row's single value a statement answered with.
+fn only_value(events: &[SessionEvent]) -> Value {
+    let rows: Vec<&Vec<Value>> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Rows { rows } => Some(rows),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    match rows.as_slice() {
+        [row] => row[0].clone(),
+        other => panic!("expected one row, got {other:?} from {events:?}"),
+    }
+}
+
+/// The handle a Begin answered with.
+fn begun(events: &[SessionEvent]) -> TransactionHandle {
+    match events {
+        [SessionEvent::Begun { transaction }] => *transaction,
+        other => panic!("expected a transaction, got {other:?}"),
+    }
+}
+
+/// A transaction outlives the stream that began it: closing that stream rolls
+/// nothing back, and another stream continues it by its handle, with the same
+/// pinned view and its own writes, then commits it. A statement retransmitted
+/// under a nonce the first stream already sent is not applied a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_continues_on_another_stream_after_the_first_closes() {
+    let database = seeded_db(0);
+    let engine = Arc::new(DatabaseCursorEngine::new(Arc::clone(&database)));
+
+    let mut first = Driver::open_shared(Arc::clone(&engine));
+    let transaction = begun(
+        &first
+            .send(SessionOp::Begin {
+                ordering: coordinode_core::operations::TxnOrdering::Unordered,
+                drain_timeout_ms: 0,
+            })
+            .await,
+    );
+    let wrote = first
+        .execute_numbered("CREATE (:Moved {k: 1})", Some(transaction), 1, None)
+        .await;
+    assert!(
+        matches!(wrote.last(), Some(SessionEvent::CursorEnd { .. })),
+        "{wrote:?}"
+    );
+    // A write committed elsewhere after BEGIN is outside the pinned view.
+    database
+        .write()
+        .execute_cypher("CREATE (:Moved {k: 2})")
+        .expect("a later write");
+    drop(first);
+
+    let mut second = Driver::open_shared(engine);
+    let repeated = second
+        .execute_numbered("CREATE (:Moved {k: 1})", Some(transaction), 1, None)
+        .await;
+    match repeated.as_slice() {
+        [SessionEvent::Error(failure)] => {
+            assert_eq!(failure.code, coordinode_session::ErrorCode::AlreadyExists);
+        }
+        other => panic!("a retransmitted statement is refused, got {other:?}"),
+    }
+    let seen = second
+        .execute_numbered(
+            "MATCH (n:Moved) RETURN count(n) AS c",
+            Some(transaction),
+            2,
+            None,
+        )
+        .await;
+    assert_eq!(
+        only_value(&seen),
+        Value::Int(1),
+        "its own write, and not the one committed after it began"
+    );
+    let committed = second
+        .send(SessionOp::Commit {
+            transaction,
+            last_nonce: 0,
+            operation: None,
+        })
+        .await;
+    assert!(
+        matches!(committed.as_slice(), [SessionEvent::Committed { .. }]),
+        "{committed:?}"
+    );
+    drop(second);
+
+    let rows = database
+        .write()
+        .execute_cypher("MATCH (n:Moved) RETURN n.k AS k")
+        .expect("read");
+    assert_eq!(rows.len(), 2, "the transaction's write and the later one");
+}
+
+/// An ordered transaction's statements pipelined on one stream in reverse
+/// nonce order are applied by nonce, and a commit sent with them waits for
+/// the whole chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ordered_chain_sent_out_of_order_applies_by_nonce() {
+    let database = seeded_db(0);
+    let mut session = Driver::open(DatabaseCursorEngine::new(Arc::clone(&database)));
+    let transaction = begun(
+        &session
+            .send(SessionOp::Begin {
+                ordering: coordinode_core::operations::TxnOrdering::Ordered,
+                drain_timeout_ms: 0,
+            })
+            .await,
+    );
+    let numbered = |query: &str, nonce| SessionOp::Execute {
+        query: query.to_string(),
+        params: HashMap::new(),
+        transaction: Some(transaction),
+        nonce,
+        settings: unset(),
+        source: None,
+        operation: None,
+    };
+    let answers = session
+        .send_all(vec![
+            numbered("MATCH (n:Chain) SET n.step = n.step * 10", 2),
+            numbered("CREATE (:Chain {step: 1})", 1),
+            SessionOp::Commit {
+                transaction,
+                last_nonce: 2,
+                operation: None,
+            },
+        ])
+        .await;
+    for (i, answer) in answers.iter().enumerate().take(2) {
+        assert!(
+            matches!(answer.last(), Some(SessionEvent::CursorEnd { .. })),
+            "statement {i}: {answer:?}"
+        );
+    }
+    assert!(
+        matches!(answers[2].as_slice(), [SessionEvent::Committed { .. }]),
+        "{:?}",
+        answers[2]
+    );
+    drop(session);
+
+    let rows = database
+        .write()
+        .execute_cypher("MATCH (n:Chain) RETURN n.step AS step")
+        .expect("read");
+    assert_eq!(
+        rows[0].get("step"),
+        Some(&Value::Int(10)),
+        "nonce 1 ran before nonce 2"
+    );
 }
 
 /// The reason and metadata a session failure carries in its details.
@@ -740,14 +955,14 @@ async fn a_session_write_retried_with_its_operation_runs_once() {
     let mut session = Driver::open(DatabaseCursorEngine::new(Arc::clone(&database)));
 
     let first = session
-        .execute("CREATE (:Paid {k: 1})", 0, Some(statement_op))
+        .execute("CREATE (:Paid {k: 1})", None, Some(statement_op))
         .await;
     let Some(SessionEvent::CursorEnd { stats }) = first.last() else {
         panic!("expected the write to run, got {first:?}");
     };
     let statement_ts = stats.commit_ts;
     let again = session
-        .execute("CREATE (:Paid {k: 1})", 0, Some(statement_op))
+        .execute("CREATE (:Paid {k: 1})", None, Some(statement_op))
         .await;
     let (why, metadata) = settled_reason(&again);
     assert_eq!(why, "OPERATION_SETTLED");
@@ -756,21 +971,23 @@ async fn a_session_write_retried_with_its_operation_runs_once() {
 
     let begun = session
         .send(SessionOp::Begin {
-            ordering: coordinode_session::Ordering::Unordered,
+            ordering: coordinode_core::operations::TxnOrdering::Unordered,
             drain_timeout_ms: 0,
         })
         .await;
-    let [SessionEvent::Begun { txid }] = begun.as_slice() else {
+    let [SessionEvent::Begun { transaction }] = begun.as_slice() else {
         panic!("expected a transaction, got {begun:?}");
     };
-    let txid = *txid;
-    let inside = session.execute("CREATE (:Basket {k: 1})", txid, None).await;
+    let transaction = *transaction;
+    let inside = session
+        .execute("CREATE (:Basket {k: 1})", Some(transaction), None)
+        .await;
     assert!(
         matches!(inside.last(), Some(SessionEvent::CursorEnd { .. })),
         "{inside:?}"
     );
     let commit = SessionOp::Commit {
-        txid,
+        transaction,
         last_nonce: 0,
         operation: Some(commit_op),
     };

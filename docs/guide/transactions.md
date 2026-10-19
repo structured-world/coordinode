@@ -46,7 +46,7 @@ Every statement reads the snapshot pinned when the transaction began (repeatable
 For the embedded API:
 
 ```rust
-let tx = db.begin_transaction();
+let tx = db.begin_transaction()?;
 db.execute_in_transaction(tx, "CREATE (alice:Person {name: 'Alice'})", None)?;
 db.execute_in_transaction(tx, "CREATE (bob:Person {name: 'Bob'})", None)?;
 db.execute_in_transaction(
@@ -65,7 +65,13 @@ let receipt = db.commit_transaction(tx)?;
 // embedded (there is no Raft log to index).
 ```
 
-A statement error aborts the transaction; later statements and the commit fail with an unknown-transaction error, and the client restarts from `begin_transaction`. Idle transactions are rolled back after `interactive_idle_timeout` (default 30 s) and buffered writes are capped by `max_interactive_txn_bytes` (default 256 MiB) because an open transaction pins an MVCC snapshot and leader memory.
+**The handle.** `BeginTransaction` (and the session's `Begun`) returns the transaction as an opaque byte string; the embedded API returns a `TransactionHandle`. It names the database, the member that holds the transaction and the leadership term it was begun in, so a handle of another database, of an earlier term or of a restarted server names nothing. Send it back unchanged; bytes that are not a handle are refused with `INVALID_ARGUMENT`.
+
+**Who holds it.** Only the leader opens transactions. BEGIN on another member is refused with `FAILED_PRECONDITION`, `reason = NOT_LEADER`, naming the leader in `leader_id` when one is known. A transaction belongs to the member that began it, not to the connection: closing a session stream does not roll anything back, and another stream to the same member continues the transaction by its handle, with the same snapshot, its own writes and the settings fixed at BEGIN. When the leader changes before the commit, the transaction ends: commands for it are refused with `ABORTED`, `reason = TRANSACTION_ABORTED`, `end = LEADER_CHANGED`. Nothing of it was applied; run it again from BEGIN on the new leader. The same member becoming leader again later does not bring the old transaction back.
+
+**Ordering.** Commands for one transaction run one at a time. One that arrives while another runs waits for its turn in a queue on the holder; past 64 waiting commands the next is refused with `ABORTED`, `reason = TRANSACTION_BUSY`, and the transaction stays as it is. A session transaction begun `ORDERED` numbers its statements from 1 (`Execute.nonce`) and they run in that order whatever order they arrive in; a missing statement is waited for up to the drain timeout (`Begin.drain_timeout_ms`, the session's setting, else 5 s), after which the transaction is aborted (`end = DRAIN_TIMED_OUT`). A commit with `last_nonce` waits until the chain up to it has run. In either ordering a statement repeated with a nonce already used is not applied again: the same statement is refused with `ALREADY_EXISTS`, `reason = STATEMENT_ALREADY_ADMITTED` (its rows are not kept), a different one under that nonce with `INVALID_ARGUMENT`, `reason = STATEMENT_NONCE_REUSED`.
+
+**Ending.** A statement error aborts the transaction; later statements and the commit are refused with `TRANSACTION_ABORTED` (`end = STATEMENT_FAILED`), and the client restarts from BEGIN. Idle transactions are rolled back after `interactive_idle_timeout` (default 30 s, `end = IDLE_EXPIRED`) and buffered writes are capped by `max_interactive_txn_bytes` (default 256 MiB) because an open transaction pins an MVCC snapshot and leader memory. A handle naming nothing open, or a transaction of another caller, is refused with `NOT_FOUND`, `reason = UNKNOWN_TRANSACTION`. `SHOW TRANSACTIONS` lists the transactions a member holds, with the session attached to each or none when no stream is.
 
 Over gRPC the same receipt is `CommitTransactionResponse { applied_index, commit_ts }`, and the multiplexed session stream acknowledges a commit with `Committed { applied_index, commit_ts }`. Pass `commit_ts` as `ReadConcern.at_timestamp` (level `SNAPSHOT`) to read exactly the state this commit produced.
 

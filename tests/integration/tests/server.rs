@@ -33,7 +33,7 @@ async fn cypher_raw(
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction_id: 0,
+            transaction: Vec::new(),
             ..Default::default()
         })
         .await

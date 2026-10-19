@@ -6,7 +6,7 @@
 
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
-use coordinode_embed::Database;
+use coordinode_embed::{Database, TransactionHandle};
 
 /// One year in microseconds, the valid-time unit.
 const YEAR: i64 = 365 * 24 * 3600 * 1_000_000;
@@ -321,7 +321,7 @@ fn a_correction_keeping_valid_from_reads_alike_through_index_and_scan() {
     let (end, corrected) = (now + YEAR, now - YEAR / 2);
     create(&mut db, "ada", now - YEAR, Some(end));
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(
         tx,
         &format!("MATCH (n:Emp {{name: 'ada'}}) SET n.valid_to = {corrected}"),
@@ -504,7 +504,7 @@ fn a_pattern_predicate_sees_the_neighbour_state_valid_now() {
 /// key order, whatever order its write buffer holds them in.
 #[test]
 fn a_node_revised_in_a_transaction_is_found_later_in_it() {
-    let read = |db: &Database, txn: u64, query: &str| -> Vec<i64> {
+    let read = |db: &Database, txn: TransactionHandle, query: &str| -> Vec<i64> {
         db.execute_in_transaction(txn, query, None)
             .expect("statement")
             .iter()
@@ -527,7 +527,7 @@ fn a_node_revised_in_a_transaction_is_found_later_in_it() {
             db.execute_cypher(ddl).expect("setup");
         }
 
-        let txn = db.begin_transaction();
+        let txn = db.begin_transaction().expect("begin");
         db.execute_in_transaction(txn, "MATCH (n:T {name: 'p'}) SET n.k = 2", None)
             .expect("revise p");
         db.execute_in_transaction(txn, "MATCH (n:T {name: 'q'}) SET n.k = 3", None)

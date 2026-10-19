@@ -661,7 +661,7 @@ async fn follower_text_search_follows_leader_commits() {
     n1.db
         .execute_cypher("MATCH (n:Article {title: 'a'}) SET n.body = 'revised words'")
         .unwrap();
-    let tx = n1.db.begin_transaction();
+    let tx = n1.db.begin_transaction().unwrap();
     n1.db
         .execute_in_transaction(
             tx,

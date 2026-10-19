@@ -54,46 +54,24 @@ fn execute(request_id: u64, query: &str) -> ClientFrame {
         op: Some(client_frame::Op::Execute(Execute {
             query: query.to_string(),
             parameters: Default::default(),
-            txid: 0,
-            nonce: 0,
             ..Default::default()
         })),
     }
 }
 
-fn commit(request_id: u64) -> ClientFrame {
-    ClientFrame {
-        request_id,
-        op: Some(client_frame::Op::Commit(Commit {
-            txid: 1,
-            last_nonce: 0,
-            operation: None,
-        })),
-    }
+/// An Execute frame bound to the open transaction `handle`.
+fn execute_tx(request_id: u64, query: &str, handle: &[u8]) -> ClientFrame {
+    execute_tx_nonce(request_id, query, handle, 0)
 }
 
-/// An Execute frame bound to an open transaction `txid`.
-fn execute_tx(request_id: u64, query: &str, txid: u64) -> ClientFrame {
+/// An Execute frame bound to a transaction with an explicit `nonce`.
+fn execute_tx_nonce(request_id: u64, query: &str, handle: &[u8], nonce: u64) -> ClientFrame {
     ClientFrame {
         request_id,
         op: Some(client_frame::Op::Execute(Execute {
             query: query.to_string(),
             parameters: Default::default(),
-            txid,
-            nonce: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-/// An Execute frame bound to a transaction with an explicit ORDERED `nonce`.
-fn execute_tx_nonce(request_id: u64, query: &str, txid: u64, nonce: u64) -> ClientFrame {
-    ClientFrame {
-        request_id,
-        op: Some(client_frame::Op::Execute(Execute {
-            query: query.to_string(),
-            parameters: Default::default(),
-            txid,
+            transaction: handle.to_vec(),
             nonce,
             ..Default::default()
         })),
@@ -101,11 +79,11 @@ fn execute_tx_nonce(request_id: u64, query: &str, txid: u64, nonce: u64) -> Clie
 }
 
 /// A Commit frame carrying the expected final nonce of an ORDERED chain.
-fn commit_tx_nonce(request_id: u64, txid: u64, last_nonce: u64) -> ClientFrame {
+fn commit_tx_nonce(request_id: u64, handle: &[u8], last_nonce: u64) -> ClientFrame {
     ClientFrame {
         request_id,
         op: Some(client_frame::Op::Commit(Commit {
-            txid,
+            transaction: handle.to_vec(),
             last_nonce,
             operation: None,
         })),
@@ -113,14 +91,68 @@ fn commit_tx_nonce(request_id: u64, txid: u64, last_nonce: u64) -> ClientFrame {
 }
 
 /// A Commit frame for a specific transaction.
-fn commit_tx(request_id: u64, txid: u64) -> ClientFrame {
-    ClientFrame {
-        request_id,
-        op: Some(client_frame::Op::Commit(Commit {
-            txid,
-            last_nonce: 0,
-            operation: None,
-        })),
+fn commit_tx(request_id: u64, handle: &[u8]) -> ClientFrame {
+    commit_tx_nonce(request_id, handle, 0)
+}
+
+/// A handle as SHOW TRANSACTIONS renders it: its bytes in hex.
+fn hex(handle: &[u8]) -> String {
+    handle.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Open a session stream on `proc` that the test feeds frame by frame.
+async fn open_stream(
+    proc: &CoordinodeProcess,
+) -> (
+    tokio::sync::mpsc::Sender<ClientFrame>,
+    tonic::Streaming<coordinode_integration::proto::session::ServerFrame>,
+) {
+    use tokio_stream::wrappers::ReceiverStream;
+    let channel = tonic::transport::Endpoint::from_shared(proc.endpoint())
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = SessionServiceClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
+    let inbound = client
+        .session(ReceiverStream::new(rx))
+        .await
+        .expect("open session")
+        .into_inner();
+    (tx, inbound)
+}
+
+/// The terminal event (Begun / CursorEnd / Committed / Error) of request
+/// `want`.
+async fn await_terminal(
+    inbound: &mut tonic::Streaming<coordinode_integration::proto::session::ServerFrame>,
+    want: u64,
+) -> Event {
+    loop {
+        let f = inbound.message().await.expect("frame").expect("not end");
+        if f.request_id == want {
+            match f.event {
+                Some(
+                    e @ (Event::Begun(_)
+                    | Event::CursorEnd(_)
+                    | Event::Committed(_)
+                    | Event::Error(_)),
+                ) => return e,
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// The handle a Begin of request `want` answered with.
+async fn await_begun(
+    inbound: &mut tonic::Streaming<coordinode_integration::proto::session::ServerFrame>,
+    want: u64,
+) -> Vec<u8> {
+    match await_terminal(inbound, want).await {
+        Event::Begun(b) => b.transaction,
+        other => panic!("expected Begun, got {other:?}"),
     }
 }
 
@@ -239,34 +271,14 @@ async fn session_pages_a_label_scan_through_the_keyset_cursor() {
 /// commit (or roll back). Returns once the transaction resolves. Sequences each
 /// step on the response so Begin strictly precedes the in-transaction write.
 async fn drive_transaction(proc: &CoordinodeProcess, write: &str, do_commit: bool) {
-    use tokio_stream::wrappers::ReceiverStream;
-    let channel = tonic::transport::Endpoint::from_shared(proc.endpoint())
-        .expect("endpoint")
-        .connect()
-        .await
-        .expect("connect");
-    let mut client = SessionServiceClient::new(channel);
-    let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
-    let mut inbound = client
-        .session(ReceiverStream::new(rx))
-        .await
-        .expect("open session")
-        .into_inner();
+    let (tx, mut inbound) = open_stream(proc).await;
 
     // Begin → handle.
     tx.send(begin(1)).await.expect("send begin");
-    let txid = loop {
-        let f = inbound.message().await.expect("frame").expect("not end");
-        if f.request_id == 1 {
-            match f.event {
-                Some(Event::Begun(b)) => break b.txid,
-                other => panic!("expected Begun, got {other:?}"),
-            }
-        }
-    };
+    let txid = await_begun(&mut inbound, 1).await;
 
     // Write inside the transaction; wait for its cursor to finish.
-    tx.send(execute_tx(2, write, txid))
+    tx.send(execute_tx(2, write, &txid))
         .await
         .expect("send write");
     loop {
@@ -282,7 +294,7 @@ async fn drive_transaction(proc: &CoordinodeProcess, write: &str, do_commit: boo
 
     // Resolve.
     if do_commit {
-        tx.send(commit_tx(3, txid)).await.expect("send commit");
+        tx.send(commit_tx(3, &txid)).await.expect("send commit");
         loop {
             let f = inbound.message().await.expect("frame").expect("not end");
             if f.request_id == 3 {
@@ -296,7 +308,7 @@ async fn drive_transaction(proc: &CoordinodeProcess, write: &str, do_commit: boo
     } else {
         let rollback = ClientFrame {
             request_id: 3,
-            op: Some(client_frame::Op::Rollback(Rollback { txid })),
+            op: Some(client_frame::Op::Rollback(Rollback { transaction: txid })),
         };
         tx.send(rollback).await.expect("send rollback");
     }
@@ -346,49 +358,14 @@ async fn in_session_transaction_aborts_on_a_failed_statement() {
     // First-failure rollback end to end: a valid write then a broken statement
     // inside one transaction. The broken statement errors, the transaction is
     // dead, the commit is rejected, and the earlier write never persists.
-    use tokio_stream::wrappers::ReceiverStream;
     let proc = CoordinodeProcess::start().await;
-    let channel = tonic::transport::Endpoint::from_shared(proc.endpoint())
-        .expect("endpoint")
-        .connect()
-        .await
-        .expect("connect");
-    let mut client = SessionServiceClient::new(channel);
-    let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
-    let mut inbound = client
-        .session(ReceiverStream::new(rx))
-        .await
-        .expect("open session")
-        .into_inner();
-
-    // Await the terminal event (CursorEnd / Committed / Error) of one request.
-    async fn await_terminal(
-        inbound: &mut tonic::Streaming<coordinode_integration::proto::session::ServerFrame>,
-        want: u64,
-    ) -> Event {
-        loop {
-            let f = inbound.message().await.expect("frame").expect("not end");
-            if f.request_id == want {
-                match f.event {
-                    Some(e @ (Event::CursorEnd(_) | Event::Committed(_) | Event::Error(_))) => {
-                        return e;
-                    }
-                    _ => continue,
-                }
-            }
-        }
-    }
+    let (tx, mut inbound) = open_stream(&proc).await;
 
     tx.send(begin(1)).await.expect("begin");
-    let txid = loop {
-        let f = inbound.message().await.expect("frame").expect("not end");
-        if let (1, Some(Event::Begun(b))) = (f.request_id, f.event) {
-            break b.txid;
-        }
-    };
+    let txid = await_begun(&mut inbound, 1).await;
 
     // Valid write inside the transaction.
-    tx.send(execute_tx(2, "CREATE (n:Ab {k: 1})", txid))
+    tx.send(execute_tx(2, "CREATE (n:Ab {k: 1})", &txid))
         .await
         .expect("write");
     assert!(matches!(
@@ -397,7 +374,7 @@ async fn in_session_transaction_aborts_on_a_failed_statement() {
     ));
 
     // Broken statement: errors and aborts the transaction.
-    tx.send(execute_tx(3, "THIS IS NOT CYPHER", txid))
+    tx.send(execute_tx(3, "THIS IS NOT CYPHER", &txid))
         .await
         .expect("bad");
     assert!(matches!(
@@ -406,11 +383,16 @@ async fn in_session_transaction_aborts_on_a_failed_statement() {
     ));
 
     // Commit is rejected because the transaction is aborted.
-    tx.send(commit_tx(4, txid)).await.expect("commit");
-    assert!(
-        matches!(await_terminal(&mut inbound, 4).await, Event::Error(_)),
-        "commit of an aborted transaction must error"
-    );
+    tx.send(commit_tx(4, &txid)).await.expect("commit");
+    match await_terminal(&mut inbound, 4).await {
+        Event::Error(e) => assert_eq!(
+            e.code,
+            tonic::Code::Aborted as u32,
+            "the commit is told the transaction was aborted: {}",
+            e.message
+        ),
+        other => panic!("commit of an aborted transaction must error, got {other:?}"),
+    }
     drop(tx);
     while inbound.message().await.expect("frame").is_some() {}
 
@@ -430,37 +412,20 @@ async fn in_session_transaction_aborts_on_a_failed_statement() {
 async fn ordered_transaction_reassembles_out_of_order_statements() {
     // An ORDERED transaction whose statements arrive out of nonce order must
     // still apply them in nonce order, commit cleanly, and persist every write.
-    use tokio_stream::wrappers::ReceiverStream;
     let proc = CoordinodeProcess::start().await;
-    let channel = tonic::transport::Endpoint::from_shared(proc.endpoint())
-        .expect("endpoint")
-        .connect()
-        .await
-        .expect("connect");
-    let mut client = SessionServiceClient::new(channel);
-    let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
-    let mut inbound = client
-        .session(ReceiverStream::new(rx))
-        .await
-        .expect("open session")
-        .into_inner();
+    let (tx, mut inbound) = open_stream(&proc).await;
 
     tx.send(begin_ordered(1)).await.expect("begin");
-    let txid = loop {
-        let f = inbound.message().await.expect("frame").expect("not end");
-        if let (1, Some(Event::Begun(b))) = (f.request_id, f.event) {
-            break b.txid;
-        }
-    };
+    let txid = await_begun(&mut inbound, 1).await;
 
     // Send nonce 2 before nonce 1.
-    tx.send(execute_tx_nonce(2, "CREATE (n:Ord {k: 2})", txid, 2))
+    tx.send(execute_tx_nonce(2, "CREATE (n:Ord {k: 2})", &txid, 2))
         .await
         .expect("n2");
-    tx.send(execute_tx_nonce(3, "CREATE (n:Ord {k: 1})", txid, 1))
+    tx.send(execute_tx_nonce(3, "CREATE (n:Ord {k: 1})", &txid, 1))
         .await
         .expect("n1");
-    tx.send(commit_tx_nonce(4, txid, 2)).await.expect("commit");
+    tx.send(commit_tx_nonce(4, &txid, 2)).await.expect("commit");
 
     // Commit must succeed (no abort, no drain timeout): reaching past this loop
     // means a Committed for request 4 arrived.
@@ -494,35 +459,13 @@ async fn show_transactions_lists_an_open_transaction_with_a_countdown() {
     // session and confirm the live registry surfaces it with an auto-abort
     // countdown. A controlled request stream sequences Begin strictly before
     // the SHOW so the read cannot race the registration.
-    use tokio_stream::wrappers::ReceiverStream;
-
     let proc = CoordinodeProcess::start().await;
-    let channel = tonic::transport::Endpoint::from_shared(proc.endpoint())
-        .expect("valid endpoint")
-        .connect()
-        .await
-        .expect("connect");
-    let mut client = SessionServiceClient::new(channel);
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
-    let response = client
-        .session(ReceiverStream::new(rx))
-        .await
-        .expect("open session");
-    let mut inbound = response.into_inner();
+    let (tx, mut inbound) = open_stream(&proc).await;
 
     // Begin and wait for the handle before issuing the SHOW.
     tx.send(begin(1)).await.expect("send begin");
-    let txid = loop {
-        let frame = inbound.message().await.expect("frame").expect("not end");
-        if frame.request_id == 1 {
-            match frame.event {
-                Some(Event::Begun(b)) => break b.txid,
-                other => panic!("expected Begun, got {other:?}"),
-            }
-        }
-    };
-    assert_ne!(txid, 0, "transaction handle is non-zero");
+    let txid = await_begun(&mut inbound, 1).await;
+    assert!(!txid.is_empty(), "a transaction handle is never empty");
 
     // SHOW TRANSACTIONS on the same session: the open transaction must appear.
     tx.send(execute(2, "SHOW TRANSACTIONS"))
@@ -556,7 +499,7 @@ async fn show_transactions_lists_an_open_transaction_with_a_countdown() {
     };
     let cells = &rows[0].values;
     assert!(
-        matches!(&cells[col("txid")].value, Some(Pv::IntValue(t)) if *t == txid as i64),
+        matches!(&cells[col("txid")].value, Some(Pv::StringValue(t)) if *t == hex(&txid)),
         "the listed transaction is the one we opened"
     );
     match &cells[col("auto_abort_in_ms")].value {
@@ -608,25 +551,31 @@ async fn session_runs_concurrent_writes_without_deadlocking_the_runtime() {
 #[tokio::test]
 async fn session_interleaves_a_transaction_with_independent_queries() {
     let proc = CoordinodeProcess::start().await;
-    let by_id = run_session(
-        &proc,
-        vec![
-            begin(1),
-            execute(2, "RETURN 1 AS a"),
-            execute(3, "RETURN 2 AS b"),
-            commit(4),
-        ],
-    )
-    .await;
-
-    // Begin → a single Begun carrying a non-zero transaction handle.
-    match by_id.get(&1).map(Vec::as_slice) {
-        Some([Event::Begun(b)]) => assert_ne!(b.txid, 0),
-        other => panic!("request 1 (begin) got {other:?}"),
+    let (tx, mut inbound) = open_stream(&proc).await;
+    tx.send(begin(1)).await.expect("begin");
+    let handle = await_begun(&mut inbound, 1).await;
+    for frame in [
+        execute(2, "RETURN 1 AS a"),
+        execute_tx(3, "CREATE (:Interleaved {k: 1})", &handle),
+        execute(4, "RETURN 2 AS b"),
+        commit_tx(5, &handle),
+    ] {
+        tx.send(frame).await.expect("send");
     }
+    drop(tx);
+    let mut by_id: HashMap<u64, Vec<Event>> = HashMap::new();
+    while let Some(frame) = inbound.message().await.expect("server frame") {
+        if frame.request_id != 0 {
+            by_id
+                .entry(frame.request_id)
+                .or_default()
+                .push(frame.event.expect("frame event"));
+        }
+    }
+
     // Each non-transactional Execute → its own correlated cursor with its own
     // real column header and one row.
-    for (rid, col) in [(2u64, "a"), (3u64, "b")] {
+    for (rid, col) in [(2u64, "a"), (4u64, "b")] {
         match by_id.get(&rid).map(Vec::as_slice) {
             Some([Event::CursorOpen(open), rest @ ..]) => {
                 assert_eq!(open.columns, vec![col.to_string()]);
@@ -636,11 +585,83 @@ async fn session_interleaves_a_transaction_with_independent_queries() {
             other => panic!("request {rid} (execute) got {other:?}"),
         }
     }
-    // Commit → a single Committed, independent of the cursor responses above.
-    match by_id.get(&4).map(Vec::as_slice) {
+    // The transaction's statement ran before its commit, which was sent right
+    // behind it without waiting for its answer.
+    assert!(
+        matches!(
+            by_id.get(&3).and_then(|events| events.last()),
+            Some(Event::CursorEnd(_))
+        ),
+        "{:?}",
+        by_id.get(&3)
+    );
+    match by_id.get(&5).map(Vec::as_slice) {
         Some([Event::Committed(_)]) => {}
-        other => panic!("request 4 (commit) got {other:?}"),
+        other => panic!("request 5 (commit) got {other:?}"),
     }
+    let scan = run_session(
+        &proc,
+        vec![execute(1, "MATCH (n:Interleaved) RETURN n.k AS k")],
+    )
+    .await;
+    assert_eq!(
+        row_count(scan.get(&1).map(Vec::as_slice).unwrap_or_default()),
+        1,
+        "the commit included the statement sent before it"
+    );
+}
+
+/// A transaction outlives the stream that began it: the first stream closes
+/// without committing, a second one continues the transaction by its handle,
+/// sees its write and commits it.
+#[tokio::test]
+async fn a_transaction_continues_on_another_stream() {
+    let proc = CoordinodeProcess::start().await;
+
+    let (first, mut first_in) = open_stream(&proc).await;
+    first.send(begin(1)).await.expect("begin");
+    let handle = await_begun(&mut first_in, 1).await;
+    first
+        .send(execute_tx(2, "CREATE (:Reattached {k: 1})", &handle))
+        .await
+        .expect("write");
+    assert!(matches!(
+        await_terminal(&mut first_in, 2).await,
+        Event::CursorEnd(_)
+    ));
+    drop(first);
+    while first_in.message().await.expect("frame").is_some() {}
+
+    let (second, mut second_in) = open_stream(&proc).await;
+    second
+        .send(execute_tx(
+            1,
+            "MATCH (n:Reattached) RETURN count(n) AS c",
+            &handle,
+        ))
+        .await
+        .expect("read");
+    assert!(matches!(
+        await_terminal(&mut second_in, 1).await,
+        Event::CursorEnd(_)
+    ));
+    second.send(commit_tx(2, &handle)).await.expect("commit");
+    match await_terminal(&mut second_in, 2).await {
+        Event::Committed(_) => {}
+        other => panic!("the second stream commits it, got {other:?}"),
+    }
+    drop(second);
+    while second_in.message().await.expect("frame").is_some() {}
+
+    let scan = run_session(
+        &proc,
+        vec![execute(1, "MATCH (n:Reattached) RETURN n.k AS k")],
+    )
+    .await;
+    assert_eq!(
+        row_count(scan.get(&1).map(Vec::as_slice).unwrap_or_default()),
+        1
+    );
 }
 
 #[tokio::test]

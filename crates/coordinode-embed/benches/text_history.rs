@@ -199,7 +199,7 @@ fn main() {
     let mut logical = 0u64;
     let mut words = Words(0x9E37_79B9_7F4A_7C15);
     for chunk in 0..DOCS / 100 {
-        let tx = db.begin_transaction();
+        let tx = db.begin_transaction().expect("begin load");
         for i in 0..100 {
             let id = chunk * 100 + i;
             let body = words.body();
@@ -231,7 +231,7 @@ fn main() {
     let mut rewritten = 0;
     for churn in measured {
         while rewritten < churn {
-            let tx = db.begin_transaction();
+            let tx = db.begin_transaction().expect("begin rewrite");
             for _ in 0..100.min(churn - rewritten) {
                 let body = words.body();
                 logical += body.len() as u64;

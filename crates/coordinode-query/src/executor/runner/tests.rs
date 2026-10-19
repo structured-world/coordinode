@@ -365,6 +365,7 @@ fn make_ctx<'a>(
         scan_paging: None,
         scan_row_cap: None,
         operations: None,
+        transactions: None,
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,
         snapshot_ts: None,

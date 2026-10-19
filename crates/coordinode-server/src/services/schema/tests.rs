@@ -455,7 +455,7 @@ async fn a_constraint_build_outlives_its_call_and_is_inspected_by_operation() {
         .write()
         .execute_cypher("CREATE (:Customer {email: 'a@x'})")
         .expect("seed");
-    let older = svc.database.read().begin_transaction();
+    let older = svc.database.read().begin_transaction().expect("begin");
 
     let mut request = unique("customer_email", "Customer", "email");
     request.wait = Some(prost_types::Duration::default());

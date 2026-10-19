@@ -7,16 +7,14 @@ use super::*;
 async fn an_abandoned_transaction_is_rolled_back_without_further_traffic() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Database::open(dir.path()).expect("open");
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:Abandoned {k: 1})", None)
         .expect("buffered write");
     let database = Arc::new(RwLock::new(db));
 
     let idle = Duration::from_millis(50);
-    let registry = Arc::new(SessionRegistry::new(idle));
     let reaper = spawn(
         Arc::clone(&database),
-        registry,
         idle,
         Arc::new(Notify::new()),
         Duration::from_millis(20),
@@ -26,7 +24,13 @@ async fn an_abandoned_transaction_is_rolled_back_without_further_traffic() {
     reaper.abort();
 
     assert!(
-        database.read().commit_transaction(tx).is_err(),
+        matches!(
+            database.read().commit_transaction(tx),
+            Err(coordinode_embed::DatabaseError::TransactionAborted {
+                end: coordinode_embed::TransactionEnd::IdleExpired,
+                ..
+            })
+        ),
         "the idle transaction is still open after the reaper ran"
     );
 }
@@ -45,20 +49,25 @@ async fn a_transaction_begun_while_the_reaper_sleeps_is_reaped() {
     let idle = Duration::from_millis(50);
     let reaper = spawn(
         Arc::clone(&database),
-        Arc::new(SessionRegistry::new(idle)),
         idle,
         begun,
         Duration::from_millis(20),
     );
     // The reaper has found nothing open and is waiting for a begin.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let tx = database.read().begin_transaction();
+    let tx = database.read().begin_transaction().expect("begin");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     reaper.abort();
 
     assert!(
-        database.read().commit_transaction(tx).is_err(),
+        matches!(
+            database.read().commit_transaction(tx),
+            Err(coordinode_embed::DatabaseError::TransactionAborted {
+                end: coordinode_embed::TransactionEnd::IdleExpired,
+                ..
+            })
+        ),
         "the transaction begun while the reaper slept is still open"
     );
 }

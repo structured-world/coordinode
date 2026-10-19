@@ -13,7 +13,7 @@ use coordinode_embed::replication::{
     ElectionPreference, Founding, MemberOptions, PeerTimeouts, Peering, ReplicatedDatabase,
     ReplicationError,
 };
-use coordinode_embed::{Database, DatabaseError};
+use coordinode_embed::{Database, DatabaseError, TransactionEnd};
 use coordinode_query::executor::runner::ExecutionError;
 use coordinode_raft::cluster::nemesis;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
@@ -285,6 +285,94 @@ async fn leadership_moves_to_a_named_member_and_the_stream_reports_it() {
             .write()
             .execute_cypher("CREATE (:OnTheNewLeader {k: 1})")
             .unwrap();
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// An open transaction belongs to the lead it was begun in. A follower opens
+/// none and names the leader instead; once the lead moves, the old leader's
+/// transaction is refused as aborted, nothing of it lands anywhere, and only
+/// the new leader opens transactions.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_ends_with_the_lead_it_was_begun_in() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        wait_until("member 2 knows the leader", || {
+            members[1].leader() == Some(1)
+        })
+        .await;
+        wait_until("member 2 refuses BEGIN naming the leader", || {
+            matches!(
+                members[1].database().read().begin_transaction(),
+                Err(DatabaseError::NotLeader { leader_id: Some(1) })
+            )
+        })
+        .await;
+
+        let handle = {
+            let leader = members[0].database().read();
+            let handle = leader.begin_transaction().expect("the leader begins");
+            leader
+                .execute_in_transaction(handle, "CREATE (:OldLead {k: 1})", None)
+                .expect("statement");
+            handle
+        };
+
+        members[0].transfer_leadership(2).await.unwrap();
+        // The tenure follows the leadership asynchronously; until it moves a
+        // statement still runs on the context.
+        wait_until("the old leader's transaction is aborted", || {
+            matches!(
+                members[0].database().read().execute_in_transaction(
+                    handle,
+                    "RETURN 1 AS one",
+                    None
+                ),
+                Err(DatabaseError::TransactionAborted {
+                    end: TransactionEnd::LeaderChanged,
+                    ..
+                })
+            )
+        })
+        .await;
+        assert!(matches!(
+            members[0].database().read().commit_transaction(handle),
+            Err(DatabaseError::TransactionAborted { handle: h, .. }) if h == handle
+        ));
+        assert!(matches!(
+            members[0].database().read().begin_transaction(),
+            Err(DatabaseError::NotLeader { leader_id: Some(2) })
+        ));
+
+        {
+            let new_leader = members[1].database().read();
+            let fresh = new_leader
+                .begin_transaction()
+                .expect("the new leader begins");
+            assert_eq!(fresh.owner(), 2);
+            assert!(fresh.incarnation() > handle.incarnation());
+            new_leader
+                .execute_in_transaction(fresh, "CREATE (:NewLead {k: 1})", None)
+                .expect("statement");
+            new_leader.commit_transaction(fresh).expect("commit");
+        }
+        wait_until("the new leader's write reaches member 1", || {
+            count(&members[0], "NewLead") == 1
+        })
+        .await;
+        for m in &members {
+            assert_eq!(
+                count(m, "OldLead"),
+                0,
+                "the aborted transaction applied nothing"
+            );
+        }
 
         for m in members.into_iter().rev() {
             m.shutdown().await.unwrap();
@@ -654,7 +742,7 @@ async fn a_journal_writer_resolves_an_unknown_commit_instead_of_writing_again() 
         op: &OperationDescriptor,
     ) -> Result<(), DatabaseError> {
         let db = member.database().write();
-        let txn = db.begin_transaction();
+        let txn = db.begin_transaction()?;
         db.execute_in_transaction(txn, &format!("CREATE (:Entry {{k: {k}}})"), None)?;
         db.commit_transaction_as(txn, op).map(drop)
     }

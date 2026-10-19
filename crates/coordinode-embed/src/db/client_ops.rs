@@ -204,7 +204,9 @@ impl Database {
 
     /// The deployment this database's operation records belong to, when it
     /// has one.
-    fn deployment(&self) -> Result<Option<coordinode_core::group::DeploymentId>, DatabaseError> {
+    pub(crate) fn deployment(
+        &self,
+    ) -> Result<Option<coordinode_core::group::DeploymentId>, DatabaseError> {
         Ok(coordinode_storage::engine::metadata::bound_deployment(
             &self.engine,
         )?)

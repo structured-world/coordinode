@@ -25,7 +25,7 @@ fn open_db() -> (Database, tempfile::TempDir) {
 
 /// Run `statement` in its own transaction and return its commit timestamp.
 fn commit(db: &mut Database, statement: &str) -> u64 {
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, statement, None)
         .expect("statement");
     db.commit_transaction(tx)

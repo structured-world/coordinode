@@ -3,29 +3,38 @@
 //! [`SessionManager`] opens [`Session`]s; a session is driven by [`Session::run`],
 //! which reads neutral ops from one channel and funnels neutral events to
 //! another, with the single outbound writer living here, not in the transport
-//! binding. A non-transactional request runs on its own task, so three
-//! concurrent queries are three independent cursors. A request bound to an
-//! interactive transaction instead routes to that transaction's serial mailbox,
-//! so its statements apply one at a time while other traffic runs concurrently.
-//! A query is run by opening a server-side cursor through the injected
-//! [`CursorEngine`] and paging it into `CursorOpen` / `Rows`* / `CursorEnd`.
+//! binding. Every request runs on its own task, so three concurrent queries
+//! are three independent cursors. An interactive transaction is not the
+//! session's: it lives on its owner, which orders its commands, refuses
+//! repeats and ends it; the session only attaches to it. The commands one
+//! stream sends for one transaction keep their order on the way there: each
+//! is passed on once the one before it has its place at the owner (runs, or
+//! waits in the owner's queue), not once it has answered, so a pipelined
+//! chain flows and an ordered chain sent out of nonce order cannot wait on
+//! itself. Closing the stream detaches it; the transactions stay open for
+//! another stream to continue. A query is run by opening a server-side cursor
+//! through the injected [`CursorEngine`] and paging it into `CursorOpen` /
+//! `Rows`* / `CursorEnd`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use coordinode_core::graph::types::Value;
+use coordinode_core::operations::TxnOrdering;
+use coordinode_core::txn::handle::{AdmissionSignal, TransactionHandle};
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 use coordinode_core::budget::CancelFlag;
 use coordinode_core::txn::operation::OperationDescriptor;
 
-use crate::engine::{CursorEngine, EngineError};
+use crate::engine::{CursorEngine, EngineError, InTransaction};
 use crate::registry::SessionRegistry;
 use crate::types::{
-    ConnectionSettings, ConnectionState, ErrorCode, Failure, Ordering, SessionEvent, SessionOp,
-    SessionStats, StatementSource,
+    ConnectionSettings, ConnectionState, ErrorCode, Failure, SessionEvent, SessionOp, SessionStats,
+    StatementSource,
 };
 
 /// An inbound op tagged with its session-scoped request id.
@@ -36,14 +45,6 @@ pub type OutEvent = (u64, SessionEvent);
 
 /// Rows pulled from a cursor per batch before the next `Rows` event is emitted.
 const CURSOR_BATCH: usize = 1024;
-
-/// Buffered statements per transaction mailbox before a pipelining client is
-/// stalled by backpressure.
-const TXN_MAILBOX: usize = 64;
-
-/// Default wait for a missing nonce during an ORDERED commit drain when the
-/// client passed `drain_timeout_ms == 0`.
-const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Opens sessions backed by one engine and one shared registry.
 pub struct SessionManager {
@@ -106,9 +107,9 @@ impl SessionManager {
 /// A live multiplexed session.
 ///
 /// Transport-agnostic: it consumes neutral [`SessionOp`]s and produces neutral
-/// [`SessionEvent`]s. It holds the query engine and the shared session registry;
-/// transaction handles are allocated by the engine, and each open transaction
-/// runs on its own serial mailbox spawned by [`Session::run`].
+/// [`SessionEvent`]s. It holds the query engine and the shared session
+/// registry; transaction handles are allocated by the engine, and the
+/// transactions themselves live on their owner.
 pub struct Session {
     session_id: u64,
     engine: Arc<dyn CursorEngine>,
@@ -132,30 +133,16 @@ impl Session {
     /// receiver observes end-of-stream only after every event is sent.
     ///
     /// The registry tracks each request as in-flight for its lifetime and drops
-    /// the session (with its open transactions) when the stream closes, so the
-    /// introspection snapshot mirrors what is actually running.
+    /// the session when the stream closes. The transactions the session used
+    /// stay open on their owner: closing a stream detaches it, it does not roll
+    /// anything back.
     pub async fn run(mut self, mut ops: mpsc::Receiver<InOp>, out: mpsc::Sender<OutEvent>) {
-        // Per-transaction serialized mailboxes owned by this single run task (no
-        // lock needed). A transaction's statements and its commit/rollback route
-        // to its mailbox and apply one at a time, because the transaction state
-        // is checked out per statement; non-transactional requests and other
-        // transactions run concurrently alongside. An entry stays in the map
-        // until its task signals completion on `done`, NOT when its commit is
-        // sent: an ORDERED commit may still need to receive late-arriving
-        // gap-filling statements while it drains, so the transaction must remain
-        // routable until the task actually resolves.
-        let mut txns: HashMap<u64, mpsc::Sender<TxnMsg>> = HashMap::new();
-        let (done_tx, mut done_rx) = mpsc::channel::<u64>(TXN_MAILBOX);
-
+        let mut lanes = Lanes::default();
         loop {
             tokio::select! {
                 maybe_op = ops.recv() => {
                     let Some((request_id, op)) = maybe_op else { break };
-                    self.handle_op(request_id, op, &mut txns, &done_tx, &out).await;
-                }
-                Some(txid) = done_rx.recv() => {
-                    // A transaction task has resolved; stop routing to it.
-                    txns.remove(&txid);
+                    self.handle_op(request_id, op, &mut lanes, &out).await;
                 }
                 // The node's ability to serve this connection changed. Tell the
                 // client unsolicited, under request_id zero: the change it
@@ -171,22 +158,16 @@ impl Session {
                 }
             }
         }
-
-        // Stream closed: dropping every transaction mailbox signals each
-        // transaction task to abort (rollback), then the session is removed.
-        drop(txns);
         self.registry.close_session(self.session_id);
     }
 
-    /// Route one inbound op: a transactional statement to its mailbox, an
-    /// autonomous statement to its own task, or a transaction-control op to the
-    /// owning transaction (kept routable until its task signals `done`).
+    /// Dispatch one inbound op: a statement, a transaction command or a
+    /// session control.
     async fn handle_op(
         &self,
         request_id: u64,
         op: SessionOp,
-        txns: &mut HashMap<u64, mpsc::Sender<TxnMsg>>,
-        done_tx: &mpsc::Sender<u64>,
+        lanes: &mut Lanes,
         out: &mpsc::Sender<OutEvent>,
     ) {
         // A session SET changes this session's settings, on this task like a
@@ -219,10 +200,10 @@ impl Session {
             // A transaction's operation is named on its commit: one named on
             // a statement inside it would bind part of the transaction.
             SessionOp::Execute {
-                txid,
+                transaction: Some(_),
                 operation: Some(_),
                 ..
-            } if txid != 0 => {
+            } => {
                 send_error(
                     out,
                     request_id,
@@ -234,52 +215,16 @@ impl Session {
                 )
                 .await;
             }
-            // A statement bound to an open transaction: route to its mailbox.
-            // Its settings are taken now, so a Configure that arrives after it
-            // does not reach back.
+            // Its settings are taken now, so a Configure that arrives after
+            // it does not reach back.
             SessionOp::Execute {
                 query,
                 params,
-                txid,
+                transaction,
                 nonce,
                 settings,
                 source,
-                ..
-            } if txid != 0 && txns.contains_key(&txid) => {
-                let msg = TxnMsg::Statement {
-                    nonce,
-                    statement: Statement {
-                        request_id,
-                        query,
-                        params,
-                        settings: self.settings.lock().under(&settings),
-                        source,
-                        operation: None,
-                        cancel: self.cancels.register(request_id),
-                    },
-                };
-                // A send error means the task resolved and closed its mailbox
-                // before its `done` was processed: the statement runs against
-                // the handle as one naming an unknown transaction does, and
-                // the engine answers it.
-                if let Some(tx) = txns.get(&txid) {
-                    if let Err(mpsc::error::SendError(TxnMsg::Statement { statement, .. })) =
-                        tx.send(msg).await
-                    {
-                        self.spawn_autonomous(statement, txid, out);
-                    }
-                }
-            }
-            // Autonomous statement, or one naming an unknown transaction (the
-            // engine produces the "unknown transaction" error): run concurrently.
-            SessionOp::Execute {
-                query,
-                params,
-                txid,
-                settings,
-                source,
                 operation,
-                ..
             } => {
                 let statement = Statement {
                     request_id,
@@ -290,48 +235,89 @@ impl Session {
                     operation,
                     cancel: self.cancels.register(request_id),
                 };
-                self.spawn_autonomous(statement, txid, out);
+                match transaction {
+                    None => self.spawn(out, |engine, _, out| async move {
+                        execute(&engine, statement, None, &out).await;
+                    }),
+                    Some(handle) => {
+                        let lane = lanes.step(handle);
+                        self.registry.attach(self.session_id, handle);
+                        self.spawn(out, move |engine, _, out| async move {
+                            lane.after_previous().await;
+                            let transaction = InTransaction {
+                                handle,
+                                nonce,
+                                admission: lane.signal(),
+                            };
+                            execute(&engine, statement, Some(&transaction), &out).await;
+                            lane.mine.release();
+                        });
+                    }
+                }
             }
 
             SessionOp::Begin {
                 ordering,
                 drain_timeout_ms,
             } => {
-                self.begin(request_id, ordering, drain_timeout_ms, txns, done_tx, out)
+                let drain_ms = match drain_timeout_ms {
+                    0 => self.settings.lock().drain_timeout_ms.unwrap_or(0),
+                    ms => ms,
+                };
+                let drain = (drain_ms != 0).then(|| Duration::from_millis(u64::from(drain_ms)));
+                let session_id = self.session_id;
+                self.spawn(out, move |engine, registry, out| async move {
+                    begin(
+                        &engine, &registry, session_id, request_id, ordering, drain, &out,
+                    )
                     .await;
+                });
             }
 
             SessionOp::Commit {
-                txid,
+                transaction,
                 last_nonce,
                 operation,
-            } => match txns.get(&txid) {
-                // Keep the entry: the task removes itself via `done` once it has
-                // drained and resolved.
-                // A send error means the task resolved and closed its mailbox
-                // before its `done` was processed: answered as an unknown
-                // handle, which reports the outcome of a bound commit.
-                Some(tx) => {
-                    let sent = tx
-                        .send(TxnMsg::Commit {
-                            request_id,
+            } => {
+                let lane = lanes.step(transaction);
+                let session_id = self.session_id;
+                self.spawn(out, move |engine, registry, out| async move {
+                    lane.after_previous().await;
+                    let last_nonce = (last_nonce != 0).then_some(last_nonce);
+                    let admission = lane.signal();
+                    let committed = blocking(move || {
+                        engine.commit_transaction(
+                            transaction,
                             last_nonce,
-                            operation,
-                        })
-                        .await;
-                    if let Err(mpsc::error::SendError(TxnMsg::Commit { operation, .. })) = sent {
-                        self.spawn_commit_unknown(request_id, txid, operation, out);
-                    }
-                }
-                None => self.spawn_commit_unknown(request_id, txid, operation, out),
-            },
+                            operation.as_ref(),
+                            &admission,
+                        )
+                    })
+                    .await;
+                    lane.mine.release();
+                    registry.detach(session_id, &transaction);
+                    let event = match committed {
+                        Ok(receipt) => SessionEvent::Committed { receipt },
+                        Err(failure) => SessionEvent::Error(failure),
+                    };
+                    let _ = out.send((request_id, event)).await;
+                });
+            }
 
-            // Rolling back an unknown / already-resolved transaction is a silent
-            // no-op (matches the autonomous rollback contract).
-            SessionOp::Rollback { txid } => {
-                if let Some(tx) = txns.get(&txid) {
-                    let _ = tx.send(TxnMsg::Rollback).await;
-                }
+            // Silent, as a rollback of a transaction already resolved is: the
+            // client asked to discard, and nothing it can do depends on the
+            // answer.
+            SessionOp::Rollback { transaction } => {
+                let lane = lanes.step(transaction);
+                let session_id = self.session_id;
+                self.spawn(out, move |engine, registry, _| async move {
+                    lane.after_previous().await;
+                    let admission = lane.signal();
+                    let _ = blocking(move || engine.rollback_transaction(transaction, &admission))
+                        .await;
+                    lane.mine.release();
+                    registry.detach(session_id, &transaction);
+                });
             }
 
             // Stops the statement at its next check, which answers it with
@@ -357,86 +343,126 @@ impl Session {
         }
     }
 
-    /// Run an autonomous statement (or one against an unknown transaction)
-    /// concurrently, bracketing it as in-flight for its lifetime.
-    fn spawn_autonomous(&self, statement: Statement, txid: u64, out: &mpsc::Sender<OutEvent>) {
-        let engine = Arc::clone(&self.engine);
+    /// Run `request` on its own task, counted as in flight for its lifetime.
+    fn spawn<F, Fut>(&self, out: &mpsc::Sender<OutEvent>, request: F)
+    where
+        F: FnOnce(Arc<dyn CursorEngine>, Arc<SessionRegistry>, mpsc::Sender<OutEvent>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let registry = Arc::clone(&self.registry);
         let session_id = self.session_id;
-        let out = out.clone();
         registry.request_started(session_id);
+        let work = request(
+            Arc::clone(&self.engine),
+            Arc::clone(&self.registry),
+            out.clone(),
+        );
         tokio::spawn(async move {
-            let _ = execute(&engine, statement, txid, &out).await;
+            work.await;
             registry.request_finished(session_id);
         });
     }
+}
 
-    /// Open a transaction inline (so a pipelined `Execute{txid}` that follows is
-    /// guaranteed to find the mailbox), register it, and spawn its serial task.
-    #[allow(clippy::too_many_arguments)]
-    async fn begin(
-        &self,
-        request_id: u64,
-        ordering: Ordering,
-        drain_timeout_ms: u32,
-        txns: &mut HashMap<u64, mpsc::Sender<TxnMsg>>,
-        done_tx: &mpsc::Sender<u64>,
-        out: &mpsc::Sender<OutEvent>,
-    ) {
-        self.registry.request_started(self.session_id);
-        // begin_transaction is a quick blocking call (snapshot pin + register);
-        // run it on the blocking pool like every other engine call.
-        let engine = Arc::clone(&self.engine);
-        let begun = tokio::task::spawn_blocking(move || engine.begin_transaction()).await;
-        match begun {
-            Ok(Ok(txid)) => {
-                let (tx, rx) = mpsc::channel::<TxnMsg>(TXN_MAILBOX);
-                txns.insert(txid, tx);
-                self.registry.begin_txn(self.session_id, txid, ordering);
-                // A zero drain timeout means "use the default" rather than
-                // "never wait": an ORDERED commit must tolerate some reorder lag.
-                let drain = if drain_timeout_ms == 0 {
-                    DEFAULT_DRAIN_TIMEOUT
-                } else {
-                    Duration::from_millis(drain_timeout_ms as u64)
-                };
-                tokio::spawn(run_transaction(
-                    Arc::clone(&self.engine),
-                    Arc::clone(&self.registry),
-                    self.session_id,
-                    txid,
-                    ordering,
-                    drain,
-                    rx,
-                    out.clone(),
-                    done_tx.clone(),
-                ));
-                let _ = out.send((request_id, SessionEvent::Begun { txid })).await;
-            }
-            Ok(Err(e)) => send_error(out, request_id, e.0).await,
-            Err(join) => send_error(out, request_id, lost_call(join)).await,
+/// Open a transaction and answer with its handle, attaching the session.
+async fn begin(
+    engine: &Arc<dyn CursorEngine>,
+    registry: &Arc<SessionRegistry>,
+    session_id: u64,
+    request_id: u64,
+    ordering: TxnOrdering,
+    drain: Option<Duration>,
+    out: &mpsc::Sender<OutEvent>,
+) {
+    let engine = Arc::clone(engine);
+    let event = match blocking(move || engine.begin_transaction(ordering, drain)).await {
+        Ok(transaction) => {
+            registry.attach(session_id, transaction);
+            SessionEvent::Begun { transaction }
         }
-        self.registry.request_finished(self.session_id);
+        Err(failure) => SessionEvent::Error(failure),
+    };
+    let _ = out.send((request_id, event)).await;
+}
+
+/// Run a blocking engine call on the blocking pool: a commit drives a Raft
+/// proposal, and a wait for a transaction's turn parks its thread.
+async fn blocking<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T, EngineError> + Send + 'static,
+) -> Result<T, Failure> {
+    match tokio::task::spawn_blocking(call).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(e.0),
+        Err(join) => Err(lost_call(join)),
+    }
+}
+
+/// The commands this stream sent for each transaction, each one a step that
+/// the next waits on.
+#[derive(Default)]
+struct Lanes(HashMap<TransactionHandle, Arc<LaneStep>>);
+
+impl Lanes {
+    /// The step of the next command for `handle`, after the one sent before.
+    fn step(&mut self, handle: TransactionHandle) -> LanePosition {
+        // Steps already passed hold nobody back.
+        self.0.retain(|_, step| !step.is_released());
+        let mine = Arc::new(LaneStep::default());
+        let previous = self.0.insert(handle, Arc::clone(&mine));
+        LanePosition { previous, mine }
+    }
+}
+
+/// Where a command stands in its stream's order for one transaction.
+struct LanePosition {
+    previous: Option<Arc<LaneStep>>,
+    mine: Arc<LaneStep>,
+}
+
+impl LanePosition {
+    /// Wait until the command sent before has its place at the owner.
+    async fn after_previous(&self) {
+        if let Some(previous) = &self.previous {
+            previous.released().await;
+        }
     }
 
-    /// Commit a transaction not in the mailbox map: let the engine produce the
-    /// "unknown transaction" error (or commit a racing late-resolved handle).
-    fn spawn_commit_unknown(
-        &self,
-        request_id: u64,
-        txid: u64,
-        operation: Option<OperationDescriptor>,
-        out: &mpsc::Sender<OutEvent>,
-    ) {
-        let engine = Arc::clone(&self.engine);
-        let registry = Arc::clone(&self.registry);
-        let session_id = self.session_id;
-        let out = out.clone();
-        registry.request_started(session_id);
-        tokio::spawn(async move {
-            commit(&engine, request_id, txid, operation, &out).await;
-            registry.request_finished(session_id);
-        });
+    /// The signal the owner tells when this command has its place.
+    fn signal(&self) -> AdmissionSignal {
+        let mine = Arc::clone(&self.mine);
+        AdmissionSignal::new(move || mine.release())
+    }
+}
+
+/// One command's place in its lane: released once the owner has placed it,
+/// or once it has answered, whichever comes first.
+#[derive(Default)]
+struct LaneStep {
+    released: AtomicBool,
+    notify: Notify,
+}
+
+impl LaneStep {
+    fn release(&self) {
+        if !self.released.swap(true, AtomicOrdering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn is_released(&self) -> bool {
+        self.released.load(AtomicOrdering::Acquire)
+    }
+
+    async fn released(&self) {
+        loop {
+            // Registered before the check, so a release between the two is
+            // not missed.
+            let notified = self.notify.notified();
+            if self.is_released() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -489,7 +515,7 @@ struct Statement {
     settings: ConnectionSettings,
     /// Where in the client's code it was issued. Boxed: only a client in
     /// debug mode sends one, and inline it would triple the size of every
-    /// statement queued to a transaction.
+    /// statement waiting for its turn.
     source: Option<Box<StatementSource>>,
     /// The client operation an autonomous statement carries out.
     operation: Option<OperationDescriptor>,
@@ -497,383 +523,24 @@ struct Statement {
     cancel: CancelGuard,
 }
 
-/// A message in a transaction's serial mailbox.
-enum TxnMsg {
-    /// A statement to run inside the transaction.
-    Statement {
-        /// Client-assigned sequence number; orders ORDERED transactions, ignored
-        /// for UNORDERED.
-        nonce: u64,
-        statement: Statement,
-    },
-    /// Commit the transaction and finish. `last_nonce` is the expected final
-    /// nonce of an ORDERED chain, so the commit can drain a reorder gap;
-    /// `operation` is the client operation the commit carries out.
-    Commit {
-        request_id: u64,
-        last_nonce: u64,
-        operation: Option<OperationDescriptor>,
-    },
-    /// Roll the transaction back and finish (silent, carries no request id).
-    Rollback,
-}
-
-/// Serial owner of one interactive transaction: applies its statements, then
-/// commits or rolls back. Dropping the inbound channel (stream close) aborts the
-/// transaction; the transaction is deregistered when the task ends. UNORDERED
-/// applies statements in arrival order; ORDERED reassembles them by `nonce` in a
-/// reorder buffer and applies them strictly in nonce order, with a commit-drain
-/// timeout bounding the wait for a missing nonce.
-#[allow(clippy::too_many_arguments)]
-async fn run_transaction(
-    engine: Arc<dyn CursorEngine>,
-    registry: Arc<SessionRegistry>,
-    session_id: u64,
-    txid: u64,
-    ordering: Ordering,
-    drain: Duration,
-    rx: mpsc::Receiver<TxnMsg>,
-    out: mpsc::Sender<OutEvent>,
-    done: mpsc::Sender<u64>,
-) {
-    match ordering {
-        Ordering::Unordered => {
-            run_unordered(&engine, &registry, session_id, txid, rx, &out).await;
-        }
-        Ordering::Ordered => {
-            run_ordered(&engine, &registry, session_id, txid, drain, rx, &out).await;
-        }
-    }
-    registry.end_txn(session_id, txid);
-    // Tell the run loop to stop routing to this transaction.
-    let _ = done.send(txid).await;
-}
-
-/// UNORDERED loop: apply each statement as it arrives; the first failure aborts
-/// the transaction and the rest (plus the commit) are rejected. Returns whether
-/// the transaction aborted. Stream close before commit/rollback rolls back.
-async fn run_unordered(
-    engine: &Arc<dyn CursorEngine>,
-    registry: &Arc<SessionRegistry>,
-    session_id: u64,
-    txid: u64,
-    mut rx: mpsc::Receiver<TxnMsg>,
-    out: &mpsc::Sender<OutEvent>,
-) -> bool {
-    let mut aborted = false;
-    let mut resolved = false;
-    while let Some(msg) = rx.recv().await {
-        registry.request_started(session_id);
-        match msg {
-            TxnMsg::Statement { statement, .. } => {
-                if aborted {
-                    send_error(out, statement.request_id, aborted_txn()).await;
-                } else {
-                    registry.touch_txn(session_id, txid);
-                    if !execute(engine, statement, txid, out).await {
-                        aborted = true;
-                        registry.end_txn(session_id, txid);
-                    }
-                }
-            }
-            TxnMsg::Commit {
-                request_id,
-                operation,
-                ..
-            } => {
-                if aborted {
-                    send_error(out, request_id, aborted_txn()).await;
-                } else {
-                    commit(engine, request_id, txid, operation, out).await;
-                }
-                registry.request_finished(session_id);
-                resolved = true;
-                break;
-            }
-            TxnMsg::Rollback => {
-                if !aborted {
-                    rollback(engine, txid).await;
-                }
-                registry.request_finished(session_id);
-                resolved = true;
-                break;
-            }
-        }
-        registry.request_finished(session_id);
-    }
-    if !resolved && !aborted {
-        rollback(engine, txid).await;
-    }
-    answer_after_resolution(engine, registry, session_id, txid, &mut rx, out).await;
-    aborted
-}
-
-/// Answer what reached the mailbox after the transaction resolved, as the
-/// session answers a request naming a transaction it no longer routes to.
-/// Closing the mailbox first makes a later send fail, which the session
-/// answers the same way, so no request is left without a reply: a client that
-/// repeats a commit whose reply it lost is answered with its outcome.
-async fn answer_after_resolution(
-    engine: &Arc<dyn CursorEngine>,
-    registry: &Arc<SessionRegistry>,
-    session_id: u64,
-    txid: u64,
-    rx: &mut mpsc::Receiver<TxnMsg>,
-    out: &mpsc::Sender<OutEvent>,
-) {
-    rx.close();
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            TxnMsg::Statement { statement, .. } => {
-                registry.request_started(session_id);
-                let _ = execute(engine, statement, txid, out).await;
-                registry.request_finished(session_id);
-            }
-            TxnMsg::Commit {
-                request_id,
-                operation,
-                ..
-            } => {
-                registry.request_started(session_id);
-                commit(engine, request_id, txid, operation, out).await;
-                registry.request_finished(session_id);
-            }
-            TxnMsg::Rollback => {}
-        }
-    }
-}
-
-/// ORDERED loop: buffer statements by nonce and apply the contiguous run from
-/// `next_nonce`. Commit drains what is buffered, then waits (bounded by `drain`)
-/// for any missing nonce up to `last_nonce`; a gap that does not fill in time
-/// aborts the transaction. Returns whether it aborted.
-async fn run_ordered(
-    engine: &Arc<dyn CursorEngine>,
-    registry: &Arc<SessionRegistry>,
-    session_id: u64,
-    txid: u64,
-    drain: Duration,
-    mut rx: mpsc::Receiver<TxnMsg>,
-    out: &mpsc::Sender<OutEvent>,
-) -> bool {
-    // The ORDERED nonce contract is 1-based and contiguous: a client numbers its
-    // chain 1, 2, 3, ... and sends `last_nonce` on commit. A statement at nonce 0
-    // (the UNORDERED default) therefore never becomes applicable here and the
-    // commit drains it as a gap; callers wanting arrival order use UNORDERED.
-    let mut next_nonce = 1u64;
-    let mut buffer: BTreeMap<u64, Statement> = BTreeMap::new();
-    let mut aborted = false;
-    let mut resolved = false;
-
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            TxnMsg::Statement { nonce, statement } => {
-                registry.request_started(session_id);
-                if aborted {
-                    send_error(out, statement.request_id, aborted_txn()).await;
-                    registry.request_finished(session_id);
-                    continue;
-                }
-                registry.touch_txn(session_id, txid);
-                buffer.insert(nonce, statement);
-                if apply_contiguous(
-                    engine,
-                    registry,
-                    session_id,
-                    txid,
-                    &mut next_nonce,
-                    &mut buffer,
-                    out,
-                )
-                .await
-                {
-                    aborted = true;
-                }
-            }
-            TxnMsg::Commit {
-                request_id,
-                last_nonce,
-                operation,
-            } => {
-                registry.request_started(session_id);
-                if !aborted {
-                    aborted = drain_to_commit(
-                        engine,
-                        registry,
-                        session_id,
-                        txid,
-                        last_nonce,
-                        drain,
-                        &mut next_nonce,
-                        &mut buffer,
-                        &mut rx,
-                        out,
-                    )
-                    .await;
-                }
-                if aborted {
-                    // Discard whatever the transaction buffered or applied.
-                    rollback(engine, txid).await;
-                    send_error(out, request_id, aborted_txn()).await;
-                } else {
-                    commit(engine, request_id, txid, operation, out).await;
-                }
-                finish_buffered(registry, session_id, &mut buffer);
-                registry.request_finished(session_id);
-                resolved = true;
-                break;
-            }
-            TxnMsg::Rollback => {
-                if !aborted {
-                    rollback(engine, txid).await;
-                }
-                finish_buffered(registry, session_id, &mut buffer);
-                resolved = true;
-                break;
-            }
-        }
-    }
-    if !resolved && !aborted {
-        rollback(engine, txid).await;
-        finish_buffered(registry, session_id, &mut buffer);
-    }
-    answer_after_resolution(engine, registry, session_id, txid, &mut rx, out).await;
-    aborted
-}
-
-/// Apply the contiguous run of buffered statements starting at `*next_nonce`,
-/// advancing it. Each applied statement is finished in the registry. Returns
-/// `true` if a statement failed (the transaction is then dead).
-async fn apply_contiguous(
-    engine: &Arc<dyn CursorEngine>,
-    registry: &Arc<SessionRegistry>,
-    session_id: u64,
-    txid: u64,
-    next_nonce: &mut u64,
-    buffer: &mut BTreeMap<u64, Statement>,
-    out: &mpsc::Sender<OutEvent>,
-) -> bool {
-    while let Some(statement) = buffer.remove(next_nonce) {
-        registry.touch_txn(session_id, txid);
-        let ok = execute(engine, statement, txid, out).await;
-        registry.request_finished(session_id);
-        *next_nonce += 1;
-        if !ok {
-            registry.end_txn(session_id, txid);
-            return true;
-        }
-    }
-    false
-}
-
-/// Drain the ORDERED chain up to `last_nonce`: apply what is buffered, then wait
-/// (bounded by `drain`) for each missing nonce to arrive. Returns `true` if the
-/// transaction aborted (a statement failed, the wait timed out, the stream
-/// closed, or the client rolled back mid-drain).
-#[allow(clippy::too_many_arguments)]
-async fn drain_to_commit(
-    engine: &Arc<dyn CursorEngine>,
-    registry: &Arc<SessionRegistry>,
-    session_id: u64,
-    txid: u64,
-    last_nonce: u64,
-    drain: Duration,
-    next_nonce: &mut u64,
-    buffer: &mut BTreeMap<u64, Statement>,
-    rx: &mut mpsc::Receiver<TxnMsg>,
-    out: &mpsc::Sender<OutEvent>,
-) -> bool {
-    if apply_contiguous(engine, registry, session_id, txid, next_nonce, buffer, out).await {
-        return true;
-    }
-    while *next_nonce <= last_nonce {
-        match tokio::time::timeout(drain, rx.recv()).await {
-            Ok(Some(TxnMsg::Statement { nonce, statement })) => {
-                registry.request_started(session_id);
-                buffer.insert(nonce, statement);
-                if apply_contiguous(engine, registry, session_id, txid, next_nonce, buffer, out)
-                    .await
-                {
-                    return true;
-                }
-            }
-            // A second commit during drain is ignored; rollback, stream close, or
-            // a drain timeout all abort the partially-applied transaction.
-            Ok(Some(TxnMsg::Commit { .. })) => {}
-            Ok(Some(TxnMsg::Rollback)) | Ok(None) | Err(_) => return true,
-        }
-    }
-    false
-}
-
-/// Finish (in the registry) every still-buffered statement that was received but
-/// never applied, so the in-flight count does not leak when a transaction ends
-/// with statements still parked in its reorder buffer.
-fn finish_buffered(
-    registry: &Arc<SessionRegistry>,
-    session_id: u64,
-    buffer: &mut BTreeMap<u64, Statement>,
-) {
-    let parked = buffer.len();
-    buffer.clear();
-    for _ in 0..parked {
-        registry.request_finished(session_id);
-    }
-}
-
-/// Error returned for any statement or commit issued against a transaction that
-/// already failed a statement.
-const ABORTED_TXN: &str = "transaction is aborted, roll it back";
-
-/// Commit a transaction on the blocking pool and emit `Committed` or `Error`.
-async fn commit(
-    engine: &Arc<dyn CursorEngine>,
-    request_id: u64,
-    txid: u64,
-    operation: Option<OperationDescriptor>,
-    out: &mpsc::Sender<OutEvent>,
-) {
-    let engine = Arc::clone(engine);
-    match tokio::task::spawn_blocking(move || engine.commit_transaction(txid, operation.as_ref()))
-        .await
-    {
-        Ok(Ok(receipt)) => {
-            let _ = out
-                .send((request_id, SessionEvent::Committed { receipt }))
-                .await;
-        }
-        Ok(Err(e)) => send_error(out, request_id, e.0).await,
-        Err(join) => send_error(out, request_id, lost_call(join)).await,
-    }
-}
-
-/// Roll a transaction back on the blocking pool. Silent (the rollback contract
-/// emits no event); a failure is swallowed because the client asked to discard.
-async fn rollback(engine: &Arc<dyn CursorEngine>, txid: u64) {
-    let engine = Arc::clone(engine);
-    let _ = tokio::task::spawn_blocking(move || engine.rollback_transaction(txid)).await;
-}
-
 /// Open a server-side cursor for one statement and page it into a
 /// `CursorOpen` → `Rows`* → `CursorEnd` sequence (or a single `Error`).
 ///
 /// `open_cursor` and `next_batch` are synchronous and may block for a long time:
-/// a write drives a Raft commit (`block_in_place` + `block_on`) and a read pages
-/// from storage. Running them directly on the async worker thread starves the
-/// runtime: under a burst of concurrent writes every worker blocks inside a
-/// commit, leaving no worker to drive the Raft apply loop the commits wait on,
-/// which deadlocks the whole runtime. So each blocking call runs on the blocking
-/// pool via [`spawn_blocking`](tokio::task::spawn_blocking); the cursor (`Send`)
-/// moves in and back out per batch, keeping the stream's per-batch backpressure.
-/// Returns `true` if the statement completed (a `CursorEnd` was reached) and
-/// `false` if it ended in an `Error` (or the client's channel closed). A
-/// transaction uses this to abort on the first failing statement.
+/// a write drives a Raft commit (`block_in_place` + `block_on`), a read pages
+/// from storage, and a transaction's statement may wait for its turn. Running
+/// them directly on the async worker thread starves the runtime: under a burst
+/// of concurrent writes every worker blocks inside a commit, leaving no worker
+/// to drive the Raft apply loop the commits wait on, which deadlocks the whole
+/// runtime. So each blocking call runs on the blocking pool via
+/// [`spawn_blocking`](tokio::task::spawn_blocking); the cursor (`Send`) moves in
+/// and back out per batch, keeping the stream's per-batch backpressure.
 async fn execute(
     engine: &Arc<dyn CursorEngine>,
     statement: Statement,
-    txid: u64,
+    transaction: Option<&InTransaction>,
     out: &mpsc::Sender<OutEvent>,
-) -> bool {
+) {
     let Statement {
         request_id,
         query,
@@ -886,11 +553,12 @@ async fn execute(
     // Open on the blocking pool: a write statement commits through Raft here.
     let engine = Arc::clone(engine);
     let flag = cancel.flag.clone();
+    let transaction = transaction.cloned();
     let opened = tokio::task::spawn_blocking(move || {
         let cursor = engine.open_cursor(
             &query,
             params,
-            txid,
+            transaction.as_ref(),
             &settings,
             source.as_deref(),
             operation.as_ref(),
@@ -904,11 +572,11 @@ async fn execute(
         Ok(Ok(opened)) => opened,
         Ok(Err(e)) => {
             send_error(out, request_id, e.0).await;
-            return false;
+            return;
         }
         Err(join) => {
             send_error(out, request_id, lost_call(join)).await;
-            return false;
+            return;
         }
     };
 
@@ -917,7 +585,7 @@ async fn execute(
         .await
         .is_err()
     {
-        return false;
+        return;
     }
 
     loop {
@@ -930,7 +598,7 @@ async fn execute(
                 Failure::new(ErrorCode::Cancelled, "the statement was cancelled"),
             )
             .await;
-            return false;
+            return;
         }
         // Page on the blocking pool; hand the cursor in and take it back so the
         // next iteration (and `stats()` below) still own it.
@@ -946,7 +614,7 @@ async fn execute(
             }
             Err(join) => {
                 send_error(out, request_id, lost_call(join)).await;
-                return false;
+                return;
             }
         };
         match batch {
@@ -958,12 +626,12 @@ async fn execute(
                     .await
                     .is_err()
                 {
-                    return false;
+                    return;
                 }
             }
             Err(e) => {
                 send_error(out, request_id, e.0).await;
-                return false;
+                return;
             }
         }
     }
@@ -976,18 +644,11 @@ async fn execute(
             },
         ))
         .await;
-    true
 }
 
 /// Emit a single `Error` event for a failed request.
 async fn send_error(out: &mpsc::Sender<OutEvent>, request_id: u64, failure: Failure) {
     let _ = out.send((request_id, SessionEvent::Error(failure))).await;
-}
-
-/// The failure of a statement or commit sent to a transaction that already
-/// failed one: the transaction has to be rolled back before anything else.
-fn aborted_txn() -> Failure {
-    Failure::new(ErrorCode::FailedPrecondition, ABORTED_TXN)
 }
 
 /// A blocking engine call that did not return (it panicked or was cancelled).

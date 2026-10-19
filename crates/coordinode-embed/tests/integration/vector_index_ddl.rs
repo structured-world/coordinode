@@ -236,7 +236,7 @@ fn a_transaction_ranks_its_own_uncommitted_vectors() {
         other => panic!("name: {other:?}"),
     };
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(
         tx,
         "MATCH (n:Embed {name: 'near'}) SET n.vec = [0.0, 0.0, 5.0]",
@@ -312,7 +312,7 @@ fn a_rolled_back_vector_change_does_not_reach_the_index() {
     db.execute_cypher("CREATE (:Doc {name: 'y', emb: [0.0, 0.9, 0.1]})")
         .expect("create y");
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(
         tx,
         "MATCH (n:Doc {name: 'x'}) SET n.emb = [0.0, 1.0, 0.0]",

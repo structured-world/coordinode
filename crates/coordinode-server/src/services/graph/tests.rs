@@ -413,7 +413,6 @@ async fn create_node_visible_via_cypher_service() {
             read_preference: 0, // unspecified → the server default
             read_concern: None, // omitted → the server default
             write_concern: None,
-            transaction_id: 0,
             ..Default::default()
         }))
         .await

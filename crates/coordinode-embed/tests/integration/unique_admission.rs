@@ -332,7 +332,7 @@ fn await_held(db: &Database, name: &str) {
 /// waits for an older transaction, so none of the stored nodes has an entry
 /// yet; then let the build finish and return its outcome.
 fn during_build(db: &Database, profile: &str, body: impl FnOnce()) -> Result<(), String> {
-    let older = db.begin_transaction();
+    let older = db.begin_transaction().map_err(|e| e.to_string())?;
     let statement =
         format!("CREATE UNIQUE INDEX u_email ON :U(email) OPTIONS {{maintenance: '{profile}'}}");
     std::thread::scope(|s| {

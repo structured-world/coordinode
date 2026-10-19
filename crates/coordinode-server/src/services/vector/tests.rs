@@ -260,7 +260,7 @@ fn a_build_ending_leaves_a_later_rebuild_in_place() {
     let mut database = Database::open(dir.path()).expect("open database");
     // Open before the handover, so the build waits in its tail for this
     // transaction until it is rolled back.
-    let older = database.begin_transaction();
+    let older = database.begin_transaction().expect("begin");
     database
         .execute_cypher(
             "CREATE VECTOR INDEX tail_idx ON :Tail(embedding) \

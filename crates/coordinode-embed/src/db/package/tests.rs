@@ -607,7 +607,7 @@ fn an_interrupted_certification_finishes_after_a_restart() {
         let db = Database::open(dir.path()).expect("open");
         // Never ended: the blocking build, and the proof queued behind it,
         // wait until the process closes.
-        db.begin_transaction();
+        db.begin_transaction().expect("begin");
         occupy_the_only_seat(&db);
         let published = db.publish_schema(strict_user()).expect("publish");
         let pending = db.await_schema(&published, Duration::ZERO).expect("look");

@@ -58,6 +58,24 @@ pub enum Reason {
     /// finished, aborted or swept. Either way the server holds nothing for it,
     /// so there is nothing left to clean up.
     UnknownTransaction,
+    /// The transaction ended because the leader that held it changed before
+    /// it was committed. Nothing of it was applied. Metadata carries
+    /// `transaction` and `end`. Re-running the whole transaction from BEGIN is
+    /// the intended response.
+    TransactionAborted,
+    /// Another command is running on the same transaction. Nothing changed
+    /// and the transaction stays open. Metadata carries `transaction`. Retry
+    /// once that command has answered.
+    TransactionBusy,
+    /// A statement repeats a nonce already admitted to its transaction with
+    /// the same text: it was applied once, and its result is not kept. Nothing
+    /// ran this time. Metadata carries `transaction` and `nonce`. Terminal for
+    /// that nonce.
+    StatementAlreadyAdmitted,
+    /// A nonce already admitted to the transaction names another statement.
+    /// Nothing ran. Metadata carries `transaction` and `nonce`. Terminal: a new
+    /// statement takes a new nonce.
+    StatementNonceReused,
     /// A commit lost to a concurrent write. Nothing of the transaction was
     /// applied; retrying the whole transaction is the intended response.
     TransactionConflict,
@@ -225,6 +243,10 @@ impl Reason {
             Reason::DivideByZero => "DIVIDE_BY_ZERO",
             Reason::LongOverflow => "LONG_OVERFLOW",
             Reason::UnknownTransaction => "UNKNOWN_TRANSACTION",
+            Reason::TransactionAborted => "TRANSACTION_ABORTED",
+            Reason::TransactionBusy => "TRANSACTION_BUSY",
+            Reason::StatementAlreadyAdmitted => "STATEMENT_ALREADY_ADMITTED",
+            Reason::StatementNonceReused => "STATEMENT_NONCE_REUSED",
             Reason::TransactionConflict => "TRANSACTION_CONFLICT",
             Reason::InvariantRefused => "INVARIANT_REFUSED",
             Reason::RevisionMismatch => "REVISION_MISMATCH",
@@ -289,9 +311,13 @@ impl Reason {
     pub const fn retry_delay(self) -> Option<std::time::Duration> {
         match self {
             Reason::TransactionConflict
+            | Reason::TransactionAborted
             | Reason::InvariantRefused
             | Reason::NotLeader
             | Reason::MemberReadOnly => Some(std::time::Duration::ZERO),
+            // The command in flight answers within its own statement time;
+            // a short floor keeps a pipelining client from spinning on it.
+            Reason::TransactionBusy => Some(std::time::Duration::from_millis(10)),
             Reason::WriteBackpressure => Some(std::time::Duration::from_millis(500)),
             // The commits a named timestamp covers land within microseconds
             // and become durable within the journal's flush interval.
@@ -345,6 +371,16 @@ pub fn invalid_field(field: impl Into<String>, description: impl Into<String>) -
         format!("{field}: {description}"),
         details,
     )
+}
+
+/// The transaction handle request field `field` carries, or `INVALID_ARGUMENT`
+/// when its bytes are not one.
+pub fn transaction_handle(
+    field: &str,
+    bytes: &[u8],
+) -> Result<coordinode_embed::TransactionHandle, Status> {
+    coordinode_embed::TransactionHandle::from_bytes(bytes)
+        .map_err(|_| invalid_field(field, "not a transaction handle this server issued"))
 }
 
 /// A status naming catalog object `name` of kind `object`, as the subject of

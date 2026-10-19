@@ -3,6 +3,7 @@
 
 pub mod coalesce;
 pub mod frame;
+pub mod handle;
 pub mod invariant;
 pub mod operation;
 pub mod proposal;

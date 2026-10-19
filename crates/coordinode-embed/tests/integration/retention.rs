@@ -42,7 +42,7 @@ fn anchors_at(db: &mut Database, ts: u64) -> Result<usize, DatabaseError> {
 }
 
 fn commit_anchor(db: &mut Database, id: u64) -> u64 {
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, &format!("CREATE (n:Anchor {{id: {id}}})"), None)
         .expect("create");
     db.commit_transaction(tx)
@@ -292,7 +292,7 @@ fn open_transaction_snapshot_survives_window_narrowing() {
     db.set_retention_window(Duration::from_secs(3_600));
 
     commit_anchor(&mut db, 1);
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     let seen_at_begin = db
         .execute_in_transaction(tx, "MATCH (n:Anchor) RETURN n", None)
         .expect("read in txn")
@@ -365,7 +365,7 @@ fn a_zero_window_refuses_no_statement_under_concurrent_writes() {
                         }
                     }
                     loop {
-                        let tx = db.begin_transaction();
+                        let tx = db.begin_transaction().expect("begin");
                         let outcome = db
                             .execute_in_transaction(tx, &bump, None)
                             .and_then(|_| db.commit_transaction(tx).map(|_| ()));
@@ -407,7 +407,7 @@ fn a_zero_window_refuses_no_statement_under_concurrent_writes() {
 }
 
 fn commit(db: &mut Database, cypher: &str) -> u64 {
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, cypher, None)
         .expect("statement");
     db.commit_transaction(tx)

@@ -493,13 +493,70 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
             );
         }
         // Transaction lifecycle. NOT_FOUND rather than INVALID_ARGUMENT: the
-        // id was well-formed, there is simply nothing under it any more.
+        // handle was well-formed, there is simply nothing under it any more.
         DatabaseError::UnknownTransaction(id) => {
             return status_with_reason(
                 Code::NotFound,
                 rendered,
                 Reason::UnknownTransaction,
-                [("transaction_id", id.to_string())],
+                [("transaction", id.to_string())],
+            );
+        }
+        // ABORTED like a conflict: nothing of it was applied and the retry is
+        // the whole transaction, begun again at the leader.
+        DatabaseError::TransactionAborted { handle, end } => {
+            use coordinode_embed::TransactionEnd as End;
+            let end = match end {
+                End::LeaderChanged => "LEADER_CHANGED",
+                End::StatementFailed => "STATEMENT_FAILED",
+                End::DrainTimedOut => "DRAIN_TIMED_OUT",
+                End::IdleExpired => "IDLE_EXPIRED",
+                End::RolledBack => "ROLLED_BACK",
+            };
+            return status_with_reason(
+                Code::Aborted,
+                rendered,
+                Reason::TransactionAborted,
+                [("transaction", handle.to_string()), ("end", end.to_owned())],
+            );
+        }
+        // ABORTED as gRPC defines it for a concurrency conflict; unlike the
+        // others the transaction stays open, so the retry is this command.
+        DatabaseError::TransactionBusy(handle) => {
+            return status_with_reason(
+                Code::Aborted,
+                rendered,
+                Reason::TransactionBusy,
+                [("transaction", handle.to_string())],
+            );
+        }
+        // The statement exists already, applied once; its rows are gone.
+        DatabaseError::StatementAlreadyAdmitted { handle, nonce } => {
+            return status_with_reason(
+                Code::AlreadyExists,
+                rendered,
+                Reason::StatementAlreadyAdmitted,
+                [
+                    ("transaction", handle.to_string()),
+                    ("nonce", nonce.to_string()),
+                ],
+            );
+        }
+        DatabaseError::StatementNonceReused { handle, nonce } => {
+            return status_with_reason(
+                Code::InvalidArgument,
+                rendered,
+                Reason::StatementNonceReused,
+                [
+                    ("transaction", handle.to_string()),
+                    ("nonce", nonce.to_string()),
+                ],
+            );
+        }
+        DatabaseError::StatementNonceRequired(_) => {
+            return super::error_details::invalid_field(
+                "nonce",
+                "a statement of an ordered transaction is numbered from 1",
             );
         }
         DatabaseError::TransactionConflict { id, .. } => {
@@ -507,7 +564,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 Code::Aborted,
                 rendered,
                 Reason::TransactionConflict,
-                [("transaction_id", id.to_string())],
+                [("transaction", id.to_string())],
             );
         }
         // The auto-commit spelling of the same refusal: nothing was applied
@@ -528,7 +585,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 Code::Aborted,
                 rendered,
                 Reason::InvariantRefused,
-                [("transaction_id", id.to_string())],
+                [("transaction", id.to_string())],
             );
         }
         DatabaseError::Execution(
@@ -569,7 +626,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 rendered,
                 Reason::TransactionTooLarge,
                 [
-                    ("transaction_id", id.to_string()),
+                    ("transaction", id.to_string()),
                     ("buffered_bytes", buffered.to_string()),
                     ("limit_bytes", limit.to_string()),
                 ],
@@ -989,12 +1046,14 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         let start = std::time::Instant::now();
 
-        // Interactive transaction statement: a non-zero transaction_id
-        // runs this statement against the held transaction — reads at its pinned
+        // Interactive transaction statement: a transaction handle runs this
+        // statement against the held transaction: reads at its pinned
         // snapshot, writes buffer until CommitTransaction. No per-statement
-        // commit and no causal fence (the snapshot was pinned at BEGIN). A zero
-        // transaction_id is the auto-commit path below.
-        if req.transaction_id != 0 {
+        // commit and no causal fence (the snapshot was pinned at BEGIN). No
+        // handle is the auto-commit path below.
+        if !req.transaction.is_empty() {
+            let transaction =
+                super::error_details::transaction_handle("transaction", &req.transaction)?;
             // The transaction's operation is named on its commit: one named on
             // a statement inside it would bind part of the transaction.
             if req.operation.is_some() {
@@ -1017,7 +1076,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             };
             let rows = super::blocking(|| {
                 self.database().read().execute_in_transaction_with(
-                    req.transaction_id,
+                    transaction,
                     &req.query,
                     params,
                     &options,
@@ -1241,9 +1300,10 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         _request: Request<query::BeginTransactionRequest>,
     ) -> Result<Response<query::BeginTransactionResponse>, Status> {
-        let transaction_id = super::blocking(|| self.database().read().begin_transaction());
+        let transaction = super::blocking(|| self.database().read().begin_transaction())
+            .map_err(db_error_to_status)?;
         Ok(Response::new(query::BeginTransactionResponse {
-            transaction_id,
+            transaction: transaction.to_bytes().to_vec(),
         }))
     }
 
@@ -1252,6 +1312,8 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         request: Request<query::CommitTransactionRequest>,
     ) -> Result<Response<query::CommitTransactionResponse>, Status> {
         let request = request.into_inner();
+        let transaction =
+            super::error_details::transaction_handle("transaction", &request.transaction)?;
         let operation =
             super::operation::optional_descriptor("operation", request.operation.as_ref())?;
         let receipt = super::blocking(|| {
@@ -1262,14 +1324,14 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             // state, not against what the caller happens to know.
             for expect in &request.expect {
                 db.expect_node_version(
-                    request.transaction_id,
+                    transaction,
                     coordinode_core::graph::node::NodeId::from_raw(expect.node_id),
                     expect.version,
                 )?;
             }
             match &operation {
-                Some(operation) => db.commit_transaction_as(request.transaction_id, operation),
-                None => db.commit_transaction(request.transaction_id),
+                Some(operation) => db.commit_transaction_as(transaction, operation),
+                None => db.commit_transaction(transaction),
             }
         })
         .map_err(db_error_to_status)?;
@@ -1285,8 +1347,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         request: Request<query::RollbackTransactionRequest>,
     ) -> Result<Response<query::RollbackTransactionResponse>, Status> {
-        let transaction_id = request.into_inner().transaction_id;
-        super::blocking(|| self.database().read().rollback_transaction(transaction_id))
+        let transaction = super::error_details::transaction_handle(
+            "transaction",
+            &request.into_inner().transaction,
+        )?;
+        super::blocking(|| self.database().read().rollback_transaction(transaction))
             .map_err(db_error_to_status)?;
         Ok(Response::new(query::RollbackTransactionResponse {}))
     }

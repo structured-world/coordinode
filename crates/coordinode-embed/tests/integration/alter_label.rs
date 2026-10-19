@@ -156,7 +156,7 @@ fn a_write_validated_under_a_replaced_mode_is_refused() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (:Doc)").expect("label exists");
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (:Doc {x: 1})", None)
         .expect("FLEXIBLE accepts the property");
 
@@ -180,7 +180,7 @@ fn a_read_under_a_replaced_mode_still_commits() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (:Doc)").expect("label exists");
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "MATCH (n:Doc) RETURN n", None)
         .expect("read");
     db.execute_cypher("ALTER LABEL Doc SET SCHEMA STRICT")

@@ -75,7 +75,7 @@ const INDEX_CHILD_DIR: &str = "COORDINODE_CRASH_INDEX_CHILD_DIR";
 /// MATCH found.
 fn bump_revision(db: &Database, creates: &[&str], scope: &str, from: i64, to: i64) -> usize {
     use coordinode_core::graph::types::Value;
-    let txn = db.begin_transaction();
+    let txn = db.begin_transaction().expect("begin");
     for create in creates {
         db.execute_in_transaction(txn, create, None)
             .expect("create in the transaction");

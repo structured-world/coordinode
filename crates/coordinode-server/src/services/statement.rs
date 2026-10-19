@@ -122,6 +122,8 @@ impl Admitted {
             deadline: self.deadline,
             cancel: self.cancel.clone(),
             operation: self.operation,
+            // An autonomous statement: no transaction, so no nonce or turn.
+            ..StatementOptions::default()
         }
     }
 }

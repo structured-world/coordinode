@@ -566,7 +566,7 @@ impl CoordinodeClient {
                     query,
                     parameters: proto_params,
                     // Auto-commit, as on the unary path.
-                    txid: 0,
+                    transaction: Vec::new(),
                     nonce: 0,
                     read_concern,
                     write_concern,
@@ -587,8 +587,8 @@ impl CoordinodeClient {
             write_concern,
             // Auto-commit: this convenience wrapper runs each statement on its
             // own. Interactive transactions use the BeginTransaction RPC and
-            // set transaction_id on the request directly.
-            transaction_id: 0,
+            // set its handle on the request directly.
+            transaction: Vec::new(),
             // Vector settings are named in a hint in the query, or by the
             // server's defaults.
             vector_consistency: 0,

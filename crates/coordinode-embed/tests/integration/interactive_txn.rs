@@ -16,7 +16,7 @@ fn open_db() -> Database {
 #[test]
 fn commit_makes_multi_statement_writes_visible() {
     let mut db = open_db();
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:User {name: 'Alice'})", None)
         .expect("stmt 1");
     db.execute_in_transaction(tx, "CREATE (n:User {name: 'Bob'})", None)
@@ -45,7 +45,7 @@ fn commit_makes_multi_statement_writes_visible() {
 #[test]
 fn rollback_discards_writes_and_consumes_handle() {
     let mut db = open_db();
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:User {name: 'Carol'})", None)
         .expect("stmt");
     db.rollback_transaction(tx).expect("rollback");
@@ -65,7 +65,7 @@ fn rollback_discards_writes_and_consumes_handle() {
 #[test]
 fn read_your_own_writes_within_transaction() {
     let db = open_db();
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:User {name: 'Dave'})", None)
         .expect("create");
     // A read in the SAME transaction sees its own uncommitted write.
@@ -82,7 +82,7 @@ fn repeatable_read_across_statements() {
     db.execute_cypher("CREATE (n:User {name: 'Seed'})")
         .expect("seed");
 
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     let first = db
         .execute_in_transaction(tx, "MATCH (n:User) RETURN n", None)
         .expect("read 1");
@@ -112,21 +112,33 @@ fn repeatable_read_across_statements() {
     assert_eq!(now.len(), 2);
 }
 
+/// A handle that names no open transaction here (one this database never
+/// handed out) is refused as unknown by every command.
 #[test]
 fn unknown_transaction_id_errors() {
+    use coordinode_embed::DatabaseError;
+    use coordinode_embed::db::TransactionHandle;
+
     let db = open_db();
-    assert!(
-        db.execute_in_transaction(999, "MATCH (n) RETURN n", None)
-            .is_err()
-    );
-    assert!(db.commit_transaction(999).is_err());
-    assert!(db.rollback_transaction(999).is_err());
+    let never = TransactionHandle::new(None, 0, 1, 999);
+    assert!(matches!(
+        db.execute_in_transaction(never, "MATCH (n) RETURN n", None),
+        Err(DatabaseError::UnknownTransaction(h)) if h == never
+    ));
+    assert!(matches!(
+        db.commit_transaction(never),
+        Err(DatabaseError::UnknownTransaction(h)) if h == never
+    ));
+    assert!(matches!(
+        db.rollback_transaction(never),
+        Err(DatabaseError::UnknownTransaction(h)) if h == never
+    ));
 }
 
 #[test]
 fn idle_transaction_is_reaped() {
     let db = open_db();
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     // Zero timeout → the just-opened transaction is immediately idle-expired.
     db.reap_idle_transactions(Duration::from_secs(0));
     assert!(
@@ -140,7 +152,7 @@ fn max_buffered_bytes_aborts_transaction() {
     let mut db = open_db();
     // Tiny ceiling so a single CREATE's buffered write exceeds it.
     db.set_max_interactive_txn_bytes(8);
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     let err = db
         .execute_in_transaction(
             tx,
@@ -174,9 +186,9 @@ fn configured_idle_timeout_reaps_on_begin() {
     let mut db = open_db();
     // Zero timeout: any prior open transaction is idle on the next begin.
     db.set_interactive_idle_timeout(Duration::from_secs(0));
-    let stale = db.begin_transaction();
+    let stale = db.begin_transaction().expect("begin");
     // A second begin runs the reaper with the configured (zero) timeout.
-    let _fresh = db.begin_transaction();
+    let _fresh = db.begin_transaction().expect("begin");
     assert!(
         db.commit_transaction(stale).is_err(),
         "stale transaction reaped by the configured idle timeout on begin",
@@ -190,8 +202,8 @@ fn commit_conflict_aborts_second_transaction() {
         .expect("seed");
 
     // Two interactive transactions both read-modify-write the same node.
-    let tx_a = db.begin_transaction();
-    let tx_b = db.begin_transaction();
+    let tx_a = db.begin_transaction().expect("begin");
+    let tx_b = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx_a, "MATCH (n:Acct {id: 1}) SET n.bal = n.bal + 10", None)
         .expect("a read-modify-write");
     db.execute_in_transaction(tx_b, "MATCH (n:Acct {id: 1}) SET n.bal = n.bal + 20", None)
@@ -216,8 +228,8 @@ fn commit_conflict_aborts_second_transaction() {
 #[test]
 fn concurrent_transactions_are_independent() {
     let mut db = open_db();
-    let tx_a = db.begin_transaction();
-    let tx_b = db.begin_transaction();
+    let tx_a = db.begin_transaction().expect("begin");
+    let tx_b = db.begin_transaction().expect("begin");
     assert_ne!(tx_a, tx_b, "each begin allocates a distinct id");
 
     db.execute_in_transaction(tx_a, "CREATE (n:User {name: 'A'})", None)
@@ -253,8 +265,8 @@ fn reading_what_another_transaction_writes_is_not_a_conflict() {
     db.execute_cypher("CREATE (n:Audit {id: 9, seen: 0})")
         .expect("seed audit");
 
-    let reader = db.begin_transaction();
-    let writer = db.begin_transaction();
+    let reader = db.begin_transaction().expect("begin");
+    let writer = db.begin_transaction().expect("begin");
 
     // The reader READS the account and writes somewhere else entirely.
     db.execute_in_transaction(
@@ -296,7 +308,7 @@ fn commit_receipt_is_the_snapshot_boundary_of_the_write() {
     // receipt or the snapshot inclusivity fails loudly instead of passing as
     // "some timestamp near the commit".
     let mut db = open_db();
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 1})", None)
         .expect("create");
     let receipt = db.commit_transaction(tx).expect("commit");
@@ -321,7 +333,7 @@ fn as_of_timestamp_rejects_a_negative_literal() {
     // value and silently read "everything". It must be rejected as an error,
     // and the rejection must not disturb committed data.
     let mut db = open_db();
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 11})", None)
         .expect("create");
     db.commit_transaction(tx).expect("commit");
@@ -347,7 +359,7 @@ fn commit_receipt_has_no_raft_index_in_embedded_mode() {
     // Embedded mode has no Raft log, so the receipt says so with `None`
     // rather than a fake 0 the host could mistake for a real index.
     let db = open_db();
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 2})", None)
         .expect("create");
     let receipt = db.commit_transaction(tx).expect("commit");
@@ -364,7 +376,7 @@ fn commit_receipt_anchors_a_changed_keys_cursor() {
     // that has processed it resumes from commit_ts + 1, which yields nothing.
     // This is the contract a polling CDC dispatcher builds on.
     let db = open_db();
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 3})", None)
         .expect("create");
     let receipt = db.commit_transaction(tx).expect("commit");
@@ -393,12 +405,12 @@ fn commit_receipts_are_monotonic_across_commits() {
     // Two sequential commits get strictly increasing commit timestamps: a
     // cursor built from the later receipt never replays the earlier commit.
     let mut db = open_db();
-    let first = db.begin_transaction();
+    let first = db.begin_transaction().expect("begin");
     db.execute_in_transaction(first, "CREATE (n:Anchor {id: 4})", None)
         .expect("create 1");
     let r1 = db.commit_transaction(first).expect("commit 1");
 
-    let second = db.begin_transaction();
+    let second = db.begin_transaction().expect("begin");
     db.execute_in_transaction(second, "CREATE (n:Anchor {id: 5})", None)
         .expect("create 2");
     let r2 = db.commit_transaction(second).expect("commit 2");
@@ -417,7 +429,7 @@ fn read_only_commit_reports_its_pinned_snapshot() {
     let mut db = open_db();
     db.execute_cypher("CREATE (n:Anchor {id: 6})")
         .expect("seed");
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     let rows = db
         .execute_in_transaction(tx, "MATCH (n:Anchor) RETURN n", None)
         .expect("read");
@@ -441,7 +453,7 @@ fn rollback_yields_no_receipt_and_no_change_to_scan_from() {
 
     let db = open_db();
     let before = db.engine().current_seqno();
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 7})", None)
         .expect("create");
     db.rollback_transaction(tx).expect("rollback");
@@ -494,7 +506,7 @@ fn a_transaction_commits_only_at_the_node_version_it_read() {
     assert_ne!(moved_to, read_version, "the write moved the version");
 
     // The stale writer's transaction is refused, and told what is there now.
-    let stale = db.begin_transaction();
+    let stale = db.begin_transaction().expect("begin");
     db.execute_in_transaction(stale, "MATCH (n:Account) SET n.balance = 500", None)
         .expect("statement");
     db.expect_node_version(stale, account, Some(read_version))
@@ -519,7 +531,7 @@ fn a_transaction_commits_only_at_the_node_version_it_read() {
     );
 
     // Retried against what is actually there, it lands.
-    let fresh = db.begin_transaction();
+    let fresh = db.begin_transaction().expect("begin");
     db.execute_in_transaction(fresh, "MATCH (n:Account) SET n.balance = 500", None)
         .expect("statement");
     db.expect_node_version(fresh, account, Some(moved_to))
@@ -568,7 +580,7 @@ fn an_auto_commit_statement_reports_the_version_it_wrote() {
 
     // And the version it reported is directly usable as the condition of the
     // next write, with no read in between.
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "MATCH (n:Account) SET n.balance = 2", None)
         .expect("statement");
     db.expect_node_version(tx, NodeId::from_raw(1), Some(reported))
@@ -602,7 +614,7 @@ fn two_claimers_of_one_record_produce_one_winner() {
     // Both stake the same version before either commits.
     let mut claims = Vec::new();
     for holder in ["first", "second"] {
-        let tx = db.begin_transaction();
+        let tx = db.begin_transaction().expect("begin");
         db.execute_in_transaction(
             tx,
             &format!("MATCH (c:Lease) SET c.holder = '{holder}'"),
@@ -668,7 +680,7 @@ fn a_claim_fences_the_writes_of_the_holder_it_replaced() {
     // committed; and it writes the claim record itself, which puts the claim
     // in its write set, so a takeover racing this very commit loses to
     // first-committer-wins instead of interleaving with it.
-    let protected = db.begin_transaction();
+    let protected = db.begin_transaction().expect("begin");
     db.execute_in_transaction(protected, "MATCH (d:Data) SET d.value = 1", None)
         .expect("statement");
     db.execute_in_transaction(protected, "MATCH (c:Claim) SET c.touched = 1", None)
@@ -719,7 +731,7 @@ fn a_retry_after_an_unheard_outcome_learns_which_way_it_went() {
     let before = db.node_version(counter).expect("read").expect("exists");
 
     // The first attempt commits, but the caller never hears the receipt.
-    let attempt = db.begin_transaction();
+    let attempt = db.begin_transaction().expect("begin");
     db.execute_in_transaction(attempt, "MATCH (n:Counter) SET n.value = 1", None)
         .expect("statement");
     db.expect_node_version(attempt, counter, Some(before))
@@ -728,7 +740,7 @@ fn a_retry_after_an_unheard_outcome_learns_which_way_it_went() {
 
     // Not knowing that, the caller retries the same work against the same
     // version it read at the start.
-    let retry = db.begin_transaction();
+    let retry = db.begin_transaction().expect("begin");
     db.execute_in_transaction(retry, "MATCH (n:Counter) SET n.value = 1", None)
         .expect("statement");
     db.expect_node_version(retry, counter, Some(before))
@@ -764,24 +776,25 @@ fn a_version_condition_refuses_what_it_cannot_be_stated_on() {
         "a node that was never written has no version"
     );
 
+    let never = coordinode_embed::db::TransactionHandle::new(None, 0, 1, 4242);
     let err = db
-        .expect_node_version(4242, NodeId::from_raw(1), None)
+        .expect_node_version(never, NodeId::from_raw(1), None)
         .expect_err("there is no such transaction");
     assert!(
-        matches!(err, DatabaseError::UnknownTransaction(4242)),
+        matches!(err, DatabaseError::UnknownTransaction(h) if h == never),
         "expected the unknown-transaction error, got {err:?}"
     );
 
     // An absent node with the create-if-absent condition commits, and the
     // same condition afterwards does not.
-    let tx = db.begin_transaction();
+    let tx = db.begin_transaction().expect("begin");
     db.execute_in_transaction(tx, "CREATE (n:Account {balance: 1})", None)
         .expect("statement");
     db.expect_node_version(tx, NodeId::from_raw(1), None)
         .expect("state the condition");
     db.commit_transaction(tx).expect("nothing was there");
 
-    let again = db.begin_transaction();
+    let again = db.begin_transaction().expect("begin");
     db.execute_in_transaction(again, "MATCH (n:Account) SET n.balance = 2", None)
         .expect("statement");
     db.expect_node_version(again, NodeId::from_raw(1), None)
@@ -815,8 +828,8 @@ fn two_transactions_taking_one_fence_never_both_commit() {
         let mut db = open_db();
         db.execute_cypher("CREATE (:Fence {k: 1, holder: 'none'})")
             .expect("seed the fence");
-        let a = db.begin_transaction();
-        let b = db.begin_transaction();
+        let a = db.begin_transaction().expect("begin");
+        let b = db.begin_transaction().expect("begin");
         db.execute_in_transaction(a, "MATCH (f:Fence {k: 1}) SET f.holder = 'a'", None)
             .expect("a takes the fence");
         db.execute_in_transaction(b, "MATCH (f:Fence {k: 1}) SET f.holder = 'b'", None)
@@ -845,8 +858,8 @@ fn deleting_a_node_and_linking_to_it_never_both_commit() {
         let mut db = open_db();
         db.execute_cypher("CREATE (:P {name: 'a'}), (:P {name: 'b'})")
             .expect("seed");
-        let delete = db.begin_transaction();
-        let link = db.begin_transaction();
+        let delete = db.begin_transaction().expect("begin");
+        let link = db.begin_transaction().expect("begin");
         db.execute_in_transaction(delete, "MATCH (n:P {name: 'a'}) DELETE n", None)
             .expect("delete a, which has no edge yet");
         db.execute_in_transaction(
@@ -908,8 +921,8 @@ fn erasing_a_pair_and_inserting_into_it_never_lose_the_insert() {
         )
         .expect("seed one version");
 
-        let erase = db.begin_transaction();
-        let insert = db.begin_transaction();
+        let erase = db.begin_transaction().expect("begin");
+        let insert = db.begin_transaction().expect("begin");
         db.execute_in_transaction(
             erase,
             "MATCH (:Person {name: 'B'})-[r:WORKS_AT]->(:Co {name: 'Acme'}) DELETE r",
@@ -959,7 +972,7 @@ fn a_redirect_is_refused_for_an_edge_it_never_saw() {
         "CREATE (a:U {tag: 'a'})-[:R]->(:U {tag: 'x'}), (:U {tag: 'b'}), (:U {tag: 'c'})",
     )
     .expect("seed");
-    let redirect = db.begin_transaction();
+    let redirect = db.begin_transaction().expect("begin");
     db.execute_in_transaction(
         redirect,
         "MATCH (a:U {tag: 'a'}), (b:U {tag: 'b'}) REDIRECT EDGES FROM a TO b",
@@ -990,7 +1003,7 @@ fn a_type_filtered_redirect_answers_only_for_its_types() {
              (c:U {tag: 'c'})-[:S]->(:U {tag: 'y'})",
         )
         .expect("seed both types");
-        let redirect = db.begin_transaction();
+        let redirect = db.begin_transaction().expect("begin");
         db.execute_in_transaction(
             redirect,
             "MATCH (a:U {tag: 'a'}), (b:U {tag: 'b'}) \
@@ -1019,7 +1032,7 @@ fn a_detach_delete_is_refused_for_an_edge_it_never_saw() {
     let mut db = open_db();
     db.execute_cypher("CREATE (a:P {name: 'a'})-[:R]->(b:P {name: 'b'}), (:P {name: 'c'})")
         .expect("seed");
-    let delete = db.begin_transaction();
+    let delete = db.begin_transaction().expect("begin");
     db.execute_in_transaction(delete, "MATCH (n:P {name: 'a'}) DETACH DELETE n", None)
         .expect("detach a and its one edge");
     db.execute_cypher("MATCH (a:P {name: 'a'}), (c:P {name: 'c'}) CREATE (c)-[:S]->(a)")
@@ -1034,7 +1047,7 @@ fn a_detach_delete_is_refused_for_an_edge_it_never_saw() {
         .len();
     assert_eq!(a_edges, 2, "a and both its edges stay");
 
-    let again = db.begin_transaction();
+    let again = db.begin_transaction().expect("begin");
     db.execute_in_transaction(again, "MATCH (n:P {name: 'a'}) DETACH DELETE n", None)
         .expect("detach a with every edge it now has");
     db.commit_transaction(again)

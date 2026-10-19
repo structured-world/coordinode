@@ -239,6 +239,10 @@ impl Member {
             Arc::new(node.pipeline());
         let database =
             Database::from_engine(storage.data_dir(), Arc::clone(&engine), oracle, pipeline)?;
+        // Before the database serves anything: a member that does not lead
+        // opens no transaction, and one that leads opens them in its term.
+        let (leader, term) = node.next_leadership_change((None, u64::MAX)).await;
+        database.set_execution_tenure(node.node_id(), leader, term);
         // A copy of an index found damaged on this member alone is replaced
         // from a peer's copy; a member without peers answers from its records
         // instead.
@@ -249,15 +253,24 @@ impl Member {
                 runtime: tokio::runtime::Handle::current(),
             }));
         }
+        let database = Arc::new(RwLock::new(database));
+        let stop = tokio::sync::watch::Sender::new(false);
+        // Not part of the optional background work: a member that is not
+        // told when it stops leading would keep transactions of a lost lead.
+        let tenure = background::spawn_execution_tenure(
+            Arc::clone(&database),
+            Arc::clone(&node),
+            stop.subscribe(),
+        );
         Ok(Self {
-            database: Arc::new(RwLock::new(database)),
+            database,
             node,
             engine,
             handler,
             preference,
             follower: None,
-            background: Vec::new(),
-            stop: tokio::sync::watch::Sender::new(false),
+            background: vec![tenure],
+            stop,
         })
     }
 

@@ -236,7 +236,6 @@ async fn a_standalone_server_with_data_grows_into_a_cluster() {
                 read_preference: 0,
                 read_concern: None,
                 write_concern: None,
-                transaction_id: 0,
                 ..Default::default()
             })
             .await
@@ -279,7 +278,6 @@ async fn a_standalone_server_with_data_grows_into_a_cluster() {
                     at_timestamp: 0,
                 }),
                 write_concern: None,
-                transaction_id: 0,
                 ..Default::default()
             })
             .await
@@ -320,7 +318,6 @@ async fn a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor() {
                 read_preference: 0,
                 read_concern: None,
                 write_concern: None,
-                transaction_id: 0,
                 ..Default::default()
             })
             .await
@@ -402,7 +399,6 @@ async fn a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor() {
                     at_timestamp: 0,
                 }),
                 write_concern: None,
-                transaction_id: 0,
                 ..Default::default()
             })
             .await
@@ -437,7 +433,6 @@ async fn a_server_that_still_holds_data_is_refused_as_a_joiner() {
                 read_preference: 0,
                 read_concern: None,
                 write_concern: None,
-                transaction_id: 0,
                 ..Default::default()
             })
             .await
@@ -483,7 +478,6 @@ async fn a_server_killed_after_a_write_is_refused_as_a_joiner() {
                 read_preference: 0,
                 read_concern: None,
                 write_concern: None,
-                transaction_id: 0,
                 ..Default::default()
             })
             .await
@@ -577,7 +571,6 @@ async fn a_member_restarts_into_its_group_with_its_data() {
                         at_timestamp: 0,
                     }),
                     write_concern: None,
-                    transaction_id: 0,
                     ..Default::default()
                 })
                 .await
@@ -637,7 +630,6 @@ async fn local_read(
                 at_timestamp: 0,
             }),
             write_concern: None,
-            transaction_id: 0,
             ..Default::default()
         })
         .await
@@ -784,7 +776,6 @@ async fn cypher_on(
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction_id: 0,
             ..Default::default()
         })
         .await
@@ -997,7 +988,6 @@ async fn a_text_index_created_on_the_leader_serves_searches_on_a_follower() {
                     at_timestamp: 0,
                 }),
                 write_concern: None,
-                transaction_id: 0,
                 ..Default::default()
             })
             .await
