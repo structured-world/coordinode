@@ -87,6 +87,50 @@ db.acknowledge_operation(&op)?; // release the outcome once it is no longer need
 
 See [Transactions](./transactions) for the full interactive-transaction contract, safe retries with operation identity, and what the retention window costs in storage.
 
+## Declaring the Schema
+
+An application declares its labels, edge types and constraints as one package, typically at every open. `Database::publish_schema` checks the whole package against one view of the catalog, with the package itself visible to it (a constraint may name a label the same package defines, in any order), and publishes every change in one catalog commit, or nothing.
+
+```rust
+use coordinode_core::schema::definition::{
+    ConstraintKind, EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType, SchemaMode,
+};
+use coordinode_embed::{
+    EdgeTypeDeclaration, Intent, LabelDeclaration, PackageConstraint, SchemaPackage,
+};
+
+let mut user = LabelSchema::new_node_id("User");
+user.set_mode(SchemaMode::Strict);
+user.add_property(PropertyDef::new("email", PropertyType::String));
+let package = SchemaPackage {
+    labels: vec![LabelDeclaration { schema: user, intent: Intent::Ensure }],
+    edge_types: vec![EdgeTypeDeclaration {
+        schema: EdgeTypeSchema::new("FOLLOWS"),
+        intent: Intent::Ensure,
+    }],
+    constraints: vec![PackageConstraint {
+        name: Some("user_email".into()),
+        label: "User".into(),
+        properties: vec!["email".into()],
+        kind: ConstraintKind::Unique,
+        scope: None,
+        on_duplicate_rename: None,
+    }],
+};
+let published = db.publish_schema(package)?;
+// Bounded: work outwaited goes on, and the answer says it is pending.
+let readiness = db.await_schema(&published, std::time::Duration::from_secs(30))?;
+assert!(readiness.all_ready());
+```
+
+- **Ensure, change, omit.** `Intent::Ensure` creates an absent object, keeps an equal one and refuses a different one with `CatalogObjectDiffers`, which carries the revision a change would name. `Intent::Change { expected_revision }` changes the definition at that revision and is refused with `CatalogRevisionMismatch` at any other. An object the package does not mention is never dropped.
+- **Nothing to do, nothing done.** A package equal to what is in place commits nothing, scans nothing and starts no build; every object comes back `Retained`. Opening an application whose schema did not change costs one catalog read.
+- **Acceptance is not readiness.** A definition that could refuse a stored node (STRICT, VALIDATED, or a NOT NULL property) is published as a candidate and proved over the stored nodes in the background; the rules in force before stay in force until the proof puts it in force, and every write meanwhile must satisfy both. A uniqueness is proved by its index build. `PublishedObject::operation` names that work; `await_schema` waits for it with a bound and reports `Ready`, `Pending` or `Failed`. A failed proof withdraws its own candidate or constraint only; the rest of the package stays published. Both kinds of work survive a restart.
+- **Lost replies.** `Database::publish_schema_as(package, &descriptor)` publishes as a client operation: a retry of a publication that committed is answered with `OperationSettled` and its outcome instead of publishing again.
+- **Bounded.** A package carries at most `MAX_SCHEMA_PACKAGE_DECLARATIONS` (4096) declarations; a larger one is refused, never split into several commits.
+
+`define_label`, `create_label_schema`, `define_edge_type` and `create_edge_type_schema` publish one object through the same core. A single-object call that publishes a candidate waits for its proof within the statement wait (`index_build_statement_wait_secs`), as `CREATE CONSTRAINT` waits for its build. Over gRPC the package is `SchemaService.PublishSchema`, awaited with `AwaitSchema`.
+
 ## What Is and Isn't Available
 
 The embedded API exposes the full query engine (graph, vector, full-text, time-series) with the same Cypher dialect as the network server. Only network-facing features (gRPC server, REST transcoding, Prometheus scrape endpoint) are absent; replication between embedded members is available behind the `replication` feature (see below).

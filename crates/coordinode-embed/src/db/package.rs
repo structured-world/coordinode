@@ -571,36 +571,69 @@ impl Database {
         publication: &SchemaPublication,
         wait: Duration,
     ) -> Result<SchemaReadiness, DatabaseError> {
-        let deadline = std::time::Instant::now() + wait;
-        let mut objects = Vec::new();
-        let mut any_published = false;
-        for object in &publication.objects {
-            if object.object == CatalogObject::EdgeType {
-                continue;
-            }
-            let readiness = match (object.state, object.operation) {
-                (Some(ConstraintState::Active), _) | (_, None) => Readiness::Ready,
-                (_, Some(operation)) => {
-                    let left = deadline.saturating_duration_since(std::time::Instant::now());
-                    match self.index_builds.wait(operation, Some(left))? {
-                        Some(IndexBuildOutcome::Published { .. }) => {
-                            any_published = true;
-                            Readiness::Ready
-                        }
-                        Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => {
-                            Readiness::Failed(ExecutionError::from(v).to_string())
-                        }
-                        Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
-                            Readiness::Failed(reason)
-                        }
-                        Some(IndexBuildOutcome::Cancelled) => {
-                            Readiness::Failed("the build was cancelled".into())
-                        }
-                        None => Readiness::Pending,
+        let waited: Vec<_> = publication
+            .objects
+            .iter()
+            .filter(|o| o.object != CatalogObject::EdgeType)
+            .filter(|o| o.state != Some(ConstraintState::Active))
+            .filter_map(|o| o.operation)
+            .collect();
+        let mut outcomes: rustc_hash::FxHashMap<GenerationId, Readiness> =
+            self.await_operations(&waited, wait)?.into_iter().collect();
+        let objects = publication
+            .objects
+            .iter()
+            .filter(|o| o.object != CatalogObject::EdgeType)
+            .map(|o| {
+                let readiness = match (o.state, o.operation) {
+                    (Some(ConstraintState::Active), _) | (_, None) => Readiness::Ready,
+                    (_, Some(operation)) => {
+                        outcomes.remove(&operation).unwrap_or(Readiness::Pending)
                     }
+                };
+                (o.object, o.name.clone(), readiness)
+            })
+            .collect();
+        Ok(SchemaReadiness { objects })
+    }
+
+    /// Wait up to `wait`, for all of them together, for the background
+    /// schema operations `operations` (label certifications and index
+    /// builds) to end, and report each: `Ready` once its object is in force.
+    /// An operation nothing records is reported failed. Waiting cancels
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// A record could not be read, or the answer could not be made durable.
+    pub fn await_operations(
+        &self,
+        operations: &[GenerationId],
+        wait: Duration,
+    ) -> Result<Vec<(GenerationId, Readiness)>, DatabaseError> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut out = Vec::with_capacity(operations.len());
+        let mut any_published = false;
+        for &operation in operations {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let readiness = match self.index_builds.wait(operation, Some(left))? {
+                Some(IndexBuildOutcome::Published { .. }) => {
+                    any_published = true;
+                    Readiness::Ready
                 }
+                Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => {
+                    Readiness::Failed(ExecutionError::from(v).to_string())
+                }
+                Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
+                    Readiness::Failed(reason)
+                }
+                Some(IndexBuildOutcome::Cancelled) => Readiness::Failed(format!(
+                    "operation {} was cancelled, or is not known here",
+                    operation.as_raw()
+                )),
+                None => Readiness::Pending,
             };
-            objects.push((object.object, object.name.clone(), readiness));
+            out.push((operation, readiness));
         }
         // Background work commits unsynced; an answer naming it in force
         // waits for one sync covering every such commit.
@@ -609,7 +642,7 @@ impl Database {
         {
             self.engine.sync_applied()?;
         }
-        Ok(SchemaReadiness { objects })
+        Ok(out)
     }
 
     /// The error a refused publication reports: when the commit refused it

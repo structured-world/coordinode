@@ -47,6 +47,7 @@ pub mod proto {
     // (`super::super::v1::common::PropertyValue`).
     pub mod v1 {
         pub use super::common;
+        pub use super::operation;
         pub use super::query;
     }
     pub mod v2 {

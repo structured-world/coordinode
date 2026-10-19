@@ -652,10 +652,13 @@ must have exactly that type: a float is not an `INTEGER`.
 - **Names.** Constraint and index names share one namespace across all
   labels. A constraint created without a name is named
   `<Label>_<properties>_<unique|not_null|node_key|type>`. `IF NOT EXISTS`
-  makes the statement a no-op (`created` is `false`) when a constraint of
-  that name, or one with the same requirement on the same properties of the
-  label, exists. `DROP CONSTRAINT ... IF EXISTS` returns `dropped: false` for
-  a missing constraint; without it, a missing one fails.
+  makes the statement a no-op (`created` is `false`) when the constraint
+  asked for exists: one of that name with the same requirement on the same
+  properties of the same label, or, under another name, one with the same
+  requirement. A name holding a different constraint is a conflict, not a
+  no-op: gRPC `FAILED_PRECONDITION`, reason `CATALOG_OBJECT_DIFFERS`.
+  `DROP CONSTRAINT ... IF EXISTS` returns `dropped: false` for a missing
+  constraint; without it, a missing one fails.
 - **Results.** `CREATE CONSTRAINT` returns `constraint`, `label`,
   `properties`, `kind` and `created`, plus `nodes_indexed` for a unique or key
   constraint. `DROP CONSTRAINT` returns the same columns with `dropped`.
@@ -675,7 +678,11 @@ must have exactly that type: a float is not an `INTEGER`.
   the same constraints (`CreateConstraint`, `DropConstraint`,
   `ListConstraints`, or `/v2/graph/schema/constraints` over REST); each one
   reports its state and the index it owns. A label definition there carries no
-  uniqueness: a unique property is a constraint.
+  uniqueness: a unique property is a constraint. `PublishSchema` declares
+  labels, edge types and constraints together in one catalog change, and
+  `AwaitSchema` waits for the work putting them in force (see
+  [Embedded: declaring the schema](../guide/embedded#declaring-the-schema)
+  for the semantics, which are the same).
 - A `COLUMNAR` table cannot take a constraint: its rows are written outside
   the transaction a constraint is enforced in. A table that has a constraint
   cannot be dropped until its constraints are.

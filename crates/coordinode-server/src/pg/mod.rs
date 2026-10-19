@@ -187,6 +187,10 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         }) => "42P01",
         DatabaseError::Execution(ExecutionError::CatalogObjectMissing { .. }) => "42704",
         DatabaseError::Execution(ExecutionError::CatalogRefused(_)) => "55000",
+        // The name is held by an object other than the one asked for.
+        DatabaseError::Execution(ExecutionError::CatalogObjectDiffers { .. }) => "42710",
+        // The object is not in the state the change was prepared against.
+        DatabaseError::Execution(ExecutionError::CatalogRevisionMismatch { .. }) => "55000",
         DatabaseError::Execution(
             ExecutionError::DuplicateKey { .. } | ExecutionError::UniqueViolation { .. },
         ) => "23505",

@@ -172,6 +172,16 @@ pub enum Reason {
     /// validated, a dependency that forbids it. Nothing changed. Terminal
     /// until that state changes.
     CatalogChangeRefused,
+    /// A declaration differs from the catalog object of its name and does
+    /// not ask for a change: the object asked for is not the one in place.
+    /// Nothing changed. Metadata carries `object`, `name` and `revision`,
+    /// the revision a change would name. Terminal for that declaration.
+    CatalogObjectDiffers,
+    /// A change names a revision its object is no longer at, or an object
+    /// that does not exist. Nothing changed. Metadata carries `object`,
+    /// `name`, `expected` and `current` (empty when the object does not
+    /// exist). Terminal: the client reads the object again and decides.
+    CatalogRevisionMismatch,
     /// The statement needed more memory than its limit allows. Nothing it
     /// produced is returned and nothing was written. Metadata carries
     /// `requested_bytes`, `used_bytes` and `limit_bytes`. Terminal at that
@@ -238,6 +248,8 @@ impl Reason {
             Reason::CatalogObjectExists => "CATALOG_OBJECT_EXISTS",
             Reason::CatalogObjectNotFound => "CATALOG_OBJECT_NOT_FOUND",
             Reason::CatalogChangeRefused => "CATALOG_CHANGE_REFUSED",
+            Reason::CatalogObjectDiffers => "CATALOG_OBJECT_DIFFERS",
+            Reason::CatalogRevisionMismatch => "CATALOG_REVISION_MISMATCH",
             Reason::ExceedsMemoryBudget => "EXCEEDS_MEMORY_BUDGET",
             Reason::QueryDeadlineExceeded => "QUERY_DEADLINE_EXCEEDED",
             Reason::QueryCancelled => "QUERY_CANCELLED",

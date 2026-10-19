@@ -20,7 +20,11 @@ use coordinode_core::schema::definition::{
     ConstraintKind, ConstraintState, EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType,
     SchemaMode,
 };
-use coordinode_embed::{ConstraintDeclaration, Database, LabelConstraint};
+use coordinode_embed::{
+    CatalogObject, ConstraintDeclaration, Database, Disposition, EdgeTypeDeclaration, Intent,
+    LabelConstraint, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS, PackageConstraint,
+    PublishedObject, Readiness, SchemaPackage, SchemaPublication,
+};
 use coordinode_query::index::definition::PartialFilter;
 use coordinode_query::index::{BuildPhase, BuildState, BuildStatus, GenerationId};
 
@@ -317,17 +321,93 @@ fn set_formula(def: &mut schema::ComputedPropertyDefinition, formula: &DecayForm
     def.formula_type = wire as i32;
 }
 
-fn schema_mode_from_proto(v: i32) -> Result<SchemaMode, Status> {
+fn schema_mode_from_proto(field: &str, v: i32) -> Result<SchemaMode, Status> {
     use schema::SchemaMode as M;
     match M::try_from(v) {
         Ok(M::Unspecified | M::Strict) => Ok(SchemaMode::Strict),
         Ok(M::Validated) => Ok(SchemaMode::Validated),
         Ok(M::Flexible) => Ok(SchemaMode::Flexible),
-        Err(_) => Err(invalid_field(
-            "schema_mode",
-            format!("unknown schema mode {v}"),
-        )),
+        Err(_) => Err(invalid_field(field, format!("unknown schema mode {v}"))),
     }
+}
+
+/// The request path of `field` under `at`, the path of the message holding
+/// it (empty for a top-level request).
+fn path(at: &str, field: &str) -> String {
+    if at.is_empty() {
+        field.to_string()
+    } else {
+        format!("{at}.{field}")
+    }
+}
+
+/// The label definition a message declares: the shared reading of
+/// CreateLabelRequest and of a PublishSchema label. `at` is the message's
+/// request path.
+fn label_from_proto(
+    at: &str,
+    name: &str,
+    properties: &[schema::PropertyDefinition],
+    computed_properties: &[schema::ComputedPropertyDefinition],
+    schema_mode: i32,
+    temporal: bool,
+) -> Result<LabelSchema, Status> {
+    if name.is_empty() {
+        return Err(invalid_field(path(at, "name"), "a label name is required"));
+    }
+    let mut definition = LabelSchema::new_node_id(name);
+    definition.set_mode(schema_mode_from_proto(
+        &path(at, "schema_mode"),
+        schema_mode,
+    )?);
+    definition.set_temporal(temporal);
+    let mut names = HashSet::new();
+    for p in properties_from_proto(&path(at, "properties"), properties, &mut names)? {
+        definition.add_property(p);
+    }
+    for (i, cp) in computed_properties.iter().enumerate() {
+        let field = path(at, &format!("computed_properties[{i}]"));
+        if cp.name.is_empty() {
+            return Err(invalid_field(format!("{field}.name"), "a name is required"));
+        }
+        if !names.insert(cp.name.clone()) {
+            return Err(invalid_field(
+                format!("{field}.name"),
+                format!("property `{}` is declared twice", cp.name),
+            ));
+        }
+        definition.add_property(PropertyDef::computed(
+            &cp.name,
+            computed_from_proto(&field, cp)?,
+        ));
+    }
+    Ok(definition)
+}
+
+/// The edge type definition a message declares: the shared reading of
+/// CreateEdgeTypeRequest and of a PublishSchema edge type.
+fn edge_type_from_proto(
+    at: &str,
+    name: &str,
+    properties: &[schema::PropertyDefinition],
+    temporal: bool,
+    discriminator: &str,
+) -> Result<EdgeTypeSchema, Status> {
+    if name.is_empty() {
+        return Err(invalid_field(
+            path(at, "name"),
+            "an edge type name is required",
+        ));
+    }
+    let mut definition = EdgeTypeSchema::new(name);
+    definition.set_temporal(temporal);
+    for p in properties_from_proto(&path(at, "properties"), properties, &mut HashSet::new())? {
+        definition.add_property(p);
+    }
+    definition
+        .resolve_identity(Some(discriminator).filter(|d| !d.is_empty()))
+        .map_err(|why| invalid_field(path(at, "discriminator"), why))?;
+    Ok(definition)
 }
 
 fn schema_mode_to_proto(mode: SchemaMode) -> i32 {
@@ -339,17 +419,26 @@ fn schema_mode_to_proto(mode: SchemaMode) -> i32 {
     wire as i32
 }
 
-fn label_to_proto(s: &LabelSchema) -> schema::Label {
-    let mut properties = Vec::new();
-    let mut computed_properties = Vec::new();
-    for p in s.properties.values() {
+/// The stored and the computed properties of `properties`, in wire form.
+fn properties_to_proto(
+    properties: &std::collections::BTreeMap<String, PropertyDef>,
+) -> (
+    Vec<schema::PropertyDefinition>,
+    Vec<schema::ComputedPropertyDefinition>,
+) {
+    let mut stored = Vec::new();
+    let mut computed = Vec::new();
+    for p in properties.values() {
         match &p.property_type {
-            PropertyType::Computed(spec) => {
-                computed_properties.push(computed_to_proto(&p.name, spec))
-            }
-            _ => properties.push(property_to_proto(p)),
+            PropertyType::Computed(spec) => computed.push(computed_to_proto(&p.name, spec)),
+            _ => stored.push(property_to_proto(p)),
         }
     }
+    (stored, computed)
+}
+
+fn label_to_proto(s: &LabelSchema) -> schema::Label {
+    let (properties, computed_properties) = properties_to_proto(&s.properties);
     schema::Label {
         name: s.name.clone(),
         declared: true,
@@ -358,6 +447,15 @@ fn label_to_proto(s: &LabelSchema) -> schema::Label {
         schema_mode: schema_mode_to_proto(s.mode),
         temporal: s.temporal,
         schema_revision: s.schema_revision,
+        candidate: s.candidate().map(|c| {
+            let (properties, computed_properties) = properties_to_proto(&c.properties);
+            schema::LabelCandidate {
+                properties,
+                computed_properties,
+                schema_mode: schema_mode_to_proto(c.mode),
+                operation: c.operation.as_raw(),
+            }
+        }),
     }
 }
 
@@ -461,8 +559,10 @@ fn scope_to_proto(scope: &PartialFilter) -> schema::ConstraintScope {
     }
 }
 
-/// The scope a request declares, refusing one without a property or a test.
+/// The scope a message declares, refusing one without a property or a test.
+/// `at` is the message's request path.
 fn scope_from_proto(
+    at: &str,
     scope: Option<schema::ConstraintScope>,
 ) -> Result<Option<PartialFilter>, Status> {
     use schema::constraint_scope::Test;
@@ -470,7 +570,10 @@ fn scope_from_proto(
         return Ok(None);
     };
     if scope.property.is_empty() {
-        return Err(invalid_field("scope.property", "a property is required"));
+        return Err(invalid_field(
+            path(at, "scope.property"),
+            "a property is required",
+        ));
     }
     let property = scope.property;
     Ok(Some(match scope.test {
@@ -478,7 +581,7 @@ fn scope_from_proto(
         Some(Test::EqualsInt(value)) => PartialFilter::PropertyEqualsInt { property, value },
         Some(Test::EqualsBool(value)) => PartialFilter::PropertyEqualsBool { property, value },
         Some(Test::Present(())) => PartialFilter::PropertyExists { property },
-        None => return Err(invalid_field("scope.test", "a test is required")),
+        None => return Err(invalid_field(path(at, "scope.test"), "a test is required")),
     }))
 }
 
@@ -506,90 +609,224 @@ fn constraint_to_proto(c: &LabelConstraint, build: Option<&BuildStatus>) -> sche
     }
 }
 
-/// The constraint a request declares, refusing one whose shape its kind does
-/// not allow.
-fn declaration_from_proto(
-    req: schema::CreateConstraintRequest,
-) -> Result<ConstraintDeclaration, Status> {
+/// The fields of a constraint as a message declares them, before reading.
+struct ConstraintFields {
+    name: String,
+    label: Option<String>,
+    properties: Vec<String>,
+    kind: i32,
+    property_type: Option<schema::PropertyType>,
+    on_duplicate_rename: String,
+    scope: Option<schema::ConstraintScope>,
+}
+
+/// The constraint a message declares, refusing one whose shape its kind
+/// does not allow: the shared reading of CreateConstraintRequest and of a
+/// PublishSchema constraint. `at` is the message's request path.
+fn constraint_from_proto(at: &str, c: ConstraintFields) -> Result<PackageConstraint, Status> {
     use schema::ConstraintKind as K;
-    let label = match req.target {
-        Some(schema::create_constraint_request::Target::Label(label)) if !label.is_empty() => label,
-        _ => return Err(invalid_field("label", "the constrained label is required")),
+    let label = match c.label {
+        Some(label) if !label.is_empty() => label,
+        _ => {
+            return Err(invalid_field(
+                path(at, "label"),
+                "the constrained label is required",
+            ));
+        }
     };
-    let wire_kind = match K::try_from(req.kind) {
+    let wire_kind = match K::try_from(c.kind) {
         Ok(K::Unspecified) => {
-            return Err(invalid_field("kind", "the constraint kind is unspecified"));
+            return Err(invalid_field(
+                path(at, "kind"),
+                "the constraint kind is unspecified",
+            ));
         }
         Err(_) => {
             return Err(invalid_field(
-                "kind",
-                format!("unknown constraint kind {}", req.kind),
+                path(at, "kind"),
+                format!("unknown constraint kind {}", c.kind),
             ));
         }
         Ok(kind) => kind,
     };
-    if req.properties.is_empty() {
+    if c.properties.is_empty() {
         return Err(invalid_field(
-            "properties",
+            path(at, "properties"),
             "at least one property is required",
         ));
     }
-    if let Some((i, _)) = req
-        .properties
-        .iter()
-        .enumerate()
-        .find(|(_, p)| p.is_empty())
-    {
+    if let Some((i, _)) = c.properties.iter().enumerate().find(|(_, p)| p.is_empty()) {
         return Err(invalid_field(
-            format!("properties[{i}]"),
+            path(at, &format!("properties[{i}]")),
             "a name is required",
         ));
     }
     let mut seen = HashSet::new();
-    if let Some((i, p)) = req
+    if let Some((i, p)) = c
         .properties
         .iter()
         .enumerate()
         .find(|(_, p)| !seen.insert(p.as_str()))
     {
         return Err(invalid_field(
-            format!("properties[{i}]"),
+            path(at, &format!("properties[{i}]")),
             format!("property `{p}` is named twice"),
         ));
     }
-    if matches!(wire_kind, K::NotNull | K::PropertyType) && req.properties.len() != 1 {
+    if matches!(wire_kind, K::NotNull | K::PropertyType) && c.properties.len() != 1 {
         return Err(invalid_field(
-            "properties",
+            path(at, "properties"),
             "this kind constrains exactly one property",
         ));
     }
-    if wire_kind != K::PropertyType && req.property_type.is_some() {
+    if wire_kind != K::PropertyType && c.property_type.is_some() {
         return Err(invalid_field(
-            "property_type",
+            path(at, "property_type"),
             "only a PROPERTY_TYPE constraint names a type",
         ));
     }
     let kind = match wire_kind {
         K::PropertyType => ConstraintKind::Type(property_type_from_proto(
-            "property_type",
-            req.property_type.as_ref(),
+            &path(at, "property_type"),
+            c.property_type.as_ref(),
         )?),
         K::NotNull => ConstraintKind::NotNull,
         K::NodeKey => ConstraintKind::NodeKey,
         // UNSPECIFIED was refused when the kind was read.
         K::Unique | K::Unspecified => ConstraintKind::Unique,
     };
-    Ok(ConstraintDeclaration {
-        scope: scope_from_proto(req.scope)?,
-        wait: wait_from_proto("wait", req.wait)?,
-        on_duplicate_rename: (!req.on_duplicate_rename.is_empty())
-            .then_some(req.on_duplicate_rename),
-        name: (!req.name.is_empty()).then_some(req.name),
+    Ok(PackageConstraint {
+        scope: scope_from_proto(at, c.scope)?,
+        on_duplicate_rename: (!c.on_duplicate_rename.is_empty()).then_some(c.on_duplicate_rename),
+        name: (!c.name.is_empty()).then_some(c.name),
         label,
-        properties: req.properties,
+        properties: c.properties,
         kind,
-        if_not_exists: req.if_not_exists,
     })
+}
+
+/// The constraint a CreateConstraintRequest declares.
+fn declaration_from_proto(
+    req: schema::CreateConstraintRequest,
+) -> Result<ConstraintDeclaration, Status> {
+    let wait = wait_from_proto("wait", req.wait)?;
+    let label = req.target.map(|t| match t {
+        schema::create_constraint_request::Target::Label(label) => label,
+    });
+    let c = constraint_from_proto(
+        "",
+        ConstraintFields {
+            name: req.name,
+            label,
+            properties: req.properties,
+            kind: req.kind,
+            property_type: req.property_type,
+            on_duplicate_rename: req.on_duplicate_rename,
+            scope: req.scope,
+        },
+    )?;
+    Ok(ConstraintDeclaration {
+        name: c.name,
+        label: c.label,
+        properties: c.properties,
+        kind: c.kind,
+        if_not_exists: req.if_not_exists,
+        wait,
+        on_duplicate_rename: c.on_duplicate_rename,
+        scope: c.scope,
+    })
+}
+
+/// The package a PublishSchema request declares, every declaration read
+/// before anything is published.
+fn package_from_proto(req: schema::PublishSchemaRequest) -> Result<SchemaPackage, Status> {
+    let total = req.labels.len() + req.edge_types.len() + req.constraints.len();
+    if total > MAX_SCHEMA_PACKAGE_DECLARATIONS {
+        return Err(invalid_field(
+            "constraints",
+            format!(
+                "a request carries at most {MAX_SCHEMA_PACKAGE_DECLARATIONS} declarations, this \
+                 one {total}"
+            ),
+        ));
+    }
+    let intent = |expected_revision: Option<u64>| match expected_revision {
+        Some(expected_revision) => Intent::Change { expected_revision },
+        None => Intent::Ensure,
+    };
+    let mut package = SchemaPackage::default();
+    for (i, l) in req.labels.into_iter().enumerate() {
+        let at = format!("labels[{i}]");
+        package.labels.push(LabelDeclaration {
+            schema: label_from_proto(
+                &at,
+                &l.name,
+                &l.properties,
+                &l.computed_properties,
+                l.schema_mode,
+                l.temporal,
+            )?,
+            intent: intent(l.expected_revision),
+        });
+    }
+    for (i, e) in req.edge_types.into_iter().enumerate() {
+        let at = format!("edge_types[{i}]");
+        package.edge_types.push(EdgeTypeDeclaration {
+            schema: edge_type_from_proto(
+                &at,
+                &e.name,
+                &e.properties,
+                e.temporal,
+                &e.discriminator,
+            )?,
+            intent: intent(e.expected_revision),
+        });
+    }
+    for (i, c) in req.constraints.into_iter().enumerate() {
+        let label = c.target.map(|t| match t {
+            schema::constraint_declaration::Target::Label(label) => label,
+        });
+        package.constraints.push(constraint_from_proto(
+            &format!("constraints[{i}]"),
+            ConstraintFields {
+                name: c.name,
+                label,
+                properties: c.properties,
+                kind: c.kind,
+                property_type: c.property_type,
+                on_duplicate_rename: c.on_duplicate_rename,
+                scope: c.scope,
+            },
+        )?);
+    }
+    Ok(package)
+}
+
+/// The wire form of one published object.
+fn published_to_proto(o: &PublishedObject) -> schema::PublishedSchemaObject {
+    use schema::{PublicationDisposition as D, SchemaObjectKind as K};
+    schema::PublishedSchemaObject {
+        kind: match o.object {
+            CatalogObject::Label => K::Label,
+            CatalogObject::EdgeType => K::EdgeType,
+            CatalogObject::Constraint => K::Constraint,
+            // A package declares nothing else.
+            CatalogObject::Index | CatalogObject::Trigger => K::Unspecified,
+        } as i32,
+        name: o.name.clone(),
+        disposition: match o.disposition {
+            Disposition::Created => D::Created,
+            Disposition::Retained => D::Retained,
+            Disposition::Changed => D::Changed,
+        } as i32,
+        revision: o.revision,
+        constraint_state: match o.state {
+            None => schema::ConstraintState::Unspecified,
+            Some(ConstraintState::Validating) => schema::ConstraintState::Validating,
+            Some(ConstraintState::Active) => schema::ConstraintState::Active,
+        } as i32,
+        operation: o.operation.map(GenerationId::as_raw),
+    }
 }
 
 pub struct SchemaServiceImpl {
@@ -609,32 +846,14 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         request: Request<schema::CreateLabelRequest>,
     ) -> Result<Response<schema::Label>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(invalid_field("name", "a label name is required"));
-        }
-        let mut definition = LabelSchema::new_node_id(&req.name);
-        definition.set_mode(schema_mode_from_proto(req.schema_mode)?);
-        definition.set_temporal(req.temporal);
-        let mut names = HashSet::new();
-        for p in properties_from_proto("properties", &req.properties, &mut names)? {
-            definition.add_property(p);
-        }
-        for (i, cp) in req.computed_properties.iter().enumerate() {
-            let at = format!("computed_properties[{i}]");
-            if cp.name.is_empty() {
-                return Err(invalid_field(format!("{at}.name"), "a name is required"));
-            }
-            if !names.insert(cp.name.clone()) {
-                return Err(invalid_field(
-                    format!("{at}.name"),
-                    format!("property `{}` is declared twice", cp.name),
-                ));
-            }
-            definition.add_property(PropertyDef::computed(
-                &cp.name,
-                computed_from_proto(&at, cp)?,
-            ));
-        }
+        let definition = label_from_proto(
+            "",
+            &req.name,
+            &req.properties,
+            &req.computed_properties,
+            req.schema_mode,
+            req.temporal,
+        )?;
 
         let name = req.name;
         let label = super::blocking(|| -> Result<schema::Label, Status> {
@@ -650,6 +869,67 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
                 })
         })?;
         Ok(Response::new(label))
+    }
+
+    async fn publish_schema(
+        &self,
+        request: Request<schema::PublishSchemaRequest>,
+    ) -> Result<Response<schema::PublishSchemaResponse>, Status> {
+        let mut req = request.into_inner();
+        let operation =
+            super::operation::optional_descriptor("operation", req.operation.take().as_ref())?;
+        let package = package_from_proto(req)?;
+        let published = super::blocking(|| -> Result<SchemaPublication, Status> {
+            // Shared: publication commits through the catalog's own guards,
+            // and the database serves everyone else meanwhile.
+            let db = self.database.read();
+            match &operation {
+                Some(descriptor) => db.publish_schema_as(package, descriptor),
+                None => db.publish_schema(package),
+            }
+            .map_err(db_error_to_status)
+        })?;
+        Ok(Response::new(schema::PublishSchemaResponse {
+            committed: published.committed,
+            objects: published.objects.iter().map(published_to_proto).collect(),
+        }))
+    }
+
+    async fn await_schema(
+        &self,
+        request: Request<schema::AwaitSchemaRequest>,
+    ) -> Result<Response<schema::AwaitSchemaResponse>, Status> {
+        let req = request.into_inner();
+        let wait = wait_from_proto("wait", req.wait)?.unwrap_or(Duration::ZERO);
+        let operations: Vec<GenerationId> = req
+            .operations
+            .into_iter()
+            .map(GenerationId::from_raw)
+            .collect();
+        let waited = super::blocking(|| {
+            self.database
+                .read()
+                .await_operations(&operations, wait)
+                .map_err(db_error_to_status)
+        })?;
+        use schema::SchemaReadinessState as S;
+        Ok(Response::new(schema::AwaitSchemaResponse {
+            operations: waited
+                .into_iter()
+                .map(|(operation, readiness)| {
+                    let (state, failure) = match readiness {
+                        Readiness::Ready => (S::Ready, String::new()),
+                        Readiness::Pending => (S::Pending, String::new()),
+                        Readiness::Failed(why) => (S::Failed, why),
+                    };
+                    schema::OperationReadiness {
+                        operation: operation.as_raw(),
+                        state: state as i32,
+                        failure,
+                    }
+                })
+                .collect(),
+        }))
     }
 
     async fn list_labels(
@@ -682,17 +962,13 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         request: Request<schema::CreateEdgeTypeRequest>,
     ) -> Result<Response<schema::EdgeType>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(invalid_field("name", "an edge type name is required"));
-        }
-        let mut definition = EdgeTypeSchema::new(&req.name);
-        definition.set_temporal(req.temporal);
-        for p in properties_from_proto("properties", &req.properties, &mut HashSet::new())? {
-            definition.add_property(p);
-        }
-        definition
-            .resolve_identity(Some(req.discriminator.as_str()).filter(|d| !d.is_empty()))
-            .map_err(|why| invalid_field("discriminator", why))?;
+        let definition = edge_type_from_proto(
+            "",
+            &req.name,
+            &req.properties,
+            req.temporal,
+            &req.discriminator,
+        )?;
 
         let name = req.name;
         let edge_type = super::blocking(|| -> Result<schema::EdgeType, Status> {
@@ -1096,3 +1372,7 @@ fn check_to_proto(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod package_tests;

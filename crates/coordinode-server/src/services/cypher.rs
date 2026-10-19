@@ -455,6 +455,43 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
+        DatabaseError::Execution(ExecutionError::CatalogObjectDiffers {
+            object,
+            name,
+            revision,
+        }) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::CatalogObjectDiffers,
+                [
+                    ("object", object.to_string()),
+                    ("name", name.clone()),
+                    ("revision", revision.to_string()),
+                ],
+            );
+        }
+        DatabaseError::Execution(ExecutionError::CatalogRevisionMismatch {
+            object,
+            name,
+            expected,
+            current,
+        }) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::CatalogRevisionMismatch,
+                [
+                    ("object", object.to_string()),
+                    ("name", name.clone()),
+                    ("expected", expected.to_string()),
+                    (
+                        "current",
+                        current.map(|c| c.to_string()).unwrap_or_default(),
+                    ),
+                ],
+            );
+        }
         // Transaction lifecycle. NOT_FOUND rather than INVALID_ARGUMENT: the
         // id was well-formed, there is simply nothing under it any more.
         DatabaseError::UnknownTransaction(id) => {
