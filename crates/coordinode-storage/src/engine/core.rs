@@ -599,11 +599,29 @@ impl StorageEngine {
         {
             let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
             let engine = Self::open_embedded(config, oracle)?;
-            // Every entry is in a tree's memtable after the replay; the flush
-            // makes the trees the only place any of it needs to be.
-            engine.persist()?;
+            // Every entry is in a tree's memtable after the replay. The base
+            // goes into every tree, as before a purge, so a removal cut short
+            // below leaves a journal whose missing prefix every tree covers.
+            let covered = engine.persist_coverage_base()?;
+            let next = match &engine.oplog {
+                Some(log) => log
+                    .lock()
+                    .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?
+                    .next_index(),
+                None => 0,
+            };
+            if covered < next {
+                return Err(StorageError::Io(format!(
+                    "the journal holds entries up to {next} but the trees cover only below \
+                     {covered}; not retiring it"
+                )));
+            }
         }
         open_log()?.truncate_all()?;
+        // The consensus log starts in this directory next: the removals are
+        // made durable first, so a power cut cannot bring old journal
+        // segments back beside it.
+        sync_dir(&dir)?;
         tracing::info!(dir = %dir.display(), "embedded journal retired into the store");
         Ok(true)
     }
@@ -2655,16 +2673,9 @@ impl StorageEngine {
     /// means covered by a coverage base that is itself on disk: the purge
     /// folds the applied prefix into every tree and flushes them first.
     pub fn oplog_purge_expired(&self, now_secs: u64, keep_from_index: u64) -> StorageResult<usize> {
-        match (&self.oplog, &self.coverage) {
-            (Some(oplog), Some(coverage)) => {
-                let durable_below = {
-                    let mut folded = coverage.lock_folded();
-                    let next = self.fold_coverage(coverage, &mut folded, coverage::FoldScope::All);
-                    // The flush persists every memtable sealed so far, and
-                    // with it the base just written.
-                    self.persist()?;
-                    next
-                };
+        match &self.oplog {
+            Some(oplog) => {
+                let durable_below = self.persist_coverage_base()?;
                 // The fold reached every partition tree and every columnar
                 // table tree, so one index bound covers them all. A build
                 // without columnar support cannot have applied a columnar row
@@ -2684,6 +2695,27 @@ impl StorageEngine {
             }
             _ => Ok(0),
         }
+    }
+
+    /// Fold the journal's applied prefix into every tree, including the ones
+    /// no entry reached, and persist them: every index below the returned
+    /// bound is covered durably in every tree, so journal entries below it
+    /// can go without leaving a hole a later open cannot account for. 0 on a
+    /// store without a journal.
+    ///
+    /// # Errors
+    ///
+    /// The flush fails.
+    pub(crate) fn persist_coverage_base(&self) -> StorageResult<u64> {
+        let Some(coverage) = &self.coverage else {
+            return Ok(0);
+        };
+        let mut folded = coverage.lock_folded();
+        let next = self.fold_coverage(coverage, &mut folded, coverage::FoldScope::All);
+        // The flush persists every memtable sealed so far, and with it the
+        // base just written.
+        self.persist()?;
+        Ok(next)
     }
 
     /// Resolve the oplog target endpoint for a given shard (the

@@ -136,6 +136,107 @@ async fn a_member_that_shut_down_has_released_its_store() {
     }
 }
 
+/// A store written without replication, its journal kept in segments of two
+/// entries, holding five nodes written one statement each.
+fn standalone_store(dir: &std::path::Path) -> StorageConfig {
+    let mut config = storage(dir);
+    config.oplog_segment_max_entries = 2;
+    let mut alone = Database::open_with_config(config.clone()).unwrap();
+    for k in 0..5 {
+        alone
+            .execute_cypher(&format!("CREATE (:Before {{k: {k}}})"))
+            .unwrap();
+    }
+    config
+}
+
+/// How many `Before` nodes `db` holds, by a scan and by its label count: an
+/// entry applied twice shows in the count.
+fn befores(db: &Database) -> (usize, u64) {
+    let rows = db
+        .execute_cypher_shared("MATCH (n:Before) RETURN n", None, None, None, None)
+        .unwrap()
+        .rows
+        .len();
+    let counted = db
+        .label_counts()
+        .unwrap()
+        .get("Before")
+        .copied()
+        .unwrap_or(0);
+    (rows, counted)
+}
+
+/// A retirement that finished before the host first opened the store as a
+/// member leaves a store outside any group still: the host may go back to
+/// opening it without replication, keep writing, and later grow it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_retired_but_never_opened_as_a_member_is_still_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_store(dir.path());
+    assert!(StorageEngine::retire_embedded_journal(&config).unwrap());
+
+    let reopened = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut alone = Database::open_with_config(reopened).unwrap();
+        assert_eq!(befores(&alone), (5, 5));
+        alone.execute_cypher("CREATE (:Before {k: 5})").unwrap();
+    })
+    .await
+    .unwrap();
+
+    let db = ReplicatedDatabase::open(&config, MemberOptions::new(1), None)
+        .await
+        .unwrap();
+    assert_eq!(befores(&db.database().read()), (6, 6));
+    db.shutdown().await.unwrap();
+}
+
+/// What the old path answered is kept across the transition and what it did
+/// not commit is not: a j:memory write already answered is in the member's
+/// store once, a transaction still open on the handle is discarded with it,
+/// and the member takes writes through its log at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_transition_keeps_answered_writes_and_drops_open_transactions() {
+    use coordinode_core::txn::write_concern::WriteConcern;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut alone = Database::open(dir.path()).unwrap();
+    alone.set_write_concern(WriteConcern::memory());
+    alone.execute_cypher("CREATE (:Before {k: 0})").unwrap();
+    alone.set_write_concern(WriteConcern::default());
+    let open = alone.begin_transaction();
+    alone
+        .execute_in_transaction(open, "CREATE (:Unsubmitted {k: 1})", None)
+        .unwrap();
+
+    let db =
+        ReplicatedDatabase::from_database(alone, &storage(dir.path()), MemberOptions::new(1), None)
+            .await
+            .unwrap();
+    assert_eq!(befores(&db.database().read()), (1, 1));
+    let unsubmitted = db
+        .database()
+        .write()
+        .execute_cypher("MATCH (n:Unsubmitted) RETURN n")
+        .unwrap();
+    assert!(
+        unsubmitted.is_empty(),
+        "an uncommitted transaction survived"
+    );
+    db.database()
+        .write()
+        .execute_cypher("CREATE (:Before {k: 1})")
+        .unwrap();
+    db.shutdown().await.unwrap();
+
+    let db = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+        .await
+        .unwrap();
+    assert_eq!(befores(&db.database().read()), (2, 2));
+    db.shutdown().await.unwrap();
+}
+
 /// The timing a member was opened with is readable from the handle.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_timing_profile_is_visible_on_the_handle() {

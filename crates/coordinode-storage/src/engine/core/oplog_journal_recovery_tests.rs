@@ -1709,6 +1709,69 @@ fn a_member_store_is_refused_an_own_journal_and_left_as_it_was() {
     rig.cut(engine);
 }
 
+/// The retirement of a journal into its store, cut short after it covered
+/// every tree and removed the oldest segments (the order it removes them
+/// in), is finished by the next one, and the store then opens with every
+/// entry and a journal that starts above them.
+#[test]
+fn a_journal_retirement_cut_short_is_finished_by_the_next_one() {
+    let dir = TempDir::new().expect("tmp");
+    let mut config = durable_cfg(&dir);
+    config.oplog_segment_max_entries = 2;
+    let names = ["a", "b", "c", "d", "e"];
+    {
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine = StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("open");
+        for (n, name) in names.iter().enumerate() {
+            commit_at(
+                &engine,
+                &oracle,
+                &two_tree_commit(name, n as u64),
+                Journal::Journal,
+            );
+        }
+    }
+    // The retirement's first step, then part of its removal.
+    {
+        let engine = StorageEngine::open_embedded(&config, Arc::new(TimestampOracle::new()))
+            .expect("reopen");
+        engine.persist_coverage_base().expect("cover every tree");
+    }
+    let mut segments: Vec<_> = std::fs::read_dir(dir.path().join("oplog").join("0"))
+        .expect("journal")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    segments.sort();
+    assert!(segments.len() >= 3, "segments: {segments:?}");
+    for segment in &segments[..segments.len() / 2] {
+        std::fs::remove_file(segment).expect("remove");
+    }
+
+    assert!(StorageEngine::retire_embedded_journal(&config).expect("retire"));
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("open");
+    for name in names {
+        assert_eq!(
+            engine
+                .get(Partition::Node, format!("node:00:{name}").as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(name.as_bytes()),
+            "{name}"
+        );
+    }
+    commit_at(&engine, &oracle, &two_tree_commit("f", 5), Journal::Journal);
+    drop(engine);
+    let engine = StorageEngine::open_embedded(&config, Arc::new(TimestampOracle::new()))
+        .expect("open after a write on the retired store");
+    assert!(
+        engine
+            .get(Partition::Node, b"node:00:f")
+            .expect("get")
+            .is_some()
+    );
+}
+
 /// A member's own record is written while client writes are refused for
 /// space, out of the upper half of the reserve; once free space falls into
 /// the lower half, which the flushes retiring those records need, it is
