@@ -534,7 +534,15 @@ impl Database {
         }
         let mut published = Vec::with_capacity(owned_indexes.len());
         for (at, owned) in owned_indexes {
-            let def = stage_owned_index(&self.engine, txn, owned)?;
+            let def = stage_owned_index(&self.engine, txn, owned).map_err(|e| match e {
+                coordinode_modality::StoreError::IndexNameTaken(name) => {
+                    DatabaseError::from(ExecutionError::CatalogObjectExists {
+                        object: CatalogObject::Index,
+                        name,
+                    })
+                }
+                other => DatabaseError::from(ExecutionError::from(other)),
+            })?;
             objects[at].operation = Some(def.generation);
             published.push(def);
         }
@@ -822,14 +830,12 @@ impl Database {
             }
             .into());
         }
+        // Whether an index already holds the name is the catalog's to say,
+        // through the publication of the owned index below: an in-memory
+        // registry read here could see an index committed after this
+        // transaction's view and answer "exists" where the commit would
+        // only meet a conflict to retry.
         let mut planned = plan_constraint(&request, Some(&label.schema))?;
-        if planned.owned_index.is_some() && self.index_registry.get(&name).is_some() {
-            return Err(ExecutionError::CatalogObjectExists {
-                object: CatalogObject::Index,
-                name,
-            }
-            .into());
-        }
         if planned.constraint.checks_each_node() {
             if planned.owned_index.is_some() {
                 // A node key's index build activates it, so its presence
