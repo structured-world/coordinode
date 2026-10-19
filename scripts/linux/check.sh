@@ -105,6 +105,12 @@ bundle="$out/tree.bundle"
 # Snapshot the working tree as a commit on a private ref, through a scratch
 # index so the real one is left as it is.
 index="$(mktemp)"
+# The owner file goes last: a removal cut short (the run stopped while it
+# deletes a large target) leaves a lock that still names its owner, which the
+# next run from this machine takes over, instead of one nobody can claim.
+remove_root() {
+  ssh "$host" "[ ! -e '$remote_root' ] || { find '$remote_root' -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + && rm -rf '$remote_root'; }"
+}
 cleanup() {
   rm -f "$index"
   git -C "$repo" update-ref -d "$ref" 2>/dev/null || true
@@ -113,7 +119,7 @@ cleanup() {
   # every later run, so the removal is tried a few times.
   if [ "$locked" = 1 ]; then
     for attempt in 1 2 3 4 5; do
-      ssh "$host" "rm -rf '$remote_root'" && break
+      remove_root && break
       echo "cleanup attempt $attempt on $host failed; retrying" >&2
       sleep 10
     done
@@ -170,7 +176,7 @@ if ! take_lock; then
   if [ "$held_host" = "$(hostname)" ] && [ -n "$held_pid" ] && ! kill -0 "$held_pid" 2>/dev/null &&
     ! pgrep -f "$remote_root" >/dev/null; then
     echo "the run that held $remote_root on $host (pid $held_pid) is gone; taking the lock over" >&2
-    ssh "$host" "rm -rf '$remote_root'"
+    remove_root
     take_lock || {
       echo "another check took $remote_root on $host meanwhile" >&2
       exit 1
