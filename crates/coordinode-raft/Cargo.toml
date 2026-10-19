@@ -34,7 +34,14 @@ prost = { workspace = true }
 coordinode-wire = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
+[features]
+# Every share of the storage engine records its name while it lives, so a test
+# finds what still holds an engine after a shutdown. Off in a release build.
+engine-holders = []
+
 [dev-dependencies]
+# The crate's own tests run with its holders recorded.
+coordinode-raft = { path = ".", features = ["engine-holders"] }
 coordinode-test-fixtures = { workspace = true }
 # Crash tests flush one partition tree on its own through the tree API.
 lsm-tree = { workspace = true }

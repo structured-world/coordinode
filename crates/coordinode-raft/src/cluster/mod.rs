@@ -169,7 +169,7 @@ pub struct NodeOptions {
 #[derive(Clone)]
 struct Commands {
     raft: Arc<RaftInstance>,
-    engine: Arc<StorageEngine>,
+    engine: Arc<crate::engine_hold::EngineHold>,
     oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
     ids: Arc<coordinode_core::txn::proposal::ProposalIdGenerator>,
 }
@@ -189,7 +189,11 @@ impl Commands {
         );
         Self {
             raft,
-            engine,
+            // One hold for every clone of the commands: they share it.
+            engine: Arc::new(crate::engine_hold::EngineHold::new(
+                engine,
+                "metadata commands",
+            )),
             oracle,
             ids: Arc::new(ids),
         }
@@ -624,7 +628,7 @@ pub struct RaftNode {
     /// for a joining one, whose address the leader supplies when adding it.
     advertise_addr: Option<String>,
     /// Storage engine — held so `shutdown()` can flush before returning.
-    engine: Arc<StorageEngine>,
+    engine: crate::engine_hold::EngineHold,
     /// Shared handle to the Raft oplog, for reading committed entries since a
     /// checkpoint (WAL-replay repair). Shares the `LogStore`'s manager.
     oplog: Arc<std::sync::Mutex<coordinode_storage::oplog::OplogManager>>,
@@ -910,7 +914,7 @@ impl RaftNode {
             engine_work,
             node_id,
             advertise_addr: None,
-            engine,
+            engine: crate::engine_hold::EngineHold::new(engine, "raft node"),
             oplog,
             append_notifier,
             grpc_shutdown: std::sync::Mutex::new(None),
@@ -1264,7 +1268,7 @@ impl RaftNode {
             engine_work,
             node_id,
             advertise_addr,
-            engine,
+            engine: crate::engine_hold::EngineHold::new(engine, "raft node"),
             oplog,
             append_notifier,
             grpc_shutdown: std::sync::Mutex::new(grpc_shutdown),
@@ -1869,7 +1873,7 @@ impl RaftNode {
         )
         .with_version_gate(Arc::clone(&self.version))
         .with_space_guard(Arc::clone(self.engine.space()))
-        .with_closure(Arc::clone(&self.engine))
+        .with_closure(Arc::clone(self.engine.arc()))
     }
 
     /// This member's version view: its pair, its group's, and whether it
@@ -1920,7 +1924,7 @@ impl RaftNode {
             Arc::clone(&self.raft),
             RateLimiter::default(),
             config,
-            Some(Arc::clone(&self.engine)),
+            Some(Arc::clone(self.engine.arc())),
         )
         .with_space_guard(Arc::clone(self.engine.space()))
     }
@@ -3193,7 +3197,7 @@ fn spawn_snapshot_trigger(
     // later, on the runtime; the shutdown waits for the work guard to go, and
     // the engine goes first.
     let held = TriggerHold {
-        engine,
+        engine: crate::engine_hold::EngineHold::new(engine, "snapshot trigger"),
         _work: work.start(),
     };
     tokio::spawn(async move {
@@ -3287,7 +3291,7 @@ fn spawn_snapshot_trigger(
 /// What the snapshot trigger task holds. Fields drop in order: the engine
 /// before the guard that tells the shutdown the task let go of it.
 struct TriggerHold {
-    engine: Arc<StorageEngine>,
+    engine: crate::engine_hold::EngineHold,
     _work: crate::storage::EngineWorkGuard,
 }
 

@@ -1,6 +1,7 @@
 mod authority;
 pub mod closure;
 pub mod cluster;
+pub mod engine_hold;
 mod log_sync;
 pub mod member;
 pub mod proposal;

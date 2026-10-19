@@ -126,6 +126,8 @@ impl WaitForMajorityService {
         closure: Option<Arc<coordinode_storage::engine::core::StorageEngine>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
+        let closure =
+            closure.map(|engine| crate::engine_hold::EngineHold::new(engine, "batch pipeline"));
 
         let handle = tokio::spawn(drain_loop(raft, rate_limiter, rx, config, closure));
 
@@ -211,7 +213,7 @@ async fn drain_loop(
     rate_limiter: RateLimiter,
     mut rx: mpsc::Receiver<BatchEntry>,
     config: BatchConfig,
-    closure: Option<Arc<coordinode_storage::engine::core::StorageEngine>>,
+    closure: Option<crate::engine_hold::EngineHold>,
 ) {
     loop {
         // Step 1: Wait for the first proposal (blocks until work arrives).

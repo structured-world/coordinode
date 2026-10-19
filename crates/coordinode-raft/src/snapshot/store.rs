@@ -111,6 +111,7 @@ impl SnapshotFile {
     /// Remove the capture copy this value owns, through its engine.
     fn remove_capture(&mut self) {
         if let (Some(capture), Some(engine)) = (self.capture.take(), self.engine.upgrade()) {
+            let engine = crate::engine_hold::EngineHold::new(engine, "snapshot file cleanup");
             remove_capture_quietly(&engine, &capture);
         }
     }
@@ -229,7 +230,7 @@ impl Drop for SnapshotFile {
 
 /// The current snapshot of one engine.
 pub(crate) struct SnapshotStore {
-    engine: Arc<StorageEngine>,
+    engine: crate::engine_hold::EngineHold,
     dir: PathBuf,
     /// One publication at a time, so the record and the files agree.
     publish: Mutex<()>,
@@ -243,7 +244,7 @@ impl SnapshotStore {
         let dir = snapshot_dir(&engine);
         fs::create_dir_all(&dir)?;
         let store = Self {
-            engine,
+            engine: crate::engine_hold::EngineHold::new(engine, "snapshot store"),
             dir,
             publish: Mutex::new(()),
         };
@@ -308,7 +309,7 @@ impl SnapshotStore {
                 }
                 Ok(Some((
                     meta,
-                    SnapshotFile::from_capture(copy, &self.dir, &self.engine),
+                    SnapshotFile::from_capture(copy, &self.dir, self.engine.arc()),
                 )))
             }
             // A crash lost the capture the record names. Without a snapshot,

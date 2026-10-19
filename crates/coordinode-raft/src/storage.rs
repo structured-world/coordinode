@@ -412,7 +412,7 @@ impl Waiter {
 /// All fields use `Arc` so `get_log_reader()` returns a cheap clone that
 /// shares the same oplog handle and caches.
 pub struct LogStore {
-    engine: Arc<StorageEngine>,
+    engine: crate::engine_hold::EngineHold,
     /// Oplog manager for log entry segments.
     oplog: Arc<Mutex<OplogManager>>,
     /// Waiters for "my proposal is durable in this log", see [`AppendNotifier`].
@@ -646,7 +646,7 @@ impl LogStore {
             &append_notifier,
         ))?);
         let store = Self {
-            engine,
+            engine: crate::engine_hold::EngineHold::new(engine, "raft log store"),
             oplog: Arc::new(Mutex::new(oplog)),
             append_notifier,
             sync,
@@ -969,7 +969,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn get_log_reader(&mut self) -> Self::LogReader {
         // Cheap clone: all fields are Arc-wrapped.
         LogStore {
-            engine: Arc::clone(&self.engine),
+            engine: self.engine.share("raft log reader"),
             oplog: Arc::clone(&self.oplog),
             last_log_id: Arc::clone(&self.last_log_id),
             last_purged: Arc::clone(&self.last_purged),
@@ -1221,7 +1221,7 @@ pub type GroupPairs = Arc<[coordinode_core::version::RecordedPair]>;
 /// index, enabling linearizable reads (follower waits until `Applied >= readTs`)
 /// and snapshot trigger decisions.
 pub struct CoordinodeStateMachine {
-    engine: Arc<StorageEngine>,
+    engine: crate::engine_hold::EngineHold,
     /// Timestamp oracle advanced during Raft apply.
     ///
     /// Every entry is applied at its `commit_ts` as one batch (the engine
@@ -1543,7 +1543,7 @@ impl CoordinodeStateMachine {
         let reopened_at = engine.oracle().map_or(0, |o| o.current().as_raw());
 
         Ok(Self {
-            engine,
+            engine: crate::engine_hold::EngineHold::new(engine, "state machine"),
             oracle,
             last_applied: Mutex::new(last_applied),
             last_membership: Mutex::new(last_membership),
@@ -2135,9 +2135,11 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         // Counted from before the capture to the builder's end, so the work
         // never reads idle between the two.
         let builder_work = self.engine_work.start();
-        let engine = Arc::clone(&self.engine);
-        let target = dir.clone();
+        // Declared before the engine, so a capture that never runs (the fold
+        // failed) lets go of the engine before its work is counted done.
         let work = self.engine_work.start();
+        let engine = self.engine.share("snapshot capture");
+        let target = dir.clone();
         let capture = match folded {
             Err(e) => Err(e),
             Ok(()) => match tokio::task::spawn_blocking(move || {
@@ -2197,7 +2199,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         // An empty snapshot carries metadata only and leaves the data as it
         // is. The parse reads the file as it goes, off the async runtime, as
         // does the size, which serializes a snapshot kept as a capture.
-        let engine = Arc::clone(&self.engine);
+        let engine = self.engine.share("snapshot install");
         let work = self.engine_work.start();
         let mut snapshot = tokio::task::spawn_blocking(move || {
             // Locals drop in reverse: the engine before the guard.
@@ -2280,7 +2282,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         // Counted as work holding the engine: openraft may stop waiting on
         // the task at a shutdown, and the task runs on regardless.
         let capture = self.snapshots.capture_target();
-        let engine = Arc::clone(&self.engine);
+        let engine = self.engine.share("snapshot publish");
         let work = self.engine_work.start();
         let snapshots = Arc::clone(&self.snapshots);
         let published_meta = meta.clone();

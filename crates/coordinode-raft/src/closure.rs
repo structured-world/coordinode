@@ -119,6 +119,7 @@ pub(crate) fn spawn_closer(
     engine: Arc<StorageEngine>,
     settle: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    let engine = crate::engine_hold::EngineHold::new(engine, "closure closer");
     tokio::spawn(async move {
         let mut seen = 0u64;
         loop {

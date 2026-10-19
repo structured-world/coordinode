@@ -114,6 +114,7 @@ pub(crate) fn spawn_lift(
     elect: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let lost = guard.lost()?;
+    let engine = crate::engine_hold::EngineHold::new(engine, "catch-up lift");
     Some(tokio::spawn(async move {
         let mut metrics = raft.metrics();
         loop {

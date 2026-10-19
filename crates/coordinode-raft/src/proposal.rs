@@ -158,7 +158,7 @@ pub struct RaftProposalPipeline {
     /// The store whose commits this leader stamps each entry's closed bound
     /// from (see [`crate::closure`]). Without it entries carry no bound, and
     /// a member applying them can vouch for no cut of the log.
-    closure: Option<Arc<coordinode_storage::engine::core::StorageEngine>>,
+    closure: Option<crate::engine_hold::EngineHold>,
 }
 
 impl RaftProposalPipeline {
@@ -181,7 +181,10 @@ impl RaftProposalPipeline {
         mut self,
         engine: Arc<coordinode_storage::engine::core::StorageEngine>,
     ) -> Self {
-        self.closure = Some(engine);
+        self.closure = Some(crate::engine_hold::EngineHold::new(
+            engine,
+            "proposal pipeline",
+        ));
         self
     }
 

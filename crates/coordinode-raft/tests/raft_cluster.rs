@@ -1115,7 +1115,8 @@ async fn cluster_crash_recovery() {
                 assert_eq!(
                     Arc::strong_count(engine),
                     1,
-                    "a stopped node still holds its engine"
+                    "a stopped node still holds its engine: {:?}",
+                    coordinode_raft::engine_hold::engine_holders(engine)
                 );
             }
         }
@@ -2410,7 +2411,8 @@ async fn shutdown_does_not_wait_out_a_peer_that_never_answers() {
         assert_eq!(
             Arc::strong_count(&engine),
             1,
-            "the stopped node's tasks still hold the engine"
+            "the stopped node's tasks still hold the engine: {:?}",
+            coordinode_raft::engine_hold::engine_holders(&engine)
         );
         assert!(
             took < Duration::from_secs(5),
@@ -3078,7 +3080,8 @@ async fn a_member_that_lost_committed_entries_votes_again_only_once_caught_up() 
             assert_eq!(
                 Arc::strong_count(&engine),
                 1,
-                "a stopped node still holds its engine"
+                "a stopped node still holds its engine: {:?}",
+                coordinode_raft::engine_hold::engine_holders(&engine)
             );
         }
 

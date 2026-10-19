@@ -29,6 +29,7 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::engine_hold::engine_holders;
 use coordinode_raft::storage::{CommittedLeaderId, Entry, LogStore, Request};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
@@ -260,15 +261,27 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
         // Graceful shutdown (simulates "crash" after which we reopen cleanly).
         // In real crash, Drop wouldn't run and oplog entries are safe (fsynced).
         node.shutdown().await.expect("shutdown");
-        // Once shutdown returns nothing but the node and this test holds
-        // the engine, or the reopen below finds the directory locked. The
-        // pipeline stamps closed bounds from the engine, so it goes too.
+        // Once shutdown returns nothing but the node itself and the pipeline
+        // this test made hold the engine, or the reopen below finds the
+        // directory locked. Any other holder is named.
+        let mut holders = engine_holders(&engine_read);
+        holders.sort_unstable();
+        assert_eq!(
+            holders,
+            ["metadata commands", "proposal pipeline", "raft node"],
+            "only the node and the caller's pipeline may hold the engine after shutdown"
+        );
         drop(pipeline);
         drop(node);
+        assert!(
+            engine_holders(&engine_read).is_empty(),
+            "still held after the node is gone: {:?}",
+            engine_holders(&engine_read)
+        );
         assert_eq!(
             Arc::strong_count(&engine_read),
             2,
-            "something still holds the engine after shutdown"
+            "something outside the recorded holders still holds the engine"
         );
     }
 
