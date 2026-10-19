@@ -6479,6 +6479,20 @@ async fn a_member_cut_off_from_its_leader_does_not_depose_it_on_return() {
         let leader = await_ready_leader(&members).await;
         let cut = (leader + 1) % members.len();
         let term = members[leader].node.current_term();
+        // A leader is elected by a majority, so the third member may not have
+        // heard of it yet. Cut off only a member that follows this leader in
+        // its term; one cut off earlier stays in the term before and proves
+        // nothing about raising it.
+        let leader_id = members[leader].id;
+        await_condition(
+            Duration::from_secs(15),
+            "the member to cut off follows the leader",
+            || {
+                members[cut].node.current_leader() == Some(leader_id)
+                    && members[cut].node.current_term() == term
+            },
+        )
+        .await;
         let others: Vec<u64> = members
             .iter()
             .filter(|m| m.id != members[cut].id)
