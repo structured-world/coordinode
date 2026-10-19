@@ -242,6 +242,41 @@ async fn operation_identity_works_through_a_follower() {
         .into_inner();
     assert_eq!(excluded.state(), operation::OperationState::Aborted);
 
+    // Releasing the committed outcome and retiring the numbers, also through
+    // the follower, take effect at the leader: it answers the operation as
+    // retired.
+    operations
+        .acknowledge_operations(operation::AcknowledgeOperationsRequest {
+            issuer: vec![0x52; 16],
+            incarnation: enrolled.incarnation,
+            sequences: vec![enrolled.next_sequence],
+            deployment: enrolled.deployment.clone(),
+        })
+        .await
+        .expect("a release through a follower reaches the leader");
+    operations
+        .retire_operations(operation::RetireOperationsRequest {
+            issuer: vec![0x52; 16],
+            incarnation: enrolled.incarnation,
+            below: enrolled.next_sequence + 2,
+            deployment: enrolled.deployment.clone(),
+        })
+        .await
+        .expect("a retirement through a follower reaches the leader");
+    let at_leader = operation::operation_service_client::OperationServiceClient::connect(format!(
+        "http://127.0.0.1:{p1}"
+    ))
+    .await
+    .unwrap()
+    .resolve_operation(operation::ResolveOperationRequest {
+        operation: Some(reference(enrolled.next_sequence)),
+        exclude: false,
+    })
+    .await
+    .expect("a lookup at the leader")
+    .into_inner();
+    assert_eq!(at_leader.state(), operation::OperationState::Retired);
+
     tokio::time::sleep(Duration::from_millis(500)).await;
     let rows = n1
         .db

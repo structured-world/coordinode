@@ -5,13 +5,14 @@
 use std::time::Instant;
 
 use coordinode_core::budget::CancelFlag;
-use coordinode_core::txn::handle::{AdmissionSignal, TransactionHandle};
+use coordinode_core::txn::handle::{ActingContext, AdmissionSignal, TransactionHandle};
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::db::{CommitOptions, RollbackOptions, StatementOptions, TransactionOptions};
 use coordinode_embed::replication::routing::{
-    CommandExecutor, RoutedAnswer, RoutedBegin, RoutedCommit, RoutedRollback, RoutedSettings,
-    RoutedStatement, RoutedStats,
+    CommandExecutor, RoutedAnswer, RoutedBegin, RoutedCommit, RoutedOperationAnswer,
+    RoutedOperationCall, RoutedRollback, RoutedSettings, RoutedStatement, RoutedStats,
 };
+use coordinode_embed::{Database, DatabaseError};
 use coordinode_raft::read_fence::ReadPreference;
 use tonic::Status;
 
@@ -164,6 +165,14 @@ impl CommandExecutor for ServerCommandExecutor {
             .map_err(db_error_to_status)
     }
 
+    fn operation(
+        &self,
+        _actor: ActingContext,
+        call: RoutedOperationCall,
+    ) -> Result<RoutedOperationAnswer, Status> {
+        run_operation(&self.executor.database().read(), call).map_err(db_error_to_status)
+    }
+
     fn rollback(&self, rollback: RoutedRollback) -> Result<(), Status> {
         self.executor
             .database()
@@ -177,6 +186,42 @@ impl CommandExecutor for ServerCommandExecutor {
             )
             .map_err(db_error_to_status)
     }
+}
+
+/// Carry out `call` on `db`'s operation records: what a member does with the
+/// call whether its client reached it or another member passed it here.
+///
+/// # Errors
+///
+/// What the database refused the call with; a member that does not lead
+/// refuses every call that changes the records.
+pub(crate) fn run_operation(
+    db: &Database,
+    call: RoutedOperationCall,
+) -> Result<RoutedOperationAnswer, DatabaseError> {
+    Ok(match call {
+        RoutedOperationCall::Enroll(issuer) => {
+            let enrolled = db.enroll_issuer(issuer)?;
+            RoutedOperationAnswer::Enrolled {
+                incarnation: enrolled.incarnation(),
+                next_sequence: enrolled.next_sequence(),
+                deployment: enrolled.deployment(),
+            }
+        }
+        RoutedOperationCall::Resolve(descriptor, resolve) => {
+            RoutedOperationAnswer::Outcome(db.resolve_operation(&descriptor, resolve)?)
+        }
+        RoutedOperationCall::Acknowledge(descriptors) => {
+            for descriptor in &descriptors {
+                db.acknowledge_operation(descriptor)?;
+            }
+            RoutedOperationAnswer::Done
+        }
+        RoutedOperationCall::Retire(below) => {
+            db.retire_operations(&below)?;
+            RoutedOperationAnswer::Done
+        }
+    })
 }
 
 /// The settings a statement routed from here runs under: what the statement

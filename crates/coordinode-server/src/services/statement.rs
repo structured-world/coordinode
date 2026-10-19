@@ -500,30 +500,6 @@ impl StatementExecutor {
             )),
         }
     }
-
-    /// The connection to member `leader_id`, made under this node's identity
-    /// and expecting the leader's: the one the consensus layer uses, so the
-    /// hop is authenticated both ways like any other peer traffic.
-    pub(crate) fn leader_channel(
-        &self,
-        leader_id: u64,
-    ) -> Result<tonic::transport::Channel, Status> {
-        let node = self.raft_node.as_ref().ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "not the leader; leader is node {leader_id}, and this node has no peers"
-            ))
-        })?;
-        let (Some(target), Some(connections)) = (node.member_target(leader_id), node.connections())
-        else {
-            return Err(Status::failed_precondition(format!(
-                "not the leader; leader is node {leader_id}, whose address and identity this \
-                 node does not know"
-            )));
-        };
-        connections
-            .channel(&target)
-            .map_err(|e| Status::internal(format!("leader {leader_id}: {e}")))
-    }
 }
 
 /// The column header and the rows in column order: the keys of the first row
@@ -545,13 +521,6 @@ pub(crate) fn columns_and_values(rows: &[Row]) -> (Vec<String>, Vec<Vec<Value>>)
         .collect();
     (columns, values)
 }
-
-/// Marks a request that has already been forwarded once.
-///
-/// A stale leader hint could otherwise bounce a statement between two nodes
-/// that each believe the other leads. One hop is enough: the second node
-/// answers with NOT_LEADER and its own hint, and the client decides.
-pub(crate) const FORWARDED_HEADER: &str = "x-coordinode-forwarded";
 
 /// How many nodes handled this request: 0 local, 1 forwarded, 2+ scattered.
 pub(crate) const HOPS_HEADER: &str = "x-coordinode-hops";

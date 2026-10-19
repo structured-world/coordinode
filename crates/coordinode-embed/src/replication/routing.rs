@@ -36,6 +36,8 @@ use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use crate::db::ExpectedVersion;
+use crate::operation::{IssuerId, OperationOutcome, Resolve};
+use coordinode_core::group::DeploymentId;
 use wire::command_routing_service_client::CommandRoutingServiceClient;
 use wire::command_routing_service_server::{CommandRoutingService, CommandRoutingServiceServer};
 use wire::routed_statement_frame::Event;
@@ -172,6 +174,39 @@ pub struct RoutedRollback {
     pub transaction: TransactionHandle,
 }
 
+/// A call on the records of client operations, decided by the leader's log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutedOperationCall {
+    /// Enroll a new incarnation of this issuer.
+    Enroll(IssuerId),
+    /// Resolve an operation's outcome, excluding it through the log first
+    /// when nothing is recorded of it and `Resolve::Exclude` asks for that.
+    Resolve(OperationDescriptor, Resolve),
+    /// Release the outcomes of these settled operations.
+    Acknowledge(Vec<OperationDescriptor>),
+    /// Retire the operations of the descriptor's incarnation numbered below
+    /// its sequence.
+    Retire(OperationDescriptor),
+}
+
+/// The answer to a [`RoutedOperationCall`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutedOperationAnswer {
+    /// The incarnation an enrollment opened.
+    Enrolled {
+        /// Its number.
+        incarnation: u64,
+        /// The first operation number it hands out.
+        next_sequence: u64,
+        /// The deployment that enrolled it.
+        deployment: DeploymentId,
+    },
+    /// How a resolved operation stands.
+    Outcome(OperationOutcome),
+    /// A release or retirement is done.
+    Done,
+}
+
 /// Runs the commands other members route here.
 ///
 /// Every method blocks: a write commits through consensus inside it, so the
@@ -217,6 +252,17 @@ pub trait CommandExecutor: Send + Sync + 'static {
     ///
     /// The status the rollback was refused with.
     fn rollback(&self, rollback: RoutedRollback) -> Result<(), Status>;
+
+    /// Carry out a call on operation records, acting for `actor`.
+    ///
+    /// # Errors
+    ///
+    /// The status the call was refused with.
+    fn operation(
+        &self,
+        actor: ActingContext,
+        call: RoutedOperationCall,
+    ) -> Result<RoutedOperationAnswer, Status>;
 }
 
 /// The service a member serves its peers the commands they route with.
@@ -336,6 +382,17 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
         let rollback = rollback_from_wire(request.into_inner())?;
         self.blocking(move |e| e.rollback(rollback)).await?;
         Ok(Response::new(wire::RoutedRolledBack {}))
+    }
+
+    async fn operation(
+        &self,
+        request: Request<wire::RoutedOperation>,
+    ) -> Result<Response<wire::RoutedOperationAnswer>, Status> {
+        let request = request.into_inner();
+        let actor = actor_from_wire(request.actor)?;
+        let call = operation_call_from_wire(request.call)?;
+        let answer = self.blocking(move |e| e.operation(actor, call)).await?;
+        Ok(Response::new(operation_answer_to_wire(answer)))
     }
 }
 
@@ -495,6 +552,29 @@ impl CommandRouter {
             .rollback(rollback_to_wire(rollback))
             .await?;
         Ok(())
+    }
+
+    /// Carry out a call on operation records at the member, which must lead.
+    ///
+    /// # Errors
+    ///
+    /// The status the member refused it with, or why it could not be
+    /// reached.
+    pub async fn operation(
+        &self,
+        actor: &ActingContext,
+        call: RoutedOperationCall,
+    ) -> Result<RoutedOperationAnswer, Status> {
+        let answer = self
+            .client
+            .clone()
+            .operation(wire::RoutedOperation {
+                actor: Some(actor_to_wire(actor)),
+                call: Some(operation_call_to_wire(call)),
+            })
+            .await?
+            .into_inner();
+        operation_answer_from_wire(answer)
     }
 }
 
@@ -851,6 +931,133 @@ fn rollback_from_wire(rollback: wire::RoutedRollback) -> Result<RoutedRollback, 
     Ok(RoutedRollback {
         actor: actor_from_wire(rollback.actor)?,
         transaction: handle_from_wire(&rollback.transaction)?,
+    })
+}
+
+fn descriptor_from_wire(field: &str, bytes: &[u8]) -> Result<OperationDescriptor, Status> {
+    OperationDescriptor::from_bytes(bytes)
+        .ok_or_else(|| Status::invalid_argument(format!("{field}: malformed descriptor")))
+}
+
+fn operation_call_to_wire(call: RoutedOperationCall) -> wire::routed_operation::Call {
+    use wire::routed_operation::Call;
+    match call {
+        RoutedOperationCall::Enroll(issuer) => Call::Enroll(issuer.0.to_vec()),
+        RoutedOperationCall::Resolve(descriptor, resolve) => Call::Resolve(wire::RoutedResolve {
+            operation: descriptor.to_bytes(),
+            exclude: resolve == Resolve::Exclude,
+        }),
+        RoutedOperationCall::Acknowledge(descriptors) => {
+            Call::Acknowledge(wire::RoutedOperations {
+                operations: descriptors
+                    .iter()
+                    .map(OperationDescriptor::to_bytes)
+                    .collect(),
+            })
+        }
+        RoutedOperationCall::Retire(below) => Call::Retire(below.to_bytes()),
+    }
+}
+
+fn operation_call_from_wire(
+    call: Option<wire::routed_operation::Call>,
+) -> Result<RoutedOperationCall, Status> {
+    use wire::routed_operation::Call;
+    Ok(match call {
+        Some(Call::Enroll(issuer)) => RoutedOperationCall::Enroll(IssuerId(
+            <[u8; 16]>::try_from(issuer.as_slice())
+                .map_err(|_| Status::invalid_argument("enroll: an issuer is 16 bytes"))?,
+        )),
+        Some(Call::Resolve(resolve)) => RoutedOperationCall::Resolve(
+            descriptor_from_wire("resolve.operation", &resolve.operation)?,
+            if resolve.exclude {
+                Resolve::Exclude
+            } else {
+                Resolve::Lookup
+            },
+        ),
+        Some(Call::Acknowledge(acknowledge)) => RoutedOperationCall::Acknowledge(
+            acknowledge
+                .operations
+                .iter()
+                .map(|bytes| descriptor_from_wire("acknowledge.operations", bytes))
+                .collect::<Result<_, _>>()?,
+        ),
+        Some(Call::Retire(below)) => {
+            RoutedOperationCall::Retire(descriptor_from_wire("retire", &below)?)
+        }
+        None => {
+            return Err(Status::invalid_argument(
+                "an operation call names what to do",
+            ));
+        }
+    })
+}
+
+fn operation_answer_to_wire(answer: RoutedOperationAnswer) -> wire::RoutedOperationAnswer {
+    use wire::routed_operation_answer::Answer;
+    let answer = match answer {
+        RoutedOperationAnswer::Enrolled {
+            incarnation,
+            next_sequence,
+            deployment,
+        } => Answer::Enrolled(wire::RoutedEnrolled {
+            incarnation,
+            next_sequence,
+            deployment: deployment.as_bytes().to_vec(),
+        }),
+        RoutedOperationAnswer::Outcome(outcome) => {
+            let (state, attempt, commit_ts) = match outcome {
+                OperationOutcome::Committed { attempt, commit_ts } => {
+                    (wire::RoutedOperationState::Committed, attempt, commit_ts)
+                }
+                OperationOutcome::Aborted => (wire::RoutedOperationState::Aborted, 0, 0),
+                OperationOutcome::Unknown => (wire::RoutedOperationState::Unknown, 0, 0),
+                OperationOutcome::Retired => (wire::RoutedOperationState::Retired, 0, 0),
+            };
+            Answer::Outcome(wire::RoutedOutcome {
+                state: state.into(),
+                attempt,
+                commit_ts,
+            })
+        }
+        RoutedOperationAnswer::Done => Answer::Done(wire::RoutedDone {}),
+    };
+    wire::RoutedOperationAnswer {
+        answer: Some(answer),
+    }
+}
+
+fn operation_answer_from_wire(
+    answer: wire::RoutedOperationAnswer,
+) -> Result<RoutedOperationAnswer, Status> {
+    use wire::routed_operation_answer::Answer;
+    Ok(match answer.answer {
+        Some(Answer::Enrolled(enrolled)) => RoutedOperationAnswer::Enrolled {
+            incarnation: enrolled.incarnation,
+            next_sequence: enrolled.next_sequence,
+            deployment: DeploymentId::from_slice(&enrolled.deployment)
+                .ok_or_else(|| Status::internal("the leader answered a malformed deployment"))?,
+        },
+        Some(Answer::Outcome(outcome)) => RoutedOperationAnswer::Outcome(
+            match wire::RoutedOperationState::try_from(outcome.state) {
+                Ok(wire::RoutedOperationState::Committed) => OperationOutcome::Committed {
+                    attempt: outcome.attempt,
+                    commit_ts: outcome.commit_ts,
+                },
+                Ok(wire::RoutedOperationState::Aborted) => OperationOutcome::Aborted,
+                Ok(wire::RoutedOperationState::Unknown) => OperationOutcome::Unknown,
+                Ok(wire::RoutedOperationState::Retired) => OperationOutcome::Retired,
+                _ => {
+                    return Err(Status::internal(format!(
+                        "the leader answered an operation state {} this member does not know",
+                        outcome.state
+                    )));
+                }
+            },
+        ),
+        Some(Answer::Done(_)) => RoutedOperationAnswer::Done,
+        None => return Err(Status::internal("the leader answered nothing")),
     })
 }
 

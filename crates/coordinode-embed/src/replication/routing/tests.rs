@@ -67,6 +67,115 @@ impl CommandExecutor for Scripted {
         assert_eq!(rollback.transaction, handle());
         Err(Status::aborted("already ended"))
     }
+
+    /// Answers each kind of call with something that names what arrived, so
+    /// a test sees the call crossed whole.
+    fn operation(
+        &self,
+        actor: ActingContext,
+        call: RoutedOperationCall,
+    ) -> Result<RoutedOperationAnswer, Status> {
+        assert_eq!(actor, principal());
+        Ok(match call {
+            RoutedOperationCall::Enroll(issuer) => RoutedOperationAnswer::Enrolled {
+                incarnation: u64::from(issuer.0[0]),
+                next_sequence: 1,
+                deployment: deployment(),
+            },
+            RoutedOperationCall::Resolve(descriptor, Resolve::Exclude) => {
+                RoutedOperationAnswer::Outcome(OperationOutcome::Committed {
+                    attempt: descriptor.op.sequence,
+                    commit_ts: 99,
+                })
+            }
+            RoutedOperationCall::Resolve(_, Resolve::Lookup) => {
+                RoutedOperationAnswer::Outcome(OperationOutcome::Unknown)
+            }
+            RoutedOperationCall::Acknowledge(descriptors) => {
+                assert_eq!(descriptors, vec![operation(3), operation(4)]);
+                RoutedOperationAnswer::Done
+            }
+            RoutedOperationCall::Retire(below) => {
+                assert_eq!(below, operation(10));
+                RoutedOperationAnswer::Outcome(OperationOutcome::Retired)
+            }
+        })
+    }
+}
+
+fn deployment() -> DeploymentId {
+    DeploymentId([9; 16])
+}
+
+fn operation(sequence: u64) -> OperationDescriptor {
+    OperationDescriptor {
+        op: coordinode_core::txn::operation::OperationId {
+            issuer: IssuerId([5; 16]),
+            incarnation: 2,
+            sequence,
+        },
+        deployment: deployment(),
+    }
+}
+
+/// Every kind of call on operation records reaches the executing member as
+/// sent, acting for the caller, and every kind of answer comes back.
+#[tokio::test]
+async fn operation_calls_cross_both_ways() {
+    let router = serve(Arc::new(Scripted::default())).await;
+    let actor = principal();
+
+    assert_eq!(
+        router
+            .operation(&actor, RoutedOperationCall::Enroll(IssuerId([7; 16])))
+            .await
+            .expect("enrolled"),
+        RoutedOperationAnswer::Enrolled {
+            incarnation: 7,
+            next_sequence: 1,
+            deployment: deployment(),
+        }
+    );
+    assert_eq!(
+        router
+            .operation(
+                &actor,
+                RoutedOperationCall::Resolve(operation(6), Resolve::Exclude)
+            )
+            .await
+            .expect("resolved"),
+        RoutedOperationAnswer::Outcome(OperationOutcome::Committed {
+            attempt: 6,
+            commit_ts: 99,
+        })
+    );
+    assert_eq!(
+        router
+            .operation(
+                &actor,
+                RoutedOperationCall::Resolve(operation(6), Resolve::Lookup)
+            )
+            .await
+            .expect("looked up"),
+        RoutedOperationAnswer::Outcome(OperationOutcome::Unknown)
+    );
+    assert_eq!(
+        router
+            .operation(
+                &actor,
+                RoutedOperationCall::Acknowledge(vec![operation(3), operation(4)])
+            )
+            .await
+            .expect("released"),
+        RoutedOperationAnswer::Done
+    );
+    assert_eq!(
+        router
+            .operation(&actor, RoutedOperationCall::Retire(operation(10)))
+            .await
+            .expect("retired"),
+        RoutedOperationAnswer::Outcome(OperationOutcome::Retired)
+    );
 }
 
 fn handle() -> TransactionHandle {
