@@ -19577,11 +19577,9 @@ fn publish_index_build(
             "CREATE INDEX requires btree_index_registry in ExecutionContext".into(),
         ));
     };
-    if let Some(name) = &descriptor.name {
-        if registry.get(name).is_some() {
-            return Err(ctx.object_exists(CatalogObject::Index, name.clone()));
-        }
-    }
+    // A name already bound is refused by the publication itself, read in
+    // this statement's view and conditioned on still being free at commit:
+    // the in-memory registry could hold an index committed after that view.
 
     let engine = ctx.engine;
     let mut published = None;
@@ -20089,12 +20087,16 @@ fn execute_create_constraint(
         }
         return Err(ctx.object_exists(CatalogObject::Constraint, existing.name.clone()));
     }
-    if constraint.owns_index()
-        && ctx
-            .btree_index_registry
-            .is_some_and(|r| r.get(&constraint.name).is_some())
-    {
-        return Err(ctx.object_exists(CatalogObject::Index, constraint.name));
+    // Whether an index already holds the name is the catalog's to say, at
+    // the owned index's publication: the in-memory registry can hold an
+    // index committed after this statement's view, and answering "exists"
+    // from it would refuse what is only a conflict to retry.
+    if schema.as_ref().is_some_and(|s| s.candidate().is_some()) {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "the definition of :{label} is still being certified; wait for it or cancel it \
+             before adding constraint '{}'",
+            constraint.name
+        )));
     }
 
     let read_revision = schema.as_ref().map(|s| s.schema_revision);
@@ -20114,9 +20116,10 @@ fn execute_create_constraint(
     let mut published = constraint.clone();
     next.add_constraint(published.clone());
 
-    // The commit decides this authoritatively; checking here as well names
-    // the node that refuses it.
-    if constraint.checks_each_node() {
+    // A node key's commit decides this authoritatively; checking here as
+    // well names the node that refuses it. A presence or type constraint is
+    // proved in the background instead.
+    if constraint.checks_each_node() && constraint.owns_index() {
         let staged = std::collections::HashMap::new();
         if let Some(violation) =
             coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
@@ -20150,13 +20153,10 @@ fn execute_create_constraint(
         };
 
     let Some(owned) = planned.owned_index else {
-        let committed = ctx.commit_catalog_change(stage_constraint);
-        ctx.label_schema_cache.remove(label);
-        committed?;
-        // Checked on each node in the commit itself: no build, no operation.
-        let mut row = constraint_row(&published, label, ("created", true));
-        row.insert("operation".to_string(), Value::Null);
-        return Ok(vec![row]);
+        // A presence or type constraint: published validating, enforced on
+        // every write from its commit, and proved over the stored nodes by a
+        // certification of its label admitted in the same commit.
+        return create_proved_constraint(label, read_revision, next, published, shape.wait, ctx);
     };
     let def = publish_index_build(
         owned.descriptor,
@@ -20179,6 +20179,109 @@ fn execute_create_constraint(
     }
     let mut row = constraint_row(&published, label, ("created", true));
     insert_build(&mut row, &def, waited);
+    Ok(vec![row])
+}
+
+/// Publish presence or type constraint `published` of `label` validating,
+/// in `next` (the label's schema at the next revision, `read_revision` the
+/// one it was read at), with a certification of the label admitted in the
+/// same commit, and wait up to `wait` (`None`: the statement wait) for the
+/// proof. Proved, the constraint is active; refused, it is withdrawn with
+/// its name and the statement fails; outwaited, it is returned validating
+/// with its operation.
+fn create_proved_constraint(
+    label: &str,
+    read_revision: Option<u64>,
+    mut next: LabelSchema,
+    mut published: coordinode_core::schema::definition::NodeConstraint,
+    wait: Option<Duration>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use crate::index::{BuildError, IndexBuildOutcome};
+    use coordinode_core::schema::definition::{ConstraintState, LabelCandidate};
+    use coordinode_modality::{
+        IndexStore as _, LabelCertificationRecord, LocalIndexStore, LocalSchemaStore,
+        SchemaStore as _, StoreError,
+    };
+    let builds = ctx.index_builds.ok_or_else(|| {
+        ExecutionError::Unsupported(
+            "proving a constraint requires the engine's index builds".into(),
+        )
+    })?;
+    published.state = ConstraintState::Validating;
+    if let Some(constraint) = next.constraint_mut(&published.name) {
+        constraint.state = ConstraintState::Validating;
+    }
+    let engine = ctx.engine;
+    let mut operation = None;
+    let committed = ctx.commit_catalog_change_at(CatalogSync::AtAnswer, |txn| {
+        let store = LocalSchemaStore::new(engine);
+        let current = store.load_label_for_update_txn(txn, label)?;
+        if current.map(|s| s.schema_revision) != read_revision {
+            return Err(StoreError::Invariant(format!(
+                "the schema of :{label} changed while the constraint was being created; retry \
+                 the statement"
+            )));
+        }
+        let indexes = LocalIndexStore::new(engine);
+        let op = indexes.allocate_generation_txn(txn)?;
+        // The facts stay as they are; the candidate is the constraint.
+        next.set_candidate(LabelCandidate {
+            properties: next.properties.clone(),
+            mode: next.mode,
+            operation: op,
+        });
+        store.publish_candidate_txn(txn, &next)?;
+        store.claim_constraint_name_txn(txn, &published.name, label)?;
+        indexes.put_certification_txn(
+            txn,
+            &LabelCertificationRecord::accepted(op, vec![label.to_string()]),
+            None,
+        )?;
+        operation = Some(op);
+        Ok::<(), StoreError>(())
+    });
+    ctx.label_schema_cache.remove(label);
+    committed?;
+    let operation = operation.ok_or_else(|| {
+        ExecutionError::Unsupported("the constraint publication staged no certification".into())
+    })?;
+    // The statement's own transaction is open while it waits; having staged
+    // nothing, it leaves the proof's wait for older transactions.
+    ctx.txn.release_from_schema_waits();
+    builds
+        .submit_certification(operation)
+        .map_err(ExecutionError::Unsupported)?;
+    let wait = wait.unwrap_or_else(|| builds.config().statement_wait);
+    let outcome = builds.wait(operation, Some(wait))?;
+    ctx.label_schema_cache.remove(label);
+    let mut row_operation = Value::Int(operation_value(operation));
+    match outcome {
+        Some(IndexBuildOutcome::Published { .. }) => {
+            published.state = ConstraintState::Active;
+            row_operation = Value::Null;
+        }
+        Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
+            return Err(ExecutionError::SchemaViolation(format!(
+                "cannot create constraint '{}': {reason}",
+                published.name
+            )));
+        }
+        Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => return Err(v.into()),
+        Some(IndexBuildOutcome::Cancelled) => {
+            return Err(ExecutionError::CatalogRefused(format!(
+                "the proof of constraint '{}' was cancelled",
+                published.name
+            )));
+        }
+        None => {}
+    }
+    // The answer names the constraint active or validating: what the
+    // statement committed, and the proof's records up to its outcome, are
+    // made durable first, in one sync.
+    ctx.sync_for_answer()?;
+    let mut row = constraint_row(&published, label, ("created", true));
+    row.insert("operation".to_string(), row_operation);
     Ok(vec![row])
 }
 
@@ -20415,7 +20518,7 @@ fn execute_procedure_call(
 /// keys. They hold their registration from validation to apply, including a
 /// majority write, so this covers a slow replica rather than a stuck one; past
 /// it the change is refused as before.
-pub(crate) const CATALOG_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const CATALOG_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Where a catalog commit of a statement is made as durable as the
 /// statement's write concern asks.

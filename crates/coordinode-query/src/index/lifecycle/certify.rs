@@ -3,11 +3,12 @@
 //!
 //! The candidate definitions a publication changes are published in their
 //! labels' schemas beside the facts in force, with one certification for
-//! all of them admitted in the same commit. Writers from then on are held
-//! to both (`CandidateAdmits`). The executor waits for every transaction
-//! open before it to end, so each node written under the old facts alone is
-//! in the store, then checks the stored nodes against the candidates in one
-//! pass. Its last move puts in force every candidate the stored nodes
+//! all of them admitted in the same commit. That commit drains or refuses
+//! every writer still on its way under the revision before
+//! (`CandidatePublished`), and writers from then on are held to both
+//! (`CandidateAdmits`), so the executor checks the stored nodes against the
+//! candidates in one pass, with nothing written under the old facts alone
+//! still to land. Its last move puts in force every candidate the stored nodes
 //! satisfy and withdraws the others, leaving their facts in force
 //! untouched, in one commit conditioned on the record still being its own
 //! and on each label's schema as it read it.
@@ -20,7 +21,6 @@ use super::{
     BuildError, BuildPhase, Executed, GenerationId, IndexBuildOutcome, IndexBuildService, Shared,
     begin, cannot_move_here, is_contention, move_attempts, next_token, terminal_outcome, text,
 };
-use crate::index::build::{BackfillError, await_older_transactions};
 
 impl IndexBuildService {
     /// Run the certification `generation` on an executor of this process,
@@ -132,22 +132,12 @@ impl Shared {
             Ok(taken) => taken,
             Err(executed) => return Ok(executed),
         };
-        let env = self.env.as_ref();
-        self.set_phase(generation, BuildPhase::AwaitingOlderTransactions);
-        let wait = self.config.read().older_transactions_wait;
-        let refused = match await_older_transactions(env.engine(), wait, Some(&self.stopping)) {
-            Ok(()) => {
-                self.set_phase(generation, BuildPhase::Indexing { indexed: None });
-                self.prove(generation, &labels)?
-            }
-            // The record stays running under this token, and the next
-            // process to open the storage takes it over.
-            Err(BackfillError::Stopped) => return Ok(Executed::Lost),
-            Err(e) => labels
-                .iter()
-                .map(|label| (label.clone(), format!("certify :{label}: {e}")))
-                .collect(),
-        };
+        // No wait for older transactions: the publishing commit drained or
+        // refused every writer still on its way under the revision before
+        // (`CandidatePublished`), and a later one is held to the candidate.
+        // Every node the proof must see is in the store already.
+        self.set_phase(generation, BuildPhase::Indexing { indexed: None });
+        let refused = self.prove(generation, &labels)?;
         self.conclude_certification(generation, token, &labels, refused)
     }
 

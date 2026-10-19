@@ -190,6 +190,15 @@ pub trait SchemaStore {
         schema: &LabelSchema,
     ) -> StoreResult<()>;
 
+    /// Persist a revision carrying a candidate to prove over the stored
+    /// nodes, without checking them at this commit: the proof does, after
+    /// it. Writers validated under the current revision that are still on
+    /// their way to the store are waited for or refused at this commit, so
+    /// the proof reads every node they wrote; later ones read this revision
+    /// and are held to the candidate.
+    fn publish_candidate_txn(&self, txn: &mut Transaction, schema: &LabelSchema)
+    -> StoreResult<()>;
+
     /// Drop a label (DROP TABLE / DROP label) by tombstoning its
     /// current-revision pointer on the transaction. The body revisions are left
     /// in place but become unreachable, so the label resolves to "not declared"
@@ -704,6 +713,24 @@ impl SchemaStore for LocalSchemaStore<'_> {
             &schema.schema_revision.to_be_bytes(),
         )?;
         txn.note_schema_change();
+        Ok(())
+    }
+
+    fn publish_candidate_txn(
+        &self,
+        txn: &mut Transaction,
+        schema: &LabelSchema,
+    ) -> StoreResult<()> {
+        use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
+        self.save_label_admitting_txn(txn, schema)?;
+        let generation = txn.schema_generation();
+        txn.claim(Claim::new(
+            ClaimScope::LabelSchema(schema.name.clone()),
+            ClaimPredicate::CandidatePublished {
+                revision: schema.schema_revision,
+            },
+            generation,
+        ));
         Ok(())
     }
 

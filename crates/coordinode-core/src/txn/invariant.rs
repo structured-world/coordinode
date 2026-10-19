@@ -258,6 +258,15 @@ pub enum ClaimPredicate {
         /// The revision the attempt read, carrying the candidate.
         revision: u64,
     },
+    /// The attempt publishes this revision of the label's schema with a
+    /// candidate to prove over the stored nodes. The proof reads the store
+    /// after this commit, so no write validated under the previous revision
+    /// may still be on its way to the store beside it; what the commit
+    /// itself decides is nothing more.
+    CandidatePublished {
+        /// The revision being published.
+        revision: u64,
+    },
     /// The attempt makes this revision the label's schema (`0` removes it).
     /// Its result depends on every stored node of the label satisfying the
     /// new schema, so no write validated under the old one may land beside
@@ -478,6 +487,18 @@ impl Claim {
             (
                 SchemaActivated { .. },
                 SchemaRead { .. } | CandidateAdmits { .. } | SchemaActivated { .. },
+            ) => false,
+
+            // A candidate's proof reads the store once its publication is
+            // in, so a write validated under the revision before must not be
+            // on its way beside it; two publications of one label cannot
+            // both be the current one either.
+            (
+                CandidatePublished { .. },
+                SchemaRead { .. }
+                | CandidateAdmits { .. }
+                | SchemaActivated { .. }
+                | CandidatePublished { .. },
             ) => false,
 
             // Two attempts taking one value both write its entry key, and the

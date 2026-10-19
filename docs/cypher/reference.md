@@ -629,26 +629,30 @@ must have exactly that type: a float is not an `INTEGER`.
   or `23514` for a type, over the PostgreSQL wire). A second holder of a
   unique or key value fails as a unique index does: `unique constraint
   violated`, gRPC `DUPLICATE_KEY`, SQLSTATE `23505`.
-- **Creating over stored data.** `CREATE CONSTRAINT` checks every stored node
-  of the label before it returns. A node that breaks it fails the statement,
-  naming that node, and nothing is created. A transaction that wrote a node of
-  the label before the constraint existed and commits after it is refused at
-  commit; retried, it runs under the constraint.
+- **Creating over stored data.** A stored node that breaks the constraint
+  fails the statement, naming that node, and the constraint is removed. A
+  transaction that wrote a node of the label before the constraint existed
+  is waited for when it is already committing, and refused at commit
+  otherwise; retried, it runs under the constraint.
 - **Index.** A `UNIQUE` or `NODE KEY` constraint owns a unique index with the
   constraint's name. It answers lookups like any index; `DROP INDEX` refuses
   it, `DROP CONSTRAINT` removes it together with the constraint.
-- **Validating.** A `UNIQUE` or `NODE KEY` constraint is published as
-  validating, and enforced on every write from then on, while its index is
-  built over the stored nodes; it becomes active when the build finishes.
-  Stored duplicates fail the statement and remove both. A build cut short
-  (the server stopped mid-way) is finished when the database next opens,
-  on the leader in a cluster: the constraint becomes active once its index
-  holds every stored node, or, if the stored data breaks it, it is removed
-  with its index and the event is logged. While a validation is in
-  progress, `CREATE CONSTRAINT ... IF NOT EXISTS` naming it fails saying
-  the validation did not finish. While a presence or type
-  constraint is created, the commit checks every stored node of the label
-  with writes to that label held back for the duration of the scan.
+- **Validating.** A constraint is published as validating, and enforced on
+  every write from then on, while the stored nodes are checked in the
+  background: a `UNIQUE` or `NODE KEY` constraint by building its index, a
+  presence or type constraint by one pass over the nodes of the label.
+  Writes to the label are not held back meanwhile. It becomes active when
+  the check finishes; the statement waits for that up to the statement
+  wait, and past it returns the constraint validating, with its
+  `operation` to wait for or cancel. Stored data that breaks it removes
+  it (with its index), and a statement still waiting fails. A check cut
+  short (the server stopped mid-way) is finished when the database next
+  opens, on the leader in a cluster: the constraint becomes active, or, if
+  the stored data breaks it, it is removed and the event is logged. While
+  a validation is in progress, `CREATE CONSTRAINT ... IF NOT EXISTS`
+  naming it fails saying the validation did not finish, and so does
+  another constraint on the same label while a presence or type check of
+  it is running.
 - **Names.** Constraint and index names share one namespace across all
   labels. A constraint created without a name is named
   `<Label>_<properties>_<unique|not_null|node_key|type>`. `IF NOT EXISTS`
@@ -660,8 +664,8 @@ must have exactly that type: a float is not an `INTEGER`.
   `DROP CONSTRAINT ... IF EXISTS` returns `dropped: false` for a missing
   constraint; without it, a missing one fails.
 - **Results.** `CREATE CONSTRAINT` returns `constraint`, `label`,
-  `properties`, `kind` and `created`, plus `nodes_indexed` for a unique or key
-  constraint. `DROP CONSTRAINT` returns the same columns with `dropped`.
+  `properties`, `kind`, `created` and `operation` (null once active), plus
+  `nodes_indexed` for a unique or key constraint. `DROP CONSTRAINT` returns the same columns with `dropped`.
 - **Fits the definition.** A constraint that could never hold under the
   label's definition is refused: a type other than the property's declared
   type, a property that is computed, or a presence requirement on a property

@@ -728,6 +728,70 @@ fn an_unreadable_index_definition_refuses_the_open() {
     }
 }
 
+/// A presence constraint whose check outlasts the statement wait is
+/// returned validating with its operation, already enforced on writes;
+/// another constraint of the label is refused until the check ends, and the
+/// constraint is active once it does.
+#[test]
+fn a_presence_constraint_checked_past_the_wait_is_returned_validating() {
+    use coordinode_query::index::GenerationId;
+    use std::time::Duration;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (u:User {email: 'seed@x'})")
+        .expect("seed");
+    // One seat, taken by a key build waiting for a transaction opened
+    // before it: the presence check queues behind it.
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        max_running: 1,
+        statement_wait: Duration::from_millis(200),
+        ..db.index_build_config()
+    });
+    let older = db.begin_transaction();
+    db.execute_cypher("CREATE CONSTRAINT org_name FOR (o:Org) REQUIRE o.name IS UNIQUE")
+        .expect("the blocking build");
+
+    let rows = db
+        .execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("published");
+    let Some(Value::Int(operation)) = rows[0].get("operation").cloned() else {
+        panic!("a validating constraint names its operation: {rows:?}");
+    };
+    assert_eq!(
+        stored_state(&db, "User", "User_email_not_null"),
+        Some(ConstraintState::Validating)
+    );
+    let refused = db
+        .execute_cypher("CREATE (u:User {name: 'no email'})")
+        .expect_err("enforced while validating");
+    assert!(
+        refused.to_string().contains("User_email_not_null"),
+        "{refused}"
+    );
+    let second = db
+        .execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.name IS :: STRING")
+        .expect_err("the label's check is still running");
+    assert!(
+        matches!(
+            second,
+            DatabaseError::Execution(ExecutionError::CatalogRefused(ref why))
+                if why.contains("being certified")
+        ),
+        "{second}"
+    );
+
+    db.rollback_transaction(older)
+        .expect("end the older transaction");
+    let operation = GenerationId::from_raw(u64::try_from(operation).expect("operation"));
+    db.index_build(operation, Duration::from_secs(30))
+        .expect("wait");
+    assert_eq!(
+        stored_state(&db, "User", "User_email_not_null"),
+        Some(ConstraintState::Active)
+    );
+    db.execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.name IS :: STRING")
+        .expect("admitted once the check ended");
+}
+
 /// A writer that validated under the schema before the constraint and
 /// commits after it cannot slip a breaking node in: the constraint, whose
 /// scan could not see the uncommitted node, is enabled, and the writer's

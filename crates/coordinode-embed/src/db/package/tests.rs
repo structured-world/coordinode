@@ -524,15 +524,37 @@ fn a_definition_stored_nodes_break_is_withdrawn() {
     ));
 }
 
+/// Keep the next certification waiting: the executor runs one job at a
+/// time, and the build of a uniqueness on another label takes that seat and
+/// waits for a transaction the caller opened before calling, until it ends.
+fn occupy_the_only_seat(db: &Database) {
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        max_running: 1,
+        ..db.index_build_config()
+    });
+    let blocker = SchemaPackage {
+        constraints: vec![PackageConstraint {
+            name: Some("org_name".into()),
+            label: "Org".into(),
+            properties: vec!["name".into()],
+            kind: ConstraintKind::Unique,
+            scope: None,
+            on_duplicate_rename: None,
+        }],
+        ..SchemaPackage::default()
+    };
+    db.publish_schema(blocker).expect("the blocking build");
+}
+
 /// While a candidate is proved, a write is held to it as well as to the
 /// rules in force: the proof scans what was stored before, never what is
 /// written after. A conforming write lands, and the proof puts the
-/// candidate in force once the older transaction holding it ends.
+/// candidate in force once it runs.
 #[test]
 fn a_write_during_certification_is_held_to_the_candidate() {
     let (db, _dir) = open();
-    // Open before the candidate: the proof waits for it to end.
     let older = db.begin_catalog_txn();
+    occupy_the_only_seat(&db);
     let published = db.publish_schema(strict_user()).expect("publish");
     let pending = db.await_schema(&published, Duration::ZERO).expect("look");
     assert_eq!(
@@ -568,9 +590,10 @@ fn an_interrupted_certification_finishes_after_a_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let operation = {
         let db = Database::open(dir.path()).expect("open");
-        // Open before the candidate and never ended: the proof waits for
-        // it until the process closes.
+        // Never ended: the blocking build, and the proof queued behind it,
+        // wait until the process closes.
         db.begin_transaction();
+        occupy_the_only_seat(&db);
         let published = db.publish_schema(strict_user()).expect("publish");
         let pending = db.await_schema(&published, Duration::ZERO).expect("look");
         assert_eq!(
@@ -744,6 +767,7 @@ fn concurrent_publications_converge_or_conflict() {
 fn a_label_being_certified_cannot_be_changed_until_it_ends() {
     let (db, _dir) = open();
     let older = db.begin_catalog_txn();
+    occupy_the_only_seat(&db);
     let published = db.publish_schema(strict_user()).expect("publish");
     let operation = published.objects[0].operation.expect("operation");
 

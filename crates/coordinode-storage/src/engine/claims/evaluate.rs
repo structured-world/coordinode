@@ -330,6 +330,13 @@ impl<'a> Evaluation<'a> {
                 label_schema_admits_stored_nodes(engine, label, *revision, staged_points)
             }
 
+            // Publishing a candidate decides nothing over the data: its proof
+            // does, after the commit. The registry is what keeps writers
+            // under the previous revision out while it lands.
+            (ClaimScope::LabelSchema(_), ClaimPredicate::CandidatePublished { .. }) => {
+                Ok(Verdict::Holds)
+            }
+
             // The proof of a candidate covers what was stored when it began;
             // a node written after it is held to the candidate here, so the
             // records read are only the attempt's own.

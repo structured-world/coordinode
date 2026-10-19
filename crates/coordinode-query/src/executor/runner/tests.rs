@@ -5953,40 +5953,34 @@ fn drop_index_not_found_returns_error() {
     );
 }
 
+/// A name the catalog already binds is refused by the publication itself,
+/// naming the index, whatever the in-memory registry holds.
 #[test]
 fn create_index_duplicate_name_returns_error() {
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
     let (env, builds) = btree_member(engine, &interner);
-
-    // Register once.
-    let def = crate::index::IndexDescriptor::btree("dup_idx", "User", "age").bind(
-        crate::index::IndexId::from_raw(1),
-        crate::index::GenerationId::from_raw(1),
-    );
-    env.registry.register_in_memory(def);
-
     let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
+    let create = |property: &str| LogicalOp::CreateIndex {
+        name: "dup_idx".to_string(),
+        label: "User".to_string(),
+        property: property.to_string(),
+        unique: false,
+        sparse: false,
+        filter: None,
+        maintenance: None,
+        on_duplicate_rename: None,
+    };
 
-    // Attempt to CREATE INDEX with the same name again.
-    let result = execute_op(
-        &LogicalOp::CreateIndex {
-            name: "dup_idx".to_string(),
-            label: "User".to_string(),
-            property: "age".to_string(),
-            unique: false,
-            sparse: false,
-            filter: None,
-            maintenance: None,
-            on_duplicate_rename: None,
-        },
-        &mut ctx,
-    );
-    assert!(result.is_err(), "duplicate CREATE INDEX should fail");
-    let err_msg = format!("{}", result.unwrap_err());
+    execute_op(&create("age"), &mut ctx).expect("the first index");
+    let result = execute_op(&create("name"), &mut ctx);
     assert!(
-        err_msg.contains("dup_idx") || err_msg.contains("already exists"),
-        "error should mention duplicate index, got: {err_msg}"
+        matches!(
+            result,
+            Err(ExecutionError::CatalogObjectExists { object: CatalogObject::Index, ref name })
+                if name == "dup_idx"
+        ),
+        "a second index of that name is refused: {result:?}"
     );
 }
 

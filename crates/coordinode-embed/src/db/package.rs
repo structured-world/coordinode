@@ -485,11 +485,13 @@ impl Database {
                 // Every stored node is checked against the definition at the
                 // commit, with writers under the old one held out.
                 store.save_label_txn(txn, &label.schema)?;
+            } else if label.schema.candidate().is_some() {
+                // Proved in the background; writers under the revision before
+                // are drained or refused at this commit, so the proof reads
+                // every node they wrote.
+                store.publish_candidate_txn(txn, &label.schema)?;
             } else {
-                // What could refuse a stored node is proved in the background;
-                // the rest refuses none. A writer that read the old revision
-                // is refused by the pointer this moves, or committed before
-                // the proof waits for it.
+                // Refuses no stored node: nothing to prove.
                 store.save_label_admitting_txn(txn, &label.schema)?;
             }
         }

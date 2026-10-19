@@ -3677,6 +3677,11 @@ impl Database {
             id_gen: Some(&self.proposal_id_gen),
         };
         txn.note_schema_change();
+        // Writers admitted on the records this change rewrites are waited
+        // for rather than refused into, and later ones queue behind it.
+        txn.wait_for_overlapping_commits(
+            coordinode_query::executor::runner::CATALOG_ADMISSION_WAIT,
+        );
         txn.commit(&commit_ctx)
             .map_err(coordinode_query::executor::runner::catalog_commit_error)?;
         Ok(())
