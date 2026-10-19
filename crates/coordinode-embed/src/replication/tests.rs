@@ -113,6 +113,29 @@ async fn a_running_database_becomes_a_member_on_the_same_store() {
     db.shutdown().await.unwrap();
 }
 
+/// A member that has shut down has let go of its store: the host reopens the
+/// same directory at once, every time, and finds what it wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_that_shut_down_has_released_its_store() {
+    let dir = tempfile::tempdir().unwrap();
+    for round in 0..8 {
+        let db = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: the store is still held: {e}"));
+        db.database()
+            .write()
+            .execute_cypher(&format!("CREATE (:Round {{k: {round}}})"))
+            .unwrap();
+        let rows = db
+            .database()
+            .write()
+            .execute_cypher("MATCH (r:Round) RETURN r")
+            .unwrap();
+        assert_eq!(rows.len(), round + 1, "round {round}");
+        db.shutdown().await.unwrap();
+    }
+}
+
 /// The timing a member was opened with is readable from the handle.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_timing_profile_is_visible_on_the_handle() {

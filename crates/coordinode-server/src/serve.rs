@@ -1496,8 +1496,12 @@ pub(crate) async fn serve(
                 .await?;
         }
     }
-    // The member's background work stops with it.
-    drop(member);
+    // The member's background work finishes the pass it is in, then the
+    // member closes off the async runtime: closing joins its threads.
+    member.stop_background().await;
+    if let Err(e) = tokio::task::spawn_blocking(move || drop(member)).await {
+        tracing::error!(%e, "closing the database failed");
+    }
 
     if let Some(fatal) = fatal_rx.borrow().clone() {
         return Err(format!("consensus stopped on a fatal error: {fatal}").into());

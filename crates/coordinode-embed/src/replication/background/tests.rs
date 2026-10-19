@@ -18,6 +18,8 @@ struct Member {
     db: Arc<parking_lot::RwLock<Database>>,
     node: Arc<RaftNode>,
     port: u16,
+    /// Held so the resumer keeps running: a dropped sender stops it.
+    _stop: watch::Sender<bool>,
     _dir: tempfile::TempDir,
 }
 
@@ -66,11 +68,13 @@ async fn open_member(node_id: u64, port: u16, founder: Option<&Member>) -> Membe
         Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
     let db = Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap();
     let db = Arc::new(parking_lot::RwLock::new(db));
-    spawn_index_build_resumer(Arc::clone(&db), Arc::clone(&node));
+    let stop = watch::Sender::new(false);
+    spawn_index_build_resumer(Arc::clone(&db), Arc::clone(&node), stop.subscribe());
     Member {
         db,
         node,
         port,
+        _stop: stop,
         _dir: dir,
     }
 }

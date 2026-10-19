@@ -149,6 +149,9 @@ pub struct Member {
     preference: ElectionPreference,
     follower: Option<follower::IndexDefinitionFollower>,
     background: Vec<tokio::task::JoinHandle<()>>,
+    /// Tells the background tasks to finish: each stops between passes, so
+    /// none is cut off holding the database.
+    stop: tokio::sync::watch::Sender<bool>,
 }
 
 impl Member {
@@ -254,6 +257,7 @@ impl Member {
             preference,
             follower: None,
             background: Vec::new(),
+            stop: tokio::sync::watch::Sender::new(false),
         })
     }
 
@@ -276,19 +280,43 @@ impl Member {
                 Arc::clone(&self.database),
                 Arc::clone(&self.node),
                 trigger_dispatch_interval,
+                self.stop.subscribe(),
             ));
         }
         self.background.push(background::spawn_index_build_resumer(
             Arc::clone(&self.database),
             Arc::clone(&self.node),
+            self.stop.subscribe(),
         ));
         // A member that stands last leads only while no other member can, and
         // gives the lead back once another has caught up.
         if self.preference == ElectionPreference::Last && self.handler.is_some() {
             let node = Arc::clone(&self.node);
+            let mut stop = self.stop.subscribe();
             self.background.push(tokio::spawn(async move {
-                node.yield_leadership_when_caught_up().await;
+                tokio::select! {
+                    () = node.yield_leadership_when_caught_up() => {}
+                    () = background::stopped(&mut stop) => {}
+                }
             }));
+        }
+    }
+
+    /// Stop the background work and wait for it: each task finishes the pass
+    /// it is in and lets go of the database, and the index definition
+    /// follower is joined.
+    pub async fn stop_background(&mut self) {
+        self.stop.send_replace(true);
+        for task in self.background.drain(..) {
+            if let Err(e) = task.await {
+                tracing::error!(%e, "a member background task failed");
+            }
+        }
+        if let Some(follower) = self.follower.take() {
+            // Joining its thread blocks: off the async runtime.
+            if let Err(e) = tokio::task::spawn_blocking(move || drop(follower)).await {
+                tracing::error!(%e, "stopping the index definition follower failed");
+            }
         }
     }
 
@@ -661,26 +689,42 @@ impl ReplicatedDatabase {
     }
 
     /// Stop the member: hand leadership over when it leads and other voters
-    /// can take it, stop consensus, then the listener.
+    /// can take it, stop consensus, then the listener, then the background
+    /// work, and close the store. Once this returns the store is released,
+    /// so the host can reopen the same directory at once.
     ///
     /// # Errors
     ///
-    /// [`ReplicationError::Consensus`] when consensus does not stop cleanly.
+    /// [`ReplicationError::Consensus`] when consensus does not stop cleanly;
+    /// the store is released either way.
     pub async fn shutdown(mut self) -> Result<(), ReplicationError> {
         let stopped = self.member.node.shutdown().await;
         if let Some((stop, mut task)) = self.listener.take() {
             // Dropping the sender stops the accept loop, but the server then
             // holds the listener until every open connection closes, and
             // peers keep idle channels open indefinitely. A short grace for
-            // calls in flight, then the task is aborted, which drops the
-            // listener and frees the port for a reopen on the same address.
+            // calls in flight, then the task is aborted and awaited, which
+            // drops the listener (freeing the port) and the services it
+            // routes to, which hold the store.
             drop(stop);
             if tokio::time::timeout(LISTENER_DRAIN, &mut task)
                 .await
                 .is_err()
             {
                 task.abort();
+                match task.await {
+                    Err(e) if !e.is_cancelled() => {
+                        tracing::error!(%e, "the inter-node listener failed while stopping");
+                    }
+                    _ => {}
+                }
             }
+        }
+        self.member.stop_background().await;
+        // The last handles on the store: closing the database joins its
+        // threads, which blocks, so it runs off the async runtime.
+        if let Err(e) = tokio::task::spawn_blocking(move || drop(self)).await {
+            tracing::error!(%e, "closing the database failed");
         }
         Ok(stopped?)
     }

@@ -8,19 +8,31 @@ use std::time::Duration;
 
 use coordinode_raft::cluster::RaftNode;
 use parking_lot::RwLock;
+use tokio::sync::watch;
 
 use crate::Database;
 
 /// A failed attempt is tried again after this, not at the next apply.
 const RETRY: Duration = Duration::from_secs(5);
 
+/// Resolves once the member is told to stop, or its handle is gone.
+pub(super) async fn stopped(stop: &mut watch::Receiver<bool>) {
+    // A dropped sender is a stop too: nothing will send one any more.
+    while !*stop.borrow_and_update() {
+        if stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Watch `raft_node`'s leadership and, each time this member becomes the
 /// leader, finish the builds left unfinished: those a process left when it
 /// stopped, and those a former leader held when it lost the lead. Ends when
-/// the node is dropped.
+/// the node is dropped or `stop` says so, never in the middle of a pass.
 pub(super) fn spawn_index_build_resumer(
     database: Arc<RwLock<Database>>,
     raft_node: Arc<RaftNode>,
+    mut stop: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let mut applied = raft_node.subscribe_applied();
     tokio::spawn(async move {
@@ -30,7 +42,13 @@ pub(super) fn spawn_index_build_resumer(
         loop {
             // A new leader's first entry is among the applied ones, so
             // looking at each catches every change of leader.
-            if !std::mem::take(&mut look_now) && applied.changed().await.is_err() {
+            if !std::mem::take(&mut look_now) {
+                tokio::select! {
+                    changed = applied.changed() => if changed.is_err() { break },
+                    () = stopped(&mut stop) => break,
+                }
+            }
+            if *stop.borrow() {
                 break;
             }
             if raft_node.current_leader() != Some(raft_node.node_id()) {
@@ -65,17 +83,24 @@ pub(super) fn spawn_index_build_resumer(
                     tokio::select! {
                         changed = applied.changed() => if changed.is_err() { break },
                         () = tokio::time::sleep(RETRY) => {}
+                        () = stopped(&mut stop) => break,
                     }
                     look_now = true;
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(%e, "taking up unfinished index builds failed; retrying");
-                    tokio::time::sleep(RETRY).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(RETRY) => {}
+                        () = stopped(&mut stop) => break,
+                    }
                     look_now = true;
                 }
                 Err(e) => {
                     tracing::warn!(%e, "index build resumer task join error");
-                    tokio::time::sleep(RETRY).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(RETRY) => {}
+                        () = stopped(&mut stop) => break,
+                    }
                     look_now = true;
                 }
             }
@@ -93,11 +118,13 @@ pub(super) fn spawn_index_build_resumer(
 /// trigger enabled, the entry a new leader appends) and by the earliest retry
 /// the last pass left scheduled; with nothing queued it sleeps. Passes are at
 /// least `interval` apart. The blocking dispatch runs off the async runtime,
-/// so a long body never stalls consensus.
+/// so a long body never stalls consensus. Ends when the node is dropped or
+/// `stop` says so, never in the middle of a pass.
 pub(super) fn spawn_trigger_dispatch(
     database: Arc<RwLock<Database>>,
     raft_node: Arc<RaftNode>,
     interval: Duration,
+    mut stop: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let mut applied = raft_node.subscribe_applied();
     tokio::spawn(async move {
@@ -110,6 +137,10 @@ pub(super) fn spawn_trigger_dispatch(
                     }
                 }
                 _ = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {}
+                () = stopped(&mut stop) => break,
+            }
+            if *stop.borrow() {
+                break;
             }
             due = None;
             if raft_node.current_leader() != Some(raft_node.node_id()) {
