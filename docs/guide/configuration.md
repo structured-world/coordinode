@@ -769,6 +769,14 @@ Without `--config` they operate on a single endpoint at `--data` (default
 `./data`) — correct only for single-disk nodes. With `--config`, `--data` is
 ignored and the topology comes from the file.
 
+A server node's store keeps its group's history. `backup`, `verify`,
+`checkpoint` and `compact` open it as the node itself does and read or
+maintain it in place. `restore` writes, and an offline write into one member
+would never reach the rest of the group, so `restore` into a group member's
+store is refused, naming the group, and the store is left as it was. Restore
+into an empty directory instead and start the node on it: it forms its group
+from that data, and the other members join it empty.
+
 ## Retention and time-travel
 
 MVCC keeps superseded versions so `AS OF TIMESTAMP` queries can read the past

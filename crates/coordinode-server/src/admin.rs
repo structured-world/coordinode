@@ -52,6 +52,22 @@ pub(crate) fn admin_open_engine(
     Ok(coordinode_storage::engine::core::StorageEngine::open_with_oracle(config, oracle)?)
 }
 
+/// Open the store for an offline command that only reads it, as the store's
+/// writer opens it: a store outside any group replays its journal, a group
+/// member's store opens as the member does, so nothing is written outside the
+/// group's log.
+pub(crate) fn admin_open_for_reading(
+    config: &coordinode_storage::engine::config::StorageConfig,
+) -> Result<coordinode_storage::engine::core::StorageEngine, Box<dyn std::error::Error>> {
+    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    match coordinode_storage::engine::core::StorageEngine::open_embedded(config, oracle) {
+        Err(coordinode_storage::error::StorageError::GroupMemberStore { .. }) => {
+            admin_open_engine(config)
+        }
+        opened => Ok(opened?),
+    }
+}
+
 /// The raft-snapshot backup frame's mode byte: a whole database, framed with
 /// the deployment identity its operation records belong to.
 const SNAPSHOT_MODE_FULL: u8 = 2;
@@ -79,10 +95,12 @@ pub(crate) fn run_backup(
     );
 
     let storage_config = admin_storage_config(config_path.as_deref(), &data_dir)?;
-    let db = coordinode_embed::Database::open_with_config(storage_config)
-        .map_err(|e| format!("failed to open database: {e}"))?;
+    let engine = std::sync::Arc::new(
+        admin_open_for_reading(&storage_config)
+            .map_err(|e| format!("failed to open database: {e}"))?,
+    );
 
-    let snapshot = db.engine().snapshot();
+    let snapshot = engine.snapshot();
     let shard_id = 1u16;
 
     // Readable too: the raft-snapshot format reads its body back to checksum it.
@@ -96,14 +114,13 @@ pub(crate) fn run_backup(
     let mut writer = std::io::BufWriter::new(file);
     // Taken after the snapshot: it covers every binding the snapshot's
     // records use.
-    let dictionary = db
-        .interner()
+    let dictionary = coordinode_storage::engine::metadata::load_field_dictionary(&engine)
         .map_err(|e| format!("read the field dictionary: {e}"))?;
 
     let stats = match format {
         coordinode_embed::backup::BackupFormat::Json => {
             coordinode_embed::backup::export::export_json(
-                db.engine(),
+                &engine,
                 &dictionary,
                 shard_id,
                 &snapshot,
@@ -113,7 +130,7 @@ pub(crate) fn run_backup(
         }
         coordinode_embed::backup::BackupFormat::Cypher => {
             coordinode_embed::backup::export::export_cypher(
-                db.engine(),
+                &engine,
                 &dictionary,
                 shard_id,
                 &snapshot,
@@ -123,7 +140,7 @@ pub(crate) fn run_backup(
         }
         coordinode_embed::backup::BackupFormat::Binary => {
             coordinode_embed::backup::export::export_binary(
-                db.engine(),
+                &engine,
                 &dictionary,
                 shard_id,
                 &snapshot,
@@ -152,7 +169,7 @@ pub(crate) fn run_backup(
                 .map_err(|e| format!("serialize the field dictionary: {e}"))?;
             let interner_len = u32::try_from(interner_bytes.len())
                 .map_err(|_| "field interner too large to frame".to_string())?;
-            let deployment = coordinode_storage::engine::metadata::bound_deployment(db.engine())
+            let deployment = coordinode_storage::engine::metadata::bound_deployment(&engine)
                 .map_err(|e| format!("read the deployment identity: {e}"))?;
             let mut domain = [0u8; 17];
             if let Some(id) = deployment {
@@ -173,7 +190,7 @@ pub(crate) fn run_backup(
                 // Read from the live store while writes go on, so no
                 // inventory matches it exactly: a restore checks every index
                 // copy before using it.
-                coordinode_raft::snapshot::write_full_snapshot(db.engine(), None, &mut file)
+                coordinode_raft::snapshot::write_full_snapshot(&engine, None, &mut file)
                     .map_err(|e| format!("backup failed: {e}"))?;
             info!(
                 interner_bytes = interner_bytes.len(),

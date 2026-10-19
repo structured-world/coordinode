@@ -76,6 +76,156 @@ fn raft_snapshot_round_trips_data_and_interner() {
     assert_eq!(all.len(), 2, "both users restored");
 }
 
+/// A server node's store keeps its group's history; the offline backup reads
+/// it as the node itself opens it, writing nothing outside the group's log,
+/// and the image restores into a fresh directory.
+#[test]
+fn a_member_store_is_backed_up_offline() {
+    use coordinode_embed::replication::{MemberOptions, ReplicatedDatabase};
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let (src_dir, dst_dir) = (dir.path().join("src"), dir.path().join("dst"));
+    let backup = dir.path().join("db.snap");
+    let storage = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        &src_dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            let member = ReplicatedDatabase::open(&storage, MemberOptions::new(1), None)
+                .await
+                .expect("open the member");
+            member
+                .database()
+                .write()
+                .execute_cypher("CREATE (:User {name: 'Alice', age: 30})")
+                .expect("create alice");
+            member.shutdown().await.expect("shut down");
+        });
+
+    let format = std::ffi::OsStr::new("raft-snapshot");
+    coordinode(&[
+        "backup".as_ref(),
+        "--data".as_ref(),
+        src_dir.as_os_str(),
+        "--output".as_ref(),
+        backup.as_os_str(),
+        "--format".as_ref(),
+        format,
+    ]);
+    coordinode(&[
+        "restore".as_ref(),
+        "--data".as_ref(),
+        dst_dir.as_os_str(),
+        "--input".as_ref(),
+        backup.as_os_str(),
+        "--format".as_ref(),
+        format,
+    ]);
+    let mut dst = Database::open(&dst_dir).expect("open dst");
+    let alice = dst
+        .execute_cypher("MATCH (n:User {name: 'Alice'}) RETURN n.age")
+        .expect("query alice");
+    assert_eq!(alice.len(), 1, "the member's data is in the image");
+    assert_eq!(alice[0].get("n.age"), Some(&Value::Int(30)));
+}
+
+/// An offline restore into a group member's store is refused, naming the
+/// group: it would write into one member outside the group's log. The store
+/// is left as it was.
+#[test]
+fn an_offline_restore_into_a_member_store_is_refused() {
+    use coordinode_embed::replication::{MemberOptions, ReplicatedDatabase};
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let (src_dir, member_dir) = (dir.path().join("src"), dir.path().join("member"));
+    let backup = dir.path().join("db.snap");
+    {
+        let mut src = Database::open(&src_dir).expect("open src");
+        src.execute_cypher("CREATE (:User {name: 'Bob'})")
+            .expect("create bob");
+    }
+    let storage = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        &member_dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let member = ReplicatedDatabase::open(&storage, MemberOptions::new(1), None)
+            .await
+            .expect("open the member");
+        member
+            .database()
+            .write()
+            .execute_cypher("CREATE (:User {name: 'Alice'})")
+            .expect("create alice");
+        member.shutdown().await.expect("shut down");
+    });
+
+    let format = std::ffi::OsStr::new("raft-snapshot");
+    coordinode(&[
+        "backup".as_ref(),
+        "--data".as_ref(),
+        src_dir.as_os_str(),
+        "--output".as_ref(),
+        backup.as_os_str(),
+        "--format".as_ref(),
+        format,
+    ]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coordinode"))
+        .arg("restore")
+        .arg("--data")
+        .arg(&member_dir)
+        .arg("--input")
+        .arg(&backup)
+        .arg("--format")
+        .arg(format)
+        .arg("--force")
+        .output()
+        .expect("run coordinode restore");
+    assert!(
+        !output.status.success(),
+        "a member's store was restored into"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("member of a replicated group"),
+        "the refusal names the group, got: {stderr}"
+    );
+
+    runtime.block_on(async {
+        let member = ReplicatedDatabase::open(&storage, MemberOptions::new(1), None)
+            .await
+            .expect("reopen the member");
+        let names = member
+            .database()
+            .write()
+            .execute_cypher("MATCH (n:User) RETURN n.name")
+            .expect("read");
+        assert_eq!(names.len(), 1, "the member holds only its own history");
+        assert_eq!(names[0].get("n.name"), Some(&Value::String("Alice".into())));
+        member.shutdown().await.expect("shut down");
+    });
+}
+
 /// A restored image carries its operation outcomes and admits nothing new
 /// under a descriptor issued before the restore: a committed write resolves
 /// as committed and its retry runs nothing, an unused number is refused, the

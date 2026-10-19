@@ -807,6 +807,15 @@ impl StorageEngine {
         let oplog = match journal_config {
             Some(jcfg) => match config.select_oplog_endpoint(0) {
                 Ok(endpoint) => {
+                    // A store whose history is a group's log is refused
+                    // before its log is opened as a journal: an entry written
+                    // here would never reach the group.
+                    if let Some(evidence) = group_history_evidence(&endpoint.path, &trees)? {
+                        return Err(StorageError::GroupMemberStore {
+                            path: config.data_dir().display().to_string(),
+                            evidence,
+                        });
+                    }
                     let dir = endpoint.path.join("oplog").join("0");
                     let mut journal = EmbeddedOplog::open(
                         &dir,
@@ -934,13 +943,11 @@ impl StorageEngine {
         // ── Member-local journal: open + crash recovery ─────────────────────
         // A store whose log is a consensus log keeps this member's own records
         // in a journal of their own, replayed here, before anything reads them.
-        // A store with its own journal records them there instead; one that
-        // ran in a group before still replays what that left, and the store
-        // folds it into its trees once open (`drain_local_journal`).
+        // A store with its own journal records them there instead.
         let local_journal = match config.select_oplog_endpoint(0) {
             Ok(endpoint) => {
                 let dir = crate::engine::local_journal::LocalJournal::dir(&endpoint.path);
-                if oplog.is_none() || dir.exists() {
+                if oplog.is_none() {
                     Some(crate::engine::local_journal::LocalJournal::open(
                         &dir,
                         &OplogJournalConfig::from(config),
@@ -1270,7 +1277,7 @@ impl StorageEngine {
         // An open refused above leaves the old marker, so the store it
         // refused stays as its writer left it.
         crate::format::settle(&format)?;
-        let mut engine = Self {
+        let engine = Self {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
             coordinator,
@@ -1317,32 +1324,7 @@ impl StorageEngine {
             open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
             space: Arc::new(crate::engine::space::SpaceGuard::new(config)),
         };
-        engine.drain_local_journal()?;
         Ok(engine)
-    }
-
-    /// On a store with its own journal, fold what a member-local journal
-    /// left (the store ran in a group before) into the trees, flush them and
-    /// retire that journal: from here on the store's journal carries this
-    /// member's records.
-    fn drain_local_journal(&mut self) -> StorageResult<()> {
-        if self.oplog.is_none() {
-            return Ok(());
-        }
-        let Some(local) = self.local_journal.take() else {
-            return Ok(());
-        };
-        drop(self.local_flusher.take());
-        // The trees' flushes sync only the store's journal: the local one is
-        // synced first, so no table takes an entry it could still lose.
-        local.sync()?;
-        let at = self.next_seqno();
-        local.compact(self.coordinator.trees(), at, |tree| {
-            self.flush_memtables(tree)
-        })?;
-        // Every tree now covers it durably, so a later open has nothing to
-        // replay and no journal to drain again.
-        local.retire()
     }
 
     /// The free-space guard: new writes are refused while it is paused, and
@@ -5559,6 +5541,27 @@ fn remove_capture_with(fs: &dyn lsm_tree::fs::Fs, dir: &Path) -> StorageResult<(
         Err(e) if e.kind() == lsm_tree::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(StorageError::Io(format!("remove {dir:?}: {e}"))),
     }
+}
+
+/// What shows that the store at `endpoint`, with `trees`, keeps a replicated
+/// group's history, or `None` when nothing does. A member creates its
+/// member-local journal when it first opens, before it writes any entry of
+/// the group's log, and every entry it applies leaves Raft coverage in the
+/// trees it reaches.
+fn group_history_evidence(
+    endpoint: &Path,
+    trees: &HashMap<Partition, lsm_tree::AnyTree>,
+) -> StorageResult<Option<&'static str>> {
+    if crate::engine::local_journal::LocalJournal::dir(endpoint).exists() {
+        return Ok(Some("it holds a member-local journal"));
+    }
+    for tree in trees.values() {
+        let raft = TreeCoverage::read(tree, Domain::Raft)?;
+        if raft.has_record() || raft.marked_indices().next().is_some() {
+            return Ok(Some("its trees hold entries of a group's log"));
+        }
+    }
+    Ok(None)
 }
 
 fn read_rebuild_intents(data_dir: &Path) -> StorageResult<Vec<Partition>> {

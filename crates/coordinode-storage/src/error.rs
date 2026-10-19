@@ -88,6 +88,21 @@ pub enum StorageError {
     )]
     CoverageUnprovable { path: String, entries: usize },
 
+    /// The store keeps a replicated group's history, and was opened with a
+    /// journal of its own, as a store outside any group is: it would write
+    /// outside the group's log. It opens only as a member of its group, in a
+    /// build with the replication capability.
+    #[error(
+        "the store at {path} is a member of a replicated group ({evidence}); open it as a \
+         member of its group, in a build with replication"
+    )]
+    GroupMemberStore {
+        /// The store's data directory.
+        path: String,
+        /// What shows the store keeps a group's history.
+        evidence: &'static str,
+    },
+
     /// A copy of a partition stands behind this node's Raft applies:
     /// installing it would lose the entries in between, which this node
     /// has applied already and will not apply again. A peer further along,

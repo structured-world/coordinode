@@ -1674,10 +1674,12 @@ fn a_segment_lost_from_the_middle_of_the_member_local_journal_is_refused() {
     );
 }
 
-/// A store that ran in a group and is opened with its own journal keeps the
-/// records the member-local journal still held, and retires that journal.
+/// A store that ran in a group is refused when opened with a journal of its
+/// own, as a store outside any group is: it would write outside the group's
+/// log. The refusal changes nothing, and the store opens as a member again
+/// with its records.
 #[test]
-fn a_store_leaving_a_group_keeps_the_member_records_and_retires_their_journal() {
+fn a_member_store_is_refused_an_own_journal_and_left_as_it_was() {
     let rig = PowerRig::new();
     let config = rig.config();
     let engine = rig.open_group(&config).expect("open");
@@ -1685,20 +1687,18 @@ fn a_store_leaving_a_group_keeps_the_member_records_and_retires_their_journal() 
         .commit_local(vec![member_put(b"vote", b"v3")], LocalSync::BeforeUse)
         .expect("commit");
     rig.cut(engine);
-    let (engine, _) = rig.open_with(&config);
-    assert_eq!(
-        engine
-            .get(Partition::Raft, b"vote")
-            .expect("get")
-            .as_deref(),
-        Some(b"v3".as_slice())
+    let refused = StorageEngine::open_embedded(&config, Arc::new(TimestampOracle::new()));
+    assert!(
+        matches!(refused, Err(StorageError::GroupMemberStore { .. })),
+        "a member's store opened with its own journal, got {:?}",
+        refused.err()
     );
     assert!(
-        !local_journal_dir(&config).exists(),
-        "the member-local journal was left behind"
+        !config.endpoints[0].path.join("oplog").join("0").exists(),
+        "the refused open started a journal of its own"
     );
-    rig.cut(engine);
-    let (engine, _) = rig.open_with(&config);
+    assert!(local_journal_dir(&config).exists());
+    let engine = rig.open_group(&config).expect("reopen as a member");
     assert_eq!(
         engine
             .get(Partition::Raft, b"vote")

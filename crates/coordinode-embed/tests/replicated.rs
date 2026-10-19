@@ -1093,3 +1093,79 @@ async fn an_operation_keeps_its_outcome_across_a_leader_change() {
     .await;
     assert!(result.is_ok(), "TIMED OUT");
 }
+
+/// Open `dir` without replication and write to it; the refusal it meets.
+async fn open_outside_the_group(dir: &Path) -> Option<DatabaseError> {
+    let path = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        Database::open(&path)
+            .and_then(|mut db| db.execute_cypher("CREATE (:Outside {k: 1})"))
+            .err()
+    })
+    .await
+    .unwrap()
+}
+
+/// A store whose history is a group's log is opened only as a member: the
+/// non-replicated open refuses it, naming why, and writes nothing, so no
+/// write lands outside the log and the member reopens with everything it
+/// held. The trees alone show it when the member-local journal is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_store_is_refused_by_the_non_replicated_open() {
+    use coordinode_storage::error::StorageError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let member = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+        .await
+        .unwrap();
+    member
+        .database()
+        .write()
+        .execute_cypher("CREATE (:InTheLog {k: 1})")
+        .unwrap();
+    member.shutdown().await.unwrap();
+
+    let refused = open_outside_the_group(dir.path()).await;
+    assert!(
+        matches!(
+            refused,
+            Some(DatabaseError::Storage(StorageError::GroupMemberStore {
+                evidence: "it holds a member-local journal",
+                ..
+            }))
+        ),
+        "a member's store opened without its group, got {refused:?}"
+    );
+    std::fs::remove_dir_all(dir.path().join("local-journal")).unwrap();
+    let refused = open_outside_the_group(dir.path()).await;
+    assert!(
+        matches!(
+            refused,
+            Some(DatabaseError::Storage(StorageError::GroupMemberStore {
+                evidence: "its trees hold entries of a group's log",
+                ..
+            }))
+        ),
+        "a member's store without its local journal, got {refused:?}"
+    );
+
+    let member = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        count(&member, "InTheLog"),
+        1,
+        "the member keeps its history"
+    );
+    assert_eq!(
+        count(&member, "Outside"),
+        0,
+        "no write landed outside the log"
+    );
+    member
+        .database()
+        .write()
+        .execute_cypher("CREATE (:Later {k: 1})")
+        .unwrap();
+    member.shutdown().await.unwrap();
+}
