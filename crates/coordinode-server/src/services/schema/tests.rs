@@ -1209,17 +1209,13 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
     {
         use coordinode_core::schema::computed::{ComputedSpec, TtlScope};
         use coordinode_core::schema::definition::PropertyType;
-        use coordinode_storage::engine::partition::Partition;
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 
         let db = svc.database.write();
-        let key = coordinode_core::schema::definition::encode_label_schema_key("Session", 1);
-        let bytes = db
-            .engine()
-            .get(Partition::Schema, &key)
-            .expect("storage get")
+        let schema = LocalSchemaStore::new(db.engine())
+            .load_label("Session")
+            .expect("load")
             .expect("Session schema must be persisted");
-        let schema = coordinode_core::schema::definition::LabelSchema::from_msgpack(&bytes)
-            .expect("deserialize");
 
         let ttl_prop = schema
             .get_property("_ttl")
@@ -1409,20 +1405,17 @@ async fn strict_mode_set_unknown_property_rejected() {
     .await
     .expect("create_label should succeed");
 
-    // Verify schema was persisted with STRICT mode.
+    // Verify the definition in force is STRICT.
     {
         use coordinode_core::schema::definition::SchemaMode;
-        use coordinode_storage::engine::partition::Partition;
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 
         let db = svc.database.write();
-        let key = coordinode_core::schema::definition::encode_label_schema_key("User", 1);
-        let bytes = db
-            .engine()
-            .get(Partition::Schema, &key)
-            .expect("storage get")
+        let schema = LocalSchemaStore::new(db.engine())
+            .load_label("User")
+            .expect("load")
             .expect("User schema must be persisted");
-        let schema = coordinode_core::schema::definition::LabelSchema::from_msgpack(&bytes)
-            .expect("deserialize");
+        assert!(schema.candidate().is_none(), "proved and in force");
         assert_eq!(
             schema.mode,
             SchemaMode::Strict,

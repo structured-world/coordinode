@@ -208,6 +208,21 @@ pub enum CommitError {
         /// The most stored rows one proof reads.
         limit: u64,
     },
+    /// A node this attempt writes breaks the candidate definition of its
+    /// label that is being proved. Nothing was applied; retrying the same
+    /// write is refused the same way.
+    #[error(
+        "node {node} breaks the definition of :{label} being certified ({reason})",
+        node = node.as_raw()
+    )]
+    CandidateViolation {
+        /// The label.
+        label: String,
+        /// The node written.
+        node: coordinode_core::graph::node::NodeId,
+        /// What it breaks.
+        reason: String,
+    },
 }
 
 /// Map a storage [`Partition`] to its wire [`PartitionId`] for Raft proposals.
@@ -1268,6 +1283,19 @@ impl<'a> Transaction<'a> {
                         ),
                     });
                 }
+                Verdict::Violates(violation) => {
+                    let label = match &claim.scope {
+                        coordinode_core::txn::invariant::ClaimScope::LabelSchema(label) => {
+                            label.clone()
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    return Err(CommitError::CandidateViolation {
+                        label,
+                        node: violation.node,
+                        reason: violation.reason,
+                    });
+                }
                 Verdict::HeldBy { holder, values } => {
                     return Err(match &claim.scope {
                         coordinode_core::txn::invariant::ClaimScope::UniqueValue {
@@ -1366,7 +1394,7 @@ impl<'a> Transaction<'a> {
                 }
                 Verdict::Holds => {}
                 // Not a verdict this read gives; not a pass either.
-                other @ (Verdict::Broken | Verdict::Undecidable) => {
+                other @ (Verdict::Broken | Verdict::Undecidable | Verdict::Violates(_)) => {
                     return Err(CommitError::InvariantRefused {
                         reason: format!("unique values of {generation} decided {other:?}"),
                     });
@@ -1392,6 +1420,17 @@ impl<'a> Transaction<'a> {
         self.schema_reads.insert(Claim::new(
             coordinode_core::txn::invariant::ClaimScope::LabelSchema(label.to_string()),
             coordinode_core::txn::invariant::ClaimPredicate::SchemaRead { revision },
+            self.schema_generation,
+        ));
+    }
+
+    /// Record that the schema of `label` this attempt read at `revision`
+    /// carries a candidate being proved. If the attempt writes, every node
+    /// it writes under the label must satisfy the candidate too.
+    pub fn note_label_candidate_read(&mut self, label: &str, revision: u64) {
+        self.schema_reads.insert(Claim::new(
+            coordinode_core::txn::invariant::ClaimScope::LabelSchema(label.to_string()),
+            coordinode_core::txn::invariant::ClaimPredicate::CandidateAdmits { revision },
             self.schema_generation,
         ));
     }

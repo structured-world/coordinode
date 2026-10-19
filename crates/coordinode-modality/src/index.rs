@@ -48,7 +48,8 @@ use coordinode_storage::error::StorageError;
 use crate::error::{StoreError, StoreResult};
 use crate::index_def::{
     CopyQualification, DuplicateRepairRecord, GenerationId, IndexBuildRecord, IndexDefinition,
-    IndexDescriptor, IndexId, IndexIntegrityRecord, IndexProfile, NamespaceIndexPolicy,
+    IndexDescriptor, IndexId, IndexIntegrityRecord, IndexProfile, LabelCertificationRecord,
+    NamespaceIndexPolicy,
 };
 
 /// One label's members in one shard of a label lookup: what
@@ -543,6 +544,37 @@ pub trait IndexStore {
         &self,
         txn: &mut Transaction,
         record: &IndexBuildRecord,
+        version: Option<u64>,
+    ) -> StoreResult<()>;
+
+    /// The record of the certification `generation` with the version of the
+    /// same write, read together.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn load_certification(
+        &self,
+        generation: GenerationId,
+    ) -> StoreResult<Option<(LabelCertificationRecord, u64)>>;
+
+    /// Every certification record in generation order.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn list_certifications(&self) -> StoreResult<Vec<LabelCertificationRecord>>;
+
+    /// Stage `record`, only while the stored record of its generation is at
+    /// `version` when it commits (`None`: while there is none).
+    ///
+    /// # Errors
+    ///
+    /// A storage or encoding failure.
+    fn put_certification_txn(
+        &self,
+        txn: &mut Transaction,
+        record: &LabelCertificationRecord,
         version: Option<u64>,
     ) -> StoreResult<()>;
 
@@ -1464,6 +1496,47 @@ impl IndexStore for LocalIndexStore<'_> {
             Partition::Schema,
             &key,
             &encode("index build record", record)?,
+        )?;
+        Ok(())
+    }
+
+    fn load_certification(
+        &self,
+        generation: GenerationId,
+    ) -> StoreResult<Option<(LabelCertificationRecord, u64)>> {
+        self.engine
+            .get_versioned(
+                Partition::Schema,
+                &LabelCertificationRecord::key_of(generation),
+            )?
+            .map(|(bytes, version)| Ok((decode("certification record", &bytes)?, version)))
+            .transpose()
+    }
+
+    fn list_certifications(&self) -> StoreResult<Vec<LabelCertificationRecord>> {
+        let mut out = Vec::new();
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, LabelCertificationRecord::PREFIX)?
+        {
+            let (key, value) = guard.into_inner()?;
+            out.push(decode_catalog("certification record", &key, &value)?);
+        }
+        Ok(out)
+    }
+
+    fn put_certification_txn(
+        &self,
+        txn: &mut Transaction,
+        record: &LabelCertificationRecord,
+        version: Option<u64>,
+    ) -> StoreResult<()> {
+        let key = LabelCertificationRecord::key_of(record.generation);
+        txn.expect_version(Partition::Schema, &key, version)?;
+        txn.put(
+            Partition::Schema,
+            &key,
+            &encode("certification record", record)?,
         )?;
         Ok(())
     }

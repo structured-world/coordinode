@@ -2221,6 +2221,10 @@ impl Database {
                     ),
                 },
             },
+            // Not retryable: the node written breaks a rule being certified.
+            e @ CommitError::CandidateViolation { .. } => DatabaseError::Execution(
+                coordinode_query::executor::runner::ExecutionError::SchemaViolation(e.to_string()),
+            ),
             // Retryable once the build is done.
             CommitError::UniquenessUnresolved { generation, limit } => {
                 let index = self

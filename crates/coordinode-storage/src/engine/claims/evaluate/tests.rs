@@ -765,6 +765,76 @@ fn an_activation_is_decided_by_the_stored_nodes_of_its_label() {
     assert_eq!(decide_with(&engine, &points), Verdict::Broken);
 }
 
+/// A write under a schema carrying a candidate is held to the candidate:
+/// only the attempt's own nodes of the label are read, a stored node that
+/// breaks the candidate is the proof's concern, and a revision whose
+/// candidate is gone holds nothing more.
+#[test]
+fn a_candidate_holds_only_the_nodes_the_attempt_writes() {
+    use coordinode_core::graph::node::{NodeRecord, encode_node_key};
+    use coordinode_core::index::identity::GenerationId;
+    use coordinode_core::schema::definition::{LabelCandidate, LabelSchema, SchemaMode};
+
+    let (engine, _d) = engine();
+    let mut schema = LabelSchema::new_node_id("Doc");
+    schema.set_mode(SchemaMode::Flexible);
+    schema.set_candidate(LabelCandidate {
+        properties: std::collections::BTreeMap::new(),
+        mode: SchemaMode::Strict,
+        operation: GenerationId::from_raw(7),
+    });
+    store_label_schema(&engine, &schema);
+    let claim = schema_claim(
+        "Doc",
+        ClaimPredicate::CandidateAdmits {
+            revision: schema.schema_revision,
+        },
+    );
+    let loose = |labels: Vec<&str>| {
+        let mut record = NodeRecord::with_labels(labels.into_iter().map(String::from).collect());
+        record.set_extra("x", coordinode_core::graph::types::Value::Int(1));
+        record.to_msgpack().expect("encode")
+    };
+
+    // Stored before, breaking the candidate: the proof's to find, not this.
+    engine
+        .put(
+            Partition::Node,
+            &encode_node_key(0, node(1)),
+            &loose(vec!["Doc"]),
+        )
+        .expect("stored node");
+    assert_eq!(decide(&engine, &claim, &[]), Verdict::Holds);
+
+    // Written by the attempt under another primary label: not held.
+    let mut points = HashMap::new();
+    points.insert(
+        (Partition::Node, encode_node_key(0, node(2))),
+        Some(loose(vec!["User", "Doc"])),
+    );
+    let decide_with = |points: &HashMap<_, _>| {
+        evaluate(&engine, &claim, &[], points, engine.snapshot()).expect("evaluate")
+    };
+    assert_eq!(decide_with(&points), Verdict::Holds);
+
+    // Written by the attempt under the label, breaking STRICT: refused,
+    // naming the node.
+    points.insert(
+        (Partition::Node, encode_node_key(0, node(3))),
+        Some(loose(vec!["Doc"])),
+    );
+    assert!(
+        matches!(decide_with(&points), Verdict::Violates(ref v) if v.node == node(3)),
+        "{:?}",
+        decide_with(&points)
+    );
+
+    // The candidate activated or withdrawn at that revision: nothing more.
+    schema.take_candidate();
+    store_label_schema(&engine, &schema);
+    assert_eq!(decide_with(&points), Verdict::Holds);
+}
+
 /// Removing a label's schema admits every node, whatever they hold.
 #[test]
 fn removing_a_schema_admits_every_node() {

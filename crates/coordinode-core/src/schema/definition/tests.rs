@@ -731,13 +731,58 @@ fn a_schema_record_without_constraints_decodes_with_none() {
         .as_array()
         .cloned()
         .expect("a label schema is stored as an array of its fields");
+    // The trailing fields: the candidate, then the constraints.
+    fields.pop();
+    let mut without_candidate = Vec::new();
+    rmpv::encode::write_value(&mut without_candidate, &rmpv::Value::Array(fields.clone()))
+        .expect("re-encode");
+    let restored = LabelSchema::from_msgpack(&without_candidate).expect("decode");
+    assert!(restored.candidate().is_none());
+    assert_eq!(restored.constraints(), schema.constraints());
+
     fields.pop();
     let mut older = Vec::new();
     rmpv::encode::write_value(&mut older, &rmpv::Value::Array(fields)).expect("re-encode");
-
     let restored = LabelSchema::from_msgpack(&older).expect("decode the older record");
     assert!(restored.constraints().is_empty());
+    assert!(restored.candidate().is_none());
     assert_eq!(restored.properties, schema.properties);
+}
+
+/// A candidate stays beside the facts in force until it is put in force:
+/// the schema it would make is the facts swapped, constraints kept, and
+/// putting it in force leaves no candidate behind.
+#[test]
+fn a_candidate_is_put_in_force_in_place_of_the_facts() {
+    use crate::index::identity::GenerationId;
+    let mut schema = LabelSchema::new_node_id("User");
+    schema.set_mode(SchemaMode::Flexible);
+    schema.add_constraint(constraint("u_name", &["name"], ConstraintKind::NotNull));
+    let mut declared = std::collections::BTreeMap::new();
+    declared.insert(
+        "name".to_string(),
+        PropertyDef::new("name", PropertyType::String),
+    );
+    schema.set_candidate(super::LabelCandidate {
+        properties: declared.clone(),
+        mode: SchemaMode::Strict,
+        operation: GenerationId::from_raw(3),
+    });
+    let bytes = schema.to_msgpack().expect("serialize");
+    let restored = LabelSchema::from_msgpack(&bytes).expect("deserialize");
+    assert_eq!(restored, schema, "the candidate round-trips");
+    assert_eq!(schema.declared_facts(), (&declared, SchemaMode::Strict));
+
+    let would = schema.candidate_schema().expect("a candidate");
+    assert_eq!(would.mode, SchemaMode::Strict);
+    assert!(would.candidate().is_none());
+    assert_eq!(would.constraints(), schema.constraints());
+    assert_eq!(schema.mode, SchemaMode::Flexible, "the facts in force stay");
+
+    assert!(schema.activate_candidate());
+    assert_eq!(schema.mode, SchemaMode::Strict);
+    assert!(schema.candidate().is_none());
+    assert!(!schema.activate_candidate());
 }
 
 /// The kinds tell apart what each one checks: presence, per-node checking

@@ -14,9 +14,10 @@ use core::time::Duration;
 use std::collections::BTreeMap;
 
 use coordinode_core::schema::definition::{
-    ConstraintKind, ConstraintState, EdgeTypeSchema, LabelSchema, SchemaMode,
-    encode_edge_type_current_revision_key,
+    ConstraintKind, ConstraintState, EdgeTypeSchema, LabelCandidate, LabelSchema, PropertyDef,
+    SchemaMode, encode_edge_type_current_revision_key,
 };
+use coordinode_modality::LabelCertificationRecord;
 use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 use coordinode_query::executor::constraint_plan::{
     ConstraintRequest, OwnedIndex, plan_constraint, stage_owned_index,
@@ -158,31 +159,43 @@ pub struct SchemaPublication {
     pub objects: Vec<PublishedObject>,
 }
 
-/// Where a published constraint is after a wait.
+/// Where a published label definition or constraint is after a wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Readiness {
-    /// Its guarantee holds over the stored data.
+    /// It is in force over the stored data.
     Ready,
-    /// The build of its index is still running.
+    /// The proof of the definition, or the build of the constraint's index,
+    /// is still running; the rules in force before still are.
     Pending,
-    /// The build ended without making it active: the constraint and its
-    /// index are withdrawn. Nothing else the package published is undone.
+    /// The proof or build ended without putting it in force: a candidate
+    /// definition is withdrawn with the rules in force before kept, a
+    /// constraint withdrawn with its index. Nothing else the package
+    /// published is undone.
     Failed(String),
 }
 
-/// The readiness of a publication's constraints after a wait.
+/// The readiness of a publication's label definitions and constraints after
+/// a wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaReadiness {
-    /// Each constraint of the publication, by name, in its order.
-    pub constraints: Vec<(String, Readiness)>,
+    /// Each label and constraint of the publication, in its order.
+    pub objects: Vec<(CatalogObject, String, Readiness)>,
 }
 
 impl SchemaReadiness {
-    /// Whether every constraint is ready.
+    /// Whether every one is in force.
     pub fn all_ready(&self) -> bool {
-        self.constraints
+        self.objects
             .iter()
-            .all(|(_, readiness)| *readiness == Readiness::Ready)
+            .all(|(_, _, readiness)| *readiness == Readiness::Ready)
+    }
+
+    /// The readiness of the object of `kind` named `name`.
+    pub fn of(&self, kind: CatalogObject, name: &str) -> Option<&Readiness> {
+        self.objects
+            .iter()
+            .find(|(k, n, _)| *k == kind && n == name)
+            .map(|(_, _, r)| r)
     }
 }
 
@@ -221,16 +234,23 @@ pub(super) struct StagedPackage {
     labels: Vec<LabelSchema>,
     /// The indexes the commit publishes building.
     published: Vec<coordinode_query::index::IndexDefinition>,
+    /// The certifications the commit admits.
+    certifications: Vec<GenerationId>,
 }
 
 /// A label as the package stages it.
 struct StagedLabel {
-    /// Its definition as the commit publishes it.
+    /// Its definition as the commit publishes it; the facts the package
+    /// declares are in it as if in force.
     schema: LabelSchema,
     /// Its revision in the catalog before the package, `None` when absent.
     read_revision: Option<u64>,
     /// Whether the package writes a new revision of it.
     dirty: bool,
+    /// The facts in force before the package, when the declared ones could
+    /// refuse a stored node: they stay in force, and the declared ones are
+    /// published as a candidate to prove.
+    proved_over: Option<(BTreeMap<String, PropertyDef>, SchemaMode)>,
 }
 
 impl Database {
@@ -337,6 +357,7 @@ impl Database {
                         }),
                         read_revision,
                         dirty: read_revision.is_none(),
+                        proved_over: None,
                     })
                 }
             };
@@ -356,11 +377,14 @@ impl Database {
                 changes,
                 labels: Vec::new(),
                 published: Vec::new(),
+                certifications: Vec::new(),
             });
         }
 
         // Each label the package changes gets one new revision, however many
         // of its declarations changed it.
+        let indexes = coordinode_modality::LocalIndexStore::new(&self.engine);
+        let mut certifications = Vec::new();
         for label in staged.values_mut().filter(|l| l.dirty) {
             if let Some(read) = label.read_revision {
                 label.schema.schema_revision = read.checked_add(1).ok_or_else(|| {
@@ -370,7 +394,36 @@ impl Database {
                     ))
                 })?;
             }
+            // Declared facts that could refuse a stored node are published
+            // as a candidate, proved in the background; the facts in force
+            // stay until the proof puts it in force.
+            if let Some((properties, mode)) = label.proved_over.take() {
+                use coordinode_modality::IndexStore as _;
+                let operation = indexes.allocate_generation_txn(txn)?;
+                let declared = core::mem::replace(&mut label.schema.properties, properties);
+                let declared_mode = core::mem::replace(&mut label.schema.mode, mode);
+                label.schema.set_candidate(LabelCandidate {
+                    properties: declared,
+                    mode: declared_mode,
+                    operation,
+                });
+                indexes.put_certification_txn(
+                    txn,
+                    &LabelCertificationRecord::accepted(operation, label.schema.name.clone()),
+                    None,
+                )?;
+                certifications.push((label.schema.name.clone(), operation));
+            }
             store.save_label_txn(txn, &label.schema)?;
+        }
+        for object in &mut objects {
+            if object.object == CatalogObject::Label && object.disposition != Disposition::Retained
+            {
+                if let Some((_, operation)) = certifications.iter().find(|(l, _)| *l == object.name)
+                {
+                    object.operation = Some(*operation);
+                }
+            }
         }
         for (object, label) in objects.iter_mut().zip(&revision_of) {
             if let Some(staged) = label.as_ref().and_then(|name| staged.get(name)) {
@@ -395,6 +448,7 @@ impl Database {
                 .map(|l| l.schema)
                 .collect(),
             published,
+            certifications: certifications.into_iter().map(|(_, op)| op).collect(),
         })
     }
 
@@ -411,6 +465,7 @@ impl Database {
             changes,
             labels,
             published,
+            certifications,
         } = staged;
         if !changes {
             // Every object was in place: nothing to commit, scan or start.
@@ -437,30 +492,36 @@ impl Database {
                 .submit(generation)
                 .map_err(DatabaseError::Other)?;
         }
+        for operation in certifications {
+            self.index_builds
+                .submit_certification(operation)
+                .map_err(DatabaseError::Other)?;
+        }
         Ok(SchemaPublication {
             committed: true,
             objects,
         })
     }
 
-    /// Wait up to `wait` for every constraint `publication` reports to be
-    /// ready. Waiting cancels nothing: a build outwaited goes on, and a
-    /// failed one leaves every other published object in place.
+    /// Wait up to `wait` for every label definition and constraint
+    /// `publication` reports to be in force: a candidate definition proved
+    /// over the stored nodes, a constraint's index built. Waiting cancels
+    /// nothing: work outwaited goes on, and a failed one leaves every other
+    /// published object in place.
     ///
     /// # Errors
     ///
-    /// A build record could not be read, or the answer could not be made
-    /// durable.
+    /// A record could not be read, or the answer could not be made durable.
     pub fn await_schema(
         &self,
         publication: &SchemaPublication,
         wait: Duration,
     ) -> Result<SchemaReadiness, DatabaseError> {
         let deadline = std::time::Instant::now() + wait;
-        let mut constraints = Vec::new();
+        let mut objects = Vec::new();
         let mut any_published = false;
         for object in &publication.objects {
-            if object.object != CatalogObject::Constraint {
+            if object.object == CatalogObject::EdgeType {
                 continue;
             }
             let readiness = match (object.state, object.operation) {
@@ -485,16 +546,16 @@ impl Database {
                     }
                 }
             };
-            constraints.push((object.name.clone(), readiness));
+            objects.push((object.object, object.name.clone(), readiness));
         }
-        // A build commits unsynced; an answer naming it ready waits for one
-        // sync covering every such commit.
+        // Background work commits unsynced; an answer naming it in force
+        // waits for one sync covering every such commit.
         if any_published
             && self.write_concern.journal == coordinode_core::txn::write_concern::Journal::Journal
         {
             self.engine.sync_applied()?;
         }
-        Ok(SchemaReadiness { constraints })
+        Ok(SchemaReadiness { objects })
     }
 
     /// The error a refused publication reports: when the commit refused it
@@ -723,25 +784,39 @@ fn stage_label(
             .into());
         }
         let revision = schema.schema_revision;
+        // Until proved, the label is held to nothing more than it was
+        // without a definition.
+        let proved_over = schema
+            .facts_can_refuse_nodes()
+            .then(|| (BTreeMap::new(), SchemaMode::Flexible));
         return Ok((
             StagedLabel {
                 schema,
                 read_revision: None,
                 dirty: true,
+                proved_over,
             },
             object(Disposition::Created, revision),
         ));
     };
     let read = current.schema_revision;
     check_existing(CatalogObject::Label, &name, existing, read)?;
-    if !current.is_table() && unchanged_label(&schema, &current) {
+    // A candidate being proved is what the label is declared as.
+    let declared = current
+        .candidate_schema()
+        .unwrap_or_else(|| current.clone());
+    if !current.is_table() && unchanged_label(&schema, &declared) {
+        let operation = current.candidate().map(|c| c.operation);
+        let mut retained = object(Disposition::Retained, read);
+        retained.operation = operation;
         return Ok((
             StagedLabel {
                 schema: current,
                 read_revision: Some(read),
                 dirty: false,
+                proved_over: None,
             },
-            object(Disposition::Retained, read),
+            retained,
         ));
     }
     if existing == Existing::Ensure {
@@ -762,6 +837,13 @@ fn stage_label(
             "whether :{name} is temporal is fixed when it is created"
         )));
     }
+    if let Some(candidate) = current.candidate() {
+        return Err(refused(format!(
+            "the definition of :{name} declared by operation {} is still being certified; \
+             wait for it or cancel it before changing the label",
+            candidate.operation.as_raw()
+        )));
+    }
     schema.placement = current.placement.clone();
     schema.shard_keys = current.shard_keys.clone();
     for constraint in current.constraints() {
@@ -773,11 +855,15 @@ fn stage_label(
         }
         schema.add_constraint(constraint.clone());
     }
+    let proved_over = schema
+        .facts_can_refuse_nodes()
+        .then(|| (current.properties.clone(), current.mode));
     Ok((
         StagedLabel {
             schema,
             read_revision: Some(read),
             dirty: true,
+            proved_over,
         },
         object(Disposition::Changed, read),
     ))

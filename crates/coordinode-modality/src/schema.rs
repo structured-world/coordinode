@@ -606,12 +606,16 @@ impl SchemaStore for LocalSchemaStore<'_> {
                 message: format!("pointer for '{name}' references missing revision {revision}"),
             });
         };
-        LabelSchema::from_msgpack(&schema_bytes)
-            .map(Some)
-            .map_err(|e| StoreError::Decode {
-                kind: "label schema",
-                message: format!("decode failed for '{name}' rev {revision}: {e}"),
-            })
+        let schema = LabelSchema::from_msgpack(&schema_bytes).map_err(|e| StoreError::Decode {
+            kind: "label schema",
+            message: format!("decode failed for '{name}' rev {revision}: {e}"),
+        })?;
+        // A write under a schema whose candidate is being proved is held to
+        // the candidate as well, since the proof never sees it.
+        if !own_pointer && schema.candidate().is_some() {
+            txn.note_label_candidate_read(name, revision);
+        }
+        Ok(Some(schema))
     }
 
     fn load_label_for_update_txn(

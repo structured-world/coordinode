@@ -44,6 +44,40 @@ const OLDER_TRANSACTIONS_POLL: std::time::Duration = std::time::Duration::from_m
 /// whether its process is closing.
 const STOP_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Wait up to `wait` for every transaction open now to end: after it, a row
+/// written by one opened earlier is in the store, and a later one saw what
+/// was published before the call. Checked in slices against `stop`, so a
+/// closing process is not held for the whole wait.
+///
+/// # Errors
+///
+/// [`BackfillError::Stopped`] once `stop` is set;
+/// [`BackfillError::OlderTransactions`] when some are still open at the end.
+pub(crate) fn await_older_transactions(
+    engine: &StorageEngine,
+    wait: std::time::Duration,
+    stop: Option<&core::sync::atomic::AtomicBool>,
+) -> Result<(), BackfillError> {
+    let boundary = engine.snapshot_boundary();
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if stop.is_some_and(|s| s.load(core::sync::atomic::Ordering::Acquire)) {
+            return Err(BackfillError::Stopped);
+        }
+        // Past the deadline the time left is none, not negative.
+        let slice = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(STOP_SLICE);
+        match engine.await_transactions_through(boundary, OLDER_TRANSACTIONS_POLL, slice) {
+            Ok(()) => return Ok(()),
+            Err(open) if std::time::Instant::now() >= deadline => {
+                return Err(BackfillError::OlderTransactions(open));
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 /// Why a backfill stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum BackfillError {
@@ -284,27 +318,8 @@ impl<'a> Backfill<'a> {
                 progress(p);
             }
         };
-        let boundary = self.engine.snapshot_boundary();
         report(BackfillProgress::AwaitingOlderTransactions);
-        // In slices, so a closing process is not held for the whole wait.
-        let deadline = std::time::Instant::now() + self.older_transactions_wait;
-        loop {
-            self.check_stop()?;
-            // Past the deadline the time left is none, not negative.
-            let slice = deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .min(STOP_SLICE);
-            match self
-                .engine
-                .await_transactions_through(boundary, OLDER_TRANSACTIONS_POLL, slice)
-            {
-                Ok(()) => break,
-                Err(open) if std::time::Instant::now() >= deadline => {
-                    return Err(BackfillError::OlderTransactions(open));
-                }
-                Err(_) => {}
-            }
-        }
+        await_older_transactions(self.engine, self.older_transactions_wait, self.stop)?;
         // Every transaction opened before the index was registered has ended,
         // so a node row written after this point was written by one that
         // maintained the index itself.

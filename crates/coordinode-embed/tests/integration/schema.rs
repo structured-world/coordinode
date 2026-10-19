@@ -5,6 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use coordinode_embed::Database;
+use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 
 fn open_db() -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -154,17 +155,15 @@ fn create_label_schema_persists_across_reopen() {
         assert!(version > 0, "version must be positive");
     }
 
-    // Reopen and verify the schema is still there.
+    // Reopen and verify the schema in force is still there, read through
+    // its revision pointer.
     {
         let db2 = Database::open(dir.path()).expect("reopen");
-        use coordinode_storage::engine::partition::Partition;
-        let key = coordinode_core::schema::definition::encode_label_schema_key("Member", 1);
-        let bytes = db2
-            .engine()
-            .get(Partition::Schema, &key)
-            .expect("storage get")
+        let schema = LocalSchemaStore::new(db2.engine())
+            .load_label("Member")
+            .expect("load")
             .expect("schema must exist after reopen");
-        let schema = LabelSchema::from_msgpack(&bytes).expect("deserialize schema");
+        assert!(schema.candidate().is_none(), "proved and in force");
         assert_eq!(schema.name, "Member");
         assert_eq!(schema.properties.len(), 2);
         assert!(schema.get_property("handle").is_some());
@@ -288,7 +287,6 @@ fn create_edge_type_schema_persists() {
 
     {
         let db2 = Database::open(dir.path()).expect("reopen");
-        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
         let schema = LocalSchemaStore::new(db2.engine())
             .load_edge_type("WORKS_AT")
             .expect("load edge schema")
@@ -299,9 +297,10 @@ fn create_edge_type_schema_persists() {
     }
 }
 
-/// Calling create_label_schema again replaces the type facts at the next
+/// Calling create_label_schema again replaces the type facts at a later
 /// revision, so a writer validated under the previous definition is held to
-/// the new one rather than committing beside it.
+/// the new one rather than committing beside it. The replacement is proved
+/// as a candidate first, so it lands past the revision publishing that.
 #[test]
 fn create_label_schema_replaces_at_the_next_revision() {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
@@ -317,7 +316,16 @@ fn create_label_schema_replaces_at_the_next_revision() {
     schema_v2.add_property(PropertyDef::new("count", PropertyType::Int));
     let v2 = db.create_label_schema(schema_v2).expect("second create");
 
-    assert_eq!(v2, v1 + 1);
+    assert!(v2 > v1, "{v2} after {v1}");
+    let schema = LocalSchemaStore::new(db.engine())
+        .load_label("Tag")
+        .expect("load")
+        .expect("Tag");
+    assert_eq!(
+        schema.schema_revision, v2,
+        "the answer names the revision in force"
+    );
+    assert!(schema.get_property("count").is_some());
 }
 
 /// Current-revision pointer is written together with the schema body on

@@ -110,9 +110,41 @@ impl Database {
         existing: Existing,
     ) -> Result<u64, DatabaseError> {
         check_label_declaration(&schema)?;
+        let name = schema.name.clone();
         let published =
             self.publish_declarations(vec![(schema, existing)], Vec::new(), Vec::new())?;
-        Ok(only_revision(&published))
+        let Some(operation) = published.objects.first().and_then(|o| o.operation) else {
+            return Ok(only_revision(&published));
+        };
+        // Facts that could refuse a stored node are put in force by their
+        // proof; the call waits for it as a statement waits for a build.
+        let wait = self.index_builds.config().statement_wait;
+        use coordinode_query::index::{BuildError, IndexBuildOutcome};
+        match self.index_builds.wait(operation, Some(wait))? {
+            Some(IndexBuildOutcome::Published { .. }) => {
+                if self.write_concern.journal
+                    == coordinode_core::txn::write_concern::Journal::Journal
+                {
+                    self.engine.sync_applied()?;
+                }
+                Ok(LocalSchemaStore::new(&self.engine)
+                    .load_label(&name)
+                    .map_err(ExecutionError::from)?
+                    .map_or_else(|| only_revision(&published), |s| s.schema_revision))
+            }
+            Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
+                Err(ExecutionError::SchemaViolation(reason).into())
+            }
+            Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => {
+                Err(ExecutionError::from(v).into())
+            }
+            Some(IndexBuildOutcome::Cancelled) => Err(refused(format!(
+                "the certification of the definition of :{name} was cancelled"
+            ))),
+            // Outwaited: published as a candidate, still being proved, with
+            // the facts in force before still in force.
+            None => Ok(only_revision(&published)),
+        }
     }
 
     /// Define edge type `schema`. An edge type that already has a

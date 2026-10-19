@@ -701,6 +701,46 @@ impl IndexBuildRecord {
     }
 }
 
+/// The durable record of one certification: the operation proving the
+/// stored nodes of a label against the candidate definition published with
+/// it, admitted in the commit that published the candidate. Its identity is
+/// a generation from the same allocator as index builds, so one operation
+/// number names either kind of background work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelCertificationRecord {
+    /// The operation's identity.
+    pub generation: GenerationId,
+    /// The label whose stored nodes it proves.
+    pub label: String,
+    /// Where it stands; `Published` once the candidate is in force.
+    pub state: BuildState,
+    /// Nodes checked so far, reported by the executor; progress, not proof.
+    pub checked: u64,
+}
+
+impl LabelCertificationRecord {
+    /// Prefix of every certification record in the schema catalog.
+    pub const PREFIX: &'static [u8] = b"schema:certify:";
+
+    /// A certification of `label` admitted as `generation`, not taken.
+    pub fn accepted(generation: GenerationId, label: impl Into<String>) -> Self {
+        Self {
+            generation,
+            label: label.into(),
+            state: BuildState::Accepted,
+            checked: 0,
+        }
+    }
+
+    /// The catalog key of the certification `generation`.
+    pub fn key_of(generation: GenerationId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(Self::PREFIX.len() + 8);
+        key.extend_from_slice(Self::PREFIX);
+        key.extend_from_slice(&generation.as_raw().to_be_bytes());
+        key
+    }
+}
+
 /// One repair a build made: the value of `property` of `node` it replaced to
 /// end a duplicate. Committed in the transaction that changed the node, so
 /// the record exists exactly when the change does.

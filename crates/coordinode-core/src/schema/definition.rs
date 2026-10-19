@@ -356,6 +356,25 @@ pub struct LabelSchema {
     /// writer validated under. Read through [`LabelSchema::constraints`].
     #[serde(default)]
     constraints: Vec<NodeConstraint>,
+
+    /// Type facts published but not yet in force: the stored nodes are still
+    /// being proved against them. The facts above stay the ones in force
+    /// until the proof activates the candidate; every write meanwhile must
+    /// satisfy both. Read through [`LabelSchema::candidate`].
+    #[serde(default)]
+    candidate: Option<LabelCandidate>,
+}
+
+/// Type facts of a label published as a candidate, with the operation that
+/// proves the stored nodes against them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LabelCandidate {
+    /// The property definitions the candidate declares.
+    pub properties: BTreeMap<String, PropertyDef>,
+    /// The schema mode it declares.
+    pub mode: SchemaMode,
+    /// The certification operation proving it.
+    pub operation: crate::index::identity::GenerationId,
 }
 
 /// What a node constraint requires of the properties it names.
@@ -492,6 +511,75 @@ impl LabelSchema {
             storage_layout: StorageLayout::Row,
             keyed_by_row_id: false,
             constraints: Vec::new(),
+            candidate: None,
+        }
+    }
+
+    /// The type facts published but not yet in force, if any.
+    pub fn candidate(&self) -> Option<&LabelCandidate> {
+        self.candidate.as_ref()
+    }
+
+    /// Publish `candidate` beside the facts in force. The caller bumps the
+    /// revision: writers from it on satisfy both.
+    pub fn set_candidate(&mut self, candidate: LabelCandidate) {
+        self.candidate = Some(candidate);
+    }
+
+    /// Withdraw the candidate, leaving the facts in force as they are.
+    pub fn take_candidate(&mut self) -> Option<LabelCandidate> {
+        self.candidate.take()
+    }
+
+    /// Put the candidate's facts in force. `false` when there is none. The
+    /// caller bumps the revision.
+    pub fn activate_candidate(&mut self) -> bool {
+        let Some(candidate) = self.candidate.take() else {
+            return false;
+        };
+        self.properties = candidate.properties;
+        self.mode = candidate.mode;
+        true
+    }
+
+    /// This definition as it would be with its candidate in force: what a
+    /// write must also satisfy while the candidate is proved. `None` without
+    /// a candidate.
+    pub fn candidate_schema(&self) -> Option<Self> {
+        let mut schema = self.clone();
+        schema.activate_candidate().then_some(schema)
+    }
+
+    /// Whether some stored node could break this definition. A FLEXIBLE one
+    /// checks only NOT NULL and the per-node constraints; without either it
+    /// admits every node, so putting it in force needs no proof. Uniqueness
+    /// is proved by its constraint's index build, not here.
+    pub fn can_refuse_nodes(&self) -> bool {
+        self.facts_can_refuse_nodes()
+            || self
+                .constraints
+                .iter()
+                .any(NodeConstraint::checks_each_node)
+    }
+
+    /// Whether the type facts alone, without the constraints, could refuse
+    /// some stored node: what decides whether new facts need a proof before
+    /// they are put in force.
+    pub fn facts_can_refuse_nodes(&self) -> bool {
+        self.mode.validates_declared()
+            || self.mode.rejects_unknown()
+            || self
+                .properties
+                .values()
+                .any(|p| p.not_null && p.default.is_none())
+    }
+
+    /// The type facts a declaration is compared with: the candidate's while
+    /// one is published, else the facts in force.
+    pub fn declared_facts(&self) -> (&BTreeMap<String, PropertyDef>, SchemaMode) {
+        match &self.candidate {
+            Some(candidate) => (&candidate.properties, candidate.mode),
+            None => (&self.properties, self.mode),
         }
     }
 

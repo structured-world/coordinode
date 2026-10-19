@@ -250,6 +250,14 @@ pub enum ClaimPredicate {
         /// The revision the attempt read.
         revision: u64,
     },
+    /// The attempt read the label's schema at this revision while it carried
+    /// a candidate being proved, so every node it writes under the label
+    /// must satisfy the candidate too: the proof scans only what was stored
+    /// before, and a write it does not see is held to the candidate here.
+    CandidateAdmits {
+        /// The revision the attempt read, carrying the candidate.
+        revision: u64,
+    },
     /// The attempt makes this revision the label's schema (`0` removes it).
     /// Its result depends on every stored node of the label satisfying the
     /// new schema, so no write validated under the old one may land beside
@@ -455,13 +463,22 @@ impl Claim {
             // Writes validated under one schema do not depend on each other,
             // whichever revision each read: a stale read is refused by its
             // own evaluation, not by its neighbours.
-            (SchemaRead { .. }, SchemaRead { .. }) => true,
+            // Each writer's own records are what a candidate check decides,
+            // so writers held to a candidate do not depend on each other
+            // either.
+            (
+                SchemaRead { .. } | CandidateAdmits { .. },
+                SchemaRead { .. } | CandidateAdmits { .. },
+            ) => true,
 
             // An activation validates the stored nodes under the new schema;
             // a write validated under the old one in flight beside it would
             // land unseen by that validation and unbound by the new rule.
             // Two activations of one label cannot both be the current one.
-            (SchemaActivated { .. }, SchemaRead { .. } | SchemaActivated { .. }) => false,
+            (
+                SchemaActivated { .. },
+                SchemaRead { .. } | CandidateAdmits { .. } | SchemaActivated { .. },
+            ) => false,
 
             // Two attempts taking one value both write its entry key, and the
             // commit that lands second is refused there as a conflict its

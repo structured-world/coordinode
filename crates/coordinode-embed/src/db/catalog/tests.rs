@@ -262,8 +262,9 @@ fn a_replacement_its_constraints_cannot_hold_under_is_refused_atomically() {
     assert_eq!(db.constraints().expect("list"), before);
 }
 
-/// A replacement the stored nodes break is not published, and the previous
-/// definition with its constraints stays in force.
+/// A replacement the stored nodes break is not put in force, and the
+/// previous definition with its constraints stays. Its candidate was
+/// published and withdrawn, two revisions carrying the same rules.
 #[test]
 fn a_replacement_stored_nodes_break_leaves_the_previous_definition() {
     let (mut db, _dir) = open();
@@ -288,13 +289,15 @@ fn a_replacement_stored_nodes_break_leaves_the_previous_definition() {
         "{refused:?}"
     );
 
-    let after_schema = db
+    let mut after_schema = db
         .label_schemas()
         .expect("labels")
         .into_iter()
         .find(|s| s.name == "User")
         .expect("User");
-    assert_eq!(after_schema, before_schema);
+    assert!(after_schema.schema_revision > before_schema.schema_revision);
+    after_schema.schema_revision = before_schema.schema_revision;
+    assert_eq!(after_schema, before_schema, "the same rules are in force");
     assert_eq!(db.constraints().expect("list"), before);
 }
 

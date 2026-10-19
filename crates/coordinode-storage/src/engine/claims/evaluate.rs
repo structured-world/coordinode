@@ -67,6 +67,8 @@ pub enum Verdict {
         /// The most rows the decision reads.
         limit: u64,
     },
+    /// A node the attempt writes breaks a rule the claim holds it to.
+    Violates(LabelSchemaViolation),
 }
 
 /// Decide `claim` against the engine's authoritative state plus the attempt's
@@ -328,6 +330,19 @@ impl<'a> Evaluation<'a> {
                 label_schema_admits_stored_nodes(engine, label, *revision, staged_points)
             }
 
+            // The proof of a candidate covers what was stored when it began;
+            // a node written after it is held to the candidate here, so the
+            // records read are only the attempt's own.
+            (ClaimScope::LabelSchema(label), ClaimPredicate::CandidateAdmits { revision }) => {
+                candidate_admits_written_nodes(
+                    engine,
+                    label,
+                    *revision,
+                    staged_points,
+                    self.node_deltas,
+                )
+            }
+
             // A published index answers for the value through its entry key:
             // every holder writes it, and the attempt writes it too, so a
             // holder committed since the attempt's view meets it there. While
@@ -570,6 +585,112 @@ fn label_schema_admits_stored_nodes(
     )
 }
 
+/// Whether every node the attempt writes whose primary label is `label`
+/// satisfies the candidate the label's schema carried at `revision`.
+///
+/// Only the attempt's own node writes are read: a whole record staged, or a
+/// stored one under the document deltas the attempt adds to it. A revision
+/// without a candidate (activated or withdrawn since) holds nothing more;
+/// the attempt's own read of the schema is decided by its `SchemaRead`.
+fn candidate_admits_written_nodes(
+    engine: &StorageEngine,
+    label: &str,
+    revision: u64,
+    staged_points: StagedPoints<'_>,
+    node_deltas: &[(Vec<u8>, Vec<u8>)],
+) -> StorageResult<Verdict> {
+    use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_DOC_DELTA};
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_core::schema::definition::{LabelSchema, encode_label_schema_key};
+
+    let serialization = |what: &str, e: &dyn core::fmt::Display| {
+        crate::error::StorageError::Serialization(format!("{what}: {e}"))
+    };
+    let body_key = encode_label_schema_key(label, revision);
+    let body = match staged_points.get(&(Partition::Schema, body_key.clone())) {
+        Some(Some(bytes)) => Some(bytes.clone()),
+        Some(None) => None,
+        None => engine
+            .get(Partition::Schema, &body_key)?
+            .map(|b| b.to_vec()),
+    };
+    let Some(body) = body else {
+        return Ok(Verdict::Undecidable);
+    };
+    let schema = LabelSchema::from_msgpack(&body)
+        .map_err(|e| serialization(&format!("label schema '{label}'"), &e))?;
+    let Some(candidate) = schema.candidate_schema() else {
+        return Ok(Verdict::Holds);
+    };
+
+    let mut names: Option<(std::collections::HashMap<u32, String>, u32)> = None;
+    let mut check = |key: &[u8], record: NodeRecord| -> StorageResult<Option<Verdict>> {
+        if record.labels.first().map(String::as_str) != Some(label) {
+            return Ok(None);
+        }
+        if names.is_none() {
+            let dictionary = crate::engine::metadata::load_field_dictionary(engine)?;
+            names = Some((
+                dictionary
+                    .iter()
+                    .map(|(name, id)| (id, name.to_string()))
+                    .collect(),
+                dictionary.frontier(),
+            ));
+        }
+        let Some((names, frontier)) = names.as_ref() else {
+            return Ok(None);
+        };
+        Ok(
+            record_violation(&candidate, record, names, *frontier).map(|reason| {
+                Verdict::Violates(LabelSchemaViolation {
+                    node: node_of_record_key(key),
+                    reason,
+                })
+            }),
+        )
+    };
+
+    for ((part, key), value) in staged_points.iter() {
+        let (Partition::Node, Some(bytes)) = (*part, value) else {
+            continue;
+        };
+        if !is_node_record_key(key) {
+            continue;
+        }
+        let record =
+            NodeRecord::from_msgpack(bytes).map_err(|e| serialization("node record", &e))?;
+        if let Some(verdict) = check(key, record)? {
+            return Ok(verdict);
+        }
+    }
+    // A document delta on a stored node: the record it leaves is the stored
+    // one with every delta of the attempt applied, in order.
+    let mut deltas: rustc_hash::FxHashMap<&[u8], Vec<DocDelta>> = rustc_hash::FxHashMap::default();
+    for (key, operand) in node_deltas {
+        let Some((&PREFIX_DOC_DELTA, body)) = operand.split_first() else {
+            return Ok(Verdict::Undecidable);
+        };
+        let delta = DocDelta::decode(body).map_err(|e| serialization("node document delta", &e))?;
+        deltas.entry(key.as_slice()).or_default().push(delta);
+    }
+    for (key, deltas) in deltas {
+        if !is_node_record_key(key) {
+            continue;
+        }
+        let Some(stored) = engine.get(Partition::Node, key)? else {
+            continue;
+        };
+        let mut record = crate::engine::merge::decode_node_record(&stored)
+            .map_err(|e| serialization("node record under a delta", &e))?;
+        crate::engine::merge::apply_doc_deltas_to_record(&mut record, &deltas);
+        if let Some(verdict) = check(key, record)? {
+            return Ok(verdict);
+        }
+    }
+    Ok(Verdict::Holds)
+}
+
 /// A stored node that breaks a label schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelSchemaViolation {
@@ -597,20 +718,8 @@ pub fn first_label_schema_violation(
 ) -> StorageResult<Option<LabelSchemaViolation>> {
     use coordinode_core::graph::node::NodeRecord;
 
-    // A flexible schema checks only NOT NULL and the per-node constraints;
-    // without either there is nothing a stored node can break, and the scan
-    // is skipped. Uniqueness is decided by the constraint's index build.
-    if !schema.mode.validates_declared()
-        && !schema.mode.rejects_unknown()
-        && !schema
-            .properties
-            .values()
-            .any(|p| p.not_null && p.default.is_none())
-        && !schema
-            .constraints()
-            .iter()
-            .any(coordinode_core::schema::definition::NodeConstraint::checks_each_node)
-    {
+    // Nothing a stored node could break: the scan is skipped.
+    if !schema.can_refuse_nodes() {
         return Ok(None);
     }
 

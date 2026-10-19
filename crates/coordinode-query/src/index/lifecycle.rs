@@ -205,6 +205,7 @@ struct Shared {
     copy_source: parking_lot::RwLock<Option<Arc<dyn IndexCopySource>>>,
 }
 
+mod certify;
 mod integrity;
 pub use integrity::{CheckOutcome, CheckRequestError, CheckStatus};
 
@@ -731,7 +732,9 @@ impl IndexBuildService {
         let store = LocalIndexStore::new(self.shared.env.engine());
         loop {
             let outcome = match store.load_build(generation)? {
-                None => Some(IndexBuildOutcome::Cancelled),
+                // A number no build has may be a certification's.
+                None => certify::certification_outcome(&store, generation)?
+                    .unwrap_or(Some(IndexBuildOutcome::Cancelled)),
                 Some((record, _)) => terminal_outcome(&record.state),
             };
             if outcome.is_some() {
@@ -766,7 +769,8 @@ impl IndexBuildService {
         let store = LocalIndexStore::new(env.engine());
         for () in move_attempts() {
             let Some((mut record, version)) = store.load_build(generation).map_err(text)? else {
-                return Ok(false);
+                // A number no build has may be a certification's.
+                return self.cancel_certification(generation);
             };
             if record.state.is_terminal() {
                 return Ok(false);
@@ -832,6 +836,7 @@ impl IndexBuildService {
                 resumed.push(record.generation);
             }
         }
+        resumed.extend(self.resume_certifications()?);
         Ok(resumed)
     }
 

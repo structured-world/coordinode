@@ -20481,6 +20481,10 @@ fn commit_err_to_execution(
         // Named by generation here; an executor that holds the claim names
         // the index and the value before this is reached.
         e @ CommitError::UniqueValueHeld { .. } => ExecutionError::InvariantRefused(e.to_string()),
+        // The written node breaks a rule; the same write is refused again.
+        e @ CommitError::CandidateViolation { .. } => {
+            ExecutionError::SchemaViolation(e.to_string())
+        }
         CommitError::UniquenessUnresolved { generation, limit } => {
             ExecutionError::UniquenessUnresolved {
                 index: generation.to_string(),

@@ -99,6 +99,9 @@ fn proposals_writing(recording: &Recording, prefix: &[u8]) -> Vec<Vec<Mutation>>
         .collect()
 }
 
+/// Every proposal moving a label's revision pointer carries the body of the
+/// revision it points at: the publication of a candidate and the proof that
+/// puts it in force each publish a revision and its pointer together.
 #[test]
 fn a_label_schema_revision_and_its_pointer_publish_together() {
     let (db, recording, _dir) = open(None);
@@ -108,14 +111,24 @@ fn a_label_schema_revision_and_its_pointer_publish_together() {
 
     let pointer = encode_label_current_revision_key("Person");
     let published = proposals_writing(&recording, &pointer);
-    assert_eq!(
-        published.len(),
-        1,
-        "one proposal names the current revision"
-    );
-    let keys = put_keys(&published[0]);
-    assert_eq!(keys.len(), 2, "the revision and its pointer: {keys:?}");
-    assert!(keys.contains(&pointer));
+    assert!(!published.is_empty(), "the pointer was published");
+    for proposal in &published {
+        let pointed = proposal
+            .iter()
+            .find_map(|m| match m {
+                Mutation::Put { key, value, .. } if *key == pointer => {
+                    Some(u64::from_be_bytes(value.as_slice().try_into().unwrap()))
+                }
+                _ => None,
+            })
+            .expect("the proposal writes the pointer");
+        let body = coordinode_core::schema::definition::encode_label_schema_key("Person", pointed);
+        assert!(
+            put_keys(proposal).contains(&body),
+            "the pointer to revision {pointed} travels with its body: {:?}",
+            put_keys(proposal)
+        );
+    }
     assert_eq!(
         db.engine()
             .get(

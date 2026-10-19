@@ -218,14 +218,13 @@ fn every_definition_change_publishes_the_next_revision() {
 
     let (mut db, _dir) = open_db();
 
-    // Create label via the typed API — revision should be 1 with one property.
+    // A STRICT definition is proved over the stored nodes before it is in
+    // force: published as a candidate, then put in force, so the call
+    // answers with the revision in force, past the first.
     let mut schema = LabelSchema::new_node_id("Doc");
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     let rev_after_create = db.create_label_schema(schema).expect("create");
-    assert_eq!(
-        rev_after_create, 1,
-        "fresh label must start at schema_revision=1"
-    );
+    assert!(rev_after_create >= 1, "got {rev_after_create}");
 
     // Replacing the definition is a new revision: a writer validated under
     // the previous one is held to the new definition, never committed beside
@@ -234,28 +233,34 @@ fn every_definition_change_publishes_the_next_revision() {
     schema_v2.add_property(PropertyDef::new("title", PropertyType::String));
     schema_v2.add_property(PropertyDef::new("body", PropertyType::String));
     let rev_after_property_add = db.create_label_schema(schema_v2).expect("re-create");
-    assert_eq!(
-        rev_after_property_add, 2,
-        "replacing the definition publishes the next schema_revision"
+    assert!(
+        rev_after_property_add > rev_after_create,
+        "replacing the definition publishes a later schema_revision: \
+         {rev_after_property_add} after {rev_after_create}"
     );
 
     // ALTER LABEL SET SCHEMA <mode> mutates write-path semantics → MUST bump.
+    let revision_of = |rows: &[coordinode_query::executor::row::Row]| match rows[0].get("version") {
+        Some(Value::Int(v)) => u64::try_from(*v).expect("a revision is positive"),
+        other => panic!("ALTER LABEL answers with its version, got: {other:?}"),
+    };
     let rows = db
         .execute_cypher("ALTER LABEL Doc SET SCHEMA FLEXIBLE")
         .expect("alter mode");
-    let version_after_mode = rows[0].get("version");
-    assert!(
-        matches!(version_after_mode, Some(Value::Int(3))),
-        "ALTER LABEL SET SCHEMA must bump schema_revision to 3, got: {version_after_mode:?}"
+    let version_after_mode = revision_of(&rows);
+    assert_eq!(
+        version_after_mode,
+        rev_after_property_add + 1,
+        "ALTER LABEL SET SCHEMA must bump schema_revision"
     );
 
     // A subsequent mode change bumps again.
     let rows2 = db
         .execute_cypher("ALTER LABEL Doc SET SCHEMA VALIDATED")
         .expect("alter mode again");
-    let version_after_second = rows2[0].get("version");
-    assert!(
-        matches!(version_after_second, Some(Value::Int(4))),
-        "second ALTER LABEL SET SCHEMA must bump again to 4, got: {version_after_second:?}"
+    assert_eq!(
+        revision_of(&rows2),
+        version_after_mode + 1,
+        "second ALTER LABEL SET SCHEMA must bump again"
     );
 }
