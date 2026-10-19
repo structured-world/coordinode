@@ -258,6 +258,20 @@ impl LocalJournal {
         Ok(())
     }
 
+    /// Remove the journal's directory once [`Self::compact`] left every
+    /// entry covered durably by the trees. The trees keep their coverage, so
+    /// a journal opened here later hands out indices above it.
+    ///
+    /// # Errors
+    ///
+    /// The directory cannot be removed.
+    pub(crate) fn retire(self) -> StorageResult<()> {
+        let Self { log, dir, .. } = self;
+        drop(log);
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| StorageError::Io(format!("remove local journal {dir:?}: {e}")))
+    }
+
     /// Make every local record appended so far durable.
     ///
     /// # Errors

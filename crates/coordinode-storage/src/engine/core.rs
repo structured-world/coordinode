@@ -961,11 +961,14 @@ impl StorageEngine {
         // ── Member-local journal: open + crash recovery ─────────────────────
         // A store whose log is a consensus log keeps this member's own records
         // in a journal of their own, replayed here, before anything reads them.
-        // A store with its own journal records them there instead.
+        // A store with its own journal records them there instead; what an
+        // open without a journal left (an offline tool, never a member: those
+        // are refused above) is replayed too, and folded into the trees once
+        // the store is open (`drain_local_journal`).
         let local_journal = match config.select_oplog_endpoint(0) {
             Ok(endpoint) => {
                 let dir = crate::engine::local_journal::LocalJournal::dir(&endpoint.path);
-                if oplog.is_none() {
+                if oplog.is_none() || dir.exists() {
                     Some(crate::engine::local_journal::LocalJournal::open(
                         &dir,
                         &OplogJournalConfig::from(config),
@@ -1295,7 +1298,7 @@ impl StorageEngine {
         // An open refused above leaves the old marker, so the store it
         // refused stays as its writer left it.
         crate::format::settle(&format)?;
-        let engine = Self {
+        let mut engine = Self {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
             coordinator,
@@ -1342,7 +1345,32 @@ impl StorageEngine {
             open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
             space: Arc::new(crate::engine::space::SpaceGuard::new(config)),
         };
+        engine.drain_local_journal()?;
         Ok(engine)
+    }
+
+    /// On a store with its own journal, fold what a member-local journal
+    /// left (an open without a journal wrote it) into the trees, flush them
+    /// and retire that journal: from here on the store's journal carries
+    /// these records.
+    fn drain_local_journal(&mut self) -> StorageResult<()> {
+        if self.oplog.is_none() {
+            return Ok(());
+        }
+        let Some(local) = self.local_journal.take() else {
+            return Ok(());
+        };
+        drop(self.local_flusher.take());
+        // The trees' flushes sync only the store's journal: the local one is
+        // synced first, so no table takes an entry it could still lose.
+        local.sync()?;
+        let at = self.next_seqno();
+        local.compact(self.coordinator.trees(), at, |tree| {
+            self.flush_memtables(tree)
+        })?;
+        // Every tree now covers it durably, so a later open has nothing to
+        // replay and no journal to drain again.
+        local.retire()
     }
 
     /// The free-space guard: new writes are refused while it is paused, and
@@ -2695,6 +2723,35 @@ impl StorageEngine {
             }
             _ => Ok(0),
         }
+    }
+
+    /// Record, durably, that this store's log is a consensus log: from here
+    /// on the store opens only as a member of its group, never with a
+    /// journal of its own. Called before the log's first entry is written;
+    /// recording it again does nothing.
+    ///
+    /// # Errors
+    ///
+    /// The engine was opened with a journal of its own, which a consensus
+    /// log cannot share the store with; no endpoint can hold the log; the
+    /// record cannot be written.
+    pub fn bind_consensus_log(&self) -> StorageResult<()> {
+        if self.oplog.is_some() {
+            return Err(StorageError::InvalidConfig(
+                "a consensus log cannot start on a store opened with a journal of its own".into(),
+            ));
+        }
+        let endpoint = self.select_oplog_endpoint(0)?;
+        let marker = endpoint.path.join(CONSENSUS_LOG_MARKER);
+        if marker.exists() {
+            return Ok(());
+        }
+        let io = |what: &str, e: std::io::Error| {
+            StorageError::Io(format!("{what} {}: {e}", marker.display()))
+        };
+        let file = std::fs::File::create(&marker).map_err(|e| io("create", e))?;
+        file.sync_all().map_err(|e| io("sync", e))?;
+        sync_dir(&endpoint.path)
     }
 
     /// Fold the journal's applied prefix into every tree, including the ones
@@ -5575,17 +5632,20 @@ fn remove_capture_with(fs: &dyn lsm_tree::fs::Fs, dir: &Path) -> StorageResult<(
     }
 }
 
+/// The file that marks a store whose log is a consensus log, in the root of
+/// the endpoint that holds the log.
+const CONSENSUS_LOG_MARKER: &str = "consensus-log";
+
 /// What shows that the store at `endpoint`, with `trees`, keeps a replicated
-/// group's history, or `None` when nothing does. A member creates its
-/// member-local journal when it first opens, before it writes any entry of
-/// the group's log, and every entry it applies leaves Raft coverage in the
-/// trees it reaches.
+/// group's history, or `None` when nothing does. The consensus log is bound
+/// to the store before its first entry is written, and every entry a member
+/// applies leaves Raft coverage in the trees it reaches.
 fn group_history_evidence(
     endpoint: &Path,
     trees: &HashMap<Partition, lsm_tree::AnyTree>,
 ) -> StorageResult<Option<&'static str>> {
-    if crate::engine::local_journal::LocalJournal::dir(endpoint).exists() {
-        return Ok(Some("it holds a member-local journal"));
+    if endpoint.join(CONSENSUS_LOG_MARKER).exists() {
+        return Ok(Some("its log is bound to a consensus group"));
     }
     for tree in trees.values() {
         let raft = TreeCoverage::read(tree, Domain::Raft)?;

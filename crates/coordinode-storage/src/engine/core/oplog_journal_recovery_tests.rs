@@ -1683,6 +1683,7 @@ fn a_member_store_is_refused_an_own_journal_and_left_as_it_was() {
     let rig = PowerRig::new();
     let config = rig.config();
     let engine = rig.open_group(&config).expect("open");
+    engine.bind_consensus_log().expect("bind the consensus log");
     engine
         .commit_local(vec![member_put(b"vote", b"v3")], LocalSync::BeforeUse)
         .expect("commit");
@@ -1697,7 +1698,6 @@ fn a_member_store_is_refused_an_own_journal_and_left_as_it_was() {
         !config.endpoints[0].path.join("oplog").join("0").exists(),
         "the refused open started a journal of its own"
     );
-    assert!(local_journal_dir(&config).exists());
     let engine = rig.open_group(&config).expect("reopen as a member");
     assert_eq!(
         engine
@@ -1705,6 +1705,29 @@ fn a_member_store_is_refused_an_own_journal_and_left_as_it_was() {
             .expect("get")
             .as_deref(),
         Some(b"v3".as_slice())
+    );
+    rig.cut(engine);
+}
+
+/// A store opened without a journal by something that is not a group (an
+/// offline check, a test harness) is still a store outside any group: no
+/// consensus log was bound to it, so it opens with its own journal again.
+#[test]
+fn a_store_opened_without_a_journal_but_no_group_is_still_its_own() {
+    let rig = PowerRig::new();
+    let config = rig.config();
+    let engine = rig.open_group(&config).expect("open without a journal");
+    engine
+        .commit_local(vec![member_put(b"mark", b"m")], LocalSync::BeforeUse)
+        .expect("commit");
+    rig.stop(engine);
+    let (engine, _) = rig.open_with(&config);
+    assert_eq!(
+        engine
+            .get(Partition::Raft, b"mark")
+            .expect("get")
+            .as_deref(),
+        Some(b"m".as_slice())
     );
     rig.cut(engine);
 }

@@ -553,6 +553,11 @@ impl LogStore {
         // open one LogStore per shard, each routing to its own
         // select_oplog_endpoint(shard_id).
         let shard_id: u32 = 0;
+        // Before the log's first entry: from here the store opens only as a
+        // member, never with a journal of its own beside this log.
+        engine
+            .bind_consensus_log()
+            .map_err(|e| io::Error::other(e.to_string()))?;
         let RaftOplogDirs {
             active: active_dir,
             all: recovery_dirs,

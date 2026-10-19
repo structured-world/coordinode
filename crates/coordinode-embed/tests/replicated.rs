@@ -1130,13 +1130,13 @@ async fn a_member_store_is_refused_by_the_non_replicated_open() {
         matches!(
             refused,
             Some(DatabaseError::Storage(StorageError::GroupMemberStore {
-                evidence: "it holds a member-local journal",
+                evidence: "its log is bound to a consensus group",
                 ..
             }))
         ),
         "a member's store opened without its group, got {refused:?}"
     );
-    std::fs::remove_dir_all(dir.path().join("local-journal")).unwrap();
+    std::fs::remove_file(dir.path().join("consensus-log")).unwrap();
     let refused = open_outside_the_group(dir.path()).await;
     assert!(
         matches!(
@@ -1146,7 +1146,7 @@ async fn a_member_store_is_refused_by_the_non_replicated_open() {
                 ..
             }))
         ),
-        "a member's store without its local journal, got {refused:?}"
+        "a member's store without its marker, got {refused:?}"
     );
 
     let member = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
