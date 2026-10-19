@@ -14,12 +14,14 @@ use std::time::Duration;
 
 use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_embed::Database;
+use coordinode_embed::replication::routing::{CommandRoutingHandler, MAX_ROUTED_MESSAGE};
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proposal::RaftProposalPipeline;
 use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
 use coordinode_server::proto::{operation, query};
 use coordinode_server::services::cypher::CypherServiceImpl;
 use coordinode_server::services::operation::OperationServiceImpl;
+use coordinode_server::services::routing::ServerCommandExecutor;
 use coordinode_server::services::statement::StatementExecutor;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
@@ -86,7 +88,10 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> No
 
     let executor = StatementExecutor::new(Arc::clone(&db)).with_raft_node(Arc::clone(&raft));
     let cypher = CypherServiceImpl::from_executor(executor.clone());
-    let operations = OperationServiceImpl::new(executor);
+    let operations = OperationServiceImpl::new(executor.clone());
+    // What a follower passes its clients' statements to the leader through.
+    let routing = CommandRoutingHandler::new(Arc::new(ServerCommandExecutor::new(executor)))
+        .into_service(MAX_ROUTED_MESSAGE);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let context = Arc::clone(raft.connections().unwrap().context());
@@ -99,7 +104,8 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> No
             ))
             .add_service(
                 operation::operation_service_server::OperationServiceServer::new(operations),
-            ),
+            )
+            .add_service(routing),
     )
     .await;
 

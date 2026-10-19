@@ -18,13 +18,17 @@ use tonic::Status;
 use crate::services::cypher::db_error_to_status;
 use crate::services::statement::{Admission, Requested, StatementExecutor, columns_and_values};
 
-/// Runs routed commands through this member's [`StatementExecutor`].
-pub(crate) struct ServerCommandExecutor {
+/// Runs routed commands through this member's [`StatementExecutor`]. A
+/// member serves it to its peers with
+/// [`coordinode_embed::replication::Member::add_command_routing`].
+pub struct ServerCommandExecutor {
     executor: StatementExecutor,
 }
 
 impl ServerCommandExecutor {
-    pub(crate) fn new(executor: StatementExecutor) -> Self {
+    /// An executor running routed commands through `executor`, the one this
+    /// member's own clients are served by.
+    pub fn new(executor: StatementExecutor) -> Self {
         Self { executor }
     }
 }
