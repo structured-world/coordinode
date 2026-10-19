@@ -544,6 +544,21 @@ fn occupy_the_only_seat(db: &Database) {
         ..SchemaPackage::default()
     };
     db.publish_schema(blocker).expect("the blocking build");
+    // Seated and waiting before the caller publishes what must queue behind
+    // it: a build accepted but not yet seated could lose the seat to it.
+    let deadline = std::time::Instant::now() + WAIT;
+    while !db
+        .index_build_status()
+        .expect("builds")
+        .iter()
+        .any(|s| s.phase == Some(coordinode_query::index::BuildPhase::AwaitingOlderTransactions))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the blocking build never took the seat"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// While a candidate is proved, a write is held to it as well as to the
