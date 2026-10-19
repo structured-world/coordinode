@@ -1094,6 +1094,7 @@ dependencies = [
  "bytes",
  "coordinode-core",
  "coordinode-lsm-tree",
+ "coordinode-raft",
  "coordinode-storage",
  "coordinode-test-fixtures",
  "coordinode-wire",
