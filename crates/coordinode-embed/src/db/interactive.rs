@@ -120,6 +120,19 @@ pub struct CommitOptions<'a> {
     /// Told when the commit has its place behind the commands admitted
     /// before it.
     pub admission: Option<&'a AdmissionSignal>,
+    /// The versions the caller built its statements on: a node that is at
+    /// another refuses the whole commit, as
+    /// [`Database::expect_node_version`] states for the host.
+    pub expect: &'a [ExpectedVersion],
+}
+
+/// A node and the version a caller believes it is at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedVersion {
+    /// The node.
+    pub node: coordinode_core::graph::node::NodeId,
+    /// The version read earlier; `None` requires the node not to exist.
+    pub version: Option<u64>,
 }
 
 /// What a rollback carries besides the handle.
@@ -900,7 +913,7 @@ impl Database {
             }
             return Err(self.interactive.missing(&handle));
         };
-        self.commit_finished(handle, finished, options.operation)
+        self.commit_finished(handle, finished, options.operation, options.expect)
     }
 
     fn commit_finished(
@@ -908,12 +921,21 @@ impl Database {
         handle: TransactionHandle,
         finished: Finished,
         operation: Option<&crate::operation::OperationDescriptor>,
+        expect: &[ExpectedVersion],
     ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
         let Finished {
-            state,
+            mut state,
             chain,
             write_concern,
         } = finished;
+        for expected in expect {
+            let key = coordinode_core::graph::node::encode_node_key(self.shard_id, expected.node);
+            state.expect_version(
+                coordinode_storage::engine::partition::Partition::Node,
+                &key,
+                expected.version,
+            )?;
+        }
         let mut txn = coordinode_storage::engine::transaction::Transaction::resume(
             &self.engine,
             Some(&self.oracle),

@@ -39,13 +39,17 @@ use coordinode_session::{
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
 
-use super::failure;
-use crate::proto::{query, replication};
-use crate::services::cypher::{
-    build_wait_ms, db_error_to_status, proto_to_value_pub, read_concern_level, read_preference,
-    value_to_proto_pub, vector_consistency_to_proto, write_concern_to_proto,
+use coordinode_core::txn::handle::ActingContext;
+use coordinode_embed::replication::routing::{
+    RoutedBegin, RoutedCommit, RoutedRollback, RoutedSettings, RoutedStatement,
 };
-use crate::services::statement::{Admission, Requested, StatementExecutor, leader_hint};
+
+use super::failure;
+use crate::services::cypher::{db_error_to_status, read_concern_level, read_preference};
+use crate::services::routing::routed_settings;
+use crate::services::statement::{
+    Admission, Requested, StatementExecutor, columns_and_values, leader_hint,
+};
 
 /// Storage keys scanned per keyset page. Independent of the client's batch size:
 /// a page may yield fewer output rows than this when a `Filter` rejects some, so
@@ -88,50 +92,89 @@ impl DatabaseCursorEngine {
             .map_err(|s| EngineError(failure(&s)))
     }
 
-    /// Run `query` at the leader and page its answer out of memory. A Cancel
-    /// thrown meanwhile drops the call, and with it the leader's statement.
-    #[allow(clippy::too_many_arguments)]
-    fn forwarded(
+    /// Run `statement` at `member` and page its answer out of memory. A
+    /// Cancel thrown meanwhile drops the call, and with it the statement
+    /// there. `admitted` is told when the statement has its place there.
+    fn routed(
         &self,
-        leader_id: u64,
-        query: &str,
-        params: Option<HashMap<String, Value>>,
-        settings: &ConnectionSettings,
-        source: Option<&SourceContext>,
-        operation: Option<&OperationDescriptor>,
+        member: u64,
+        statement: RoutedStatement,
+        admitted: &AdmissionSignal,
         cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
-        let request = forwarded_request(query, params, settings, operation);
-        let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
-            EngineError::internal(format!("no runtime to reach the leader on: {e}"))
-        })?;
-        let response = runtime
-            .block_on(async {
-                tokio::select! {
-                    biased;
-                    () = cancel.thrown() => Err(engine_error(DatabaseError::Execution(
-                        coordinode_query::executor::runner::ExecutionError::Budget(
-                            coordinode_core::budget::BudgetStop::Cancelled,
-                        ),
-                    ))),
-                    // A session statement carries no call deadline; its
-                    // stream lives on.
-                    answered = self.executor.forward(leader_id, request, source, None) => {
-                        answered.map_err(|s| EngineError(failure(&s)))
-                    }
-                }
-            })?
-            .into_inner();
+        let led = statement.transaction.is_none();
+        let answer =
+            self.block_on_routed(cancel, self.executor.route(member, statement, admitted))?;
+        let stats = answer.stats;
         Ok(Box::new(MaterializedCursor {
-            rows: response
-                .rows
-                .iter()
-                .map(|row| row.values.iter().map(proto_to_value_pub).collect())
-                .collect(),
-            columns: response.columns,
+            columns: answer.columns,
+            rows: answer.rows,
             pos: 0,
-            stats: response.stats.map(stats_from_proto).unwrap_or_default(),
+            stats: SessionStats {
+                nodes_created: stats.nodes_created,
+                nodes_deleted: stats.nodes_deleted,
+                edges_created: stats.edges_created,
+                edges_deleted: stats.edges_deleted,
+                properties_set: stats.properties_set,
+                // A write reports its own commit's index, one answered
+                // before its commit none, a read the index it was served at.
+                applied_index: match (stats.applied_index, stats.commit_ts) {
+                    (0, 0) => stats.read_index,
+                    (0, _) => 0,
+                    (own, _) => own,
+                },
+                served_by_leader: led,
+                commit_ts: stats.commit_ts,
+                read_as_of_ts: stats.read_as_of_ts,
+                ..SessionStats::default()
+            },
         }))
+    }
+
+    /// Wait on the blocking pool for `call`, a command routed to another
+    /// member, unless the statement's Cancel is thrown first.
+    fn block_on_routed<T>(
+        &self,
+        cancel: &coordinode_core::budget::CancelFlag,
+        call: impl std::future::Future<Output = Result<T, tonic::Status>>,
+    ) -> Result<T, EngineError> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+            EngineError::internal(format!("no runtime to reach another member on: {e}"))
+        })?;
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                () = cancel.thrown() => Err(engine_error(DatabaseError::Execution(
+                    coordinode_query::executor::runner::ExecutionError::Budget(
+                        coordinode_core::budget::BudgetStop::Cancelled,
+                    ),
+                ))),
+                answered = call => answered.map_err(|s| EngineError(failure(&s))),
+            }
+        })
+    }
+
+    /// An autonomous session statement as routed to the leader: the settings
+    /// the session named go with it, the leader does not know the session.
+    fn autonomous(
+        query: &str,
+        params: Option<HashMap<String, Value>>,
+        requested: &Requested,
+        source: Option<SourceContext>,
+    ) -> RoutedStatement {
+        RoutedStatement {
+            actor: ActingContext::Trusted,
+            query: query.to_string(),
+            params: params.unwrap_or_default(),
+            settings: routed_settings(requested),
+            transaction: None,
+            nonce: None,
+            operation: requested.operation,
+            // A session statement has no call deadline; its stream lives on,
+            // and Cancel stops it.
+            deadline: None,
+            source,
+        }
     }
 }
 
@@ -177,6 +220,27 @@ impl CursorEngine for DatabaseCursorEngine {
         // fence and no commit of its own here. Its session's vector settings
         // still apply.
         if let Some(transaction) = transaction {
+            // Held by another member: the statement runs there, and has its
+            // place once that member says so.
+            if let Some(holder) = self.executor.holder(&transaction.handle) {
+                let statement = RoutedStatement {
+                    actor: ActingContext::Trusted,
+                    query: query.to_string(),
+                    params: params.unwrap_or_default(),
+                    settings: RoutedSettings {
+                        vector_consistency: settings.vector_consistency,
+                        vector_build_wait: settings.vector_build_wait,
+                        query_memory_limit: settings.query_memory_limit,
+                        ..RoutedSettings::default()
+                    },
+                    transaction: Some(transaction.handle),
+                    nonce: Some(transaction.nonce),
+                    operation: None,
+                    deadline: None,
+                    source,
+                };
+                return self.routed(holder, statement, &transaction.admission, cancel);
+            }
             let options = StatementOptions {
                 vector_consistency: settings.vector_consistency,
                 vector_build_wait: settings.vector_build_wait,
@@ -191,7 +255,7 @@ impl CursorEngine for DatabaseCursorEngine {
                 .read()
                 .execute_in_transaction_with(transaction.handle, query, params, &options)
                 .map_err(engine_error)?;
-            let (columns, rows) = rows_to_values(&rows);
+            let (columns, rows) = columns_and_values(&rows);
             return Ok(Box::new(MaterializedCursor {
                 columns,
                 rows,
@@ -201,18 +265,12 @@ impl CursorEngine for DatabaseCursorEngine {
         }
 
         let start = Instant::now();
-        let admitted = match self.admit(query, &requested(settings, cancel, operation))? {
+        let requested = requested(settings, cancel, operation);
+        let admitted = match self.admit(query, &requested)? {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
-                return self.forwarded(
-                    leader_id,
-                    query,
-                    params,
-                    settings,
-                    source.as_ref(),
-                    operation,
-                    cancel,
-                );
+                let statement = Self::autonomous(query, params, &requested, source);
+                return self.routed(leader_id, statement, &AdmissionSignal::new(|| {}), cancel);
             }
         };
         let fenced = SessionStats {
@@ -257,21 +315,14 @@ impl CursorEngine for DatabaseCursorEngine {
             Ok(result) => result,
             Err(e) => match (leader_hint(&e), retry) {
                 (Some(leader_id), Some(params)) => {
-                    return self.forwarded(
-                        leader_id,
-                        query,
-                        params,
-                        settings,
-                        source.as_ref(),
-                        operation,
-                        cancel,
-                    );
+                    let statement = Self::autonomous(query, params, &requested, source);
+                    return self.routed(leader_id, statement, &AdmissionSignal::new(|| {}), cancel);
                 }
                 _ => return Err(engine_error(e)),
             },
         };
         self.executor.record(query, source.as_ref(), start);
-        let (columns, rows) = rows_to_values(&result.rows);
+        let (columns, rows) = columns_and_values(&result.rows);
         let written = write_stats(&result.write_stats);
         Ok(Box::new(MaterializedCursor {
             columns,
@@ -297,6 +348,29 @@ impl CursorEngine for DatabaseCursorEngine {
         ordering: TxnOrdering,
         drain: Option<Duration>,
     ) -> Result<TransactionHandle, EngineError> {
+        // A transaction is held by the leader: on another member it opens
+        // there.
+        if let Some(leader) = self
+            .executor
+            .transaction_leader()
+            .map_err(|s| EngineError(failure(&s)))?
+        {
+            let router = self
+                .executor
+                .router(leader)
+                .map_err(|s| EngineError(failure(&s)))?;
+            let begin = RoutedBegin {
+                actor: ActingContext::Trusted,
+                read_concern: None,
+                write_concern: None,
+                ordering,
+                drain_timeout: drain,
+            };
+            return self.block_on_routed(
+                &coordinode_core::budget::CancelFlag::new(),
+                router.begin(begin),
+            );
+        }
         self.database()
             .read()
             .begin_transaction_with(&TransactionOptions {
@@ -314,6 +388,24 @@ impl CursorEngine for DatabaseCursorEngine {
         operation: Option<&OperationDescriptor>,
         admission: &AdmissionSignal,
     ) -> Result<CommitReceipt, EngineError> {
+        if let Some(holder) = self.executor.holder(&transaction) {
+            let router = self
+                .executor
+                .router(holder)
+                .map_err(|s| EngineError(failure(&s)))?;
+            let commit = RoutedCommit {
+                actor: ActingContext::Trusted,
+                transaction,
+                last_nonce,
+                operation: operation.copied(),
+                deadline: None,
+                expect: Vec::new(),
+            };
+            return self.block_on_routed(
+                &coordinode_core::budget::CancelFlag::new(),
+                router.commit(commit),
+            );
+        }
         self.database()
             .read()
             .commit_transaction_with(
@@ -333,6 +425,20 @@ impl CursorEngine for DatabaseCursorEngine {
         transaction: TransactionHandle,
         admission: &AdmissionSignal,
     ) -> Result<(), EngineError> {
+        if let Some(holder) = self.executor.holder(&transaction) {
+            let router = self
+                .executor
+                .router(holder)
+                .map_err(|s| EngineError(failure(&s)))?;
+            let rollback = RoutedRollback {
+                actor: ActingContext::Trusted,
+                transaction,
+            };
+            return self.block_on_routed(
+                &coordinode_core::budget::CancelFlag::new(),
+                router.rollback(rollback),
+            );
+        }
         self.database()
             .read()
             .rollback_transaction_with(
@@ -406,62 +512,6 @@ fn requested(
         deadline: None,
         cancel: Some(cancel.clone()),
         operation: operation.copied(),
-    }
-}
-
-/// The unary request that carries a session statement to the leader, with the
-/// settings it runs under spelled out: the leader does not know the session.
-fn forwarded_request(
-    query: &str,
-    params: Option<HashMap<String, Value>>,
-    settings: &ConnectionSettings,
-    operation: Option<&OperationDescriptor>,
-) -> query::ExecuteCypherRequest {
-    let read_concern = (settings.read_concern.is_some()
-        || settings.after_index.is_some()
-        || settings.at_timestamp.is_some())
-    .then(|| replication::ReadConcern {
-        level: settings.read_concern.map_or(0, i32::from),
-        after_index: settings.after_index.unwrap_or(0),
-        at_timestamp: settings.at_timestamp.unwrap_or(0),
-    });
-    query::ExecuteCypherRequest {
-        query: query.to_string(),
-        parameters: params
-            .unwrap_or_default()
-            .iter()
-            .map(|(k, v)| (k.clone(), value_to_proto_pub(v)))
-            .collect(),
-        read_preference: settings.read_preference.map_or(0, i32::from),
-        read_concern,
-        write_concern: settings.write_concern.as_ref().map(write_concern_to_proto),
-        // Autonomous: the session forwards no transaction's statement.
-        transaction: Vec::new(),
-        vector_consistency: settings
-            .vector_consistency
-            .map_or(0, vector_consistency_to_proto),
-        vector_build_wait_ms: settings.vector_build_wait.map(build_wait_ms),
-        query_memory_limit_mb: settings
-            .query_memory_limit
-            .and_then(|bytes| u32::try_from(bytes >> 20).ok()),
-        // The leader binds the statement to the same operation, so a retry
-        // through any member is still one write.
-        operation: operation.map(crate::services::operation::descriptor_to_proto),
-    }
-}
-
-fn stats_from_proto(stats: query::QueryStats) -> SessionStats {
-    SessionStats {
-        nodes_created: stats.nodes_created,
-        nodes_deleted: stats.nodes_deleted,
-        edges_created: stats.edges_created,
-        edges_deleted: stats.edges_deleted,
-        properties_set: stats.properties_set,
-        execution_time_ms: stats.execution_time_ms,
-        applied_index: stats.applied_index,
-        served_by_leader: stats.served_by_leader,
-        commit_ts: stats.commit_ts,
-        read_as_of_ts: stats.read_as_of_ts,
     }
 }
 
@@ -582,19 +632,6 @@ impl QueryCursor for KeysetCursor {
     fn stats(&self) -> SessionStats {
         self.stats.clone()
     }
-}
-
-/// Derive the column header and per-row value vectors from executor rows.
-///
-/// Columns are the keys of the first row (all rows share keys); the column list
-/// is empty for an empty result, matching the unary query path.
-fn rows_to_values(rows: &[Row]) -> (Vec<String>, Vec<Vec<Value>>) {
-    let columns: Vec<String> = rows
-        .first()
-        .map(|r| r.keys().cloned().collect())
-        .unwrap_or_default();
-    let values: Vec<Vec<Value>> = rows.iter().map(|row| project_row(row, &columns)).collect();
-    (columns, values)
 }
 
 /// Project a single executor row onto the established column order, filling

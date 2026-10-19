@@ -17,5 +17,11 @@ pub mod proto {
     /// The frozen version handshake between members.
     pub mod internode {
         tonic::include_proto!("coordinode.internode");
+
+        /// Whole commands routed from the member a client reached to the
+        /// member that executes them.
+        pub mod routing {
+            tonic::include_proto!("coordinode.internode.routing");
+        }
     }
 }

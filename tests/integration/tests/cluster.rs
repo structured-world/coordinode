@@ -20,6 +20,9 @@
 //! | `a_new_leader_never_reissues_a_node_id` | ExecuteCypher | After the leader goes away the member that takes over creates a node beside the old ones, never over one |
 //! | `a_text_index_created_on_the_leader_serves_searches_on_a_follower` | ExecuteCypher | A text index defined on the leader registers on the follower when it applies there and answers searches from the follower's own index |
 //! | `constraints_held_before_the_cluster_bind_every_member_after_a_leader_change` | ExecuteCypher, ListConstraints | Constraints that reached the members through the base snapshot are listed active on the new leader and refuse the writes that break them |
+//! | `a_transaction_runs_through_any_member` | BeginTransaction, ExecuteCypher, CommitTransaction | A transaction begun on a follower opens at the leader, takes statements through two members and commits through a follower; follower answers name the leader |
+//! | `a_write_through_a_follower_runs_at_the_leader` | ExecuteCypher | An autonomous write on a follower runs at the leader, one hop, naming the leader; the leader adds no hint |
+//! | `a_session_on_a_follower_works_on_the_leaders_transaction` | Session | A session on a follower fills the leader's transaction, and a session on another member continues and commits it |
 //!
 //! ## Running
 //!
@@ -1106,6 +1109,298 @@ async fn constraints_held_before_the_cluster_bind_every_member_after_a_leader_ch
         unnamed.code(),
         tonic::Code::FailedPrecondition,
         "{unnamed:?}"
+    );
+}
+
+/// A group of three members formed around the first, which leads.
+async fn three_member_group() -> (CoordinodeProcess, CoordinodeProcess, CoordinodeProcess) {
+    let (p1, p2, p3) = (free_port(), free_port(), free_port());
+    let n1 = CoordinodeProcess::start_cluster_member(1, p1, &[p2, p3]).await;
+    let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[p1, p3]).await;
+    let n3 = CoordinodeProcess::start_cluster_member(3, p3, &[p1, p2]).await;
+    let mut leader = n1.cluster_client().await;
+    for (id, member) in [(2, &n2), (3, &n3)] {
+        leader
+            .join_node(JoinNodeRequest {
+                node_id: id,
+                address: member.member_addr(),
+                pre_seeded: false,
+                node_identity: member.member_identity(),
+            })
+            .await
+            .expect("JoinNode must be accepted");
+        wait_for_voters(
+            &mut leader,
+            usize::try_from(id).expect("small"),
+            Duration::from_secs(40),
+        )
+        .await;
+    }
+    (n1, n2, n3)
+}
+
+fn in_transaction(query: &str, transaction: &[u8]) -> ExecuteCypherRequest {
+    ExecuteCypherRequest {
+        query: query.to_string(),
+        transaction: transaction.to_vec(),
+        ..Default::default()
+    }
+}
+
+/// A client works through whichever member it reached. A transaction begun on
+/// a follower opens at the leader; its statements, sent to different members
+/// one after another, all run in it; it commits through a follower; and every
+/// answer of a follower names the leader to move to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_runs_through_any_member() {
+    use coordinode_integration::proto::query::{BeginTransactionRequest, CommitTransactionRequest};
+
+    let (n1, n2, n3) = three_member_group().await;
+    let mut on_two = n2.cypher_client().await;
+    let mut on_three = n3.cypher_client().await;
+
+    let begun = on_two
+        .begin_transaction(BeginTransactionRequest::default())
+        .await
+        .expect("a follower opens the transaction at the leader");
+    assert_eq!(
+        begun
+            .metadata()
+            .get("x-coordinode-leader")
+            .map(|v| v.to_str().expect("ascii")),
+        Some("1"),
+        "a follower names the leader on its answer"
+    );
+    assert!(
+        begun.metadata().get("x-coordinode-leader-addr").is_none(),
+        "the address members reach each other at is not disclosed"
+    );
+    let transaction = begun.into_inner().transaction;
+
+    on_two
+        .execute_cypher(in_transaction("CREATE (:Routed {k: 1})", &transaction))
+        .await
+        .expect("the first statement runs at the holder");
+    on_three
+        .execute_cypher(in_transaction("CREATE (:Routed {k: 2})", &transaction))
+        .await
+        .expect("the next one, through another member, runs in the same transaction");
+    let seen = on_three
+        .execute_cypher(in_transaction(
+            "MATCH (n:Routed) RETURN count(n) AS c",
+            &transaction,
+        ))
+        .await
+        .expect("a read in the transaction")
+        .into_inner();
+    use coordinode_integration::proto::common::property_value::Value as Pv;
+    assert!(
+        matches!(seen.rows[0].values[0].value, Some(Pv::IntValue(2))),
+        "the transaction sees both of its writes: {seen:?}"
+    );
+    assert!(
+        cypher_on(&n1, "MATCH (n:Routed) RETURN n")
+            .await
+            .expect("read")
+            .is_empty(),
+        "nothing is visible before the commit"
+    );
+
+    on_two
+        .commit_transaction(CommitTransactionRequest {
+            transaction: transaction.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("the commit through a follower lands");
+    assert_eq!(
+        cypher_on(&n1, "MATCH (n:Routed) RETURN n")
+            .await
+            .expect("read")
+            .len(),
+        2,
+        "both writes committed together"
+    );
+
+    // The transaction is gone at its holder: committing it again through
+    // any member is told so.
+    let again = on_three
+        .commit_transaction(CommitTransactionRequest {
+            transaction,
+            ..Default::default()
+        })
+        .await
+        .expect_err("already committed");
+    assert_ne!(again.code(), tonic::Code::Ok);
+}
+
+/// An autonomous write sent to a follower runs at the leader and answers as
+/// the follower's own, counted as one hop and naming the leader; the leader's
+/// own answers carry no hint.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_through_a_follower_runs_at_the_leader() {
+    let (n1, n2, _n3) = three_member_group().await;
+    let answered = n2
+        .cypher_client()
+        .await
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE (n:ViaFollower {k: 1}) RETURN n.k AS k".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("the follower passes the write on");
+    let metadata = answered.metadata().clone();
+    let answer = answered.into_inner();
+    assert_eq!(answer.columns, vec!["k".to_string()]);
+    assert_eq!(answer.rows.len(), 1);
+    let stats = answer.stats.expect("stats");
+    assert_eq!(stats.nodes_created, 1);
+    assert!(stats.served_by_leader);
+    assert!(stats.applied_index > 0, "the write's own index comes back");
+    assert_eq!(
+        metadata
+            .get("x-coordinode-hops")
+            .map(|v| v.to_str().expect("ascii")),
+        Some("1")
+    );
+    assert_eq!(
+        metadata
+            .get("x-coordinode-leader")
+            .map(|v| v.to_str().expect("ascii")),
+        Some("1")
+    );
+
+    let on_leader = n1
+        .cypher_client()
+        .await
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:ViaFollower) RETURN n.k AS k".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("read at the leader");
+    assert!(on_leader.metadata().get("x-coordinode-leader").is_none());
+    assert_eq!(on_leader.into_inner().rows.len(), 1);
+}
+
+/// A session on a follower opens, fills and commits a transaction held by
+/// the leader, and a second session on another member continues a
+/// transaction the first one began.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
+    use coordinode_integration::proto::session::server_frame::Event;
+    use coordinode_integration::proto::session::session_service_client::SessionServiceClient;
+    use coordinode_integration::proto::session::{
+        Begin, ClientFrame, Commit, Execute, ServerFrame, client_frame,
+    };
+    use tokio_stream::wrappers::ReceiverStream;
+
+    async fn open(
+        node: &CoordinodeProcess,
+    ) -> (
+        tokio::sync::mpsc::Sender<ClientFrame>,
+        tonic::Streaming<ServerFrame>,
+    ) {
+        let channel = tonic::transport::Endpoint::from_shared(node.endpoint())
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let inbound = SessionServiceClient::new(channel)
+            .session(ReceiverStream::new(rx))
+            .await
+            .expect("open session")
+            .into_inner();
+        (tx, inbound)
+    }
+    async fn terminal(inbound: &mut tonic::Streaming<ServerFrame>, want: u64) -> Event {
+        loop {
+            let f = inbound.message().await.expect("frame").expect("not end");
+            if f.request_id == want {
+                match f.event {
+                    Some(
+                        e @ (Event::Begun(_)
+                        | Event::CursorEnd(_)
+                        | Event::Committed(_)
+                        | Event::Error(_)),
+                    ) => return e,
+                    _ => continue,
+                }
+            }
+        }
+    }
+    fn execute(request_id: u64, query: &str, transaction: &[u8]) -> ClientFrame {
+        ClientFrame {
+            request_id,
+            op: Some(client_frame::Op::Execute(Execute {
+                query: query.to_string(),
+                transaction: transaction.to_vec(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    let (n1, n2, n3) = three_member_group().await;
+    let (first, mut first_in) = open(&n2).await;
+    first
+        .send(ClientFrame {
+            request_id: 1,
+            op: Some(client_frame::Op::Begin(Begin {
+                ordering: 2, // ORDERING_UNORDERED
+                drain_timeout_ms: 0,
+            })),
+        })
+        .await
+        .expect("begin");
+    let transaction = match terminal(&mut first_in, 1).await {
+        Event::Begun(b) => b.transaction,
+        other => panic!("expected Begun, got {other:?}"),
+    };
+    first
+        .send(execute(2, "CREATE (:SessionRouted {k: 1})", &transaction))
+        .await
+        .expect("write");
+    match terminal(&mut first_in, 2).await {
+        Event::CursorEnd(_) => {}
+        other => panic!("the write runs at the holder, got {other:?}"),
+    }
+    drop(first);
+    while first_in.message().await.expect("frame").is_some() {}
+
+    let (second, mut second_in) = open(&n3).await;
+    second
+        .send(execute(1, "CREATE (:SessionRouted {k: 2})", &transaction))
+        .await
+        .expect("write");
+    match terminal(&mut second_in, 1).await {
+        Event::CursorEnd(_) => {}
+        other => panic!("another member continues it, got {other:?}"),
+    }
+    second
+        .send(ClientFrame {
+            request_id: 2,
+            op: Some(client_frame::Op::Commit(Commit {
+                transaction,
+                last_nonce: 0,
+                operation: None,
+            })),
+        })
+        .await
+        .expect("commit");
+    match terminal(&mut second_in, 2).await {
+        Event::Committed(_) => {}
+        other => panic!("the commit lands, got {other:?}"),
+    }
+    drop(second);
+    while second_in.message().await.expect("frame").is_some() {}
+
+    assert_eq!(
+        cypher_on(&n1, "MATCH (n:SessionRouted) RETURN n")
+            .await
+            .expect("read")
+            .len(),
+        2
     );
 }
 

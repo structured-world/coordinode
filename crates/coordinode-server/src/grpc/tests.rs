@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 
 use tower::{Layer, Service};
 
-use super::{HEADER_HOPS, HEADER_NODE, NodeInfoLayer};
+use super::{HEADER_HOPS, HEADER_LEADER, HEADER_NODE, Leadership, NodeInfoLayer};
 
 /// Answers every request with a fixed set of response headers.
 struct Respond(Vec<(&'static str, &'static str)>);
@@ -96,4 +96,55 @@ fn calls_are_counted_by_method_and_refusals_by_code() {
 async fn a_forwarded_response_keeps_its_hop_count() {
     let response = call(Respond(vec![(HEADER_HOPS, "1")])).await;
     assert_eq!(response.headers()[HEADER_HOPS], "1");
+}
+
+async fn call_seeing(leadership: Leadership) -> http::Response<()> {
+    let mut service = NodeInfoLayer::new(7)
+        .with_leadership(std::sync::Arc::new(move || leadership))
+        .layer(Respond(Vec::new()));
+    service
+        .call(http::Request::new(()))
+        .await
+        .expect("infallible")
+}
+
+/// A member that does not lead tells the client, on every answer, which
+/// member does, so a client that came to it works on and can move to the
+/// leader when it chooses. The address members reach each other at is not
+/// disclosed.
+#[tokio::test]
+async fn a_member_that_does_not_lead_names_the_leader() {
+    let response = call_seeing(Leadership::Elsewhere(2)).await;
+    assert_eq!(response.headers()[HEADER_LEADER], "2");
+    assert!(
+        response
+            .headers()
+            .keys()
+            .all(|name| !name.as_str().contains("addr")),
+        "{:?}",
+        response.headers()
+    );
+}
+
+/// The leader's answers carry no hint: the client is already where it should
+/// be.
+#[tokio::test]
+async fn the_leader_adds_no_hint() {
+    let response = call_seeing(Leadership::Here).await;
+    assert!(response.headers().get(HEADER_LEADER).is_none());
+}
+
+/// During an election the member says no leader is known rather than naming a
+/// stale one.
+#[tokio::test]
+async fn without_a_leader_the_hint_says_none_is_known() {
+    let response = call_seeing(Leadership::Unknown).await;
+    assert_eq!(response.headers()[HEADER_LEADER], "none");
+}
+
+/// A standalone server leads itself and says nothing about leadership.
+#[tokio::test]
+async fn a_standalone_server_adds_no_hint() {
+    let response = call(Respond(Vec::new())).await;
+    assert!(response.headers().get(HEADER_LEADER).is_none());
 }

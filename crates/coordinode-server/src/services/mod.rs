@@ -6,6 +6,7 @@ pub mod error_details;
 pub mod graph;
 pub mod health;
 pub mod operation;
+pub(crate) mod routing;
 pub mod schema;
 pub mod session;
 pub mod statement;

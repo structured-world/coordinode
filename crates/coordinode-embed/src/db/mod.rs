@@ -3989,7 +3989,8 @@ pub use coordinode_core::txn::handle::{
 };
 pub use fields::FieldDictionary;
 pub use interactive::{
-    CommitOptions, DEFAULT_DRAIN_TIMEOUT, RollbackOptions, TransactionEnd, TransactionOptions,
+    CommitOptions, DEFAULT_DRAIN_TIMEOUT, ExpectedVersion, RollbackOptions, TransactionEnd,
+    TransactionOptions,
 };
 pub use package::{
     Disposition, EdgeTypeDeclaration, Intent, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,

@@ -19,6 +19,7 @@ replication = [
     "dep:coordinode-wire",
     "dep:coordinode-replicate",
     "dep:tokio",
+    "dep:tokio-stream",
     "dep:tonic",
 ]
 
@@ -30,6 +31,8 @@ coordinode-raft = { workspace = true, optional = true }
 coordinode-wire = { workspace = true, optional = true }
 coordinode-replicate = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+# The answer of a routed statement streams to the member that sent it.
+tokio-stream = { version = "0.1", optional = true }
 tonic = { workspace = true, optional = true }
 coordinode-vector = { workspace = true }
 coordinode-search = { workspace = true }

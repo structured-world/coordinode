@@ -13,11 +13,16 @@
 //! | `x-coordinode-node` | node_id (decimal) | Always set |
 //! | `x-coordinode-hops` | `0` or `1` | `1` when the node forwarded the request to the leader |
 //! | `x-coordinode-load` | `0` | No load tracking |
+//! | `x-coordinode-leader` | leader's node id, or `none` | Only from a member that does not lead |
+//!
+//! The leader is named by id only: the address members reach each other at is
+//! internal and is not disclosed to clients.
 //!
 //! EE header `x-coordinode-shard-hint` is **not** added by CE code.
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tower::{Layer, Service};
@@ -27,6 +32,21 @@ use tower::{Layer, Service};
 const HEADER_NODE: &str = "x-coordinode-node";
 const HEADER_HOPS: &str = "x-coordinode-hops";
 const HEADER_LOAD: &str = "x-coordinode-load";
+const HEADER_LEADER: &str = "x-coordinode-leader";
+
+/// Who leads the group, as a member sees it when it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leadership {
+    /// This member leads.
+    Here,
+    /// Another member leads: its node id.
+    Elsewhere(u64),
+    /// No leader is known: an election is under way.
+    Unknown,
+}
+
+/// Reads who leads at the moment a response is sent.
+pub type LeadershipSource = Arc<dyn Fn() -> Leadership + Send + Sync>;
 
 // ── NodeInfoLayer ──────────────────────────────────────────────────────────────
 
@@ -44,12 +64,23 @@ const HEADER_LOAD: &str = "x-coordinode-load";
 #[derive(Clone)]
 pub struct NodeInfoLayer {
     node_id: u64,
+    leadership: Option<LeadershipSource>,
 }
 
 impl NodeInfoLayer {
     /// Create a layer that tags every response with `node_id`.
     pub fn new(node_id: u64) -> Self {
-        Self { node_id }
+        Self {
+            node_id,
+            leadership: None,
+        }
+    }
+
+    /// Name the leader on every response of a member that does not lead, as
+    /// `leadership` reports it.
+    pub fn with_leadership(mut self, leadership: LeadershipSource) -> Self {
+        self.leadership = Some(leadership);
+        self
     }
 }
 
@@ -60,6 +91,7 @@ impl<S> Layer<S> for NodeInfoLayer {
         NodeInfoService {
             inner,
             node_id: self.node_id,
+            leadership: self.leadership.clone(),
         }
     }
 }
@@ -71,6 +103,7 @@ impl<S> Layer<S> for NodeInfoLayer {
 pub struct NodeInfoService<S> {
     inner: S,
     node_id: u64,
+    leadership: Option<LeadershipSource>,
 }
 
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for NodeInfoService<S>
@@ -92,6 +125,7 @@ where
         NodeInfoFuture {
             inner: self.inner.call(req),
             node_id: self.node_id,
+            leadership: self.leadership.clone(),
             method,
             started: std::time::Instant::now(),
         }
@@ -106,6 +140,7 @@ pin_project_lite::pin_project! {
         #[pin]
         inner: F,
         node_id: u64,
+        leadership: Option<LeadershipSource>,
         method: String,
         started: std::time::Instant,
     }
@@ -140,6 +175,25 @@ where
                     http::header::HeaderName::from_static(HEADER_LOAD),
                     http::HeaderValue::from_static("0"),
                 );
+
+                // A member that does not lead still answers, and says where
+                // the leader is: a client keeps working through any member
+                // and moves to the leader when it chooses.
+                match this.leadership.as_ref().map(|source| source()) {
+                    None | Some(Leadership::Here) => {}
+                    Some(Leadership::Elsewhere(id)) => {
+                        headers.insert(
+                            http::header::HeaderName::from_static(HEADER_LEADER),
+                            http::HeaderValue::from(id),
+                        );
+                    }
+                    Some(Leadership::Unknown) => {
+                        headers.insert(
+                            http::header::HeaderName::from_static(HEADER_LEADER),
+                            http::HeaderValue::from_static("none"),
+                        );
+                    }
+                }
 
                 // A call is counted when its response starts: for a stream
                 // the duration is the time to its first frame, not its life.

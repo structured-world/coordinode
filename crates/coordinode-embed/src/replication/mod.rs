@@ -22,6 +22,7 @@
 mod background;
 mod follower;
 mod index_copy;
+pub mod routing;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -383,6 +384,28 @@ impl Member {
         routes.add_service(InterceptedService::new(
             SegmentTransferServiceServer::new(segments)
                 .max_decoding_message_size(max_decoding_bytes),
+            nodes_only,
+        ));
+        true
+    }
+
+    /// Add the service peers route their clients' commands to, run here by
+    /// `executor`, refusing a caller that is not an admitted node before it
+    /// reads the message. Returns `false`, adding nothing, for a member
+    /// without peers.
+    pub fn add_command_routing<E: routing::CommandExecutor>(
+        &self,
+        routes: &mut tonic::service::RoutesBuilder,
+        executor: Arc<E>,
+    ) -> bool {
+        use coordinode_raft::cluster::admission::nodes_only;
+        use tonic::service::interceptor::InterceptedService;
+
+        if self.handler.is_none() || self.node.admission().is_none() {
+            return false;
+        }
+        routes.add_service(InterceptedService::new(
+            routing::CommandRoutingHandler::new(executor).into_service(routing::MAX_ROUTED_MESSAGE),
             nodes_only,
         ));
         true

@@ -44,7 +44,8 @@ pub(crate) fn optional_descriptor(
         .transpose()
 }
 
-/// The wire form of `descriptor`.
+/// The wire form of `descriptor`, as a client sends it.
+#[cfg(test)]
 pub(crate) fn descriptor_to_proto(descriptor: &OperationDescriptor) -> wire::OperationRef {
     wire::OperationRef {
         issuer: descriptor.op.issuer.0.to_vec(),

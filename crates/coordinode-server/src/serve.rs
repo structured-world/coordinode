@@ -1465,6 +1465,14 @@ pub(crate) async fn serve(
     if member.add_inter_node_services(&mut routes, max_req_bytes) {
         info!(node_id, "inter-node services registered on the shared port");
     }
+    // Commands peers route here from the clients they serve run on the path
+    // this member's own clients take.
+    member.add_command_routing(
+        &mut routes,
+        Arc::new(services::routing::ServerCommandExecutor::new(
+            statement_executor.clone(),
+        )),
+    );
 
     // Services contributed by a downstream distribution, added after the
     // built-in ones. CE registers no providers and this loop does nothing.
@@ -1473,8 +1481,17 @@ pub(crate) async fn serve(
     }
 
     // NodeInfoLayer: inject x-coordinode-node / x-coordinode-hops /
-    // x-coordinode-load response headers on every gRPC response.
-    let mut server = server.layer(grpc::NodeInfoLayer::new(node_id));
+    // x-coordinode-load response headers on every gRPC response, and on a
+    // member that does not lead, the leader to move to.
+    let leadership: grpc::LeadershipSource = {
+        let node = Arc::clone(&raft_node);
+        Arc::new(move || match node.current_leader() {
+            Some(id) if id == node.node_id() => grpc::Leadership::Here,
+            Some(id) => grpc::Leadership::Elsewhere(id),
+            None => grpc::Leadership::Unknown,
+        })
+    };
+    let mut server = server.layer(grpc::NodeInfoLayer::new(node_id).with_leadership(leadership));
     let router = server.add_routes(routes.routes());
 
     // The listener is bound and every service registered: connections that

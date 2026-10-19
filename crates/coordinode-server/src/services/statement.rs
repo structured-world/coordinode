@@ -14,16 +14,19 @@ use std::time::{Duration, Instant};
 
 use crate::writer::ReplicatedWriter;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
+use coordinode_core::txn::handle::{AdmissionSignal, TransactionHandle};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::read_concern::{
     ReadConcern as ExecutorReadConcern, ReadConcernLevel as ExecutorReadConcernLevel,
 };
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_embed::db::{CypherResult, StatementOptions};
+use coordinode_embed::replication::routing::{CommandRouter, RoutedAnswer, RoutedStatement};
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::QueryRegistry;
 use coordinode_query::advisor::nplus1::NPlus1Detector;
-use coordinode_query::advisor::source::{SourceContext, grpc_keys};
+use coordinode_query::advisor::source::SourceContext;
+use coordinode_query::executor::row::Row;
 use coordinode_query::frontend::QueryFrontend;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::{
@@ -31,10 +34,9 @@ use coordinode_raft::read_fence::{
 };
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
-use tonic::{Request, Response, Status};
+use tonic::Status;
 
 use crate::config::StatementDefaults;
-use crate::proto::query;
 
 /// The consistency settings a statement arrived with, after its session's
 /// were folded in. `None` leaves the setting to the server's default.
@@ -446,57 +448,57 @@ impl StatementExecutor {
         }
     }
 
-    /// Re-issue `req` at the leader and return its answer as our own.
+    /// Run `statement` at `member` and return its answer.
     ///
-    /// A level-0 client keeps working through a leader change without
-    /// noticing one: the node that knows who leads passes the request along.
-    /// The response carries the hop count, so a client that does care can see
-    /// it and start addressing the leader directly. `source` travels along,
-    /// so the leader's advisor counts the statement where it was issued, and
-    /// so does what is left of the caller's `deadline`.
-    pub(crate) async fn forward(
+    /// A client keeps working through whichever member it reached: a
+    /// statement this member cannot run goes to the leader, a transaction's
+    /// command to the member that holds it, and the answer comes back as
+    /// this member's own. The responses of a member that does not lead name
+    /// the leader, so a client that cares moves there.
+    pub(crate) async fn route(
         &self,
-        leader_id: u64,
-        req: query::ExecuteCypherRequest,
-        source: Option<&SourceContext>,
-        deadline: Option<std::time::Instant>,
-    ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
-        let channel = self.leader_channel(leader_id)?;
-        let mut client = query::cypher_service_client::CypherServiceClient::new(channel);
-        let mut forwarded = Request::new(req);
-        forwarded.metadata_mut().insert(
-            FORWARDED_HEADER,
-            tonic::metadata::MetadataValue::from_static("1"),
-        );
-        if let Some(deadline) = deadline {
-            // Already past: the leader stops it at its first check.
-            forwarded.set_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        member: u64,
+        statement: RoutedStatement,
+        admitted: &AdmissionSignal,
+    ) -> Result<RoutedAnswer, Status> {
+        self.router(member)?.execute(statement, admitted).await
+    }
+
+    /// A router to `member` over this node's authenticated connection to it.
+    pub(crate) fn router(&self, member: u64) -> Result<CommandRouter, Status> {
+        let node = self.raft_node.as_ref().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "member {member} is needed, and this node has no peers"
+            ))
+        })?;
+        CommandRouter::to_member(node, member)
+    }
+
+    /// The member holding `handle`'s transaction when it is another one;
+    /// `None` when this member holds it.
+    pub(crate) fn holder(&self, handle: &TransactionHandle) -> Option<u64> {
+        let node = self.raft_node.as_ref()?;
+        // Owner 0 is a database outside a group: this one.
+        (handle.owner() != 0 && handle.owner() != node.node_id()).then_some(handle.owner())
+    }
+
+    /// The member a transaction opens at: `None` when it is this one,
+    /// standalone or leading.
+    ///
+    /// # Errors
+    ///
+    /// The refusal a write gets during an election, when no member leads.
+    pub(crate) fn transaction_leader(&self) -> Result<Option<u64>, Status> {
+        let Some(node) = self.raft_node.as_ref() else {
+            return Ok(None);
+        };
+        match node.current_leader() {
+            Some(leader) if leader == node.node_id() => Ok(None),
+            Some(leader) => Ok(Some(leader)),
+            None => Err(crate::services::cypher::db_error_to_status(
+                DatabaseError::NotLeader { leader_id: None },
+            )),
         }
-        if let Some(source) = source {
-            let line = source.line.to_string();
-            for (key, value) in [
-                (grpc_keys::FILE, source.file.as_str()),
-                (grpc_keys::LINE, line.as_str()),
-                (grpc_keys::FUNCTION, source.function.as_str()),
-                (grpc_keys::APP, source.app.as_str()),
-                (grpc_keys::VERSION, source.version.as_str()),
-            ] {
-                // A value metadata cannot carry (not visible ASCII) is left
-                // out: the leader then counts the statement without it, which
-                // is what the advisor does with any missing part.
-                if let Ok(value) = tonic::metadata::MetadataValue::try_from(value) {
-                    if !value.is_empty() {
-                        forwarded.metadata_mut().insert(key, value);
-                    }
-                }
-            }
-        }
-        let mut response = client.execute_cypher(forwarded).await?;
-        response.metadata_mut().insert(
-            HOPS_HEADER,
-            tonic::metadata::MetadataValue::from_static("1"),
-        );
-        Ok(response)
     }
 
     /// The connection to member `leader_id`, made under this node's identity
@@ -522,6 +524,26 @@ impl StatementExecutor {
             .channel(&target)
             .map_err(|e| Status::internal(format!("leader {leader_id}: {e}")))
     }
+}
+
+/// The column header and the rows in column order: the keys of the first row
+/// (every row has the same), and a missing value as `Null` so each row is as
+/// wide as the header. No rows have no columns.
+pub(crate) fn columns_and_values(rows: &[Row]) -> (Vec<String>, Vec<Vec<Value>>) {
+    let columns: Vec<String> = rows
+        .first()
+        .map(|r| r.keys().cloned().collect())
+        .unwrap_or_default();
+    let values = rows
+        .iter()
+        .map(|row| {
+            columns
+                .iter()
+                .map(|col| row.get(col).cloned().unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect();
+    (columns, values)
 }
 
 /// Marks a request that has already been forwarded once.

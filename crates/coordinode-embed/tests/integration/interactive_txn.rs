@@ -544,6 +544,83 @@ fn a_transaction_commits_only_at_the_node_version_it_read() {
     assert_eq!(after[0].get("balance").and_then(|v| v.as_int()), Some(500));
 }
 
+/// The versions a caller built on travel with its commit and are checked
+/// there, acting for the caller that holds the transaction: a transaction a
+/// principal began is refused at a moved version and lands at the current
+/// one, with no separate call that would act for anyone else.
+#[test]
+fn a_commit_carries_the_versions_its_caller_built_on() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_embed::db::{CommitOptions, ExpectedVersion, StatementOptions};
+    use coordinode_embed::{ActingContext, DatabaseError, Principal, TransactionOptions};
+
+    let mut db = open_db();
+    db.execute_cypher("CREATE (n:Account {balance: 100})")
+        .expect("create");
+    let account = NodeId::from_raw(1);
+    let read_version = db
+        .node_version(account)
+        .expect("read version")
+        .expect("the account exists");
+    db.execute_cypher("MATCH (n:Account) SET n.balance = 250")
+        .expect("concurrent write");
+    let moved_to = db
+        .node_version(account)
+        .expect("read version")
+        .expect("still there");
+
+    let alice = ActingContext::Principal(Principal {
+        subject: "alice".into(),
+        trust_scope: "idp".into(),
+        namespace: "default".into(),
+    });
+    let as_alice = StatementOptions {
+        actor: Some(alice.clone()),
+        ..StatementOptions::default()
+    };
+    let run = |db: &coordinode_embed::Database, expected: Option<u64>| {
+        let tx = db
+            .begin_transaction_with(&TransactionOptions {
+                actor: Some(alice.clone()),
+                ..TransactionOptions::trusted()
+            })
+            .expect("begin");
+        db.execute_in_transaction_with(
+            tx,
+            "MATCH (n:Account) SET n.balance = 500",
+            None,
+            &as_alice,
+        )
+        .expect("statement");
+        db.commit_transaction_with(
+            tx,
+            &CommitOptions {
+                actor: Some(&alice),
+                expect: &[ExpectedVersion {
+                    node: account,
+                    version: expected,
+                }],
+                ..CommitOptions::default()
+            },
+        )
+    };
+
+    match run(&db, Some(read_version)) {
+        Err(DatabaseError::RevisionMismatch {
+            expected, current, ..
+        }) => {
+            assert_eq!(expected, Some(read_version));
+            assert_eq!(current, Some(moved_to));
+        }
+        other => panic!("expected a version mismatch, got {other:?}"),
+    }
+    run(&db, Some(moved_to)).expect("the version matches");
+    let after = db
+        .execute_cypher("MATCH (n:Account) RETURN n.balance AS balance")
+        .expect("read");
+    assert_eq!(after[0].get("balance").and_then(|v| v.as_int()), Some(500));
+}
+
 /// A statement that commits on its own reports the timestamp it committed at,
 /// and that timestamp is the version of what it wrote.
 ///

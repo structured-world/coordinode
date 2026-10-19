@@ -17,9 +17,15 @@ use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::ReadPreference;
 
+use coordinode_core::txn::handle::{ActingContext, AdmissionSignal};
+use coordinode_embed::db::{CommitOptions, ExpectedVersion};
+use coordinode_embed::replication::routing::{
+    RoutedAnswer, RoutedBegin, RoutedCommit, RoutedRollback, RoutedSettings, RoutedStatement,
+};
+
+use super::routing::routed_settings;
 use super::statement::{
-    Admission, Admitted, FORWARDED_HEADER, Requested, StatementExecutor, leader_hint,
-    mismatch_metadata,
+    Admission, Admitted, HOPS_HEADER, Requested, StatementExecutor, leader_hint, mismatch_metadata,
 };
 use crate::config::StatementDefaults;
 use crate::proto::{common, query, replication};
@@ -948,6 +954,84 @@ impl CypherServiceImpl {
     fn database(&self) -> &Arc<RwLock<Database>> {
         self.executor.database()
     }
+
+    /// Run the autonomous statement `req` at `leader` with the settings this
+    /// member resolved, and answer with what the leader answered.
+    async fn run_at(
+        &self,
+        leader: u64,
+        req: query::ExecuteCypherRequest,
+        requested: &Requested,
+        source: Option<SourceContext>,
+        start: std::time::Instant,
+    ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
+        let statement = RoutedStatement {
+            actor: ActingContext::Trusted,
+            params: convert_params(&req.parameters),
+            query: req.query,
+            settings: routed_settings(requested),
+            transaction: None,
+            nonce: None,
+            operation: requested.operation,
+            deadline: time_left(requested.deadline),
+            source,
+        };
+        let answer = self
+            .executor
+            .route(leader, statement, &AdmissionSignal::new(|| {}))
+            .await?;
+        Ok(routed_response(answer, true, start))
+    }
+}
+
+/// What is left until `deadline`, zero once it passed; `None` without one.
+fn time_left(deadline: Option<std::time::Instant>) -> Option<Duration> {
+    deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()))
+}
+
+/// A routed statement's answer as this member's response. `led` says the
+/// member that ran it was leading, which an autonomous statement routed to
+/// the leader always was. A write reports its own commit's index, one
+/// answered before its commit reports none, and a read the index it was
+/// served at, as on the local path.
+fn routed_response(
+    answer: RoutedAnswer,
+    led: bool,
+    start: std::time::Instant,
+) -> Response<query::ExecuteCypherResponse> {
+    let stats = answer.stats;
+    let applied_index = match (stats.applied_index, stats.commit_ts) {
+        (0, 0) => stats.read_index,
+        (0, _) => 0,
+        (own, _) => own,
+    };
+    let mut response = Response::new(query::ExecuteCypherResponse {
+        columns: answer.columns,
+        rows: answer
+            .rows
+            .iter()
+            .map(|row| query::Row {
+                values: row.iter().map(value_to_proto).collect(),
+            })
+            .collect(),
+        stats: Some(query::QueryStats {
+            nodes_created: stats.nodes_created,
+            nodes_deleted: stats.nodes_deleted,
+            edges_created: stats.edges_created,
+            edges_deleted: stats.edges_deleted,
+            properties_set: stats.properties_set,
+            execution_time_ms: start.elapsed().as_millis() as i64,
+            applied_index,
+            served_by_leader: led,
+            commit_ts: stats.commit_ts,
+            read_as_of_ts: stats.read_as_of_ts,
+        }),
+    });
+    response.metadata_mut().insert(
+        HOPS_HEADER,
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    response
 }
 
 /// When a call carrying `metadata` must have finished: its `grpc-timeout`
@@ -1034,11 +1118,6 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         request: Request<query::ExecuteCypherRequest>,
     ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
         let source_ctx = extract_source_context(&request);
-        // Read before the request is consumed: a request that has already been
-        // passed along once is answered here, right or wrong, rather than sent
-        // on again. Two nodes with stale hints would otherwise trade it back
-        // and forth while the client waits.
-        let already_forwarded = request.metadata().contains_key(FORWARDED_HEADER);
         let deadline = grpc_deadline(request.metadata());
         let cancel = coordinode_core::budget::CancelFlag::new();
         let _cancel_on_drop = CancelOnDrop(cancel.clone());
@@ -1068,8 +1147,31 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             } else {
                 Some(convert_params(&req.parameters))
             };
+            let query_memory_limit = memory_limit_from_proto(req.query_memory_limit_mb)?;
+            // Held by another member: the statement runs there.
+            if let Some(holder) = self.executor.holder(&transaction) {
+                let statement = RoutedStatement {
+                    actor: ActingContext::Trusted,
+                    query: req.query,
+                    params: params.unwrap_or_default(),
+                    settings: RoutedSettings {
+                        query_memory_limit,
+                        ..RoutedSettings::default()
+                    },
+                    transaction: Some(transaction),
+                    nonce: None,
+                    operation: None,
+                    deadline: time_left(deadline),
+                    source: source_ctx,
+                };
+                let answer = self
+                    .executor
+                    .route(holder, statement, &AdmissionSignal::new(|| {}))
+                    .await?;
+                return Ok(routed_response(answer, false, start));
+            }
             let options = coordinode_embed::db::StatementOptions {
-                query_memory_limit: memory_limit_from_proto(req.query_memory_limit_mb)?,
+                query_memory_limit,
                 deadline,
                 cancel: Some(cancel.clone()),
                 ..Default::default()
@@ -1125,18 +1227,13 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         }
 
         // Resolve and check the settings, fence the read and wait for the
-        // causal position. A statement that needs the leader is passed there.
+        // causal position. A statement that needs the leader runs there.
         let requested = requested_from_proto(&req, deadline, &cancel)?;
-        let admitted = match self
-            .executor
-            .admit(&req.query, &requested, already_forwarded)
-            .await?
-        {
+        let admitted = match self.executor.admit(&req.query, &requested, false).await? {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
                 return self
-                    .executor
-                    .forward(leader_id, req, source_ctx.as_ref(), deadline)
+                    .run_at(leader_id, req, &requested, source_ctx, start)
                     .await;
             }
         };
@@ -1154,19 +1251,17 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 Ok(result) => result,
                 Err(e) => {
                     // The write came to a node that cannot replicate it. If we
-                    // know who leads and this request has not already been
-                    // passed along once, send it there and answer with what
-                    // the leader says: the client never learns that leadership
-                    // moved. Nothing was applied here, so forwarding replays
-                    // the write rather than repeating it.
+                    // know who leads, it runs there and its answer is ours:
+                    // the client never learns that leadership moved. Nothing
+                    // was applied here, so running it there is its first run,
+                    // not a repeat.
                     match leader_hint(&e) {
-                        Some(leader_id) if !already_forwarded => {
+                        Some(leader_id) => {
                             return self
-                                .executor
-                                .forward(leader_id, req, source_ctx.as_ref(), deadline)
+                                .run_at(leader_id, req, &requested, source_ctx, start)
                                 .await;
                         }
-                        _ => return Err(db_error_to_status(e)),
+                        None => return Err(db_error_to_status(e)),
                     }
                 }
             }
@@ -1300,8 +1395,24 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         _request: Request<query::BeginTransactionRequest>,
     ) -> Result<Response<query::BeginTransactionResponse>, Status> {
-        let transaction = super::blocking(|| self.database().read().begin_transaction())
-            .map_err(db_error_to_status)?;
+        // A transaction is held by the leader: on another member it opens
+        // there.
+        let transaction = match self.executor.transaction_leader()? {
+            Some(leader) => {
+                self.executor
+                    .router(leader)?
+                    .begin(RoutedBegin {
+                        actor: ActingContext::Trusted,
+                        read_concern: None,
+                        write_concern: None,
+                        ordering: coordinode_core::operations::TxnOrdering::Unordered,
+                        drain_timeout: None,
+                    })
+                    .await?
+            }
+            None => super::blocking(|| self.database().read().begin_transaction())
+                .map_err(db_error_to_status)?,
+        };
         Ok(Response::new(query::BeginTransactionResponse {
             transaction: transaction.to_bytes().to_vec(),
         }))
@@ -1311,30 +1422,50 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         request: Request<query::CommitTransactionRequest>,
     ) -> Result<Response<query::CommitTransactionResponse>, Status> {
+        let deadline = grpc_deadline(request.metadata());
         let request = request.into_inner();
         let transaction =
             super::error_details::transaction_handle("transaction", &request.transaction)?;
         let operation =
             super::operation::optional_descriptor("operation", request.operation.as_ref())?;
-        let receipt = super::blocking(|| {
-            let db = self.database().read();
-            // The conditions the caller built its statements on, stated before
-            // the commit that checks them. A condition naming a node the caller
-            // never read is still a condition: the engine decides it against the
-            // state, not against what the caller happens to know.
-            for expect in &request.expect {
-                db.expect_node_version(
+        // The conditions the caller built its statements on, checked by the
+        // commit itself. A condition naming a node the caller never read is
+        // still a condition: the engine decides it against the state, not
+        // against what the caller happens to know.
+        let expect: Vec<ExpectedVersion> = request
+            .expect
+            .iter()
+            .map(|e| ExpectedVersion {
+                node: coordinode_core::graph::node::NodeId::from_raw(e.node_id),
+                version: e.version,
+            })
+            .collect();
+        let receipt = match self.executor.holder(&transaction) {
+            Some(holder) => {
+                self.executor
+                    .router(holder)?
+                    .commit(RoutedCommit {
+                        actor: ActingContext::Trusted,
+                        transaction,
+                        last_nonce: None,
+                        operation,
+                        deadline: time_left(deadline),
+                        expect,
+                    })
+                    .await?
+            }
+            None => super::blocking(|| {
+                self.database().read().commit_transaction_with(
                     transaction,
-                    coordinode_core::graph::node::NodeId::from_raw(expect.node_id),
-                    expect.version,
-                )?;
-            }
-            match &operation {
-                Some(operation) => db.commit_transaction_as(transaction, operation),
-                None => db.commit_transaction(transaction),
-            }
-        })
-        .map_err(db_error_to_status)?;
+                    &CommitOptions {
+                        operation: operation.as_ref(),
+                        expect: &expect,
+                        ..CommitOptions::default()
+                    },
+                )
+            })
+            .map_err(db_error_to_status)?,
+        };
         // `applied_index` 0 = no Raft log (embedded / single node); `commit_ts`
         // is present in every mode.
         Ok(Response::new(query::CommitTransactionResponse {
@@ -1351,8 +1482,19 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             "transaction",
             &request.into_inner().transaction,
         )?;
-        super::blocking(|| self.database().read().rollback_transaction(transaction))
-            .map_err(db_error_to_status)?;
+        match self.executor.holder(&transaction) {
+            Some(holder) => {
+                self.executor
+                    .router(holder)?
+                    .rollback(RoutedRollback {
+                        actor: ActingContext::Trusted,
+                        transaction,
+                    })
+                    .await?
+            }
+            None => super::blocking(|| self.database().read().rollback_transaction(transaction))
+                .map_err(db_error_to_status)?,
+        }
         Ok(Response::new(query::RollbackTransactionResponse {}))
     }
 }
