@@ -534,6 +534,76 @@ fn an_interrupted_certification_finishes_after_a_restart() {
     );
 }
 
+/// A publication under a client operation takes effect once: retrying it
+/// after a lost reply answers with the operation's outcome instead of a
+/// revision conflict, another package under the same number is told
+/// apart, and an unchanged package records nothing under its operation.
+#[test]
+fn a_publication_retried_under_its_operation_answers_with_its_outcome() {
+    use crate::operation::{IssuerId, OperationOutcome, Resolve};
+    let (db, _dir) = open();
+    let first = db.publish_schema(package()).expect("publish");
+    db.await_schema(&first, WAIT).expect("await");
+    let issuer = db.enroll_issuer(IssuerId([0x41; 16])).expect("enroll");
+
+    let mut change = package();
+    change.labels[0].schema = user(Some("age"));
+    change.labels[0].intent = Intent::Change {
+        expected_revision: user_schema(&db).schema_revision,
+    };
+    change.constraints.clear();
+    change.edge_types.clear();
+    let descriptor = issuer.next().expect("descriptor");
+    let changed = db
+        .publish_schema_as(change.clone(), &descriptor)
+        .expect("change");
+    assert!(changed.committed);
+
+    // The reply was lost: the same call again changes nothing and says how
+    // the first one ended.
+    match db.publish_schema_as(change.clone(), &descriptor) {
+        Err(DatabaseError::OperationSettled {
+            outcome,
+            intent_differs,
+            ..
+        }) => {
+            assert!(
+                matches!(outcome, OperationOutcome::Committed { .. }),
+                "{outcome:?}"
+            );
+            assert!(!intent_differs);
+        }
+        other => panic!("expected the settled operation, got {other:?}"),
+    }
+    let mut other = change;
+    other.labels[0].schema = user(Some("level"));
+    other.labels[0].intent = Intent::Change {
+        expected_revision: changed.objects[0].revision,
+    };
+    assert!(matches!(
+        db.publish_schema_as(other, &descriptor),
+        Err(DatabaseError::OperationSettled {
+            intent_differs: true,
+            ..
+        })
+    ));
+
+    let unchanged = issuer.next().expect("descriptor");
+    let mut same = package();
+    same.labels[0].schema = user(Some("age"));
+    assert!(
+        !db.publish_schema_as(same, &unchanged)
+            .expect("no-op")
+            .committed
+    );
+    assert_eq!(
+        db.resolve_operation(&unchanged, Resolve::Lookup)
+            .expect("resolve"),
+        OperationOutcome::Unknown,
+        "nothing was committed under the operation"
+    );
+}
+
 /// A change of a label whose candidate is still being proved is refused,
 /// naming the operation to wait for or cancel; cancelling withdraws it.
 #[test]

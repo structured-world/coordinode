@@ -164,6 +164,20 @@ pub(crate) fn statement_intent(
     IntentDigest(hasher.finalize().into())
 }
 
+/// Domain separation of a schema package's intent digest.
+const PACKAGE_INTENT_TAG: &[u8] = b"coordinode/operation/schema-package/v1";
+
+/// What a schema package means: its declarations as encoded, so two attempts
+/// of one publication carry the same intent and a different package under a
+/// reused number is told apart.
+pub(crate) fn package_intent(encoded: &[u8]) -> IntentDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(PACKAGE_INTENT_TAG);
+    hasher.update((encoded.len() as u64).to_be_bytes());
+    hasher.update(encoded);
+    IntentDigest(hasher.finalize().into())
+}
+
 /// The intent of a transaction's statements so far, `chain`, extended by
 /// one more statement.
 pub(crate) fn chain_intent(chain: &IntentDigest, statement: &IntentDigest) -> IntentDigest {

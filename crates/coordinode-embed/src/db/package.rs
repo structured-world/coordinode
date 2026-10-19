@@ -36,7 +36,7 @@ use super::{Database, DatabaseError};
 pub const MAX_SCHEMA_PACKAGE_DECLARATIONS: usize = 4096;
 
 /// What a declaration asks of an object that already exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Intent {
     /// Create it when absent, keep it when equal, refuse it when it differs.
     Ensure,
@@ -50,7 +50,7 @@ pub enum Intent {
 }
 
 /// A label definition in a package.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct LabelDeclaration {
     /// The type facts of the label. It declares no constraints: those are
     /// separate declarations.
@@ -60,7 +60,7 @@ pub struct LabelDeclaration {
 }
 
 /// An edge type definition in a package.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct EdgeTypeDeclaration {
     /// The type facts of the edge type.
     pub schema: EdgeTypeSchema,
@@ -70,7 +70,7 @@ pub struct EdgeTypeDeclaration {
 
 /// A constraint in a package. A constraint is created or kept: changing one
 /// is dropping it and declaring another.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PackageConstraint {
     /// Its name; `None` derives one from the label, properties and kind.
     pub name: Option<String>,
@@ -92,7 +92,7 @@ pub struct PackageConstraint {
 
 /// Declarations published together. Each name appears at most once per
 /// kind of object.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct SchemaPackage {
     /// Label definitions.
     pub labels: Vec<LabelDeclaration>,
@@ -141,9 +141,12 @@ pub struct PublishedObject {
     /// enforced on every write while the build of its index checks the
     /// stored nodes.
     pub state: Option<ConstraintState>,
-    /// For a constraint that owns an index, the build of that index: the
-    /// operation [`Database::index_build`] inspects and
-    /// [`Database::cancel_index_build`] cancels.
+    /// The background work putting it in force: for a label, the proof of
+    /// its candidate definition; for a constraint owning an index, that
+    /// index's build. [`Database::await_schema`] waits for it,
+    /// [`Database::index_build`] inspects a build and
+    /// [`Database::cancel_index_build`] cancels either. `None` when it is in
+    /// force already.
     pub operation: Option<GenerationId>,
 }
 
@@ -273,13 +276,56 @@ impl Database {
         &self,
         package: SchemaPackage,
     ) -> Result<SchemaPublication, DatabaseError> {
+        self.publish_package(package, None)
+    }
+
+    /// [`Self::publish_schema`] as the client operation `operation`: the
+    /// catalog commit takes effect at most once however the call is
+    /// retried. A retry after a lost reply of a publication that committed
+    /// is refused with [`DatabaseError::OperationSettled`], and
+    /// [`Self::resolve_operation`] tells how it stands without publishing
+    /// again. A package that changes nothing commits nothing and records
+    /// nothing under the operation.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_schema`], and the operation already settled or
+    /// not admissible.
+    pub fn publish_schema_as(
+        &self,
+        package: SchemaPackage,
+        operation: &crate::operation::OperationDescriptor,
+    ) -> Result<SchemaPublication, DatabaseError> {
+        self.publish_package(package, Some(operation))
+    }
+
+    fn publish_package(
+        &self,
+        package: SchemaPackage,
+        operation: Option<&crate::operation::OperationDescriptor>,
+    ) -> Result<SchemaPublication, DatabaseError> {
         check_package(&package)?;
+        let operation = match operation {
+            Some(descriptor) => {
+                let encoded = rmp_serde::to_vec(&package)
+                    .map_err(|e| DatabaseError::Other(format!("encode the schema package: {e}")))?;
+                let intent = crate::operation::package_intent(&encoded);
+                // Before the catalog is read: a retry of a publication that
+                // committed is answered by its outcome, not by the conflict
+                // its own commit now makes for it.
+                self.admit_operation(descriptor, &intent)?;
+                Some((descriptor, intent))
+            }
+            None => None,
+        };
         let SchemaPackage {
             labels,
             edge_types,
             constraints,
         } = package;
-        self.publish_declarations(
+        let mut txn = self.begin_catalog_txn();
+        let staged = self.stage_declarations(
+            &mut txn,
             labels
                 .into_iter()
                 .map(|d| (d.schema, Existing::from(d.intent)))
@@ -289,7 +335,15 @@ impl Database {
                 .map(|d| (d.schema, Existing::from(d.intent)))
                 .collect(),
             constraints,
-        )
+        )?;
+        // The commit records the operation; a concurrent attempt of the same
+        // one that committed first refuses this commit there.
+        if let Some((descriptor, intent)) = operation {
+            if staged.changes {
+                txn.bind_operation(descriptor.op, intent);
+            }
+        }
+        self.finish_publication(txn, staged)
     }
 
     /// The publication core every schema entry point stages through: one
