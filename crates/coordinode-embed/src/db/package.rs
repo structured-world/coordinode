@@ -132,6 +132,8 @@ pub struct PublishedObject {
     pub object: CatalogObject,
     /// Its name.
     pub name: String,
+    /// For a constraint, the label it constrains; `None` for a definition.
+    pub label: Option<String>,
     /// What publication did with it.
     pub disposition: Disposition,
     /// Its revision: a definition's own, or for a constraint the revision of
@@ -252,8 +254,14 @@ struct StagedLabel {
     dirty: bool,
     /// The facts in force before the package, when the declared ones could
     /// refuse a stored node: they stay in force, and the declared ones are
-    /// published as a candidate to prove.
+    /// published as a candidate to prove. Also set, to the facts unchanged,
+    /// when the package adds a presence or type constraint: the proof
+    /// covers it too.
     proved_over: Option<(BTreeMap<String, PropertyDef>, SchemaMode)>,
+    /// Whether the commit itself must check every stored node against the
+    /// definition, as for a new node key, whose index build activates it
+    /// and so cannot wait for a proof of its presence part.
+    checked_at_commit: bool,
 }
 
 impl Database {
@@ -379,8 +387,9 @@ impl Database {
         let mut staged: BTreeMap<String, StagedLabel> = BTreeMap::new();
         for (schema, existing) in labels {
             let (label, object) = stage_label(&store, txn, schema, existing)?;
-            revision_of
-                .push((object.disposition != Disposition::Retained).then(|| object.name.clone()));
+            // A kept definition still moves to a new revision when the
+            // package changes the label's constraints.
+            revision_of.push(Some(object.name.clone()));
             objects.push(object);
             staged.insert(label.schema.name.clone(), label);
         }
@@ -412,6 +421,7 @@ impl Database {
                         read_revision,
                         dirty: read_revision.is_none(),
                         proved_over: None,
+                        checked_at_commit: false,
                     })
                 }
             };
@@ -438,6 +448,14 @@ impl Database {
         // Each label the package changes gets one new revision, however many
         // of its declarations changed it.
         let indexes = coordinode_modality::LocalIndexStore::new(&self.engine);
+        // One certification proves every label the package publishes a
+        // candidate for, in one pass over the stored nodes.
+        let operation = if staged.values().any(|l| l.dirty && l.proved_over.is_some()) {
+            use coordinode_modality::IndexStore as _;
+            Some(indexes.allocate_generation_txn(txn)?)
+        } else {
+            None
+        };
         let mut certifications = Vec::new();
         for label in staged.values_mut().filter(|l| l.dirty) {
             if let Some(read) = label.read_revision {
@@ -451,9 +469,9 @@ impl Database {
             // Declared facts that could refuse a stored node are published
             // as a candidate, proved in the background; the facts in force
             // stay until the proof puts it in force.
-            if let Some((properties, mode)) = label.proved_over.take() {
-                use coordinode_modality::IndexStore as _;
-                let operation = indexes.allocate_generation_txn(txn)?;
+            if let (Some((properties, mode)), Some(operation)) =
+                (label.proved_over.take(), operation)
+            {
                 let declared = core::mem::replace(&mut label.schema.properties, properties);
                 let declared_mode = core::mem::replace(&mut label.schema.mode, mode);
                 label.schema.set_candidate(LabelCandidate {
@@ -461,22 +479,49 @@ impl Database {
                     mode: declared_mode,
                     operation,
                 });
-                indexes.put_certification_txn(
-                    txn,
-                    &LabelCertificationRecord::accepted(operation, label.schema.name.clone()),
-                    None,
-                )?;
                 certifications.push((label.schema.name.clone(), operation));
             }
-            store.save_label_txn(txn, &label.schema)?;
+            if label.checked_at_commit {
+                // Every stored node is checked against the definition at the
+                // commit, with writers under the old one held out.
+                store.save_label_txn(txn, &label.schema)?;
+            } else {
+                // What could refuse a stored node is proved in the background;
+                // the rest refuses none. A writer that read the old revision
+                // is refused by the pointer this moves, or committed before
+                // the proof waits for it.
+                store.save_label_admitting_txn(txn, &label.schema)?;
+            }
         }
-        for object in &mut objects {
-            if object.object == CatalogObject::Label && object.disposition != Disposition::Retained
-            {
-                if let Some((_, operation)) = certifications.iter().find(|(l, _)| *l == object.name)
-                {
-                    object.operation = Some(*operation);
+        if let Some(operation) = operation {
+            use coordinode_modality::IndexStore as _;
+            indexes.put_certification_txn(
+                txn,
+                &LabelCertificationRecord::accepted(
+                    operation,
+                    certifications.iter().map(|(l, _)| l.clone()).collect(),
+                ),
+                None,
+            )?;
+        }
+        for (object, holder) in objects.iter_mut().zip(&revision_of) {
+            let certified_by = match object.object {
+                CatalogObject::Label if object.disposition != Disposition::Retained => {
+                    Some(object.name.as_str())
                 }
+                CatalogObject::Constraint
+                    if object.disposition == Disposition::Created
+                        && object.operation.is_none()
+                        && object.state == Some(ConstraintState::Validating) =>
+                {
+                    holder.as_deref()
+                }
+                _ => None,
+            };
+            if let Some((_, operation)) =
+                certified_by.and_then(|l| certifications.iter().find(|(c, _)| c == l))
+            {
+                object.operation = Some(*operation);
             }
         }
         for (object, label) in objects.iter_mut().zip(&revision_of) {
@@ -502,7 +547,7 @@ impl Database {
                 .map(|l| l.schema)
                 .collect(),
             published,
-            certifications: certifications.into_iter().map(|(_, op)| op).collect(),
+            certifications: operation.into_iter().collect(),
         })
     }
 
@@ -578,22 +623,43 @@ impl Database {
             .filter(|o| o.state != Some(ConstraintState::Active))
             .filter_map(|o| o.operation)
             .collect();
-        let mut outcomes: rustc_hash::FxHashMap<GenerationId, Readiness> =
+        let outcomes: rustc_hash::FxHashMap<GenerationId, Readiness> =
             self.await_operations(&waited, wait)?.into_iter().collect();
-        let objects = publication
+        use coordinode_modality::IndexStore as _;
+        let indexes = coordinode_modality::LocalIndexStore::new(&self.engine);
+        let mut objects = Vec::new();
+        for o in publication
             .objects
             .iter()
             .filter(|o| o.object != CatalogObject::EdgeType)
-            .map(|o| {
-                let readiness = match (o.state, o.operation) {
-                    (Some(ConstraintState::Active), _) | (_, None) => Readiness::Ready,
-                    (_, Some(operation)) => {
-                        outcomes.remove(&operation).unwrap_or(Readiness::Pending)
+        {
+            let readiness = match (o.state, o.operation) {
+                (Some(ConstraintState::Active), _) | (_, None) => Readiness::Ready,
+                (_, Some(operation)) => match outcomes.get(&operation) {
+                    None | Some(Readiness::Pending) => Readiness::Pending,
+                    Some(Readiness::Ready) => Readiness::Ready,
+                    // A certification proves several labels and refuses
+                    // each on its own: its record tells which it refused.
+                    Some(Readiness::Failed(why)) => {
+                        let label = o.label.as_deref().unwrap_or(o.name.as_str());
+                        match indexes
+                            .load_certification(operation)
+                            .map_err(ExecutionError::from)?
+                        {
+                            Some((record, _)) => match record.refusal_of(label) {
+                                Some(refusal) => Readiness::Failed(refusal.to_string()),
+                                None if record.labels.iter().any(|l| l == label) => {
+                                    Readiness::Ready
+                                }
+                                None => Readiness::Failed(why.clone()),
+                            },
+                            None => Readiness::Failed(why.clone()),
+                        }
                     }
-                };
-                (o.object, o.name.clone(), readiness)
-            })
-            .collect();
+                },
+            };
+            objects.push((o.object, o.name.clone(), readiness));
+        }
         Ok(SchemaReadiness { objects })
     }
 
@@ -707,14 +773,22 @@ impl Database {
                         label: &StagedLabel| PublishedObject {
             object: CatalogObject::Constraint,
             name: existing.name.clone(),
+            label: Some(label.schema.name.clone()),
             disposition: Disposition::Retained,
             revision: label.read_revision.unwrap_or(label.schema.schema_revision),
             state: Some(existing.state),
-            operation: self
-                .index_registry
-                .get(&existing.name)
-                .filter(|d| d.owner.as_deref() == Some(existing.name.as_str()))
-                .map(|d| d.generation),
+            operation: match existing.owns_index() {
+                true => self
+                    .index_registry
+                    .get(&existing.name)
+                    .filter(|d| d.owner.as_deref() == Some(existing.name.as_str()))
+                    .map(|d| d.generation),
+                // A presence or type constraint still validating is proved
+                // with its label's candidate.
+                false => (existing.state == ConstraintState::Validating)
+                    .then(|| label.schema.candidate().map(|c| c.operation))
+                    .flatten(),
+            },
         };
         if let Some(holder) = store.constraint_label_txn(txn, &name)? {
             let existing = (holder == request.label)
@@ -748,13 +822,34 @@ impl Database {
             }
             .into());
         }
-        let planned = plan_constraint(&request, Some(&label.schema))?;
+        let mut planned = plan_constraint(&request, Some(&label.schema))?;
         if planned.owned_index.is_some() && self.index_registry.get(&name).is_some() {
             return Err(ExecutionError::CatalogObjectExists {
                 object: CatalogObject::Index,
                 name,
             }
             .into());
+        }
+        if planned.constraint.checks_each_node() {
+            if planned.owned_index.is_some() {
+                // A node key's index build activates it, so its presence
+                // part is checked at the commit, as before.
+                label.checked_at_commit = true;
+            } else {
+                if label.read_revision.is_some() && label.schema.candidate().is_some() {
+                    return Err(refused(format!(
+                        "the definition of :{} is still being certified; wait for it or cancel \
+                         it before adding constraint '{name}'",
+                        label.schema.name
+                    )));
+                }
+                // Proved over the stored nodes with the label, enforced on
+                // every write meanwhile.
+                planned.constraint.state = ConstraintState::Validating;
+                if label.proved_over.is_none() {
+                    label.proved_over = Some((label.schema.properties.clone(), label.schema.mode));
+                }
+            }
         }
         store.claim_constraint_name_txn(txn, &name, &request.label)?;
         label.schema.add_constraint(planned.constraint.clone());
@@ -763,6 +858,7 @@ impl Database {
             PublishedObject {
                 object: CatalogObject::Constraint,
                 name,
+                label: Some(request.label.clone()),
                 disposition: Disposition::Created,
                 revision: 0,
                 state: Some(planned.constraint.state),
@@ -855,6 +951,7 @@ fn stage_label(
     let object = |disposition, revision| PublishedObject {
         object: CatalogObject::Label,
         name: name.clone(),
+        label: None,
         disposition,
         revision,
         state: None,
@@ -882,6 +979,7 @@ fn stage_label(
                 read_revision: None,
                 dirty: true,
                 proved_over,
+                checked_at_commit: false,
             },
             object(Disposition::Created, revision),
         ));
@@ -902,6 +1000,7 @@ fn stage_label(
                 read_revision: Some(read),
                 dirty: false,
                 proved_over: None,
+                checked_at_commit: false,
             },
             retained,
         ));
@@ -951,6 +1050,7 @@ fn stage_label(
             read_revision: Some(read),
             dirty: true,
             proved_over,
+            checked_at_commit: false,
         },
         object(Disposition::Changed, read),
     ))
@@ -985,6 +1085,7 @@ fn stage_edge_type(
     let object = |disposition, revision| PublishedObject {
         object: CatalogObject::EdgeType,
         name: name.clone(),
+        label: None,
         disposition,
         revision,
         state: None,

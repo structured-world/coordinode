@@ -1,15 +1,16 @@
 //! Certification of label candidates, on the same executors, seats, records
 //! and moves as index builds.
 //!
-//! A candidate definition is published in the label's schema beside the
-//! facts in force, with its certification admitted in the same commit.
-//! Writers from then on are held to both (`CandidateAdmits`). The executor
-//! waits for every transaction open before it to end, so each node written
-//! under the old facts alone is in the store, then checks the stored nodes
-//! against the candidate. Its last move puts the candidate in force, or
-//! withdraws it leaving the facts in force untouched, in one commit
-//! conditioned on the record still being its own and on the label's schema
-//! as it read it.
+//! The candidate definitions a publication changes are published in their
+//! labels' schemas beside the facts in force, with one certification for
+//! all of them admitted in the same commit. Writers from then on are held
+//! to both (`CandidateAdmits`). The executor waits for every transaction
+//! open before it to end, so each node written under the old facts alone is
+//! in the store, then checks the stored nodes against the candidates in one
+//! pass. Its last move puts in force every candidate the stored nodes
+//! satisfy and withdraws the others, leaving their facts in force
+//! untouched, in one commit conditioned on the record still being its own
+//! and on each label's schema as it read it.
 
 use coordinode_modality::{
     BuildState, IndexStore as _, LocalIndexStore, LocalSchemaStore, SchemaStore as _, StoreError,
@@ -21,18 +22,12 @@ use super::{
 };
 use crate::index::build::{BackfillError, await_older_transactions};
 
-/// How a certification ended, before its last move lands.
-enum Proof {
-    /// Every stored node satisfies the candidate; this many were checked.
-    Holds(u64),
-    /// The candidate is refused, for this reason.
-    Refused(String),
-}
-
 impl IndexBuildService {
     /// Run the certification `generation` on an executor of this process,
-    /// unless one already has it. [`Self::wait`] reports its outcome: the
-    /// candidate put in force is `Published`, a refused one `Failed`.
+    /// unless one already has it. [`Self::wait`] reports its outcome:
+    /// `Published` when every candidate was put in force, `Failed` naming
+    /// the labels whose candidate was refused (the others were put in force;
+    /// the record tells which).
     ///
     /// # Errors
     ///
@@ -41,7 +36,7 @@ impl IndexBuildService {
         self.spawn(generation, move |shared| shared.certify(generation))
     }
 
-    /// Cancel the certification `generation`: its candidate is withdrawn,
+    /// Cancel the certification `generation`: its candidates are withdrawn,
     /// the facts in force stay. `false` when it already had an outcome or no
     /// certification has the number.
     ///
@@ -61,13 +56,25 @@ impl IndexBuildService {
                 return Ok(false);
             }
             record.state = BuildState::Cancelled;
+            // Every candidate is withdrawn: none was put in force.
+            record.refused = record
+                .labels
+                .iter()
+                .map(|label| {
+                    (
+                        label.clone(),
+                        format!("the certification of :{label} was cancelled"),
+                    )
+                })
+                .collect();
             let committed = {
                 let mut txn = begin(env);
                 store
                     .put_certification_txn(&mut txn, &record, Some(version))
                     .map_err(text)?;
-                stage_withdrawal(env.engine(), &mut txn, &record.label, generation)
-                    .map_err(text)?;
+                for label in &record.labels {
+                    stage_withdrawal(env.engine(), &mut txn, label, generation).map_err(text)?;
+                }
                 env.commit_catalog(&mut txn)
             };
             match committed {
@@ -110,7 +117,7 @@ pub(super) fn certification_outcome(
 
 impl Shared {
     /// Take the certification `generation`, prove the stored nodes and put
-    /// the candidate in force or withdraw it.
+    /// each candidate in force or withdraw it.
     fn certify(self: &std::sync::Arc<Self>, generation: GenerationId) -> Executed {
         let _seat = self.seat(generation);
         if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
@@ -121,61 +128,75 @@ impl Shared {
     }
 
     fn try_certify(&self, generation: GenerationId) -> Result<Executed, String> {
-        let (token, label) = match self.take_certification(generation)? {
+        let (token, labels) = match self.take_certification(generation)? {
             Ok(taken) => taken,
             Err(executed) => return Ok(executed),
         };
         let env = self.env.as_ref();
         self.set_phase(generation, BuildPhase::AwaitingOlderTransactions);
         let wait = self.config.read().older_transactions_wait;
-        match await_older_transactions(env.engine(), wait, Some(&self.stopping)) {
-            Ok(()) => {}
+        let refused = match await_older_transactions(env.engine(), wait, Some(&self.stopping)) {
+            Ok(()) => {
+                self.set_phase(generation, BuildPhase::Indexing { indexed: None });
+                self.prove(generation, &labels)?
+            }
             // The record stays running under this token, and the next
             // process to open the storage takes it over.
             Err(BackfillError::Stopped) => return Ok(Executed::Lost),
-            Err(e) => {
-                return self.conclude_certification(
-                    generation,
-                    token,
-                    &label,
-                    Proof::Refused(format!("certify :{label}: {e}")),
-                );
-            }
-        }
-        self.set_phase(generation, BuildPhase::Indexing { indexed: None });
-        let proof = self.prove(generation, &label)?;
-        self.conclude_certification(generation, token, &label, proof)
+            Err(e) => labels
+                .iter()
+                .map(|label| (label.clone(), format!("certify :{label}: {e}")))
+                .collect(),
+        };
+        self.conclude_certification(generation, token, &labels, refused)
     }
 
-    /// Check every stored node of `label` against its candidate as published
-    /// with `generation`. A candidate no longer there (withdrawn, or the
-    /// label dropped) refuses itself.
-    fn prove(&self, generation: GenerationId, label: &str) -> Result<Proof, String> {
+    /// Check the stored nodes of `labels` against their candidates as
+    /// published with `generation`, in one pass. Returns the labels refused,
+    /// each with why; a candidate no longer there (withdrawn, or the label
+    /// dropped) refuses itself.
+    fn prove(
+        &self,
+        generation: GenerationId,
+        labels: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
         let engine = self.env.engine();
-        let schema = LocalSchemaStore::new(engine)
-            .load_label(label)
-            .map_err(text)?;
-        let candidate = schema
-            .as_ref()
-            .filter(|s| s.candidate().is_some_and(|c| c.operation == generation))
-            .and_then(|s| s.candidate_schema());
-        let Some(candidate) = candidate else {
-            return Ok(Proof::Refused(format!(
-                "the candidate definition of :{label} is no longer published"
-            )));
-        };
-        let none = std::collections::HashMap::new();
-        match coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
-            engine, &candidate, &none,
-        ) {
-            Ok(None) => Ok(Proof::Holds(0)),
-            Ok(Some(violation)) => Ok(Proof::Refused(format!(
-                "the definition of :{label} is not put in force: node {} breaks it ({})",
-                violation.node.to_element_id(),
-                violation.reason
-            ))),
-            Err(e) => Ok(Proof::Refused(format!("certify :{label}: {e}"))),
+        let store = LocalSchemaStore::new(engine);
+        let mut refused = Vec::new();
+        let mut candidates = Vec::with_capacity(labels.len());
+        for label in labels {
+            let candidate = store
+                .load_label(label)
+                .map_err(text)?
+                .filter(|s| s.candidate().is_some_and(|c| c.operation == generation))
+                .and_then(|s| s.candidate_schema());
+            match candidate {
+                Some(candidate) => candidates.push(candidate),
+                None => refused.push((
+                    label.clone(),
+                    format!("the candidate definition of :{label} is no longer published"),
+                )),
+            }
         }
+        match coordinode_storage::engine::claims::evaluate::label_schema_violations(
+            engine,
+            &candidates,
+        ) {
+            Ok(violations) => refused.extend(violations.into_iter().map(|(label, v)| {
+                let why = format!(
+                    "the definition of :{label} is not put in force: node {} breaks it ({})",
+                    v.node.to_element_id(),
+                    v.reason
+                );
+                (label, why)
+            })),
+            Err(e) => refused.extend(
+                candidates
+                    .iter()
+                    .map(|c| (c.name.clone(), format!("certify :{}: {e}", c.name))),
+            ),
+        }
+        Ok(refused)
     }
 
     /// Take the certification `generation`: its record moves to running
@@ -184,7 +205,7 @@ impl Shared {
     fn take_certification(
         &self,
         generation: GenerationId,
-    ) -> Result<Result<(u64, String), Executed>, String> {
+    ) -> Result<Result<(u64, Vec<String>), Executed>, String> {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
         for () in move_attempts() {
@@ -205,7 +226,7 @@ impl Shared {
                 env.commit_catalog(&mut txn)
             };
             match committed {
-                Ok(()) => return Ok(Ok((token, record.label))),
+                Ok(()) => return Ok(Ok((token, record.labels))),
                 Err(e) if is_contention(&e) => continue,
                 Err(e) if cannot_move_here(&e) => return Ok(Err(Executed::Lost)),
                 Err(e) => return Err(e.to_string()),
@@ -218,16 +239,17 @@ impl Shared {
     }
 
     /// The last move of the certification the executor holding `token`
-    /// took: the candidate put in force or withdrawn, and the record ended,
-    /// in one commit conditioned on the record still naming the token and on
-    /// the label's schema as read; retried while a conflicting move leaves
-    /// the certification the executor's.
+    /// took: every candidate of `labels` not `refused` put in force, the
+    /// refused ones withdrawn, and the record ended, in one commit
+    /// conditioned on the record still naming the token and on each label's
+    /// schema as read; retried while a conflicting move leaves the
+    /// certification the executor's.
     fn conclude_certification(
         &self,
         generation: GenerationId,
         token: u64,
-        label: &str,
-        proof: Proof,
+        labels: &[String],
+        refused: Vec<(String, String)>,
     ) -> Result<Executed, String> {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
@@ -244,35 +266,37 @@ impl Shared {
             }
             let committed = {
                 let mut txn = begin(env);
-                let outcome = match &proof {
-                    Proof::Holds(checked) => {
-                        match stage_activation(env.engine(), &mut txn, label, generation)
-                            .map_err(text)?
-                        {
-                            true => {
-                                record.checked = *checked;
-                                record.state = BuildState::Published;
-                                IndexBuildOutcome::Published {
-                                    indexed: Some(*checked),
-                                }
-                            }
-                            // Withdrawn or replaced meanwhile: nothing of it
-                            // is left to put in force.
-                            false => {
-                                record.state = BuildState::Cancelled;
-                                IndexBuildOutcome::Cancelled
-                            }
-                        }
-                    }
-                    Proof::Refused(reason) => {
+                let mut withdrawn = refused.clone();
+                for label in labels {
+                    if withdrawn.iter().any(|(l, _)| l == label) {
                         stage_withdrawal(env.engine(), &mut txn, label, generation)
                             .map_err(text)?;
-                        record.state = BuildState::Failed {
-                            reason: reason.clone(),
-                        };
-                        IndexBuildOutcome::Failed(BuildError::Other(reason.clone()))
+                    } else if !stage_activation(env.engine(), &mut txn, label, generation)
+                        .map_err(text)?
+                    {
+                        // Withdrawn or replaced meanwhile: nothing of it is
+                        // left to put in force.
+                        withdrawn.push((
+                            label.clone(),
+                            format!("the candidate definition of :{label} is no longer published"),
+                        ));
                     }
+                }
+                let outcome = if withdrawn.is_empty() {
+                    record.state = BuildState::Published;
+                    IndexBuildOutcome::Published { indexed: None }
+                } else {
+                    let reason = withdrawn
+                        .iter()
+                        .map(|(_, why)| why.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    record.state = BuildState::Failed {
+                        reason: reason.clone(),
+                    };
+                    IndexBuildOutcome::Failed(BuildError::Other(reason))
                 };
+                record.refused = withdrawn;
                 store
                     .put_certification_txn(&mut txn, &record, Some(version))
                     .map_err(text)?;
@@ -312,6 +336,13 @@ fn stage_activation(
         return Ok(false);
     }
     schema.activate_candidate();
+    // The presence and type constraints published with it were proved by
+    // the same pass; a node key's index build activates it, not this.
+    for name in validating_checks(&schema) {
+        if let Some(constraint) = schema.constraint_mut(&name) {
+            constraint.state = coordinode_core::schema::definition::ConstraintState::Active;
+        }
+    }
     schema.schema_revision = next_revision(&schema)?;
     // Every write since the candidate's publication was held to it, and
     // every stored node was proved against it: no scan at this commit.
@@ -339,8 +370,29 @@ fn stage_withdrawal(
         return Ok(());
     }
     schema.take_candidate();
+    // The presence and type constraints the proof was to put in force go
+    // with it, their names released.
+    for name in validating_checks(&schema) {
+        schema.remove_constraint(&name);
+        store.release_constraint_name_txn(txn, &name)?;
+    }
     schema.schema_revision = next_revision(&schema)?;
     store.save_label_admitting_txn(txn, &schema)
+}
+
+/// The presence and type constraints of `schema` still validating: the
+/// ones a certification proves, as opposed to those an index build does.
+fn validating_checks(schema: &coordinode_core::schema::definition::LabelSchema) -> Vec<String> {
+    schema
+        .constraints()
+        .iter()
+        .filter(|c| {
+            c.state == coordinode_core::schema::definition::ConstraintState::Validating
+                && c.checks_each_node()
+                && !c.owns_index()
+        })
+        .map(|c| c.name.clone())
+        .collect()
 }
 
 /// The revision a change of `schema` is published at.

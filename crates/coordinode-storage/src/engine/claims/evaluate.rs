@@ -767,6 +767,69 @@ pub fn first_label_schema_violation(
     Ok(None)
 }
 
+/// For each of `schemas` (one per label), the first stored node whose
+/// primary label is that label and that breaks it, in one pass over the
+/// stored nodes; labels every node satisfies are absent from the answer.
+/// The pass stops early once every label has a violation.
+///
+/// # Errors
+///
+/// A stored record or the field dictionary does not decode.
+pub fn label_schema_violations(
+    engine: &StorageEngine,
+    schemas: &[coordinode_core::schema::definition::LabelSchema],
+) -> StorageResult<Vec<(String, LabelSchemaViolation)>> {
+    use coordinode_core::graph::node::NodeRecord;
+
+    // Only definitions that can refuse a node are read for.
+    let mut pending: rustc_hash::FxHashMap<
+        &str,
+        &coordinode_core::schema::definition::LabelSchema,
+    > = schemas
+        .iter()
+        .filter(|s| s.can_refuse_nodes())
+        .map(|s| (s.name.as_str(), s))
+        .collect();
+    let mut found = Vec::new();
+    if pending.is_empty() {
+        return Ok(found);
+    }
+    let dictionary = crate::engine::metadata::load_field_dictionary(engine)?;
+    let names: std::collections::HashMap<u32, String> = dictionary
+        .iter()
+        .map(|(name, id)| (id, name.to_string()))
+        .collect();
+    for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
+        let (key, value) = guard.into_inner()?;
+        if !is_node_record_key(&key) {
+            continue;
+        }
+        let record = NodeRecord::from_msgpack(&value)
+            .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
+        let Some(schema) = record
+            .labels
+            .first()
+            .and_then(|label| pending.get(label.as_str()).copied())
+        else {
+            continue;
+        };
+        if let Some(reason) = record_violation(schema, record, &names, dictionary.frontier()) {
+            found.push((
+                schema.name.clone(),
+                LabelSchemaViolation {
+                    node: node_of_record_key(&key),
+                    reason,
+                },
+            ));
+            pending.remove(schema.name.as_str());
+            if pending.is_empty() {
+                break;
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// The node a record key addresses: the id follows `node:<shard:2>:`.
 fn node_of_record_key(key: &[u8]) -> NodeId {
     let mut id = [0u8; 8];

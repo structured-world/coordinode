@@ -354,10 +354,11 @@ fn a_failed_build_leaves_the_rest_of_the_package_published() {
     assert_eq!(db.edge_type_schemas().unwrap().len(), 1);
 }
 
-/// A presence constraint stored nodes break refuses the whole package at
-/// its commit: nothing of it is published.
+/// A presence constraint is proved over the stored nodes in the background,
+/// enforced on writes meanwhile: one the stored nodes break is withdrawn
+/// by its proof, with its name released, and the rest of the package stays.
 #[test]
-fn a_presence_constraint_broken_by_stored_nodes_refuses_the_package() {
+fn a_presence_constraint_broken_by_stored_nodes_is_withdrawn() {
     let (mut db, _dir) = open();
     db.execute_cypher("CREATE (:User {email: 'a@x'})")
         .expect("seed");
@@ -367,10 +368,72 @@ fn a_presence_constraint_broken_by_stored_nodes_refuses_the_package() {
         "handle",
         ConstraintKind::NotNull,
     ));
-    assert!(db.publish_schema(broken).is_err());
-    assert!(db.label_schemas().unwrap().is_empty());
-    assert!(db.edge_type_schemas().unwrap().is_empty());
-    assert!(db.constraints().unwrap().is_empty());
+    let published = db
+        .publish_schema(broken)
+        .expect("acceptance is not readiness");
+    let presence = published
+        .objects
+        .iter()
+        .find(|o| o.name == "user_handle_present")
+        .expect("published");
+    assert_eq!(presence.state, Some(ConstraintState::Validating));
+    assert!(presence.operation.is_some());
+
+    let readiness = db.await_schema(&published, WAIT).expect("await");
+    assert!(
+        matches!(
+            readiness.of(CatalogObject::Constraint, "user_handle_present"),
+            Some(Readiness::Failed(why)) if why.contains("breaks it")
+        ),
+        "{readiness:?}"
+    );
+    let names: Vec<_> = db
+        .constraints()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.constraint.name)
+        .collect();
+    assert!(!names.contains(&"user_handle_present".to_string()));
+    assert_eq!(db.edge_type_schemas().unwrap().len(), 1);
+    // The name is free again.
+    db.execute_cypher("CREATE (:User {email: 'b@x', handle: 'b'})")
+        .expect("write");
+}
+
+/// One certification proves every label a package publishes a candidate
+/// for, each on its own outcome: the label the stored nodes satisfy is put
+/// in force, the one they break withdrawn, neither rolling back the other.
+#[test]
+fn one_certification_settles_each_label_on_its_own() {
+    let (mut db, _dir) = open();
+    db.execute_cypher("CREATE (:User {email: 'a@x'}), (:Org {name: 'o', loose: 1})")
+        .expect("seed");
+    let mut org = LabelSchema::new_node_id("Org");
+    org.set_mode(SchemaMode::Strict);
+    org.add_property(PropertyDef::new("name", PropertyType::String));
+    let mut package = strict_user();
+    package.labels.push(LabelDeclaration {
+        schema: org,
+        intent: Intent::Ensure,
+    });
+    let published = db.publish_schema(package).expect("publish");
+    assert_eq!(
+        published.objects[0].operation, published.objects[1].operation,
+        "one operation for both"
+    );
+    let readiness = db.await_schema(&published, WAIT).expect("await");
+    assert_eq!(
+        readiness.of(CatalogObject::Label, "User"),
+        Some(&Readiness::Ready)
+    );
+    assert!(matches!(
+        readiness.of(CatalogObject::Label, "Org"),
+        Some(Readiness::Failed(_))
+    ));
+    let schemas = db.label_schemas().unwrap();
+    let mode = |name: &str| schemas.iter().find(|s| s.name == name).unwrap().mode;
+    assert_eq!(mode("User"), SchemaMode::Strict);
+    assert_eq!(mode("Org"), SchemaMode::Flexible);
 }
 
 /// A STRICT `User` declaring only `email`.

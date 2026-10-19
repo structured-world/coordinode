@@ -702,34 +702,49 @@ impl IndexBuildRecord {
 }
 
 /// The durable record of one certification: the operation proving the
-/// stored nodes of a label against the candidate definition published with
-/// it, admitted in the commit that published the candidate. Its identity is
-/// a generation from the same allocator as index builds, so one operation
-/// number names either kind of background work.
+/// stored nodes of the labels a publication changed against the candidate
+/// definitions published with it, admitted in that publication's commit.
+/// One pass over the stored nodes proves every label; each label's
+/// candidate is put in force or withdrawn on its own outcome. Its identity
+/// is a generation from the same allocator as index builds, so one
+/// operation number names either kind of background work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelCertificationRecord {
     /// The operation's identity.
     pub generation: GenerationId,
-    /// The label whose stored nodes it proves.
-    pub label: String,
-    /// Where it stands; `Published` once the candidate is in force.
+    /// The labels whose stored nodes it proves.
+    pub labels: Vec<String>,
+    /// Where it stands; `Published` once it ended with every candidate that
+    /// held put in force, `Failed` when none did.
     pub state: BuildState,
     /// Nodes checked so far, reported by the executor; progress, not proof.
     pub checked: u64,
+    /// The labels whose candidate the stored nodes broke, each with why;
+    /// their candidates are withdrawn, the others put in force.
+    pub refused: Vec<(String, String)>,
 }
 
 impl LabelCertificationRecord {
     /// Prefix of every certification record in the schema catalog.
     pub const PREFIX: &'static [u8] = b"schema:certify:";
 
-    /// A certification of `label` admitted as `generation`, not taken.
-    pub fn accepted(generation: GenerationId, label: impl Into<String>) -> Self {
+    /// A certification of `labels` admitted as `generation`, not taken.
+    pub fn accepted(generation: GenerationId, labels: Vec<String>) -> Self {
         Self {
             generation,
-            label: label.into(),
+            labels,
             state: BuildState::Accepted,
             checked: 0,
+            refused: Vec::new(),
         }
+    }
+
+    /// Why the stored nodes refused `label`'s candidate, when they did.
+    pub fn refusal_of(&self, label: &str) -> Option<&str> {
+        self.refused
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, why)| why.as_str())
     }
 
     /// The catalog key of the certification `generation`.
