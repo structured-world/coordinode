@@ -604,6 +604,77 @@ fn a_publication_retried_under_its_operation_answers_with_its_outcome() {
     );
 }
 
+/// Equal packages published at once converge on one set of objects: each
+/// call either publishes, keeps what the other published, or meets a
+/// retriable conflict; the catalog ends with one label, one constraint
+/// and one build for it, never a hidden duplicate. A different package
+/// published at once over the same names is refused, never merged.
+#[test]
+fn concurrent_publications_converge_or_conflict() {
+    let (db, _dir) = open();
+    let db = std::sync::Arc::new(db);
+    let outcomes: Vec<_> = (0..4)
+        .map(|i| {
+            let db = std::sync::Arc::clone(&db);
+            std::thread::spawn(move || {
+                let mut package = package();
+                if i == 3 {
+                    package.labels[0].schema = user(Some("age"));
+                }
+                db.publish_schema(package)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|t| t.join().expect("thread"))
+        .collect();
+    for (i, outcome) in outcomes.iter().enumerate() {
+        match outcome {
+            Ok(_) => {}
+            Err(DatabaseError::Execution(
+                ExecutionError::Conflict(_)
+                | ExecutionError::InvariantRefused(_)
+                | ExecutionError::CatalogObjectDiffers { .. },
+            ))
+            | Err(DatabaseError::TransactionConflict { .. })
+            | Err(DatabaseError::InvariantRefused { .. }) => {}
+            Err(other) => panic!("publication {i}: {other:?}"),
+        }
+    }
+    let settled = db.publish_schema(package());
+    let settled = match settled {
+        Ok(p) => p,
+        // The differing package won: the equal one now differs from it.
+        Err(DatabaseError::Execution(ExecutionError::CatalogObjectDiffers { .. })) => {
+            let mut other = package();
+            other.labels[0].schema = user(Some("age"));
+            db.publish_schema(other)
+                .expect("the winner's package is in place")
+        }
+        Err(e) => panic!("{e:?}"),
+    };
+    db.await_schema(&settled, WAIT).expect("await");
+    assert_eq!(db.label_schemas().unwrap().len(), 1);
+    let constraints = db.constraints().unwrap();
+    let names: Vec<_> = constraints
+        .iter()
+        .map(|c| c.constraint.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["user_email", "user_handle"],
+        "no duplicate constraint"
+    );
+    let builds: Vec<_> = db
+        .index_build_status()
+        .unwrap()
+        .into_iter()
+        // Every store keeps its built-in label lookup besides.
+        .filter(|b| !b.index.as_ref().is_some_and(|i| i.builtin))
+        .collect();
+    assert_eq!(builds.len(), 2, "one build per constraint: {builds:?}");
+}
+
 /// A change of a label whose candidate is still being proved is refused,
 /// naming the operation to wait for or cancel; cancelling withdraws it.
 #[test]

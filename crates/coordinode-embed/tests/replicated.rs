@@ -803,6 +803,89 @@ fn label_count(db: &ReplicatedDatabase, label: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// A schema package published on the leader is proved there and reaches
+/// every member through the group's log: the label in force STRICT, its
+/// uniqueness active. Publishing it again changes nothing. A follower
+/// refuses a publication as not the leader, and nothing of it lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_package_is_published_through_the_group() {
+    use coordinode_core::schema::definition::{
+        ConstraintKind, ConstraintState, LabelSchema, PropertyDef, PropertyType, SchemaMode,
+    };
+    use coordinode_embed::{Intent, LabelDeclaration, PackageConstraint, SchemaPackage};
+
+    let package = || {
+        let mut user = LabelSchema::new_node_id("User");
+        user.set_mode(SchemaMode::Strict);
+        user.add_property(PropertyDef::new("email", PropertyType::String));
+        SchemaPackage {
+            labels: vec![LabelDeclaration {
+                schema: user,
+                intent: Intent::Ensure,
+            }],
+            constraints: vec![PackageConstraint {
+                name: Some("user_email".into()),
+                label: "User".into(),
+                properties: vec!["email".into()],
+                kind: ConstraintKind::Unique,
+                scope: None,
+                on_duplicate_rename: None,
+            }],
+            ..SchemaPackage::default()
+        }
+    };
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        members[0]
+            .database()
+            .write()
+            .execute_cypher("CREATE (:User {email: 'a@x'})")
+            .unwrap();
+
+        let refused = members[1].database().read().publish_schema(package());
+        assert!(
+            matches!(
+                refused,
+                Err(DatabaseError::Execution(ExecutionError::NotLeader {
+                    leader_id: Some(1)
+                }))
+            ),
+            "{refused:?}"
+        );
+
+        {
+            let leader = members[0].database().read();
+            let published = leader.publish_schema(package()).unwrap();
+            assert!(published.committed);
+            let ready = leader
+                .await_schema(&published, Duration::from_secs(60))
+                .unwrap();
+            assert!(ready.all_ready(), "{ready:?}");
+            assert!(!leader.publish_schema(package()).unwrap().committed);
+        }
+        let in_force = |m: &ReplicatedDatabase| {
+            let db = m.database().read();
+            let strict = db.label_schemas().unwrap().iter().any(|s| {
+                s.name == "User" && s.mode == SchemaMode::Strict && s.candidate().is_none()
+            });
+            let active = db.constraints().unwrap().iter().any(|c| {
+                c.constraint.name == "user_email" && c.constraint.state == ConstraintState::Active
+            });
+            strict && active
+        };
+        for m in &members {
+            wait_until("the schema is in force on the member", || in_force(m)).await;
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A j:memory write on the leader is answered once the leader's log holds
 /// it, and goes through the group's log like any write: it reaches every
 /// member exactly once, its label count included.
