@@ -9,8 +9,8 @@ fn defaults_match_documented_values() {
     assert_eq!(c.interactive_txn_idle_timeout_secs, 30);
     assert_eq!(c.interactive_txn_max_bytes, 256 * 1024 * 1024);
     assert_eq!(
-        c.interactive_txn_drain_timeout_ms,
-        coordinode_embed::db::DEFAULT_DRAIN_TIMEOUT.as_millis() as u64
+        c.interactive_txn_timeout_outcome,
+        TimeoutOutcomeSetting::Rollback
     );
     assert!(c.cache_size_mb.is_none());
     assert!(c.peers.is_empty());
@@ -75,7 +75,7 @@ fn partial_yaml_overlays_only_its_keys() {
     std::fs::write(
         &path,
         "node_id: 7\ngrpc_addr: \"0.0.0.0:9999\"\ninteractive_txn_idle_timeout_secs: 120\n\
-         interactive_txn_drain_timeout_ms: 750\n",
+         interactive_txn_timeout_outcome: commit\n",
     )
     .unwrap();
     let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
@@ -83,7 +83,10 @@ fn partial_yaml_overlays_only_its_keys() {
     assert_eq!(c.node_id, 7);
     assert_eq!(c.grpc_addr, "0.0.0.0:9999");
     assert_eq!(c.interactive_txn_idle_timeout_secs, 120);
-    assert_eq!(c.interactive_txn_drain_timeout_ms, 750);
+    assert_eq!(
+        c.interactive_txn_timeout_outcome,
+        TimeoutOutcomeSetting::Commit
+    );
     // Unset keys keep defaults.
     assert_eq!(c.max_request_size_mb, 16);
     assert_eq!(c.ops_addr, "[::]:7084");

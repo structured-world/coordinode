@@ -206,14 +206,19 @@ fn every_write_across_a_build_is_in_the_index() {
 
 /// The bound on waiting for a building index belongs to the caller: the
 /// session's bound applies to a query that names none, and a query's own hint
-/// wins over it. With the session at zero a read of the building index is
-/// refused at once; the same read with a generous hint waits and is served.
+/// wins over it. The build is held, not raced: a read of the index's graph
+/// keeps the build's fold out, so it cannot turn ready while the test holds
+/// it. Held, a read under the session's zero bound is refused at once, and
+/// one with its own bound is refused only after waiting that bound out; let
+/// go, the read with its own bound is served.
 #[test]
 fn a_query_hint_bounds_the_wait_over_the_session() {
+    const HINTED: std::time::Duration = std::time::Duration::from_millis(300);
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open db");
-    // Enough vectors that the build is still running when the reads arrive.
-    for start in (0..20_000).step_by(2_000) {
+    // Enough vectors that the scan is still running when the test takes its
+    // hold right after CREATE returns.
+    for start in (0..4_000).step_by(2_000) {
         create_items(&mut db, start..start + 2_000);
     }
     db.execute_cypher("SET vector_build_wait = '0ms'")
@@ -228,19 +233,37 @@ fn a_query_hint_bounds_the_wait_over_the_session() {
          ORDER BY d ASC LIMIT 1 RETURN n.ext_id AS ext_id",
         spread_vector(7)
     );
+    let registry = db.vector_index_registry();
+    let graph = registry.get("Item", "embedding").expect("the index");
+    let health = registry
+        .health_handle("Item", "embedding")
+        .expect("the build's health");
 
+    let hold = graph.read().expect("the graph");
     assert!(
-        !db.index_builds().is_empty(),
-        "the build finished before the reads, so they prove nothing"
+        health.snapshot().is_rebuilding(),
+        "the build finished before the hold, so the reads below prove nothing"
     );
     let refused = db.execute_cypher(&search);
     assert!(
         refused.is_err(),
         "the session's zero bound refuses the building index: {refused:?}"
     );
+    let asked = std::time::Instant::now();
+    let outwaited = db.execute_cypher(&format!("{search} /*+ vector_build_wait('300ms') */"));
+    assert!(
+        outwaited.is_err(),
+        "a held build cannot be served within the query's bound: {outwaited:?}"
+    );
+    assert!(
+        asked.elapsed() >= HINTED,
+        "the query's own bound was waited out, not the session's zero ({:?})",
+        asked.elapsed()
+    );
+    drop(hold);
 
     let served = db
-        .execute_cypher(&format!("{search} /*+ vector_build_wait('2m') */"))
+        .execute_cypher(&format!("{search} /*+ vector_build_wait('10m') */"))
         .expect("the query's own bound waits for the build");
     assert_eq!(
         served

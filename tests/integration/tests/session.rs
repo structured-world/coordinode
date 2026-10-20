@@ -30,30 +30,15 @@ fn draw_txid() -> Vec<u8> {
     uuid::Uuid::new_v4().as_bytes().to_vec()
 }
 
-/// Begin an UNORDERED transaction (statements applied in arrival order; nonces
-/// ignored) under `txid`. Used by the simple transaction tests that send
-/// nonce-0 statements. Nothing answers it; the statements sent after it run
-/// once it is open.
+/// Begin a transaction under `txid` with the session's settings. Nothing
+/// answers it; the statements sent after it run once it is open, in the
+/// order they were sent.
 fn begin(request_id: u64, txid: &[u8]) -> ClientFrame {
     ClientFrame {
         request_id,
         op: Some(client_frame::Op::Begin(Begin {
             txid: txid.to_vec(),
-            ordering: 2, // ORDERING_UNORDERED
-            drain_timeout_ms: 0,
-        })),
-    }
-}
-
-/// Begin an ORDERED transaction (statements reassembled by nonce) under
-/// `txid`.
-fn begin_ordered(request_id: u64, txid: &[u8]) -> ClientFrame {
-    ClientFrame {
-        request_id,
-        op: Some(client_frame::Op::Begin(Begin {
-            txid: txid.to_vec(),
-            ordering: 1, // ORDERING_ORDERED
-            drain_timeout_ms: 0,
+            operation: None,
         })),
     }
 }
@@ -71,38 +56,27 @@ fn execute(request_id: u64, query: &str) -> ClientFrame {
 
 /// An Execute frame bound to the open transaction `txid`.
 fn execute_tx(request_id: u64, query: &str, txid: &[u8]) -> ClientFrame {
-    execute_tx_nonce(request_id, query, txid, 0)
-}
-
-/// An Execute frame bound to a transaction with an explicit `nonce`.
-fn execute_tx_nonce(request_id: u64, query: &str, txid: &[u8], nonce: u64) -> ClientFrame {
     ClientFrame {
         request_id,
         op: Some(client_frame::Op::Execute(Execute {
             query: query.to_string(),
             parameters: Default::default(),
             txid: txid.to_vec(),
-            nonce,
             ..Default::default()
-        })),
-    }
-}
-
-/// A Commit frame carrying the expected final nonce of an ORDERED chain.
-fn commit_tx_nonce(request_id: u64, txid: &[u8], last_nonce: u64) -> ClientFrame {
-    ClientFrame {
-        request_id,
-        op: Some(client_frame::Op::Commit(Commit {
-            txid: txid.to_vec(),
-            last_nonce,
-            operation: None,
         })),
     }
 }
 
 /// A Commit frame for a specific transaction.
 fn commit_tx(request_id: u64, txid: &[u8]) -> ClientFrame {
-    commit_tx_nonce(request_id, txid, 0)
+    ClientFrame {
+        request_id,
+        op: Some(client_frame::Op::Commit(Commit {
+            txid: txid.to_vec(),
+            operation: None,
+            expect: Vec::new(),
+        })),
+    }
 }
 
 /// A transaction ID as SHOW TRANSACTIONS renders it: a hyphenated UUID.
@@ -404,48 +378,46 @@ async fn in_session_transaction_aborts_on_a_failed_statement() {
 }
 
 #[tokio::test]
-async fn ordered_transaction_reassembles_out_of_order_statements() {
-    // An ORDERED transaction whose statements arrive out of nonce order must
-    // still apply them in nonce order, commit cleanly, and persist every write.
+async fn a_pipelined_transaction_runs_in_the_order_it_was_sent() {
+    // A transaction's statements and commit sent back to back, without
+    // waiting for answers, run in the order the stream delivered them: the
+    // second statement sees the first one's write, and the commit lands both.
     let proc = CoordinodeProcess::start().await;
     let (tx, mut inbound) = open_stream(&proc).await;
 
     let txid = draw_txid();
-    tx.send(begin_ordered(1, &txid)).await.expect("begin");
-
-    // Send nonce 2 before nonce 1.
-    tx.send(execute_tx_nonce(2, "CREATE (n:Ord {k: 2})", &txid, 2))
+    tx.send(begin(1, &txid)).await.expect("begin");
+    tx.send(execute_tx(2, "CREATE (n:Ord {k: 1})", &txid))
         .await
-        .expect("n2");
-    tx.send(execute_tx_nonce(3, "CREATE (n:Ord {k: 1})", &txid, 1))
+        .expect("first");
+    tx.send(execute_tx(3, "MATCH (n:Ord) SET n.k = n.k * 10", &txid))
         .await
-        .expect("n1");
-    tx.send(commit_tx_nonce(4, &txid, 2)).await.expect("commit");
+        .expect("second");
+    tx.send(commit_tx(4, &txid)).await.expect("commit");
 
-    // Commit must succeed (no abort, no drain timeout): reaching past this loop
-    // means a Committed for request 4 arrived.
-    loop {
-        let f = inbound.message().await.expect("frame").expect("not end");
-        if f.request_id == 4 {
-            match f.event {
-                Some(Event::Committed(_)) => break,
-                Some(Event::Error(e)) => panic!("ordered commit errored: {}", e.message),
-                _ => {}
-            }
-        }
+    match await_terminal(&mut inbound, 4).await {
+        Event::Committed(_) => {}
+        other => panic!("the pipelined commit lands, got {other:?}"),
     }
     drop(tx);
     while inbound.message().await.expect("frame").is_some() {}
 
-    // Both writes persisted.
+    use coordinode_integration::proto::common::property_value::Value as Pv;
     let by_id = run_session(&proc, vec![execute(1, "MATCH (n:Ord) RETURN n.k AS k")]).await;
     let events = by_id.get(&1).map(Vec::as_slice).unwrap_or_default();
-    match events {
-        [Event::CursorOpen(_), rest @ ..] => {
-            assert_eq!(row_count(rest), 2, "both ordered writes committed");
-        }
-        other => panic!("verify scan got {other:?}"),
-    }
+    let values: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Rows(b) => Some(b.rows.iter().map(|r| r.values[0].value.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(
+        values,
+        vec![Some(Pv::IntValue(10))],
+        "the second statement ran after the first"
+    );
 }
 
 #[tokio::test]
@@ -502,13 +474,17 @@ async fn show_transactions_lists_an_open_transaction_with_a_countdown() {
         matches!(&cells[col("txid")].value, Some(Pv::StringValue(t)) if *t == uuid_text(&txid)),
         "the listed transaction is the one we opened"
     );
-    match &cells[col("auto_abort_in_ms")].value {
-        Some(Pv::IntValue(auto_abort)) => assert!(
-            *auto_abort > 0,
-            "an idle transaction still has time left before auto-abort"
+    match &cells[col("expires_in_ms")].value {
+        Some(Pv::IntValue(expires)) => assert!(
+            *expires > 0,
+            "an idle transaction still has time left before it expires"
         ),
-        other => panic!("auto_abort_in_ms not an int: {other:?}"),
+        other => panic!("expires_in_ms not an int: {other:?}"),
     }
+    assert!(
+        matches!(&cells[col("timeout_outcome")].value, Some(Pv::StringValue(o)) if o == "rollback"),
+        "the server's default outcome"
+    );
 }
 
 #[tokio::test]

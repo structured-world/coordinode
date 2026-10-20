@@ -85,8 +85,6 @@ async fn write_seq(port: u16, seq: i64) -> bool {
                 journal: Journal::Journal as i32,
                 timeout_ms: 0,
             }),
-            transaction_id: Vec::new(),
-            start_transaction: false,
             ..Default::default()
         })
         .await
@@ -110,8 +108,6 @@ async fn local_seqs(port: u16) -> Result<BTreeSet<i64>, String> {
                 at_timestamp: 0,
             }),
             write_concern: None,
-            transaction_id: Vec::new(),
-            start_transaction: false,
             ..Default::default()
         })
         .await

@@ -5,7 +5,6 @@
 use std::time::Instant;
 
 use coordinode_core::budget::CancelFlag;
-use coordinode_core::operations::TxnOrdering;
 use coordinode_core::txn::command::{ActingContext, AdmissionSignal};
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::db::{CommitOptions, RollbackOptions, StatementOptions, TransactionOptions};
@@ -48,8 +47,6 @@ impl CommandExecutor for ServerCommandExecutor {
             params,
             settings,
             transaction,
-            start_transaction,
-            nonce,
             operation,
             deadline,
             source,
@@ -58,23 +55,9 @@ impl CommandExecutor for ServerCommandExecutor {
         let deadline = deadline.map(|left| Instant::now() + left);
 
         // A transaction's statement reads at its pinned snapshot and buffers
-        // its writes: no fence and no commit of its own. The start opens the
-        // transaction under the client's ID first.
+        // its writes: no fence and no commit of its own.
         if let Some(id) = transaction {
             let db = self.executor.database().read();
-            if start_transaction {
-                db.begin_transaction_as(
-                    id,
-                    &TransactionOptions {
-                        actor: Some(actor.clone()),
-                        read_concern: settings.read_concern,
-                        write_concern: settings.write_concern,
-                        ordering: TxnOrdering::Unordered,
-                        drain_timeout: None,
-                    },
-                )
-                .map_err(db_error_to_status)?;
-            }
             let options = StatementOptions {
                 vector_consistency: settings.vector_consistency,
                 vector_build_wait: settings.vector_build_wait,
@@ -82,7 +65,6 @@ impl CommandExecutor for ServerCommandExecutor {
                 deadline,
                 cancel: Some(cancel.clone()),
                 actor: Some(actor),
-                nonce,
                 admission: Some(admitted.clone()),
                 ..StatementOptions::default()
             };
@@ -158,8 +140,8 @@ impl CommandExecutor for ServerCommandExecutor {
                     actor: Some(begin.actor),
                     read_concern: begin.read_concern,
                     write_concern: begin.write_concern,
-                    ordering: begin.ordering,
-                    drain_timeout: begin.drain_timeout,
+                    timeout_outcome: begin.timeout_outcome,
+                    operation: begin.operation,
                 },
             )
             .map_err(db_error_to_status)
@@ -174,7 +156,6 @@ impl CommandExecutor for ServerCommandExecutor {
                 &CommitOptions {
                     operation: commit.operation.as_ref(),
                     actor: Some(&commit.actor),
-                    last_nonce: commit.last_nonce,
                     admission: None,
                     expect: &commit.expect,
                 },
@@ -199,6 +180,7 @@ impl CommandExecutor for ServerCommandExecutor {
                 &RollbackOptions {
                     actor: Some(&rollback.actor),
                     admission: None,
+                    end: rollback.end(),
                 },
             )
             .map_err(db_error_to_status)

@@ -2045,7 +2045,8 @@ fn paged_cursor_empty_label_is_exhausted_immediately() {
 #[test]
 fn show_transactions_lists_held_transactions_with_their_attachments() {
     use coordinode_core::graph::types::Value;
-    use coordinode_core::operations::{OperationsView, SessionSnapshot, TxnOrdering};
+    use coordinode_core::operations::{OperationsView, SessionSnapshot};
+    use coordinode_core::txn::command::TimeoutOutcome;
 
     struct MockOps {
         attached: Vec<String>,
@@ -2065,9 +2066,15 @@ fn show_transactions_lists_held_transactions_with_their_attachments() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
     let attached = db.begin_transaction().expect("begin");
+    let operation = db
+        .enroll_issuer(crate::operation::IssuerId([0x44; 16]))
+        .expect("enroll")
+        .next()
+        .expect("an operation");
     let detached = db
         .begin_transaction_with(&TransactionOptions {
-            ordering: TxnOrdering::Ordered,
+            timeout_outcome: Some(TimeoutOutcome::Commit),
+            operation: Some(operation),
             ..TransactionOptions::trusted()
         })
         .expect("begin");
@@ -2104,15 +2111,15 @@ fn show_transactions_lists_held_transactions_with_their_attachments() {
         Some(&Value::String("s-1".into()))
     );
     assert_eq!(
-        row(attached).get("ordering"),
-        Some(&Value::String("unordered".into()))
+        row(attached).get("timeout_outcome"),
+        Some(&Value::String("rollback".into()))
     );
     assert_eq!(row(detached).get("session"), Some(&Value::Null));
     assert_eq!(
-        row(detached).get("ordering"),
-        Some(&Value::String("ordered".into()))
+        row(detached).get("timeout_outcome"),
+        Some(&Value::String("commit".into()))
     );
-    match row(detached).get("auto_abort_in_ms") {
+    match row(detached).get("expires_in_ms") {
         Some(Value::Int(ms)) => assert!(
             *ms > 0 && *ms as u128 <= Database::DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT.as_millis(),
             "{ms}"

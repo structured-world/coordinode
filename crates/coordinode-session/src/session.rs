@@ -5,21 +5,22 @@
 //! another, with the single outbound writer living here, not in the transport
 //! binding. Every request runs on its own task, so three concurrent queries
 //! are three independent cursors. An interactive transaction is not the
-//! session's: it lives on its owner, which orders its commands, refuses
-//! repeats and ends it; the session only attaches to it. The commands one
-//! stream sends for one transaction keep their order on the way there: each
-//! is passed on once the one before it has its place at the owner (runs, or
-//! waits in the owner's queue), not once it has answered, so a pipelined
-//! chain flows and an ordered chain sent out of nonce order cannot wait on
-//! itself. Closing the stream detaches it; the transactions stay open for
-//! another stream to continue. A query is run by opening a server-side cursor
-//! through the injected [`CursorEngine`] and paging it into `CursorOpen` /
-//! `Rows`* / `CursorEnd`.
+//! session's: it lives on its owner, which runs its commands one at a time
+//! in the order they arrive and ends it; the session only attaches to it. The
+//! commands one stream sends for one transaction keep their order on the way
+//! there: each is passed on once the one before it has its place at the
+//! owner (runs, or waits in the owner's queue), not once it has answered, so
+//! a pipelined chain flows. Closing the stream between commands detaches it;
+//! the transactions stay open for another stream to continue. A statement of
+//! a transaction whose answer cannot reach the client, because the stream
+//! went away while it ran, aborts the transaction: the client cannot know
+//! what it did, and a statement never runs twice. A query is run by opening
+//! a server-side cursor through the injected [`CursorEngine`] and paging it
+//! into `CursorOpen` / `Rows`* / `CursorEnd`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::time::Duration;
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::command::{AdmissionSignal, TransactionId};
@@ -196,8 +197,9 @@ impl Session {
             }
         }
         match op {
-            // A transaction's operation is named on its commit: one named on
-            // a statement inside it would bind part of the transaction.
+            // A transaction's operation is named on its begin or its commit:
+            // one named on a statement inside it would bind part of the
+            // transaction.
             SessionOp::Execute {
                 transaction: Some(_),
                 operation: Some(_),
@@ -209,7 +211,26 @@ impl Session {
                     Failure::new(
                         ErrorCode::InvalidArgument,
                         "a statement inside a transaction carries no operation; name it on \
-                         the transaction's commit",
+                         the transaction's begin or commit",
+                    ),
+                )
+                .await;
+            }
+            // A transaction runs under the settings fixed at its begin: a
+            // statement naming its own would silently not get them.
+            SessionOp::Execute {
+                transaction: Some(_),
+                ref settings,
+                ..
+            } if settings.names_concern() => {
+                send_error(
+                    out,
+                    request_id,
+                    Failure::new(
+                        ErrorCode::InvalidArgument,
+                        "a statement inside a transaction names no concern or read \
+                         preference; the transaction runs under those its begin took from \
+                         the session",
                     ),
                 )
                 .await;
@@ -220,7 +241,6 @@ impl Session {
                 query,
                 params,
                 transaction,
-                nonce,
                 settings,
                 source,
                 operation,
@@ -245,10 +265,24 @@ impl Session {
                             lane.after_previous().await;
                             let transaction = InTransaction {
                                 id,
-                                nonce,
                                 admission: lane.signal(),
                             };
-                            execute(&engine, statement, Some(&transaction), &out).await;
+                            // The stream going away stops the statement: its
+                            // answer has nowhere to go.
+                            let watch = {
+                                let out = out.clone();
+                                let flag = statement.cancel.flag.clone();
+                                tokio::spawn(async move {
+                                    out.closed().await;
+                                    flag.cancel();
+                                })
+                            };
+                            let delivered =
+                                execute(&engine, statement, Some(&transaction), &out).await;
+                            watch.abort();
+                            if !delivered {
+                                abandon(engine, id).await;
+                            }
                             lane.mine.release();
                         });
                     }
@@ -257,48 +291,46 @@ impl Session {
 
             // In the transaction's lane like any of its commands, so the
             // statements the client sends right after it run once it is open.
-            // Only a refusal answers.
+            // Only a refusal answers. The session's settings are taken now:
+            // they are the transaction's for its life.
             SessionOp::Begin {
                 transaction,
-                ordering,
-                drain_timeout_ms,
+                operation,
             } => {
-                let drain_ms = match drain_timeout_ms {
-                    0 => self.settings.lock().drain_timeout_ms.unwrap_or(0),
-                    ms => ms,
-                };
-                let drain = (drain_ms != 0).then(|| Duration::from_millis(u64::from(drain_ms)));
+                let settings = self.settings.lock().clone();
                 let lane = lanes.step(transaction);
                 let session_id = self.session_id;
                 self.spawn(out, move |engine, registry, out| async move {
                     lane.after_previous().await;
-                    let begun =
-                        blocking(move || engine.begin_transaction(transaction, ordering, drain))
-                            .await;
+                    let begun = blocking(move || {
+                        engine.begin_transaction(transaction, &settings, operation.as_ref())
+                    })
+                    .await;
                     lane.mine.release();
                     match begun {
                         Ok(()) => registry.attach(session_id, transaction),
-                        Err(failure) => send_error(&out, request_id, failure).await,
+                        Err(failure) => {
+                            send_error(&out, request_id, failure).await;
+                        }
                     }
                 });
             }
 
             SessionOp::Commit {
                 transaction,
-                last_nonce,
                 operation,
+                expect,
             } => {
                 let lane = lanes.step(transaction);
                 let session_id = self.session_id;
                 self.spawn(out, move |engine, registry, out| async move {
                     lane.after_previous().await;
-                    let last_nonce = (last_nonce != 0).then_some(last_nonce);
                     let admission = lane.signal();
                     let committed = blocking(move || {
                         engine.commit_transaction(
                             transaction,
-                            last_nonce,
                             operation.as_ref(),
+                            &expect,
                             &admission,
                         )
                     })
@@ -524,12 +556,15 @@ struct Statement {
 /// runtime. So each blocking call runs on the blocking pool via
 /// [`spawn_blocking`](tokio::task::spawn_blocking); the cursor (`Send`) moves in
 /// and back out per batch, keeping the stream's per-batch backpressure.
+///
+/// Returns whether the whole answer, the error included, was handed to the
+/// stream.
 async fn execute(
     engine: &Arc<dyn CursorEngine>,
     statement: Statement,
     transaction: Option<&InTransaction>,
     out: &mpsc::Sender<OutEvent>,
-) {
+) -> bool {
     let Statement {
         request_id,
         query,
@@ -559,14 +594,8 @@ async fn execute(
     .await;
     let (mut cursor, columns) = match opened {
         Ok(Ok(opened)) => opened,
-        Ok(Err(e)) => {
-            send_error(out, request_id, e.0).await;
-            return;
-        }
-        Err(join) => {
-            send_error(out, request_id, lost_call(join)).await;
-            return;
-        }
+        Ok(Err(e)) => return send_error(out, request_id, e.0).await,
+        Err(join) => return send_error(out, request_id, lost_call(join)).await,
     };
 
     if out
@@ -574,20 +603,19 @@ async fn execute(
         .await
         .is_err()
     {
-        return;
+        return false;
     }
 
     loop {
         // A cancelled statement stops paging: the rows already sent are not
         // a complete answer, and the error says so.
         if cancel.flag.is_cancelled() {
-            send_error(
+            return send_error(
                 out,
                 request_id,
                 Failure::new(ErrorCode::Cancelled, "the statement was cancelled"),
             )
             .await;
-            return;
         }
         // Page on the blocking pool; hand the cursor in and take it back so the
         // next iteration (and `stats()` below) still own it.
@@ -601,10 +629,7 @@ async fn execute(
                 cursor = returned;
                 batch
             }
-            Err(join) => {
-                send_error(out, request_id, lost_call(join)).await;
-                return;
-            }
+            Err(join) => return send_error(out, request_id, lost_call(join)).await,
         };
         match batch {
             // Empty batch = exhausted.
@@ -615,29 +640,38 @@ async fn execute(
                     .await
                     .is_err()
                 {
-                    return;
+                    return false;
                 }
             }
-            Err(e) => {
-                send_error(out, request_id, e.0).await;
-                return;
-            }
+            Err(e) => return send_error(out, request_id, e.0).await,
         }
     }
 
-    let _ = out
-        .send((
-            request_id,
-            SessionEvent::CursorEnd {
-                stats: cursor.stats(),
-            },
-        ))
-        .await;
+    out.send((
+        request_id,
+        SessionEvent::CursorEnd {
+            stats: cursor.stats(),
+        },
+    ))
+    .await
+    .is_ok()
 }
 
-/// Emit a single `Error` event for a failed request.
-async fn send_error(out: &mpsc::Sender<OutEvent>, request_id: u64, failure: Failure) {
-    let _ = out.send((request_id, SessionEvent::Error(failure))).await;
+/// Abort `transaction`, whose statement's answer did not reach the client.
+/// One its failed statement already ended is refused, which is the outcome
+/// wanted.
+async fn abandon(engine: Arc<dyn CursorEngine>, transaction: TransactionId) {
+    if let Err(failure) = blocking(move || engine.abandon_transaction(transaction)).await {
+        tracing::debug!(%transaction, reason = %failure.message, "abandoned transaction already ended");
+    }
+}
+
+/// Emit a single `Error` event for a failed request. Returns whether it was
+/// handed to the stream.
+async fn send_error(out: &mpsc::Sender<OutEvent>, request_id: u64, failure: Failure) -> bool {
+    out.send((request_id, SessionEvent::Error(failure)))
+        .await
+        .is_ok()
 }
 
 /// A blocking engine call that did not return (it panicked or was cancelled).

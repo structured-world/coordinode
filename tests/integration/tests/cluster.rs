@@ -1139,103 +1139,9 @@ async fn three_member_group() -> (CoordinodeProcess, CoordinodeProcess, Coordino
     (n1, n2, n3)
 }
 
-fn in_transaction(query: &str, transaction: &[u8]) -> ExecuteCypherRequest {
-    ExecuteCypherRequest {
-        query: query.to_string(),
-        transaction_id: transaction.to_vec(),
-        ..Default::default()
-    }
-}
-
 /// A transaction ID as a client draws it: a random UUID.
 fn draw_transaction_id() -> Vec<u8> {
     uuid::Uuid::new_v4().as_bytes().to_vec()
-}
-
-/// A client works through whichever member it reached. A transaction started
-/// on a follower opens at the leader under the ID the client drew; its
-/// statements, sent to different members one after another, all run in it;
-/// it commits through a follower; and every answer of a follower names the
-/// leader to move to.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_transaction_runs_through_any_member() {
-    use coordinode_integration::proto::query::CommitTransactionRequest;
-
-    let (n1, n2, n3) = three_member_group().await;
-    let mut on_two = n2.cypher_client().await;
-    let mut on_three = n3.cypher_client().await;
-
-    let transaction = draw_transaction_id();
-    let started = on_two
-        .execute_cypher(ExecuteCypherRequest {
-            start_transaction: true,
-            ..in_transaction("CREATE (:Routed {k: 1})", &transaction)
-        })
-        .await
-        .expect("a follower starts the transaction at the leader");
-    assert_eq!(
-        started
-            .metadata()
-            .get("x-coordinode-leader")
-            .map(|v| v.to_str().expect("ascii")),
-        Some("1"),
-        "a follower names the leader on its answer"
-    );
-    assert!(
-        started.metadata().get("x-coordinode-leader-addr").is_none(),
-        "the address members reach each other at is not disclosed"
-    );
-    on_three
-        .execute_cypher(in_transaction("CREATE (:Routed {k: 2})", &transaction))
-        .await
-        .expect("the next one, through another member, runs in the same transaction");
-    let seen = on_three
-        .execute_cypher(in_transaction(
-            "MATCH (n:Routed) RETURN count(n) AS c",
-            &transaction,
-        ))
-        .await
-        .expect("a read in the transaction")
-        .into_inner();
-    use coordinode_integration::proto::common::property_value::Value as Pv;
-    assert!(
-        matches!(seen.rows[0].values[0].value, Some(Pv::IntValue(2))),
-        "the transaction sees both of its writes: {seen:?}"
-    );
-    assert!(
-        cypher_on(&n1, "MATCH (n:Routed) RETURN n")
-            .await
-            .expect("read")
-            .is_empty(),
-        "nothing is visible before the commit"
-    );
-
-    on_two
-        .commit_transaction(CommitTransactionRequest {
-            transaction_id: transaction.clone(),
-            ..Default::default()
-        })
-        .await
-        .expect("the commit through a follower lands");
-    assert_eq!(
-        cypher_on(&n1, "MATCH (n:Routed) RETURN n")
-            .await
-            .expect("read")
-            .len(),
-        2,
-        "both writes committed together"
-    );
-
-    // The transaction is gone at the leader: committing it again through
-    // any member is told so.
-    let again = on_three
-        .commit_transaction(CommitTransactionRequest {
-            transaction_id: transaction,
-            ..Default::default()
-        })
-        .await
-        .expect_err("already committed");
-    assert_eq!(again.code(), tonic::Code::NotFound);
 }
 
 /// An autonomous write sent to a follower runs at the leader and answers as
@@ -1287,9 +1193,11 @@ async fn a_write_through_a_follower_runs_at_the_leader() {
     assert_eq!(on_leader.into_inner().rows.len(), 1);
 }
 
-/// A session on a follower opens, fills and commits a transaction held by
-/// the leader, and a second session on another member continues a
-/// transaction the first one began.
+/// A client works through whichever member it reached: a session on a
+/// follower opens and fills a transaction held by the leader, a second
+/// session on another member continues the transaction the first one began
+/// and commits it, and a commit repeated after that is told the transaction
+/// is gone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
     use coordinode_integration::proto::session::server_frame::Event;
@@ -1352,8 +1260,7 @@ async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
             request_id: 1,
             op: Some(client_frame::Op::Begin(Begin {
                 txid: transaction.clone(),
-                ordering: 2, // ORDERING_UNORDERED
-                drain_timeout_ms: 0,
+                operation: None,
             })),
         })
         .await
@@ -1378,20 +1285,24 @@ async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
         Event::CursorEnd(_) => {}
         other => panic!("another member continues it, got {other:?}"),
     }
-    second
-        .send(ClientFrame {
-            request_id: 2,
-            op: Some(client_frame::Op::Commit(Commit {
-                txid: transaction,
-                last_nonce: 0,
-                operation: None,
-            })),
-        })
-        .await
-        .expect("commit");
+    let commit = |request_id| ClientFrame {
+        request_id,
+        op: Some(client_frame::Op::Commit(Commit {
+            txid: transaction.clone(),
+            operation: None,
+            expect: Vec::new(),
+        })),
+    };
+    second.send(commit(2)).await.expect("commit");
     match terminal(&mut second_in, 2).await {
         Event::Committed(_) => {}
         other => panic!("the commit lands, got {other:?}"),
+    }
+    // The transaction is gone at the leader: committing it again is told so.
+    second.send(commit(3)).await.expect("commit again");
+    match terminal(&mut second_in, 3).await {
+        Event::Error(e) => assert_eq!(e.code, tonic::Code::NotFound as u32, "{e:?}"),
+        other => panic!("already committed, got {other:?}"),
     }
     drop(second);
     while second_in.message().await.expect("frame").is_some() {}

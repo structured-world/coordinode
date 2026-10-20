@@ -18,10 +18,7 @@ use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::ReadPreference;
 
 use coordinode_core::txn::command::{ActingContext, AdmissionSignal};
-use coordinode_embed::db::{CommitOptions, ExpectedVersion, TransactionOptions};
-use coordinode_embed::replication::routing::{
-    RoutedAnswer, RoutedCommit, RoutedRollback, RoutedSettings, RoutedStatement,
-};
+use coordinode_embed::replication::routing::{RoutedAnswer, RoutedStatement};
 
 use super::routing::routed_settings;
 use super::statement::{
@@ -524,9 +521,12 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
             use coordinode_embed::TransactionEnd as End;
             let end = match end {
                 End::StatementFailed => "STATEMENT_FAILED",
-                End::DrainTimedOut => "DRAIN_TIMED_OUT",
                 End::IdleExpired => "IDLE_EXPIRED",
+                End::IdleCommitted => "IDLE_COMMITTED",
+                End::IdleCommitRefused => "IDLE_COMMIT_REFUSED",
+                End::IdleCommitUnknown => "IDLE_COMMIT_UNKNOWN",
                 End::RolledBack => "ROLLED_BACK",
+                End::StreamLost => "STREAM_LOST",
             };
             return status_with_reason(
                 Code::Aborted,
@@ -545,33 +545,43 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [("transaction", id.to_string())],
             );
         }
-        // The statement exists already, applied once; its rows are gone.
-        DatabaseError::StatementAlreadyAdmitted { id, nonce } => {
-            return status_with_reason(
-                Code::AlreadyExists,
-                rendered,
-                Reason::StatementAlreadyAdmitted,
-                [
-                    ("transaction", id.to_string()),
-                    ("nonce", nonce.to_string()),
-                ],
-            );
-        }
-        DatabaseError::StatementNonceReused { id, nonce } => {
+        // The start of a transaction that commits at idle expiry names no
+        // operation its client could resolve that commit by.
+        DatabaseError::OperationRequired(id) => {
             return status_with_reason(
                 Code::InvalidArgument,
                 rendered,
-                Reason::StatementNonceReused,
-                [
-                    ("transaction", id.to_string()),
-                    ("nonce", nonce.to_string()),
-                ],
+                Reason::OperationRequired,
+                [("transaction", id.to_string())],
             );
         }
-        DatabaseError::StatementNonceRequired(_) => {
-            return super::error_details::invalid_field(
-                "nonce",
-                "a statement of an ordered transaction is numbered from 1",
+        DatabaseError::OperationDiffers(id) => {
+            return status_with_reason(
+                Code::InvalidArgument,
+                rendered,
+                Reason::OperationDiffers,
+                [("transaction", id.to_string())],
+            );
+        }
+        // FAILED_PRECONDITION: the transaction is gone because it committed
+        // at idle expiry; its operation reports the commit timestamp.
+        DatabaseError::TransactionCommittedOnTimeout(id) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::TransactionCommittedOnTimeout,
+                [("transaction", id.to_string())],
+            );
+        }
+        // FAILED_PRECONDITION too: the transaction is gone, and only its
+        // operation, never a rerun, tells whether its commit at idle expiry
+        // applied.
+        DatabaseError::TransactionOutcomeUnknown(id) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::TransactionOutcomeUnknown,
+                [("transaction", id.to_string())],
             );
         }
         DatabaseError::TransactionConflict { id, .. } => {
@@ -980,8 +990,6 @@ impl CypherServiceImpl {
             query: req.query,
             settings: routed_settings(requested),
             transaction: None,
-            start_transaction: false,
-            nonce: None,
             operation: requested.operation,
             deadline: time_left(requested.deadline),
             source,
@@ -990,7 +998,7 @@ impl CypherServiceImpl {
             .executor
             .route(leader, statement, &AdmissionSignal::new(|| {}))
             .await?;
-        Ok(routed_response(answer, true, start))
+        Ok(routed_response(answer, start))
     }
 }
 
@@ -999,14 +1007,12 @@ fn time_left(deadline: Option<std::time::Instant>) -> Option<Duration> {
     deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()))
 }
 
-/// A routed statement's answer as this member's response. `led` says the
-/// member that ran it was leading, which an autonomous statement routed to
-/// the leader always was. A write reports its own commit's index, one
-/// answered before its commit reports none, and a read the index it was
-/// served at, as on the local path.
+/// A routed statement's answer as this member's response: the leader ran it,
+/// which a statement is only ever routed to. A write reports its own commit's
+/// index, one answered before its commit reports none, and a read the index
+/// it was served at, as on the local path.
 fn routed_response(
     answer: RoutedAnswer,
-    led: bool,
     start: std::time::Instant,
 ) -> Response<query::ExecuteCypherResponse> {
     let stats = answer.stats;
@@ -1032,7 +1038,7 @@ fn routed_response(
             properties_set: stats.properties_set,
             execution_time_ms: start.elapsed().as_millis() as i64,
             applied_index,
-            served_by_leader: led,
+            served_by_leader: true,
             commit_ts: stats.commit_ts,
             read_as_of_ts: stats.read_as_of_ts,
         }),
@@ -1135,136 +1141,6 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         let start = std::time::Instant::now();
 
-        if req.start_transaction && req.transaction_id.is_empty() {
-            return Err(super::error_details::invalid_field(
-                "start_transaction",
-                "a statement starts a transaction only under its transaction_id",
-            ));
-        }
-        // Interactive transaction statement: the transaction ID runs this
-        // statement against the open transaction: reads at its pinned
-        // snapshot, writes buffer until CommitTransaction. No per-statement
-        // commit and no causal fence (the snapshot was pinned at the start).
-        // The statement flagged as the start opens it first. No ID is the
-        // auto-commit path below.
-        if !req.transaction_id.is_empty() {
-            let transaction =
-                super::error_details::transaction_id("transaction_id", &req.transaction_id)?;
-            // The start fixes the transaction's concerns from its statement.
-            let opening = if req.start_transaction {
-                let rc = req.read_concern.as_ref();
-                Some(TransactionOptions {
-                    actor: None,
-                    read_concern: match rc {
-                        Some(rc) => read_concern_level("read_concern.level", rc.level)?,
-                        None => None,
-                    },
-                    write_concern: req
-                        .write_concern
-                        .as_ref()
-                        .map(write_concern_from_proto)
-                        .transpose()?,
-                    ordering: coordinode_core::operations::TxnOrdering::Unordered,
-                    drain_timeout: None,
-                })
-            } else {
-                None
-            };
-            // The transaction's operation is named on its commit: one named on
-            // a statement inside it would bind part of the transaction.
-            if req.operation.is_some() {
-                return Err(super::error_details::invalid_field(
-                    "operation",
-                    "a statement inside a transaction carries no operation; name it on \
-                     CommitTransactionRequest.operation",
-                ));
-            }
-            let params = if req.parameters.is_empty() {
-                None
-            } else {
-                Some(convert_params(&req.parameters))
-            };
-            let query_memory_limit = memory_limit_from_proto(req.query_memory_limit_mb)?;
-            // Another member leads: the statement, and its start, run there.
-            if let Some(leader) = self.executor.transaction_leader()? {
-                let statement = RoutedStatement {
-                    actor: ActingContext::Trusted,
-                    query: req.query,
-                    params: params.unwrap_or_default(),
-                    settings: RoutedSettings {
-                        query_memory_limit,
-                        read_concern: opening.as_ref().and_then(|o| o.read_concern),
-                        write_concern: opening.as_ref().and_then(|o| o.write_concern),
-                        ..RoutedSettings::default()
-                    },
-                    transaction: Some(transaction),
-                    start_transaction: opening.is_some(),
-                    nonce: None,
-                    operation: None,
-                    deadline: time_left(deadline),
-                    source: source_ctx,
-                };
-                let answer = self
-                    .executor
-                    .route(leader, statement, &AdmissionSignal::new(|| {}))
-                    .await?;
-                return Ok(routed_response(answer, false, start));
-            }
-            let options = coordinode_embed::db::StatementOptions {
-                query_memory_limit,
-                deadline,
-                cancel: Some(cancel.clone()),
-                ..Default::default()
-            };
-            let rows = super::blocking(|| {
-                let db = self.database().read();
-                if let Some(opening) = &opening {
-                    db.begin_transaction_as(transaction, opening)?;
-                }
-                db.execute_in_transaction_with(transaction, &req.query, params, &options)
-            })
-            .map_err(db_error_to_status)?;
-            let columns: Vec<String> = rows
-                .first()
-                .map(|r| r.keys().cloned().collect())
-                .unwrap_or_default();
-            let proto_rows: Vec<query::Row> = rows
-                .iter()
-                .map(|row| query::Row {
-                    values: columns
-                        .iter()
-                        .map(|col| {
-                            row.get(col)
-                                .map(value_to_proto)
-                                .unwrap_or(common::PropertyValue { value: None })
-                        })
-                        .collect(),
-                })
-                .collect();
-            return Ok(Response::new(query::ExecuteCypherResponse {
-                columns,
-                rows: proto_rows,
-                // Buffered statement: no commit yet, so no mutation stats, no
-                // applied_index and no commit timestamp — those land on the
-                // CommitTransaction response, which is where this statement's
-                // writes will actually be committed.
-                stats: Some(query::QueryStats {
-                    nodes_created: 0,
-                    nodes_deleted: 0,
-                    edges_created: 0,
-                    edges_deleted: 0,
-                    properties_set: 0,
-                    execution_time_ms: start.elapsed().as_millis() as i64,
-                    applied_index: 0,
-                    served_by_leader: false,
-                    commit_ts: 0,
-                    // The transaction's commit decides; on a read-only member
-                    // it is refused there.
-                    read_as_of_ts: 0,
-                }),
-            }));
-        }
-
         // Resolve and check the settings, fence the read and wait for the
         // causal position. A statement that needs the leader runs there.
         let requested = requested_from_proto(&req, deadline, &cancel)?;
@@ -1362,11 +1238,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 execution_time_ms: duration_ms as i64,
                 applied_index,
                 served_by_leader,
-                // The version of what this statement wrote, for a statement
-                // that committed on its own. Zero when there was no commit of
-                // its own to report: a read, or a statement of an interactive
-                // transaction, whose timestamp belongs to the commit that
-                // ends it.
+                // The version of what this statement wrote; zero for a read.
                 commit_ts: write_stats.commit_ts.unwrap_or(0),
                 read_as_of_ts,
             }),
@@ -1428,86 +1300,6 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 estimated_rows: cost.estimated_rows,
             }),
         }))
-    }
-
-    async fn commit_transaction(
-        &self,
-        request: Request<query::CommitTransactionRequest>,
-    ) -> Result<Response<query::CommitTransactionResponse>, Status> {
-        let deadline = grpc_deadline(request.metadata());
-        let request = request.into_inner();
-        let transaction =
-            super::error_details::transaction_id("transaction_id", &request.transaction_id)?;
-        let operation =
-            super::operation::optional_descriptor("operation", request.operation.as_ref())?;
-        // The conditions the caller built its statements on, checked by the
-        // commit itself. A condition naming a node the caller never read is
-        // still a condition: the engine decides it against the state, not
-        // against what the caller happens to know.
-        let expect: Vec<ExpectedVersion> = request
-            .expect
-            .iter()
-            .map(|e| ExpectedVersion {
-                node: coordinode_core::graph::node::NodeId::from_raw(e.node_id),
-                version: e.version,
-            })
-            .collect();
-        let receipt = match self.executor.transaction_leader()? {
-            Some(leader) => {
-                self.executor
-                    .router(leader)?
-                    .commit(RoutedCommit {
-                        actor: ActingContext::Trusted,
-                        transaction,
-                        last_nonce: None,
-                        operation,
-                        deadline: time_left(deadline),
-                        expect,
-                    })
-                    .await?
-            }
-            None => super::blocking(|| {
-                self.database().read().commit_transaction_with(
-                    transaction,
-                    &CommitOptions {
-                        operation: operation.as_ref(),
-                        expect: &expect,
-                        ..CommitOptions::default()
-                    },
-                )
-            })
-            .map_err(db_error_to_status)?,
-        };
-        // `applied_index` 0 = no Raft log (embedded / single node); `commit_ts`
-        // is present in every mode.
-        Ok(Response::new(query::CommitTransactionResponse {
-            applied_index: receipt.applied_index.unwrap_or(0),
-            commit_ts: receipt.commit_ts.as_raw(),
-        }))
-    }
-
-    async fn rollback_transaction(
-        &self,
-        request: Request<query::RollbackTransactionRequest>,
-    ) -> Result<Response<query::RollbackTransactionResponse>, Status> {
-        let transaction = super::error_details::transaction_id(
-            "transaction_id",
-            &request.into_inner().transaction_id,
-        )?;
-        match self.executor.transaction_leader()? {
-            Some(leader) => {
-                self.executor
-                    .router(leader)?
-                    .rollback(RoutedRollback {
-                        actor: ActingContext::Trusted,
-                        transaction,
-                    })
-                    .await?
-            }
-            None => super::blocking(|| self.database().read().rollback_transaction(transaction))
-                .map_err(db_error_to_status)?,
-        }
-        Ok(Response::new(query::RollbackTransactionResponse {}))
     }
 }
 

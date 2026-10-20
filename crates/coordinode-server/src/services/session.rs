@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use coordinode_core::operations::TxnOrdering;
+use coordinode_core::graph::node::NodeId;
+use coordinode_core::txn::command::{ExpectedVersion, TimeoutOutcome};
 use coordinode_query::advisor::source::grpc_keys;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_session::{
@@ -26,7 +27,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status, Streaming};
 
-use self::engine::DatabaseCursorEngine;
+pub(crate) use self::engine::DatabaseCursorEngine;
 use super::cdc::{ChangeEventServiceImpl, Credit, Delivery, session_error};
 use super::cypher::{
     build_wait, build_wait_ms, proto_to_value_pub, read_concern_level, read_preference,
@@ -40,8 +41,8 @@ use crate::proto::session::server_frame::Event;
 use crate::proto::session::session_service_server::SessionService as SessionServiceTrait;
 use crate::proto::session::{
     Acknowledged, ClientFrame, Committed, Configure, ConnectionStatus as ProtoConnectionStatus,
-    CursorEnd, CursorOpen, Execute, Ordering as ProtoOrdering, RowBatch, ServerFrame, Subscribed,
-    SubscriptionCancelled, client_frame,
+    CursorEnd, CursorOpen, Execute, RowBatch, ServerFrame, Subscribed, SubscriptionCancelled,
+    TimeoutOutcome as ProtoTimeoutOutcome, client_frame,
 };
 
 /// In-flight messages buffered per channel before backpressure: a producer that
@@ -200,9 +201,19 @@ impl SessionServiceTrait for SessionSvc {
             }
         });
 
-        // Writer: map each neutral event back to a proto frame.
+        // Writer: map each neutral event back to a proto frame. It stops as
+        // soon as the client is gone, not at its next event: dropping the
+        // events' receiver is how the core learns a statement's answer has
+        // nowhere to go.
         tokio::spawn(async move {
-            while let Some((request_id, event)) = ev_rx.recv().await {
+            loop {
+                let (request_id, event) = tokio::select! {
+                    next = ev_rx.recv() => match next {
+                        Some(next) => next,
+                        None => break,
+                    },
+                    () = frame_tx.closed() => break,
+                };
                 if frame_tx
                     .send(Ok(event_to_frame(request_id, event)))
                     .await
@@ -366,16 +377,13 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
                 .iter()
                 .map(|(k, v)| (k.clone(), proto_to_value_pub(v)))
                 .collect(),
-            nonce: e.nonce,
         },
         client_frame::Op::Begin(b) => SessionOp::Begin {
             transaction: super::error_details::transaction_id("begin.txid", &b.txid)?,
-            ordering: match b.ordering() {
-                ProtoOrdering::Unordered => TxnOrdering::Unordered,
-                // Unspecified and Ordered both mean ordered.
-                _ => TxnOrdering::Ordered,
-            },
-            drain_timeout_ms: b.drain_timeout_ms,
+            operation: super::operation::optional_descriptor(
+                "begin.operation",
+                b.operation.as_ref(),
+            )?,
         },
         client_frame::Op::Commit(c) => SessionOp::Commit {
             operation: super::operation::optional_descriptor(
@@ -383,7 +391,14 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
                 c.operation.as_ref(),
             )?,
             transaction: super::error_details::transaction_id("commit.txid", &c.txid)?,
-            last_nonce: c.last_nonce,
+            expect: c
+                .expect
+                .iter()
+                .map(|e| ExpectedVersion {
+                    node: NodeId::from_raw(e.node_id),
+                    version: e.version,
+                })
+                .collect(),
         },
         client_frame::Op::Rollback(r) => SessionOp::Rollback {
             transaction: super::error_details::transaction_id("rollback.txid", &r.txid)?,
@@ -436,7 +451,11 @@ fn settings_from_proto(c: &Configure) -> Result<ConnectionSettings, Status> {
             .read_preference
             .map(|p| known_preference("read_preference", p))
             .transpose()?,
-        drain_timeout_ms: c.drain_timeout_ms,
+        timeout_outcome: c
+            .timeout_outcome
+            .map(timeout_outcome_from_proto)
+            .transpose()?
+            .flatten(),
         vector_consistency: c
             .vector_consistency
             .map(|mode| vector_consistency("vector_consistency", mode))
@@ -469,13 +488,27 @@ fn statement_settings(e: &Execute) -> Result<ConnectionSettings, Status> {
             .map(|p| known_preference("read_preference", p))
             .transpose()?
             .filter(|&preference| preference != 0),
-        drain_timeout_ms: None,
+        // A transaction setting, which a statement does not name.
+        timeout_outcome: None,
         // A statement names its vector settings in a hint in its query, and
         // runs under its session's memory limit.
         vector_consistency: None,
         vector_build_wait: None,
         query_memory_limit: None,
     })
+}
+
+/// A timeout outcome a Configure names: `None` for UNSPECIFIED, which leaves
+/// the setting as it is.
+fn timeout_outcome_from_proto(outcome: i32) -> Result<Option<TimeoutOutcome>, Status> {
+    match ProtoTimeoutOutcome::try_from(outcome) {
+        Ok(ProtoTimeoutOutcome::Unspecified) => Ok(None),
+        Ok(ProtoTimeoutOutcome::Rollback) => Ok(Some(TimeoutOutcome::Rollback)),
+        Ok(ProtoTimeoutOutcome::Commit) => Ok(Some(TimeoutOutcome::Commit)),
+        Err(_) => Err(Status::invalid_argument(format!(
+            "timeout_outcome {outcome} is not one this server knows"
+        ))),
+    }
 }
 
 /// A read concern level the server knows, in the session's encoding.
@@ -531,7 +564,13 @@ fn settings_to_proto(s: &ConnectionSettings) -> Configure {
         }),
         write_concern: s.write_concern.as_ref().map(write_concern_to_proto),
         read_preference: s.read_preference.map(i32::from),
-        drain_timeout_ms: s.drain_timeout_ms,
+        timeout_outcome: s.timeout_outcome.map(|outcome| {
+            match outcome {
+                TimeoutOutcome::Rollback => ProtoTimeoutOutcome::Rollback,
+                TimeoutOutcome::Commit => ProtoTimeoutOutcome::Commit,
+            }
+            .into()
+        }),
         vector_consistency: s.vector_consistency.map(vector_consistency_to_proto),
         vector_build_wait_ms: s.vector_build_wait.map(build_wait_ms),
         // Set in whole MiB within the 4096 MiB ceiling, so it fits.
@@ -628,7 +667,7 @@ pub(crate) fn failure(status: &Status) -> Failure {
 }
 
 /// The status a failure carried through the session core stands for.
-fn status(f: Failure) -> Status {
+pub(crate) fn status(f: Failure) -> Status {
     let code = match f.code {
         ErrorCode::Cancelled => Code::Cancelled,
         ErrorCode::Unknown => Code::Unknown,

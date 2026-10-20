@@ -18681,9 +18681,9 @@ fn execute_show_sessions(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, Exe
 }
 
 /// `SHOW TRANSACTIONS`: one row per open interactive transaction this node
-/// holds as its owner, attached to a session or not: its handle, a session
-/// attached to it here (null when none is), ordering mode, age, and the
-/// milliseconds left before the idle reaper auto-aborts it (null while a
+/// holds as its owner, attached to a session or not: its ID, a session
+/// attached to it here (null when none is), age, what ends it when idle,
+/// and the milliseconds left before the idle reaper does (null while a
 /// command runs on it).
 fn execute_show_transactions(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, ExecutionError> {
     let Some(view) = ctx.transactions else {
@@ -18705,11 +18705,14 @@ fn execute_show_transactions(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>,
             attached.map_or(Value::Null, |s| Value::String(s.peer.clone())),
         );
         row.insert("txid".into(), Value::String(t.transaction));
-        row.insert("ordering".into(), Value::String(t.ordering.as_str().into()));
         row.insert("age_ms".into(), Value::Int(t.age_ms as i64));
         row.insert(
-            "auto_abort_in_ms".into(),
-            t.auto_abort_in_ms
+            "timeout_outcome".into(),
+            Value::String(t.timeout_outcome.as_str().into()),
+        );
+        row.insert(
+            "expires_in_ms".into(),
+            t.expires_in_ms
                 .map_or(Value::Null, |ms| Value::Int(ms as i64)),
         );
         rows.push(row);

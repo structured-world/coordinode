@@ -2,8 +2,9 @@
 //!
 //! An open interactive transaction pins an MVCC snapshot and buffers its
 //! writes in memory until it commits or rolls back. A client that walks away
-//! would hold both forever, so this task drops every transaction left
-//! untouched past the idle timeout. The transactions live in the
+//! would hold both forever, so this task ends every transaction left
+//! untouched past the idle timeout with its timeout outcome: rolled back,
+//! or committed under the operation its start named. The transactions live in the
 //! [`Database`] that owns them, whatever session sent their commands, so
 //! the countdown SHOW TRANSACTIONS surfaces hits zero exactly when the
 //! transaction is gone.
@@ -18,8 +19,8 @@ use coordinode_embed::Database;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
-/// Spawn the reaper: drop interactive transactions idle for at least
-/// `idle_timeout`. `begun` is notified whenever a transaction opens (the
+/// Spawn the reaper: end interactive transactions idle for at least
+/// `idle_timeout` with their timeout outcome. `begun` is notified whenever a transaction opens (the
 /// database's begin hook). Passes are at least `granularity` apart, so
 /// transactions expiring close together are reaped in one pass. The task
 /// runs for the life of the runtime.

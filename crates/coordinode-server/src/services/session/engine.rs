@@ -18,15 +18,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
-use std::time::Duration;
-
 use coordinode_core::graph::types::Value;
-use coordinode_core::operations::TxnOrdering;
-use coordinode_core::txn::command::{AdmissionSignal, TransactionId};
+use coordinode_core::txn::command::{AdmissionSignal, ExpectedVersion, TransactionId};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::db::{
-    CommitOptions, RollbackOptions, SessionSetting, StatementOptions, TransactionOptions,
+    CommitOptions, RollbackOptions, SessionSetting, StatementOptions, TransactionEnd,
+    TransactionOptions,
 };
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
@@ -176,8 +174,6 @@ impl DatabaseCursorEngine {
             params: params.unwrap_or_default(),
             settings: routed_settings(requested),
             transaction: None,
-            start_transaction: false,
-            nonce: None,
             operation: requested.operation,
             // A session statement has no call deadline; its stream lives on,
             // and Cancel stops it.
@@ -243,8 +239,6 @@ impl CursorEngine for DatabaseCursorEngine {
                         ..RoutedSettings::default()
                     },
                     transaction: Some(transaction.id),
-                    start_transaction: false,
-                    nonce: Some(transaction.nonce),
                     operation: None,
                     deadline: None,
                     source,
@@ -256,7 +250,6 @@ impl CursorEngine for DatabaseCursorEngine {
                 vector_build_wait: settings.vector_build_wait,
                 query_memory_limit: settings.query_memory_limit,
                 cancel: Some(cancel.clone()),
-                nonce: Some(transaction.nonce),
                 admission: Some(transaction.admission.clone()),
                 ..StatementOptions::default()
             };
@@ -356,9 +349,14 @@ impl CursorEngine for DatabaseCursorEngine {
     fn begin_transaction(
         &self,
         transaction: TransactionId,
-        ordering: TxnOrdering,
-        drain: Option<Duration>,
+        settings: &ConnectionSettings,
+        operation: Option<&OperationDescriptor>,
     ) -> Result<(), EngineError> {
+        // The session's settings now are the transaction's for its life; a
+        // setting the session never named is the leader's.
+        let read_concern = settings
+            .read_concern
+            .and_then(|level| read_concern_level("", i32::from(level)).ok().flatten());
         // A transaction is held by the leader: on another member it opens
         // there.
         if let Some(leader) = self.transaction_leader()? {
@@ -369,10 +367,10 @@ impl CursorEngine for DatabaseCursorEngine {
             let begin = RoutedBegin {
                 transaction,
                 actor: ActingContext::Trusted,
-                read_concern: None,
-                write_concern: None,
-                ordering,
-                drain_timeout: drain,
+                read_concern,
+                write_concern: settings.write_concern,
+                timeout_outcome: settings.timeout_outcome,
+                operation: operation.copied(),
             };
             return self.block_on_routed(
                 &coordinode_core::budget::CancelFlag::new(),
@@ -384,8 +382,10 @@ impl CursorEngine for DatabaseCursorEngine {
             .begin_transaction_as(
                 transaction,
                 &TransactionOptions {
-                    ordering,
-                    drain_timeout: drain,
+                    read_concern,
+                    write_concern: settings.write_concern,
+                    timeout_outcome: settings.timeout_outcome,
+                    operation: operation.copied(),
                     ..TransactionOptions::trusted()
                 },
             )
@@ -395,8 +395,8 @@ impl CursorEngine for DatabaseCursorEngine {
     fn commit_transaction(
         &self,
         transaction: TransactionId,
-        last_nonce: Option<u64>,
         operation: Option<&OperationDescriptor>,
+        expect: &[ExpectedVersion],
         admission: &AdmissionSignal,
     ) -> Result<CommitReceipt, EngineError> {
         if let Some(leader) = self.transaction_leader()? {
@@ -407,10 +407,9 @@ impl CursorEngine for DatabaseCursorEngine {
             let commit = RoutedCommit {
                 actor: ActingContext::Trusted,
                 transaction,
-                last_nonce,
                 operation: operation.copied(),
                 deadline: None,
-                expect: Vec::new(),
+                expect: expect.to_vec(),
             };
             return self.block_on_routed(
                 &coordinode_core::budget::CancelFlag::new(),
@@ -423,8 +422,8 @@ impl CursorEngine for DatabaseCursorEngine {
                 transaction,
                 &CommitOptions {
                     operation,
-                    last_nonce,
                     admission: Some(admission),
+                    expect,
                     ..CommitOptions::default()
                 },
             )
@@ -436,6 +435,22 @@ impl CursorEngine for DatabaseCursorEngine {
         transaction: TransactionId,
         admission: &AdmissionSignal,
     ) -> Result<(), EngineError> {
+        self.end_transaction(transaction, Some(admission), TransactionEnd::RolledBack)
+    }
+
+    fn abandon_transaction(&self, transaction: TransactionId) -> Result<(), EngineError> {
+        self.end_transaction(transaction, None, TransactionEnd::StreamLost)
+    }
+}
+
+impl DatabaseCursorEngine {
+    /// Roll back `transaction` for `end`, at the leader that holds it.
+    fn end_transaction(
+        &self,
+        transaction: TransactionId,
+        admission: Option<&AdmissionSignal>,
+        end: TransactionEnd,
+    ) -> Result<(), EngineError> {
         if let Some(leader) = self.transaction_leader()? {
             let router = self
                 .executor
@@ -444,6 +459,7 @@ impl CursorEngine for DatabaseCursorEngine {
             let rollback = RoutedRollback {
                 actor: ActingContext::Trusted,
                 transaction,
+                abandoned: end == TransactionEnd::StreamLost,
             };
             return self.block_on_routed(
                 &coordinode_core::budget::CancelFlag::new(),
@@ -455,7 +471,8 @@ impl CursorEngine for DatabaseCursorEngine {
             .rollback_transaction_with(
                 transaction,
                 &RollbackOptions {
-                    admission: Some(admission),
+                    admission,
+                    end,
                     ..RollbackOptions::default()
                 },
             )

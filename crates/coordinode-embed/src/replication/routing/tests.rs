@@ -18,6 +18,8 @@ struct Scripted {
     cancelled: AtomicBool,
     /// Commits that arrived.
     commits: AtomicUsize,
+    /// Rollbacks that arrived, in order.
+    rollbacks: Mutex<Vec<RoutedRollback>>,
 }
 
 impl CommandExecutor for Scripted {
@@ -49,13 +51,13 @@ impl CommandExecutor for Scripted {
 
     fn begin(&self, begin: RoutedBegin) -> Result<(), Status> {
         assert_eq!(begin.transaction, txid());
-        assert_eq!(begin.ordering, TxnOrdering::Ordered);
+        assert_eq!(begin.timeout_outcome, Some(TimeoutOutcome::Commit));
+        assert_eq!(begin.operation, Some(operation(1)));
         Ok(())
     }
 
     fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, Status> {
         assert_eq!(commit.transaction, txid());
-        assert_eq!(commit.last_nonce, Some(3));
         assert_eq!(commit.expect, expectations());
         self.commits.fetch_add(1, Ordering::AcqRel);
         Ok(CommitReceipt {
@@ -66,6 +68,7 @@ impl CommandExecutor for Scripted {
 
     fn rollback(&self, rollback: RoutedRollback) -> Result<(), Status> {
         assert_eq!(rollback.transaction, txid());
+        self.rollbacks.lock().unwrap().push(rollback);
         Err(Status::aborted("already ended"))
     }
 
@@ -246,8 +249,6 @@ fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
             query_memory_limit: Some(1 << 20),
         },
         transaction,
-        start_transaction: false,
-        nonce: transaction.map(|_| 2),
         operation: None,
         deadline: Some(Duration::from_secs(30)),
         source: Some(SourceContext {
@@ -261,8 +262,8 @@ fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
 }
 
 /// A statement reaches the executing member as the ingress sent it: who it
-/// acts for, its parameters, every setting, its transaction, nonce and
-/// source; and its answer comes back whole, rows in order.
+/// acts for, its parameters, every setting, its transaction and source; and
+/// its answer comes back whole, rows in order.
 #[tokio::test]
 async fn a_statement_and_its_answer_cross_unchanged() {
     let executor = Arc::new(Scripted::default());
@@ -351,34 +352,51 @@ async fn the_ingress_learns_of_the_admission_before_the_answer() {
     call.await.expect("joined").expect("answered");
     let arrived = executor.statements.lock().unwrap().pop().expect("arrived");
     assert_eq!(arrived.transaction, Some(txid()));
-    assert_eq!(arrived.nonce, Some(2));
 }
 
-/// A statement that starts its transaction crosses with the start flag, and
-/// one naming no transaction cannot ask to start one.
+/// An ingress that leaves before a transaction's statement answered aborts
+/// the transaction at the executing member: the client cannot know what the
+/// statement did, and it never runs twice. An autonomous statement in the
+/// same situation leaves nothing to abort.
 #[tokio::test]
-async fn a_starting_statement_crosses_with_its_flag() {
-    let executor = Arc::new(Scripted::default());
-    *executor.answer.lock().unwrap() = Some(Ok(RoutedAnswer::default()));
-    let router = serve(Arc::clone(&executor)).await;
-    router
-        .execute(
-            RoutedStatement {
-                start_transaction: true,
-                ..statement(Some(txid()))
-            },
-            &AdmissionSignal::new(|| {}),
-        )
-        .await
-        .expect("answered");
-    let arrived = executor.statements.lock().unwrap().pop().expect("arrived");
-    assert!(arrived.start_transaction);
-    assert_eq!(arrived.transaction, Some(txid()));
-
-    let mut wire = statement_to_wire(statement(None)).expect("encoded");
-    wire.start_transaction = true;
-    let err = statement_from_wire(wire).expect_err("refused");
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+async fn an_ingress_that_leaves_mid_statement_abandons_its_transaction() {
+    for transaction in [Some(txid()), None] {
+        let executor = Arc::new(Scripted::default());
+        let router = serve(Arc::clone(&executor)).await;
+        let call = tokio::spawn(async move {
+            router
+                .execute(statement(transaction), &AdmissionSignal::new(|| {}))
+                .await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while executor.statements.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "never arrived");
+            tokio::task::yield_now().await;
+        }
+        call.abort();
+        while !executor.cancelled.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "never cancelled");
+            tokio::task::yield_now().await;
+        }
+        // The abandon, if any, follows the cancelled statement on its thread.
+        let abandoned = loop {
+            let rollbacks = executor.rollbacks.lock().unwrap().clone();
+            if transaction.is_none() || !rollbacks.is_empty() {
+                break rollbacks;
+            }
+            assert!(std::time::Instant::now() < deadline, "never abandoned");
+            tokio::task::yield_now().await;
+        };
+        match transaction {
+            Some(id) => {
+                assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+                assert_eq!(abandoned[0].transaction, id);
+                assert!(abandoned[0].abandoned, "not one the client asked for");
+                assert_eq!(abandoned[0].end(), TransactionEnd::StreamLost);
+            }
+            None => assert!(abandoned.is_empty(), "{abandoned:?}"),
+        }
+    }
 }
 
 /// A refusal reaches the ingress with its code, message and details, so the
@@ -434,8 +452,8 @@ async fn transaction_commands_cross_both_ways() {
             actor: principal(),
             read_concern: Some(ReadConcernLevel::Snapshot),
             write_concern: None,
-            ordering: TxnOrdering::Ordered,
-            drain_timeout: Some(Duration::from_millis(500)),
+            timeout_outcome: Some(TimeoutOutcome::Commit),
+            operation: Some(operation(1)),
         })
         .await
         .expect("begun");
@@ -443,7 +461,6 @@ async fn transaction_commands_cross_both_ways() {
         .commit(RoutedCommit {
             actor: principal(),
             transaction: txid(),
-            last_nonce: Some(3),
             operation: None,
             deadline: None,
             expect: expectations(),
@@ -453,14 +470,29 @@ async fn transaction_commands_cross_both_ways() {
     assert_eq!(receipt.commit_ts, Timestamp::from_raw(77));
     assert_eq!(receipt.applied_index, Some(12));
     assert_eq!(executor.commits.load(Ordering::Acquire), 1);
-    let err = router
-        .rollback(RoutedRollback {
-            actor: principal(),
-            transaction: txid(),
-        })
-        .await
-        .expect_err("refused");
-    assert_eq!(err.code(), tonic::Code::Aborted);
+    for abandoned in [false, true] {
+        let err = router
+            .rollback(RoutedRollback {
+                actor: principal(),
+                transaction: txid(),
+                abandoned,
+            })
+            .await
+            .expect_err("refused");
+        assert_eq!(err.code(), tonic::Code::Aborted);
+    }
+    let arrived: Vec<bool> = executor
+        .rollbacks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|rollback| rollback.abandoned)
+        .collect();
+    assert_eq!(
+        arrived,
+        [false, true],
+        "the cause crosses with the rollback"
+    );
 }
 
 /// A command that names nobody is refused rather than run as anyone.

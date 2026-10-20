@@ -23,6 +23,8 @@ struct Services {
     operations: OperationServiceImpl,
     cypher: CypherServiceImpl,
     graph: GraphServiceImpl,
+    /// What a session's transactions run through.
+    session: crate::services::session::DatabaseCursorEngine,
     _dir: tempfile::TempDir,
 }
 
@@ -32,6 +34,7 @@ fn services() -> Services {
     let executor = StatementExecutor::new(Arc::clone(&database));
     Services {
         operations: OperationServiceImpl::new(executor.clone()),
+        session: crate::services::session::DatabaseCursorEngine::from_executor(executor.clone()),
         cypher: CypherServiceImpl::from_executor(executor),
         graph: GraphServiceImpl::new(database),
         _dir: dir,
@@ -165,61 +168,55 @@ async fn a_unary_write_retried_runs_once() {
         .into_inner()
         .rows;
     assert_eq!(rows.len(), 1);
-
-    let txn = coordinode_embed::db::draw_transaction_id();
-    let refused = s
-        .cypher
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
-            query: "CREATE (:Inside)".to_string(),
-            transaction_id: txn.to_bytes().to_vec(),
-            start_transaction: true,
-            operation: Some(wire::OperationRef {
-                sequence: op.sequence + 1,
-                ..op.clone()
-            }),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert_eq!(refused.code(), Code::InvalidArgument);
 }
 
-/// A commit repeated after a lost reply answers with the operation's
+/// A session commit repeated after a lost reply answers with the operation's
 /// outcome and writes nothing again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_repeated_commit_answers_with_the_outcome() {
+    use coordinode_core::txn::command::AdmissionSignal;
+    use coordinode_session::CursorEngine;
+
     let s = services();
-    let op = enroll(&s).await;
-    let txn = coordinode_embed::db::draw_transaction_id()
-        .to_bytes()
-        .to_vec();
-    s.cypher
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
-            query: "CREATE (:Purchase {k: 1})".to_string(),
-            transaction_id: txn.clone(),
-            start_transaction: true,
-            ..Default::default()
-        }))
-        .await
+    let op = super::optional_descriptor("operation", Some(&enroll(&s).await))
+        .unwrap()
+        .expect("a descriptor");
+    let txn = coordinode_embed::db::draw_transaction_id();
+    s.session
+        .begin_transaction(
+            txn,
+            &coordinode_session::ConnectionSettings::default(),
+            None,
+        )
+        .unwrap();
+    s.session
+        .open_cursor(
+            "CREATE (:Purchase {k: 1})",
+            std::collections::HashMap::new(),
+            Some(&coordinode_session::InTransaction {
+                id: txn,
+                admission: AdmissionSignal::new(|| {}),
+            }),
+            &coordinode_session::ConnectionSettings::default(),
+            None,
+            None,
+            &coordinode_core::budget::CancelFlag::new(),
+        )
         .unwrap();
     let commit = || {
-        Request::new(query::CommitTransactionRequest {
-            transaction_id: txn.clone(),
-            expect: Vec::new(),
-            operation: Some(op.clone()),
-        })
+        s.session
+            .commit_transaction(txn, Some(&op), &[], &AdmissionSignal::new(|| {}))
+            .map_err(|e| crate::services::session::status(e.0))
     };
-    let receipt = s
-        .cypher
-        .commit_transaction(commit())
-        .await
-        .unwrap()
-        .into_inner();
-    let refused = s.cypher.commit_transaction(commit()).await.unwrap_err();
+    let receipt = commit().unwrap();
+    let refused = commit().unwrap_err();
     let (why, metadata) = reason(&refused);
     assert_eq!(why, "OPERATION_SETTLED");
     assert_eq!(metadata["outcome"], "COMMITTED");
-    assert_eq!(metadata["commit_ts"], receipt.commit_ts.to_string());
+    assert_eq!(
+        metadata["commit_ts"],
+        receipt.commit_ts.as_raw().to_string()
+    );
 }
 
 /// A typed creation carries its operation like a statement does; a batch

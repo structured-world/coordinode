@@ -67,6 +67,40 @@ impl fmt::Display for MalformedTransactionId {
     }
 }
 
+/// What ends an interactive transaction that stays idle past the idle
+/// timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeoutOutcome {
+    /// It is rolled back: nothing of it is applied.
+    #[default]
+    Rollback,
+    /// It is committed as an explicit commit would commit it, under the
+    /// client operation its start named, by which the client learns the
+    /// outcome. A transaction one of whose statements failed is rolled back
+    /// instead.
+    Commit,
+}
+
+impl TimeoutOutcome {
+    /// Lowercase label for result rows and configuration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rollback => "rollback",
+            Self::Commit => "commit",
+        }
+    }
+}
+
+/// A node and the version a caller believes it is at, which a commit
+/// checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedVersion {
+    /// The node.
+    pub node: crate::graph::node::NodeId,
+    /// The version read earlier; `None` requires the node not to exist.
+    pub version: Option<u64>,
+}
+
 /// Told when a command has its place in its transaction's order: it runs
 /// now, or waits in the owner's queue behind the commands admitted before it.
 /// An ingress that keeps one stream's commands for a transaction in order

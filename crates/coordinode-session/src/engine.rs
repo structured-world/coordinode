@@ -7,11 +7,9 @@
 //! [`QueryCursor`] into neutral events.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use coordinode_core::graph::types::Value;
-use coordinode_core::operations::TxnOrdering;
-use coordinode_core::txn::command::{AdmissionSignal, TransactionId};
+use coordinode_core::txn::command::{AdmissionSignal, ExpectedVersion, TransactionId};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 
@@ -22,8 +20,6 @@ use crate::types::{ConnectionSettings, Failure, SessionStats, StatementSource};
 pub struct InTransaction {
     /// The transaction.
     pub id: TransactionId,
-    /// The statement's number within it; zero for none.
-    pub nonce: u64,
     /// Told when the statement has its place in the transaction's order; the
     /// session sends this stream's next command for the transaction then.
     pub admission: AdmissionSignal,
@@ -93,31 +89,32 @@ pub trait CursorEngine: Send + Sync {
     }
 
     /// Open a new interactive transaction under `transaction`, the ID the
-    /// client drew, ordering its statements as `ordering` says. Subsequent
-    /// `open_cursor` calls carrying this ID run inside it, reading its pinned
-    /// snapshot and buffering writes until `commit_transaction`. `drain`
-    /// bounds how long an ordered transaction waits for a missing statement;
-    /// the engine's default when `None`.
+    /// client drew, with `settings`: the session's at the moment, of which
+    /// the concerns and the timeout outcome become the transaction's for its
+    /// life (a field still unset is the engine's default). `operation` is
+    /// the client operation its commit carries out. Subsequent `open_cursor`
+    /// calls carrying this ID run inside it, reading its pinned snapshot and
+    /// buffering writes until `commit_transaction`.
     fn begin_transaction(
         &self,
         transaction: TransactionId,
-        ordering: TxnOrdering,
-        drain: Option<Duration>,
+        settings: &ConnectionSettings,
+        operation: Option<&OperationDescriptor>,
     ) -> Result<(), EngineError>;
 
-    /// Commit an interactive transaction once every statement admitted to it
-    /// has run (an ordered chain up to `last_nonce`), flushing its buffered
-    /// writes in one proposal and returning the commit receipt: the HLC
-    /// commit timestamp plus the applied Raft index (the causal token; `None`
-    /// in embedded mode). With `operation`, the commit carries out that
-    /// client operation: it takes effect at most once, and a repeat of one
-    /// already settled is refused with its outcome. `admission` is told when
-    /// the commit has its place.
+    /// Commit an interactive transaction once every command that reached it
+    /// before has run, flushing its buffered writes in one proposal and
+    /// returning the commit receipt: the HLC commit timestamp plus the
+    /// applied Raft index (the causal token; `None` in embedded mode). With
+    /// `operation`, the commit carries out that client operation: it takes
+    /// effect at most once, and a repeat of one already settled is refused
+    /// with its outcome. `expect` names the node versions the caller built
+    /// on. `admission` is told when the commit has its place.
     fn commit_transaction(
         &self,
         transaction: TransactionId,
-        last_nonce: Option<u64>,
         operation: Option<&OperationDescriptor>,
+        expect: &[ExpectedVersion],
         admission: &AdmissionSignal,
     ) -> Result<CommitReceipt, EngineError>;
 
@@ -129,6 +126,11 @@ pub trait CursorEngine: Send + Sync {
         transaction: TransactionId,
         admission: &AdmissionSignal,
     ) -> Result<(), EngineError>;
+
+    /// Abort an interactive transaction whose statement's answer did not
+    /// reach its client: the client cannot know what the statement did, and
+    /// a statement never runs twice. Later commands for it are told so.
+    fn abandon_transaction(&self, transaction: TransactionId) -> Result<(), EngineError>;
 }
 
 /// A live server-side cursor: a column header plus paged row batches.

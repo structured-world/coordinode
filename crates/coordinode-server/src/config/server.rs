@@ -139,6 +139,26 @@ pub enum ElectionStanding {
     Last,
 }
 
+/// What ends an idle interactive transaction, as written in the file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutOutcomeSetting {
+    /// It is rolled back.
+    #[default]
+    Rollback,
+    /// It is committed under the operation its start named.
+    Commit,
+}
+
+impl From<TimeoutOutcomeSetting> for coordinode_core::txn::command::TimeoutOutcome {
+    fn from(setting: TimeoutOutcomeSetting) -> Self {
+        match setting {
+            TimeoutOutcomeSetting::Rollback => Self::Rollback,
+            TimeoutOutcomeSetting::Commit => Self::Commit,
+        }
+    }
+}
+
 /// Zstd level when the file names zstd without one: the library's default.
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
@@ -474,10 +494,9 @@ pub struct ServerConfig {
     pub interactive_txn_idle_timeout_secs: u64,
     /// Max buffered (uncommitted) bytes per interactive transaction.
     pub interactive_txn_max_bytes: u64,
-    /// How long, in ms, an ordered interactive transaction waits for a
-    /// missing statement before it is aborted, when its BEGIN and session
-    /// name no bound.
-    pub interactive_txn_drain_timeout_ms: u64,
+    /// What ends an interactive transaction that stays idle past the idle
+    /// timeout, when its session names nothing: `rollback` or `commit`.
+    pub interactive_txn_timeout_outcome: TimeoutOutcomeSetting,
     /// Runs of an auto-commit statement refused at commit for contention
     /// before the refusal is returned to the client.
     pub autocommit_retry_attempts: NonZeroU32,
@@ -636,7 +655,7 @@ impl Default for ServerConfig {
             default_write_concern: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
-            interactive_txn_drain_timeout_ms: 5_000,
+            interactive_txn_timeout_outcome: TimeoutOutcomeSetting::Rollback,
             autocommit_retry_attempts: coordinode_embed::Database::DEFAULT_AUTOCOMMIT_ATTEMPTS,
             autocommit_retry_backoff_ms: 2,
             operation_admission_window:

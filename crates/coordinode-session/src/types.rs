@@ -8,8 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
-use coordinode_core::operations::TxnOrdering;
-use coordinode_core::txn::command::TransactionId;
+use coordinode_core::txn::command::{ExpectedVersion, TimeoutOutcome, TransactionId};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_core::txn::write_concern::WriteConcern;
@@ -19,40 +18,40 @@ use coordinode_core::txn::write_concern::WriteConcern;
 pub enum SessionOp {
     /// Run one query statement, autonomously (no `transaction`) or inside a
     /// transaction. `params` are already in the engine's value space; the
-    /// binding converts its wire values before constructing this. `nonce`
-    /// is the statement's number within its transaction, zero for none.
+    /// binding converts its wire values before constructing this.
     /// `settings` are the ones the statement names itself; each one it leaves
-    /// unset is the session's. `source` is where in the client's code it was
-    /// issued, boxed: only a client in debug mode sends one, and inline it
-    /// would dominate the size of every operation. `operation` is the client
+    /// unset is the session's, and a statement inside a transaction naming
+    /// any is refused, since the transaction runs under the settings fixed at
+    /// its begin. `source` is where in the client's code it was issued,
+    /// boxed: only a client in debug mode sends one, and inline it would
+    /// dominate the size of every operation. `operation` is the client
     /// operation an autonomous statement carries out; a statement inside a
     /// transaction carrying one is refused, since the transaction's
-    /// operation is named on its commit.
+    /// operation is named on its begin or its commit.
     Execute {
         query: String,
         params: HashMap<String, Value>,
         transaction: Option<TransactionId>,
-        nonce: u64,
         settings: ConnectionSettings,
         source: Option<Box<StatementSource>>,
         operation: Option<OperationDescriptor>,
     },
     /// Open an interactive transaction under `transaction`, the ID the client
-    /// drew. Nothing answers a Begin that succeeds; a refused one answers
-    /// with an error. A zero `drain_timeout_ms` takes the session's setting,
-    /// then the server's default.
+    /// drew, with the session's settings in effect now. `operation` is the
+    /// client operation its commit carries out, required when it commits at
+    /// idle expiry. Nothing answers a Begin that succeeds; a refused one
+    /// answers with an error.
     Begin {
         transaction: TransactionId,
-        ordering: TxnOrdering,
-        drain_timeout_ms: u32,
+        operation: Option<OperationDescriptor>,
     },
     /// Commit an interactive transaction by ID, carrying out `operation`
-    /// when the client named one. `last_nonce` is the last statement of an
-    /// ordered chain, zero for none.
+    /// when the client named one, and only while the nodes in `expect` are
+    /// at the versions named there.
     Commit {
         transaction: TransactionId,
-        last_nonce: u64,
         operation: Option<OperationDescriptor>,
+        expect: Vec<ExpectedVersion>,
     },
     /// Roll back an interactive transaction by ID.
     Rollback { transaction: TransactionId },
@@ -95,9 +94,9 @@ pub struct ConnectionSettings {
     pub write_concern: Option<WriteConcern>,
     /// Default read preference for statements that carry none.
     pub read_preference: Option<u8>,
-    /// Default reorder-buffer drain timeout for ordered transactions, in
-    /// milliseconds.
-    pub drain_timeout_ms: Option<u32>,
+    /// What ends a transaction the connection begins that stays idle past
+    /// the idle timeout; the server's setting when unset.
+    pub timeout_outcome: Option<TimeoutOutcome>,
     /// Vector consistency for statements whose query names none in a hint.
     pub vector_consistency: Option<VectorConsistencyMode>,
     /// How long a statement waits for a vector index still being built, when
@@ -130,8 +129,8 @@ impl ConnectionSettings {
         if change.read_preference.is_some() {
             self.read_preference = change.read_preference;
         }
-        if change.drain_timeout_ms.is_some() {
-            self.drain_timeout_ms = change.drain_timeout_ms;
+        if change.timeout_outcome.is_some() {
+            self.timeout_outcome = change.timeout_outcome;
         }
         if change.vector_consistency.is_some() {
             self.vector_consistency = change.vector_consistency;
@@ -150,6 +149,16 @@ impl ConnectionSettings {
         let mut effective = self.clone();
         effective.apply(statement);
         effective
+    }
+
+    /// Whether a statement names any concern or preference of its own,
+    /// which a statement inside a transaction may not.
+    pub fn names_concern(&self) -> bool {
+        self.read_concern.is_some()
+            || self.after_index.is_some()
+            || self.at_timestamp.is_some()
+            || self.write_concern.is_some()
+            || self.read_preference.is_some()
     }
 }
 

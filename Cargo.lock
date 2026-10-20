@@ -1253,6 +1253,7 @@ dependencies = [
  "coordinode-core",
  "parking_lot",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

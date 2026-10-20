@@ -1,7 +1,6 @@
 //! Whole commands carried from the member a client reached (the ingress) to
-//! the member that runs them: an autonomous statement or a transaction's
-//! first command to the leader, a transaction's later commands to the member
-//! that holds it.
+//! the member that runs them: an autonomous statement to the leader, a
+//! transaction's commands to the leader that holds it.
 //!
 //! The executing member selects the view, evaluates, validates and commits;
 //! the ingress never ships a write set it evaluated itself. A command is
@@ -21,8 +20,9 @@ use std::time::Duration;
 use coordinode_core::budget::CancelFlag;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
-use coordinode_core::operations::TxnOrdering;
-use coordinode_core::txn::command::{ActingContext, AdmissionSignal, Principal, TransactionId};
+use coordinode_core::txn::command::{
+    ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,
+};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::read_concern::ReadConcernLevel;
 use coordinode_core::txn::timestamp::Timestamp;
@@ -35,7 +35,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
-use crate::db::ExpectedVersion;
+use crate::db::TransactionEnd;
 use crate::operation::{IssuerId, OperationOutcome, Resolve};
 use coordinode_core::group::DeploymentId;
 use wire::command_routing_service_client::CommandRoutingServiceClient;
@@ -86,12 +86,6 @@ pub struct RoutedStatement {
     pub settings: RoutedSettings,
     /// The transaction it runs in; `None` commits it on its own.
     pub transaction: Option<TransactionId>,
-    /// The statement starts `transaction`: it opens with `actor` and the
-    /// read and write concern of `settings`, statements applied as they
-    /// come, then the statement runs in it.
-    pub start_transaction: bool,
-    /// Its number within the transaction.
-    pub nonce: Option<u64>,
     /// The client operation an autonomous statement carries out.
     pub operation: Option<OperationDescriptor>,
     /// What is left of the caller's deadline.
@@ -147,11 +141,10 @@ pub struct RoutedBegin {
     pub read_concern: Option<ReadConcernLevel>,
     /// The write concern of its commit; the leader's when `None`.
     pub write_concern: Option<WriteConcern>,
-    /// How its statements are ordered.
-    pub ordering: TxnOrdering,
-    /// How long an ordered transaction waits for a missing statement; the
-    /// leader's setting when `None`.
-    pub drain_timeout: Option<Duration>,
+    /// What ends it when it stays idle; the leader's setting when `None`.
+    pub timeout_outcome: Option<TimeoutOutcome>,
+    /// The client operation its commit carries out.
+    pub operation: Option<OperationDescriptor>,
 }
 
 /// Commit an interactive transaction at the leader.
@@ -161,9 +154,8 @@ pub struct RoutedCommit {
     pub actor: ActingContext,
     /// The transaction.
     pub transaction: TransactionId,
-    /// The last nonce of an ordered chain.
-    pub last_nonce: Option<u64>,
-    /// The client operation the commit carries out.
+    /// The client operation the commit carries out; the one its begin named
+    /// when `None`.
     pub operation: Option<OperationDescriptor>,
     /// What is left of the caller's deadline.
     pub deadline: Option<Duration>,
@@ -178,6 +170,20 @@ pub struct RoutedRollback {
     pub actor: ActingContext,
     /// The transaction.
     pub transaction: TransactionId,
+    /// The client did not ask for it: the stream a statement of the
+    /// transaction ran on was lost.
+    pub abandoned: bool,
+}
+
+impl RoutedRollback {
+    /// Why the transaction ends.
+    pub fn end(&self) -> TransactionEnd {
+        if self.abandoned {
+            TransactionEnd::StreamLost
+        } else {
+            TransactionEnd::RolledBack
+        }
+    }
 }
 
 /// A call on the records of client operations, decided by the leader's log.
@@ -345,6 +351,14 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
             admitted.admitted();
         }
 
+        // A statement of a transaction whose answer does not reach the
+        // ingress leaves its client unable to know what it did, and a
+        // statement never runs twice: the transaction is aborted.
+        let abandon = statement.transaction.map(|transaction| RoutedRollback {
+            actor: statement.actor.clone(),
+            transaction,
+            abandoned: true,
+        });
         let executor = Arc::clone(&self.executor);
         tokio::task::spawn_blocking(move || {
             let sent = match executor.execute(statement, &cancel, &admitted) {
@@ -353,6 +367,13 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
             };
             if !sent {
                 tracing::debug!("a routed statement's ingress left before its answer");
+                if let Some(rollback) = abandon {
+                    // A transaction the failed statement already ended is
+                    // refused here, which is the outcome wanted.
+                    if let Err(status) = executor.rollback(rollback) {
+                        tracing::debug!(%status, "abandoned transaction already ended");
+                    }
+                }
             }
         });
         Ok(Response::new(ReceiverStream::new(answer)))
@@ -782,8 +803,6 @@ fn statement_to_wire(statement: RoutedStatement) -> Result<wire::RoutedStatement
             .transaction
             .map(|id| id.to_bytes().to_vec())
             .unwrap_or_default(),
-        start_transaction: statement.start_transaction,
-        nonce: statement.nonce.unwrap_or(0),
         operation: statement
             .operation
             .map(|o| o.to_bytes())
@@ -800,11 +819,6 @@ fn statement_to_wire(statement: RoutedStatement) -> Result<wire::RoutedStatement
 }
 
 fn statement_from_wire(statement: wire::RoutedStatement) -> Result<RoutedStatement, Status> {
-    if statement.start_transaction && statement.transaction_id.is_empty() {
-        return Err(Status::invalid_argument(
-            "start_transaction: a statement starts a transaction only under its transaction_id",
-        ));
-    }
     Ok(RoutedStatement {
         actor: actor_from_wire(statement.actor)?,
         params: if statement.parameters.is_empty() {
@@ -820,8 +834,6 @@ fn statement_from_wire(statement: wire::RoutedStatement) -> Result<RoutedStateme
         } else {
             Some(transaction_id_from_wire(&statement.transaction_id)?)
         },
-        start_transaction: statement.start_transaction,
-        nonce: (statement.nonce > 0).then_some(statement.nonce),
         operation: operation_from_wire(&statement.operation)?,
         deadline: deadline_from_wire(statement.deadline_ms),
         source: statement.source.map(|s| SourceContext {
@@ -871,8 +883,12 @@ fn begin_to_wire(begin: RoutedBegin) -> wire::RoutedBegin {
             write_concern: begin.write_concern,
             ..RoutedSettings::default()
         })),
-        ordered: begin.ordering == TxnOrdering::Ordered,
-        drain_timeout_ms: deadline_to_wire(begin.drain_timeout),
+        timeout_outcome: match begin.timeout_outcome {
+            None => 0,
+            Some(TimeoutOutcome::Rollback) => 1,
+            Some(TimeoutOutcome::Commit) => 2,
+        },
+        operation: begin.operation.map(|o| o.to_bytes()).unwrap_or_default(),
     }
 }
 
@@ -883,12 +899,17 @@ fn begin_from_wire(begin: wire::RoutedBegin) -> Result<RoutedBegin, Status> {
         actor: actor_from_wire(begin.actor)?,
         read_concern: settings.read_concern,
         write_concern: settings.write_concern,
-        ordering: if begin.ordered {
-            TxnOrdering::Ordered
-        } else {
-            TxnOrdering::Unordered
+        timeout_outcome: match begin.timeout_outcome {
+            0 => None,
+            1 => Some(TimeoutOutcome::Rollback),
+            2 => Some(TimeoutOutcome::Commit),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "timeout outcome {other} is not one this member knows"
+                )));
+            }
         },
-        drain_timeout: deadline_from_wire(begin.drain_timeout_ms),
+        operation: operation_from_wire(&begin.operation)?,
     })
 }
 
@@ -896,7 +917,6 @@ fn commit_to_wire(commit: RoutedCommit) -> wire::RoutedCommit {
     wire::RoutedCommit {
         actor: Some(actor_to_wire(&commit.actor)),
         transaction_id: commit.transaction.to_bytes().to_vec(),
-        last_nonce: commit.last_nonce.unwrap_or(0),
         operation: commit.operation.map(|o| o.to_bytes()).unwrap_or_default(),
         deadline_ms: deadline_to_wire(commit.deadline),
         expect: commit
@@ -914,7 +934,6 @@ fn commit_from_wire(commit: wire::RoutedCommit) -> Result<RoutedCommit, Status> 
     Ok(RoutedCommit {
         actor: actor_from_wire(commit.actor)?,
         transaction: transaction_id_from_wire(&commit.transaction_id)?,
-        last_nonce: (commit.last_nonce > 0).then_some(commit.last_nonce),
         operation: operation_from_wire(&commit.operation)?,
         deadline: deadline_from_wire(commit.deadline_ms),
         expect: commit
@@ -932,6 +951,7 @@ fn rollback_to_wire(rollback: RoutedRollback) -> wire::RoutedRollback {
     wire::RoutedRollback {
         actor: Some(actor_to_wire(&rollback.actor)),
         transaction_id: rollback.transaction.to_bytes().to_vec(),
+        abandoned: rollback.abandoned,
     }
 }
 
@@ -939,6 +959,7 @@ fn rollback_from_wire(rollback: wire::RoutedRollback) -> Result<RoutedRollback, 
     Ok(RoutedRollback {
         actor: actor_from_wire(rollback.actor)?,
         transaction: transaction_id_from_wire(&rollback.transaction_id)?,
+        abandoned: rollback.abandoned,
     })
 }
 

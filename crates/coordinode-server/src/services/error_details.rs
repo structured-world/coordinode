@@ -66,24 +66,34 @@ pub enum Reason {
     /// new transaction draws a new one.
     TransactionIdInUse,
     /// The transaction ended on its leader before it was committed: a
-    /// statement failed, it stayed idle, or an ordered chain did not
-    /// complete. Nothing of it was applied. Metadata carries `transaction`
-    /// and `end`. Re-running the whole transaction under a new ID is the
-    /// intended response.
+    /// statement failed, it stayed idle, it was rolled back, or the stream a
+    /// statement of it ran on was lost (`end` STATEMENT_FAILED, IDLE_EXPIRED,
+    /// ROLLED_BACK, STREAM_LOST). Nothing of it was applied. Metadata
+    /// carries `transaction` and `end`. Re-running the whole transaction
+    /// under a new ID is the intended response.
     TransactionAborted,
-    /// Another command is running on the same transaction. Nothing changed
-    /// and the transaction stays open. Metadata carries `transaction`. Retry
-    /// once that command has answered.
+    /// Too many commands wait their turn on the same transaction. Nothing
+    /// changed and the transaction stays open. Metadata carries
+    /// `transaction`. Retry once earlier commands have answered.
     TransactionBusy,
-    /// A statement repeats a nonce already admitted to its transaction with
-    /// the same text: it was applied once, and its result is not kept. Nothing
-    /// ran this time. Metadata carries `transaction` and `nonce`. Terminal for
-    /// that nonce.
-    StatementAlreadyAdmitted,
-    /// A nonce already admitted to the transaction names another statement.
-    /// Nothing ran. Metadata carries `transaction` and `nonce`. Terminal: a new
-    /// statement takes a new nonce.
-    StatementNonceReused,
+    /// A transaction that commits at idle expiry was started without the
+    /// client operation that commit binds. Nothing was opened. Metadata
+    /// carries `transaction`. Terminal: start it again naming an operation.
+    OperationRequired,
+    /// A commit names another client operation than its transaction was
+    /// started under. Nothing changed; the transaction stays open. Metadata
+    /// carries `transaction`. Terminal for that operation.
+    OperationDiffers,
+    /// The transaction stayed idle past the idle timeout and its timeout
+    /// outcome committed it, under the operation its start named. Metadata
+    /// carries `transaction`. Terminal for that ID: the operation reports
+    /// the commit timestamp.
+    TransactionCommittedOnTimeout,
+    /// The transaction stayed idle past the idle timeout and the commit its
+    /// timeout outcome made failed without proving whether it applied.
+    /// Metadata carries `transaction`. Terminal for that ID: resolve the
+    /// operation its start named, never run it again blindly.
+    TransactionOutcomeUnknown,
     /// A commit lost to a concurrent write. Nothing of the transaction was
     /// applied; retrying the whole transaction is the intended response.
     TransactionConflict,
@@ -254,8 +264,10 @@ impl Reason {
             Reason::TransactionIdInUse => "TRANSACTION_ID_IN_USE",
             Reason::TransactionAborted => "TRANSACTION_ABORTED",
             Reason::TransactionBusy => "TRANSACTION_BUSY",
-            Reason::StatementAlreadyAdmitted => "STATEMENT_ALREADY_ADMITTED",
-            Reason::StatementNonceReused => "STATEMENT_NONCE_REUSED",
+            Reason::OperationRequired => "OPERATION_REQUIRED",
+            Reason::OperationDiffers => "OPERATION_DIFFERS",
+            Reason::TransactionCommittedOnTimeout => "TRANSACTION_COMMITTED_ON_TIMEOUT",
+            Reason::TransactionOutcomeUnknown => "TRANSACTION_OUTCOME_UNKNOWN",
             Reason::TransactionConflict => "TRANSACTION_CONFLICT",
             Reason::InvariantRefused => "INVARIANT_REFUSED",
             Reason::RevisionMismatch => "REVISION_MISMATCH",

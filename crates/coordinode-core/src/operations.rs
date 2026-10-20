@@ -17,40 +17,22 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// How an interactive transaction orders the statements pipelined into it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TxnOrdering {
-    /// Statements applied in nonce order, reassembled in a reorder buffer.
-    Ordered,
-    /// Statements applied in the order their owner admits them.
-    Unordered,
-}
-
-impl TxnOrdering {
-    /// Lowercase label for result rows / JSON.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TxnOrdering::Ordered => "ordered",
-            TxnOrdering::Unordered => "unordered",
-        }
-    }
-}
+use crate::txn::command::TimeoutOutcome;
 
 /// One open interactive transaction held by this node.
 #[derive(Debug, Clone)]
 pub struct TransactionSnapshot {
-    /// The transaction's handle, rendered as the client carries it.
+    /// The transaction's ID, rendered as the client carries it.
     pub transaction: String,
-    /// Statement-ordering mode chosen at `BEGIN`.
-    pub ordering: TxnOrdering,
+    /// What ends it when it stays idle past the idle timeout.
+    pub timeout_outcome: TimeoutOutcome,
     /// Milliseconds since the transaction was begun.
     pub age_ms: u64,
-    /// Milliseconds until the idle reaper auto-aborts this transaction, measured
-    /// from its last activity. `Some(0)` means it is due for reaping now; `None`
-    /// while a command runs on it, which the reaper never interrupts. The model
-    /// has no auto-commit: an abandoned transaction is rolled back, never
-    /// committed, because uncommitted state is not durable.
-    pub auto_abort_in_ms: Option<u64>,
+    /// Milliseconds until the idle reaper ends this transaction with its
+    /// timeout outcome, measured from its last activity. `Some(0)` means it
+    /// is due now; `None` while a command runs on it, which the reaper never
+    /// interrupts.
+    pub expires_in_ms: Option<u64>,
 }
 
 /// One live client session (connection) on this node.

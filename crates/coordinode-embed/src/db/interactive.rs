@@ -5,27 +5,30 @@
 //! client used: a command for it carries the [`TransactionId`] the client
 //! drew and the [`ActingContext`] it acts for, whatever path it took, and a
 //! connection closing leaves it open. Commands for one transaction run one
-//! at a time in the order the leader admits them, or by statement nonce for
-//! an ordered one; those waiting for their turn sit in a bounded queue, so a
-//! command arriving while another runs waits instead of being refused. A
-//! statement repeated under an admitted nonce is never applied twice. When
-//! the member stops leading, its open transactions are dropped: nothing of
-//! them was submitted, nothing a command still running does can bring one
-//! back, and a command for one is told no such transaction is known, as the
-//! new leader tells it.
+//! at a time, in the order they reach the leader; those waiting for their
+//! turn sit in a bounded queue, so a command arriving while another runs
+//! waits instead of being refused. There is no per-statement number: a
+//! stream keeps a transaction's commands in the order its client sent them,
+//! and a statement is never run twice, so one whose stream was lost while it
+//! ran aborts its transaction. When the member stops leading, its open
+//! transactions are dropped: nothing of them was submitted, nothing a
+//! command still running does can bring one back, and a command for one is
+//! told no such transaction is known, as the new leader tells it.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use coordinode_core::operations::{TransactionSnapshot, TransactionsView, TxnOrdering};
-use coordinode_core::txn::command::{ActingContext, AdmissionSignal, TransactionId};
+use coordinode_core::operations::{TransactionSnapshot, TransactionsView};
+use coordinode_core::txn::command::{
+    ActingContext, AdmissionSignal, ExpectedVersion, TimeoutOutcome, TransactionId,
+};
 use coordinode_core::txn::read_concern::ReadConcernLevel;
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_storage::engine::transaction::TransactionState;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use super::{Database, DatabaseError, QuerySession, Row, StatementOptions, TxnMode};
-use crate::operation::IntentDigest;
+use crate::operation::{IntentDigest, OperationDescriptor};
 
 /// IDs of transactions that ended on this leader before their commit, kept
 /// so a command for one is told it was aborted rather than that nothing is
@@ -34,45 +37,54 @@ const ENDED_REMEMBERED: usize = 4096;
 
 /// Commands one transaction holds waiting for their turn. A client
 /// pipelining past it is refused until earlier commands answer.
-const MAILBOX: usize = 64;
+const MAILBOX: u64 = 64;
 
-/// Admitted statement nonces a transaction remembers with their intent, to
-/// tell a retransmission from a reused nonce. An ordered transaction refuses
-/// any nonce below its next one even past this window.
-const ADMITTED_REMEMBERED: usize = 1024;
-
-/// How long an ordered transaction waits for a missing statement before it
-/// is aborted, when its BEGIN named no bound.
-pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Why an open transaction ended on its leader before it was submitted.
-/// Nothing of it was applied in any of these cases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why an open transaction ended on its leader other than by a commit the
+/// client asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransactionEnd {
     /// One of its statements failed, which aborts the transaction.
     StatementFailed,
-    /// An ordered transaction waited past its drain timeout for a missing
-    /// statement.
-    DrainTimedOut,
-    /// It stayed idle past the idle timeout.
+    /// It stayed idle past the idle timeout and was rolled back.
     IdleExpired,
+    /// It stayed idle past the idle timeout and its timeout outcome
+    /// committed it.
+    IdleCommitted,
+    /// It stayed idle past the idle timeout and the commit its timeout
+    /// outcome made was refused; nothing of it was applied.
+    IdleCommitRefused,
+    /// It stayed idle past the idle timeout and the commit its timeout
+    /// outcome made failed without proving whether it applied; its
+    /// operation resolves how it stands.
+    IdleCommitUnknown,
     /// It was rolled back.
+    #[default]
     RolledBack,
+    /// The stream one of its statements ran on was lost before the answer
+    /// reached the client, which cannot know what the statement did.
+    StreamLost,
 }
 
 impl core::fmt::Display for TransactionEnd {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::StatementFailed => "one of its statements failed",
-            Self::DrainTimedOut => "a statement it waited for did not arrive in time",
             Self::IdleExpired => "it stayed idle past the idle timeout",
+            Self::IdleCommitted => "it was committed when it stayed idle past the idle timeout",
+            Self::IdleCommitRefused => {
+                "its commit when it stayed idle past the idle timeout was refused"
+            }
+            Self::IdleCommitUnknown => {
+                "its commit when it stayed idle past the idle timeout has an unknown outcome"
+            }
             Self::RolledBack => "it was rolled back",
+            Self::StreamLost => "the stream one of its statements ran on was lost",
         })
     }
 }
 
 /// What a transaction is opened with and keeps until it ends.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TransactionOptions {
     /// Who the transaction acts for; every later command must act for the
     /// same. `None` is the embedding host's own trusted access.
@@ -81,38 +93,30 @@ pub struct TransactionOptions {
     pub read_concern: Option<ReadConcernLevel>,
     /// The write concern of the commit; the database's when `None`.
     pub write_concern: Option<WriteConcern>,
-    /// How its statements are ordered.
-    pub ordering: TxnOrdering,
-    /// How long an ordered transaction waits for a missing statement before
-    /// it is aborted; the database's setting
-    /// ([`Database::set_interactive_drain_timeout`]) when `None`.
-    pub drain_timeout: Option<Duration>,
+    /// What ends it when it stays idle past the idle timeout; the
+    /// database's setting ([`Database::set_interactive_timeout_outcome`])
+    /// when `None`.
+    pub timeout_outcome: Option<TimeoutOutcome>,
+    /// The client operation its commit carries out. Required when it
+    /// commits at idle expiry, so that its client can resolve that commit.
+    pub operation: Option<OperationDescriptor>,
 }
 
 impl TransactionOptions {
-    /// The host's trusted access with the database's concerns, statements
-    /// applied as they come.
+    /// The host's trusted access with the database's settings.
     pub fn trusted() -> Self {
-        Self {
-            actor: None,
-            read_concern: None,
-            write_concern: None,
-            ordering: TxnOrdering::Unordered,
-            drain_timeout: None,
-        }
+        Self::default()
     }
 }
 
 /// What a commit carries besides the transaction ID.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CommitOptions<'a> {
-    /// The client operation the commit carries out.
-    pub operation: Option<&'a crate::operation::OperationDescriptor>,
+    /// The client operation the commit carries out; the one the transaction
+    /// was started under when `None`.
+    pub operation: Option<&'a OperationDescriptor>,
     /// Who the commit acts for; the host's trusted access when `None`.
     pub actor: Option<&'a ActingContext>,
-    /// The last nonce of an ordered transaction's chain: the commit waits,
-    /// within the drain timeout, until every statement up to it has run.
-    pub last_nonce: Option<u64>,
     /// Told when the commit has its place behind the commands admitted
     /// before it.
     pub admission: Option<&'a AdmissionSignal>,
@@ -122,23 +126,18 @@ pub struct CommitOptions<'a> {
     pub expect: &'a [ExpectedVersion],
 }
 
-/// A node and the version a caller believes it is at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExpectedVersion {
-    /// The node.
-    pub node: coordinode_core::graph::node::NodeId,
-    /// The version read earlier; `None` requires the node not to exist.
-    pub version: Option<u64>,
-}
-
 /// What a rollback carries besides the transaction ID.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RollbackOptions<'a> {
     /// Who the rollback acts for; the host's trusted access when `None`.
     pub actor: Option<&'a ActingContext>,
-    /// Told when the rollback has its place behind the command running on
-    /// the transaction.
+    /// Told when the rollback has its place behind the commands admitted
+    /// before it.
     pub admission: Option<&'a AdmissionSignal>,
+    /// Why the transaction ends: [`TransactionEnd::RolledBack`] for a
+    /// rollback the client asked for, [`TransactionEnd::StreamLost`] for one
+    /// its ingress makes after losing the stream a statement ran on.
+    pub end: TransactionEnd,
 }
 
 /// One open transaction.
@@ -153,17 +152,22 @@ struct Context {
     actor: ActingContext,
     read_concern: ReadConcernLevel,
     write_concern: WriteConcern,
-    ordering: TxnOrdering,
-    drain: Duration,
-    /// The nonce an ordered transaction runs next, from 1.
-    next_nonce: u64,
-    /// Nonces admitted so far with their statements' intent, newest last.
-    admitted: VecDeque<(u64, IntentDigest)>,
-    /// Commands waiting for their turn.
-    waiting: usize,
-    /// A commit waits for its chain to complete; the idle sweep leaves the
-    /// transaction to the commit's own drain timeout.
-    draining: bool,
+    timeout_outcome: TimeoutOutcome,
+    operation: Option<OperationDescriptor>,
+    /// The turn handed to the next command that arrives.
+    next_turn: u64,
+    /// The turn that runs now, or runs next once the context is back.
+    serving: u64,
+    /// Its timeout outcome is committing it; it ends once the commit's
+    /// result is known.
+    committing: bool,
+}
+
+impl Context {
+    /// Commands that arrived and have not finished, the running one included.
+    fn pending(&self) -> u64 {
+        self.next_turn - self.serving
+    }
 }
 
 /// The member's leadership tenure. `term` 0 means none: the member does not
@@ -178,26 +182,15 @@ struct Tenure {
 /// The open transactions of a database, on the leader that holds them.
 pub(crate) struct Registry {
     contexts: Mutex<HashMap<TransactionId, Context>>,
-    /// Woken whenever a context is returned, advanced or ended: the commands
-    /// waiting for their turn look again.
+    /// Woken whenever a context is returned or ended: the commands waiting
+    /// for their turn look again.
     turn: Condvar,
     tenure: Mutex<Tenure>,
     ended: Mutex<VecDeque<(TransactionId, TransactionEnd)>>,
     /// The idle timeout, for the countdown a snapshot reports.
     idle_timeout: Mutex<Duration>,
-    /// The drain timeout of a transaction whose BEGIN names none.
-    drain_timeout: Mutex<Duration>,
-}
-
-/// What a transaction's commit or rollback waits for before it takes the
-/// context.
-#[derive(Debug, Clone, Copy)]
-enum Settle {
-    /// Every statement admitted so far, and an ordered chain up to its last
-    /// nonce.
-    Commit { last_nonce: Option<u64> },
-    /// Only the command running on it.
-    Rollback,
+    /// The timeout outcome of a transaction whose start names none.
+    timeout_outcome: Mutex<TimeoutOutcome>,
 }
 
 impl Registry {
@@ -214,7 +207,7 @@ impl Registry {
             }),
             ended: Mutex::new(VecDeque::new()),
             idle_timeout: Mutex::new(idle_timeout),
-            drain_timeout: Mutex::new(DEFAULT_DRAIN_TIMEOUT),
+            timeout_outcome: Mutex::new(TimeoutOutcome::default()),
         }
     }
 
@@ -269,6 +262,12 @@ impl Registry {
     /// The refusal for `id`, which names no context a command may use.
     fn missing(&self, id: &TransactionId) -> DatabaseError {
         match self.ended_with(id) {
+            Some(TransactionEnd::IdleCommitted) => {
+                DatabaseError::TransactionCommittedOnTimeout(*id)
+            }
+            Some(TransactionEnd::IdleCommitUnknown) => {
+                DatabaseError::TransactionOutcomeUnknown(*id)
+            }
             Some(end) => DatabaseError::TransactionAborted { id: *id, end },
             None => DatabaseError::UnknownTransaction(*id),
         }
@@ -294,24 +293,20 @@ impl Registry {
         self.end_locked(&mut contexts, id, end);
     }
 
-    /// Take `id`'s context for one statement acting for `actor`, once it is
-    /// the statement's turn: the running command has answered and, in an
-    /// ordered transaction, every earlier nonce has run. A context of another
-    /// actor is refused as if it did not exist: an ID grants nothing by
-    /// itself. A statement repeating an admitted nonce is refused rather than
-    /// applied again.
-    fn check_out(
-        &self,
+    /// Wait for the turn of a command for `id` acting for `actor`, in the
+    /// order commands reach the context: the command is handed the next
+    /// turn and runs once every command before it has finished. A context of
+    /// another actor is refused as if it did not exist: an ID grants nothing
+    /// by itself. Returns with the context lock held and the command's turn
+    /// due.
+    fn await_turn<'a>(
+        &'a self,
         id: &TransactionId,
         actor: &ActingContext,
-        nonce: Option<u64>,
-        intent: &IntentDigest,
         admission: Option<&AdmissionSignal>,
-    ) -> Result<CheckedOut, DatabaseError> {
-        let nonce = nonce.filter(|n| *n != 0);
+    ) -> Result<MutexGuard<'a, HashMap<TransactionId, Context>>, DatabaseError> {
         let mut contexts = self.contexts.lock();
-        let mut gap_deadline: Option<Instant> = None;
-        loop {
+        let turn = {
             let Some(context) = contexts
                 .get_mut(id)
                 .filter(|context| context.actor == *actor)
@@ -319,84 +314,60 @@ impl Registry {
                 drop(contexts);
                 return Err(self.missing(id));
             };
-            let ordered = context.ordering == TxnOrdering::Ordered;
-            if let Some(n) = nonce {
-                if let Some((_, admitted)) = context.admitted.iter().find(|(m, _)| *m == n) {
-                    return Err(if admitted == intent {
-                        DatabaseError::StatementAlreadyAdmitted { id: *id, nonce: n }
-                    } else {
-                        DatabaseError::StatementNonceReused { id: *id, nonce: n }
-                    });
-                }
-                if ordered && n < context.next_nonce {
-                    // Admitted before the remembered window.
-                    return Err(DatabaseError::StatementAlreadyAdmitted { id: *id, nonce: n });
-                }
-            } else if ordered {
-                return Err(DatabaseError::StatementNonceRequired(*id));
-            }
-            let turn = !ordered || nonce == Some(context.next_nonce);
-            if let Some(state) = context.state.take_if(|_| turn) {
-                if ordered {
-                    context.next_nonce += 1;
-                }
-                if let Some(n) = nonce {
-                    if context.admitted.len() == ADMITTED_REMEMBERED {
-                        context.admitted.pop_front();
-                    }
-                    context.admitted.push_back((n, *intent));
-                }
-                context.touched = Instant::now();
-                if let Some(admission) = admission {
-                    admission.admitted();
-                }
-                return Ok(CheckedOut {
-                    state,
-                    chain: context.chain,
-                    read_concern: context.read_concern,
-                    write_concern: context.write_concern,
-                });
-            }
-            if context.waiting >= MAILBOX {
+            if context.pending() > MAILBOX {
                 return Err(DatabaseError::TransactionBusy(*id));
             }
-            // Idle but not this statement's turn: an earlier nonce has not
-            // arrived. That wait is bounded by the drain timeout; a wait for
-            // a running command is bounded by that command's own budget.
-            let gap = context.state.is_some();
-            let drain = context.drain;
-            context.waiting += 1;
-            // Queued: the commands after it may follow.
-            if let Some(admission) = admission {
-                admission.admitted();
-            }
-            let timed_out = if gap {
-                let deadline = *gap_deadline.get_or_insert_with(|| Instant::now() + drain);
-                self.turn.wait_until(&mut contexts, deadline).timed_out()
-            } else {
-                self.turn.wait(&mut contexts);
-                false
-            };
-            let still_gap = match contexts.get_mut(id) {
-                Some(context) => {
-                    context.waiting -= 1;
-                    context.state.is_some() && nonce != Some(context.next_nonce)
+            let turn = context.next_turn;
+            context.next_turn += 1;
+            turn
+        };
+        // It has its place: the commands after it may follow.
+        if let Some(admission) = admission {
+            admission.admitted();
+        }
+        loop {
+            match contexts.get(id) {
+                Some(context) if context.serving == turn && context.state.is_some() => {
+                    return Ok(contexts);
                 }
-                None => false,
-            };
-            if timed_out && still_gap {
-                self.end_locked(&mut contexts, id, TransactionEnd::DrainTimedOut);
-                return Err(DatabaseError::TransactionAborted {
-                    id: *id,
-                    end: TransactionEnd::DrainTimedOut,
-                });
+                Some(_) => self.turn.wait(&mut contexts),
+                None => {
+                    drop(contexts);
+                    return Err(self.missing(id));
+                }
             }
         }
     }
 
-    /// Put a context back after its statement, with the statements it has
-    /// run now. Refused once it has ended, with its tenure or otherwise: the
-    /// statement finished, but the transaction cannot continue.
+    /// Take `id`'s context for one command acting for `actor`, once it is
+    /// the command's turn.
+    fn check_out(
+        &self,
+        id: &TransactionId,
+        actor: &ActingContext,
+        admission: Option<&AdmissionSignal>,
+    ) -> Result<CheckedOut, DatabaseError> {
+        let mut contexts = self.await_turn(id, actor, admission)?;
+        let context = contexts
+            .get_mut(id)
+            .ok_or_else(|| DatabaseError::Other("transaction context vanished".into()))?;
+        let state = context
+            .state
+            .take()
+            .ok_or_else(|| DatabaseError::Other("transaction context is in use".into()))?;
+        context.touched = Instant::now();
+        Ok(CheckedOut {
+            state,
+            chain: context.chain,
+            read_concern: context.read_concern,
+            write_concern: context.write_concern,
+        })
+    }
+
+    /// Put a context back after its command, with the statements it has
+    /// run now, and pass the turn on. Refused once it has ended, with its
+    /// tenure or otherwise: the command finished, but the transaction cannot
+    /// continue.
     fn check_in(
         &self,
         id: &TransactionId,
@@ -410,85 +381,53 @@ impl Registry {
         };
         context.state = Some(state);
         context.chain = chain;
+        context.serving += 1;
         context.touched = Instant::now();
         drop(contexts);
         self.turn.notify_all();
         Ok(())
     }
 
-    /// Remove `id`'s context for `actor` to finish it, once what `settle`
-    /// waits for has run. `None` when no context of `actor` is held under it.
+    /// Remove `id`'s context for `actor` to finish it, once every command
+    /// that reached it before has finished. A rollback records why the
+    /// transaction ended. `None` when no context of `actor` is held under
+    /// it.
     fn take(
         &self,
         id: &TransactionId,
         actor: &ActingContext,
-        settle: Settle,
+        rollback: Option<TransactionEnd>,
         admission: Option<&AdmissionSignal>,
     ) -> Result<Option<Finished>, DatabaseError> {
-        let mut contexts = self.contexts.lock();
-        let mut deadline: Option<Instant> = None;
-        loop {
-            let Some(context) = contexts.get(id).filter(|context| context.actor == *actor) else {
+        let mut contexts = match self.await_turn(id, actor, admission) {
+            Ok(contexts) => contexts,
+            Err(
+                DatabaseError::UnknownTransaction(_) | DatabaseError::TransactionAborted { .. },
+            ) => {
                 return Ok(None);
-            };
-            // Whether it takes the context now or waits for it, nothing
-            // sent after it can get ahead.
-            if let Some(admission) = admission {
-                admission.admitted();
             }
-            let settled = context.state.is_some()
-                && match settle {
-                    Settle::Rollback => true,
-                    Settle::Commit { last_nonce } => {
-                        context.waiting == 0
-                            && match (context.ordering, last_nonce) {
-                                (TxnOrdering::Ordered, Some(last)) => context.next_nonce > last,
-                                _ => true,
-                            }
-                    }
-                };
-            if settled {
-                let context = contexts
-                    .remove(id)
-                    .ok_or_else(|| DatabaseError::Other("transaction context vanished".into()))?;
-                if matches!(settle, Settle::Rollback) {
-                    remember_end(&mut self.ended.lock(), *id, TransactionEnd::RolledBack);
-                }
-                drop(contexts);
-                self.turn.notify_all();
-                return Ok(Some(Finished {
-                    state: context.state.ok_or_else(|| {
-                        DatabaseError::Other("transaction context vanished".into())
-                    })?,
-                    chain: context.chain,
-                    write_concern: context.write_concern,
-                }));
-            }
-            let at = *deadline.get_or_insert_with(|| Instant::now() + context.drain);
-            if let Some(context) = contexts.get_mut(id) {
-                context.draining = true;
-            }
-            let timed_out = self.turn.wait_until(&mut contexts, at).timed_out();
-            if let Some(context) = contexts.get_mut(id) {
-                context.draining = false;
-            }
-            if timed_out {
-                let Some(context) = contexts.get(id) else {
-                    return Ok(None);
-                };
-                if context.state.is_none() {
-                    // A statement still runs past the drain timeout: the
-                    // transaction stays as it is, and the caller tries again.
-                    return Err(DatabaseError::TransactionBusy(*id));
-                }
-                // Idle, yet the chain it must drain is incomplete.
-                self.end_locked(&mut contexts, id, TransactionEnd::DrainTimedOut);
-                return Err(DatabaseError::TransactionAborted {
-                    id: *id,
-                    end: TransactionEnd::DrainTimedOut,
-                });
-            }
+            Err(
+                DatabaseError::TransactionCommittedOnTimeout(_)
+                | DatabaseError::TransactionOutcomeUnknown(_),
+            ) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        let context = contexts
+            .remove(id)
+            .ok_or_else(|| DatabaseError::Other("transaction context vanished".into()))?;
+        if let Some(end) = rollback {
+            remember_end(&mut self.ended.lock(), *id, end);
         }
+        drop(contexts);
+        self.turn.notify_all();
+        Ok(Some(Finished {
+            state: context
+                .state
+                .ok_or_else(|| DatabaseError::Other("transaction context vanished".into()))?,
+            chain: context.chain,
+            write_concern: context.write_concern,
+            operation: context.operation,
+        }))
     }
 }
 
@@ -501,10 +440,10 @@ impl TransactionsView for Registry {
             .values()
             .map(|context| TransactionSnapshot {
                 transaction: context.id.to_string(),
-                ordering: context.ordering,
+                timeout_outcome: context.timeout_outcome,
                 age_ms: now.duration_since(context.begun).as_millis() as u64,
                 // A context a command runs on is never reaped.
-                auto_abort_in_ms: context.state.as_ref().map(|_| {
+                expires_in_ms: context.state.as_ref().map(|_| {
                     let idle = now.duration_since(context.touched);
                     timeout.checked_sub(idle).unwrap_or_default().as_millis() as u64
                 }),
@@ -526,12 +465,41 @@ fn remember_end(
     ended.push_back((id, end));
 }
 
+/// How a commit made at idle expiry ended, read from its result. Success is
+/// only a candidate for committed: the caller confirms it against the
+/// operation's record, since an early acknowledgement precedes apply. A refusal
+/// counts as applying nothing only when its source proves it: validation,
+/// constraint and admission refusals are decided before the proposal is
+/// handed over, and the pipeline reports a member that does not lead only
+/// when no attempt reached the log (a refused retry after an attempt that
+/// did is reported as a timeout). Any other failure, a lost leadership or a
+/// storage error after the hand-over included, proves nothing; nor does a
+/// settled operation, whose record rather than this attempt says whether it
+/// took effect. Those are unknown, for the operation to resolve.
+fn idle_commit_end(
+    result: &Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError>,
+) -> TransactionEnd {
+    match result {
+        Ok(_) => TransactionEnd::IdleCommitted,
+        Err(
+            DatabaseError::TransactionConflict { .. }
+            | DatabaseError::InvariantRefused { .. }
+            | DatabaseError::RevisionMismatch { .. }
+            | DatabaseError::WriteBackpressure
+            | DatabaseError::NotLeader { .. }
+            | DatabaseError::Mismatched(_)
+            | DatabaseError::Execution(_),
+        ) => TransactionEnd::IdleCommitRefused,
+        Err(_) => TransactionEnd::IdleCommitUnknown,
+    }
+}
+
 /// A new transaction ID: a random UUID (version 4), as any client draws one.
 pub fn draw_transaction_id() -> TransactionId {
     TransactionId::from_raw(*uuid::Uuid::new_v4().as_bytes())
 }
 
-/// A context taken for one statement.
+/// A context taken for one command.
 struct CheckedOut {
     state: TransactionState,
     chain: IntentDigest,
@@ -544,6 +512,7 @@ struct Finished {
     state: TransactionState,
     chain: IntentDigest,
     write_concern: WriteConcern,
+    operation: Option<OperationDescriptor>,
 }
 
 /// The host's own access: an embedding host is its own trust boundary.
@@ -562,11 +531,11 @@ impl Database {
         self.interactive.set_tenure(owner, leader, term);
     }
 
-    /// How long an ordered transaction waits for a missing statement before
-    /// it is aborted, when its BEGIN names no bound ([`DEFAULT_DRAIN_TIMEOUT`]
-    /// until set). Applies to transactions begun from now on.
-    pub fn set_interactive_drain_timeout(&self, timeout: Duration) {
-        *self.interactive.drain_timeout.lock() = timeout;
+    /// What ends a transaction that stays idle past the idle timeout, when
+    /// its start names nothing ([`TimeoutOutcome::Rollback`] until set).
+    /// Applies to transactions begun from now on.
+    pub fn set_interactive_timeout_outcome(&self, outcome: TimeoutOutcome) {
+        *self.interactive.timeout_outcome.lock() = outcome;
     }
 
     /// The open transactions this database holds, for introspection.
@@ -575,15 +544,15 @@ impl Database {
     }
 
     /// Begin an interactive multi-statement transaction with the database's
-    /// concerns, acting for the host, under a newly drawn ID.
+    /// settings, acting for the host, under a newly drawn ID.
     ///
     /// Pass the returned ID to [`Self::execute_in_transaction`] for each
     /// statement, then [`Self::commit_transaction`] or
     /// [`Self::rollback_transaction`]. Every statement reads the snapshot
     /// pinned here (repeatable read). The transaction is ephemeral: nothing of
     /// it is durable before the commit, and one left idle longer than the
-    /// configured timeout ([`Self::set_interactive_idle_timeout`]) is
-    /// discarded.
+    /// configured timeout ([`Self::set_interactive_idle_timeout`]) ends with
+    /// its timeout outcome.
     ///
     /// # Errors
     ///
@@ -609,8 +578,8 @@ impl Database {
 
     /// Begin an interactive transaction under `id`, the random UUID a client
     /// drew for it, with `options`, which it keeps until it ends: who it acts
-    /// for, its concerns and how its statements are ordered. Later commands
-    /// must act for the same caller.
+    /// for, its concerns, its timeout outcome and its operation. Later
+    /// commands must act for the same caller.
     ///
     /// # Errors
     ///
@@ -618,11 +587,19 @@ impl Database {
     /// it does not lead its group. [`DatabaseError::TransactionIdInUse`]
     /// when a transaction is open under `id`, or ended under it recently: an
     /// ID names one transaction, and a start is never joined to another.
+    /// [`DatabaseError::OperationRequired`] when the transaction commits at
+    /// idle expiry and names no operation.
     pub fn begin_transaction_as(
         &self,
         id: TransactionId,
         options: &TransactionOptions,
     ) -> Result<(), DatabaseError> {
+        let timeout_outcome = options
+            .timeout_outcome
+            .unwrap_or_else(|| *self.interactive.timeout_outcome.lock());
+        if timeout_outcome == TimeoutOutcome::Commit && options.operation.is_none() {
+            return Err(DatabaseError::OperationRequired(id));
+        }
         self.reap_idle_transactions(self.interactive_idle_timeout);
         let tenure = self.interactive.current()?;
         let read_concern = options.read_concern.unwrap_or(self.read_concern);
@@ -657,14 +634,11 @@ impl Database {
             actor: host_actor(options.actor.as_ref()),
             read_concern,
             write_concern: options.write_concern.unwrap_or(self.write_concern),
-            ordering: options.ordering,
-            drain: options
-                .drain_timeout
-                .unwrap_or_else(|| *self.interactive.drain_timeout.lock()),
-            next_nonce: 1,
-            admitted: VecDeque::new(),
-            waiting: 0,
-            draining: false,
+            timeout_outcome,
+            operation: options.operation,
+            next_turn: 0,
+            serving: 0,
+            committing: false,
         };
         {
             // Under the tenure lock: a context of a tenure that just ended is
@@ -709,16 +683,16 @@ impl Database {
         self.execute_in_transaction_with(id, query, params, &StatementOptions::default())
     }
 
-    /// [`Self::execute_in_transaction`] with the vector settings, budget,
-    /// caller and nonce of `options`. Its read and write concerns are the
+    /// [`Self::execute_in_transaction`] with the vector settings, budget and
+    /// caller of `options`. Its read and write concerns are the
     /// transaction's, fixed when it began, so those fields of `options` are
     /// not read here.
     ///
     /// # Errors
     ///
-    /// The ID names no open transaction of this caller, or one that ended; the queue of waiting commands is full; the nonce was admitted
-    /// already, or is missing in an ordered transaction; or the statement
-    /// failed, which ends the transaction.
+    /// The ID names no open transaction of this caller, or one that ended;
+    /// the queue of waiting commands is full; or the statement failed, which
+    /// ends the transaction.
     pub fn execute_in_transaction_with(
         &self,
         id: TransactionId,
@@ -729,13 +703,9 @@ impl Database {
         let actor = host_actor(options.actor.as_ref());
         let params = params.filter(|p| !p.is_empty());
         let intent = crate::operation::statement_intent(query, params.as_ref());
-        let checked = self.interactive.check_out(
-            &id,
-            &actor,
-            options.nonce,
-            &intent,
-            options.admission.as_ref(),
-        )?;
+        let checked = self
+            .interactive
+            .check_out(&id, &actor, options.admission.as_ref())?;
         let failed = |e: DatabaseError| {
             self.interactive.end(&id, TransactionEnd::StatementFailed);
             e
@@ -812,7 +782,7 @@ impl Database {
     pub fn commit_transaction_as(
         &self,
         id: TransactionId,
-        operation: &crate::operation::OperationDescriptor,
+        operation: &OperationDescriptor,
     ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
         self.commit_transaction_with(
             id,
@@ -823,28 +793,36 @@ impl Database {
         )
     }
 
-    /// Commit `id`'s transaction as `options` say: once every statement
-    /// admitted to it has run (an ordered chain up to its last nonce, within
-    /// the drain timeout), acting for its caller and carrying out its
-    /// operation when given.
+    /// Commit `id`'s transaction as `options` say: once every command that
+    /// reached it before has run, acting for its caller and carrying out its
+    /// operation, or the one it was started under.
     ///
     /// # Errors
     ///
-    /// As [`Self::commit_transaction_as`]; the chain did not complete within
-    /// the drain timeout, which aborts the transaction; or a statement still
-    /// runs past it, which leaves it open.
+    /// As [`Self::commit_transaction_as`];
+    /// [`DatabaseError::OperationDiffers`] when `options` names another
+    /// operation than the start did, which leaves the transaction open.
     pub fn commit_transaction_with(
         &self,
         id: TransactionId,
         options: &CommitOptions<'_>,
     ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
         let actor = host_actor(options.actor);
-        let settle = Settle::Commit {
-            last_nonce: options.last_nonce,
-        };
+        if let Some(named) = options.operation {
+            let started = self
+                .interactive
+                .contexts
+                .lock()
+                .get(&id)
+                .filter(|context| context.actor == actor)
+                .and_then(|context| context.operation);
+            if started.is_some_and(|started| started != *named) {
+                return Err(DatabaseError::OperationDiffers(id));
+            }
+        }
         let Some(finished) = self
             .interactive
-            .take(&id, &actor, settle, options.admission)?
+            .take(&id, &actor, None, options.admission)?
         else {
             // A commit repeated after its reply was lost: the context is gone
             // with the attempt, and the operation's outcome is the answer.
@@ -860,20 +838,22 @@ impl Database {
             }
             return Err(self.interactive.missing(&id));
         };
-        self.commit_finished(id, finished, options.operation, options.expect)
+        let operation = options.operation.copied().or(finished.operation);
+        self.commit_finished(id, finished, operation.as_ref(), options.expect)
     }
 
     fn commit_finished(
         &self,
         id: TransactionId,
         finished: Finished,
-        operation: Option<&crate::operation::OperationDescriptor>,
+        operation: Option<&OperationDescriptor>,
         expect: &[ExpectedVersion],
     ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
         let Finished {
             mut state,
             chain,
             write_concern,
+            operation: _,
         } = finished;
         for expected in expect {
             let key = coordinode_core::graph::node::encode_node_key(self.shard_id, expected.node);
@@ -1026,19 +1006,19 @@ impl Database {
 
     /// Roll back an interactive transaction acting for the host: discard all
     /// buffered writes and the OCC read-set. No proposal is emitted (nothing
-    /// was durable). A statement running on it finishes first; statements
-    /// still waiting for their turn are refused as aborted.
+    /// was durable). It takes its turn behind the commands that reached the
+    /// transaction before it.
     ///
     /// # Errors
     ///
-    /// The ID names no open transaction, or a statement still runs on it
-    /// past the drain timeout.
+    /// The ID names no open transaction.
     pub fn rollback_transaction(&self, id: TransactionId) -> Result<(), DatabaseError> {
         self.rollback_transaction_with(id, &RollbackOptions::default())
     }
 
     /// [`Self::rollback_transaction`] as `options` say: acting for its caller
-    /// (the host's trusted access when `None`).
+    /// (the host's trusted access when `None`), and recording why the
+    /// transaction ended.
     ///
     /// # Errors
     ///
@@ -1051,7 +1031,7 @@ impl Database {
         match self.interactive.take(
             &id,
             &host_actor(options.actor),
-            Settle::Rollback,
+            Some(options.end),
             options.admission,
         )? {
             Some(_) => Ok(()),
@@ -1081,14 +1061,10 @@ impl Database {
         expected: Option<u64>,
     ) -> Result<(), DatabaseError> {
         let key = coordinode_core::graph::node::encode_node_key(self.shard_id, node_id);
-        // Not a statement: it takes no nonce and adds nothing to the chain.
-        let mut checked = self.interactive.check_out(
-            &id,
-            &ActingContext::Trusted,
-            None,
-            &crate::operation::EMPTY_CHAIN,
-            None,
-        )?;
+        // Not a statement: it adds nothing to the chain.
+        let mut checked = self
+            .interactive
+            .check_out(&id, &ActingContext::Trusted, None)?;
         let stated = checked.state.expect_version(
             coordinode_storage::engine::partition::Partition::Node,
             &key,
@@ -1099,12 +1075,14 @@ impl Database {
         Ok(stated?)
     }
 
-    /// Drop interactive transactions idle longer than `timeout`. An open
-    /// transaction pins an MVCC snapshot and buffers writes in memory, so an
-    /// abandoned one would leak retention and leader memory. A transaction a
-    /// command is running on is never idle. Called opportunistically on
-    /// `begin`; the server's reaper also runs it at the returned instant, so
-    /// reaping does not wait for the next `begin`.
+    /// End interactive transactions idle longer than `timeout` with their
+    /// timeout outcome: roll them back, or commit those that commit at
+    /// expiry, under the operation their start named. An open transaction
+    /// pins an MVCC snapshot and buffers writes in memory, so an abandoned
+    /// one would leak retention and leader memory. A transaction a command
+    /// runs on, or has commands waiting, is never idle. Called
+    /// opportunistically on `begin`; the server's reaper also runs it at the
+    /// returned instant, so expiry does not wait for the next `begin`.
     ///
     /// Returns when the earliest transaction still open becomes idle for
     /// `timeout`, or `None` when none is open.
@@ -1112,28 +1090,78 @@ impl Database {
         let now = Instant::now();
         let registry = &self.interactive;
         let mut contexts = registry.contexts.lock();
-        let mut reaped = false;
-        contexts.retain(|_, context| {
-            let keep = context.state.is_none()
-                || context.draining
-                || now.duration_since(context.touched) < timeout;
-            if !keep {
-                remember_end(
-                    &mut registry.ended.lock(),
-                    context.id,
-                    TransactionEnd::IdleExpired,
-                );
-                reaped = true;
+        let expired: Vec<TransactionId> = contexts
+            .values()
+            .filter(|context| {
+                context.state.is_some()
+                    && context.pending() == 0
+                    && now.duration_since(context.touched) >= timeout
+            })
+            .map(|context| context.id)
+            .collect();
+        let mut commits = Vec::new();
+        for id in &expired {
+            let Some(context) = contexts.get_mut(id) else {
+                continue;
+            };
+            if context.timeout_outcome == TimeoutOutcome::Rollback {
+                registry.end_locked(&mut contexts, id, TransactionEnd::IdleExpired);
+                continue;
             }
-            keep
-        });
+            // The commit takes the context's turn and keeps it in the
+            // registry until its result is known: a command arriving
+            // meanwhile waits behind it and is then told how it ended, never
+            // that it committed before it did.
+            let Some(state) = context.state.take() else {
+                continue;
+            };
+            context.next_turn += 1;
+            context.committing = true;
+            commits.push((
+                *id,
+                Finished {
+                    state,
+                    chain: context.chain,
+                    write_concern: context.write_concern,
+                    operation: context.operation,
+                },
+            ));
+        }
         let next = contexts
             .values()
+            .filter(|context| !context.committing)
             .map(|context| context.touched + timeout)
             .min();
         drop(contexts);
-        if reaped {
-            registry.turn.notify_all();
+        // Outside the registry's lock: a commit waits on consensus.
+        for (id, finished) in commits {
+            let operation = finished.operation;
+            let result = self.commit_finished(id, finished, operation.as_ref(), &[]);
+            if let Err(e) = &result {
+                tracing::warn!(transaction = %id, error = %e, "commit at idle expiry failed");
+            }
+            let mut end = idle_commit_end(&result);
+            // A successful answer can come before the commit is applied (a
+            // write concern acknowledged at submission or at append). The
+            // operation's record is applied in the commit's own log entry, so
+            // only a committed record here proves the commit took effect.
+            if end == TransactionEnd::IdleCommitted
+                && !operation.as_ref().is_some_and(|op| {
+                    matches!(
+                        self.resolve_operation(op, crate::operation::Resolve::Lookup),
+                        Ok(crate::operation::OperationOutcome::Committed { .. })
+                    )
+                })
+            {
+                end = TransactionEnd::IdleCommitUnknown;
+            }
+            // A context dropped with its tenure meanwhile is not recorded:
+            // a command for it is told it is unknown, as a new leader tells
+            // it, and its operation still resolves the commit.
+            let mut contexts = registry.contexts.lock();
+            if contexts.get(&id).is_some_and(|context| context.committing) {
+                registry.end_locked(&mut contexts, &id, end);
+            }
         }
         next
     }

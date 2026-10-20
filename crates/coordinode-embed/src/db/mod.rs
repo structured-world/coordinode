@@ -605,12 +605,6 @@ pub struct StatementOptions {
     /// trusted access. A statement of an open transaction must act for the
     /// caller that began it.
     pub actor: Option<coordinode_core::txn::command::ActingContext>,
-    /// The statement's number within its transaction, kept by a client
-    /// across retransmissions: an ordered transaction applies its
-    /// statements by it, from 1, and in either order a repeat is refused
-    /// instead of applied twice. `None` (or 0) in an unordered transaction
-    /// is a statement without one. Not read outside a transaction.
-    pub nonce: Option<u64>,
     /// Told when a statement of a transaction has its place in the
     /// transaction's order. Not read outside a transaction.
     pub admission: Option<coordinode_core::txn::command::AdmissionSignal>,
@@ -727,32 +721,34 @@ pub enum DatabaseError {
     #[error("transaction {0} has too many commands waiting")]
     TransactionBusy(TransactionId),
 
-    /// A statement with this nonce was already admitted to the transaction:
-    /// it is applied once, and its result is not kept to answer a repeat.
+    /// A transaction that commits when it stays idle needs the client
+    /// operation that commit binds, so that its client can learn the
+    /// outcome; its start named none. Nothing was opened.
     #[error(
-        "statement {nonce} of transaction {id} was already admitted; its result is not retained"
+        "transaction {0} commits at idle expiry and so needs an operation its client can \
+         resolve; none was named"
     )]
-    StatementAlreadyAdmitted {
-        /// The transaction.
-        id: TransactionId,
-        /// The repeated nonce.
-        nonce: u64,
-    },
+    OperationRequired(TransactionId),
 
-    /// The nonce names a statement already admitted with different text or
-    /// parameters. Nothing was done; a new statement takes a new nonce.
-    #[error("nonce {nonce} of transaction {id} names a different statement")]
-    StatementNonceReused {
-        /// The transaction.
-        id: TransactionId,
-        /// The reused nonce.
-        nonce: u64,
-    },
+    /// The commit names another client operation than the one the
+    /// transaction was started under. Nothing was done; the transaction
+    /// stays open.
+    #[error("the commit of transaction {0} names another operation than its start")]
+    OperationDiffers(TransactionId),
 
-    /// A statement of an ordered transaction came without its nonce, which
-    /// numbers the chain from 1. Nothing was done.
-    #[error("a statement of ordered transaction {0} needs a nonce from 1")]
-    StatementNonceRequired(TransactionId),
+    /// The transaction stayed idle past the idle timeout and its timeout
+    /// outcome committed it, under the operation its start named, which
+    /// reports the commit timestamp.
+    #[error("transaction {0} was committed when it stayed idle past the idle timeout")]
+    TransactionCommittedOnTimeout(TransactionId),
+
+    /// The transaction stayed idle past the idle timeout and the commit its
+    /// timeout outcome made failed without proving whether it applied: the
+    /// operation its start named resolves how it stands.
+    #[error(
+        "the commit of transaction {0} at the idle timeout has an unknown outcome; resolve its operation"
+    )]
+    TransactionOutcomeUnknown(TransactionId),
 
     /// The transaction ended before anything of it was submitted, so nothing
     /// of it was applied. Running it again is a new transaction.
@@ -3991,11 +3987,12 @@ mod interactive;
 mod package;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
-pub use coordinode_core::txn::command::{ActingContext, AdmissionSignal, Principal, TransactionId};
+pub use coordinode_core::txn::command::{
+    ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,
+};
 pub use fields::FieldDictionary;
 pub use interactive::{
-    CommitOptions, DEFAULT_DRAIN_TIMEOUT, ExpectedVersion, RollbackOptions, TransactionEnd,
-    TransactionOptions, draw_transaction_id,
+    CommitOptions, RollbackOptions, TransactionEnd, TransactionOptions, draw_transaction_id,
 };
 pub use package::{
     Disposition, EdgeTypeDeclaration, Intent, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,

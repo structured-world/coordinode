@@ -196,7 +196,7 @@ pub(crate) async fn serve(
         default_write_concern: _,
         interactive_txn_idle_timeout_secs,
         interactive_txn_max_bytes,
-        interactive_txn_drain_timeout_ms,
+        interactive_txn_timeout_outcome,
         autocommit_retry_attempts,
         autocommit_retry_backoff_ms,
         operation_admission_window,
@@ -782,9 +782,7 @@ pub(crate) async fn serve(
         let begun = Arc::clone(&interactive_begun);
         db.set_interactive_begun_hook(Arc::new(move || begun.notify_one()));
         db.set_max_interactive_txn_bytes(interactive_txn_max_bytes as usize);
-        db.set_interactive_drain_timeout(std::time::Duration::from_millis(
-            interactive_txn_drain_timeout_ms,
-        ));
+        db.set_interactive_timeout_outcome(interactive_txn_timeout_outcome.into());
         db.set_autocommit_retry(
             autocommit_retry_attempts,
             std::time::Duration::from_millis(autocommit_retry_backoff_ms),
@@ -816,9 +814,9 @@ pub(crate) async fn serve(
         }
     }
 
-    // Idle reaper: roll back interactive transactions left untouched past
-    // the idle timeout, so an abandoned client cannot pin a transaction (and
-    // its snapshot) forever. Asleep while none is open.
+    // Idle reaper: end interactive transactions left untouched past the idle
+    // timeout with their timeout outcome, so an abandoned client cannot pin
+    // a transaction (and its snapshot) forever. Asleep while none is open.
     crate::txn_reaper::spawn(
         Arc::clone(&database),
         std::time::Duration::from_secs(interactive_txn_idle_timeout_secs),

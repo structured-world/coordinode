@@ -21,20 +21,15 @@ fn to_op_maps_execute_with_its_transaction() {
             query: "RETURN 1".to_string(),
             parameters: Default::default(),
             txid: wire,
-            nonce: 3,
             ..Default::default()
         })),
     };
     match to_op(frame.op, &anonymous()) {
         Ok(SessionOp::Execute {
-            query,
-            transaction,
-            nonce,
-            ..
+            query, transaction, ..
         }) => {
             assert_eq!(query, "RETURN 1");
             assert_eq!(transaction, Some(id));
-            assert_eq!(nonce, 3);
         }
         other => panic!("expected Execute op, got {other:?}"),
     }
@@ -90,84 +85,156 @@ fn to_op_refuses_bytes_that_are_not_a_transaction_id() {
     ));
 }
 
+fn reference() -> crate::proto::operation::OperationRef {
+    crate::proto::operation::OperationRef {
+        issuer: vec![7; 16],
+        incarnation: 2,
+        sequence: 5,
+        deployment: vec![8; 16],
+    }
+}
+
+/// A Begin carries its ID and the operation its commit binds; without one it
+/// names none.
 #[test]
-fn to_op_maps_begin_id_and_ordering_with_unspecified_defaulting_to_ordered() {
+fn to_op_maps_begin_id_and_operation() {
     let (id, wire) = drawn();
-    let unordered = ClientFrame {
+    let named = ClientFrame {
         request_id: 1,
         op: Some(client_frame::Op::Begin(Begin {
             txid: wire.clone(),
-            ordering: ProtoOrdering::Unordered as i32,
-            drain_timeout_ms: 50,
+            operation: Some(reference()),
         })),
     };
-    match to_op(unordered.op, &anonymous()) {
+    match to_op(named.op, &anonymous()) {
         Ok(SessionOp::Begin {
             transaction,
-            ordering,
-            drain_timeout_ms,
-        }) => {
-            assert_eq!(transaction, id);
-            assert_eq!(ordering, TxnOrdering::Unordered);
-            assert_eq!(drain_timeout_ms, 50);
-        }
-        other => panic!("expected Begin op, got {other:?}"),
+            operation: Some(descriptor),
+        }) if transaction == id => assert_eq!(
+            crate::services::operation::descriptor_to_proto(&descriptor),
+            reference()
+        ),
+        other => panic!("expected Begin with its operation, got {other:?}"),
     }
-    let unspecified = ClientFrame {
+    let bare = ClientFrame {
         request_id: 1,
         op: Some(client_frame::Op::Begin(Begin {
             txid: wire,
-            ordering: 0,
-            drain_timeout_ms: 0,
+            operation: None,
         })),
     };
     assert!(matches!(
-        to_op(unspecified.op, &anonymous()),
+        to_op(bare.op, &anonymous()),
         Ok(SessionOp::Begin {
-            ordering: TxnOrdering::Ordered,
+            operation: None,
             ..
         })
     ));
 }
 
+/// A Configure names the timeout outcome a session's transactions take;
+/// UNSPECIFIED leaves it as it is, and a value the server does not know is
+/// refused.
+#[test]
+fn configure_maps_the_timeout_outcome() {
+    use coordinode_core::txn::command::TimeoutOutcome;
+
+    let configured = |outcome: i32| {
+        settings_from_proto(&Configure {
+            timeout_outcome: Some(outcome),
+            ..Default::default()
+        })
+    };
+    assert_eq!(
+        configured(ProtoTimeoutOutcome::Commit as i32)
+            .expect("known")
+            .timeout_outcome,
+        Some(TimeoutOutcome::Commit)
+    );
+    assert_eq!(
+        configured(ProtoTimeoutOutcome::Rollback as i32)
+            .expect("known")
+            .timeout_outcome,
+        Some(TimeoutOutcome::Rollback)
+    );
+    assert_eq!(
+        configured(ProtoTimeoutOutcome::Unspecified as i32)
+            .expect("known")
+            .timeout_outcome,
+        None
+    );
+    assert_eq!(
+        configured(99).expect_err("unknown").code(),
+        Code::InvalidArgument
+    );
+    // Reported back as it is in effect.
+    assert_eq!(
+        settings_to_proto(&ConnectionSettings {
+            timeout_outcome: Some(TimeoutOutcome::Commit),
+            ..Default::default()
+        })
+        .timeout_outcome,
+        Some(ProtoTimeoutOutcome::Commit as i32)
+    );
+}
+
 #[test]
 fn to_op_maps_commit_rollback_cancel() {
-    let reference = crate::proto::operation::OperationRef {
-        issuer: vec![7; 16],
-        incarnation: 2,
-        sequence: 5,
-        deployment: vec![8; 16],
-    };
     let (id, wire) = drawn();
     let commit = ClientFrame {
         request_id: 1,
         op: Some(client_frame::Op::Commit(Commit {
             txid: wire.clone(),
-            last_nonce: 9,
-            operation: Some(reference.clone()),
+            operation: Some(reference()),
+            expect: vec![
+                crate::proto::session::ExpectedNodeVersion {
+                    node_id: 4,
+                    version: Some(19),
+                },
+                crate::proto::session::ExpectedNodeVersion {
+                    node_id: 5,
+                    version: None,
+                },
+            ],
         })),
     };
     match to_op(commit.op, &anonymous()) {
         Ok(SessionOp::Commit {
             transaction,
-            last_nonce: 9,
             operation: Some(descriptor),
-        }) if transaction == id => assert_eq!(
-            crate::services::operation::descriptor_to_proto(&descriptor),
-            reference
-        ),
-        other => panic!("a commit keeps its operation, got {other:?}"),
+            expect,
+        }) if transaction == id => {
+            assert_eq!(
+                crate::services::operation::descriptor_to_proto(&descriptor),
+                reference()
+            );
+            assert_eq!(
+                expect,
+                vec![
+                    ExpectedVersion {
+                        node: NodeId::from_raw(4),
+                        version: Some(19),
+                    },
+                    ExpectedVersion {
+                        node: NodeId::from_raw(5),
+                        version: None,
+                    },
+                ],
+                "the conditions cross whole, absence included"
+            );
+        }
+        other => panic!("a commit keeps its operation and conditions, got {other:?}"),
     }
     // A reference without its domain is refused, never committed unbound.
     let stripped = ClientFrame {
         request_id: 1,
         op: Some(client_frame::Op::Commit(Commit {
             txid: wire.clone(),
-            last_nonce: 9,
             operation: Some(crate::proto::operation::OperationRef {
                 deployment: Vec::new(),
-                ..reference
+                ..reference()
             }),
+            expect: Vec::new(),
         })),
     };
     assert_eq!(
