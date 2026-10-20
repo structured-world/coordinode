@@ -74,8 +74,9 @@ pub trait BlobStore {
     fn put_chunk(&self, engine: &StorageEngine, chunk_id: &ChunkId, data: &[u8])
     -> StoreResult<()>;
 
-    /// Persist many chunks in one engine [`WriteBatch`] (data plane).
-    /// Useful when a new blob ref pulls in multiple new chunks.
+    /// Persist many chunks in one durable write (data plane), through
+    /// [`coordinode_storage::blob::put_chunks_durably`]. Useful when a new
+    /// blob ref pulls in multiple new chunks.
     fn put_chunks(&self, engine: &StorageEngine, chunks: &[(ChunkId, Vec<u8>)]) -> StoreResult<()>;
 
     /// Fetch a chunk by content hash (data plane). Returns `None` if not
