@@ -54,6 +54,8 @@ parking_lot = { workspace = true }
 # Node keys the vector index worker collects: internal keys, no
 # attacker-chosen hash input.
 rustc-hash = { workspace = true }
+# The host draws its transaction IDs as random UUIDs, as any client does.
+uuid = { version = "1", features = ["v4"] }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]

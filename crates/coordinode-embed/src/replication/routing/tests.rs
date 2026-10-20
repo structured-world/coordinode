@@ -47,13 +47,14 @@ impl CommandExecutor for Scripted {
         self.answer.lock().unwrap().clone().expect("an answer")
     }
 
-    fn begin(&self, begin: RoutedBegin) -> Result<TransactionHandle, Status> {
+    fn begin(&self, begin: RoutedBegin) -> Result<(), Status> {
+        assert_eq!(begin.transaction, txid());
         assert_eq!(begin.ordering, TxnOrdering::Ordered);
-        Ok(handle())
+        Ok(())
     }
 
     fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, Status> {
-        assert_eq!(commit.transaction, handle());
+        assert_eq!(commit.transaction, txid());
         assert_eq!(commit.last_nonce, Some(3));
         assert_eq!(commit.expect, expectations());
         self.commits.fetch_add(1, Ordering::AcqRel);
@@ -64,7 +65,7 @@ impl CommandExecutor for Scripted {
     }
 
     fn rollback(&self, rollback: RoutedRollback) -> Result<(), Status> {
-        assert_eq!(rollback.transaction, handle());
+        assert_eq!(rollback.transaction, txid());
         Err(Status::aborted("already ended"))
     }
 
@@ -178,8 +179,8 @@ async fn operation_calls_cross_both_ways() {
     );
 }
 
-fn handle() -> TransactionHandle {
-    TransactionHandle::new(None, 2, 5, 7)
+fn txid() -> TransactionId {
+    TransactionId::from_raw([0x2a; 16])
 }
 
 /// A condition on a version and one requiring a node to be absent.
@@ -226,7 +227,7 @@ async fn serve(executor: Arc<Scripted>) -> CommandRouter {
     CommandRouter::new(channel)
 }
 
-fn statement(transaction: Option<TransactionHandle>) -> RoutedStatement {
+fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
     RoutedStatement {
         actor: principal(),
         query: "MATCH (n) RETURN n.k AS k".into(),
@@ -245,6 +246,7 @@ fn statement(transaction: Option<TransactionHandle>) -> RoutedStatement {
             query_memory_limit: Some(1 << 20),
         },
         transaction,
+        start_transaction: false,
         nonce: transaction.map(|_| 2),
         operation: None,
         deadline: Some(Duration::from_secs(30)),
@@ -335,8 +337,7 @@ async fn the_ingress_learns_of_the_admission_before_the_answer() {
         let admitted = Arc::clone(&admitted);
         AdmissionSignal::new(move || admitted.notify_one())
     };
-    let call =
-        tokio::spawn(async move { router.execute(statement(Some(handle())), &signal).await });
+    let call = tokio::spawn(async move { router.execute(statement(Some(txid())), &signal).await });
     // Not admitted while the executing member holds the statement.
     assert!(
         tokio::time::timeout(Duration::from_millis(100), admitted.notified())
@@ -349,8 +350,35 @@ async fn the_ingress_learns_of_the_admission_before_the_answer() {
         .expect("admitted");
     call.await.expect("joined").expect("answered");
     let arrived = executor.statements.lock().unwrap().pop().expect("arrived");
-    assert_eq!(arrived.transaction, Some(handle()));
+    assert_eq!(arrived.transaction, Some(txid()));
     assert_eq!(arrived.nonce, Some(2));
+}
+
+/// A statement that starts its transaction crosses with the start flag, and
+/// one naming no transaction cannot ask to start one.
+#[tokio::test]
+async fn a_starting_statement_crosses_with_its_flag() {
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Ok(RoutedAnswer::default()));
+    let router = serve(Arc::clone(&executor)).await;
+    router
+        .execute(
+            RoutedStatement {
+                start_transaction: true,
+                ..statement(Some(txid()))
+            },
+            &AdmissionSignal::new(|| {}),
+        )
+        .await
+        .expect("answered");
+    let arrived = executor.statements.lock().unwrap().pop().expect("arrived");
+    assert!(arrived.start_transaction);
+    assert_eq!(arrived.transaction, Some(txid()));
+
+    let mut wire = statement_to_wire(statement(None)).expect("encoded");
+    wire.start_transaction = true;
+    let err = statement_from_wire(wire).expect_err("refused");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
 /// A refusal reaches the ingress with its code, message and details, so the
@@ -400,8 +428,9 @@ async fn an_ingress_that_leaves_cancels_the_statement() {
 async fn transaction_commands_cross_both_ways() {
     let executor = Arc::new(Scripted::default());
     let router = serve(Arc::clone(&executor)).await;
-    let begun = router
+    router
         .begin(RoutedBegin {
+            transaction: txid(),
             actor: principal(),
             read_concern: Some(ReadConcernLevel::Snapshot),
             write_concern: None,
@@ -410,11 +439,10 @@ async fn transaction_commands_cross_both_ways() {
         })
         .await
         .expect("begun");
-    assert_eq!(begun, handle());
     let receipt = router
         .commit(RoutedCommit {
             actor: principal(),
-            transaction: begun,
+            transaction: txid(),
             last_nonce: Some(3),
             operation: None,
             deadline: None,
@@ -428,7 +456,7 @@ async fn transaction_commands_cross_both_ways() {
     let err = router
         .rollback(RoutedRollback {
             actor: principal(),
-            transaction: begun,
+            transaction: txid(),
         })
         .await
         .expect_err("refused");

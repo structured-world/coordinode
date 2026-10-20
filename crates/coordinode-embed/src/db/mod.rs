@@ -604,7 +604,7 @@ pub struct StatementOptions {
     /// trusted host established it; `None` is the embedding host's own
     /// trusted access. A statement of an open transaction must act for the
     /// caller that began it.
-    pub actor: Option<coordinode_core::txn::handle::ActingContext>,
+    pub actor: Option<coordinode_core::txn::command::ActingContext>,
     /// The statement's number within its transaction, kept by a client
     /// across retransmissions: an ordered transaction applies its
     /// statements by it, from 1, and in either order a repeat is refused
@@ -613,7 +613,7 @@ pub struct StatementOptions {
     pub nonce: Option<u64>,
     /// Told when a statement of a transaction has its place in the
     /// transaction's order. Not read outside a transaction.
-    pub admission: Option<coordinode_core::txn::handle::AdmissionSignal>,
+    pub admission: Option<coordinode_core::txn::command::AdmissionSignal>,
 }
 
 #[derive(Debug, Clone)]
@@ -702,42 +702,49 @@ pub enum DatabaseError {
     #[error("semantic error: {0}")]
     Semantic(String),
 
-    /// No interactive transaction this caller may use is held under this
-    /// handle.
+    /// No interactive transaction this caller may use is held under this ID.
     ///
-    /// Either it was never opened here, or it is already finished: committed,
-    /// rolled back, aborted by a failed statement, or collected by the idle
-    /// sweep; or it acts for another caller, which the handle alone does not
-    /// reveal. In every case nothing is held for this caller under it. It is
-    /// not proof that a commit did not happen: an operation's outcome is
-    /// resolved by its descriptor.
+    /// Either it was never opened on this leader (a transaction of an earlier
+    /// leader among them: a change of leader ends every open transaction), or
+    /// it is already finished: committed, rolled back, aborted by a failed
+    /// statement, or collected by the idle sweep; or it acts for another
+    /// caller, which the ID alone does not reveal. In every case nothing is
+    /// held for this caller under it, and a transaction that was never
+    /// committed is run again under a new ID. It is not proof that a commit
+    /// did not happen: an operation's outcome is resolved by its descriptor.
     #[error("unknown transaction {0}")]
-    UnknownTransaction(TransactionHandle),
+    UnknownTransaction(TransactionId),
+
+    /// A transaction is open under this ID, or ended under it recently: an
+    /// ID names one transaction, and a start never joins another. Nothing was
+    /// done; a new transaction takes a newly drawn ID.
+    #[error("transaction ID {0} is already in use")]
+    TransactionIdInUse(TransactionId),
 
     /// The transaction's queue of commands waiting for their turn is full;
     /// send this one once earlier ones have answered. Nothing was done and
     /// the transaction stays open.
     #[error("transaction {0} has too many commands waiting")]
-    TransactionBusy(TransactionHandle),
+    TransactionBusy(TransactionId),
 
     /// A statement with this nonce was already admitted to the transaction:
     /// it is applied once, and its result is not kept to answer a repeat.
     #[error(
-        "statement {nonce} of transaction {handle} was already admitted; its result is not retained"
+        "statement {nonce} of transaction {id} was already admitted; its result is not retained"
     )]
     StatementAlreadyAdmitted {
         /// The transaction.
-        handle: TransactionHandle,
+        id: TransactionId,
         /// The repeated nonce.
         nonce: u64,
     },
 
     /// The nonce names a statement already admitted with different text or
     /// parameters. Nothing was done; a new statement takes a new nonce.
-    #[error("nonce {nonce} of transaction {handle} names a different statement")]
+    #[error("nonce {nonce} of transaction {id} names a different statement")]
     StatementNonceReused {
         /// The transaction.
-        handle: TransactionHandle,
+        id: TransactionId,
         /// The reused nonce.
         nonce: u64,
     },
@@ -745,14 +752,14 @@ pub enum DatabaseError {
     /// A statement of an ordered transaction came without its nonce, which
     /// numbers the chain from 1. Nothing was done.
     #[error("a statement of ordered transaction {0} needs a nonce from 1")]
-    StatementNonceRequired(TransactionHandle),
+    StatementNonceRequired(TransactionId),
 
     /// The transaction ended before anything of it was submitted, so nothing
     /// of it was applied. Running it again is a new transaction.
-    #[error("transaction {handle} was aborted: {end}")]
+    #[error("transaction {id} was aborted: {end}")]
     TransactionAborted {
         /// The transaction.
-        handle: TransactionHandle,
+        id: TransactionId,
         /// Why it ended.
         end: interactive::TransactionEnd,
     },
@@ -765,7 +772,7 @@ pub enum DatabaseError {
     /// helps.
     #[error("transaction {id} conflicts with a concurrent write: {source_message}")]
     TransactionConflict {
-        id: TransactionHandle,
+        id: TransactionId,
         source_message: String,
     },
 
@@ -790,7 +797,7 @@ pub enum DatabaseError {
     )]
     RevisionMismatch {
         /// The transaction the refusal belongs to.
-        id: TransactionHandle,
+        id: TransactionId,
         /// The version the write was conditioned on; `None` required absence.
         expected: Option<u64>,
         /// The version the record has now; `None` means it is absent.
@@ -800,7 +807,7 @@ pub enum DatabaseError {
     #[error("transaction {id} was refused by an invariant: {reason}")]
     InvariantRefused {
         /// The transaction the refusal belongs to.
-        id: TransactionHandle,
+        id: TransactionId,
         /// Which condition refused it, in the words of the condition.
         reason: String,
     },
@@ -809,7 +816,7 @@ pub enum DatabaseError {
     /// was discarded. Splitting the work into smaller transactions is the fix.
     #[error("transaction {id} exceeded its buffer limit ({buffered} > {limit} bytes)")]
     TransactionTooLarge {
-        id: TransactionHandle,
+        id: TransactionId,
         buffered: usize,
         limit: usize,
     },
@@ -3984,13 +3991,11 @@ mod interactive;
 mod package;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
-pub use coordinode_core::txn::handle::{
-    ActingContext, AdmissionSignal, Principal, TransactionHandle,
-};
+pub use coordinode_core::txn::command::{ActingContext, AdmissionSignal, Principal, TransactionId};
 pub use fields::FieldDictionary;
 pub use interactive::{
     CommitOptions, DEFAULT_DRAIN_TIMEOUT, ExpectedVersion, RollbackOptions, TransactionEnd,
-    TransactionOptions,
+    TransactionOptions, draw_transaction_id,
 };
 pub use package::{
     Disposition, EdgeTypeDeclaration, Intent, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,

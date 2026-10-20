@@ -112,15 +112,14 @@ fn repeatable_read_across_statements() {
     assert_eq!(now.len(), 2);
 }
 
-/// A handle that names no open transaction here (one this database never
-/// handed out) is refused as unknown by every command.
+/// An ID that names no open transaction here (one no transaction was begun
+/// under) is refused as unknown by every command.
 #[test]
 fn unknown_transaction_id_errors() {
     use coordinode_embed::DatabaseError;
-    use coordinode_embed::db::TransactionHandle;
 
     let db = open_db();
-    let never = TransactionHandle::new(None, 0, 1, 999);
+    let never = coordinode_embed::db::draw_transaction_id();
     assert!(matches!(
         db.execute_in_transaction(never, "MATCH (n) RETURN n", None),
         Err(DatabaseError::UnknownTransaction(h)) if h == never
@@ -143,7 +142,7 @@ fn idle_transaction_is_reaped() {
     db.reap_idle_transactions(Duration::from_secs(0));
     assert!(
         db.commit_transaction(tx).is_err(),
-        "reaped transaction handle is gone",
+        "a reaped transaction is gone",
     );
 }
 
@@ -853,7 +852,7 @@ fn a_version_condition_refuses_what_it_cannot_be_stated_on() {
         "a node that was never written has no version"
     );
 
-    let never = coordinode_embed::db::TransactionHandle::new(None, 0, 1, 4242);
+    let never = coordinode_embed::db::draw_transaction_id();
     let err = db
         .expect_node_version(never, NodeId::from_raw(1), None)
         .expect_err("there is no such transaction");

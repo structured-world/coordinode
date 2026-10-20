@@ -33,6 +33,6 @@ pub use db::{
     Database, DatabaseError, Disposition, EdgeTypeDeclaration, Intent, LabelConstraint,
     LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS, PackageConstraint, Principal,
     PublishedObject, Readiness, ResumedIndexBuilds, SchemaPackage, SchemaPublication,
-    SchemaReadiness, TransactionEnd, TransactionHandle, TransactionOptions, TriggerDispatchConfig,
+    SchemaReadiness, TransactionEnd, TransactionId, TransactionOptions, TriggerDispatchConfig,
 };
 pub use repair::RepairReport;

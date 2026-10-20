@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 use coordinode_core::operations::TxnOrdering;
-use coordinode_core::txn::handle::TransactionHandle;
+use coordinode_core::txn::command::TransactionId;
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_core::txn::write_concern::WriteConcern;
@@ -31,28 +31,31 @@ pub enum SessionOp {
     Execute {
         query: String,
         params: HashMap<String, Value>,
-        transaction: Option<TransactionHandle>,
+        transaction: Option<TransactionId>,
         nonce: u64,
         settings: ConnectionSettings,
         source: Option<Box<StatementSource>>,
         operation: Option<OperationDescriptor>,
     },
-    /// Open an interactive transaction. A zero `drain_timeout_ms` takes the
-    /// session's setting, then the server's default.
+    /// Open an interactive transaction under `transaction`, the ID the client
+    /// drew. Nothing answers a Begin that succeeds; a refused one answers
+    /// with an error. A zero `drain_timeout_ms` takes the session's setting,
+    /// then the server's default.
     Begin {
+        transaction: TransactionId,
         ordering: TxnOrdering,
         drain_timeout_ms: u32,
     },
-    /// Commit an interactive transaction by handle, carrying out `operation`
+    /// Commit an interactive transaction by ID, carrying out `operation`
     /// when the client named one. `last_nonce` is the last statement of an
     /// ordered chain, zero for none.
     Commit {
-        transaction: TransactionHandle,
+        transaction: TransactionId,
         last_nonce: u64,
         operation: Option<OperationDescriptor>,
     },
-    /// Roll back an interactive transaction by handle.
-    Rollback { transaction: TransactionHandle },
+    /// Roll back an interactive transaction by ID.
+    Rollback { transaction: TransactionId },
     /// Abort an in-flight request and close its cursor.
     Cancel { target_request_id: u64 },
     /// Read, and optionally change, the connection's settings. Answered with a
@@ -280,8 +283,6 @@ impl Failure {
 /// A neutral result event for a request.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    /// Acknowledges `Begin`, carrying the allocated transaction handle.
-    Begun { transaction: TransactionHandle },
     /// Opens a result cursor with its column header.
     CursorOpen { columns: Vec<String> },
     /// A batch of result rows for an open cursor.

@@ -22,7 +22,7 @@ use coordinode_core::budget::CancelFlag;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 use coordinode_core::operations::TxnOrdering;
-use coordinode_core::txn::handle::{ActingContext, AdmissionSignal, Principal, TransactionHandle};
+use coordinode_core::txn::command::{ActingContext, AdmissionSignal, Principal, TransactionId};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::read_concern::ReadConcernLevel;
 use coordinode_core::txn::timestamp::Timestamp;
@@ -85,7 +85,11 @@ pub struct RoutedStatement {
     /// The settings it runs under.
     pub settings: RoutedSettings,
     /// The transaction it runs in; `None` commits it on its own.
-    pub transaction: Option<TransactionHandle>,
+    pub transaction: Option<TransactionId>,
+    /// The statement starts `transaction`: it opens with `actor` and the
+    /// read and write concern of `settings`, statements applied as they
+    /// come, then the statement runs in it.
+    pub start_transaction: bool,
     /// Its number within the transaction.
     pub nonce: Option<u64>,
     /// The client operation an autonomous statement carries out.
@@ -134,6 +138,8 @@ pub struct RoutedAnswer {
 /// Open an interactive transaction at the leader.
 #[derive(Debug, Clone)]
 pub struct RoutedBegin {
+    /// The ID the client drew for it.
+    pub transaction: TransactionId,
     /// Who the transaction acts for; every later command must act for the
     /// same.
     pub actor: ActingContext,
@@ -148,13 +154,13 @@ pub struct RoutedBegin {
     pub drain_timeout: Option<Duration>,
 }
 
-/// Commit an interactive transaction at the member that holds it.
+/// Commit an interactive transaction at the leader.
 #[derive(Debug, Clone)]
 pub struct RoutedCommit {
     /// Who the commit acts for.
     pub actor: ActingContext,
     /// The transaction.
-    pub transaction: TransactionHandle,
+    pub transaction: TransactionId,
     /// The last nonce of an ordered chain.
     pub last_nonce: Option<u64>,
     /// The client operation the commit carries out.
@@ -165,13 +171,13 @@ pub struct RoutedCommit {
     pub expect: Vec<ExpectedVersion>,
 }
 
-/// Roll back an interactive transaction at the member that holds it.
+/// Roll back an interactive transaction at the leader.
 #[derive(Debug, Clone)]
 pub struct RoutedRollback {
     /// Who the rollback acts for.
     pub actor: ActingContext,
     /// The transaction.
-    pub transaction: TransactionHandle,
+    pub transaction: TransactionId,
 }
 
 /// A call on the records of client operations, decided by the leader's log.
@@ -232,12 +238,12 @@ pub trait CommandExecutor: Send + Sync + 'static {
         admitted: &AdmissionSignal,
     ) -> Result<RoutedAnswer, Status>;
 
-    /// Open a transaction.
+    /// Open a transaction under the ID the client drew.
     ///
     /// # Errors
     ///
     /// The status the transaction was refused with.
-    fn begin(&self, begin: RoutedBegin) -> Result<TransactionHandle, Status>;
+    fn begin(&self, begin: RoutedBegin) -> Result<(), Status>;
 
     /// Commit a transaction this member holds.
     ///
@@ -357,10 +363,8 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
         request: Request<wire::RoutedBegin>,
     ) -> Result<Response<wire::RoutedBegun>, Status> {
         let begin = begin_from_wire(request.into_inner())?;
-        let handle = self.blocking(move |e| e.begin(begin)).await?;
-        Ok(Response::new(wire::RoutedBegun {
-            transaction: handle.to_bytes().to_vec(),
-        }))
+        self.blocking(move |e| e.begin(begin)).await?;
+        Ok(Response::new(wire::RoutedBegun {}))
     }
 
     async fn commit(
@@ -504,24 +508,19 @@ impl CommandRouter {
         ))
     }
 
-    /// Open a transaction at the member, which must lead.
+    /// Open a transaction at the member, which must lead, under the ID the
+    /// client drew.
     ///
     /// # Errors
     ///
     /// The status the member refused it with, or why it could not be
     /// reached.
-    pub async fn begin(&self, begin: RoutedBegin) -> Result<TransactionHandle, Status> {
-        let begun = self
-            .client
-            .clone()
-            .begin(begin_to_wire(begin))
-            .await?
-            .into_inner();
-        TransactionHandle::from_bytes(&begun.transaction)
-            .map_err(|e| Status::internal(format!("the leader answered a malformed handle: {e}")))
+    pub async fn begin(&self, begin: RoutedBegin) -> Result<(), Status> {
+        self.client.clone().begin(begin_to_wire(begin)).await?;
+        Ok(())
     }
 
-    /// Commit a transaction at the member that holds it.
+    /// Commit a transaction at the leader.
     ///
     /// # Errors
     ///
@@ -540,7 +539,7 @@ impl CommandRouter {
         })
     }
 
-    /// Roll back a transaction at the member that holds it.
+    /// Roll back a transaction at the leader.
     ///
     /// # Errors
     ///
@@ -623,9 +622,9 @@ fn actor_from_wire(actor: Option<wire::ActingContext>) -> Result<ActingContext, 
     }
 }
 
-fn handle_from_wire(bytes: &[u8]) -> Result<TransactionHandle, Status> {
-    TransactionHandle::from_bytes(bytes)
-        .map_err(|e| Status::invalid_argument(format!("transaction: {e}")))
+fn transaction_id_from_wire(bytes: &[u8]) -> Result<TransactionId, Status> {
+    TransactionId::from_bytes(bytes)
+        .map_err(|e| Status::invalid_argument(format!("transaction_id: {e}")))
 }
 
 fn operation_from_wire(bytes: &[u8]) -> Result<Option<OperationDescriptor>, Status> {
@@ -779,10 +778,11 @@ fn statement_to_wire(statement: RoutedStatement) -> Result<wire::RoutedStatement
             })?
         },
         settings: Some(settings_to_wire(statement.settings)),
-        transaction: statement
+        transaction_id: statement
             .transaction
-            .map(|h| h.to_bytes().to_vec())
+            .map(|id| id.to_bytes().to_vec())
             .unwrap_or_default(),
+        start_transaction: statement.start_transaction,
         nonce: statement.nonce.unwrap_or(0),
         operation: statement
             .operation
@@ -800,6 +800,11 @@ fn statement_to_wire(statement: RoutedStatement) -> Result<wire::RoutedStatement
 }
 
 fn statement_from_wire(statement: wire::RoutedStatement) -> Result<RoutedStatement, Status> {
+    if statement.start_transaction && statement.transaction_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "start_transaction: a statement starts a transaction only under its transaction_id",
+        ));
+    }
     Ok(RoutedStatement {
         actor: actor_from_wire(statement.actor)?,
         params: if statement.parameters.is_empty() {
@@ -810,11 +815,12 @@ fn statement_from_wire(statement: wire::RoutedStatement) -> Result<RoutedStateme
         },
         query: statement.query,
         settings: settings_from_wire(statement.settings)?,
-        transaction: if statement.transaction.is_empty() {
+        transaction: if statement.transaction_id.is_empty() {
             None
         } else {
-            Some(handle_from_wire(&statement.transaction)?)
+            Some(transaction_id_from_wire(&statement.transaction_id)?)
         },
+        start_transaction: statement.start_transaction,
         nonce: (statement.nonce > 0).then_some(statement.nonce),
         operation: operation_from_wire(&statement.operation)?,
         deadline: deadline_from_wire(statement.deadline_ms),
@@ -858,6 +864,7 @@ fn stats_from_wire(stats: wire::RoutedStats) -> RoutedStats {
 
 fn begin_to_wire(begin: RoutedBegin) -> wire::RoutedBegin {
     wire::RoutedBegin {
+        transaction_id: begin.transaction.to_bytes().to_vec(),
         actor: Some(actor_to_wire(&begin.actor)),
         settings: Some(settings_to_wire(RoutedSettings {
             read_concern: begin.read_concern,
@@ -872,6 +879,7 @@ fn begin_to_wire(begin: RoutedBegin) -> wire::RoutedBegin {
 fn begin_from_wire(begin: wire::RoutedBegin) -> Result<RoutedBegin, Status> {
     let settings = settings_from_wire(begin.settings)?;
     Ok(RoutedBegin {
+        transaction: transaction_id_from_wire(&begin.transaction_id)?,
         actor: actor_from_wire(begin.actor)?,
         read_concern: settings.read_concern,
         write_concern: settings.write_concern,
@@ -887,7 +895,7 @@ fn begin_from_wire(begin: wire::RoutedBegin) -> Result<RoutedBegin, Status> {
 fn commit_to_wire(commit: RoutedCommit) -> wire::RoutedCommit {
     wire::RoutedCommit {
         actor: Some(actor_to_wire(&commit.actor)),
-        transaction: commit.transaction.to_bytes().to_vec(),
+        transaction_id: commit.transaction.to_bytes().to_vec(),
         last_nonce: commit.last_nonce.unwrap_or(0),
         operation: commit.operation.map(|o| o.to_bytes()).unwrap_or_default(),
         deadline_ms: deadline_to_wire(commit.deadline),
@@ -905,7 +913,7 @@ fn commit_to_wire(commit: RoutedCommit) -> wire::RoutedCommit {
 fn commit_from_wire(commit: wire::RoutedCommit) -> Result<RoutedCommit, Status> {
     Ok(RoutedCommit {
         actor: actor_from_wire(commit.actor)?,
-        transaction: handle_from_wire(&commit.transaction)?,
+        transaction: transaction_id_from_wire(&commit.transaction_id)?,
         last_nonce: (commit.last_nonce > 0).then_some(commit.last_nonce),
         operation: operation_from_wire(&commit.operation)?,
         deadline: deadline_from_wire(commit.deadline_ms),
@@ -923,14 +931,14 @@ fn commit_from_wire(commit: wire::RoutedCommit) -> Result<RoutedCommit, Status> 
 fn rollback_to_wire(rollback: RoutedRollback) -> wire::RoutedRollback {
     wire::RoutedRollback {
         actor: Some(actor_to_wire(&rollback.actor)),
-        transaction: rollback.transaction.to_bytes().to_vec(),
+        transaction_id: rollback.transaction.to_bytes().to_vec(),
     }
 }
 
 fn rollback_from_wire(rollback: wire::RoutedRollback) -> Result<RoutedRollback, Status> {
     Ok(RoutedRollback {
         actor: actor_from_wire(rollback.actor)?,
-        transaction: handle_from_wire(&rollback.transaction)?,
+        transaction: transaction_id_from_wire(&rollback.transaction_id)?,
     })
 }
 

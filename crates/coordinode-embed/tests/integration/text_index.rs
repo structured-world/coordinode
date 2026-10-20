@@ -10,7 +10,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use coordinode_core::graph::types::Value;
-use coordinode_embed::{Database, TransactionHandle};
+use coordinode_embed::{Database, TransactionId};
 
 fn open_db() -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -558,7 +558,7 @@ const QUERIES: [&str; 8] = [
 /// transaction `tx` when given).
 fn doc_scores(
     db: &mut Database,
-    tx: Option<TransactionHandle>,
+    tx: Option<TransactionId>,
     query: &str,
 ) -> std::collections::BTreeMap<String, f64> {
     let statement = format!(
@@ -589,7 +589,7 @@ fn doc_scores(
 /// with a database that holds only `live`, indexed from nothing.
 fn assert_ranks_as_built_from(
     db: &mut Database,
-    tx: Option<TransactionHandle>,
+    tx: Option<TransactionId>,
     live: &std::collections::BTreeMap<String, String>,
 ) {
     let (mut model, model_dir) = open_db();

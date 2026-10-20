@@ -67,6 +67,8 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Sys
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+# Transaction IDs are random UUIDs the client draws.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

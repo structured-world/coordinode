@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::writer::ReplicatedWriter;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
-use coordinode_core::txn::handle::{AdmissionSignal, TransactionHandle};
+use coordinode_core::txn::command::AdmissionSignal;
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::read_concern::{
     ReadConcern as ExecutorReadConcern, ReadConcernLevel as ExecutorReadConcernLevel,
@@ -451,9 +451,9 @@ impl StatementExecutor {
     /// Run `statement` at `member` and return its answer.
     ///
     /// A client keeps working through whichever member it reached: a
-    /// statement this member cannot run goes to the leader, a transaction's
-    /// command to the member that holds it, and the answer comes back as
-    /// this member's own. The responses of a member that does not lead name
+    /// statement this member cannot run, and every command of a
+    /// transaction, goes to the leader, and the answer comes back as this
+    /// member's own. The responses of a member that does not lead name
     /// the leader, so a client that cares moves there.
     pub(crate) async fn route(
         &self,
@@ -474,16 +474,8 @@ impl StatementExecutor {
         CommandRouter::to_member(node, member)
     }
 
-    /// The member holding `handle`'s transaction when it is another one;
-    /// `None` when this member holds it.
-    pub(crate) fn holder(&self, handle: &TransactionHandle) -> Option<u64> {
-        let node = self.raft_node.as_ref()?;
-        // Owner 0 is a database outside a group: this one.
-        (handle.owner() != 0 && handle.owner() != node.node_id()).then_some(handle.owner())
-    }
-
-    /// The member a transaction opens at: `None` when it is this one,
-    /// standalone or leading.
+    /// The member every command of a transaction runs at, the leader: `None`
+    /// when it is this one, standalone or leading.
     ///
     /// # Errors
     ///

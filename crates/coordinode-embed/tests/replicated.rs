@@ -13,7 +13,7 @@ use coordinode_embed::replication::{
     ElectionPreference, Founding, MemberOptions, PeerTimeouts, Peering, ReplicatedDatabase,
     ReplicationError,
 };
-use coordinode_embed::{Database, DatabaseError, TransactionEnd};
+use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::executor::runner::ExecutionError;
 use coordinode_raft::cluster::nemesis;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
@@ -295,9 +295,10 @@ async fn leadership_moves_to_a_named_member_and_the_stream_reports_it() {
 }
 
 /// An open transaction belongs to the lead it was begun in. A follower opens
-/// none and names the leader instead; once the lead moves, the old leader's
-/// transaction is refused as aborted, nothing of it lands anywhere, and only
-/// the new leader opens transactions.
+/// none and names the leader instead; once the lead moves, the old leader
+/// drops its transaction and neither it nor the new leader knows it any
+/// more, nothing of it lands anywhere, and only the new leader opens
+/// transactions.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transaction_ends_with_the_lead_it_was_begun_in() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
@@ -327,24 +328,28 @@ async fn a_transaction_ends_with_the_lead_it_was_begun_in() {
         members[0].transfer_leadership(2).await.unwrap();
         // The tenure follows the leadership asynchronously; until it moves a
         // statement still runs on the context.
-        wait_until("the old leader's transaction is aborted", || {
+        wait_until("the old leader drops its transaction", || {
             matches!(
                 members[0].database().read().execute_in_transaction(
                     handle,
                     "RETURN 1 AS one",
                     None
                 ),
-                Err(DatabaseError::TransactionAborted {
-                    end: TransactionEnd::LeaderChanged,
-                    ..
-                })
+                Err(DatabaseError::UnknownTransaction(_))
             )
         })
         .await;
         assert!(matches!(
             members[0].database().read().commit_transaction(handle),
-            Err(DatabaseError::TransactionAborted { handle: h, .. }) if h == handle
+            Err(DatabaseError::UnknownTransaction(h)) if h == handle
         ));
+        assert!(
+            matches!(
+                members[1].database().read().commit_transaction(handle),
+                Err(DatabaseError::UnknownTransaction(h)) if h == handle
+            ),
+            "the new leader never held it"
+        );
         assert!(matches!(
             members[0].database().read().begin_transaction(),
             Err(DatabaseError::NotLeader { leader_id: Some(2) })
@@ -355,8 +360,6 @@ async fn a_transaction_ends_with_the_lead_it_was_begun_in() {
             let fresh = new_leader
                 .begin_transaction()
                 .expect("the new leader begins");
-            assert_eq!(fresh.owner(), 2);
-            assert!(fresh.incarnation() > handle.incarnation());
             new_leader
                 .execute_in_transaction(fresh, "CREATE (:NewLead {k: 1})", None)
                 .expect("statement");

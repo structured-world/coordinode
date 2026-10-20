@@ -166,18 +166,13 @@ async fn a_unary_write_retried_runs_once() {
         .rows;
     assert_eq!(rows.len(), 1);
 
-    let txn = s
-        .cypher
-        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
-        .await
-        .unwrap()
-        .into_inner()
-        .transaction;
+    let txn = coordinode_embed::db::draw_transaction_id();
     let refused = s
         .cypher
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "CREATE (:Inside)".to_string(),
-            transaction: txn,
+            transaction_id: txn.to_bytes().to_vec(),
+            start_transaction: true,
             operation: Some(wire::OperationRef {
                 sequence: op.sequence + 1,
                 ..op.clone()
@@ -195,24 +190,21 @@ async fn a_unary_write_retried_runs_once() {
 async fn a_repeated_commit_answers_with_the_outcome() {
     let s = services();
     let op = enroll(&s).await;
-    let txn = s
-        .cypher
-        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
-        .await
-        .unwrap()
-        .into_inner()
-        .transaction;
+    let txn = coordinode_embed::db::draw_transaction_id()
+        .to_bytes()
+        .to_vec();
     s.cypher
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "CREATE (:Purchase {k: 1})".to_string(),
-            transaction: txn.clone(),
+            transaction_id: txn.clone(),
+            start_transaction: true,
             ..Default::default()
         }))
         .await
         .unwrap();
     let commit = || {
         Request::new(query::CommitTransactionRequest {
-            transaction: txn.clone(),
+            transaction_id: txn.clone(),
             expect: Vec::new(),
             operation: Some(op.clone()),
         })

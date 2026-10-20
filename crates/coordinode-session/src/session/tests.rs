@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use coordinode_core::graph::types::Value;
-use coordinode_core::operations::OperationsView;
+use coordinode_core::operations::{OperationsView, TxnOrdering};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_core::txn::write_concern::WriteConcern;
@@ -49,9 +48,11 @@ const MOCK_RECEIPT: CommitReceipt = CommitReceipt {
     applied_index: Some(7),
 };
 
-/// Handle `n` of a mock engine.
-fn handle(n: u64) -> TransactionHandle {
-    TransactionHandle::new(None, 1, 1, n)
+/// Transaction ID number `n` of a test.
+fn txid(n: u64) -> TransactionId {
+    let mut bytes = [0u8; 16];
+    bytes[8..].copy_from_slice(&n.to_be_bytes());
+    TransactionId::from_raw(bytes)
 }
 
 /// An engine returning a fixed result, or a fixed error.
@@ -60,7 +61,6 @@ struct MockEngine {
     rows: Vec<Vec<Value>>,
     /// When set, every `open_cursor` fails with this message.
     fail: Option<String>,
-    next_txn: AtomicU64,
 }
 
 impl CursorEngine for MockEngine {
@@ -93,17 +93,16 @@ impl CursorEngine for MockEngine {
 
     fn begin_transaction(
         &self,
+        _transaction: TransactionId,
         _ordering: TxnOrdering,
         _drain: Option<Duration>,
-    ) -> Result<TransactionHandle, EngineError> {
-        Ok(handle(
-            self.next_txn.fetch_add(1, AtomicOrdering::Relaxed) + 1,
-        ))
+    ) -> Result<(), EngineError> {
+        Ok(())
     }
 
     fn commit_transaction(
         &self,
-        _transaction: TransactionHandle,
+        _transaction: TransactionId,
         _last_nonce: Option<u64>,
         _operation: Option<&OperationDescriptor>,
         admission: &AdmissionSignal,
@@ -114,7 +113,7 @@ impl CursorEngine for MockEngine {
 
     fn rollback_transaction(
         &self,
-        _transaction: TransactionHandle,
+        _transaction: TransactionId,
         admission: &AdmissionSignal,
     ) -> Result<(), EngineError> {
         admission.admitted();
@@ -127,11 +126,10 @@ fn engine(columns: &[&str], rows: Vec<Vec<Value>>) -> Arc<dyn CursorEngine> {
         columns: columns.iter().map(|s| s.to_string()).collect(),
         rows,
         fail: None,
-        next_txn: AtomicU64::new(0),
     })
 }
 
-fn statement(query: &str, transaction: Option<TransactionHandle>) -> SessionOp {
+fn statement(query: &str, transaction: Option<TransactionId>) -> SessionOp {
     SessionOp::Execute {
         query: query.to_string(),
         params: HashMap::new(),
@@ -153,14 +151,14 @@ enum Call {
     // Boxed fields: a test record, kept small beside the other calls.
     Statement {
         query: String,
-        transaction: Option<(TransactionHandle, u64)>,
+        transaction: Option<(TransactionId, u64)>,
         settings: Box<ConnectionSettings>,
         source: Option<StatementSource>,
         operation: Option<OperationDescriptor>,
     },
-    Begin(TxnOrdering, Option<Duration>),
-    Commit(TransactionHandle, Option<u64>, Option<OperationDescriptor>),
-    Rollback(TransactionHandle),
+    Begin(TransactionId, TxnOrdering, Option<Duration>),
+    Commit(TransactionId, Option<u64>, Option<OperationDescriptor>),
+    Rollback(TransactionId),
 }
 
 /// An engine that answers every statement with an empty result and records
@@ -168,7 +166,6 @@ enum Call {
 #[derive(Default)]
 struct RecordingEngine {
     calls: parking_lot::Mutex<Vec<Call>>,
-    next_txn: AtomicU64,
 }
 
 impl RecordingEngine {
@@ -210,7 +207,7 @@ impl CursorEngine for RecordingEngine {
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         self.calls.lock().push(Call::Statement {
             query: query.to_string(),
-            transaction: transaction.map(|t| (t.handle, t.nonce)),
+            transaction: transaction.map(|t| (t.id, t.nonce)),
             settings: Box::new(settings.clone()),
             source: source.cloned(),
             operation: operation.copied(),
@@ -223,18 +220,19 @@ impl CursorEngine for RecordingEngine {
 
     fn begin_transaction(
         &self,
+        transaction: TransactionId,
         ordering: TxnOrdering,
         drain: Option<Duration>,
-    ) -> Result<TransactionHandle, EngineError> {
-        self.calls.lock().push(Call::Begin(ordering, drain));
-        Ok(handle(
-            self.next_txn.fetch_add(1, AtomicOrdering::Relaxed) + 1,
-        ))
+    ) -> Result<(), EngineError> {
+        self.calls
+            .lock()
+            .push(Call::Begin(transaction, ordering, drain));
+        Ok(())
     }
 
     fn commit_transaction(
         &self,
-        transaction: TransactionHandle,
+        transaction: TransactionId,
         last_nonce: Option<u64>,
         operation: Option<&OperationDescriptor>,
         admission: &AdmissionSignal,
@@ -248,7 +246,7 @@ impl CursorEngine for RecordingEngine {
 
     fn rollback_transaction(
         &self,
-        transaction: TransactionHandle,
+        transaction: TransactionId,
         admission: &AdmissionSignal,
     ) -> Result<(), EngineError> {
         admission.admitted();
@@ -339,14 +337,15 @@ async fn a_statement_failing_after_its_first_rows_ends_with_the_error() {
         }
         fn begin_transaction(
             &self,
+            _transaction: TransactionId,
             _ordering: TxnOrdering,
             _drain: Option<Duration>,
-        ) -> Result<TransactionHandle, EngineError> {
-            Ok(handle(1))
+        ) -> Result<(), EngineError> {
+            Ok(())
         }
         fn commit_transaction(
             &self,
-            _transaction: TransactionHandle,
+            _transaction: TransactionId,
             _last_nonce: Option<u64>,
             _operation: Option<&OperationDescriptor>,
             _admission: &AdmissionSignal,
@@ -355,7 +354,7 @@ async fn a_statement_failing_after_its_first_rows_ends_with_the_error() {
         }
         fn rollback_transaction(
             &self,
-            _transaction: TransactionHandle,
+            _transaction: TransactionId,
             _admission: &AdmissionSignal,
         ) -> Result<(), EngineError> {
             Ok(())
@@ -492,7 +491,7 @@ async fn a_statement_runs_under_its_session_settings_and_its_own() {
             SessionOp::Execute {
                 query: "in-txn".to_string(),
                 params: HashMap::new(),
-                transaction: Some(handle(9)),
+                transaction: Some(txid(9)),
                 nonce: 4,
                 settings: ConnectionSettings {
                     write_concern: Some(WriteConcern::majority()),
@@ -532,7 +531,7 @@ async fn a_statement_runs_under_its_session_settings_and_its_own() {
     else {
         unreachable!()
     };
-    assert_eq!(transaction, Some((handle(9), 4)));
+    assert_eq!(transaction, Some((txid(9), 4)));
     assert_eq!(source, Some(here), "the source rides along");
     assert_eq!(
         *settings,
@@ -575,9 +574,9 @@ async fn operations_reach_the_engine_and_a_transaction_statement_names_none() {
         vec![
             with_op("bound", None, Some(op(1))),
             with_op("unbound", None, None),
-            with_op("inside", Some(handle(1)), Some(op(2))),
+            with_op("inside", Some(txid(1)), Some(op(2))),
             SessionOp::Commit {
-                transaction: handle(1),
+                transaction: txid(1),
                 last_nonce: 0,
                 operation: Some(op(3)),
             },
@@ -606,7 +605,7 @@ async fn operations_reach_the_engine_and_a_transaction_statement_names_none() {
             .any(|call| matches!(call, Call::Statement { query, .. } if query == "inside")),
         "the engine never saw it"
     );
-    assert!(calls.contains(&Call::Commit(handle(1), None, Some(op(3)))));
+    assert!(calls.contains(&Call::Commit(txid(1), None, Some(op(3)))));
 }
 
 /// An engine whose statement works until it is cancelled, checking the
@@ -640,15 +639,16 @@ impl CursorEngine for UntilCancelled {
 
     fn begin_transaction(
         &self,
+        _transaction: TransactionId,
         _ordering: TxnOrdering,
         _drain: Option<Duration>,
-    ) -> Result<TransactionHandle, EngineError> {
-        Ok(handle(1))
+    ) -> Result<(), EngineError> {
+        Ok(())
     }
 
     fn commit_transaction(
         &self,
-        _transaction: TransactionHandle,
+        _transaction: TransactionId,
         _last_nonce: Option<u64>,
         _operation: Option<&OperationDescriptor>,
         _admission: &AdmissionSignal,
@@ -658,7 +658,7 @@ impl CursorEngine for UntilCancelled {
 
     fn rollback_transaction(
         &self,
-        _transaction: TransactionHandle,
+        _transaction: TransactionId,
         _admission: &AdmissionSignal,
     ) -> Result<(), EngineError> {
         Ok(())
@@ -736,7 +736,6 @@ async fn execute_surfaces_an_engine_error() {
         columns: vec![],
         rows: vec![],
         fail: Some("boom".to_string()),
-        next_txn: AtomicU64::new(0),
     });
     let events = run_one(engine, exec()).await;
     match events.as_slice() {
@@ -749,15 +748,18 @@ async fn execute_surfaces_an_engine_error() {
     }
 }
 
-/// Begin answers with the engine's handle, and passes on the ordering and the
-/// drain bound: the frame's own, else the session's setting, else none.
+/// Begin passes on the client's transaction ID, the ordering and the drain
+/// bound (the frame's own, else the session's setting, else none), and a
+/// Begin that opens is not answered: the client sends the transaction's
+/// statements right after it.
 #[tokio::test]
-async fn begin_passes_its_ordering_and_drain_bound_to_the_engine() {
+async fn begin_passes_its_id_ordering_and_drain_bound_to_the_engine() {
     let recording = Arc::new(RecordingEngine::default());
     let by_id = run_session(
         Arc::clone(&recording) as Arc<dyn CursorEngine>,
         vec![
             SessionOp::Begin {
+                transaction: txid(1),
                 ordering: TxnOrdering::Ordered,
                 drain_timeout_ms: 0,
             },
@@ -766,27 +768,128 @@ async fn begin_passes_its_ordering_and_drain_bound_to_the_engine() {
                 ..ConnectionSettings::default()
             }),
             SessionOp::Begin {
+                transaction: txid(3),
                 ordering: TxnOrdering::Unordered,
                 drain_timeout_ms: 0,
             },
         ],
     )
     .await;
-    let begun = |rid: u64| match by_id[&rid].as_slice() {
-        [SessionEvent::Begun { transaction }] => *transaction,
-        other => panic!("expected Begun, got {other:?}"),
-    };
-    assert_ne!(begun(1), begun(3), "each begin gets a distinct handle");
+    assert!(
+        !by_id.contains_key(&1) && !by_id.contains_key(&3),
+        "an opened transaction is not answered: {by_id:?}"
+    );
     let begins: Vec<Call> = recording
         .calls()
         .into_iter()
         .filter(|call| matches!(call, Call::Begin(..)))
         .collect();
-    assert!(begins.contains(&Call::Begin(TxnOrdering::Ordered, None)));
+    assert!(begins.contains(&Call::Begin(txid(1), TxnOrdering::Ordered, None)));
     assert!(begins.contains(&Call::Begin(
+        txid(3),
         TxnOrdering::Unordered,
         Some(Duration::from_millis(250))
     )));
+}
+
+/// A statement sent right after its Begin runs once the transaction is
+/// open: the Begin holds the transaction's lane until the engine has opened
+/// it, so the statement cannot reach the engine first.
+#[tokio::test]
+async fn a_statement_sent_right_after_its_begin_runs_after_it() {
+    let recording = Arc::new(RecordingEngine::default());
+    run_session(
+        Arc::clone(&recording) as Arc<dyn CursorEngine>,
+        vec![
+            SessionOp::Begin {
+                transaction: txid(7),
+                ordering: TxnOrdering::Unordered,
+                drain_timeout_ms: 0,
+            },
+            statement("first", Some(txid(7))),
+        ],
+    )
+    .await;
+    let calls = recording.calls();
+    let begin = calls
+        .iter()
+        .position(|call| matches!(call, Call::Begin(id, ..) if *id == txid(7)))
+        .expect("the begin reached the engine");
+    let first = calls
+        .iter()
+        .position(|call| matches!(call, Call::Statement { query, .. } if query == "first"))
+        .expect("the statement reached the engine");
+    assert!(
+        begin < first,
+        "the statement ran before its begin: {calls:?}"
+    );
+}
+
+/// A Begin the engine refuses is answered with the refusal.
+#[tokio::test]
+async fn a_refused_begin_is_answered() {
+    struct Refuses;
+    impl CursorEngine for Refuses {
+        fn open_cursor(
+            &self,
+            _query: &str,
+            _params: HashMap<String, Value>,
+            _transaction: Option<&InTransaction>,
+            _settings: &ConnectionSettings,
+            _source: Option<&StatementSource>,
+            _operation: Option<&OperationDescriptor>,
+            _cancel: &coordinode_core::budget::CancelFlag,
+        ) -> Result<Box<dyn QueryCursor>, EngineError> {
+            Ok(empty_cursor())
+        }
+        fn begin_transaction(
+            &self,
+            _transaction: TransactionId,
+            _ordering: TxnOrdering,
+            _drain: Option<Duration>,
+        ) -> Result<(), EngineError> {
+            Err(EngineError(Failure::new(
+                ErrorCode::AlreadyExists,
+                "transaction ID in use",
+            )))
+        }
+        fn commit_transaction(
+            &self,
+            _transaction: TransactionId,
+            _last_nonce: Option<u64>,
+            _operation: Option<&OperationDescriptor>,
+            _admission: &AdmissionSignal,
+        ) -> Result<CommitReceipt, EngineError> {
+            Ok(MOCK_RECEIPT)
+        }
+        fn rollback_transaction(
+            &self,
+            _transaction: TransactionId,
+            _admission: &AdmissionSignal,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    let events = run_one(
+        Arc::new(Refuses),
+        SessionOp::Begin {
+            transaction: txid(1),
+            ordering: TxnOrdering::Unordered,
+            drain_timeout_ms: 0,
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [SessionEvent::Error(Failure {
+                code: ErrorCode::AlreadyExists,
+                ..
+            })]
+        ),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -795,12 +898,12 @@ async fn commit_acknowledges_and_rollback_cancel_are_silent() {
         engine(&[], vec![]),
         vec![
             SessionOp::Commit {
-                transaction: handle(1),
+                transaction: txid(1),
                 last_nonce: 0,
                 operation: None,
             },
             SessionOp::Rollback {
-                transaction: handle(2),
+                transaction: txid(2),
             },
             SessionOp::Cancel {
                 target_request_id: 1,
@@ -824,7 +927,7 @@ async fn commit_acknowledges_and_rollback_cancel_are_silent() {
 #[tokio::test]
 async fn a_repeated_commit_is_answered() {
     let commit = SessionOp::Commit {
-        transaction: handle(1),
+        transaction: txid(1),
         last_nonce: 0,
         operation: None,
     };
@@ -880,15 +983,16 @@ impl CursorEngine for Gated {
 
     fn begin_transaction(
         &self,
+        _transaction: TransactionId,
         _ordering: TxnOrdering,
         _drain: Option<Duration>,
-    ) -> Result<TransactionHandle, EngineError> {
-        Ok(handle(1))
+    ) -> Result<(), EngineError> {
+        Ok(())
     }
 
     fn commit_transaction(
         &self,
-        _transaction: TransactionHandle,
+        _transaction: TransactionId,
         _last_nonce: Option<u64>,
         _operation: Option<&OperationDescriptor>,
         admission: &AdmissionSignal,
@@ -900,7 +1004,7 @@ impl CursorEngine for Gated {
 
     fn rollback_transaction(
         &self,
-        _transaction: TransactionHandle,
+        _transaction: TransactionId,
         _admission: &AdmissionSignal,
     ) -> Result<(), EngineError> {
         Ok(())
@@ -927,14 +1031,14 @@ async fn a_stream_keeps_its_order_for_each_transaction() {
     let run = tokio::spawn(session.run(op_rx, ev_tx));
 
     let ops = [
-        statement("held", Some(handle(1))),
-        statement("next", Some(handle(1))),
+        statement("held", Some(txid(1))),
+        statement("next", Some(txid(1))),
         SessionOp::Commit {
-            transaction: handle(1),
+            transaction: txid(1),
             last_nonce: 0,
             operation: None,
         },
-        statement("other", Some(handle(2))),
+        statement("other", Some(txid(2))),
         statement("free", None),
     ];
     for (i, op) in ops.into_iter().enumerate() {
@@ -986,10 +1090,11 @@ async fn closing_the_stream_detaches_its_transactions() {
         Arc::clone(&registry),
         vec![
             SessionOp::Begin {
+                transaction: txid(5),
                 ordering: TxnOrdering::Unordered,
                 drain_timeout_ms: 0,
             },
-            statement("open", Some(handle(5))),
+            statement("open", Some(txid(5))),
         ],
     )
     .await;
@@ -1021,9 +1126,7 @@ async fn attachments_follow_the_commands_a_session_sends() {
             if got == rid
                 && matches!(
                     event,
-                    SessionEvent::Begun { .. }
-                        | SessionEvent::CursorEnd { .. }
-                        | SessionEvent::Committed { .. }
+                    SessionEvent::CursorEnd { .. } | SessionEvent::Committed { .. }
                 )
             {
                 return event;
@@ -1031,29 +1134,33 @@ async fn attachments_follow_the_commands_a_session_sends() {
         }
     };
 
-    let SessionEvent::Begun { transaction: begun } = answer(
-        1,
-        SessionOp::Begin {
-            ordering: TxnOrdering::Unordered,
-            drain_timeout_ms: 0,
-        },
-    )
-    .await
-    else {
-        unreachable!()
-    };
-    answer(2, statement("used", Some(handle(42)))).await;
+    // A Begin is not answered; the statement after it in the same lane is,
+    // once the transaction is open.
+    let begun = txid(1);
+    op_tx
+        .send((
+            1,
+            SessionOp::Begin {
+                transaction: begun,
+                ordering: TxnOrdering::Unordered,
+                drain_timeout_ms: 0,
+            },
+        ))
+        .await
+        .unwrap();
+    answer(2, statement("in-begun", Some(begun))).await;
+    answer(3, statement("used", Some(txid(42)))).await;
     let attached = |registry: &SessionRegistry| {
         let mut attached = registry.sessions()[0].attached.clone();
         attached.sort();
         attached
     };
-    let mut expected = vec![begun.to_string(), handle(42).to_string()];
+    let mut expected = vec![begun.to_string(), txid(42).to_string()];
     expected.sort();
     assert_eq!(attached(&registry), expected);
 
     answer(
-        3,
+        4,
         SessionOp::Commit {
             transaction: begun,
             last_nonce: 0,
@@ -1061,7 +1168,7 @@ async fn attachments_follow_the_commands_a_session_sends() {
         },
     )
     .await;
-    assert_eq!(attached(&registry), vec![handle(42).to_string()]);
+    assert_eq!(attached(&registry), vec![txid(42).to_string()]);
 
     drop(op_tx);
     while ev_rx.recv().await.is_some() {}

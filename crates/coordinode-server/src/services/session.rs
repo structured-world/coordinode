@@ -39,10 +39,9 @@ use crate::proto::replication;
 use crate::proto::session::server_frame::Event;
 use crate::proto::session::session_service_server::SessionService as SessionServiceTrait;
 use crate::proto::session::{
-    Acknowledged, Begun, ClientFrame, Committed, Configure,
-    ConnectionStatus as ProtoConnectionStatus, CursorEnd, CursorOpen, Execute,
-    Ordering as ProtoOrdering, RowBatch, ServerFrame, Subscribed, SubscriptionCancelled,
-    client_frame,
+    Acknowledged, ClientFrame, Committed, Configure, ConnectionStatus as ProtoConnectionStatus,
+    CursorEnd, CursorOpen, Execute, Ordering as ProtoOrdering, RowBatch, ServerFrame, Subscribed,
+    SubscriptionCancelled, client_frame,
 };
 
 /// In-flight messages buffered per channel before backpressure: a producer that
@@ -344,10 +343,8 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
     let op = op.ok_or_else(|| Status::invalid_argument("client frame had no op"))?;
     Ok(match op {
         client_frame::Op::Execute(e) => SessionOp::Execute {
-            transaction: (!e.transaction.is_empty())
-                .then(|| {
-                    super::error_details::transaction_handle("execute.transaction", &e.transaction)
-                })
+            transaction: (!e.txid.is_empty())
+                .then(|| super::error_details::transaction_id("execute.txid", &e.txid))
                 .transpose()?,
             settings: statement_settings(&e)?,
             operation: super::operation::optional_descriptor(
@@ -372,6 +369,7 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
             nonce: e.nonce,
         },
         client_frame::Op::Begin(b) => SessionOp::Begin {
+            transaction: super::error_details::transaction_id("begin.txid", &b.txid)?,
             ordering: match b.ordering() {
                 ProtoOrdering::Unordered => TxnOrdering::Unordered,
                 // Unspecified and Ordered both mean ordered.
@@ -384,17 +382,11 @@ fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, 
                 "commit.operation",
                 c.operation.as_ref(),
             )?,
-            transaction: super::error_details::transaction_handle(
-                "commit.transaction",
-                &c.transaction,
-            )?,
+            transaction: super::error_details::transaction_id("commit.txid", &c.txid)?,
             last_nonce: c.last_nonce,
         },
         client_frame::Op::Rollback(r) => SessionOp::Rollback {
-            transaction: super::error_details::transaction_handle(
-                "rollback.transaction",
-                &r.transaction,
-            )?,
+            transaction: super::error_details::transaction_id("rollback.txid", &r.txid)?,
         },
         client_frame::Op::Cancel(c) => SessionOp::Cancel {
             target_request_id: c.target_request_id,
@@ -552,9 +544,6 @@ fn settings_to_proto(s: &ConnectionSettings) -> Configure {
 /// Map a neutral event back to a gRPC server frame.
 fn event_to_frame(request_id: u64, event: SessionEvent) -> ServerFrame {
     let event = match event {
-        SessionEvent::Begun { transaction } => Event::Begun(Begun {
-            transaction: transaction.to_bytes().to_vec(),
-        }),
         SessionEvent::CursorOpen { columns } => Event::CursorOpen(CursorOpen { columns }),
         SessionEvent::Rows { rows } => Event::Rows(RowBatch {
             rows: rows

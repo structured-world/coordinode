@@ -128,9 +128,9 @@ fn a_refused_set_in_a_transaction_leaves_no_version() {
             matches!(
                 ended,
                 Err(coordinode_embed::DatabaseError::TransactionAborted {
-                    handle,
+                    id,
                     end: coordinode_embed::TransactionEnd::StatementFailed,
-                }) if handle == tx
+                }) if id == tx
             ),
             "commit={commit}: {ended:?}"
         );

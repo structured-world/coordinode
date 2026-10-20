@@ -54,14 +54,22 @@ pub enum Reason {
     DivideByZero,
     /// An integer operation whose exact result leaves the 64-bit range.
     LongOverflow,
-    /// No transaction is held under this id: never opened, or already
-    /// finished, aborted or swept. Either way the server holds nothing for it,
-    /// so there is nothing left to clean up.
+    /// No transaction is held under this ID on the leader: never opened
+    /// there (a change of leader ends every open transaction, so the new
+    /// leader knows none of the old one's), or already finished, aborted or
+    /// swept. Either way the server holds nothing for it, so there is nothing
+    /// left to clean up, and a transaction never committed runs again under
+    /// a new ID. Metadata carries `transaction`.
     UnknownTransaction,
-    /// The transaction ended because the leader that held it changed before
-    /// it was committed. Nothing of it was applied. Metadata carries
-    /// `transaction` and `end`. Re-running the whole transaction from BEGIN is
-    /// the intended response.
+    /// A transaction start names an ID that is open, or ended recently.
+    /// Nothing ran. Metadata carries `transaction`. Terminal for that ID: a
+    /// new transaction draws a new one.
+    TransactionIdInUse,
+    /// The transaction ended on its leader before it was committed: a
+    /// statement failed, it stayed idle, or an ordered chain did not
+    /// complete. Nothing of it was applied. Metadata carries `transaction`
+    /// and `end`. Re-running the whole transaction under a new ID is the
+    /// intended response.
     TransactionAborted,
     /// Another command is running on the same transaction. Nothing changed
     /// and the transaction stays open. Metadata carries `transaction`. Retry
@@ -243,6 +251,7 @@ impl Reason {
             Reason::DivideByZero => "DIVIDE_BY_ZERO",
             Reason::LongOverflow => "LONG_OVERFLOW",
             Reason::UnknownTransaction => "UNKNOWN_TRANSACTION",
+            Reason::TransactionIdInUse => "TRANSACTION_ID_IN_USE",
             Reason::TransactionAborted => "TRANSACTION_ABORTED",
             Reason::TransactionBusy => "TRANSACTION_BUSY",
             Reason::StatementAlreadyAdmitted => "STATEMENT_ALREADY_ADMITTED",
@@ -373,14 +382,14 @@ pub fn invalid_field(field: impl Into<String>, description: impl Into<String>) -
     )
 }
 
-/// The transaction handle request field `field` carries, or `INVALID_ARGUMENT`
+/// The transaction ID request field `field` carries, or `INVALID_ARGUMENT`
 /// when its bytes are not one.
-pub fn transaction_handle(
+pub fn transaction_id(
     field: &str,
     bytes: &[u8],
-) -> Result<coordinode_embed::TransactionHandle, Status> {
-    coordinode_embed::TransactionHandle::from_bytes(bytes)
-        .map_err(|_| invalid_field(field, "not a transaction handle this server issued"))
+) -> Result<coordinode_embed::TransactionId, Status> {
+    coordinode_embed::TransactionId::from_bytes(bytes)
+        .map_err(|_| invalid_field(field, "a transaction ID is a UUID of 16 bytes"))
 }
 
 /// A status naming catalog object `name` of kind `object`, as the subject of

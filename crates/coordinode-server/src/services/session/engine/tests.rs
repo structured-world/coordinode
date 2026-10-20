@@ -159,11 +159,16 @@ fn a_cancelled_statement_answers_with_a_cancellation() {
         .expect("cancelled");
     assert_eq!(refused.0.code, coordinode_session::ErrorCode::Cancelled);
 
-    let handle = engine
-        .begin_transaction(coordinode_core::operations::TxnOrdering::Unordered, None)
+    let id = coordinode_embed::db::draw_transaction_id();
+    engine
+        .begin_transaction(
+            id,
+            coordinode_core::operations::TxnOrdering::Unordered,
+            None,
+        )
         .expect("begin");
     let transaction = coordinode_session::InTransaction {
-        handle,
+        id,
         nonce: 0,
         admission: AdmissionSignal::new(|| {}),
     };
@@ -576,7 +581,7 @@ async fn a_cancel_stops_a_statement_waiting_on_the_leader() {
                 .routed(
                     1,
                     statement,
-                    &coordinode_core::txn::handle::AdmissionSignal::new(|| {}),
+                    &coordinode_core::txn::command::AdmissionSignal::new(|| {}),
                     &cancel,
                 )
                 .err()
@@ -665,6 +670,27 @@ impl Driver {
         }
     }
 
+    /// Begin a transaction under a newly drawn ID, as a client does: the
+    /// Begin is not answered when it opens, and the transaction's next
+    /// command waits for it on the session.
+    async fn begin(&mut self, ordering: coordinode_core::operations::TxnOrdering) -> TransactionId {
+        let transaction = coordinode_embed::db::draw_transaction_id();
+        let id = self.next_id;
+        self.next_id += 1;
+        self.ops
+            .send((
+                id,
+                SessionOp::Begin {
+                    transaction,
+                    ordering,
+                    drain_timeout_ms: 0,
+                },
+            ))
+            .await
+            .expect("send");
+        transaction
+    }
+
     /// Send `op` and collect its answer; a request left unanswered fails the
     /// test naming it rather than hanging the run.
     async fn send(&mut self, op: SessionOp) -> Vec<SessionEvent> {
@@ -690,7 +716,6 @@ impl Driver {
                 SessionEvent::CursorEnd { .. }
                     | SessionEvent::Error(_)
                     | SessionEvent::Committed { .. }
-                    | SessionEvent::Begun { .. }
             );
             out.push(event);
             if last {
@@ -729,7 +754,6 @@ impl Driver {
                 SessionEvent::CursorEnd { .. }
                     | SessionEvent::Error(_)
                     | SessionEvent::Committed { .. }
-                    | SessionEvent::Begun { .. }
             );
             slot.push(event);
             if last {
@@ -742,7 +766,7 @@ impl Driver {
     async fn execute(
         &mut self,
         query: &str,
-        transaction: Option<TransactionHandle>,
+        transaction: Option<TransactionId>,
         operation: Option<coordinode_embed::operation::OperationDescriptor>,
     ) -> Vec<SessionEvent> {
         self.execute_numbered(query, transaction, 0, operation)
@@ -752,7 +776,7 @@ impl Driver {
     async fn execute_numbered(
         &mut self,
         query: &str,
-        transaction: Option<TransactionHandle>,
+        transaction: Option<TransactionId>,
         nonce: u64,
         operation: Option<coordinode_embed::operation::OperationDescriptor>,
     ) -> Vec<SessionEvent> {
@@ -785,16 +809,8 @@ fn only_value(events: &[SessionEvent]) -> Value {
     }
 }
 
-/// The handle a Begin answered with.
-fn begun(events: &[SessionEvent]) -> TransactionHandle {
-    match events {
-        [SessionEvent::Begun { transaction }] => *transaction,
-        other => panic!("expected a transaction, got {other:?}"),
-    }
-}
-
 /// A transaction outlives the stream that began it: closing that stream rolls
-/// nothing back, and another stream continues it by its handle, with the same
+/// nothing back, and another stream continues it by its ID, with the same
 /// pinned view and its own writes, then commits it. A statement retransmitted
 /// under a nonce the first stream already sent is not applied a second time.
 #[tokio::test(flavor = "multi_thread")]
@@ -803,14 +819,9 @@ async fn a_transaction_continues_on_another_stream_after_the_first_closes() {
     let engine = Arc::new(DatabaseCursorEngine::new(Arc::clone(&database)));
 
     let mut first = Driver::open_shared(Arc::clone(&engine));
-    let transaction = begun(
-        &first
-            .send(SessionOp::Begin {
-                ordering: coordinode_core::operations::TxnOrdering::Unordered,
-                drain_timeout_ms: 0,
-            })
-            .await,
-    );
+    let transaction = first
+        .begin(coordinode_core::operations::TxnOrdering::Unordered)
+        .await;
     let wrote = first
         .execute_numbered("CREATE (:Moved {k: 1})", Some(transaction), 1, None)
         .await;
@@ -875,14 +886,9 @@ async fn a_transaction_continues_on_another_stream_after_the_first_closes() {
 async fn an_ordered_chain_sent_out_of_order_applies_by_nonce() {
     let database = seeded_db(0);
     let mut session = Driver::open(DatabaseCursorEngine::new(Arc::clone(&database)));
-    let transaction = begun(
-        &session
-            .send(SessionOp::Begin {
-                ordering: coordinode_core::operations::TxnOrdering::Ordered,
-                drain_timeout_ms: 0,
-            })
-            .await,
-    );
+    let transaction = session
+        .begin(coordinode_core::operations::TxnOrdering::Ordered)
+        .await;
     let numbered = |query: &str, nonce| SessionOp::Execute {
         query: query.to_string(),
         params: HashMap::new(),
@@ -980,16 +986,9 @@ async fn a_session_write_retried_with_its_operation_runs_once() {
     assert_eq!(metadata["outcome"], "COMMITTED");
     assert_eq!(metadata["commit_ts"], statement_ts.to_string());
 
-    let begun = session
-        .send(SessionOp::Begin {
-            ordering: coordinode_core::operations::TxnOrdering::Unordered,
-            drain_timeout_ms: 0,
-        })
+    let transaction = session
+        .begin(coordinode_core::operations::TxnOrdering::Unordered)
         .await;
-    let [SessionEvent::Begun { transaction }] = begun.as_slice() else {
-        panic!("expected a transaction, got {begun:?}");
-    };
-    let transaction = *transaction;
     let inside = session
         .execute("CREATE (:Basket {k: 1})", Some(transaction), None)
         .await;

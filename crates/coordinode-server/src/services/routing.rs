@@ -5,7 +5,8 @@
 use std::time::Instant;
 
 use coordinode_core::budget::CancelFlag;
-use coordinode_core::txn::handle::{ActingContext, AdmissionSignal, TransactionHandle};
+use coordinode_core::operations::TxnOrdering;
+use coordinode_core::txn::command::{ActingContext, AdmissionSignal};
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::db::{CommitOptions, RollbackOptions, StatementOptions, TransactionOptions};
 use coordinode_embed::replication::routing::{
@@ -47,6 +48,7 @@ impl CommandExecutor for ServerCommandExecutor {
             params,
             settings,
             transaction,
+            start_transaction,
             nonce,
             operation,
             deadline,
@@ -56,8 +58,23 @@ impl CommandExecutor for ServerCommandExecutor {
         let deadline = deadline.map(|left| Instant::now() + left);
 
         // A transaction's statement reads at its pinned snapshot and buffers
-        // its writes: no fence and no commit of its own.
-        if let Some(handle) = transaction {
+        // its writes: no fence and no commit of its own. The start opens the
+        // transaction under the client's ID first.
+        if let Some(id) = transaction {
+            let db = self.executor.database().read();
+            if start_transaction {
+                db.begin_transaction_as(
+                    id,
+                    &TransactionOptions {
+                        actor: Some(actor.clone()),
+                        read_concern: settings.read_concern,
+                        write_concern: settings.write_concern,
+                        ordering: TxnOrdering::Unordered,
+                        drain_timeout: None,
+                    },
+                )
+                .map_err(db_error_to_status)?;
+            }
             let options = StatementOptions {
                 vector_consistency: settings.vector_consistency,
                 vector_build_wait: settings.vector_build_wait,
@@ -69,11 +86,8 @@ impl CommandExecutor for ServerCommandExecutor {
                 admission: Some(admitted.clone()),
                 ..StatementOptions::default()
             };
-            let rows = self
-                .executor
-                .database()
-                .read()
-                .execute_in_transaction_with(handle, &query, params, &options)
+            let rows = db
+                .execute_in_transaction_with(id, &query, params, &options)
                 .map_err(db_error_to_status)?;
             let (columns, rows) = columns_and_values(&rows);
             return Ok(RoutedAnswer {
@@ -134,17 +148,20 @@ impl CommandExecutor for ServerCommandExecutor {
         })
     }
 
-    fn begin(&self, begin: RoutedBegin) -> Result<TransactionHandle, Status> {
+    fn begin(&self, begin: RoutedBegin) -> Result<(), Status> {
         self.executor
             .database()
             .read()
-            .begin_transaction_with(&TransactionOptions {
-                actor: Some(begin.actor),
-                read_concern: begin.read_concern,
-                write_concern: begin.write_concern,
-                ordering: begin.ordering,
-                drain_timeout: begin.drain_timeout,
-            })
+            .begin_transaction_as(
+                begin.transaction,
+                &TransactionOptions {
+                    actor: Some(begin.actor),
+                    read_concern: begin.read_concern,
+                    write_concern: begin.write_concern,
+                    ordering: begin.ordering,
+                    drain_timeout: begin.drain_timeout,
+                },
+            )
             .map_err(db_error_to_status)
     }
 

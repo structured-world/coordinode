@@ -20,7 +20,7 @@
 //! | `a_new_leader_never_reissues_a_node_id` | ExecuteCypher | After the leader goes away the member that takes over creates a node beside the old ones, never over one |
 //! | `a_text_index_created_on_the_leader_serves_searches_on_a_follower` | ExecuteCypher | A text index defined on the leader registers on the follower when it applies there and answers searches from the follower's own index |
 //! | `constraints_held_before_the_cluster_bind_every_member_after_a_leader_change` | ExecuteCypher, ListConstraints | Constraints that reached the members through the base snapshot are listed active on the new leader and refuse the writes that break them |
-//! | `a_transaction_runs_through_any_member` | BeginTransaction, ExecuteCypher, CommitTransaction | A transaction begun on a follower opens at the leader, takes statements through two members and commits through a follower; follower answers name the leader |
+//! | `a_transaction_runs_through_any_member` | ExecuteCypher, CommitTransaction | A transaction started on a follower under the client's ID opens at the leader, takes statements through two members and commits through a follower; follower answers name the leader |
 //! | `a_write_through_a_follower_runs_at_the_leader` | ExecuteCypher | An autonomous write on a follower runs at the leader, one hop, naming the leader; the leader adds no hint |
 //! | `a_session_on_a_follower_works_on_the_leaders_transaction` | Session | A session on a follower fills the leader's transaction, and a session on another member continues and commits it |
 //!
@@ -1142,29 +1142,39 @@ async fn three_member_group() -> (CoordinodeProcess, CoordinodeProcess, Coordino
 fn in_transaction(query: &str, transaction: &[u8]) -> ExecuteCypherRequest {
     ExecuteCypherRequest {
         query: query.to_string(),
-        transaction: transaction.to_vec(),
+        transaction_id: transaction.to_vec(),
         ..Default::default()
     }
 }
 
-/// A client works through whichever member it reached. A transaction begun on
-/// a follower opens at the leader; its statements, sent to different members
-/// one after another, all run in it; it commits through a follower; and every
-/// answer of a follower names the leader to move to.
+/// A transaction ID as a client draws it: a random UUID.
+fn draw_transaction_id() -> Vec<u8> {
+    uuid::Uuid::new_v4().as_bytes().to_vec()
+}
+
+/// A client works through whichever member it reached. A transaction started
+/// on a follower opens at the leader under the ID the client drew; its
+/// statements, sent to different members one after another, all run in it;
+/// it commits through a follower; and every answer of a follower names the
+/// leader to move to.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transaction_runs_through_any_member() {
-    use coordinode_integration::proto::query::{BeginTransactionRequest, CommitTransactionRequest};
+    use coordinode_integration::proto::query::CommitTransactionRequest;
 
     let (n1, n2, n3) = three_member_group().await;
     let mut on_two = n2.cypher_client().await;
     let mut on_three = n3.cypher_client().await;
 
-    let begun = on_two
-        .begin_transaction(BeginTransactionRequest::default())
+    let transaction = draw_transaction_id();
+    let started = on_two
+        .execute_cypher(ExecuteCypherRequest {
+            start_transaction: true,
+            ..in_transaction("CREATE (:Routed {k: 1})", &transaction)
+        })
         .await
-        .expect("a follower opens the transaction at the leader");
+        .expect("a follower starts the transaction at the leader");
     assert_eq!(
-        begun
+        started
             .metadata()
             .get("x-coordinode-leader")
             .map(|v| v.to_str().expect("ascii")),
@@ -1172,15 +1182,9 @@ async fn a_transaction_runs_through_any_member() {
         "a follower names the leader on its answer"
     );
     assert!(
-        begun.metadata().get("x-coordinode-leader-addr").is_none(),
+        started.metadata().get("x-coordinode-leader-addr").is_none(),
         "the address members reach each other at is not disclosed"
     );
-    let transaction = begun.into_inner().transaction;
-
-    on_two
-        .execute_cypher(in_transaction("CREATE (:Routed {k: 1})", &transaction))
-        .await
-        .expect("the first statement runs at the holder");
     on_three
         .execute_cypher(in_transaction("CREATE (:Routed {k: 2})", &transaction))
         .await
@@ -1208,7 +1212,7 @@ async fn a_transaction_runs_through_any_member() {
 
     on_two
         .commit_transaction(CommitTransactionRequest {
-            transaction: transaction.clone(),
+            transaction_id: transaction.clone(),
             ..Default::default()
         })
         .await
@@ -1222,16 +1226,16 @@ async fn a_transaction_runs_through_any_member() {
         "both writes committed together"
     );
 
-    // The transaction is gone at its holder: committing it again through
+    // The transaction is gone at the leader: committing it again through
     // any member is told so.
     let again = on_three
         .commit_transaction(CommitTransactionRequest {
-            transaction,
+            transaction_id: transaction,
             ..Default::default()
         })
         .await
         .expect_err("already committed");
-    assert_ne!(again.code(), tonic::Code::Ok);
+    assert_eq!(again.code(), tonic::Code::NotFound);
 }
 
 /// An autonomous write sent to a follower runs at the leader and answers as
@@ -1319,12 +1323,9 @@ async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
             let f = inbound.message().await.expect("frame").expect("not end");
             if f.request_id == want {
                 match f.event {
-                    Some(
-                        e @ (Event::Begun(_)
-                        | Event::CursorEnd(_)
-                        | Event::Committed(_)
-                        | Event::Error(_)),
-                    ) => return e,
+                    Some(e @ (Event::CursorEnd(_) | Event::Committed(_) | Event::Error(_))) => {
+                        return e;
+                    }
                     _ => continue,
                 }
             }
@@ -1335,7 +1336,7 @@ async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
             request_id,
             op: Some(client_frame::Op::Execute(Execute {
                 query: query.to_string(),
-                transaction: transaction.to_vec(),
+                txid: transaction.to_vec(),
                 ..Default::default()
             })),
         }
@@ -1343,27 +1344,27 @@ async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
 
     let (n1, n2, n3) = three_member_group().await;
     let (first, mut first_in) = open(&n2).await;
+    let transaction = draw_transaction_id();
+    // The Begin is not answered; the write sent right after it runs once the
+    // transaction is open.
     first
         .send(ClientFrame {
             request_id: 1,
             op: Some(client_frame::Op::Begin(Begin {
+                txid: transaction.clone(),
                 ordering: 2, // ORDERING_UNORDERED
                 drain_timeout_ms: 0,
             })),
         })
         .await
         .expect("begin");
-    let transaction = match terminal(&mut first_in, 1).await {
-        Event::Begun(b) => b.transaction,
-        other => panic!("expected Begun, got {other:?}"),
-    };
     first
         .send(execute(2, "CREATE (:SessionRouted {k: 1})", &transaction))
         .await
         .expect("write");
     match terminal(&mut first_in, 2).await {
         Event::CursorEnd(_) => {}
-        other => panic!("the write runs at the holder, got {other:?}"),
+        other => panic!("the write runs at the leader, got {other:?}"),
     }
     drop(first);
     while first_in.message().await.expect("frame").is_some() {}
@@ -1381,7 +1382,7 @@ async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
         .send(ClientFrame {
             request_id: 2,
             op: Some(client_frame::Op::Commit(Commit {
-                transaction,
+                txid: transaction,
                 last_nonce: 0,
                 operation: None,
             })),

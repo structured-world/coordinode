@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant; // no-std: caller-provided Clock trait
 
 use coordinode_core::operations::{OperationsView, SessionSnapshot};
-use coordinode_core::txn::handle::TransactionHandle;
+use coordinode_core::txn::command::TransactionId;
 use parking_lot::RwLock;
 
 /// Node-local registry of live sessions and their transaction attachments.
@@ -31,7 +31,7 @@ struct SessionEntry {
     peer: String,
     opened_at: Instant,
     in_flight: u64,
-    attached: HashSet<TransactionHandle>,
+    attached: HashSet<TransactionId>,
 }
 
 impl SessionRegistry {
@@ -80,14 +80,14 @@ impl SessionRegistry {
     }
 
     /// Record that the session sends commands for `transaction`.
-    pub fn attach(&self, session_id: u64, transaction: TransactionHandle) {
+    pub fn attach(&self, session_id: u64, transaction: TransactionId) {
         if let Some(e) = self.sessions.write().get_mut(&session_id) {
             e.attached.insert(transaction);
         }
     }
 
     /// Record that `transaction` ended through the session.
-    pub fn detach(&self, session_id: u64, transaction: &TransactionHandle) {
+    pub fn detach(&self, session_id: u64, transaction: &TransactionId) {
         if let Some(e) = self.sessions.write().get_mut(&session_id) {
             e.attached.remove(transaction);
         }

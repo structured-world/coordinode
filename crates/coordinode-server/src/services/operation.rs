@@ -13,7 +13,7 @@ use coordinode_embed::operation::{
 };
 use tonic::{Code, Request, Response, Status};
 
-use coordinode_core::txn::handle::ActingContext;
+use coordinode_core::txn::command::ActingContext;
 use coordinode_embed::replication::routing::{RoutedOperationAnswer, RoutedOperationCall};
 
 use super::cypher::db_error_to_status;

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::operations::TxnOrdering;
-use coordinode_core::txn::handle::{AdmissionSignal, TransactionHandle};
+use coordinode_core::txn::command::{AdmissionSignal, TransactionId};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 
@@ -21,7 +21,7 @@ use crate::types::{ConnectionSettings, Failure, SessionStats, StatementSource};
 #[derive(Debug, Clone)]
 pub struct InTransaction {
     /// The transaction.
-    pub handle: TransactionHandle,
+    pub id: TransactionId,
     /// The statement's number within it; zero for none.
     pub nonce: u64,
     /// Told when the statement has its place in the transaction's order; the
@@ -55,7 +55,7 @@ impl std::error::Error for EngineError {}
 /// opaque dialect text the core does not inspect; `params` are already in the
 /// engine's value space; `transaction` is the interactive transaction the
 /// statement runs in, `None` for an autonomous (auto-commit) statement. The
-/// transaction lives on its owner, not in the session: a session closing
+/// transaction lives on the leader, not in the session: a session closing
 /// leaves it open. `settings` are the statement's
 /// own settings over its session's: a field still unset is the engine's
 /// default. `source` is where in the client's code the statement was issued.
@@ -92,17 +92,18 @@ pub trait CursorEngine: Send + Sync {
         None
     }
 
-    /// Open a new interactive transaction ordering its statements as
-    /// `ordering` says and return its handle. Subsequent `open_cursor` calls
-    /// carrying this handle run inside it, reading its pinned snapshot and
-    /// buffering writes until `commit_transaction`. `drain` bounds how long
-    /// an ordered transaction waits for a missing statement; the engine's
-    /// default when `None`.
+    /// Open a new interactive transaction under `transaction`, the ID the
+    /// client drew, ordering its statements as `ordering` says. Subsequent
+    /// `open_cursor` calls carrying this ID run inside it, reading its pinned
+    /// snapshot and buffering writes until `commit_transaction`. `drain`
+    /// bounds how long an ordered transaction waits for a missing statement;
+    /// the engine's default when `None`.
     fn begin_transaction(
         &self,
+        transaction: TransactionId,
         ordering: TxnOrdering,
         drain: Option<Duration>,
-    ) -> Result<TransactionHandle, EngineError>;
+    ) -> Result<(), EngineError>;
 
     /// Commit an interactive transaction once every statement admitted to it
     /// has run (an ordered chain up to `last_nonce`), flushing its buffered
@@ -114,7 +115,7 @@ pub trait CursorEngine: Send + Sync {
     /// the commit has its place.
     fn commit_transaction(
         &self,
-        transaction: TransactionHandle,
+        transaction: TransactionId,
         last_nonce: Option<u64>,
         operation: Option<&OperationDescriptor>,
         admission: &AdmissionSignal,
@@ -125,7 +126,7 @@ pub trait CursorEngine: Send + Sync {
     /// the rollback has its place.
     fn rollback_transaction(
         &self,
-        transaction: TransactionHandle,
+        transaction: TransactionId,
         admission: &AdmissionSignal,
     ) -> Result<(), EngineError>;
 }

@@ -252,7 +252,7 @@ fn retryable_refusals_carry_the_sqlstate_drivers_retry_on() {
     let cases = [
         (
             DatabaseError::TransactionConflict {
-                id: coordinode_embed::TransactionHandle::new(None, 0, 1, 1),
+                id: coordinode_embed::TransactionId::from_raw([1; 16]),
                 source_message: "conflict".to_string(),
             },
             "40001",

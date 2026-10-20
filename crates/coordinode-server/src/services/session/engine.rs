@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::operations::TxnOrdering;
-use coordinode_core::txn::handle::{AdmissionSignal, TransactionHandle};
+use coordinode_core::txn::command::{AdmissionSignal, TransactionId};
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::db::{
@@ -39,7 +39,7 @@ use coordinode_session::{
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
 
-use coordinode_core::txn::handle::ActingContext;
+use coordinode_core::txn::command::ActingContext;
 use coordinode_embed::replication::routing::{
     RoutedBegin, RoutedCommit, RoutedRollback, RoutedSettings, RoutedStatement,
 };
@@ -154,6 +154,14 @@ impl DatabaseCursorEngine {
         })
     }
 
+    /// The member every command of a transaction runs at, when it is not this
+    /// one.
+    fn transaction_leader(&self) -> Result<Option<u64>, EngineError> {
+        self.executor
+            .transaction_leader()
+            .map_err(|s| EngineError(failure(&s)))
+    }
+
     /// An autonomous session statement as routed to the leader: the settings
     /// the session named go with it, the leader does not know the session.
     fn autonomous(
@@ -168,6 +176,7 @@ impl DatabaseCursorEngine {
             params: params.unwrap_or_default(),
             settings: routed_settings(requested),
             transaction: None,
+            start_transaction: false,
             nonce: None,
             operation: requested.operation,
             // A session statement has no call deadline; its stream lives on,
@@ -220,9 +229,9 @@ impl CursorEngine for DatabaseCursorEngine {
         // fence and no commit of its own here. Its session's vector settings
         // still apply.
         if let Some(transaction) = transaction {
-            // Held by another member: the statement runs there, and has its
-            // place once that member says so.
-            if let Some(holder) = self.executor.holder(&transaction.handle) {
+            // Another member leads: the statement runs there, and has its
+            // place once the leader says so.
+            if let Some(leader) = self.transaction_leader()? {
                 let statement = RoutedStatement {
                     actor: ActingContext::Trusted,
                     query: query.to_string(),
@@ -233,13 +242,14 @@ impl CursorEngine for DatabaseCursorEngine {
                         query_memory_limit: settings.query_memory_limit,
                         ..RoutedSettings::default()
                     },
-                    transaction: Some(transaction.handle),
+                    transaction: Some(transaction.id),
+                    start_transaction: false,
                     nonce: Some(transaction.nonce),
                     operation: None,
                     deadline: None,
                     source,
                 };
-                return self.routed(holder, statement, &transaction.admission, cancel);
+                return self.routed(leader, statement, &transaction.admission, cancel);
             }
             let options = StatementOptions {
                 vector_consistency: settings.vector_consistency,
@@ -253,7 +263,7 @@ impl CursorEngine for DatabaseCursorEngine {
             let rows = self
                 .database()
                 .read()
-                .execute_in_transaction_with(transaction.handle, query, params, &options)
+                .execute_in_transaction_with(transaction.id, query, params, &options)
                 .map_err(engine_error)?;
             let (columns, rows) = columns_and_values(&rows);
             return Ok(Box::new(MaterializedCursor {
@@ -345,21 +355,19 @@ impl CursorEngine for DatabaseCursorEngine {
 
     fn begin_transaction(
         &self,
+        transaction: TransactionId,
         ordering: TxnOrdering,
         drain: Option<Duration>,
-    ) -> Result<TransactionHandle, EngineError> {
+    ) -> Result<(), EngineError> {
         // A transaction is held by the leader: on another member it opens
         // there.
-        if let Some(leader) = self
-            .executor
-            .transaction_leader()
-            .map_err(|s| EngineError(failure(&s)))?
-        {
+        if let Some(leader) = self.transaction_leader()? {
             let router = self
                 .executor
                 .router(leader)
                 .map_err(|s| EngineError(failure(&s)))?;
             let begin = RoutedBegin {
+                transaction,
                 actor: ActingContext::Trusted,
                 read_concern: None,
                 write_concern: None,
@@ -373,25 +381,28 @@ impl CursorEngine for DatabaseCursorEngine {
         }
         self.database()
             .read()
-            .begin_transaction_with(&TransactionOptions {
-                ordering,
-                drain_timeout: drain,
-                ..TransactionOptions::trusted()
-            })
+            .begin_transaction_as(
+                transaction,
+                &TransactionOptions {
+                    ordering,
+                    drain_timeout: drain,
+                    ..TransactionOptions::trusted()
+                },
+            )
             .map_err(engine_error)
     }
 
     fn commit_transaction(
         &self,
-        transaction: TransactionHandle,
+        transaction: TransactionId,
         last_nonce: Option<u64>,
         operation: Option<&OperationDescriptor>,
         admission: &AdmissionSignal,
     ) -> Result<CommitReceipt, EngineError> {
-        if let Some(holder) = self.executor.holder(&transaction) {
+        if let Some(leader) = self.transaction_leader()? {
             let router = self
                 .executor
-                .router(holder)
+                .router(leader)
                 .map_err(|s| EngineError(failure(&s)))?;
             let commit = RoutedCommit {
                 actor: ActingContext::Trusted,
@@ -422,13 +433,13 @@ impl CursorEngine for DatabaseCursorEngine {
 
     fn rollback_transaction(
         &self,
-        transaction: TransactionHandle,
+        transaction: TransactionId,
         admission: &AdmissionSignal,
     ) -> Result<(), EngineError> {
-        if let Some(holder) = self.executor.holder(&transaction) {
+        if let Some(leader) = self.transaction_leader()? {
             let router = self
                 .executor
-                .router(holder)
+                .router(leader)
                 .map_err(|s| EngineError(failure(&s)))?;
             let rollback = RoutedRollback {
                 actor: ActingContext::Trusted,

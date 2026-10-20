@@ -2,8 +2,8 @@
 //! Raft proposal pipeline abstraction.
 
 pub mod coalesce;
+pub mod command;
 pub mod frame;
-pub mod handle;
 pub mod invariant;
 pub mod operation;
 pub mod proposal;

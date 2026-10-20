@@ -1,26 +1,24 @@
-//! Interactive transactions on their owner: the registry of open contexts,
+//! Interactive transactions on the leader: the registry of open contexts,
 //! the leadership tenure they belong to, and the commands that run on them.
 //!
-//! An open transaction belongs to the member that began it while it led, not
-//! to the connection the client used: a command for it carries its
-//! [`TransactionHandle`] and the [`ActingContext`] it acts for, whatever path
-//! it took, and a connection closing leaves it open. Commands for one
-//! transaction run one at a time in the order its owner admits them, or by
-//! statement nonce for an ordered one; those waiting for their turn sit in a
-//! bounded queue on the owner, so a command arriving while another runs
-//! waits instead of being refused. A statement repeated under an admitted
-//! nonce is never applied twice. When the tenure that opened a transaction
-//! ends, the transaction ends with it: commands for it are told it was
-//! aborted, and nothing a command still running does can bring it back, not
-//! even a later tenure of the same member.
+//! An open transaction is held by the leader, not by the connection the
+//! client used: a command for it carries the [`TransactionId`] the client
+//! drew and the [`ActingContext`] it acts for, whatever path it took, and a
+//! connection closing leaves it open. Commands for one transaction run one
+//! at a time in the order the leader admits them, or by statement nonce for
+//! an ordered one; those waiting for their turn sit in a bounded queue, so a
+//! command arriving while another runs waits instead of being refused. A
+//! statement repeated under an admitted nonce is never applied twice. When
+//! the member stops leading, its open transactions are dropped: nothing of
+//! them was submitted, nothing a command still running does can bring one
+//! back, and a command for one is told no such transaction is known, as the
+//! new leader tells it.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use coordinode_core::group::DeploymentId;
 use coordinode_core::operations::{TransactionSnapshot, TransactionsView, TxnOrdering};
-use coordinode_core::txn::handle::{ActingContext, AdmissionSignal, TransactionHandle};
+use coordinode_core::txn::command::{ActingContext, AdmissionSignal, TransactionId};
 use coordinode_core::txn::read_concern::ReadConcernLevel;
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_storage::engine::transaction::TransactionState;
@@ -29,8 +27,9 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use super::{Database, DatabaseError, QuerySession, Row, StatementOptions, TxnMode};
 use crate::operation::IntentDigest;
 
-/// Handles of contexts that ended before their commit, kept so a command for
-/// one is told it was aborted rather than that nothing is known of it.
+/// IDs of transactions that ended on this leader before their commit, kept
+/// so a command for one is told it was aborted rather than that nothing is
+/// known of it.
 const ENDED_REMEMBERED: usize = 4096;
 
 /// Commands one transaction holds waiting for their turn. A client
@@ -46,12 +45,10 @@ const ADMITTED_REMEMBERED: usize = 1024;
 /// is aborted, when its BEGIN named no bound.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Why an open transaction ended before it was submitted. Nothing of it was
-/// applied in any of these cases.
+/// Why an open transaction ended on its leader before it was submitted.
+/// Nothing of it was applied in any of these cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionEnd {
-    /// The member stopped leading: the tenure that held it is over.
-    LeaderChanged,
     /// One of its statements failed, which aborts the transaction.
     StatementFailed,
     /// An ordered transaction waited past its drain timeout for a missing
@@ -66,7 +63,6 @@ pub enum TransactionEnd {
 impl core::fmt::Display for TransactionEnd {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Self::LeaderChanged => "the leader that held it changed before it was submitted",
             Self::StatementFailed => "one of its statements failed",
             Self::DrainTimedOut => "a statement it waited for did not arrive in time",
             Self::IdleExpired => "it stayed idle past the idle timeout",
@@ -107,7 +103,7 @@ impl TransactionOptions {
     }
 }
 
-/// What a commit carries besides the handle.
+/// What a commit carries besides the transaction ID.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CommitOptions<'a> {
     /// The client operation the commit carries out.
@@ -135,7 +131,7 @@ pub struct ExpectedVersion {
     pub version: Option<u64>,
 }
 
-/// What a rollback carries besides the handle.
+/// What a rollback carries besides the transaction ID.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RollbackOptions<'a> {
     /// Who the rollback acts for; the host's trusted access when `None`.
@@ -147,7 +143,7 @@ pub struct RollbackOptions<'a> {
 
 /// One open transaction.
 struct Context {
-    handle: TransactionHandle,
+    id: TransactionId,
     /// `None` while a command runs on it.
     state: Option<TransactionState>,
     begun: Instant,
@@ -170,27 +166,23 @@ struct Context {
     draining: bool,
 }
 
-/// The member's leadership tenure: who holds new transactions, and which
-/// tenure they belong to. Incarnation 0 means no tenure: the member does not
+/// The member's leadership tenure. `term` 0 means none: the member does not
 /// lead, and `leader` is the member that does, when one is known.
 #[derive(Debug, Clone, Copy)]
 struct Tenure {
     owner: u64,
-    incarnation: u64,
+    term: u64,
     leader: Option<u64>,
 }
 
-/// The open transactions of a database, on the member that holds them.
+/// The open transactions of a database, on the leader that holds them.
 pub(crate) struct Registry {
-    contexts: Mutex<HashMap<u64, Context>>,
+    contexts: Mutex<HashMap<TransactionId, Context>>,
     /// Woken whenever a context is returned, advanced or ended: the commands
     /// waiting for their turn look again.
     turn: Condvar,
-    next: AtomicU64,
-    /// The database's deployment, once recorded: it never changes after.
-    scope: std::sync::OnceLock<DeploymentId>,
     tenure: Mutex<Tenure>,
-    ended: Mutex<VecDeque<(TransactionHandle, TransactionEnd)>>,
+    ended: Mutex<VecDeque<(TransactionId, TransactionEnd)>>,
     /// The idle timeout, for the countdown a snapshot reports.
     idle_timeout: Mutex<Duration>,
     /// The drain timeout of a transaction whose BEGIN names none.
@@ -210,17 +202,14 @@ enum Settle {
 
 impl Registry {
     /// A registry for a database outside a group: it holds its transactions
-    /// from the start, in a tenure drawn now, so a handle of an earlier open
-    /// of the same store names nothing here.
+    /// from the start.
     pub(crate) fn new(idle_timeout: Duration) -> Self {
         Self {
             contexts: Mutex::new(HashMap::new()),
             turn: Condvar::new(),
-            next: AtomicU64::new(0),
-            scope: std::sync::OnceLock::new(),
             tenure: Mutex::new(Tenure {
                 owner: 0,
-                incarnation: fresh_incarnation(),
+                term: 1,
                 leader: Some(0),
             }),
             ended: Mutex::new(VecDeque::new()),
@@ -237,7 +226,7 @@ impl Registry {
     /// leader when this member holds none.
     fn current(&self) -> Result<Tenure, DatabaseError> {
         let tenure = *self.tenure.lock();
-        if tenure.incarnation == 0 {
+        if tenure.term == 0 {
             return Err(DatabaseError::NotLeader {
                 leader_id: tenure.leader,
             });
@@ -246,130 +235,105 @@ impl Registry {
     }
 
     /// Hand the tenure over: member `owner` sees `leader` leading in `term`.
-    /// It holds new transactions in that term when it is the leader, none
-    /// otherwise. Contexts of any other tenure end, and commands for them are
-    /// told so.
+    /// It holds transactions in that term when it is the leader, none
+    /// otherwise. Any other tenure drops every open transaction: all of them
+    /// were opened in the tenure that just ended, nothing of them was
+    /// submitted, and a command for one is told no such transaction is
+    /// known, as the new leader tells it.
     fn set_tenure(&self, owner: u64, leader: Option<u64>, term: u64) {
-        let incarnation = if leader == Some(owner) { term } else { 0 };
+        let term = if leader == Some(owner) { term } else { 0 };
         let mut tenure = self.tenure.lock();
         tenure.leader = leader;
-        if tenure.owner == owner && tenure.incarnation == incarnation {
+        if tenure.owner == owner && tenure.term == term {
             return;
         }
         tenure.owner = owner;
-        tenure.incarnation = incarnation;
-        // The tenure lock is held across the sweep, so no command admitted
-        // under the old tenure parks its context after it.
-        let mut contexts = self.contexts.lock();
-        let mut ended = self.ended.lock();
-        contexts.retain(|_, context| {
-            let keep =
-                context.handle.owner() == owner && context.handle.incarnation() == incarnation;
-            if !keep {
-                remember_end(&mut ended, context.handle, TransactionEnd::LeaderChanged);
-            }
-            keep
-        });
-        drop(ended);
-        drop(contexts);
+        tenure.term = term;
+        // The tenure lock is held across the sweep, and a BEGIN parks its
+        // context under it, so no transaction of the old tenure is left.
+        self.contexts.lock().clear();
+        self.ended.lock().clear();
+        drop(tenure);
         self.turn.notify_all();
     }
 
-    /// Why `handle`'s transaction ended, when it ended before its commit.
-    fn ended_with(&self, handle: &TransactionHandle) -> Option<TransactionEnd> {
+    /// Why `id`'s transaction ended, when it ended here before its commit.
+    fn ended_with(&self, id: &TransactionId) -> Option<TransactionEnd> {
         self.ended
             .lock()
             .iter()
-            .find(|(ended, _)| ended == handle)
+            .find(|(ended, _)| ended == id)
             .map(|(_, why)| *why)
     }
 
-    /// The refusal for `handle`, which names no context a command may use.
-    fn missing(&self, handle: &TransactionHandle) -> DatabaseError {
-        match self.ended_with(handle) {
-            Some(end) => DatabaseError::TransactionAborted {
-                handle: *handle,
-                end,
-            },
-            None => DatabaseError::UnknownTransaction(*handle),
+    /// The refusal for `id`, which names no context a command may use.
+    fn missing(&self, id: &TransactionId) -> DatabaseError {
+        match self.ended_with(id) {
+            Some(end) => DatabaseError::TransactionAborted { id: *id, end },
+            None => DatabaseError::UnknownTransaction(*id),
         }
     }
 
-    /// End `handle`'s context for `end`, under the context lock, and wake
-    /// the commands waiting on it.
+    /// End `id`'s context for `end`, under the context lock, and wake the
+    /// commands waiting on it.
     fn end_locked(
         &self,
-        contexts: &mut MutexGuard<'_, HashMap<u64, Context>>,
-        handle: &TransactionHandle,
+        contexts: &mut MutexGuard<'_, HashMap<TransactionId, Context>>,
+        id: &TransactionId,
         end: TransactionEnd,
     ) {
-        if contexts
-            .get(&handle.local())
-            .is_some_and(|context| context.handle == *handle)
-        {
-            contexts.remove(&handle.local());
-            remember_end(&mut self.ended.lock(), *handle, end);
+        if contexts.remove(id).is_some() {
+            remember_end(&mut self.ended.lock(), *id, end);
         }
         self.turn.notify_all();
     }
 
-    /// End `handle`'s transaction for `end`: a command found it cannot
-    /// continue.
-    fn end(&self, handle: &TransactionHandle, end: TransactionEnd) {
+    /// End `id`'s transaction for `end`: a command found it cannot continue.
+    fn end(&self, id: &TransactionId, end: TransactionEnd) {
         let mut contexts = self.contexts.lock();
-        self.end_locked(&mut contexts, handle, end);
+        self.end_locked(&mut contexts, id, end);
     }
 
-    /// Take `handle`'s context for one statement acting for `actor`, once it
-    /// is the statement's turn: the running command has answered and, in an
+    /// Take `id`'s context for one statement acting for `actor`, once it is
+    /// the statement's turn: the running command has answered and, in an
     /// ordered transaction, every earlier nonce has run. A context of another
-    /// actor is refused as if it did not exist: a handle grants nothing by
+    /// actor is refused as if it did not exist: an ID grants nothing by
     /// itself. A statement repeating an admitted nonce is refused rather than
     /// applied again.
     fn check_out(
         &self,
-        handle: &TransactionHandle,
+        id: &TransactionId,
         actor: &ActingContext,
         nonce: Option<u64>,
         intent: &IntentDigest,
         admission: Option<&AdmissionSignal>,
     ) -> Result<CheckedOut, DatabaseError> {
         let nonce = nonce.filter(|n| *n != 0);
-        let local = handle.local();
         let mut contexts = self.contexts.lock();
         let mut gap_deadline: Option<Instant> = None;
         loop {
             let Some(context) = contexts
-                .get_mut(&local)
-                .filter(|context| context.handle == *handle && context.actor == *actor)
+                .get_mut(id)
+                .filter(|context| context.actor == *actor)
             else {
                 drop(contexts);
-                return Err(self.missing(handle));
+                return Err(self.missing(id));
             };
             let ordered = context.ordering == TxnOrdering::Ordered;
             if let Some(n) = nonce {
                 if let Some((_, admitted)) = context.admitted.iter().find(|(m, _)| *m == n) {
                     return Err(if admitted == intent {
-                        DatabaseError::StatementAlreadyAdmitted {
-                            handle: *handle,
-                            nonce: n,
-                        }
+                        DatabaseError::StatementAlreadyAdmitted { id: *id, nonce: n }
                     } else {
-                        DatabaseError::StatementNonceReused {
-                            handle: *handle,
-                            nonce: n,
-                        }
+                        DatabaseError::StatementNonceReused { id: *id, nonce: n }
                     });
                 }
                 if ordered && n < context.next_nonce {
                     // Admitted before the remembered window.
-                    return Err(DatabaseError::StatementAlreadyAdmitted {
-                        handle: *handle,
-                        nonce: n,
-                    });
+                    return Err(DatabaseError::StatementAlreadyAdmitted { id: *id, nonce: n });
                 }
             } else if ordered {
-                return Err(DatabaseError::StatementNonceRequired(*handle));
+                return Err(DatabaseError::StatementNonceRequired(*id));
             }
             let turn = !ordered || nonce == Some(context.next_nonce);
             if let Some(state) = context.state.take_if(|_| turn) {
@@ -394,7 +358,7 @@ impl Registry {
                 });
             }
             if context.waiting >= MAILBOX {
-                return Err(DatabaseError::TransactionBusy(*handle));
+                return Err(DatabaseError::TransactionBusy(*id));
             }
             // Idle but not this statement's turn: an earlier nonce has not
             // arrived. That wait is bounded by the drain timeout; a wait for
@@ -413,10 +377,7 @@ impl Registry {
                 self.turn.wait(&mut contexts);
                 false
             };
-            let still_gap = match contexts
-                .get_mut(&local)
-                .filter(|context| context.handle == *handle)
-            {
+            let still_gap = match contexts.get_mut(id) {
                 Some(context) => {
                     context.waiting -= 1;
                     context.state.is_some() && nonce != Some(context.next_nonce)
@@ -424,9 +385,9 @@ impl Registry {
                 None => false,
             };
             if timed_out && still_gap {
-                self.end_locked(&mut contexts, handle, TransactionEnd::DrainTimedOut);
+                self.end_locked(&mut contexts, id, TransactionEnd::DrainTimedOut);
                 return Err(DatabaseError::TransactionAborted {
-                    handle: *handle,
+                    id: *id,
                     end: TransactionEnd::DrainTimedOut,
                 });
             }
@@ -434,21 +395,18 @@ impl Registry {
     }
 
     /// Put a context back after its statement, with the statements it has
-    /// run now. Refused once it has ended, by its tenure or otherwise: the
+    /// run now. Refused once it has ended, with its tenure or otherwise: the
     /// statement finished, but the transaction cannot continue.
     fn check_in(
         &self,
-        handle: &TransactionHandle,
+        id: &TransactionId,
         state: TransactionState,
         chain: IntentDigest,
     ) -> Result<(), DatabaseError> {
         let mut contexts = self.contexts.lock();
-        let Some(context) = contexts
-            .get_mut(&handle.local())
-            .filter(|context| context.handle == *handle)
-        else {
+        let Some(context) = contexts.get_mut(id) else {
             drop(contexts);
-            return Err(self.missing(handle));
+            return Err(self.missing(id));
         };
         context.state = Some(state);
         context.chain = chain;
@@ -458,23 +416,19 @@ impl Registry {
         Ok(())
     }
 
-    /// Remove `handle`'s context for `actor` to finish it, once what `settle`
+    /// Remove `id`'s context for `actor` to finish it, once what `settle`
     /// waits for has run. `None` when no context of `actor` is held under it.
     fn take(
         &self,
-        handle: &TransactionHandle,
+        id: &TransactionId,
         actor: &ActingContext,
         settle: Settle,
         admission: Option<&AdmissionSignal>,
     ) -> Result<Option<Finished>, DatabaseError> {
-        let local = handle.local();
         let mut contexts = self.contexts.lock();
         let mut deadline: Option<Instant> = None;
         loop {
-            let Some(context) = contexts
-                .get(&local)
-                .filter(|context| context.handle == *handle && context.actor == *actor)
-            else {
+            let Some(context) = contexts.get(id).filter(|context| context.actor == *actor) else {
                 return Ok(None);
             };
             // Whether it takes the context now or waits for it, nothing
@@ -495,10 +449,10 @@ impl Registry {
                 };
             if settled {
                 let context = contexts
-                    .remove(&local)
+                    .remove(id)
                     .ok_or_else(|| DatabaseError::Other("transaction context vanished".into()))?;
                 if matches!(settle, Settle::Rollback) {
-                    remember_end(&mut self.ended.lock(), *handle, TransactionEnd::RolledBack);
+                    remember_end(&mut self.ended.lock(), *id, TransactionEnd::RolledBack);
                 }
                 drop(contexts);
                 self.turn.notify_all();
@@ -511,26 +465,26 @@ impl Registry {
                 }));
             }
             let at = *deadline.get_or_insert_with(|| Instant::now() + context.drain);
-            if let Some(context) = contexts.get_mut(&local) {
+            if let Some(context) = contexts.get_mut(id) {
                 context.draining = true;
             }
             let timed_out = self.turn.wait_until(&mut contexts, at).timed_out();
-            if let Some(context) = contexts.get_mut(&local).filter(|c| c.handle == *handle) {
+            if let Some(context) = contexts.get_mut(id) {
                 context.draining = false;
             }
             if timed_out {
-                let Some(context) = contexts.get(&local).filter(|c| c.handle == *handle) else {
+                let Some(context) = contexts.get(id) else {
                     return Ok(None);
                 };
                 if context.state.is_none() {
                     // A statement still runs past the drain timeout: the
                     // transaction stays as it is, and the caller tries again.
-                    return Err(DatabaseError::TransactionBusy(*handle));
+                    return Err(DatabaseError::TransactionBusy(*id));
                 }
                 // Idle, yet the chain it must drain is incomplete.
-                self.end_locked(&mut contexts, handle, TransactionEnd::DrainTimedOut);
+                self.end_locked(&mut contexts, id, TransactionEnd::DrainTimedOut);
                 return Err(DatabaseError::TransactionAborted {
-                    handle: *handle,
+                    id: *id,
                     end: TransactionEnd::DrainTimedOut,
                 });
             }
@@ -546,7 +500,7 @@ impl TransactionsView for Registry {
             .lock()
             .values()
             .map(|context| TransactionSnapshot {
-                transaction: context.handle.to_string(),
+                transaction: context.id.to_string(),
                 ordering: context.ordering,
                 age_ms: now.duration_since(context.begun).as_millis() as u64,
                 // A context a command runs on is never reaped.
@@ -559,17 +513,22 @@ impl TransactionsView for Registry {
     }
 }
 
-/// Remember that `handle`'s transaction ended for `end`, forgetting the
-/// oldest when the record is full.
+/// Remember that `id`'s transaction ended for `end`, forgetting the oldest
+/// when the record is full.
 fn remember_end(
-    ended: &mut VecDeque<(TransactionHandle, TransactionEnd)>,
-    handle: TransactionHandle,
+    ended: &mut VecDeque<(TransactionId, TransactionEnd)>,
+    id: TransactionId,
     end: TransactionEnd,
 ) {
     if ended.len() == ENDED_REMEMBERED {
         ended.pop_front();
     }
-    ended.push_back((handle, end));
+    ended.push_back((id, end));
+}
+
+/// A new transaction ID: a random UUID (version 4), as any client draws one.
+pub fn draw_transaction_id() -> TransactionId {
+    TransactionId::from_raw(*uuid::Uuid::new_v4().as_bytes())
 }
 
 /// A context taken for one statement.
@@ -587,18 +546,6 @@ struct Finished {
     write_concern: WriteConcern,
 }
 
-/// A tenure number for a database outside a group, never 0 and different
-/// at every open.
-fn fresh_incarnation() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u128(now);
-    hasher.finish().max(1)
-}
-
 /// The host's own access: an embedding host is its own trust boundary.
 fn host_actor(actor: Option<&ActingContext>) -> ActingContext {
     actor.cloned().unwrap_or(ActingContext::Trusted)
@@ -607,10 +554,10 @@ fn host_actor(actor: Option<&ActingContext>) -> ActingContext {
 impl Database {
     /// Tell the database who leads its group: this member `owner` sees
     /// `leader` (`None` during an election) leading in `term`. While `owner`
-    /// leads, transactions are opened in that term; otherwise BEGIN is
-    /// refused naming `leader`. Transactions of an earlier tenure end: a
-    /// command for one is refused as aborted, since nothing of it was
-    /// submitted. Called by the group member as leadership moves.
+    /// leads, it holds transactions; otherwise BEGIN is refused naming
+    /// `leader`. Transactions of an earlier tenure are dropped: nothing of
+    /// them was submitted, and a command for one is told no such transaction
+    /// is known. Called by the group member as leadership moves.
     pub fn set_execution_tenure(&self, owner: u64, leader: Option<u64>, term: u64) {
         self.interactive.set_tenure(owner, leader, term);
     }
@@ -628,9 +575,9 @@ impl Database {
     }
 
     /// Begin an interactive multi-statement transaction with the database's
-    /// concerns, acting for the host.
+    /// concerns, acting for the host, under a newly drawn ID.
     ///
-    /// Pass the returned handle to [`Self::execute_in_transaction`] for each
+    /// Pass the returned ID to [`Self::execute_in_transaction`] for each
     /// statement, then [`Self::commit_transaction`] or
     /// [`Self::rollback_transaction`]. Every statement reads the snapshot
     /// pinned here (repeatable read). The transaction is ephemeral: nothing of
@@ -641,31 +588,43 @@ impl Database {
     /// # Errors
     ///
     /// As [`Self::begin_transaction_with`].
-    pub fn begin_transaction(&self) -> Result<TransactionHandle, DatabaseError> {
+    pub fn begin_transaction(&self) -> Result<TransactionId, DatabaseError> {
         self.begin_transaction_with(&TransactionOptions::trusted())
     }
 
-    /// Begin an interactive transaction with `options`, which it keeps until
-    /// it ends: who it acts for, its concerns and how its statements are
-    /// ordered. Later commands must act for the same caller.
+    /// Begin an interactive transaction with `options` under a newly drawn
+    /// ID, as [`Self::begin_transaction_as`] does for an ID a client drew.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::begin_transaction_as`].
+    pub fn begin_transaction_with(
+        &self,
+        options: &TransactionOptions,
+    ) -> Result<TransactionId, DatabaseError> {
+        let id = draw_transaction_id();
+        self.begin_transaction_as(id, options)?;
+        Ok(id)
+    }
+
+    /// Begin an interactive transaction under `id`, the random UUID a client
+    /// drew for it, with `options`, which it keeps until it ends: who it acts
+    /// for, its concerns and how its statements are ordered. Later commands
+    /// must act for the same caller.
     ///
     /// # Errors
     ///
     /// [`DatabaseError::NotLeader`] when this member holds no transactions:
-    /// it does not lead its group.
-    pub fn begin_transaction_with(
+    /// it does not lead its group. [`DatabaseError::TransactionIdInUse`]
+    /// when a transaction is open under `id`, or ended under it recently: an
+    /// ID names one transaction, and a start is never joined to another.
+    pub fn begin_transaction_as(
         &self,
+        id: TransactionId,
         options: &TransactionOptions,
-    ) -> Result<TransactionHandle, DatabaseError> {
+    ) -> Result<(), DatabaseError> {
         self.reap_idle_transactions(self.interactive_idle_timeout);
         let tenure = self.interactive.current()?;
-        let local = self.interactive.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let handle = TransactionHandle::new(
-            self.handle_scope()?,
-            tenure.owner,
-            tenure.incarnation,
-            local,
-        );
         let read_concern = options.read_concern.unwrap_or(self.read_concern);
         let read_ts = self.oracle.next();
         // The view is the engine's complete snapshot, not the timestamp just
@@ -690,7 +649,7 @@ impl Database {
         };
         let now = Instant::now();
         let context = Context {
-            handle,
+            id,
             state: Some(txn.take_state()),
             begun: now,
             touched: now,
@@ -711,30 +670,21 @@ impl Database {
             // Under the tenure lock: a context of a tenure that just ended is
             // not parked after its sweep.
             let tenure_now = self.interactive.tenure.lock();
-            if tenure_now.owner != tenure.owner || tenure_now.incarnation != tenure.incarnation {
+            if tenure_now.owner != tenure.owner || tenure_now.term != tenure.term {
                 return Err(DatabaseError::NotLeader {
                     leader_id: tenure_now.leader,
                 });
             }
-            self.interactive.contexts.lock().insert(local, context);
+            let mut contexts = self.interactive.contexts.lock();
+            if contexts.contains_key(&id) || self.interactive.ended_with(&id).is_some() {
+                return Err(DatabaseError::TransactionIdInUse(id));
+            }
+            contexts.insert(id, context);
         }
         if let Some(begun) = &self.interactive_begun {
             begun();
         }
-        Ok(handle)
-    }
-
-    /// The deployment new handles name, read once it is recorded.
-    fn handle_scope(&self) -> Result<Option<DeploymentId>, DatabaseError> {
-        if let Some(scope) = self.interactive.scope.get() {
-            return Ok(Some(*scope));
-        }
-        let recorded = self.deployment()?;
-        if let Some(scope) = recorded {
-            // A concurrent BEGIN read the same recorded identity.
-            let _ = self.interactive.scope.set(scope);
-        }
-        Ok(recorded)
+        Ok(())
     }
 
     /// Call `begun` after every interactive transaction opens. The server's
@@ -752,11 +702,11 @@ impl Database {
     /// waits for its turn.
     pub fn execute_in_transaction(
         &self,
-        handle: TransactionHandle,
+        id: TransactionId,
         query: &str,
         params: Option<HashMap<String, coordinode_core::graph::types::Value>>,
     ) -> Result<Vec<Row>, DatabaseError> {
-        self.execute_in_transaction_with(handle, query, params, &StatementOptions::default())
+        self.execute_in_transaction_with(id, query, params, &StatementOptions::default())
     }
 
     /// [`Self::execute_in_transaction`] with the vector settings, budget,
@@ -766,13 +716,12 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// The handle names no open transaction of this caller, or one that
-    /// ended; the queue of waiting commands is full; the nonce was admitted
+    /// The ID names no open transaction of this caller, or one that ended; the queue of waiting commands is full; the nonce was admitted
     /// already, or is missing in an ordered transaction; or the statement
     /// failed, which ends the transaction.
     pub fn execute_in_transaction_with(
         &self,
-        handle: TransactionHandle,
+        id: TransactionId,
         query: &str,
         params: Option<HashMap<String, coordinode_core::graph::types::Value>>,
         options: &StatementOptions,
@@ -781,15 +730,14 @@ impl Database {
         let params = params.filter(|p| !p.is_empty());
         let intent = crate::operation::statement_intent(query, params.as_ref());
         let checked = self.interactive.check_out(
-            &handle,
+            &id,
             &actor,
             options.nonce,
             &intent,
             options.admission.as_ref(),
         )?;
         let failed = |e: DatabaseError| {
-            self.interactive
-                .end(&handle, TransactionEnd::StatementFailed);
+            self.interactive.end(&id, TransactionEnd::StatementFailed);
             e
         };
         let session = QuerySession {
@@ -817,8 +765,7 @@ impl Database {
             )
             .map_err(failed)?;
         let Some(state) = out_state else {
-            self.interactive
-                .end(&handle, TransactionEnd::StatementFailed);
+            self.interactive.end(&id, TransactionEnd::StatementFailed);
             return Ok(rows);
         };
         // Cap buffered (uncommitted) memory: a client that keeps writing
@@ -826,12 +773,12 @@ impl Database {
         let buffered = state.buffered_bytes();
         if buffered > self.max_interactive_txn_bytes {
             return Err(failed(DatabaseError::TransactionTooLarge {
-                id: handle,
+                id,
                 buffered,
                 limit: self.max_interactive_txn_bytes,
             }));
         }
-        self.interactive.check_in(&handle, state, chain)?;
+        self.interactive.check_in(&id, state, chain)?;
         Ok(rows)
     }
 
@@ -845,9 +792,9 @@ impl Database {
     /// committed Raft index in a group (`None` outside one).
     pub fn commit_transaction(
         &self,
-        handle: TransactionHandle,
+        id: TransactionId,
     ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
-        self.commit_transaction_with(handle, &CommitOptions::default())
+        self.commit_transaction_with(id, &CommitOptions::default())
     }
 
     /// [`Self::commit_transaction`] carrying out client operation
@@ -864,11 +811,11 @@ impl Database {
     /// As [`Self::commit_transaction`], and the above.
     pub fn commit_transaction_as(
         &self,
-        handle: TransactionHandle,
+        id: TransactionId,
         operation: &crate::operation::OperationDescriptor,
     ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
         self.commit_transaction_with(
-            handle,
+            id,
             &CommitOptions {
                 operation: Some(operation),
                 ..CommitOptions::default()
@@ -876,7 +823,7 @@ impl Database {
         )
     }
 
-    /// Commit `handle`'s transaction as `options` say: once every statement
+    /// Commit `id`'s transaction as `options` say: once every statement
     /// admitted to it has run (an ordered chain up to its last nonce, within
     /// the drain timeout), acting for its caller and carrying out its
     /// operation when given.
@@ -888,7 +835,7 @@ impl Database {
     /// runs past it, which leaves it open.
     pub fn commit_transaction_with(
         &self,
-        handle: TransactionHandle,
+        id: TransactionId,
         options: &CommitOptions<'_>,
     ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
         let actor = host_actor(options.actor);
@@ -897,7 +844,7 @@ impl Database {
         };
         let Some(finished) = self
             .interactive
-            .take(&handle, &actor, settle, options.admission)?
+            .take(&id, &actor, settle, options.admission)?
         else {
             // A commit repeated after its reply was lost: the context is gone
             // with the attempt, and the operation's outcome is the answer.
@@ -911,14 +858,14 @@ impl Database {
                     intent_differs: false,
                 });
             }
-            return Err(self.interactive.missing(&handle));
+            return Err(self.interactive.missing(&id));
         };
-        self.commit_finished(handle, finished, options.operation, options.expect)
+        self.commit_finished(id, finished, options.operation, options.expect)
     }
 
     fn commit_finished(
         &self,
-        handle: TransactionHandle,
+        id: TransactionId,
         finished: Finished,
         operation: Option<&crate::operation::OperationDescriptor>,
         expect: &[ExpectedVersion],
@@ -956,14 +903,14 @@ impl Database {
         };
         let outcome = txn
             .commit(&commit_ctx)
-            .map_err(|e| self.commit_error(handle, e))?;
+            .map_err(|e| self.commit_error(id, e))?;
         // An interactive transaction is always opened against the oracle, so
         // the storage commit always carries a commit timestamp. A missing one
         // is an engine invariant violation, surfaced as an error rather than
         // a made-up timestamp the host would then trust as a cursor.
         let commit_ts = outcome.commit_ts.ok_or_else(|| {
             DatabaseError::Other(format!(
-                "transaction {handle} committed without a commit timestamp"
+                "transaction {id} committed without a commit timestamp"
             ))
         })?;
         Ok(coordinode_core::txn::transaction::CommitReceipt {
@@ -972,20 +919,20 @@ impl Database {
         })
     }
 
-    /// The error a refused commit of `handle`'s transaction reports. Split by
+    /// The error a refused commit of `id`'s transaction reports. Split by
     /// variant, because the failures call for opposite reactions: only an OCC
     /// conflict is worth retrying from begin; a storage or pipeline failure
     /// retried immediately just fails again.
     fn commit_error(
         &self,
-        handle: TransactionHandle,
+        id: TransactionId,
         e: coordinode_storage::engine::transaction::CommitError,
     ) -> DatabaseError {
         use coordinode_query::executor::runner::ExecutionError;
         use coordinode_storage::engine::transaction::CommitError;
         match e {
             CommitError::Conflict(detail) => DatabaseError::TransactionConflict {
-                id: handle,
+                id,
                 source_message: detail,
             },
             CommitError::Storage(s) => DatabaseError::Storage(s),
@@ -1012,7 +959,7 @@ impl Database {
             // reason: the condition is re-evaluated against the state the
             // retry reads.
             CommitError::InvariantRefused { reason } => {
-                DatabaseError::InvariantRefused { id: handle, reason }
+                DatabaseError::InvariantRefused { id, reason }
             }
             // Not retryable: the value is held, by the node named. The
             // statements that claimed it are gone, so the index is found by
@@ -1031,7 +978,7 @@ impl Database {
                     coordinode_query::index::UniqueViolation::new(&index, &values, holder).into(),
                 ),
                 None => DatabaseError::InvariantRefused {
-                    id: handle,
+                    id,
                     reason: format!(
                         "a unique value of {generation} is held by node {}",
                         holder.to_element_id()
@@ -1058,7 +1005,7 @@ impl Database {
             // the refusal so that decision needs no second read.
             CommitError::RevisionMismatch { expected, current } => {
                 DatabaseError::RevisionMismatch {
-                    id: handle,
+                    id,
                     expected,
                     current,
                 }
@@ -1084,10 +1031,10 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// The handle names no open transaction, or a statement still runs on it
+    /// The ID names no open transaction, or a statement still runs on it
     /// past the drain timeout.
-    pub fn rollback_transaction(&self, handle: TransactionHandle) -> Result<(), DatabaseError> {
-        self.rollback_transaction_with(handle, &RollbackOptions::default())
+    pub fn rollback_transaction(&self, id: TransactionId) -> Result<(), DatabaseError> {
+        self.rollback_transaction_with(id, &RollbackOptions::default())
     }
 
     /// [`Self::rollback_transaction`] as `options` say: acting for its caller
@@ -1098,17 +1045,17 @@ impl Database {
     /// As [`Self::rollback_transaction`].
     pub fn rollback_transaction_with(
         &self,
-        handle: TransactionHandle,
+        id: TransactionId,
         options: &RollbackOptions<'_>,
     ) -> Result<(), DatabaseError> {
         match self.interactive.take(
-            &handle,
+            &id,
             &host_actor(options.actor),
             Settle::Rollback,
             options.admission,
         )? {
             Some(_) => Ok(()),
-            None => Err(self.interactive.missing(&handle)),
+            None => Err(self.interactive.missing(&id)),
         }
     }
 
@@ -1126,17 +1073,17 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// The handle names no open transaction for the host.
+    /// The ID names no open transaction for the host.
     pub fn expect_node_version(
         &self,
-        handle: TransactionHandle,
+        id: TransactionId,
         node_id: coordinode_core::graph::node::NodeId,
         expected: Option<u64>,
     ) -> Result<(), DatabaseError> {
         let key = coordinode_core::graph::node::encode_node_key(self.shard_id, node_id);
         // Not a statement: it takes no nonce and adds nothing to the chain.
         let mut checked = self.interactive.check_out(
-            &handle,
+            &id,
             &ActingContext::Trusted,
             None,
             &crate::operation::EMPTY_CHAIN,
@@ -1148,7 +1095,7 @@ impl Database {
             expected,
         );
         self.interactive
-            .check_in(&handle, checked.state, checked.chain)?;
+            .check_in(&id, checked.state, checked.chain)?;
         Ok(stated?)
     }
 
@@ -1173,7 +1120,7 @@ impl Database {
             if !keep {
                 remember_end(
                     &mut registry.ended.lock(),
-                    context.handle,
+                    context.id,
                     TransactionEnd::IdleExpired,
                 );
                 reaped = true;

@@ -2094,7 +2094,7 @@ fn show_transactions_lists_held_transactions_with_their_attachments() {
         .execute_cypher("SHOW TRANSACTIONS")
         .expect("show transactions");
     assert_eq!(txns.len(), 2, "{txns:?}");
-    let row = |handle: TransactionHandle| {
+    let row = |handle: TransactionId| {
         txns.iter()
             .find(|r| r.get("txid") == Some(&Value::String(handle.to_string())))
             .unwrap_or_else(|| panic!("no row for {handle}"))

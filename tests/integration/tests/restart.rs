@@ -104,7 +104,8 @@ async fn cypher(
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await?
@@ -787,7 +788,8 @@ async fn write_acked(
                 journal: Journal::Journal as i32,
                 timeout_ms: 0,
             }),
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await

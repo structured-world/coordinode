@@ -34,7 +34,8 @@ async fn cypher_q(proc: &CoordinodeProcess, query: &str) -> Vec<HashMap<String, 
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await
@@ -97,7 +98,8 @@ async fn causal_write_without_concern_uses_the_majority_default() {
                 at_timestamp: 0,
             }),
             write_concern: None, // omitted → the majority default
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -133,7 +135,8 @@ async fn causal_write_with_w1_rejected() {
                 journal: Journal::Journal as i32,
                 timeout_ms: 0,
             }),
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -174,7 +177,8 @@ async fn causal_write_with_majority_accepted() {
                 journal: Journal::Journal as i32,
                 timeout_ms: 0,
             }),
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -205,7 +209,8 @@ async fn write_concern_volatile_journal_above_leader_rejected() {
                 journal: Journal::Memory as i32,
                 timeout_ms: 0,
             }),
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -247,7 +252,8 @@ async fn causal_read_without_majority_accepted() {
                 at_timestamp: 0,
             }),
             write_concern: None, // read-only — write_concern irrelevant
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -351,7 +357,8 @@ async fn set_after_delete_must_not_show_unwritten_value() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -583,7 +590,8 @@ async fn temporal_create_without_valid_from_rejected() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -964,7 +972,8 @@ async fn temporal_set_valid_from_rejected() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -996,7 +1005,8 @@ async fn temporal_invalid_interval_rejected() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -1073,7 +1083,8 @@ async fn temporal_merge_rejected() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await;
@@ -1130,7 +1141,8 @@ async fn temporal_overlaps_with_parameters() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
-            transaction: Vec::new(),
+            transaction_id: Vec::new(),
+            start_transaction: false,
             ..Default::default()
         })
         .await

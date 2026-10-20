@@ -25,23 +25,33 @@ use coordinode_integration::proto::session::{
     Begin, ClientFrame, Commit, Configure, Execute, Rollback, client_frame,
 };
 
+/// A transaction ID as a client draws it: a random UUID.
+fn draw_txid() -> Vec<u8> {
+    uuid::Uuid::new_v4().as_bytes().to_vec()
+}
+
 /// Begin an UNORDERED transaction (statements applied in arrival order; nonces
-/// ignored). Used by the simple transaction tests that send nonce-0 statements.
-fn begin(request_id: u64) -> ClientFrame {
+/// ignored) under `txid`. Used by the simple transaction tests that send
+/// nonce-0 statements. Nothing answers it; the statements sent after it run
+/// once it is open.
+fn begin(request_id: u64, txid: &[u8]) -> ClientFrame {
     ClientFrame {
         request_id,
         op: Some(client_frame::Op::Begin(Begin {
+            txid: txid.to_vec(),
             ordering: 2, // ORDERING_UNORDERED
             drain_timeout_ms: 0,
         })),
     }
 }
 
-/// Begin an ORDERED transaction (statements reassembled by nonce).
-fn begin_ordered(request_id: u64) -> ClientFrame {
+/// Begin an ORDERED transaction (statements reassembled by nonce) under
+/// `txid`.
+fn begin_ordered(request_id: u64, txid: &[u8]) -> ClientFrame {
     ClientFrame {
         request_id,
         op: Some(client_frame::Op::Begin(Begin {
+            txid: txid.to_vec(),
             ordering: 1, // ORDERING_ORDERED
             drain_timeout_ms: 0,
         })),
@@ -59,19 +69,19 @@ fn execute(request_id: u64, query: &str) -> ClientFrame {
     }
 }
 
-/// An Execute frame bound to the open transaction `handle`.
-fn execute_tx(request_id: u64, query: &str, handle: &[u8]) -> ClientFrame {
-    execute_tx_nonce(request_id, query, handle, 0)
+/// An Execute frame bound to the open transaction `txid`.
+fn execute_tx(request_id: u64, query: &str, txid: &[u8]) -> ClientFrame {
+    execute_tx_nonce(request_id, query, txid, 0)
 }
 
 /// An Execute frame bound to a transaction with an explicit `nonce`.
-fn execute_tx_nonce(request_id: u64, query: &str, handle: &[u8], nonce: u64) -> ClientFrame {
+fn execute_tx_nonce(request_id: u64, query: &str, txid: &[u8], nonce: u64) -> ClientFrame {
     ClientFrame {
         request_id,
         op: Some(client_frame::Op::Execute(Execute {
             query: query.to_string(),
             parameters: Default::default(),
-            transaction: handle.to_vec(),
+            txid: txid.to_vec(),
             nonce,
             ..Default::default()
         })),
@@ -79,11 +89,11 @@ fn execute_tx_nonce(request_id: u64, query: &str, handle: &[u8], nonce: u64) -> 
 }
 
 /// A Commit frame carrying the expected final nonce of an ORDERED chain.
-fn commit_tx_nonce(request_id: u64, handle: &[u8], last_nonce: u64) -> ClientFrame {
+fn commit_tx_nonce(request_id: u64, txid: &[u8], last_nonce: u64) -> ClientFrame {
     ClientFrame {
         request_id,
         op: Some(client_frame::Op::Commit(Commit {
-            transaction: handle.to_vec(),
+            txid: txid.to_vec(),
             last_nonce,
             operation: None,
         })),
@@ -91,13 +101,13 @@ fn commit_tx_nonce(request_id: u64, handle: &[u8], last_nonce: u64) -> ClientFra
 }
 
 /// A Commit frame for a specific transaction.
-fn commit_tx(request_id: u64, handle: &[u8]) -> ClientFrame {
-    commit_tx_nonce(request_id, handle, 0)
+fn commit_tx(request_id: u64, txid: &[u8]) -> ClientFrame {
+    commit_tx_nonce(request_id, txid, 0)
 }
 
-/// A handle as SHOW TRANSACTIONS renders it: its bytes in hex.
-fn hex(handle: &[u8]) -> String {
-    handle.iter().map(|b| format!("{b:02x}")).collect()
+/// A transaction ID as SHOW TRANSACTIONS renders it: a hyphenated UUID.
+fn uuid_text(txid: &[u8]) -> String {
+    uuid::Uuid::from_slice(txid).expect("a UUID").to_string()
 }
 
 /// Open a session stream on `proc` that the test feeds frame by frame.
@@ -123,8 +133,7 @@ async fn open_stream(
     (tx, inbound)
 }
 
-/// The terminal event (Begun / CursorEnd / Committed / Error) of request
-/// `want`.
+/// The terminal event (CursorEnd / Committed / Error) of request `want`.
 async fn await_terminal(
     inbound: &mut tonic::Streaming<coordinode_integration::proto::session::ServerFrame>,
     want: u64,
@@ -133,26 +142,12 @@ async fn await_terminal(
         let f = inbound.message().await.expect("frame").expect("not end");
         if f.request_id == want {
             match f.event {
-                Some(
-                    e @ (Event::Begun(_)
-                    | Event::CursorEnd(_)
-                    | Event::Committed(_)
-                    | Event::Error(_)),
-                ) => return e,
+                Some(e @ (Event::CursorEnd(_) | Event::Committed(_) | Event::Error(_))) => {
+                    return e;
+                }
                 _ => continue,
             }
         }
-    }
-}
-
-/// The handle a Begin of request `want` answered with.
-async fn await_begun(
-    inbound: &mut tonic::Streaming<coordinode_integration::proto::session::ServerFrame>,
-    want: u64,
-) -> Vec<u8> {
-    match await_terminal(inbound, want).await {
-        Event::Begun(b) => b.transaction,
-        other => panic!("expected Begun, got {other:?}"),
     }
 }
 
@@ -273,9 +268,9 @@ async fn session_pages_a_label_scan_through_the_keyset_cursor() {
 async fn drive_transaction(proc: &CoordinodeProcess, write: &str, do_commit: bool) {
     let (tx, mut inbound) = open_stream(proc).await;
 
-    // Begin → handle.
-    tx.send(begin(1)).await.expect("send begin");
-    let txid = await_begun(&mut inbound, 1).await;
+    // Begin under the client's ID; the write after it waits for it.
+    let txid = draw_txid();
+    tx.send(begin(1, &txid)).await.expect("send begin");
 
     // Write inside the transaction; wait for its cursor to finish.
     tx.send(execute_tx(2, write, &txid))
@@ -308,7 +303,7 @@ async fn drive_transaction(proc: &CoordinodeProcess, write: &str, do_commit: boo
     } else {
         let rollback = ClientFrame {
             request_id: 3,
-            op: Some(client_frame::Op::Rollback(Rollback { transaction: txid })),
+            op: Some(client_frame::Op::Rollback(Rollback { txid })),
         };
         tx.send(rollback).await.expect("send rollback");
     }
@@ -361,8 +356,8 @@ async fn in_session_transaction_aborts_on_a_failed_statement() {
     let proc = CoordinodeProcess::start().await;
     let (tx, mut inbound) = open_stream(&proc).await;
 
-    tx.send(begin(1)).await.expect("begin");
-    let txid = await_begun(&mut inbound, 1).await;
+    let txid = draw_txid();
+    tx.send(begin(1, &txid)).await.expect("begin");
 
     // Valid write inside the transaction.
     tx.send(execute_tx(2, "CREATE (n:Ab {k: 1})", &txid))
@@ -415,8 +410,8 @@ async fn ordered_transaction_reassembles_out_of_order_statements() {
     let proc = CoordinodeProcess::start().await;
     let (tx, mut inbound) = open_stream(&proc).await;
 
-    tx.send(begin_ordered(1)).await.expect("begin");
-    let txid = await_begun(&mut inbound, 1).await;
+    let txid = draw_txid();
+    tx.send(begin_ordered(1, &txid)).await.expect("begin");
 
     // Send nonce 2 before nonce 1.
     tx.send(execute_tx_nonce(2, "CREATE (n:Ord {k: 2})", &txid, 2))
@@ -457,25 +452,30 @@ async fn ordered_transaction_reassembles_out_of_order_statements() {
 async fn show_transactions_lists_an_open_transaction_with_a_countdown() {
     // Open a transaction on a session, then run SHOW TRANSACTIONS on the SAME
     // session and confirm the live registry surfaces it with an auto-abort
-    // countdown. A controlled request stream sequences Begin strictly before
-    // the SHOW so the read cannot race the registration.
+    // countdown. A statement in the transaction, answered before the SHOW is
+    // sent, proves it open, so the read cannot race the registration.
     let proc = CoordinodeProcess::start().await;
     let (tx, mut inbound) = open_stream(&proc).await;
 
-    // Begin and wait for the handle before issuing the SHOW.
-    tx.send(begin(1)).await.expect("send begin");
-    let txid = await_begun(&mut inbound, 1).await;
-    assert!(!txid.is_empty(), "a transaction handle is never empty");
+    let txid = draw_txid();
+    tx.send(begin(1, &txid)).await.expect("send begin");
+    tx.send(execute_tx(2, "RETURN 1 AS one", &txid))
+        .await
+        .expect("send a statement in it");
+    assert!(matches!(
+        await_terminal(&mut inbound, 2).await,
+        Event::CursorEnd(_)
+    ));
 
     // SHOW TRANSACTIONS on the same session: the open transaction must appear.
-    tx.send(execute(2, "SHOW TRANSACTIONS"))
+    tx.send(execute(3, "SHOW TRANSACTIONS"))
         .await
         .expect("send show");
     let mut columns: Vec<String> = Vec::new();
     let mut rows = Vec::new();
     loop {
         let frame = inbound.message().await.expect("frame").expect("not end");
-        if frame.request_id != 2 {
+        if frame.request_id != 3 {
             continue;
         }
         match frame.event {
@@ -499,7 +499,7 @@ async fn show_transactions_lists_an_open_transaction_with_a_countdown() {
     };
     let cells = &rows[0].values;
     assert!(
-        matches!(&cells[col("txid")].value, Some(Pv::StringValue(t)) if *t == hex(&txid)),
+        matches!(&cells[col("txid")].value, Some(Pv::StringValue(t)) if *t == uuid_text(&txid)),
         "the listed transaction is the one we opened"
     );
     match &cells[col("auto_abort_in_ms")].value {
@@ -552,13 +552,13 @@ async fn session_runs_concurrent_writes_without_deadlocking_the_runtime() {
 async fn session_interleaves_a_transaction_with_independent_queries() {
     let proc = CoordinodeProcess::start().await;
     let (tx, mut inbound) = open_stream(&proc).await;
-    tx.send(begin(1)).await.expect("begin");
-    let handle = await_begun(&mut inbound, 1).await;
+    let txid = draw_txid();
     for frame in [
+        begin(1, &txid),
         execute(2, "RETURN 1 AS a"),
-        execute_tx(3, "CREATE (:Interleaved {k: 1})", &handle),
+        execute_tx(3, "CREATE (:Interleaved {k: 1})", &txid),
         execute(4, "RETURN 2 AS b"),
-        commit_tx(5, &handle),
+        commit_tx(5, &txid),
     ] {
         tx.send(frame).await.expect("send");
     }
@@ -612,17 +612,17 @@ async fn session_interleaves_a_transaction_with_independent_queries() {
 }
 
 /// A transaction outlives the stream that began it: the first stream closes
-/// without committing, a second one continues the transaction by its handle,
+/// without committing, a second one continues the transaction by its ID,
 /// sees its write and commits it.
 #[tokio::test]
 async fn a_transaction_continues_on_another_stream() {
     let proc = CoordinodeProcess::start().await;
 
     let (first, mut first_in) = open_stream(&proc).await;
-    first.send(begin(1)).await.expect("begin");
-    let handle = await_begun(&mut first_in, 1).await;
+    let txid = draw_txid();
+    first.send(begin(1, &txid)).await.expect("begin");
     first
-        .send(execute_tx(2, "CREATE (:Reattached {k: 1})", &handle))
+        .send(execute_tx(2, "CREATE (:Reattached {k: 1})", &txid))
         .await
         .expect("write");
     assert!(matches!(
@@ -637,7 +637,7 @@ async fn a_transaction_continues_on_another_stream() {
         .send(execute_tx(
             1,
             "MATCH (n:Reattached) RETURN count(n) AS c",
-            &handle,
+            &txid,
         ))
         .await
         .expect("read");
@@ -645,7 +645,7 @@ async fn a_transaction_continues_on_another_stream() {
         await_terminal(&mut second_in, 1).await,
         Event::CursorEnd(_)
     ));
-    second.send(commit_tx(2, &handle)).await.expect("commit");
+    second.send(commit_tx(2, &txid)).await.expect("commit");
     match await_terminal(&mut second_in, 2).await {
         Event::Committed(_) => {}
         other => panic!("the second stream commits it, got {other:?}"),

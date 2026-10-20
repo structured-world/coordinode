@@ -6,7 +6,7 @@
 
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
-use coordinode_embed::{Database, TransactionHandle};
+use coordinode_embed::{Database, TransactionId};
 
 /// One year in microseconds, the valid-time unit.
 const YEAR: i64 = 365 * 24 * 3600 * 1_000_000;
@@ -504,7 +504,7 @@ fn a_pattern_predicate_sees_the_neighbour_state_valid_now() {
 /// key order, whatever order its write buffer holds them in.
 #[test]
 fn a_node_revised_in_a_transaction_is_found_later_in_it() {
-    let read = |db: &Database, txn: TransactionHandle, query: &str| -> Vec<i64> {
+    let read = |db: &Database, txn: TransactionId, query: &str| -> Vec<i64> {
         db.execute_in_transaction(txn, query, None)
             .expect("statement")
             .iter()

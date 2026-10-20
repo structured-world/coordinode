@@ -1,8 +1,8 @@
 use super::*;
 use coordinode_core::operations::OperationsView;
 
-fn handle(local: u64) -> TransactionHandle {
-    TransactionHandle::new(None, 1, 1, local)
+fn txid(n: u8) -> TransactionId {
+    TransactionId::from_raw([n; 16])
 }
 
 #[test]
@@ -44,17 +44,17 @@ fn in_flight_counts_up_and_down_without_underflow() {
     assert_eq!(reg.sessions()[0].in_flight, 0);
 }
 
-/// A session's attachments are reported as the handles a client carries, and
-/// detaching one leaves the others.
+/// A session's attachments are reported as the transaction IDs a client
+/// carries, and detaching one leaves the others.
 #[test]
 fn attachments_appear_and_detach_one_at_a_time() {
     let reg = SessionRegistry::new();
     let id = reg.register_session("p".into());
-    reg.attach(id, handle(1));
-    reg.attach(id, handle(2));
-    reg.attach(id, handle(2));
-    reg.detach(id, &handle(1));
+    reg.attach(id, txid(1));
+    reg.attach(id, txid(2));
+    reg.attach(id, txid(2));
+    reg.detach(id, &txid(1));
 
     let attached = reg.sessions()[0].attached.clone();
-    assert_eq!(attached, vec![handle(2).to_string()]);
+    assert_eq!(attached, vec![txid(2).to_string()]);
 }

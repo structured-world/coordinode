@@ -22,8 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use coordinode_core::graph::types::Value;
-use coordinode_core::operations::TxnOrdering;
-use coordinode_core::txn::handle::{AdmissionSignal, TransactionHandle};
+use coordinode_core::txn::command::{AdmissionSignal, TransactionId};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc, watch};
 
@@ -56,7 +55,7 @@ pub struct SessionManager {
 impl SessionManager {
     /// Create a session manager backed by `engine` and the shared session
     /// `registry` that powers operational introspection (`SHOW SESSIONS` /
-    /// `SHOW TRANSACTIONS`). Transaction handles are allocated by the engine.
+    /// `SHOW TRANSACTIONS`). Clients draw their transaction IDs.
     ///
     /// Sessions report a connection that is always writable, which is the truth
     /// for an embedded database: there is no cluster to lose touch with. Use
@@ -108,8 +107,8 @@ impl SessionManager {
 ///
 /// Transport-agnostic: it consumes neutral [`SessionOp`]s and produces neutral
 /// [`SessionEvent`]s. It holds the query engine and the shared session
-/// registry; transaction handles are allocated by the engine, and the
-/// transactions themselves live on their owner.
+/// registry; clients draw their transaction IDs, and the transactions
+/// themselves live on the leader.
 pub struct Session {
     session_id: u64,
     engine: Arc<dyn CursorEngine>,
@@ -239,13 +238,13 @@ impl Session {
                     None => self.spawn(out, |engine, _, out| async move {
                         execute(&engine, statement, None, &out).await;
                     }),
-                    Some(handle) => {
-                        let lane = lanes.step(handle);
-                        self.registry.attach(self.session_id, handle);
+                    Some(id) => {
+                        let lane = lanes.step(id);
+                        self.registry.attach(self.session_id, id);
                         self.spawn(out, move |engine, _, out| async move {
                             lane.after_previous().await;
                             let transaction = InTransaction {
-                                handle,
+                                id,
                                 nonce,
                                 admission: lane.signal(),
                             };
@@ -256,7 +255,11 @@ impl Session {
                 }
             }
 
+            // In the transaction's lane like any of its commands, so the
+            // statements the client sends right after it run once it is open.
+            // Only a refusal answers.
             SessionOp::Begin {
+                transaction,
                 ordering,
                 drain_timeout_ms,
             } => {
@@ -265,12 +268,18 @@ impl Session {
                     ms => ms,
                 };
                 let drain = (drain_ms != 0).then(|| Duration::from_millis(u64::from(drain_ms)));
+                let lane = lanes.step(transaction);
                 let session_id = self.session_id;
                 self.spawn(out, move |engine, registry, out| async move {
-                    begin(
-                        &engine, &registry, session_id, request_id, ordering, drain, &out,
-                    )
-                    .await;
+                    lane.after_previous().await;
+                    let begun =
+                        blocking(move || engine.begin_transaction(transaction, ordering, drain))
+                            .await;
+                    lane.mine.release();
+                    match begun {
+                        Ok(()) => registry.attach(session_id, transaction),
+                        Err(failure) => send_error(&out, request_id, failure).await,
+                    }
                 });
             }
 
@@ -364,27 +373,6 @@ impl Session {
     }
 }
 
-/// Open a transaction and answer with its handle, attaching the session.
-async fn begin(
-    engine: &Arc<dyn CursorEngine>,
-    registry: &Arc<SessionRegistry>,
-    session_id: u64,
-    request_id: u64,
-    ordering: TxnOrdering,
-    drain: Option<Duration>,
-    out: &mpsc::Sender<OutEvent>,
-) {
-    let engine = Arc::clone(engine);
-    let event = match blocking(move || engine.begin_transaction(ordering, drain)).await {
-        Ok(transaction) => {
-            registry.attach(session_id, transaction);
-            SessionEvent::Begun { transaction }
-        }
-        Err(failure) => SessionEvent::Error(failure),
-    };
-    let _ = out.send((request_id, event)).await;
-}
-
 /// Run a blocking engine call on the blocking pool: a commit drives a Raft
 /// proposal, and a wait for a transaction's turn parks its thread.
 async fn blocking<T: Send + 'static>(
@@ -400,15 +388,16 @@ async fn blocking<T: Send + 'static>(
 /// The commands this stream sent for each transaction, each one a step that
 /// the next waits on.
 #[derive(Default)]
-struct Lanes(HashMap<TransactionHandle, Arc<LaneStep>>);
+struct Lanes(HashMap<TransactionId, Arc<LaneStep>>);
 
 impl Lanes {
-    /// The step of the next command for `handle`, after the one sent before.
-    fn step(&mut self, handle: TransactionHandle) -> LanePosition {
+    /// The step of the next command for transaction `id`, after the one sent
+    /// before.
+    fn step(&mut self, id: TransactionId) -> LanePosition {
         // Steps already passed hold nobody back.
         self.0.retain(|_, step| !step.is_released());
         let mine = Arc::new(LaneStep::default());
-        let previous = self.0.insert(handle, Arc::clone(&mine));
+        let previous = self.0.insert(id, Arc::clone(&mine));
         LanePosition { previous, mine }
     }
 }
