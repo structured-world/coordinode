@@ -58,10 +58,22 @@ async fn open(
     founding: Founding,
     preference: ElectionPreference,
 ) -> Result<ReplicatedDatabase, ReplicationError> {
+    open_under(id, dir, port, founding, preference, PKI.context(id)).await
+}
+
+/// [`open`] proving the identity and trusting the peers `security` says.
+async fn open_under(
+    id: u64,
+    dir: &Path,
+    port: u16,
+    founding: Founding,
+    preference: ElectionPreference,
+    security: Arc<coordinode_embed::replication::SecurityContext>,
+) -> Result<ReplicatedDatabase, ReplicationError> {
     let mut options = MemberOptions::new(id);
     options.preference = preference;
     options.peering = Some(Peering {
-        security: PKI.context(id),
+        security,
         advertise: addr(port),
         founding,
         timeouts: PeerTimeouts::default(),
@@ -2102,6 +2114,139 @@ async fn an_idle_routed_transaction_ends_with_its_timeout_outcome() {
             );
             assert_eq!(count(m, "CommittedAtExpiry"), 1, "committed once");
         }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// Node `id`'s security context under an embedding host's profile, which
+/// identifies peers as `adapter` says.
+fn host_context(
+    id: u64,
+    adapter: &Arc<coordinode_test_fixtures::pki::UriAdapter>,
+) -> Arc<coordinode_embed::replication::SecurityContext> {
+    let (chain, key) = PKI.node_credentials(id);
+    Arc::new(
+        coordinode_embed::replication::SecurityContext::new(
+            coordinode_wire::tls::selected_provider(),
+            chain,
+            key,
+            PKI.host_profile(Arc::clone(adapter)),
+        )
+        .expect("a node security context"),
+    )
+}
+
+/// A group of members `1..=dirs.len()` under the host profile of `adapter`.
+async fn host_group(
+    dirs: &[tempfile::TempDir],
+    adapter: &Arc<coordinode_test_fixtures::pki::UriAdapter>,
+) -> Vec<ReplicatedDatabase> {
+    let ports: Vec<u16> = dirs.iter().map(|_| alloc_port()).collect();
+    let founder = open_under(
+        1,
+        dirs[0].path(),
+        ports[0],
+        Founding::Form { deployment: None },
+        ElectionPreference::Ordinary,
+        host_context(1, adapter),
+    )
+    .await
+    .unwrap();
+    let enrollment = founder.enrollment(addr(ports[0])).expect("enrollment");
+    let mut members = vec![founder];
+    for (i, dir) in dirs.iter().enumerate().skip(1) {
+        let id = i as u64 + 1;
+        members.push(
+            open_under(
+                id,
+                dir.path(),
+                ports[i],
+                Founding::Join(enrollment.clone()),
+                ElectionPreference::Ordinary,
+                host_context(id, adapter),
+            )
+            .await
+            .unwrap(),
+        );
+        members[0]
+            .add_learner(id, addr(ports[i]), PKI.host_identity(id, adapter))
+            .await
+            .unwrap();
+        members[0].promote(id).await.unwrap();
+    }
+    members
+}
+
+/// The credentials a routed transaction travels under change while it is
+/// open. A member renewing its certificate keeps sending the transaction's
+/// commands; once the host revokes a member, the leader stops taking its
+/// commands on the connection already made, so a statement sent through it
+/// runs nowhere, and the transaction carries on through another member
+/// with nothing of that statement in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routed_transaction_outlives_a_renewal_and_a_revoked_member() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let adapter = coordinode_test_fixtures::pki::UriAdapter::new("host-routing");
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let members = host_group(&dirs, &adapter).await;
+        followers_reach_the_leader(&members).await;
+        let id = draw_transaction_id();
+        members[1]
+            .ingress()
+            .begin(begin_of(id), Placement::Anywhere)
+            .await
+            .expect("begun through follower 2");
+        run_in(&members[1], id, "CREATE (:Credentials {step: 'before'})")
+            .await
+            .expect("written before the renewal");
+
+        let (chain, key) = PKI.node_credentials(2);
+        members[1]
+            .security()
+            .expect("peers")
+            .update_credentials(chain, key)
+            .expect("a renewal keeping the identity");
+        run_in(&members[1], id, "CREATE (:Credentials {step: 'renewed'})")
+            .await
+            .expect("written after the renewal");
+
+        adapter.revoke(&PKI.spiffe_id(2));
+        members[0].security().expect("peers").reverify_peers();
+        let refused = run_in(&members[1], id, "CREATE (:Credentials {step: 'revoked'})").await;
+        assert!(
+            matches!(
+                refused,
+                Err(DatabaseError::PeerUnreachable { .. }
+                    | DatabaseError::PeerOutcomeUnknown { .. })
+            ),
+            "a revoked member's command, got {refused:?}"
+        );
+
+        let receipt = members[2]
+            .ingress()
+            .commit(commit_of(id), Placement::Anywhere)
+            .await
+            .expect("committed through follower 3");
+        assert_eq!(receipt.forwarded_to, Some(1));
+        let rows = members[0]
+            .database()
+            .write()
+            .execute_cypher("MATCH (n:Credentials) RETURN n.step AS step ORDER BY step")
+            .unwrap();
+        let steps: Vec<_> = rows.iter().map(|row| row.get("step").cloned()).collect();
+        assert_eq!(
+            steps,
+            vec![
+                Some(Value::String("before".into())),
+                Some(Value::String("renewed".into())),
+            ],
+            "the revoked member's statement ran nowhere"
+        );
 
         for m in members.into_iter().rev() {
             m.shutdown().await.unwrap();
