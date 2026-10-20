@@ -245,19 +245,22 @@ pub enum RoutedOperationAnswer {
     note = "implement `CommandExecutor` over the statement path that serves this member's own clients, so a routed command is fenced, run and refused the same way"
 )]
 pub trait CommandExecutor: Send + Sync + 'static {
-    /// Run `statement`. A statement of a transaction tells `admitted` when it
-    /// has its place in the transaction's order; one that ends meanwhile was
-    /// cancelled through `cancel`.
+    /// Run `statement`, writing its rows to `answer` as they are produced,
+    /// and return its statistics. A statement of a transaction tells
+    /// `admitted` when it has its place in the transaction's order; one that
+    /// ends meanwhile was cancelled through `cancel`, and one whose
+    /// [`AnswerWriter::row`] says the ingress left may stop.
     ///
     /// # Errors
     ///
-    /// What the statement failed with.
+    /// What the statement failed with, before or after rows were written.
     fn execute(
         &self,
         statement: RoutedStatement,
         cancel: &CancelFlag,
         admitted: &AdmissionSignal,
-    ) -> Result<RoutedAnswer, DatabaseError>;
+        answer: &mut AnswerWriter,
+    ) -> Result<RoutedStats, DatabaseError>;
 
     /// Open a transaction under the ID the client drew.
     ///
@@ -413,13 +416,9 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
         });
         let executor = Arc::clone(&self.executor);
         tokio::task::spawn_blocking(move || {
-            let sent = match executor.execute(statement, &cancel, &admitted) {
-                Ok(answer) => send_answer(&frames, answer),
-                Err(err) => frames
-                    .blocking_send(Ok(frame(Event::Error(errors::encode(err)))))
-                    .is_ok(),
-            };
-            if !sent {
+            let mut answer = AnswerWriter::new(frames);
+            let result = executor.execute(statement, &cancel, &admitted, &mut answer);
+            if !answer.finish(result) {
                 tracing::debug!("a routed statement's ingress left before its answer");
                 if let Some(rollback) = abandon {
                     // A transaction the failed statement already ended is
@@ -500,35 +499,115 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
     }
 }
 
-/// Send `answer` as its columns, its rows in batches and its statistics.
-/// `false` when the ingress left before it had all of it.
-fn send_answer(
-    frames: &tokio::sync::mpsc::Sender<Result<wire::RoutedStatementFrame, Status>>,
-    answer: RoutedAnswer,
-) -> bool {
-    let send = |event| frames.blocking_send(Ok(frame(event))).is_ok();
-    if !send(Event::Columns(wire::Columns {
-        names: answer.columns,
-    })) {
-        return false;
-    }
-    let mut batch = Vec::new();
-    for row in &answer.rows {
-        if let Err(e) = rmp_serde::encode::write(&mut batch, row) {
-            return frames
-                .blocking_send(Err(Status::internal(format!(
-                    "a result row could not be encoded: {e}"
-                ))))
-                .is_ok();
+/// Where a member puts the answer of a routed statement while the statement
+/// runs: its columns, then its rows in batches sent as they fill. A batch
+/// waits for room in the call's bounded queue, so an ingress that reads
+/// slowly holds the statement back rather than the answer piling up here.
+/// Called from the blocking pool.
+pub struct AnswerWriter {
+    frames: tokio::sync::mpsc::Sender<Result<wire::RoutedStatementFrame, Status>>,
+    batch: Vec<u8>,
+    columns: bool,
+    /// The ingress left: nothing more reaches it.
+    gone: bool,
+    /// A row that could not be encoded: the answer ends with this failure.
+    broken: Option<String>,
+}
+
+impl AnswerWriter {
+    fn new(frames: tokio::sync::mpsc::Sender<Result<wire::RoutedStatementFrame, Status>>) -> Self {
+        Self {
+            frames,
+            batch: Vec::new(),
+            columns: false,
+            gone: false,
+            broken: None,
         }
-        if batch.len() >= ROW_BATCH_BYTES && !send(Event::Rows(std::mem::take(&mut batch))) {
+    }
+
+    /// An answer nobody reads, for a caller that runs an executor directly
+    /// for its result alone: the statement stops at its first row.
+    pub fn unread() -> Self {
+        let (frames, _) = tokio::sync::mpsc::channel(1);
+        Self::new(frames)
+    }
+
+    /// Send the column names, once and before any row; later calls are
+    /// ignored. `false` once nothing more is worth producing.
+    pub fn columns(&mut self, names: &[String]) -> bool {
+        if !self.columns {
+            self.columns = true;
+            self.send(Event::Columns(wire::Columns {
+                names: names.to_vec(),
+            }));
+        }
+        self.wanted()
+    }
+
+    /// Add one row, its values in column order. `false` once nothing more is
+    /// worth producing: the ingress left, or a row could not be sent.
+    pub fn row(&mut self, row: &[Value]) -> bool {
+        debug_assert!(
+            self.columns,
+            "a routed answer's rows come after its columns"
+        );
+        if !self.wanted() {
             return false;
         }
+        if let Err(e) = rmp_serde::encode::write(&mut self.batch, row) {
+            self.broken = Some(format!("a result row could not be encoded: {e}"));
+            return false;
+        }
+        if self.batch.len() >= ROW_BATCH_BYTES {
+            self.flush();
+        }
+        self.wanted()
     }
-    if !batch.is_empty() && !send(Event::Rows(batch)) {
-        return false;
+
+    fn wanted(&self) -> bool {
+        !self.gone && self.broken.is_none()
     }
-    send(Event::End(stats_to_wire(answer.stats)))
+
+    fn flush(&mut self) {
+        if !self.batch.is_empty() {
+            let batch = std::mem::take(&mut self.batch);
+            self.send(Event::Rows(batch));
+        }
+    }
+
+    fn send(&mut self, event: Event) {
+        if !self.gone && self.frames.blocking_send(Ok(frame(event))).is_err() {
+            self.gone = true;
+        }
+    }
+
+    /// End the answer with the statement's `result`: its statistics after
+    /// the last rows, or its failure after the rows already written, which
+    /// stay delivered. `false` when the ingress left before it had all of
+    /// it.
+    fn finish(mut self, result: Result<RoutedStats, DatabaseError>) -> bool {
+        if let Some(broken) = self.broken.take() {
+            // What the statement did is not what the ingress is told: its
+            // outcome is unknown there, as for any answer lost on the way.
+            return !self.gone
+                && self
+                    .frames
+                    .blocking_send(Err(Status::internal(broken)))
+                    .is_ok();
+        }
+        match result {
+            Ok(stats) => {
+                self.columns(&[]);
+                self.flush();
+                self.send(Event::End(stats_to_wire(stats)));
+            }
+            Err(err) => {
+                self.flush();
+                self.send(Event::Error(errors::encode(err)));
+            }
+        }
+        !self.gone
+    }
 }
 
 fn frame(event: Event) -> wire::RoutedStatementFrame {

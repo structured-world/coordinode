@@ -9,8 +9,9 @@ use coordinode_core::txn::operation::{IssuerId, OperationDescriptor, OperationId
 use coordinode_embed::DatabaseError;
 use coordinode_embed::operation::Resolve;
 use coordinode_embed::replication::routing::{
-    CommandExecutor, CommandRouter, CommandRoutingHandler, MAX_ROUTED_MESSAGE, RoutedBegin,
-    RoutedCommit, RoutedOperationCall, RoutedRollback, RoutedSettings, RoutedStatement,
+    AnswerWriter, CommandExecutor, CommandRouter, CommandRoutingHandler, MAX_ROUTED_MESSAGE,
+    RoutedBegin, RoutedCommit, RoutedOperationCall, RoutedRollback, RoutedSettings,
+    RoutedStatement,
 };
 use tonic_types::StatusExt;
 
@@ -63,7 +64,12 @@ async fn locally(executor: &Arc<ServerCommandExecutor>, query: &str) -> Database
     let statement = statement(query);
     tokio::task::spawn_blocking(move || {
         executor
-            .execute(statement, &CancelFlag::new(), &AdmissionSignal::new(|| {}))
+            .execute(
+                statement,
+                &CancelFlag::new(),
+                &AdmissionSignal::new(|| {}),
+                &mut AnswerWriter::unread(),
+            )
             .expect_err("refused locally")
     })
     .await
@@ -118,6 +124,39 @@ async fn a_statement_fails_the_same_way_on_both_paths() {
             .expect_err(query);
         assert_same(query, local, routed);
     }
+}
+
+/// A read that pages is answered page by page at the executing member, and
+/// the ingress gets every row once, as the member's own client would: more
+/// rows than one page holds, none lost or repeated at a page boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paged_read_answers_every_row_across_pages() {
+    let (executor, router, _dir) = both_ways().await;
+    router
+        .execute(
+            statement("UNWIND range(1, 2500) AS k CREATE (:Paged {k: k})"),
+            &AdmissionSignal::new(|| {}),
+        )
+        .await
+        .expect("seeded");
+    let query = "MATCH (n:Paged) RETURN n.k AS k";
+    assert!(executor.executor.database().read().keyset_pageable(query));
+
+    let answer = router
+        .execute(statement(query), &AdmissionSignal::new(|| {}))
+        .await
+        .expect("read");
+    assert_eq!(answer.columns, ["k".to_string()]);
+    let mut keys: Vec<i64> = answer
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [coordinode_core::graph::types::Value::Int(k)] => *k,
+            other => panic!("unexpected row {other:?}"),
+        })
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, (1..=2500).collect::<Vec<i64>>());
 }
 
 /// Transaction control refused by the executing member reaches the ingress

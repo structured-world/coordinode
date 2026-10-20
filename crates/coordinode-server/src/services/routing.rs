@@ -10,8 +10,8 @@ use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::DatabaseError;
 use coordinode_embed::replication::executor;
 use coordinode_embed::replication::routing::{
-    CommandExecutor, RoutedAnswer, RoutedBegin, RoutedCommit, RoutedOperationAnswer,
-    RoutedOperationCall, RoutedRollback, RoutedStatement,
+    AnswerWriter, CommandExecutor, RoutedBegin, RoutedCommit, RoutedOperationAnswer,
+    RoutedOperationCall, RoutedRollback, RoutedStatement, RoutedStats,
 };
 
 use crate::services::statement::{Admission, StatementExecutor};
@@ -41,13 +41,15 @@ impl CommandExecutor for ServerCommandExecutor {
         statement: RoutedStatement,
         cancel: &CancelFlag,
         admitted: &AdmissionSignal,
-    ) -> Result<RoutedAnswer, DatabaseError> {
+        answer: &mut AnswerWriter,
+    ) -> Result<RoutedStats, DatabaseError> {
         if statement.transaction.is_some() {
-            return executor::run_in_transaction(
-                &self.executor.database().read(),
+            return executor::write_in_transaction(
+                self.executor.database(),
                 statement,
                 cancel,
                 admitted,
+                answer,
             );
         }
 
@@ -74,11 +76,28 @@ impl CommandExecutor for ServerCommandExecutor {
         } = statement;
         let params = (!params.is_empty()).then_some(params);
         let start = Instant::now();
+        // A read that pages is answered page by page, as a session here
+        // pages it: one page of memory whatever the result size.
+        if self.executor.database().read().keyset_pageable(&query) {
+            let stats =
+                executor::write_paged(self.executor.database(), &query, params, &fenced, answer);
+            crate::services::statement::observe_query(
+                if stats.is_ok() {
+                    crate::services::statement::QueryKind::Read
+                } else {
+                    crate::services::statement::QueryKind::Failed
+                },
+                start,
+            );
+            self.executor.record(&query, source.as_ref(), start);
+            return stats;
+        }
         let result = self
             .executor
             .execute(&query, params, source.as_ref(), &fenced)?;
         self.executor.record(&query, source.as_ref(), start);
-        Ok(executor::answer(&result, &fenced))
+        executor::write_rows(&result.rows, answer);
+        Ok(executor::stats(&result.write_stats, &fenced))
     }
 
     fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {

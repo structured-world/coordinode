@@ -7,11 +7,33 @@ use super::*;
 const COMMIT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// What every statement the scripted executor runs answers.
+#[derive(Clone)]
 enum Script {
     /// These rows.
     Rows(RoutedAnswer),
     /// The error this builds.
     Refuse(fn() -> DatabaseError),
+    /// These rows, then the error this builds.
+    RowsThenRefuse(RoutedAnswer, fn() -> DatabaseError),
+    /// `rows` rows of one value, [`noise`] `width` bytes long, made as they
+    /// are written.
+    Many { rows: usize, width: usize },
+}
+
+/// `width` bytes that do not compress, the same for the same `seed`: an
+/// answer whose size on the wire is its size here.
+fn noise(seed: u64, width: usize) -> Value {
+    // xorshift64*, never zero for a seed that is not.
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let bytes = (0..width)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+        })
+        .collect();
+    Value::Blob(bytes)
 }
 
 /// An executor that answers from what the test gave it and records what
@@ -33,6 +55,23 @@ struct Scripted {
     commits: AtomicUsize,
     /// Rollbacks that arrived, in order.
     rollbacks: Mutex<Vec<RoutedRollback>>,
+    /// Rows written to answers so far.
+    written: AtomicUsize,
+}
+
+impl Scripted {
+    /// Write `rows` under `columns` to `answer`, counting each.
+    fn write(&self, columns: &[String], rows: &[Vec<Value>], answer: &mut AnswerWriter) {
+        if !answer.columns(columns) {
+            return;
+        }
+        for row in rows {
+            self.written.fetch_add(1, Ordering::AcqRel);
+            if !answer.row(row) {
+                return;
+            }
+        }
+    }
 }
 
 impl CommandExecutor for Scripted {
@@ -41,7 +80,8 @@ impl CommandExecutor for Scripted {
         statement: RoutedStatement,
         cancel: &CancelFlag,
         admitted: &AdmissionSignal,
-    ) -> Result<RoutedAnswer, DatabaseError> {
+        answer: &mut AnswerWriter,
+    ) -> Result<RoutedStats, DatabaseError> {
         let in_transaction = statement.transaction.is_some();
         self.statements.lock().unwrap().push(statement);
         if in_transaction {
@@ -61,9 +101,28 @@ impl CommandExecutor for Scripted {
                 coordinode_core::budget::BudgetStop::Cancelled,
             ));
         }
-        match self.answer.lock().unwrap().as_ref().expect("an answer") {
-            Script::Rows(answer) => Ok(answer.clone()),
+        let script = self.answer.lock().unwrap().clone().expect("an answer");
+        match script {
+            Script::Rows(rows) => {
+                self.write(&rows.columns, &rows.rows, answer);
+                Ok(rows.stats)
+            }
             Script::Refuse(refusal) => Err(refusal()),
+            Script::RowsThenRefuse(rows, refusal) => {
+                self.write(&rows.columns, &rows.rows, answer);
+                Err(refusal())
+            }
+            Script::Many { rows, width } => {
+                if answer.columns(&["b".to_owned()]) {
+                    for k in 0..rows {
+                        self.written.fetch_add(1, Ordering::AcqRel);
+                        if !answer.row(&[noise(k as u64 + 1, width)]) {
+                            break;
+                        }
+                    }
+                }
+                Ok(RoutedStats::default())
+            }
         }
     }
 
@@ -411,6 +470,100 @@ async fn an_answer_is_read_in_the_pieces_asked_for() {
     }
     assert_eq!(read, rows);
     assert_eq!(answer.stats().map(|s| s.nodes_created), Some(7));
+}
+
+/// An ingress that does not read holds the executing member back: the
+/// member writes a few batches ahead and then waits, rather than producing
+/// the whole answer into memory, and goes on as the ingress reads. Every row
+/// still arrives, in order.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ingress_that_does_not_read_holds_the_member_back() {
+    const ROWS: usize = 800;
+    const WIDTH: usize = 32 << 10;
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Script::Many {
+        rows: ROWS,
+        width: WIDTH,
+    });
+    let router = serve(Arc::clone(&executor)).await;
+    let mut answer = router
+        .execute_rows(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect("answering");
+
+    // Until the member stops writing: it is waiting for the ingress.
+    let mut seen = executor.written.load(Ordering::Acquire);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = executor.written.load(Ordering::Acquire);
+        if now == seen {
+            break;
+        }
+        seen = now;
+    }
+    let per_batch = ROW_BATCH_BYTES / WIDTH;
+    // The queue, the batch being sent, and what HTTP/2 lets through before
+    // the ingress's window is spent.
+    let ahead = (FRAMES_IN_FLIGHT + 6) * per_batch;
+    assert!(
+        seen < ROWS && seen <= ahead,
+        "{seen} of {ROWS} rows written with none read, at most {ahead} expected"
+    );
+
+    let mut read = 0;
+    loop {
+        let piece = answer.next_rows(64).await.expect("rows");
+        if piece.is_empty() {
+            break;
+        }
+        for row in &piece {
+            read += 1;
+            assert_eq!(row, &vec![noise(read as u64, WIDTH)], "row {read}");
+        }
+    }
+    assert_eq!(read, ROWS);
+    assert!(answer.stats().is_some());
+}
+
+/// A statement that fails after part of its answer went out delivers those
+/// rows and then its failure: the ingress reads the rows, then the error the
+/// member raised, never the end of a complete answer.
+#[tokio::test]
+async fn a_failure_after_some_rows_follows_them() {
+    let executor = Arc::new(Scripted::default());
+    let rows: Vec<Vec<Value>> = (0..3).map(|k| vec![Value::Int(k)]).collect();
+    *executor.answer.lock().unwrap() = Some(Script::RowsThenRefuse(
+        RoutedAnswer {
+            columns: vec!["k".into()],
+            rows: rows.clone(),
+            stats: RoutedStats::default(),
+        },
+        || DatabaseError::Budget(coordinode_core::budget::BudgetStop::Deadline),
+    ));
+    let router = serve(executor).await;
+    let mut answer = router
+        .execute_rows(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect("answering");
+    assert_eq!(answer.columns(), ["k".to_string()]);
+    assert_eq!(answer.next_rows(10).await.expect("the rows sent"), rows);
+    let failed = answer.next_rows(10).await;
+    assert!(
+        matches!(
+            failed,
+            Err(DatabaseError::Budget(
+                coordinode_core::budget::BudgetStop::Deadline
+            ))
+        ),
+        "{failed:?}"
+    );
+    assert_eq!(answer.stats(), None, "the answer never completed");
+
+    // Read whole, the failure is the answer.
+    let whole = router
+        .execute(statement(None), &AdmissionSignal::new(|| {}))
+        .await;
+    assert!(matches!(whole, Err(DatabaseError::Budget(_))), "{whole:?}");
 }
 
 /// A transaction's statement tells the ingress it has its place before its
