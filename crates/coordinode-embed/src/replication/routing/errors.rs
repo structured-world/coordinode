@@ -9,8 +9,10 @@
 //! carried whole or the failure is reported as unreadable.
 
 use coordinode_core::budget::BudgetStop;
+use coordinode_core::graph::types::VectorMetric;
 use coordinode_core::group::DeploymentId;
-use coordinode_core::schema::definition::ConstraintKind;
+use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
+use coordinode_core::schema::definition::{ConstraintKind, MAX_ARRAY_NESTING, PropertyType};
 use coordinode_core::txn::command::TransactionId;
 use coordinode_core::txn::operation::IssuerId;
 use coordinode_core::version::{Mismatch, VersionPair};
@@ -28,7 +30,7 @@ use wire::routed_error::Kind;
 
 /// The version of this encoding. A member refuses a call whose ingress reads
 /// another one, before reading the call.
-pub const ERROR_CODEC_VERSION: u32 = 1;
+pub const ERROR_CODEC_VERSION: u32 = 2;
 
 /// The largest encoded error a member sends or reads.
 pub const MAX_ROUTED_ERROR: usize = 64 << 10;
@@ -417,17 +419,17 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             label,
             property,
             element_id,
-        } => match rmp_serde::to_vec(&*kind) {
-            Ok(kind) => Kind::ConstraintViolation(wire::ConstraintViolation {
+        } => match constraint_kind_to_wire(&kind) {
+            Some(kind) => Kind::ConstraintViolation(wire::ConstraintViolation {
                 constraint,
-                kind,
+                kind: Some(kind),
                 label,
                 property,
                 element_id,
             }),
-            // A kind the engine cannot encode is not carried as some other
-            // error; the receiver reads it as unreadable.
-            Err(_) => return undeliverable("ConstraintViolation", 0),
+            // A type nested past the engine's bound is not carried as some
+            // other error; the receiver reads it as unreadable.
+            None => return undeliverable("ConstraintViolation", 0),
         },
         E::KeyImmutable { table, column } => {
             Kind::KeyImmutable(wire::KeyImmutable { table, column })
@@ -754,10 +756,7 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             limit: u.limit,
         },
         Kind::ConstraintViolation(c) => E::ConstraintViolation {
-            kind: Box::new(
-                rmp_serde::from_slice::<ConstraintKind>(&c.kind)
-                    .map_err(|e| format!("a constraint kind that does not decode: {e}"))?,
-            ),
+            kind: Box::new(constraint_kind_from_wire(c.kind)?),
             constraint: c.constraint,
             label: c.label,
             property: c.property,
@@ -908,6 +907,242 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             ));
         }
     })
+}
+
+/// `kind` with its type flattened to a depth and a base; `None` for a type
+/// nested past [`MAX_ARRAY_NESTING`], which the engine does not admit.
+fn constraint_kind_to_wire(kind: &ConstraintKind) -> Option<wire::RoutedConstraintKind> {
+    use wire::routed_constraint_kind::Kind as K;
+    let nothing = wire::RoutedNothing {};
+    Some(wire::RoutedConstraintKind {
+        kind: Some(match kind {
+            ConstraintKind::Unique => K::Unique(nothing),
+            ConstraintKind::NotNull => K::NotNull(nothing),
+            ConstraintKind::NodeKey => K::NodeKey(nothing),
+            ConstraintKind::Type(t) => K::Type(property_type_to_wire(t)?),
+        }),
+    })
+}
+
+fn property_type_to_wire(t: &PropertyType) -> Option<wire::RoutedPropertyType> {
+    use wire::RoutedScalarType as S;
+    use wire::routed_property_type::Base;
+    let (depth, base) = t.array_nesting();
+    if depth > MAX_ARRAY_NESTING {
+        return None;
+    }
+    let scalar = |s: S| Base::Scalar(s as i32);
+    let base = match base {
+        PropertyType::String => scalar(S::String),
+        PropertyType::Int => scalar(S::Int),
+        PropertyType::Float => scalar(S::Float),
+        PropertyType::Bool => scalar(S::Bool),
+        PropertyType::Timestamp => scalar(S::Timestamp),
+        PropertyType::Blob => scalar(S::Blob),
+        PropertyType::Map => scalar(S::Map),
+        PropertyType::Geo => scalar(S::Geo),
+        PropertyType::Binary => scalar(S::Binary),
+        PropertyType::Document => scalar(S::Document),
+        PropertyType::Vector { dimensions, metric } => Base::Vector(wire::RoutedVectorType {
+            dimensions: *dimensions,
+            metric: vector_metric_to_wire(*metric) as i32,
+        }),
+        PropertyType::Computed(spec) => Base::Computed(computed_to_wire(spec)),
+        // `array_nesting` returns the first type that is not an array.
+        PropertyType::Array(_) => return None,
+    };
+    Some(wire::RoutedPropertyType {
+        // At most MAX_ARRAY_NESTING, checked above.
+        array_depth: u32::try_from(depth).ok()?,
+        base: Some(base),
+    })
+}
+
+fn vector_metric_to_wire(metric: VectorMetric) -> wire::RoutedVectorMetric {
+    use wire::RoutedVectorMetric as M;
+    match metric {
+        VectorMetric::Cosine => M::Cosine,
+        VectorMetric::L2 => M::L2,
+        VectorMetric::DotProduct => M::DotProduct,
+        VectorMetric::L1 => M::L1,
+    }
+}
+
+fn computed_to_wire(spec: &ComputedSpec) -> wire::RoutedComputedSpec {
+    use wire::routed_computed_spec::Spec;
+    wire::RoutedComputedSpec {
+        spec: Some(match spec {
+            ComputedSpec::Decay {
+                formula,
+                initial,
+                target,
+                duration_secs,
+                anchor_field,
+            } => Spec::Decay(wire::RoutedDecay {
+                formula: Some(decay_formula_to_wire(formula)),
+                initial: *initial,
+                target: *target,
+                duration_secs: *duration_secs,
+                anchor_field: anchor_field.clone(),
+            }),
+            ComputedSpec::Ttl {
+                duration_secs,
+                anchor_field,
+                scope,
+                target_field,
+            } => Spec::Ttl(wire::RoutedTtl {
+                duration_secs: *duration_secs,
+                anchor_field: anchor_field.clone(),
+                scope: match scope {
+                    TtlScope::Field => wire::RoutedTtlScope::Field,
+                    TtlScope::Subtree => wire::RoutedTtlScope::Subtree,
+                    TtlScope::Node => wire::RoutedTtlScope::Node,
+                } as i32,
+                target_field: target_field.clone(),
+            }),
+            ComputedSpec::VectorDecay {
+                formula,
+                duration_secs,
+                anchor_field,
+            } => Spec::VectorDecay(wire::RoutedVectorDecay {
+                formula: Some(decay_formula_to_wire(formula)),
+                duration_secs: *duration_secs,
+                anchor_field: anchor_field.clone(),
+            }),
+        }),
+    }
+}
+
+fn decay_formula_to_wire(formula: &DecayFormula) -> wire::RoutedDecayFormula {
+    use wire::routed_decay_formula::Formula;
+    wire::RoutedDecayFormula {
+        formula: Some(match formula {
+            DecayFormula::Linear => Formula::Linear(wire::RoutedNothing {}),
+            DecayFormula::Exponential { lambda } => Formula::ExponentialLambda(*lambda),
+            DecayFormula::PowerLaw { tau, alpha } => Formula::PowerLaw(wire::RoutedPowerLaw {
+                tau: *tau,
+                alpha: *alpha,
+            }),
+            DecayFormula::Step => Formula::Step(wire::RoutedNothing {}),
+        }),
+    }
+}
+
+/// The constraint kind `kind` carries. The nesting is checked by its count
+/// before any type is built.
+fn constraint_kind_from_wire(
+    kind: Option<wire::RoutedConstraintKind>,
+) -> Result<ConstraintKind, String> {
+    use wire::routed_constraint_kind::Kind as K;
+    match kind.and_then(|k| k.kind) {
+        Some(K::Unique(_)) => Ok(ConstraintKind::Unique),
+        Some(K::NotNull(_)) => Ok(ConstraintKind::NotNull),
+        Some(K::NodeKey(_)) => Ok(ConstraintKind::NodeKey),
+        Some(K::Type(t)) => Ok(ConstraintKind::Type(property_type_from_wire(t)?)),
+        None => Err("a constraint violation names no kind".to_owned()),
+    }
+}
+
+fn property_type_from_wire(t: wire::RoutedPropertyType) -> Result<PropertyType, String> {
+    use wire::RoutedScalarType as S;
+    use wire::routed_property_type::Base;
+    let depth = usize::try_from(t.array_depth)
+        .ok()
+        .filter(|depth| *depth <= MAX_ARRAY_NESTING)
+        .ok_or_else(|| {
+            format!(
+                "a property type nests {} arrays, past the bound of {MAX_ARRAY_NESTING}",
+                t.array_depth
+            )
+        })?;
+    let base = match t.base {
+        Some(Base::Scalar(s)) => match S::try_from(s) {
+            Ok(S::String) => PropertyType::String,
+            Ok(S::Int) => PropertyType::Int,
+            Ok(S::Float) => PropertyType::Float,
+            Ok(S::Bool) => PropertyType::Bool,
+            Ok(S::Timestamp) => PropertyType::Timestamp,
+            Ok(S::Blob) => PropertyType::Blob,
+            Ok(S::Map) => PropertyType::Map,
+            Ok(S::Geo) => PropertyType::Geo,
+            Ok(S::Binary) => PropertyType::Binary,
+            Ok(S::Document) => PropertyType::Document,
+            Ok(S::Unspecified) | Err(_) => {
+                return Err(format!("scalar type {s} is not one this member knows"));
+            }
+        },
+        Some(Base::Vector(v)) => PropertyType::Vector {
+            dimensions: v.dimensions,
+            metric: vector_metric_from_wire(v.metric)?,
+        },
+        Some(Base::Computed(c)) => PropertyType::Computed(computed_from_wire(c)?),
+        None => return Err("a property type names no base type".to_owned()),
+    };
+    Ok(PropertyType::in_arrays(base, depth))
+}
+
+fn vector_metric_from_wire(metric: i32) -> Result<VectorMetric, String> {
+    use wire::RoutedVectorMetric as M;
+    match M::try_from(metric) {
+        Ok(M::Cosine) => Ok(VectorMetric::Cosine),
+        Ok(M::L2) => Ok(VectorMetric::L2),
+        Ok(M::DotProduct) => Ok(VectorMetric::DotProduct),
+        Ok(M::L1) => Ok(VectorMetric::L1),
+        Ok(M::Unspecified) | Err(_) => Err(format!(
+            "vector metric {metric} is not one this member knows"
+        )),
+    }
+}
+
+fn computed_from_wire(spec: wire::RoutedComputedSpec) -> Result<ComputedSpec, String> {
+    use wire::routed_computed_spec::Spec;
+    Ok(match spec.spec {
+        Some(Spec::Decay(d)) => ComputedSpec::Decay {
+            formula: decay_formula_from_wire(d.formula)?,
+            initial: d.initial,
+            target: d.target,
+            duration_secs: d.duration_secs,
+            anchor_field: d.anchor_field,
+        },
+        Some(Spec::Ttl(t)) => ComputedSpec::Ttl {
+            duration_secs: t.duration_secs,
+            anchor_field: t.anchor_field,
+            scope: match wire::RoutedTtlScope::try_from(t.scope) {
+                Ok(wire::RoutedTtlScope::Field) => TtlScope::Field,
+                Ok(wire::RoutedTtlScope::Subtree) => TtlScope::Subtree,
+                Ok(wire::RoutedTtlScope::Node) => TtlScope::Node,
+                Ok(wire::RoutedTtlScope::Unspecified) | Err(_) => {
+                    return Err(format!(
+                        "TTL scope {} is not one this member knows",
+                        t.scope
+                    ));
+                }
+            },
+            target_field: t.target_field,
+        },
+        Some(Spec::VectorDecay(v)) => ComputedSpec::VectorDecay {
+            formula: decay_formula_from_wire(v.formula)?,
+            duration_secs: v.duration_secs,
+            anchor_field: v.anchor_field,
+        },
+        None => return Err("a computed type names no spec".to_owned()),
+    })
+}
+
+fn decay_formula_from_wire(
+    formula: Option<wire::RoutedDecayFormula>,
+) -> Result<DecayFormula, String> {
+    use wire::routed_decay_formula::Formula;
+    match formula.and_then(|f| f.formula) {
+        Some(Formula::Linear(_)) => Ok(DecayFormula::Linear),
+        Some(Formula::ExponentialLambda(lambda)) => Ok(DecayFormula::Exponential { lambda }),
+        Some(Formula::PowerLaw(p)) => Ok(DecayFormula::PowerLaw {
+            tau: p.tau,
+            alpha: p.alpha,
+        }),
+        Some(Formula::Step(_)) => Ok(DecayFormula::Step),
+        None => Err("a decay names no formula".to_owned()),
+    }
 }
 
 #[cfg(test)]

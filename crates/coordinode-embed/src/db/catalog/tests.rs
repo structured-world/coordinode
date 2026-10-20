@@ -29,6 +29,43 @@ fn declare(name: &str, property: &str, kind: ConstraintKind) -> ConstraintDeclar
     }
 }
 
+/// A property type may nest arrays up to the engine's bound and not one
+/// deeper, on a label and on an edge type: the deeper definition is refused
+/// before anything is published, so no type past the bound is stored.
+#[test]
+fn a_definition_nesting_arrays_past_the_bound_is_refused() {
+    use coordinode_core::schema::definition::{EdgeTypeSchema, MAX_ARRAY_NESTING};
+    let (db, _dir) = open();
+    let nested = |depth| PropertyType::in_arrays(PropertyType::Int, depth);
+
+    let mut fits = LabelSchema::new_node_id("Grid");
+    fits.add_property(PropertyDef::new("cells", nested(MAX_ARRAY_NESTING)));
+    db.define_label(fits).expect("nesting at the bound");
+
+    let mut deep = LabelSchema::new_node_id("Deep");
+    deep.add_property(PropertyDef::new("cells", nested(MAX_ARRAY_NESTING + 1)));
+    let refused = db.define_label(deep).expect_err("one past the bound");
+    assert!(
+        matches!(&refused, DatabaseError::CatalogRefused(m) if m.contains("cells")),
+        "{refused:?}"
+    );
+
+    let mut edge = EdgeTypeSchema::new("LINKS");
+    edge.add_property(PropertyDef::new("path", nested(MAX_ARRAY_NESTING + 1)));
+    let refused = db.define_edge_type(edge).expect_err("one past the bound");
+    assert!(
+        matches!(&refused, DatabaseError::CatalogRefused(m) if m.contains("path")),
+        "{refused:?}"
+    );
+    assert!(
+        db.label_schemas()
+            .expect("labels")
+            .iter()
+            .all(|l| l.name != "Deep"),
+        "nothing of the refused definition was stored"
+    );
+}
+
 fn constraint_names(db: &Database) -> Vec<String> {
     db.constraints()
         .expect("list constraints")

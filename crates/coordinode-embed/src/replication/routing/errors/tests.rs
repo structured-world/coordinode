@@ -1,6 +1,8 @@
 use super::*;
 
-use coordinode_core::schema::definition::PropertyType;
+use coordinode_core::graph::types::VectorMetric;
+use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
+use coordinode_core::schema::definition::{MAX_ARRAY_NESTING, PropertyType};
 
 fn txid() -> TransactionId {
     TransactionId::from_raw([0x2a; 16])
@@ -113,6 +115,71 @@ fn every_variant() -> Vec<DatabaseError> {
             label: "Item".into(),
             property: "qty".into(),
             element_id: "0000000000007".into(),
+        },
+        E::ConstraintViolation {
+            constraint: "item_grid".into(),
+            kind: Box::new(ConstraintKind::Type(PropertyType::in_arrays(
+                PropertyType::Vector {
+                    dimensions: 384,
+                    metric: VectorMetric::L1,
+                },
+                MAX_ARRAY_NESTING,
+            ))),
+            label: "Item".into(),
+            property: "grid".into(),
+            element_id: "0000000000008".into(),
+        },
+        E::ConstraintViolation {
+            constraint: "item_sku".into(),
+            kind: Box::new(ConstraintKind::NodeKey),
+            label: "Item".into(),
+            property: "sku".into(),
+            element_id: "0000000000009".into(),
+        },
+        E::ConstraintViolation {
+            constraint: "item_ttl".into(),
+            kind: Box::new(ConstraintKind::Type(PropertyType::Computed(
+                ComputedSpec::Ttl {
+                    duration_secs: 86_400,
+                    anchor_field: "created".into(),
+                    scope: TtlScope::Subtree,
+                    target_field: Some("meta".into()),
+                },
+            ))),
+            label: "Item".into(),
+            property: "expires".into(),
+            element_id: "000000000000a".into(),
+        },
+        E::ConstraintViolation {
+            constraint: "item_score".into(),
+            kind: Box::new(ConstraintKind::Type(PropertyType::Computed(
+                ComputedSpec::Decay {
+                    formula: DecayFormula::PowerLaw {
+                        tau: 0.25,
+                        alpha: 1.5,
+                    },
+                    initial: 10.0,
+                    target: 1.0,
+                    duration_secs: 3_600,
+                    anchor_field: "seen".into(),
+                },
+            ))),
+            label: "Item".into(),
+            property: "score".into(),
+            element_id: "000000000000b".into(),
+        },
+        E::ConstraintViolation {
+            constraint: "item_boost".into(),
+            kind: Box::new(ConstraintKind::Type(PropertyType::Computed(
+                ComputedSpec::VectorDecay {
+                    formula: DecayFormula::Exponential { lambda: 0.7 },
+                    duration_secs: 60,
+                    anchor_field: "seen".into(),
+                },
+            ))),
+            label: "Item".into(),
+            property: "boost".into(),
+            element_id: "000000000000c".into(),
         },
         E::KeyImmutable {
             table: "Account".into(),
@@ -477,14 +544,75 @@ fn what_this_member_does_not_know_is_unreadable() {
     .encode_to_vec();
     assert!(decode(&short_id).is_err());
 
-    let unknown_kind = wire::RoutedError {
-        kind: Some(Kind::ConstraintViolation(wire::ConstraintViolation {
-            kind: vec![0xc1],
-            ..wire::ConstraintViolation::default()
-        })),
-    }
-    .encode_to_vec();
-    assert!(decode(&unknown_kind).is_err());
+    let violation = |kind: Option<wire::RoutedConstraintKind>| {
+        wire::RoutedError {
+            kind: Some(Kind::ConstraintViolation(wire::ConstraintViolation {
+                kind,
+                ..wire::ConstraintViolation::default()
+            })),
+        }
+        .encode_to_vec()
+    };
+    let of_type = |t: wire::RoutedPropertyType| {
+        Some(wire::RoutedConstraintKind {
+            kind: Some(wire::routed_constraint_kind::Kind::Type(t)),
+        })
+    };
+    // No kind, an empty kind, a type with no base, an unspecified scalar.
+    assert!(decode(&violation(None)).is_err());
+    assert!(decode(&violation(Some(wire::RoutedConstraintKind { kind: None }))).is_err());
+    assert!(decode(&violation(of_type(wire::RoutedPropertyType::default()))).is_err());
+    assert!(
+        decode(&violation(of_type(wire::RoutedPropertyType {
+            array_depth: 0,
+            base: Some(wire::routed_property_type::Base::Scalar(0)),
+        })))
+        .is_err()
+    );
 
     assert!(decode(&[0xff, 0xff, 0xff]).is_err());
+}
+
+/// A type nested past the engine's bound is not delivered: it never reaches
+/// the wire as some other refusal.
+#[test]
+fn a_type_nested_past_the_bound_is_not_delivered() {
+    let err = DatabaseError::ConstraintViolation {
+        constraint: "deep".into(),
+        kind: Box::new(ConstraintKind::Type(PropertyType::in_arrays(
+            PropertyType::Int,
+            MAX_ARRAY_NESTING + 1,
+        ))),
+        label: "L".into(),
+        property: "p".into(),
+        element_id: "0000000000001".into(),
+    };
+    let unreadable = decode(&encode(err)).expect_err("not delivered");
+    assert!(unreadable.contains("ConstraintViolation"), "{unreadable}");
+}
+
+/// A received nesting past the bound is refused by its count, before any
+/// type is built: a four-billion-deep claim costs nothing to refuse.
+#[test]
+fn a_received_nesting_past_the_bound_is_unreadable() {
+    for depth in [MAX_ARRAY_NESTING as u32 + 1, u32::MAX] {
+        let bytes = wire::RoutedError {
+            kind: Some(Kind::ConstraintViolation(wire::ConstraintViolation {
+                kind: Some(wire::RoutedConstraintKind {
+                    kind: Some(wire::routed_constraint_kind::Kind::Type(
+                        wire::RoutedPropertyType {
+                            array_depth: depth,
+                            base: Some(wire::routed_property_type::Base::Scalar(
+                                wire::RoutedScalarType::Int as i32,
+                            )),
+                        },
+                    )),
+                }),
+                ..wire::ConstraintViolation::default()
+            })),
+        }
+        .encode_to_vec();
+        let unreadable = decode(&bytes).expect_err("refused by its count");
+        assert!(unreadable.contains("nest"), "{depth}: {unreadable}");
+    }
 }

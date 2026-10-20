@@ -398,7 +398,29 @@ pub(super) fn check_label_declaration(schema: &LabelSchema) -> Result<(), Databa
             p.name, schema.name
         )));
     }
-    Ok(())
+    check_property_nesting(&schema.name, &schema.properties)
+}
+
+/// Refuse a property whose type nests arrays past [`MAX_ARRAY_NESTING`]: no
+/// such type enters the catalog, so none is stored, encoded or read back.
+pub(super) fn check_property_nesting(
+    owner: &str,
+    properties: &std::collections::BTreeMap<
+        String,
+        coordinode_core::schema::definition::PropertyDef,
+    >,
+) -> Result<(), DatabaseError> {
+    use coordinode_core::schema::definition::MAX_ARRAY_NESTING;
+    match properties
+        .values()
+        .find(|p| p.property_type.array_nesting().0 > MAX_ARRAY_NESTING)
+    {
+        Some(p) => Err(refused(format!(
+            "property `{}` of {owner} nests arrays more than {MAX_ARRAY_NESTING} deep",
+            p.name
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Give `schema` its identity when the caller left it unresolved: a
@@ -406,6 +428,7 @@ pub(super) fn check_label_declaration(schema: &LabelSchema) -> Result<(), Databa
 /// caller declaring a discriminator resolves it with
 /// [`EdgeTypeSchema::resolve_identity`] before handing the schema over.
 pub(super) fn resolve_edge_identity(schema: &mut EdgeTypeSchema) -> Result<(), DatabaseError> {
+    check_property_nesting(&schema.name, &schema.properties)?;
     if schema.discriminator().is_none() {
         schema.resolve_identity(None).map_err(refused)?;
     }

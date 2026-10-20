@@ -101,7 +101,30 @@ pub enum PropertyType {
     Computed(ComputedSpec),
 }
 
+/// The most arrays a declared property type may nest. Deeper declarations
+/// are refused where a type enters the engine, so every type the engine
+/// holds, encodes or reads back stays within it.
+pub const MAX_ARRAY_NESTING: usize = 32;
+
 impl PropertyType {
+    /// How many arrays wrap the type, and the type they wrap, which is not an
+    /// array. Walks the chain without recursion.
+    pub fn array_nesting(&self) -> (usize, &PropertyType) {
+        let mut depth = 0;
+        let mut base = self;
+        while let Self::Array(element) = base {
+            depth += 1;
+            base = element;
+        }
+        (depth, base)
+    }
+
+    /// `base` wrapped in `depth` arrays.
+    #[must_use]
+    pub fn in_arrays(base: PropertyType, depth: usize) -> Self {
+        (0..depth).fold(base, |inner, _| Self::Array(Box::new(inner)))
+    }
+
     /// The scalar type a DDL type name denotes, in the cypher, SQL or Neo4j
     /// spelling, any case; `None` for an unknown name and for the types that
     /// take parameters (vectors, arrays, computed properties).

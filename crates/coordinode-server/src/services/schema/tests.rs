@@ -891,6 +891,33 @@ async fn structured_property_types_round_trip() {
     assert_eq!(type_of("tags"), Some(tags));
 }
 
+/// A client's type may nest arrays up to the engine's bound and not one
+/// deeper: the deeper one is refused naming the field, before any engine
+/// type is built, so no type past the bound ever enters the catalog.
+#[test]
+fn array_nesting_past_the_bound_is_refused() {
+    use coordinode_core::schema::definition::MAX_ARRAY_NESTING;
+    let nested = |depth: usize| {
+        let mut t = scalar(schema::ScalarType::Int64).expect("scalar");
+        for _ in 0..depth {
+            t = schema::PropertyType {
+                r#type: Some(schema::property_type::Type::Array(Box::new(
+                    schema::ArrayType {
+                        element: Some(Box::new(t)),
+                    },
+                ))),
+            };
+        }
+        t
+    };
+    let at_bound = property_type_from_proto("t", Some(&nested(MAX_ARRAY_NESTING)))
+        .expect("nesting at the bound");
+    assert_eq!(at_bound.array_nesting().0, MAX_ARRAY_NESTING);
+    let refused = property_type_from_proto("t", Some(&nested(MAX_ARRAY_NESTING + 1)))
+        .expect_err("one past the bound");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+}
+
 /// A uniqueness constraint created after the type is enforced on the next
 /// CREATE.
 #[tokio::test]

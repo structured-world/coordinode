@@ -48,6 +48,10 @@ CoordiNode supports all standard property types:
 | Vector | `[0.1, 0.2, ...]` | Dense float array |
 | DateTime | `datetime("2024-01-01")` | ISO 8601, timezone-aware |
 
+A declared property type nests arrays at most 32 deep (an array of arrays of
+integers is two). A label or edge type declaring a deeper one is refused when
+it is defined, over gRPC and through the embedded API alike.
+
 ### Property Names
 
 Stored records carry a compact integer id for each property name, not the

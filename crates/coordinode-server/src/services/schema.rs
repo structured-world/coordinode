@@ -17,8 +17,8 @@ use tonic::{Request, Response, Status};
 use coordinode_core::graph::types::VectorMetric;
 use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
 use coordinode_core::schema::definition::{
-    ConstraintKind, ConstraintState, EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType,
-    SchemaMode,
+    ConstraintKind, ConstraintState, EdgeTypeSchema, LabelSchema, MAX_ARRAY_NESTING, PropertyDef,
+    PropertyType, SchemaMode,
 };
 use coordinode_embed::{
     CatalogObject, ConstraintDeclaration, Database, Disposition, EdgeTypeDeclaration, Intent,
@@ -37,8 +37,34 @@ use crate::services::error_details::{Reason, catalog_object_status, invalid_fiel
 const MAX_VECTOR_DIMENSIONS: u32 = 65_536;
 
 /// The engine type a wire type names. `field` is the request path of the
-/// type, for the refusal.
+/// type, for the refusal. Arrays are unwrapped in a loop and counted against
+/// [`MAX_ARRAY_NESTING`] before the base type is read: no recursion, and no
+/// type past the bound is built.
 fn property_type_from_proto(
+    field: &str,
+    t: Option<&schema::PropertyType>,
+) -> Result<PropertyType, Status> {
+    use schema::property_type::Type;
+    let mut field = field.to_owned();
+    let mut t = t;
+    let mut depth = 0;
+    while let Some(Type::Array(a)) = t.and_then(|t| t.r#type.as_ref()) {
+        if depth == MAX_ARRAY_NESTING {
+            return Err(invalid_field(
+                field,
+                format!("arrays nest at most {MAX_ARRAY_NESTING} deep"),
+            ));
+        }
+        depth += 1;
+        field.push_str(".array.element");
+        t = a.element.as_deref();
+    }
+    let base = base_type_from_proto(&field, t)?;
+    Ok(PropertyType::in_arrays(base, depth))
+}
+
+/// The engine type a wire type that is not an array names.
+fn base_type_from_proto(
     field: &str,
     t: Option<&schema::PropertyType>,
 ) -> Result<PropertyType, Status> {
@@ -92,11 +118,8 @@ fn property_type_from_proto(
                 metric,
             })
         }
-        Type::Array(a) => {
-            let element =
-                property_type_from_proto(&format!("{field}.array.element"), a.element.as_deref())?;
-            Ok(PropertyType::Array(Box::new(element)))
-        }
+        // The caller unwraps every array before reading the base.
+        Type::Array(_) => Err(invalid_field(field, "an array is not a base type")),
     }
 }
 
