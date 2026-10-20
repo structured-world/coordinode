@@ -550,7 +550,8 @@ pub struct ServerConfig {
     /// Whether periodic local checkpoints are taken. A checkpoint is the base for
     /// WAL-replay repair (rebuild a corrupt partition from the last checkpoint +
     /// oplog when no healthy replica can serve it). Per-node, no leader election.
-    /// Default true.
+    /// Default false: each checkpoint keeps every table compaction has since
+    /// replaced, so the operator schedules them where that space is wanted.
     pub checkpoint_enabled: bool,
     /// Interval between periodic checkpoints, in seconds. Default 1 hour.
     pub checkpoint_interval_secs: u64,
@@ -672,7 +673,7 @@ impl Default for ServerConfig {
             scrub_enabled: false,
             scrub_interval_secs: 7 * 24 * 3600,
             scrub_throttle_ms: Some(50),
-            checkpoint_enabled: true,
+            checkpoint_enabled: false,
             checkpoint_interval_secs: 3600,
             checkpoint_dir: None,
             checkpoint_keep: 3,

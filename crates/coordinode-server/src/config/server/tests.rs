@@ -16,6 +16,19 @@ fn defaults_match_documented_values() {
     assert!(c.peers.is_empty());
 }
 
+/// Periodic checkpoints are off unless the operator schedules them: each one
+/// keeps by hard link every table compaction has since replaced, so on a
+/// store whose data is rewritten it holds close to a second copy of it.
+#[test]
+fn periodic_checkpoints_are_off_by_default() {
+    assert!(!ServerConfig::default().checkpoint_enabled);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "node_id: 1\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert!(!c.checkpoint_enabled, "a file that does not name it");
+}
+
 /// MiB settings convert to bytes exactly, and a value whose byte count does
 /// not fit is an error naming the key, not a silent `u64::MAX` cache.
 #[test]

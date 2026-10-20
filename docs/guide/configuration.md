@@ -140,7 +140,7 @@ the key is unset.
 | `scrub_enabled` | `false` | restart | Whether the background integrity scrub runs (each node verifies its own on-disk block checksums). A pass reads every block, so it is off unless enabled. |
 | `scrub_interval_secs` | `604800` (7 days) | restart | Seconds between background scrub cycles. |
 | `scrub_throttle_ms` | `50` | restart | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
-| `checkpoint_enabled` | `true` | restart | Whether periodic local checkpoints are taken (the base for WAL-replay repair when no healthy replica is available). |
+| `checkpoint_enabled` | `false` | restart | Whether periodic local checkpoints are taken (the base for WAL-replay repair when no healthy replica is available). A checkpoint hard-links the store's tables, so taking one copies nothing, but it keeps every table compaction replaces after it: on data that is rewritten, each retained checkpoint grows toward a second copy of the store. Off by default; enable it where that space buys repair without a replica (a standalone node), and size `checkpoint_keep` to the disk. |
 | `checkpoint_interval_secs` | `3600` (1 hour) | restart | Seconds between periodic checkpoints. A rebuild from the latest checkpoint replays the Raft log from the oldest entry the checkpoint lacks, so the log is kept from there: a longer interval keeps more log on disk. |
 | `checkpoint_dir` | `<data_dir>/checkpoints` | restart | Directory checkpoints are written under. |
 | `checkpoint_keep` | `3` | restart | Number of recent checkpoints to retain; older ones are pruned. |
@@ -421,8 +421,8 @@ scrub_enabled: false
 # scrub_interval_secs: 604800
 # scrub_throttle_ms: 50
 
-# Periodic local checkpoints (base for WAL-replay repair).
-checkpoint_enabled: true
+# Periodic local checkpoints (base for WAL-replay repair); off by default.
+# checkpoint_enabled: false
 # checkpoint_interval_secs: 3600
 # checkpoint_dir: /var/lib/coordinode/checkpoints
 # checkpoint_keep: 3
