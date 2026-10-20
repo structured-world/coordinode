@@ -119,6 +119,18 @@ impl PropertyType {
         (depth, base)
     }
 
+    /// As [`Self::array_nesting`], taking the type apart: the base is moved
+    /// out, nothing is copied.
+    pub fn into_array_nesting(self) -> (usize, PropertyType) {
+        let mut depth = 0;
+        let mut base = self;
+        while let Self::Array(element) = base {
+            depth += 1;
+            base = *element;
+        }
+        (depth, base)
+    }
+
     /// `base` wrapped in `depth` arrays.
     #[must_use]
     pub fn in_arrays(base: PropertyType, depth: usize) -> Self {

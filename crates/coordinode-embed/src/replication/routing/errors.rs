@@ -419,7 +419,7 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             label,
             property,
             element_id,
-        } => match constraint_kind_to_wire(&kind) {
+        } => match constraint_kind_to_wire(*kind) {
             Some(kind) => Kind::ConstraintViolation(wire::ConstraintViolation {
                 constraint,
                 kind: Some(kind),
@@ -910,8 +910,9 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
 }
 
 /// `kind` with its type flattened to a depth and a base; `None` for a type
-/// nested past [`MAX_ARRAY_NESTING`], which the engine does not admit.
-fn constraint_kind_to_wire(kind: &ConstraintKind) -> Option<wire::RoutedConstraintKind> {
+/// nested past [`MAX_ARRAY_NESTING`], which the engine does not admit. The
+/// fields are moved, not copied: the error's size is taken from them after.
+fn constraint_kind_to_wire(kind: ConstraintKind) -> Option<wire::RoutedConstraintKind> {
     use wire::routed_constraint_kind::Kind as K;
     let nothing = wire::RoutedNothing {};
     Some(wire::RoutedConstraintKind {
@@ -924,13 +925,13 @@ fn constraint_kind_to_wire(kind: &ConstraintKind) -> Option<wire::RoutedConstrai
     })
 }
 
-fn property_type_to_wire(t: &PropertyType) -> Option<wire::RoutedPropertyType> {
+fn property_type_to_wire(t: PropertyType) -> Option<wire::RoutedPropertyType> {
     use wire::RoutedScalarType as S;
     use wire::routed_property_type::Base;
-    let (depth, base) = t.array_nesting();
-    if depth > MAX_ARRAY_NESTING {
+    if t.array_nesting().0 > MAX_ARRAY_NESTING {
         return None;
     }
+    let (depth, base) = t.into_array_nesting();
     let scalar = |s: S| Base::Scalar(s as i32);
     let base = match base {
         PropertyType::String => scalar(S::String),
@@ -944,8 +945,8 @@ fn property_type_to_wire(t: &PropertyType) -> Option<wire::RoutedPropertyType> {
         PropertyType::Binary => scalar(S::Binary),
         PropertyType::Document => scalar(S::Document),
         PropertyType::Vector { dimensions, metric } => Base::Vector(wire::RoutedVectorType {
-            dimensions: *dimensions,
-            metric: vector_metric_to_wire(*metric) as i32,
+            dimensions,
+            metric: vector_metric_to_wire(metric) as i32,
         }),
         PropertyType::Computed(spec) => Base::Computed(computed_to_wire(spec)),
         // `array_nesting` returns the first type that is not an array.
@@ -968,7 +969,7 @@ fn vector_metric_to_wire(metric: VectorMetric) -> wire::RoutedVectorMetric {
     }
 }
 
-fn computed_to_wire(spec: &ComputedSpec) -> wire::RoutedComputedSpec {
+fn computed_to_wire(spec: ComputedSpec) -> wire::RoutedComputedSpec {
     use wire::routed_computed_spec::Spec;
     wire::RoutedComputedSpec {
         spec: Some(match spec {
@@ -980,10 +981,10 @@ fn computed_to_wire(spec: &ComputedSpec) -> wire::RoutedComputedSpec {
                 anchor_field,
             } => Spec::Decay(wire::RoutedDecay {
                 formula: Some(decay_formula_to_wire(formula)),
-                initial: *initial,
-                target: *target,
-                duration_secs: *duration_secs,
-                anchor_field: anchor_field.clone(),
+                initial,
+                target,
+                duration_secs,
+                anchor_field,
             }),
             ComputedSpec::Ttl {
                 duration_secs,
@@ -991,14 +992,14 @@ fn computed_to_wire(spec: &ComputedSpec) -> wire::RoutedComputedSpec {
                 scope,
                 target_field,
             } => Spec::Ttl(wire::RoutedTtl {
-                duration_secs: *duration_secs,
-                anchor_field: anchor_field.clone(),
+                duration_secs,
+                anchor_field,
                 scope: match scope {
                     TtlScope::Field => wire::RoutedTtlScope::Field,
                     TtlScope::Subtree => wire::RoutedTtlScope::Subtree,
                     TtlScope::Node => wire::RoutedTtlScope::Node,
                 } as i32,
-                target_field: target_field.clone(),
+                target_field,
             }),
             ComputedSpec::VectorDecay {
                 formula,
@@ -1006,23 +1007,22 @@ fn computed_to_wire(spec: &ComputedSpec) -> wire::RoutedComputedSpec {
                 anchor_field,
             } => Spec::VectorDecay(wire::RoutedVectorDecay {
                 formula: Some(decay_formula_to_wire(formula)),
-                duration_secs: *duration_secs,
-                anchor_field: anchor_field.clone(),
+                duration_secs,
+                anchor_field,
             }),
         }),
     }
 }
 
-fn decay_formula_to_wire(formula: &DecayFormula) -> wire::RoutedDecayFormula {
+fn decay_formula_to_wire(formula: DecayFormula) -> wire::RoutedDecayFormula {
     use wire::routed_decay_formula::Formula;
     wire::RoutedDecayFormula {
         formula: Some(match formula {
             DecayFormula::Linear => Formula::Linear(wire::RoutedNothing {}),
-            DecayFormula::Exponential { lambda } => Formula::ExponentialLambda(*lambda),
-            DecayFormula::PowerLaw { tau, alpha } => Formula::PowerLaw(wire::RoutedPowerLaw {
-                tau: *tau,
-                alpha: *alpha,
-            }),
+            DecayFormula::Exponential { lambda } => Formula::ExponentialLambda(lambda),
+            DecayFormula::PowerLaw { tau, alpha } => {
+                Formula::PowerLaw(wire::RoutedPowerLaw { tau, alpha })
+            }
             DecayFormula::Step => Formula::Step(wire::RoutedNothing {}),
         }),
     }

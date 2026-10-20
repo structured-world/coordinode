@@ -468,6 +468,22 @@ fn an_error_whose_fields_do_not_fit_is_not_delivered_as_another() {
             limit: 1,
             chain: vec!["t".repeat(1 << 10); 128],
         },
+        // A computed type's field names are carried whole and count toward
+        // the bound like every other field.
+        DatabaseError::ConstraintViolation {
+            constraint: "c".into(),
+            kind: Box::new(ConstraintKind::Type(PropertyType::Computed(
+                ComputedSpec::Ttl {
+                    duration_secs: 1,
+                    anchor_field: "a".repeat(MAX_ROUTED_ERROR),
+                    scope: TtlScope::Field,
+                    target_field: None,
+                },
+            ))),
+            label: "L".into(),
+            property: "p".into(),
+            element_id: "0000000000001".into(),
+        },
     ];
     for err in errors {
         let name = variant_name(&err);
