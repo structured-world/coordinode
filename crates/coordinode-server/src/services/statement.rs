@@ -21,7 +21,9 @@ pub(crate) use coordinode_embed::replication::admission::{
 };
 use coordinode_embed::replication::admission::{AdmissionDefaults, Admitter};
 pub(crate) use coordinode_embed::replication::executor::columns_and_values;
-use coordinode_embed::replication::routing::{CommandRouter, RoutedAnswer, RoutedStatement};
+use coordinode_embed::replication::routing::{
+    CommandRouter, RoutedAnswer, RoutedRows, RoutedStatement,
+};
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::QueryRegistry;
 use coordinode_query::advisor::nplus1::NPlus1Detector;
@@ -217,6 +219,17 @@ impl StatementExecutor {
         admitted: &AdmissionSignal,
     ) -> Result<RoutedAnswer, DatabaseError> {
         self.router(member)?.execute(statement, admitted).await
+    }
+
+    /// Run `statement` at `member` and return its rows as they arrive, held
+    /// back by the member's bounded queue until the caller takes them.
+    pub(crate) async fn route_rows(
+        &self,
+        member: u64,
+        statement: RoutedStatement,
+        admitted: &AdmissionSignal,
+    ) -> Result<RoutedRows, DatabaseError> {
+        self.router(member)?.execute_rows(statement, admitted).await
     }
 
     /// A router to `member` over this node's authenticated connection to it.

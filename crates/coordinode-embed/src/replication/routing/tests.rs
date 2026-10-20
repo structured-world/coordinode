@@ -342,6 +342,53 @@ async fn a_large_answer_is_split_and_reassembled_in_order() {
     assert_eq!(answer.rows, rows);
 }
 
+/// The ingress reads a routed answer as its caller asks for rows, not whole
+/// before handing any out: the columns come first, each read returns at most
+/// what was asked for, and the statistics, sent last, are unknown until the
+/// rows run out. The rows still arrive whole and in order.
+#[tokio::test]
+async fn an_answer_is_read_in_the_pieces_asked_for() {
+    let executor = Arc::new(Scripted::default());
+    // About 3 MiB in all: several batches on the wire.
+    let rows: Vec<Vec<Value>> = (0..48)
+        .map(|k| vec![Value::Int(k), Value::String("x".repeat(64 << 10))])
+        .collect();
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer {
+        columns: vec!["k".into(), "pad".into()],
+        rows: rows.clone(),
+        stats: RoutedStats {
+            nodes_created: 7,
+            ..RoutedStats::default()
+        },
+    }));
+    let router = serve(executor).await;
+    let mut answer = router
+        .execute_rows(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect("answering");
+    assert_eq!(answer.columns(), ["k".to_string(), "pad".to_string()]);
+
+    let first = answer.next_rows(1).await.expect("first row");
+    assert_eq!(first, rows[..1]);
+    assert_eq!(
+        answer.stats(),
+        None,
+        "the rest of the answer is not read yet"
+    );
+
+    let mut read = first;
+    loop {
+        let piece = answer.next_rows(5).await.expect("rows");
+        assert!(piece.len() <= 5, "a read returns at most what was asked");
+        if piece.is_empty() {
+            break;
+        }
+        read.extend(piece);
+    }
+    assert_eq!(read, rows);
+    assert_eq!(answer.stats().map(|s| s.nodes_created), Some(7));
+}
+
 /// A transaction's statement tells the ingress it has its place before its
 /// answer is ready: the ingress passes the next command of the transaction
 /// on at that point, not after the whole statement ran.

@@ -634,8 +634,8 @@ impl CommandRouter {
         Err(errors::decode(bytes).unwrap_or_else(|e| self.unreadable(e)))
     }
 
-    /// Run `statement` at the member and return its answer. `admitted` is told
-    /// when the statement has its place there.
+    /// Run `statement` at the member and return its whole answer. `admitted`
+    /// is told when the statement has its place there.
     ///
     /// # Errors
     ///
@@ -646,6 +646,26 @@ impl CommandRouter {
         statement: RoutedStatement,
         admitted: &AdmissionSignal,
     ) -> Result<RoutedAnswer, DatabaseError> {
+        self.execute_rows(statement, admitted)
+            .await?
+            .collect()
+            .await
+    }
+
+    /// Run `statement` at the member and return its answer as rows read off
+    /// the wire as they are asked for: the columns are known once this
+    /// returns, and the member waits on its bounded queue for rows the caller
+    /// has not taken, so a large answer is never held whole here.
+    ///
+    /// # Errors
+    ///
+    /// What the statement failed with at the member before its answer began,
+    /// or how the call was lost.
+    pub async fn execute_rows(
+        &self,
+        statement: RoutedStatement,
+        admitted: &AdmissionSignal,
+    ) -> Result<RoutedRows, DatabaseError> {
         let deadline = statement.deadline;
         let request = Self::request(statement_to_wire(statement)?, deadline);
         let mut frames = self
@@ -655,26 +675,32 @@ impl CommandRouter {
             .await
             .map_err(|s| self.lost(&s))?
             .into_inner();
-        let mut answer = RoutedAnswer::default();
+        // The answer opens with its columns, after the admission of a
+        // transaction's statement and unless the statement failed.
         while let Some(frame) = frames.message().await.map_err(|s| self.lost(&s))? {
             match frame.event {
                 Some(Event::Admitted(_)) => admitted.admitted(),
-                Some(Event::Columns(columns)) => answer.columns = columns.names,
-                Some(Event::Rows(batch)) => {
-                    decode_rows(&batch, &mut answer.rows).map_err(|e| self.unreadable(e))?;
-                }
-                Some(Event::End(stats)) => {
-                    answer.stats = stats_from_wire(stats);
-                    return Ok(answer);
+                Some(Event::Columns(columns)) => {
+                    return Ok(RoutedRows {
+                        router: self.clone(),
+                        columns: columns.names,
+                        frames,
+                        buffered: std::collections::VecDeque::new(),
+                        stats: None,
+                    });
                 }
                 Some(Event::Error(bytes)) => {
                     return Err(errors::decode(&bytes).unwrap_or_else(|e| self.unreadable(e)));
                 }
+                Some(Event::Rows(_) | Event::End(_)) => {
+                    return Err(self.unreadable(
+                        "the executing member sent rows before their columns".to_owned(),
+                    ));
+                }
                 None => {}
             }
         }
-        Err(self
-            .unreadable("the executing member ended the answer before its statistics".to_owned()))
+        Err(self.unreadable("the executing member ended the answer before its columns".to_owned()))
     }
 
     /// Open a transaction at the member, which must lead, under the ID the
@@ -758,6 +784,90 @@ impl CommandRouter {
             return Err(errors::decode(bytes).unwrap_or_else(|e| self.unreadable(e)));
         }
         operation_answer_from_wire(answer).map_err(|e| self.unreadable(e))
+    }
+}
+
+/// The rows of a statement another member runs, read off the wire as the
+/// caller asks for them. At most one received batch is held here; the rest
+/// waits in the member's bounded queue, which holds the member back.
+pub struct RoutedRows {
+    router: CommandRouter,
+    columns: Vec<String>,
+    frames: tonic::Streaming<wire::RoutedStatementFrame>,
+    buffered: std::collections::VecDeque<Vec<Value>>,
+    stats: Option<RoutedStats>,
+}
+
+impl RoutedRows {
+    /// The column names, in result order.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// The statement's statistics, known once every row was read; `None`
+    /// before.
+    pub fn stats(&self) -> Option<RoutedStats> {
+        self.stats
+    }
+
+    /// Up to `max` more rows; none once they run out, when the statistics
+    /// are known.
+    ///
+    /// # Errors
+    ///
+    /// How the rest of the answer was lost: a failure after rows were
+    /// delivered leaves the statement's outcome to be resolved, never rerun.
+    pub async fn next_rows(&mut self, max: usize) -> Result<Vec<Vec<Value>>, DatabaseError> {
+        while self.buffered.is_empty() && self.stats.is_none() {
+            let Some(frame) = self
+                .frames
+                .message()
+                .await
+                .map_err(|s| self.router.lost(&s))?
+            else {
+                return Err(self.router.unreadable(
+                    "the executing member ended the answer before its statistics".to_owned(),
+                ));
+            };
+            match frame.event {
+                Some(Event::Rows(batch)) => {
+                    let mut rows = Vec::new();
+                    decode_rows(&batch, &mut rows).map_err(|e| self.router.unreadable(e))?;
+                    self.buffered.extend(rows);
+                }
+                Some(Event::End(stats)) => self.stats = Some(stats_from_wire(stats)),
+                Some(Event::Error(bytes)) => {
+                    return Err(
+                        errors::decode(&bytes).unwrap_or_else(|e| self.router.unreadable(e))
+                    );
+                }
+                Some(Event::Admitted(_) | Event::Columns(_)) | None => {}
+            }
+        }
+        let take = max.min(self.buffered.len());
+        Ok(self.buffered.drain(..take).collect())
+    }
+
+    /// Every remaining row and the statistics, as one answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`RoutedRows::next_rows`].
+    pub async fn collect(mut self) -> Result<RoutedAnswer, DatabaseError> {
+        let mut rows = Vec::new();
+        loop {
+            let piece = self.next_rows(usize::MAX).await?;
+            if piece.is_empty() {
+                break;
+            }
+            rows.extend(piece);
+        }
+        Ok(RoutedAnswer {
+            columns: self.columns,
+            rows,
+            // Known: the rows ran out only once the statistics arrived.
+            stats: self.stats.unwrap_or_default(),
+        })
     }
 }
 

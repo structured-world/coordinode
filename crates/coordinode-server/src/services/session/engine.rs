@@ -39,7 +39,7 @@ use parking_lot::RwLock;
 
 use coordinode_core::txn::command::ActingContext;
 use coordinode_embed::replication::routing::{
-    RoutedBegin, RoutedCommit, RoutedRollback, RoutedSettings, RoutedStatement,
+    RoutedBegin, RoutedCommit, RoutedRollback, RoutedRows, RoutedSettings, RoutedStatement,
 };
 
 use super::failure;
@@ -90,8 +90,9 @@ impl DatabaseCursorEngine {
             .map_err(engine_error)
     }
 
-    /// Run `statement` at `member` and page its answer out of memory. A
-    /// Cancel thrown meanwhile drops the call, and with it the statement
+    /// Run `statement` at `member` and page its answer off the wire as the
+    /// client asks for rows: nothing beyond one received batch is held here.
+    /// A Cancel thrown meanwhile drops the call, and with it the statement
     /// there. `admitted` is told when the statement has its place there.
     fn routed(
         &self,
@@ -101,31 +102,14 @@ impl DatabaseCursorEngine {
         cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         let led = statement.transaction.is_none();
-        let answer =
-            self.block_on_routed(cancel, self.executor.route(member, statement, admitted))?;
-        let stats = answer.stats;
-        Ok(Box::new(MaterializedCursor {
-            columns: answer.columns,
-            rows: answer.rows,
-            pos: 0,
-            stats: SessionStats {
-                nodes_created: stats.nodes_created,
-                nodes_deleted: stats.nodes_deleted,
-                edges_created: stats.edges_created,
-                edges_deleted: stats.edges_deleted,
-                properties_set: stats.properties_set,
-                // A write reports its own commit's index, one answered
-                // before its commit none, a read the index it was served at.
-                applied_index: match (stats.applied_index, stats.commit_ts) {
-                    (0, 0) => stats.read_index,
-                    (0, _) => 0,
-                    (own, _) => own,
-                },
-                served_by_leader: led,
-                commit_ts: stats.commit_ts,
-                read_as_of_ts: stats.read_as_of_ts,
-                ..SessionStats::default()
-            },
+        let rows = self.block_on_routed(
+            cancel,
+            self.executor.route_rows(member, statement, admitted),
+        )?;
+        Ok(Box::new(RoutedCursor {
+            rows,
+            cancel: cancel.clone(),
+            led,
         }))
     }
 
@@ -667,6 +651,63 @@ fn write_stats(ws: &WriteStats) -> SessionStats {
         // own; zero otherwise, which is what the session protocol documents.
         commit_ts: ws.commit_ts.unwrap_or(0),
         ..SessionStats::default()
+    }
+}
+
+/// A cursor over a statement another member runs: each `next_batch` reads
+/// the next rows off the wire, so the session holds at most one received
+/// batch and the executing member waits for the client. Called from the
+/// blocking pool, where waiting on the runtime is allowed.
+struct RoutedCursor {
+    rows: RoutedRows,
+    cancel: coordinode_core::budget::CancelFlag,
+    /// The statement ran at the leader on its own, not in a transaction.
+    led: bool,
+}
+
+impl QueryCursor for RoutedCursor {
+    fn columns(&self) -> Vec<String> {
+        self.rows.columns().to_vec()
+    }
+
+    fn next_batch(&mut self, max: usize) -> Result<Vec<Vec<Value>>, EngineError> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+            EngineError::internal(format!("no runtime to read another member's rows on: {e}"))
+        })?;
+        let (rows, cancel) = (&mut self.rows, &self.cancel);
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                () = cancel.thrown() => Err(engine_error(DatabaseError::Budget(
+                    coordinode_core::budget::BudgetStop::Cancelled,
+                ))),
+                read = rows.next_rows(max) => read.map_err(engine_error),
+            }
+        })
+    }
+
+    fn stats(&self) -> SessionStats {
+        let Some(stats) = self.rows.stats() else {
+            return SessionStats::default();
+        };
+        SessionStats {
+            nodes_created: stats.nodes_created,
+            nodes_deleted: stats.nodes_deleted,
+            edges_created: stats.edges_created,
+            edges_deleted: stats.edges_deleted,
+            properties_set: stats.properties_set,
+            // A write reports its own commit's index, one answered before
+            // its commit none, a read the index it was served at.
+            applied_index: match (stats.applied_index, stats.commit_ts) {
+                (0, 0) => stats.read_index,
+                (0, _) => 0,
+                (own, _) => own,
+            },
+            served_by_leader: self.led,
+            commit_ts: stats.commit_ts,
+            read_as_of_ts: stats.read_as_of_ts,
+            ..SessionStats::default()
+        }
     }
 }
 
