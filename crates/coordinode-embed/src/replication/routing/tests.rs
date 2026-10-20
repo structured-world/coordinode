@@ -516,7 +516,16 @@ async fn a_call_under_another_codec_is_refused_unread() {
 async fn an_unreadable_error_is_an_unknown_outcome() {
     let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
     let router = CommandRouter::new(MEMBER, channel);
-    for bytes in [vec![0xff, 0xff, 0xff], vec![0; MAX_ROUTED_ERROR + 1]] {
+    let undeliverable = errors::encode(DatabaseError::DuplicateKey {
+        table: "Account".into(),
+        key: "k".repeat(MAX_ROUTED_ERROR),
+        element_id: "0000000000007".into(),
+    });
+    for bytes in [
+        vec![0xff, 0xff, 0xff],
+        vec![0; MAX_ROUTED_ERROR + 1],
+        undeliverable,
+    ] {
         let err = router.failure(&bytes).expect_err("a failure");
         assert!(
             matches!(

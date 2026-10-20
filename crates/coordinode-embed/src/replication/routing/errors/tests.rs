@@ -350,21 +350,100 @@ fn long_text_is_cut_and_fields_are_kept() {
     }
 }
 
-/// An error whose identifying fields alone exceed the bound is sent as an
-/// internal failure, which claims nothing about what applied.
+/// A value a caller acts on (the duplicate key, the held unique value) is
+/// structured data, not display text: past the free-text bound it still
+/// crosses whole, never cut into another value.
 #[test]
-fn an_error_too_large_to_carry_is_internal() {
-    let err = DatabaseError::CascadeOverflow {
-        current: 1,
-        limit: 1,
-        chain: vec!["t".repeat(1 << 10); 128],
+fn a_semantic_value_past_the_text_bound_crosses_whole() {
+    let key = "k".repeat(TEXT_LIMIT * 4);
+    let value = "v".repeat(TEXT_LIMIT * 4);
+    let errors = [
+        DatabaseError::DuplicateKey {
+            table: "Account".into(),
+            key: key.clone(),
+            element_id: "0000000000007".into(),
+        },
+        DatabaseError::UniqueViolation {
+            index: "user_email".into(),
+            property: "email".into(),
+            value: value.clone(),
+            element_id: "0000000000003".into(),
+        },
+    ];
+    for err in errors {
+        let name = variant_name(&err);
+        let sent = format!("{err:?}");
+        let bytes = encode(err);
+        assert!(bytes.len() <= MAX_ROUTED_ERROR);
+        let back = format!("{:?}", decode(&bytes).expect("decoded"));
+        assert!(
+            back == sent,
+            "{name}: sent {} bytes of Debug, got {}",
+            sent.len(),
+            back.len()
+        );
+    }
+}
+
+/// An error whose fields a caller acts on do not fit the bound is not
+/// delivered as some other error: the ingress cannot read it, which is a lost
+/// answer, never a refusal with the fields missing.
+#[test]
+fn an_error_whose_fields_do_not_fit_is_not_delivered_as_another() {
+    let errors = [
+        DatabaseError::DuplicateKey {
+            table: "Account".into(),
+            key: "k".repeat(MAX_ROUTED_ERROR),
+            element_id: "0000000000007".into(),
+        },
+        DatabaseError::CascadeOverflow {
+            current: 1,
+            limit: 1,
+            chain: vec!["t".repeat(1 << 10); 128],
+        },
+    ];
+    for err in errors {
+        let name = variant_name(&err);
+        let bytes = encode(err);
+        assert!(bytes.len() <= MAX_ROUTED_ERROR);
+        let unreadable = decode(&bytes).expect_err("not delivered");
+        assert!(unreadable.contains(name), "{name}: {unreadable}");
+    }
+}
+
+/// Exactly at the bound an error crosses; one byte of a field past it, it is
+/// not delivered.
+#[test]
+fn the_bound_holds_at_its_edge() {
+    let fits = |len: usize| {
+        let err = DatabaseError::DuplicateKey {
+            table: String::new(),
+            key: "k".repeat(len),
+            element_id: String::new(),
+        };
+        decode(&encode(err)).is_ok()
     };
-    let bytes = encode(err);
-    assert!(bytes.len() <= MAX_ROUTED_ERROR);
-    assert!(matches!(
-        decode(&bytes).expect("decoded"),
-        DatabaseError::Other(_)
-    ));
+    let mut low = 0;
+    let mut high = MAX_ROUTED_ERROR;
+    while low + 1 < high {
+        let mid = (low + high) / 2;
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    assert!(fits(low) && !fits(low + 1), "edge at {low}");
+    let at_edge = DatabaseError::DuplicateKey {
+        table: String::new(),
+        key: "k".repeat(low),
+        element_id: String::new(),
+    };
+    assert_eq!(
+        encode(at_edge).len(),
+        MAX_ROUTED_ERROR,
+        "the whole bound is usable"
+    );
 }
 
 /// Bytes past the bound are refused before they are decoded.

@@ -38,16 +38,85 @@ const TEXT_LIMIT: usize = 8 << 10;
 
 /// `err` as the bytes of a `RoutedError`, within [`MAX_ROUTED_ERROR`].
 ///
-/// Free text is cut at [`TEXT_LIMIT`]; a failure whose identifying fields
-/// alone do not fit is sent as an internal failure naming its text, which
-/// claims nothing about what applied.
+/// Free text is cut at [`TEXT_LIMIT`]; every other field is carried whole.
+/// The size is taken from the moved fields before anything is serialized or
+/// rendered; an error whose fields do not fit is sent as undeliverable, which
+/// the receiver reads as an answer it could not read, never as another
+/// refusal.
 pub fn encode(err: DatabaseError) -> Vec<u8> {
-    let rendered = err.to_string();
-    let encoded = to_wire(err).encode_to_vec();
-    if encoded.len() <= MAX_ROUTED_ERROR {
-        return encoded;
+    let variant = variant_name(&err);
+    let error = to_wire(err);
+    let size = error.encoded_len();
+    if size <= MAX_ROUTED_ERROR {
+        return error.encode_to_vec();
     }
-    text_case(Kind::Other, rendered).encode_to_vec()
+    undeliverable(variant, size).encode_to_vec()
+}
+
+fn undeliverable(variant: &str, size: usize) -> wire::RoutedError {
+    wire::RoutedError {
+        kind: Some(Kind::Undeliverable(wire::Undeliverable {
+            variant: variant.to_owned(),
+            // usize is at most 64 bits on every supported target.
+            size: size as u64,
+        })),
+    }
+}
+
+/// The name of `err`'s variant, for the receiver of an undeliverable error.
+fn variant_name(err: &DatabaseError) -> &'static str {
+    use DatabaseError as E;
+    match err {
+        E::Parse(_) => "Parse",
+        E::Plan(_) => "Plan",
+        E::Semantic(_) => "Semantic",
+        E::SessionSetting { .. } => "SessionSetting",
+        E::Arithmetic(_) => "Arithmetic",
+        E::Procedure(_) => "Procedure",
+        E::Unsupported(_) => "Unsupported",
+        E::Budget(_) => "Budget",
+        E::IndexUnresolved { .. } => "IndexUnresolved",
+        E::CascadeOverflow { .. } => "CascadeOverflow",
+        E::CascadeFanoutOverflow { .. } => "CascadeFanoutOverflow",
+        E::SchemaViolation(_) => "SchemaViolation",
+        E::DuplicateKey { .. } => "DuplicateKey",
+        E::UniqueViolation { .. } => "UniqueViolation",
+        E::UniquenessUnresolved { .. } => "UniquenessUnresolved",
+        E::ConstraintViolation { .. } => "ConstraintViolation",
+        E::KeyImmutable { .. } => "KeyImmutable",
+        E::CatalogObjectExists { .. } => "CatalogObjectExists",
+        E::CatalogObjectDiffers { .. } => "CatalogObjectDiffers",
+        E::CatalogRevisionMismatch { .. } => "CatalogRevisionMismatch",
+        E::CatalogObjectMissing { .. } => "CatalogObjectMissing",
+        E::CatalogRefused(_) => "CatalogRefused",
+        E::UnknownTransaction(_) => "UnknownTransaction",
+        E::TransactionIdInUse(_) => "TransactionIdInUse",
+        E::TransactionBusy(_) => "TransactionBusy",
+        E::OperationRequired(_) => "OperationRequired",
+        E::OperationDiffers(_) => "OperationDiffers",
+        E::TransactionCommittedOnTimeout(_) => "TransactionCommittedOnTimeout",
+        E::TransactionOutcomeUnknown(_) => "TransactionOutcomeUnknown",
+        E::TransactionAborted { .. } => "TransactionAborted",
+        E::TransactionConflict { .. } => "TransactionConflict",
+        E::InvariantRefused { .. } => "InvariantRefused",
+        E::RevisionMismatch { .. } => "RevisionMismatch",
+        E::TransactionTooLarge { .. } => "TransactionTooLarge",
+        E::WriteBackpressure => "WriteBackpressure",
+        E::CapacityExhausted { .. } => "CapacityExhausted",
+        E::StorageFull { .. } => "StorageFull",
+        E::NotLeader { .. } => "NotLeader",
+        E::Mismatched(_) => "Mismatched",
+        E::SettingsRefused(_) => "SettingsRefused",
+        E::ReadFence { .. } => "ReadFence",
+        E::OutsideRetention { .. } => "OutsideRetention",
+        E::ReadNotReady { .. } => "ReadNotReady",
+        E::OperationSettled { .. } => "OperationSettled",
+        E::ForeignOperation { .. } => "ForeignOperation",
+        E::Storage(_) => "Storage",
+        E::Other(_) => "Other",
+        E::PeerUnreachable { .. } => "PeerUnreachable",
+        E::PeerOutcomeUnknown { .. } => "PeerOutcomeUnknown",
+    }
 }
 
 /// The error `bytes` encode.
@@ -83,12 +152,6 @@ fn cut(mut text: String) -> String {
 fn text(message: String) -> wire::Text {
     wire::Text {
         message: cut(message),
-    }
-}
-
-fn text_case(kind: fn(wire::Text) -> Kind, message: String) -> wire::RoutedError {
-    wire::RoutedError {
-        kind: Some(kind(text(message))),
     }
 }
 
@@ -331,7 +394,7 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             element_id,
         } => Kind::DuplicateKey(wire::DuplicateKey {
             table,
-            key: cut(key),
+            key,
             element_id,
         }),
         E::UniqueViolation {
@@ -342,7 +405,7 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
         } => Kind::UniqueViolation(wire::UniqueViolation {
             index,
             property,
-            value: cut(value),
+            value,
             element_id,
         }),
         E::UniquenessUnresolved { index, limit } => {
@@ -362,9 +425,9 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
                 property,
                 element_id,
             }),
-            Err(e) => Kind::Other(text(format!(
-                "constraint `{constraint}` violated on :{label}, and its kind could not be encoded: {e}"
-            ))),
+            // A kind the engine cannot encode is not carried as some other
+            // error; the receiver reads it as unreadable.
+            Err(_) => return undeliverable("ConstraintViolation", 0),
         },
         E::KeyImmutable { table, column } => {
             Kind::KeyImmutable(wire::KeyImmutable { table, column })
@@ -837,6 +900,13 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
         },
         Kind::Storage(t) => E::Storage(StorageFailure::reported(t.message)),
         Kind::Other(t) => E::Other(t.message),
+        Kind::Undeliverable(u) => {
+            return Err(format!(
+                "the member's {} error does not fit the {MAX_ROUTED_ERROR}-byte bound \
+                 ({} bytes)",
+                u.variant, u.size
+            ));
+        }
     })
 }
 
