@@ -7,9 +7,13 @@
 //! routed once: a member that cannot run it answers with the refusal that
 //! says why, and the ingress decides what to tell its client.
 //!
-//! The library owns the transport and the encoding. What runs a command at
-//! the executing member is a [`CommandExecutor`]: the server brings its own,
-//! which fences, records and reports refusals the way its clients see them.
+//! The library owns the transport and the encoding, the encoding of failures
+//! included. What runs a command at the executing member is a
+//! [`CommandExecutor`]: the server brings its own, which fences and records
+//! commands the way it does for its own clients. A command that ran and
+//! failed answers with its [`DatabaseError`] in the body of the answer, so the
+//! ingress returns the same error the executing member raised; a failure to
+//! deliver the answer is never mistaken for one.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -32,15 +36,26 @@ use coordinode_query::advisor::source::SourceContext;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proto::internode::routing as wire;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
-use crate::db::TransactionEnd;
+use crate::db::{DatabaseError, PeerFailure, TransactionEnd};
 use crate::operation::{IssuerId, OperationOutcome, Resolve};
 use coordinode_core::group::DeploymentId;
 use wire::command_routing_service_client::CommandRoutingServiceClient;
 use wire::command_routing_service_server::{CommandRoutingService, CommandRoutingServiceServer};
 use wire::routed_statement_frame::Event;
+
+mod errors;
+pub use errors::{ERROR_CODEC_VERSION, MAX_ROUTED_ERROR};
+
+/// Request metadata naming the error encoding the ingress reads.
+const CODEC_HEADER: &str = "cn-routed-error-codec";
+
+/// Response metadata of a call refused before it was read: the command did
+/// not run. Its value says why.
+const REFUSED_HEADER: &str = "cn-routing-refused";
 
 /// The encoded size a batch of rows grows to before it is sent.
 const ROW_BATCH_BYTES: usize = 1 << 20;
@@ -222,8 +237,8 @@ pub enum RoutedOperationAnswer {
 /// Runs the commands other members route here.
 ///
 /// Every method blocks: a write commits through consensus inside it, so the
-/// service calls it from the blocking pool. A refusal is the status the
-/// command's client sees, which the ingress passes on as it is.
+/// service calls it from the blocking pool. A failure is the error the
+/// command failed with here, which the ingress returns as it is.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot run commands routed from other members",
     label = "not a command executor",
@@ -236,45 +251,45 @@ pub trait CommandExecutor: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// The status the statement failed with.
+    /// What the statement failed with.
     fn execute(
         &self,
         statement: RoutedStatement,
         cancel: &CancelFlag,
         admitted: &AdmissionSignal,
-    ) -> Result<RoutedAnswer, Status>;
+    ) -> Result<RoutedAnswer, DatabaseError>;
 
     /// Open a transaction under the ID the client drew.
     ///
     /// # Errors
     ///
-    /// The status the transaction was refused with.
-    fn begin(&self, begin: RoutedBegin) -> Result<(), Status>;
+    /// Why the transaction was not opened.
+    fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError>;
 
     /// Commit a transaction this member holds.
     ///
     /// # Errors
     ///
-    /// The status the commit failed with.
-    fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, Status>;
+    /// What the commit failed with.
+    fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, DatabaseError>;
 
     /// Roll back a transaction this member holds.
     ///
     /// # Errors
     ///
-    /// The status the rollback was refused with.
-    fn rollback(&self, rollback: RoutedRollback) -> Result<(), Status>;
+    /// Why the rollback was refused.
+    fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError>;
 
     /// Carry out a call on operation records, acting for `actor`.
     ///
     /// # Errors
     ///
-    /// The status the call was refused with.
+    /// Why the call was refused.
     fn operation(
         &self,
         actor: ActingContext,
         call: RoutedOperationCall,
-    ) -> Result<RoutedOperationAnswer, Status>;
+    ) -> Result<RoutedOperationAnswer, DatabaseError>;
 }
 
 /// The service a member serves its peers the commands they route with.
@@ -294,16 +309,52 @@ impl<E: CommandExecutor> CommandRoutingHandler<E> {
         CommandRoutingServiceServer::new(self).max_decoding_message_size(max_decoding_bytes)
     }
 
-    /// Run `call` on the blocking pool and answer with what it returns.
+    /// Run `call` on the blocking pool and answer with what it returns. A
+    /// call that did not finish is a lost answer: it may have run.
     async fn blocking<T: Send + 'static>(
         &self,
-        call: impl FnOnce(&E) -> Result<T, Status> + Send + 'static,
-    ) -> Result<T, Status> {
+        call: impl FnOnce(&E) -> Result<T, DatabaseError> + Send + 'static,
+    ) -> Result<Result<T, DatabaseError>, Status> {
         let executor = Arc::clone(&self.executor);
         tokio::task::spawn_blocking(move || call(&executor))
             .await
-            .map_err(|e| Status::internal(format!("the routed command did not finish: {e}")))?
+            .map_err(|e| Status::internal(format!("the routed command did not finish: {e}")))
     }
+}
+
+/// A call refused before it was read, for `why`: the command did not run,
+/// which the ingress learns from the metadata rather than the text.
+fn refused(status: Status, why: &'static str) -> Status {
+    let mut status = status;
+    status
+        .metadata_mut()
+        .insert(REFUSED_HEADER, MetadataValue::from_static(why));
+    status
+}
+
+/// Refuse `request` unless its ingress reads the error encoding this member
+/// writes.
+fn check_codec<T>(request: &Request<T>) -> Result<(), Status> {
+    let theirs = request
+        .metadata()
+        .get(CODEC_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u32>().ok());
+    if theirs == Some(ERROR_CODEC_VERSION) {
+        return Ok(());
+    }
+    Err(refused(
+        Status::failed_precondition(format!(
+            "the ingress reads routed errors in encoding {theirs:?}, this member writes \
+             encoding {ERROR_CODEC_VERSION}"
+        )),
+        "codec",
+    ))
+}
+
+/// A request that does not decode: refused before anything ran.
+fn malformed(status: Status) -> Status {
+    refused(status, "request")
 }
 
 #[tonic::async_trait]
@@ -314,7 +365,8 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
         &self,
         request: Request<wire::RoutedStatement>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
-        let statement = statement_from_wire(request.into_inner())?;
+        check_codec(&request)?;
+        let statement = statement_from_wire(request.into_inner()).map_err(malformed)?;
         let (frames, answer) = tokio::sync::mpsc::channel(FRAMES_IN_FLIGHT);
 
         // The ingress going away cancels the statement.
@@ -363,15 +415,17 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
         tokio::task::spawn_blocking(move || {
             let sent = match executor.execute(statement, &cancel, &admitted) {
                 Ok(answer) => send_answer(&frames, answer),
-                Err(status) => frames.blocking_send(Err(status)).is_ok(),
+                Err(err) => frames
+                    .blocking_send(Ok(frame(Event::Error(errors::encode(err)))))
+                    .is_ok(),
             };
             if !sent {
                 tracing::debug!("a routed statement's ingress left before its answer");
                 if let Some(rollback) = abandon {
                     // A transaction the failed statement already ended is
                     // refused here, which is the outcome wanted.
-                    if let Err(status) = executor.rollback(rollback) {
-                        tracing::debug!(%status, "abandoned transaction already ended");
+                    if let Err(err) = executor.rollback(rollback) {
+                        tracing::debug!(%err, "abandoned transaction already ended");
                     }
                 }
             }
@@ -383,41 +437,66 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
         &self,
         request: Request<wire::RoutedBegin>,
     ) -> Result<Response<wire::RoutedBegun>, Status> {
-        let begin = begin_from_wire(request.into_inner())?;
-        self.blocking(move |e| e.begin(begin)).await?;
-        Ok(Response::new(wire::RoutedBegun {}))
+        check_codec(&request)?;
+        let begin = begin_from_wire(request.into_inner()).map_err(malformed)?;
+        let error = match self.blocking(move |e| e.begin(begin)).await? {
+            Ok(()) => Vec::new(),
+            Err(err) => errors::encode(err),
+        };
+        Ok(Response::new(wire::RoutedBegun { error }))
     }
 
     async fn commit(
         &self,
         request: Request<wire::RoutedCommit>,
     ) -> Result<Response<wire::RoutedCommitted>, Status> {
-        let commit = commit_from_wire(request.into_inner())?;
-        let receipt = self.blocking(move |e| e.commit(commit)).await?;
-        Ok(Response::new(wire::RoutedCommitted {
-            commit_ts: receipt.commit_ts.as_raw(),
-            applied_index: receipt.applied_index.unwrap_or(0),
-        }))
+        check_codec(&request)?;
+        let commit = commit_from_wire(request.into_inner()).map_err(malformed)?;
+        Ok(Response::new(
+            match self.blocking(move |e| e.commit(commit)).await? {
+                Ok(receipt) => wire::RoutedCommitted {
+                    commit_ts: receipt.commit_ts.as_raw(),
+                    applied_index: receipt.applied_index.unwrap_or(0),
+                    error: Vec::new(),
+                },
+                Err(err) => wire::RoutedCommitted {
+                    error: errors::encode(err),
+                    ..wire::RoutedCommitted::default()
+                },
+            },
+        ))
     }
 
     async fn rollback(
         &self,
         request: Request<wire::RoutedRollback>,
     ) -> Result<Response<wire::RoutedRolledBack>, Status> {
-        let rollback = rollback_from_wire(request.into_inner())?;
-        self.blocking(move |e| e.rollback(rollback)).await?;
-        Ok(Response::new(wire::RoutedRolledBack {}))
+        check_codec(&request)?;
+        let rollback = rollback_from_wire(request.into_inner()).map_err(malformed)?;
+        let error = match self.blocking(move |e| e.rollback(rollback)).await? {
+            Ok(()) => Vec::new(),
+            Err(err) => errors::encode(err),
+        };
+        Ok(Response::new(wire::RoutedRolledBack { error }))
     }
 
     async fn operation(
         &self,
         request: Request<wire::RoutedOperation>,
     ) -> Result<Response<wire::RoutedOperationAnswer>, Status> {
+        check_codec(&request)?;
         let request = request.into_inner();
-        let actor = actor_from_wire(request.actor)?;
-        let call = operation_call_from_wire(request.call)?;
-        let answer = self.blocking(move |e| e.operation(actor, call)).await?;
-        Ok(Response::new(operation_answer_to_wire(answer)))
+        let actor = actor_from_wire(request.actor).map_err(malformed)?;
+        let call = operation_call_from_wire(request.call).map_err(malformed)?;
+        let answer = match self.blocking(move |e| e.operation(actor, call)).await? {
+            Ok(answer) => operation_answer_to_wire(answer),
+            Err(err) => wire::RoutedOperationAnswer {
+                answer: Some(wire::routed_operation_answer::Answer::Error(
+                    errors::encode(err),
+                )),
+            },
+        };
+        Ok(Response::new(answer))
     }
 }
 
@@ -458,15 +537,24 @@ fn frame(event: Event) -> wire::RoutedStatementFrame {
 
 /// The ingress's side of routing: sends commands to one member and returns
 /// its answers.
+///
+/// A command the member ran and refused returns the error it raised there.
+/// A command the member refused before reading it returns
+/// [`DatabaseError::PeerUnreachable`]: it did not run. Every other way the
+/// answer can fail to arrive whole returns
+/// [`DatabaseError::PeerOutcomeUnknown`]: it may have run.
 #[derive(Debug, Clone)]
 pub struct CommandRouter {
+    member: u64,
     client: CommandRoutingServiceClient<Channel>,
 }
 
 impl CommandRouter {
-    /// A router over `channel`, a connection to the executing member.
-    pub fn new(channel: Channel) -> Self {
+    /// A router over `channel`, a connection to `member`, the executing
+    /// member.
+    pub fn new(member: u64, channel: Channel) -> Self {
         Self {
+            member,
             client: CommandRoutingServiceClient::new(channel)
                 .max_decoding_message_size(MAX_ROUTED_MESSAGE),
         }
@@ -477,20 +565,73 @@ impl CommandRouter {
     ///
     /// # Errors
     ///
-    /// `FAILED_PRECONDITION` when `node` has no peers or does not know where
-    /// `member` is or what identity it proves; `UNAVAILABLE` when no
-    /// connection can be made.
-    pub fn to_member(node: &RaftNode, member: u64) -> Result<Self, Status> {
+    /// [`DatabaseError::PeerUnreachable`] when `node` has no peers, does not
+    /// know where `member` is or what identity it proves, or cannot make a
+    /// connection.
+    pub fn to_member(node: &RaftNode, member: u64) -> Result<Self, DatabaseError> {
+        let unreachable = |message: String| DatabaseError::PeerUnreachable { member, message };
         let (Some(target), Some(connections)) = (node.member_target(member), node.connections())
         else {
-            return Err(Status::failed_precondition(format!(
-                "member {member} is not one this node knows how to reach"
-            )));
+            return Err(unreachable(
+                "this node does not know how to reach it".to_owned(),
+            ));
         };
         let channel = connections
             .channel(&target)
-            .map_err(|e| Status::unavailable(format!("member {member}: {e}")))?;
-        Ok(Self::new(channel))
+            .map_err(|e| unreachable(e.to_string()))?;
+        Ok(Self::new(member, channel))
+    }
+
+    /// `message` as a request this member reads the error encoding of, bound
+    /// to `deadline` when there is one.
+    fn request<T>(message: T, deadline: Option<Duration>) -> Request<T> {
+        let mut request = Request::new(message);
+        request
+            .metadata_mut()
+            .insert(CODEC_HEADER, MetadataValue::from(ERROR_CODEC_VERSION));
+        if let Some(deadline) = deadline {
+            request.set_timeout(deadline);
+        }
+        request
+    }
+
+    /// The error a failed call answers: a refusal before the call was read
+    /// did not run it; anything else lost an answer that may have run.
+    fn lost(&self, status: &Status) -> DatabaseError {
+        if status.metadata().contains_key(REFUSED_HEADER) {
+            return DatabaseError::PeerUnreachable {
+                member: self.member,
+                message: status.message().to_owned(),
+            };
+        }
+        let failure = match status.code() {
+            Code::DeadlineExceeded | Code::Cancelled => PeerFailure::Deadline,
+            _ => PeerFailure::Transport,
+        };
+        DatabaseError::PeerOutcomeUnknown {
+            member: self.member,
+            failure,
+            message: status.message().to_owned(),
+        }
+    }
+
+    /// An answer this member cannot read: whatever the command did is
+    /// unknown.
+    fn unreadable(&self, message: String) -> DatabaseError {
+        DatabaseError::PeerOutcomeUnknown {
+            member: self.member,
+            failure: PeerFailure::Protocol,
+            message,
+        }
+    }
+
+    /// The error `bytes` carry, read as the member's failure; empty bytes are
+    /// no failure.
+    fn failure(&self, bytes: &[u8]) -> Result<(), DatabaseError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        Err(errors::decode(bytes).unwrap_or_else(|e| self.unreadable(e)))
     }
 
     /// Run `statement` at the member and return its answer. `admitted` is told
@@ -498,35 +639,42 @@ impl CommandRouter {
     ///
     /// # Errors
     ///
-    /// The status the statement failed with at the member, or why it could
-    /// not be reached.
+    /// What the statement failed with at the member, or how its answer was
+    /// lost.
     pub async fn execute(
         &self,
         statement: RoutedStatement,
         admitted: &AdmissionSignal,
-    ) -> Result<RoutedAnswer, Status> {
+    ) -> Result<RoutedAnswer, DatabaseError> {
         let deadline = statement.deadline;
-        let mut request = Request::new(statement_to_wire(statement)?);
-        if let Some(deadline) = deadline {
-            request.set_timeout(deadline);
-        }
-        let mut frames = self.client.clone().execute(request).await?.into_inner();
+        let request = Self::request(statement_to_wire(statement)?, deadline);
+        let mut frames = self
+            .client
+            .clone()
+            .execute(request)
+            .await
+            .map_err(|s| self.lost(&s))?
+            .into_inner();
         let mut answer = RoutedAnswer::default();
-        while let Some(frame) = frames.message().await? {
+        while let Some(frame) = frames.message().await.map_err(|s| self.lost(&s))? {
             match frame.event {
                 Some(Event::Admitted(_)) => admitted.admitted(),
                 Some(Event::Columns(columns)) => answer.columns = columns.names,
-                Some(Event::Rows(batch)) => decode_rows(&batch, &mut answer.rows)?,
+                Some(Event::Rows(batch)) => {
+                    decode_rows(&batch, &mut answer.rows).map_err(|e| self.unreadable(e))?;
+                }
                 Some(Event::End(stats)) => {
                     answer.stats = stats_from_wire(stats);
                     return Ok(answer);
                 }
+                Some(Event::Error(bytes)) => {
+                    return Err(errors::decode(&bytes).unwrap_or_else(|e| self.unreadable(e)));
+                }
                 None => {}
             }
         }
-        Err(Status::unavailable(
-            "the executing member ended the answer before its statistics",
-        ))
+        Err(self
+            .unreadable("the executing member ended the answer before its statistics".to_owned()))
     }
 
     /// Open a transaction at the member, which must lead, under the ID the
@@ -534,26 +682,33 @@ impl CommandRouter {
     ///
     /// # Errors
     ///
-    /// The status the member refused it with, or why it could not be
-    /// reached.
-    pub async fn begin(&self, begin: RoutedBegin) -> Result<(), Status> {
-        self.client.clone().begin(begin_to_wire(begin)).await?;
-        Ok(())
+    /// Why the member did not open it, or how its answer was lost.
+    pub async fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
+        let begun = self
+            .client
+            .clone()
+            .begin(Self::request(begin_to_wire(begin), None))
+            .await
+            .map_err(|s| self.lost(&s))?
+            .into_inner();
+        self.failure(&begun.error)
     }
 
     /// Commit a transaction at the leader.
     ///
     /// # Errors
     ///
-    /// The status the commit failed with, or why the member could not be
-    /// reached.
-    pub async fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, Status> {
+    /// What the commit failed with, or how its answer was lost.
+    pub async fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, DatabaseError> {
         let deadline = commit.deadline;
-        let mut request = Request::new(commit_to_wire(commit));
-        if let Some(deadline) = deadline {
-            request.set_timeout(deadline);
-        }
-        let committed = self.client.clone().commit(request).await?.into_inner();
+        let committed = self
+            .client
+            .clone()
+            .commit(Self::request(commit_to_wire(commit), deadline))
+            .await
+            .map_err(|s| self.lost(&s))?
+            .into_inner();
+        self.failure(&committed.error)?;
         Ok(CommitReceipt {
             commit_ts: Timestamp::from_raw(committed.commit_ts),
             applied_index: (committed.applied_index > 0).then_some(committed.applied_index),
@@ -564,46 +719,54 @@ impl CommandRouter {
     ///
     /// # Errors
     ///
-    /// The status the rollback was refused with, or why the member could not
-    /// be reached.
-    pub async fn rollback(&self, rollback: RoutedRollback) -> Result<(), Status> {
-        self.client
+    /// Why the rollback was refused, or how its answer was lost.
+    pub async fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError> {
+        let rolled_back = self
+            .client
             .clone()
-            .rollback(rollback_to_wire(rollback))
-            .await?;
-        Ok(())
+            .rollback(Self::request(rollback_to_wire(rollback), None))
+            .await
+            .map_err(|s| self.lost(&s))?
+            .into_inner();
+        self.failure(&rolled_back.error)
     }
 
     /// Carry out a call on operation records at the member, which must lead.
     ///
     /// # Errors
     ///
-    /// The status the member refused it with, or why it could not be
-    /// reached.
+    /// Why the member refused it, or how its answer was lost.
     pub async fn operation(
         &self,
         actor: &ActingContext,
         call: RoutedOperationCall,
-    ) -> Result<RoutedOperationAnswer, Status> {
+    ) -> Result<RoutedOperationAnswer, DatabaseError> {
         let answer = self
             .client
             .clone()
-            .operation(wire::RoutedOperation {
-                actor: Some(actor_to_wire(actor)),
-                call: Some(operation_call_to_wire(call)),
-            })
-            .await?
+            .operation(Self::request(
+                wire::RoutedOperation {
+                    actor: Some(actor_to_wire(actor)),
+                    call: Some(operation_call_to_wire(call)),
+                },
+                None,
+            ))
+            .await
+            .map_err(|s| self.lost(&s))?
             .into_inner();
-        operation_answer_from_wire(answer)
+        if let Some(wire::routed_operation_answer::Answer::Error(bytes)) = &answer.answer {
+            return Err(errors::decode(bytes).unwrap_or_else(|e| self.unreadable(e)));
+        }
+        operation_answer_from_wire(answer).map_err(|e| self.unreadable(e))
     }
 }
 
 /// Append the rows of one batch, a run of encoded rows, to `rows`.
-fn decode_rows(batch: &[u8], rows: &mut Vec<Vec<Value>>) -> Result<(), Status> {
+fn decode_rows(batch: &[u8], rows: &mut Vec<Vec<Value>>) -> Result<(), String> {
     let mut cursor = Cursor::new(batch);
     while (cursor.position() as usize) < batch.len() {
         let row: Vec<Value> = rmp_serde::from_read(&mut cursor)
-            .map_err(|e| Status::internal(format!("a routed row could not be decoded: {e}")))?;
+            .map_err(|e| format!("a routed row could not be decoded: {e}"))?;
         rows.push(row);
     }
     Ok(())
@@ -787,7 +950,7 @@ fn settings_from_wire(settings: Option<wire::RoutedSettings>) -> Result<RoutedSe
     })
 }
 
-fn statement_to_wire(statement: RoutedStatement) -> Result<wire::RoutedStatement, Status> {
+fn statement_to_wire(statement: RoutedStatement) -> Result<wire::RoutedStatement, DatabaseError> {
     Ok(wire::RoutedStatement {
         actor: Some(actor_to_wire(&statement.actor)),
         query: statement.query,
@@ -795,7 +958,7 @@ fn statement_to_wire(statement: RoutedStatement) -> Result<wire::RoutedStatement
             Vec::new()
         } else {
             rmp_serde::to_vec(&statement.params).map_err(|e| {
-                Status::invalid_argument(format!("parameters could not be encoded: {e}"))
+                DatabaseError::Semantic(format!("parameters could not be encoded: {e}"))
             })?
         },
         settings: Some(settings_to_wire(statement.settings)),
@@ -1036,19 +1199,7 @@ fn operation_answer_to_wire(answer: RoutedOperationAnswer) -> wire::RoutedOperat
             deployment: deployment.as_bytes().to_vec(),
         }),
         RoutedOperationAnswer::Outcome(outcome) => {
-            let (state, attempt, commit_ts) = match outcome {
-                OperationOutcome::Committed { attempt, commit_ts } => {
-                    (wire::RoutedOperationState::Committed, attempt, commit_ts)
-                }
-                OperationOutcome::Aborted => (wire::RoutedOperationState::Aborted, 0, 0),
-                OperationOutcome::Unknown => (wire::RoutedOperationState::Unknown, 0, 0),
-                OperationOutcome::Retired => (wire::RoutedOperationState::Retired, 0, 0),
-            };
-            Answer::Outcome(wire::RoutedOutcome {
-                state: state.into(),
-                attempt,
-                commit_ts,
-            })
+            Answer::Outcome(errors::outcome_to_wire(outcome))
         }
         RoutedOperationAnswer::Done => Answer::Done(wire::RoutedDone {}),
     };
@@ -1057,36 +1208,27 @@ fn operation_answer_to_wire(answer: RoutedOperationAnswer) -> wire::RoutedOperat
     }
 }
 
+/// The answer to an operation call that succeeded.
+///
+/// # Errors
+///
+/// What makes it unreadable; an answer carrying an error is read before.
 fn operation_answer_from_wire(
     answer: wire::RoutedOperationAnswer,
-) -> Result<RoutedOperationAnswer, Status> {
+) -> Result<RoutedOperationAnswer, String> {
     use wire::routed_operation_answer::Answer;
     Ok(match answer.answer {
         Some(Answer::Enrolled(enrolled)) => RoutedOperationAnswer::Enrolled {
             incarnation: enrolled.incarnation,
             next_sequence: enrolled.next_sequence,
             deployment: DeploymentId::from_slice(&enrolled.deployment)
-                .ok_or_else(|| Status::internal("the leader answered a malformed deployment"))?,
+                .ok_or("the leader answered a malformed deployment")?,
         },
-        Some(Answer::Outcome(outcome)) => RoutedOperationAnswer::Outcome(
-            match wire::RoutedOperationState::try_from(outcome.state) {
-                Ok(wire::RoutedOperationState::Committed) => OperationOutcome::Committed {
-                    attempt: outcome.attempt,
-                    commit_ts: outcome.commit_ts,
-                },
-                Ok(wire::RoutedOperationState::Aborted) => OperationOutcome::Aborted,
-                Ok(wire::RoutedOperationState::Unknown) => OperationOutcome::Unknown,
-                Ok(wire::RoutedOperationState::Retired) => OperationOutcome::Retired,
-                _ => {
-                    return Err(Status::internal(format!(
-                        "the leader answered an operation state {} this member does not know",
-                        outcome.state
-                    )));
-                }
-            },
-        ),
+        Some(Answer::Outcome(outcome)) => {
+            RoutedOperationAnswer::Outcome(errors::outcome_from_wire(&outcome)?)
+        }
         Some(Answer::Done(_)) => RoutedOperationAnswer::Done,
-        None => return Err(Status::internal("the leader answered nothing")),
+        Some(Answer::Error(_)) | None => return Err("the leader answered nothing".to_owned()),
     })
 }
 

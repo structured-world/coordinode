@@ -15,7 +15,6 @@ use coordinode_core::txn::proposal::{ProposalIdGenerator, fresh_proposal_id_base
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::{AdvisorContext, DismissedSet, QueryRegistry, SourceContext};
-use coordinode_query::cypher;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::{
     AdaptiveConfig, ExecutionContext, ExecutionError, ExtensionHandler, ExtensionRegistry,
@@ -672,286 +671,6 @@ fn statement_budget(
         }
         None => budget,
     })
-}
-
-/// Error from embedded database operations.
-#[derive(Debug, thiserror::Error)]
-pub enum DatabaseError {
-    #[error("storage error: {0}")]
-    Storage(#[from] coordinode_storage::error::StorageError),
-
-    #[error("parse error: {0}")]
-    Parse(#[from] cypher::ParseError),
-
-    #[error("plan error: {0}")]
-    Plan(#[from] planner::PlanError),
-
-    #[error("execution error: {0}")]
-    Execution(#[from] ExecutionError),
-
-    /// A session SET named a known setting with a value it cannot take.
-    #[error(transparent)]
-    SessionSetting(#[from] SessionSettingRefused),
-
-    #[error("semantic error: {0}")]
-    Semantic(String),
-
-    /// No interactive transaction this caller may use is held under this ID.
-    ///
-    /// Either it was never opened on this leader (a transaction of an earlier
-    /// leader among them: a change of leader ends every open transaction), or
-    /// it is already finished: committed, rolled back, aborted by a failed
-    /// statement, or collected by the idle sweep; or it acts for another
-    /// caller, which the ID alone does not reveal. In every case nothing is
-    /// held for this caller under it, and a transaction that was never
-    /// committed is run again under a new ID. It is not proof that a commit
-    /// did not happen: an operation's outcome is resolved by its descriptor.
-    #[error("unknown transaction {0}")]
-    UnknownTransaction(TransactionId),
-
-    /// A transaction is open under this ID, or ended under it recently: an
-    /// ID names one transaction, and a start never joins another. Nothing was
-    /// done; a new transaction takes a newly drawn ID.
-    #[error("transaction ID {0} is already in use")]
-    TransactionIdInUse(TransactionId),
-
-    /// The transaction's queue of commands waiting for their turn is full;
-    /// send this one once earlier ones have answered. Nothing was done and
-    /// the transaction stays open.
-    #[error("transaction {0} has too many commands waiting")]
-    TransactionBusy(TransactionId),
-
-    /// A transaction that commits when it stays idle needs the client
-    /// operation that commit binds, so that its client can learn the
-    /// outcome; its start named none. Nothing was opened.
-    #[error(
-        "transaction {0} commits at idle expiry and so needs an operation its client can \
-         resolve; none was named"
-    )]
-    OperationRequired(TransactionId),
-
-    /// The commit names another client operation than the one the
-    /// transaction was started under. Nothing was done; the transaction
-    /// stays open.
-    #[error("the commit of transaction {0} names another operation than its start")]
-    OperationDiffers(TransactionId),
-
-    /// The transaction stayed idle past the idle timeout and its timeout
-    /// outcome committed it, under the operation its start named, which
-    /// reports the commit timestamp.
-    #[error("transaction {0} was committed when it stayed idle past the idle timeout")]
-    TransactionCommittedOnTimeout(TransactionId),
-
-    /// The transaction stayed idle past the idle timeout and the commit its
-    /// timeout outcome made failed without proving whether it applied: the
-    /// operation its start named resolves how it stands.
-    #[error(
-        "the commit of transaction {0} at the idle timeout has an unknown outcome; resolve its operation"
-    )]
-    TransactionOutcomeUnknown(TransactionId),
-
-    /// The transaction ended before anything of it was submitted, so nothing
-    /// of it was applied. Running it again is a new transaction.
-    #[error("transaction {id} was aborted: {end}")]
-    TransactionAborted {
-        /// The transaction.
-        id: TransactionId,
-        /// Why it ended.
-        end: interactive::TransactionEnd,
-    },
-
-    /// A commit refused by OCC validation: a key this transaction READ was
-    /// modified by a concurrent writer after the snapshot was pinned at begin,
-    /// so the transaction's view is no longer the state it would commit into.
-    /// Nothing was applied; re-running the whole transaction from begin is the
-    /// intended response, and the only failure of the commit for which that
-    /// helps.
-    #[error("transaction {id} conflicts with a concurrent write: {source_message}")]
-    TransactionConflict {
-        id: TransactionId,
-        source_message: String,
-    },
-
-    /// A commit refused by a declared condition: the state the transaction's
-    /// result depends on no longer holds, or a concurrent transaction holds an
-    /// incompatible claim on it. Nothing was applied; re-running the whole
-    /// transaction from begin re-reads that state.
-    ///
-    /// Separate from `TransactionConflict` because the two transactions need
-    /// not touch a common key: disjoint writes can break one graph condition
-    /// together, and reporting that as a write conflict names the wrong cause.
-    /// A write conditioned on a record's version found a different one.
-    /// Nothing was applied.
-    ///
-    /// The version that is there now is part of the error: a caller that has
-    /// to decide whether to retry, merge or give up needs it, and making it
-    /// read the record again would hand it a second race instead of an
-    /// answer.
-    #[error(
-        "transaction {id}: record version mismatch, expected {expected:?}, \
-         found {current:?}; nothing was applied"
-    )]
-    RevisionMismatch {
-        /// The transaction the refusal belongs to.
-        id: TransactionId,
-        /// The version the write was conditioned on; `None` required absence.
-        expected: Option<u64>,
-        /// The version the record has now; `None` means it is absent.
-        current: Option<u64>,
-    },
-
-    #[error("transaction {id} was refused by an invariant: {reason}")]
-    InvariantRefused {
-        /// The transaction the refusal belongs to.
-        id: TransactionId,
-        /// Which condition refused it, in the words of the condition.
-        reason: String,
-    },
-
-    /// A transaction buffered more uncommitted data than it is allowed to, and
-    /// was discarded. Splitting the work into smaller transactions is the fix.
-    #[error("transaction {id} exceeded its buffer limit ({buffered} > {limit} bytes)")]
-    TransactionTooLarge {
-        id: TransactionId,
-        buffered: usize,
-        limit: usize,
-    },
-
-    /// The storage engine is over its compaction-debt stop threshold and
-    /// rejected the commit's writes. Nothing was applied; retrying after a
-    /// short delay succeeds once compaction catches up.
-    #[error(
-        "write rejected: storage is over its compaction-debt stop threshold; \
-         retry after compaction catches up"
-    )]
-    WriteBackpressure,
-
-    /// The write reached a node that is not the leader, so it could not be
-    /// replicated. Nothing was applied; the same write succeeds at the leader,
-    /// whose id is carried here when the cluster has named one.
-    #[error("not the leader{}", match leader_id {
-        Some(id) => format!("; leader is node {id}"),
-        None => String::from("; no leader known yet"),
-    })]
-    NotLeader {
-        /// The node the cluster last named leader, if any. `None` while an
-        /// election is in flight.
-        leader_id: Option<u64>,
-    },
-
-    /// The write reached a member that does not run its group's version: it
-    /// is read-only. Nothing was applied. Names both versions and the leader
-    /// when known.
-    #[error("this member is read-only: {0}")]
-    Mismatched(coordinode_core::version::Mismatch),
-
-    /// A snapshot read (`ReadConcern.at_timestamp`) older than the MVCC
-    /// retention horizon. History that old may already be collected, so the
-    /// read is refused; the same read succeeds at any timestamp from
-    /// `oldest_readable` on. The horizon moves with the clock and
-    /// `retention_window_secs` (`Database::set_retention_window`).
-    #[error(
-        "snapshot timestamp {requested} is older than the MVCC retention horizon: \
-         history is readable from timestamp {oldest_readable} on"
-    )]
-    OutsideRetention {
-        /// The timestamp the read asked for.
-        requested: u64,
-        /// The oldest timestamp still readable when the read ran.
-        oldest_readable: u64,
-    },
-
-    /// A snapshot read (`ReadConcern.at_timestamp`) whose timestamp covers a
-    /// commit not yet applied, or not yet durable in the store's journal. The
-    /// read does not wait for it and is not answered at another timestamp:
-    /// nothing was read. The same read succeeds once the commits it covers
-    /// have landed, usually within the journal's flush interval; a read at
-    /// `ready_through` or earlier is answerable now.
-    #[error(
-        "snapshot timestamp {requested} is not ready: a commit it covers has not \
-         landed or is not durable yet{}",
-        match ready_through {
-            Some(ts) => format!("; readable through timestamp {ts} now"),
-            None => String::new(),
-        }
-    )]
-    ReadNotReady {
-        /// The timestamp the read asked for.
-        requested: u64,
-        /// The latest timestamp a read is answerable at now, when there is one.
-        ready_through: Option<u64>,
-    },
-
-    /// The client operation a write carries out already stands as
-    /// `outcome`, or cannot be admitted: this attempt ran or applied nothing.
-    /// A committed outcome is the operation's answer, reached by an earlier
-    /// attempt; `intent_differs` says that attempt meant something else (one
-    /// number used for two writes). Anything else says why no attempt takes
-    /// effect: aborted (excluded), retired, or not admissible now (an issuer
-    /// not enrolled, closed, or past its admission window).
-    #[error("operation {op:?} stands as {outcome:?}; this attempt applied nothing")]
-    OperationSettled {
-        /// The operation.
-        op: crate::operation::OperationId,
-        /// How it stands.
-        outcome: crate::operation::OperationOutcome,
-        /// Whether its committed outcome carries another intent.
-        intent_differs: bool,
-    },
-
-    /// A descriptor names another deployment than this database's: its
-    /// operation's record is not here, and nothing here can resolve it.
-    #[error("the operation belongs to another deployment ({descriptor}), not this one")]
-    ForeignOperation {
-        /// The deployment the descriptor names.
-        descriptor: coordinode_core::group::DeploymentId,
-    },
-
-    #[error("{0}")]
-    Other(String),
-}
-
-impl DatabaseError {
-    /// The operation outcome this error reports, when it is one: the same
-    /// whether the statement or its commit found it.
-    fn into_operation_settled(self) -> Self {
-        match self {
-            Self::Execution(ExecutionError::OperationSettled {
-                op,
-                outcome,
-                intent_differs,
-            }) => Self::OperationSettled {
-                op,
-                outcome,
-                intent_differs,
-            },
-            other => other,
-        }
-    }
-}
-
-impl From<coordinode_modality::StoreError> for DatabaseError {
-    fn from(e: coordinode_modality::StoreError) -> Self {
-        DatabaseError::Execution(e.into())
-    }
-}
-
-impl From<coordinode_query::frontend::FrontendError> for DatabaseError {
-    fn from(e: coordinode_query::frontend::FrontendError) -> Self {
-        use coordinode_query::frontend::FrontendError as FE;
-        match e {
-            FE::Parse(p) => DatabaseError::Parse(p),
-            FE::Plan(p) => DatabaseError::Plan(p),
-            FE::Semantic(errors) => DatabaseError::Semantic(
-                errors
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ),
-            FE::Message(m) => DatabaseError::Semantic(m),
-        }
-    }
 }
 
 impl Drop for Database {
@@ -2404,7 +2123,6 @@ impl Database {
             &mut None,
         )
         .map(|(rows, write_stats, _)| CypherResult { rows, write_stats })
-        .map_err(DatabaseError::into_operation_settled)
     }
 
     /// Execute one page of a keyset-resumable server-side cursor.
@@ -2941,9 +2659,10 @@ impl Database {
         let (results, write_stats, out_state, duration_us) = loop {
             let mode = txn_mode.take().unwrap_or(TxnMode::AutoCommit);
             match attempt_once(mode) {
-                Err(DatabaseError::Execution(
-                    coordinode_query::executor::runner::ExecutionError::Conflict(reason),
-                )) if reexecutable && attempt < self.autocommit_attempts.get() => {
+                Err(DatabaseError::TransactionConflict {
+                    transaction: None,
+                    message: reason,
+                }) if reexecutable && attempt < self.autocommit_attempts.get() => {
                     tracing::debug!(attempt, %reason, "auto-commit statement refused at commit; running it again");
                     std::thread::sleep(backoff);
                     backoff *= 2;
@@ -3001,7 +2720,7 @@ impl Database {
         let bindings = FieldInterner::from_bytes(bytes).map_err(ExecutionError::from)?;
         self.fields
             .adopt(&bindings)
-            .map_err(|e| DatabaseError::Execution(e.into()))
+            .map_err(|e| ExecutionError::from(e).into())
     }
 
     /// Turn a lowered plan into the one that runs: B-tree index selection,
@@ -3285,11 +3004,9 @@ impl Database {
             // An answer that the object exists is read as "created" by a
             // caller retrying after a lost reply: it waits for the records
             // it rests on, which a weaker creating call may not have synced.
-            if matches!(
-                refused,
-                DatabaseError::Execution(ExecutionError::CatalogObjectExists { .. })
-            ) && self.write_concern.journal
-                == coordinode_core::txn::write_concern::Journal::Journal
+            if matches!(refused, DatabaseError::CatalogObjectExists { .. })
+                && self.write_concern.journal
+                    == coordinode_core::txn::write_concern::Journal::Journal
             {
                 self.engine.sync_applied()?;
             }
@@ -3415,7 +3132,7 @@ impl Database {
                 Ok(indexed.unwrap_or(0))
             }
             Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => {
-                Err(DatabaseError::Execution(v.into()))
+                Err(ExecutionError::from(v).into())
             }
             Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
                 Err(DatabaseError::Other(reason))
@@ -3501,7 +3218,7 @@ impl Database {
     pub fn refresh_btree_indexes(&self) -> Result<(), DatabaseError> {
         self.index_registry
             .load_all(&self.engine)
-            .map_err(DatabaseError::Storage)
+            .map_err(DatabaseError::from)
     }
 
     /// Get a reference to the vector index registry.
@@ -3609,12 +3326,11 @@ impl Database {
             matches,
             &mut search,
         );
-        let stopped = |stop| DatabaseError::Execution(ExecutionError::Budget(stop));
         let found = found.map_err(|e| match e {
-            FindError::Budget(stop) => stopped(stop),
+            FindError::Budget(stop) => DatabaseError::Budget(stop),
             FindError::Failed(reason) => DatabaseError::Other(reason),
         })?;
-        search.finish().map_err(stopped)?;
+        search.finish().map_err(DatabaseError::Budget)?;
         Ok(found)
     }
 
@@ -3979,6 +3695,7 @@ fn query_memory_limit_from_mib(text: &str) -> Result<u64, SessionSettingRefused>
 mod after_commit;
 mod catalog;
 mod client_ops;
+mod error;
 mod fields;
 mod id_lease;
 mod index_builds;
@@ -3990,6 +3707,7 @@ pub use catalog::{ConstraintDeclaration, LabelConstraint};
 pub use coordinode_core::txn::command::{
     ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,
 };
+pub use error::{DatabaseError, PeerFailure, ReadFenceFailure, StorageFailure};
 pub use fields::FieldDictionary;
 pub use interactive::{
     CommitOptions, RollbackOptions, TransactionEnd, TransactionOptions, draw_transaction_id,

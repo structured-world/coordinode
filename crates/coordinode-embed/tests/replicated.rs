@@ -14,7 +14,6 @@ use coordinode_embed::replication::{
     ReplicationError,
 };
 use coordinode_embed::{Database, DatabaseError};
-use coordinode_query::executor::runner::ExecutionError;
 use coordinode_raft::cluster::nemesis;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::partition::Partition;
@@ -228,10 +227,7 @@ async fn a_fire_and_forget_write_on_a_follower_lands_nowhere() {
             assert!(
                 matches!(
                     refused,
-                    Err(DatabaseError::NotLeader { leader_id: Some(1) }
-                        | DatabaseError::Execution(ExecutionError::NotLeader {
-                            leader_id: Some(1)
-                        }))
+                    Err(DatabaseError::NotLeader { leader_id: Some(1) })
                 ),
                 "{concern} on a follower is refused naming the leader, got {:?}",
                 refused.as_ref().err()
@@ -938,9 +934,7 @@ async fn a_schema_package_is_published_through_the_group() {
         assert!(
             matches!(
                 refused,
-                Err(DatabaseError::Execution(ExecutionError::NotLeader {
-                    leader_id: Some(1)
-                }))
+                Err(DatabaseError::NotLeader { leader_id: Some(1) })
             ),
             "{refused:?}"
         );
@@ -1219,11 +1213,11 @@ async fn a_member_store_is_refused_by_the_non_replicated_open() {
     let refused = open_outside_the_group(dir.path()).await;
     assert!(
         matches!(
-            refused,
-            Some(DatabaseError::Storage(StorageError::GroupMemberStore {
+            refused.as_ref().and_then(DatabaseError::storage_cause),
+            Some(StorageError::GroupMemberStore {
                 evidence: "its log is bound to a consensus group",
                 ..
-            }))
+            })
         ),
         "a member's store opened without its group, got {refused:?}"
     );
@@ -1231,11 +1225,11 @@ async fn a_member_store_is_refused_by_the_non_replicated_open() {
     let refused = open_outside_the_group(dir.path()).await;
     assert!(
         matches!(
-            refused,
-            Some(DatabaseError::Storage(StorageError::GroupMemberStore {
+            refused.as_ref().and_then(DatabaseError::storage_cause),
+            Some(StorageError::GroupMemberStore {
                 evidence: "its trees hold entries of a group's log",
                 ..
-            }))
+            })
         ),
         "a member's store without its marker, got {refused:?}"
     );

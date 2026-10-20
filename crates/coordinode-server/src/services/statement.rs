@@ -22,7 +22,7 @@ use coordinode_core::txn::read_concern::{
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_embed::db::{CypherResult, StatementOptions};
 use coordinode_embed::replication::routing::{CommandRouter, RoutedAnswer, RoutedStatement};
-use coordinode_embed::{Database, DatabaseError};
+use coordinode_embed::{Database, DatabaseError, ReadFenceFailure};
 use coordinode_query::advisor::QueryRegistry;
 use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::source::SourceContext;
@@ -34,7 +34,6 @@ use coordinode_raft::read_fence::{
 };
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
-use tonic::Status;
 
 use crate::config::StatementDefaults;
 
@@ -211,12 +210,17 @@ impl StatementExecutor {
 
     /// Resolve `requested` against the defaults and refuse a combination
     /// that cannot be served, before anything waits or runs.
-    pub(crate) fn check(&self, query: &str, requested: &Requested) -> Result<Checked, Status> {
+    pub(crate) fn check(
+        &self,
+        query: &str,
+        requested: &Requested,
+    ) -> Result<Checked, DatabaseError> {
+        let refused = |reason: &str| DatabaseError::SettingsRefused(reason.to_owned());
         // A session SET changes the settings of the session that sends it.
         // A session takes it before it gets here; on this path there is no
         // session, and the database's own setting is every client's.
         if Database::parse_session_set(query).is_some() {
-            return Err(Status::failed_precondition(
+            return Err(refused(
                 "SET changes the settings of a session, and this request has none: \
                  send it on a Session, or name the setting for one query in a hint",
             ));
@@ -231,13 +235,13 @@ impl StatementExecutor {
         if after_index > 0 {
             match level {
                 ExecutorReadConcernLevel::Local => {
-                    return Err(Status::failed_precondition(
+                    return Err(refused(
                         "readConcern=LOCAL is incompatible with afterClusterTime. \
                          Causal reads require readConcern=MAJORITY.",
                     ));
                 }
                 ExecutorReadConcernLevel::Linearizable => {
-                    return Err(Status::failed_precondition(
+                    return Err(refused(
                         "readConcern=LINEARIZABLE is incompatible with afterClusterTime. \
                          Use readConcern=MAJORITY for causal reads.",
                     ));
@@ -259,7 +263,7 @@ impl StatementExecutor {
                         .write_concern
                         .unwrap_or_else(|| db.write_concern());
                     if !concern.is_causal_safe() {
-                        return Err(Status::failed_precondition(
+                        return Err(refused(
                             "Causal sessions require writeConcern w:majority with \
                              j:journal for write statements. A weaker write (w:1, w:0, \
                              or a volatile journal level) may be lost before replication: \
@@ -276,7 +280,7 @@ impl StatementExecutor {
         // A pinned timestamp means something only to a snapshot read; any
         // other level would ignore it silently.
         if requested.at_timestamp > 0 && level != ExecutorReadConcernLevel::Snapshot {
-            return Err(Status::failed_precondition(
+            return Err(refused(
                 "readConcern.at_timestamp is only valid with level=SNAPSHOT",
             ));
         }
@@ -325,7 +329,7 @@ impl StatementExecutor {
         &self,
         checked: Checked,
         already_forwarded: bool,
-    ) -> Result<Admission, Status> {
+    ) -> Result<Admission, DatabaseError> {
         let Some(raft) = self.raft_node.as_ref() else {
             return Ok(Admission::Run(self.admit_standalone(checked)));
         };
@@ -351,14 +355,14 @@ impl StatementExecutor {
                 {
                     Ok(Admission::Forward(leader_id))
                 }
-                _ => Err(fence_error_to_status(e)),
+                _ => Err(fence_error(e)),
             };
         }
         if let Some(after_index) = checked.read_concern.after_index {
             fence
                 .wait_for_index(after_index, READ_FENCE_TIMEOUT)
                 .await
-                .map_err(fence_error_to_status)?;
+                .map_err(fence_error)?;
         }
         let applied_index = fence.applied_index();
         let served_by_leader = fence.locally_leads();
@@ -383,7 +387,7 @@ impl StatementExecutor {
         query: &str,
         requested: &Requested,
         already_forwarded: bool,
-    ) -> Result<Admission, Status> {
+    ) -> Result<Admission, DatabaseError> {
         let checked = self.check(query, requested)?;
         self.fence(checked, already_forwarded).await
     }
@@ -460,17 +464,19 @@ impl StatementExecutor {
         member: u64,
         statement: RoutedStatement,
         admitted: &AdmissionSignal,
-    ) -> Result<RoutedAnswer, Status> {
+    ) -> Result<RoutedAnswer, DatabaseError> {
         self.router(member)?.execute(statement, admitted).await
     }
 
     /// A router to `member` over this node's authenticated connection to it.
-    pub(crate) fn router(&self, member: u64) -> Result<CommandRouter, Status> {
-        let node = self.raft_node.as_ref().ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "member {member} is needed, and this node has no peers"
-            ))
-        })?;
+    pub(crate) fn router(&self, member: u64) -> Result<CommandRouter, DatabaseError> {
+        let node = self
+            .raft_node
+            .as_ref()
+            .ok_or_else(|| DatabaseError::PeerUnreachable {
+                member,
+                message: "this node has no peers".to_owned(),
+            })?;
         CommandRouter::to_member(node, member)
     }
 
@@ -480,16 +486,14 @@ impl StatementExecutor {
     /// # Errors
     ///
     /// The refusal a write gets during an election, when no member leads.
-    pub(crate) fn transaction_leader(&self) -> Result<Option<u64>, Status> {
+    pub(crate) fn transaction_leader(&self) -> Result<Option<u64>, DatabaseError> {
         let Some(node) = self.raft_node.as_ref() else {
             return Ok(None);
         };
         match node.current_leader() {
             Some(leader) if leader == node.node_id() => Ok(None),
             Some(leader) => Ok(Some(leader)),
-            None => Err(crate::services::cypher::db_error_to_status(
-                DatabaseError::NotLeader { leader_id: None },
-            )),
+            None => Err(DatabaseError::NotLeader { leader_id: None }),
         }
     }
 }
@@ -593,10 +597,7 @@ pub(crate) fn observe_query(kind: QueryKind, started: Instant) {
 /// no node to forward to and the caller has to be told to try again.
 pub(crate) fn leader_hint(err: &DatabaseError) -> Option<u64> {
     match err {
-        DatabaseError::NotLeader { leader_id }
-        | DatabaseError::Execution(
-            coordinode_query::executor::runner::ExecutionError::NotLeader { leader_id },
-        ) => *leader_id,
+        DatabaseError::NotLeader { leader_id } => *leader_id,
         _ => None,
     }
 }
@@ -636,26 +637,21 @@ pub(crate) fn mismatch_metadata(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub(crate) mod tests;
 
-/// A read fence refusal as the status a client sees.
-fn fence_error_to_status(err: ReadFenceError) -> Status {
-    use crate::services::error_details::{Reason, status_with_reason};
-    use tonic::Code;
+/// A read fence refusal in the library's error contract.
+fn fence_error(err: ReadFenceError) -> DatabaseError {
+    let message = err.to_string();
+    let fence = |kind| DatabaseError::ReadFence { kind, message };
     match err {
-        ReadFenceError::NotFollower => Status::failed_precondition(err.to_string()),
-        ReadFenceError::NotLeader => Status::failed_precondition(err.to_string()),
-        ReadFenceError::LinearizableRequiresLeader => Status::failed_precondition(err.to_string()),
-        ReadFenceError::StaleReplica { .. } => Status::unavailable(err.to_string()),
+        ReadFenceError::NotFollower
+        | ReadFenceError::NotLeader
+        | ReadFenceError::LinearizableRequiresLeader => fence(ReadFenceFailure::Role),
+        ReadFenceError::StaleReplica { .. } => fence(ReadFenceFailure::Stale),
         ReadFenceError::Timeout { .. } | ReadFenceError::LeaseTimeout { .. } => {
-            Status::deadline_exceeded(err.to_string())
+            fence(ReadFenceFailure::Timeout)
         }
-        ReadFenceError::Raft(e) => Status::internal(format!("Raft error: {e}")),
-        // Named like a refused write: the same metadata says why this member
-        // is read-only and where the current reads are.
-        ReadFenceError::ReadOnly(ref m) => status_with_reason(
-            Code::FailedPrecondition,
-            err.to_string(),
-            Reason::MemberReadOnly,
-            mismatch_metadata(m),
-        ),
+        ReadFenceError::Raft(e) => DatabaseError::Other(format!("Raft error: {e}")),
+        // Named like a refused write: the same fields say why this member is
+        // read-only and where the current reads are.
+        ReadFenceError::ReadOnly(m) => DatabaseError::Mismatched(m),
     }
 }

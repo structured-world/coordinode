@@ -488,7 +488,10 @@ fn idle_commit_end(
             | DatabaseError::WriteBackpressure
             | DatabaseError::NotLeader { .. }
             | DatabaseError::Mismatched(_)
-            | DatabaseError::Execution(_),
+            | DatabaseError::Budget(_)
+            | DatabaseError::UniqueViolation { .. }
+            | DatabaseError::SchemaViolation(_)
+            | DatabaseError::UniquenessUnresolved { .. },
         ) => TransactionEnd::IdleCommitRefused,
         Err(_) => TransactionEnd::IdleCommitUnknown,
     }
@@ -742,10 +745,11 @@ impl Database {
         // without committing must not grow leader memory unbounded.
         let buffered = state.buffered_bytes();
         if buffered > self.max_interactive_txn_bytes {
+            // usize is at most 64 bits on every supported target.
             return Err(failed(DatabaseError::TransactionTooLarge {
                 id,
-                buffered,
-                limit: self.max_interactive_txn_bytes,
+                buffered: buffered as u64,
+                limit: self.max_interactive_txn_bytes as u64,
             }));
         }
         self.interactive.check_in(&id, state, chain)?;
@@ -908,14 +912,13 @@ impl Database {
         id: TransactionId,
         e: coordinode_storage::engine::transaction::CommitError,
     ) -> DatabaseError {
-        use coordinode_query::executor::runner::ExecutionError;
         use coordinode_storage::engine::transaction::CommitError;
         match e {
             CommitError::Conflict(detail) => DatabaseError::TransactionConflict {
-                id,
-                source_message: detail,
+                transaction: Some(id),
+                message: detail,
             },
-            CommitError::Storage(s) => DatabaseError::Storage(s),
+            CommitError::Storage(s) => s.into(),
             CommitError::Serialization(detail) => {
                 DatabaseError::Other(format!("commit failed: {detail}"))
             }
@@ -934,13 +937,14 @@ impl Database {
             e @ CommitError::IndexFanOut { .. } => DatabaseError::Other(e.to_string()),
             // A statement of the transaction outgrew its budget: its writes
             // were cut short, so the transaction cannot commit as staged.
-            CommitError::Budget(stop) => DatabaseError::Execution(ExecutionError::Budget(stop)),
+            CommitError::Budget(stop) => DatabaseError::Budget(stop),
             // Retryable from begin, like a conflict, but for a different
             // reason: the condition is re-evaluated against the state the
             // retry reads.
-            CommitError::InvariantRefused { reason } => {
-                DatabaseError::InvariantRefused { id, reason }
-            }
+            CommitError::InvariantRefused { reason } => DatabaseError::InvariantRefused {
+                transaction: Some(id),
+                reason,
+            },
             // Not retryable: the value is held, by the node named. The
             // statements that claimed it are gone, so the index is found by
             // the generation the refusal names.
@@ -954,11 +958,12 @@ impl Database {
                 .into_iter()
                 .find(|index| index.generation == generation)
             {
-                Some(index) => DatabaseError::Execution(
-                    coordinode_query::index::UniqueViolation::new(&index, &values, holder).into(),
-                ),
+                Some(index) => coordinode_query::executor::runner::ExecutionError::from(
+                    coordinode_query::index::UniqueViolation::new(&index, &values, holder),
+                )
+                .into(),
                 None => DatabaseError::InvariantRefused {
-                    id,
+                    transaction: Some(id),
                     reason: format!(
                         "a unique value of {generation} is held by node {}",
                         holder.to_element_id()
@@ -967,7 +972,7 @@ impl Database {
             },
             // Not retryable: the node written breaks a rule being certified.
             e @ CommitError::CandidateViolation { .. } => {
-                DatabaseError::Execution(ExecutionError::SchemaViolation(e.to_string()))
+                DatabaseError::SchemaViolation(e.to_string())
             }
             // Retryable once the build is done.
             CommitError::UniquenessUnresolved { generation, limit } => {
@@ -977,7 +982,7 @@ impl Database {
                     .into_iter()
                     .find(|index| index.generation == generation)
                     .map_or_else(|| generation.to_string(), |index| index.to_string());
-                DatabaseError::Execution(ExecutionError::UniquenessUnresolved { index, limit })
+                DatabaseError::UniquenessUnresolved { index, limit }
             }
             // Retryable, but whether retrying is the right answer is the
             // caller's to decide: the record moved, and what that means
@@ -985,7 +990,7 @@ impl Database {
             // the refusal so that decision needs no second read.
             CommitError::RevisionMismatch { expected, current } => {
                 DatabaseError::RevisionMismatch {
-                    id,
+                    transaction: Some(id),
                     expected,
                     current,
                 }

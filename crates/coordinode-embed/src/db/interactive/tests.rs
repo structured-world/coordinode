@@ -624,8 +624,8 @@ fn the_end_of_a_commit_on_timeout_follows_its_result() {
     assert_eq!(idle_commit_end(&Ok(receipt)), TransactionEnd::IdleCommitted);
     assert_eq!(
         idle_commit_end(&Err(DatabaseError::TransactionConflict {
-            id,
-            source_message: "lost".into(),
+            transaction: Some(id),
+            message: "lost".into(),
         })),
         TransactionEnd::IdleCommitRefused
     );

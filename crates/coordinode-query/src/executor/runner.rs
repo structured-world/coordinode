@@ -212,7 +212,7 @@ pub enum ExecutionError {
     )]
     OutsideRetention {
         /// The timestamp the query asked for.
-        requested: i64,
+        requested: u64,
         /// The oldest timestamp still readable when the query ran.
         oldest_readable: u64,
     },
@@ -3812,7 +3812,8 @@ pub fn execute_no_commit(
             // own lock means a granted pin always protects live history.
             let Some(pin) = ctx.engine.pin_snapshot_at(seqno) else {
                 return Err(ExecutionError::OutsideRetention {
-                    requested: ts,
+                    // `seqno` is the timestamp plus one, so at least 1.
+                    requested: seqno - 1,
                     // A read at T is served from snapshot T + 1, so the oldest
                     // readable timestamp is one below the first readable seqno.
                     // The clamp is the bottom of the timestamp domain, not an

@@ -174,54 +174,42 @@ fn command_tag(query: &str) -> Tag {
 fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
     use coordinode_core::schema::definition::ConstraintKind;
     use coordinode_embed::db::DatabaseError;
-    use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
+    use coordinode_query::executor::runner::CatalogObject;
     match error {
-        DatabaseError::Execution(ExecutionError::CatalogObjectExists {
+        DatabaseError::CatalogObjectExists {
             object: CatalogObject::Label,
             ..
-        }) => "42P07",
-        DatabaseError::Execution(ExecutionError::CatalogObjectExists { .. }) => "42710",
-        DatabaseError::Execution(ExecutionError::CatalogObjectMissing {
+        } => "42P07",
+        DatabaseError::CatalogObjectExists { .. } => "42710",
+        DatabaseError::CatalogObjectMissing {
             object: CatalogObject::Label,
             ..
-        }) => "42P01",
-        DatabaseError::Execution(ExecutionError::CatalogObjectMissing { .. }) => "42704",
-        DatabaseError::Execution(ExecutionError::CatalogRefused(_)) => "55000",
+        } => "42P01",
+        DatabaseError::CatalogObjectMissing { .. } => "42704",
+        DatabaseError::CatalogRefused(_) => "55000",
         // The name is held by an object other than the one asked for.
-        DatabaseError::Execution(ExecutionError::CatalogObjectDiffers { .. }) => "42710",
+        DatabaseError::CatalogObjectDiffers { .. } => "42710",
         // The object is not in the state the change was prepared against.
-        DatabaseError::Execution(ExecutionError::CatalogRevisionMismatch { .. }) => "55000",
-        DatabaseError::Execution(
-            ExecutionError::DuplicateKey { .. } | ExecutionError::UniqueViolation { .. },
-        ) => "23505",
-        DatabaseError::Execution(ExecutionError::ConstraintViolation { kind, .. })
+        DatabaseError::CatalogRevisionMismatch { .. } => "55000",
+        DatabaseError::DuplicateKey { .. } | DatabaseError::UniqueViolation { .. } => "23505",
+        DatabaseError::ConstraintViolation { kind, .. }
             if matches!(**kind, ConstraintKind::Type(_)) =>
         {
             "23514"
         }
-        DatabaseError::Execution(ExecutionError::ConstraintViolation { .. }) => "23502",
-        DatabaseError::Execution(ExecutionError::KeyImmutable { .. }) => "42P10",
-        DatabaseError::TransactionConflict { .. }
-        | DatabaseError::Execution(ExecutionError::Conflict(_)) => "40001",
+        DatabaseError::ConstraintViolation { .. } => "23502",
+        DatabaseError::KeyImmutable { .. } => "42P10",
+        DatabaseError::TransactionConflict { .. } => "40001",
         // insufficient_resources: the server catching up, and the same
         // statement succeeds once it has.
         // A unique value not proved free while its index is being built is
         // the same: the statement succeeds once the build has caught up.
-        DatabaseError::WriteBackpressure
-        | DatabaseError::Execution(
-            ExecutionError::Backpressure | ExecutionError::UniquenessUnresolved { .. },
-        ) => "53000",
+        DatabaseError::WriteBackpressure | DatabaseError::UniquenessUnresolved { .. } => "53000",
         // disk_full: the disk is below its reserve, writes wait for space.
-        DatabaseError::Storage(coordinode_storage::error::StorageError::OutOfSpace { .. })
-        | DatabaseError::Execution(ExecutionError::Storage(
-            coordinode_storage::error::StorageError::OutOfSpace { .. },
-        )) => "53100",
+        DatabaseError::StorageFull { .. } => "53100",
         // read_only_sql_transaction: this member takes no writes, the leader
         // does, and a read-only member is read-only for the same reason.
-        DatabaseError::NotLeader { .. }
-        | DatabaseError::Execution(ExecutionError::NotLeader { .. })
-        | DatabaseError::Mismatched(_)
-        | DatabaseError::Execution(ExecutionError::Mismatched(_)) => "25006",
+        DatabaseError::NotLeader { .. } | DatabaseError::Mismatched(_) => "25006",
         _ => "XX000",
     }
 }

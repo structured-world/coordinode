@@ -2339,12 +2339,10 @@ fn as_of_timestamp_rejects_expired() {
             requested,
             oldest_readable,
         }) => {
+            let old_ts = u64::try_from(old_ts).expect("positive");
             assert_eq!(requested, old_ts);
             assert_eq!(oldest_readable, horizon);
-            assert!(
-                u64::try_from(old_ts).expect("positive") < horizon,
-                "30 days ago lies below a 7-day horizon"
-            );
+            assert!(old_ts < horizon, "30 days ago lies below a 7-day horizon");
         }
         other => panic!("expected OutsideRetention, got {other:?}"),
     }

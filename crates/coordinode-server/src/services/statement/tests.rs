@@ -1,4 +1,5 @@
 use super::*;
+use crate::services::cypher::db_error_to_status;
 
 /// A standalone executor over a fresh database.
 pub(crate) fn standalone() -> (StatementExecutor, tempfile::TempDir) {
@@ -315,20 +316,30 @@ fn an_unservable_combination_is_refused_before_it_runs() {
         ExecutorReadConcernLevel::Local,
         ExecutorReadConcernLevel::Linearizable,
     ] {
-        let status = executor
+        let refused = executor
             .check("RETURN 1", &causal(level))
             .expect_err("a causal read needs MAJORITY or SNAPSHOT");
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            matches!(refused, DatabaseError::SettingsRefused(_)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            db_error_to_status(refused).code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 
     let lossy_write = Requested {
         write_concern: Some(WriteConcern::w1()),
         ..causal(ExecutorReadConcernLevel::Majority)
     };
-    let status = executor
+    let refused = executor
         .check("CREATE (:Causal)", &lossy_write)
         .expect_err("a causal write must be majority-journaled");
-    assert!(status.message().contains("writeConcern"), "{status:?}");
+    assert!(
+        matches!(&refused, DatabaseError::SettingsRefused(m) if m.contains("writeConcern")),
+        "{refused:?}"
+    );
     // The same concern on a read is no concern of the causal check.
     executor
         .check("RETURN 1", &lossy_write)
@@ -339,10 +350,13 @@ fn an_unservable_combination_is_refused_before_it_runs() {
         at_timestamp: 7,
         ..Requested::default()
     };
-    let status = executor
+    let refused = executor
         .check("RETURN 1", &pinned)
         .expect_err("a pinned timestamp needs SNAPSHOT");
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        db_error_to_status(refused).code(),
+        tonic::Code::FailedPrecondition
+    );
 }
 
 /// On the leader of a real group, a statement is fenced with its preference:
@@ -356,11 +370,24 @@ async fn the_fence_applies_the_resolved_preference() {
         read_preference: Some(ReadPreference::Secondary),
         ..Requested::default()
     };
-    let status = executor
+    let refused = executor
         .admit("RETURN 1", &secondary, false)
         .await
         .expect_err("the leader is not a secondary");
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        matches!(
+            refused,
+            DatabaseError::ReadFence {
+                kind: coordinode_embed::ReadFenceFailure::Role,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        db_error_to_status(refused).code(),
+        tonic::Code::FailedPrecondition
+    );
 
     match executor
         .admit("RETURN 1", &Requested::default(), false)

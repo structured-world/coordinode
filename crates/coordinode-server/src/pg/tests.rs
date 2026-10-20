@@ -178,7 +178,7 @@ fn constraint_violations_carry_their_postgres_sqlstate() {
     use coordinode_query::executor::runner::ExecutionError;
 
     let violation = |kind| {
-        DatabaseError::Execution(ExecutionError::ConstraintViolation {
+        DatabaseError::from(ExecutionError::ConstraintViolation {
             constraint: "c".into(),
             kind: Box::new(kind),
             label: "T".into(),
@@ -210,13 +210,13 @@ fn catalog_refusals_carry_their_postgres_sqlstate() {
     use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
 
     let exists = |object| {
-        DatabaseError::Execution(ExecutionError::CatalogObjectExists {
+        DatabaseError::from(ExecutionError::CatalogObjectExists {
             object,
             name: "x".into(),
         })
     };
     let missing = |object| {
-        DatabaseError::Execution(ExecutionError::CatalogObjectMissing {
+        DatabaseError::from(ExecutionError::CatalogObjectMissing {
             object,
             name: "x".into(),
         })
@@ -228,7 +228,7 @@ fn catalog_refusals_carry_their_postgres_sqlstate() {
         (missing(CatalogObject::Label), "42P01"),
         (missing(CatalogObject::Constraint), "42704"),
         (
-            DatabaseError::Execution(ExecutionError::CatalogRefused("x".into())),
+            DatabaseError::from(ExecutionError::CatalogRefused("x".into())),
             "55000",
         ),
     ];
@@ -252,23 +252,20 @@ fn retryable_refusals_carry_the_sqlstate_drivers_retry_on() {
     let cases = [
         (
             DatabaseError::TransactionConflict {
-                id: coordinode_embed::TransactionId::from_raw([1; 16]),
-                source_message: "conflict".to_string(),
+                transaction: Some(coordinode_embed::TransactionId::from_raw([1; 16])),
+                message: "conflict".to_string(),
             },
             "40001",
         ),
         (
-            DatabaseError::Execution(ExecutionError::Conflict("conflict".to_string())),
+            DatabaseError::from(ExecutionError::Conflict("conflict".to_string())),
             "40001",
         ),
         (DatabaseError::WriteBackpressure, "53000"),
-        (
-            DatabaseError::Execution(ExecutionError::Backpressure),
-            "53000",
-        ),
+        (DatabaseError::from(ExecutionError::Backpressure), "53000"),
         // Not 23505: the value is not known to be held.
         (
-            DatabaseError::Execution(ExecutionError::UniquenessUnresolved {
+            DatabaseError::from(ExecutionError::UniquenessUnresolved {
                 index: "user_email".to_string(),
                 limit: 1,
             }),
@@ -276,11 +273,11 @@ fn retryable_refusals_carry_the_sqlstate_drivers_retry_on() {
         ),
         (DatabaseError::NotLeader { leader_id: Some(2) }, "25006"),
         (
-            DatabaseError::Execution(ExecutionError::NotLeader { leader_id: None }),
+            DatabaseError::from(ExecutionError::NotLeader { leader_id: None }),
             "25006",
         ),
         (
-            DatabaseError::Execution(ExecutionError::Storage(
+            DatabaseError::from(ExecutionError::Storage(
                 coordinode_storage::error::StorageError::OutOfSpace {
                     path: "/data".to_string(),
                     available_bytes: 1,

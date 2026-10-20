@@ -89,6 +89,14 @@ db.acknowledge_operation(&op)?; // release the outcome once it is no longer need
 
 See [Transactions](./transactions) for the full interactive-transaction contract, safe retries with operation identity, and what the retention window costs in storage.
 
+## Errors
+
+Every call fails with a `DatabaseError` whose variant says what happened and whose fields carry what a caller decides on: the transaction and why it ended, the versions a conditioned write expected and found, the constraint and node a write broke, the leader to retry at, the oldest readable timestamp, an operation's outcome. Match on the variant; the rendered text is for people. A refusal is one variant wherever it was found: a conflict is `TransactionConflict` for an interactive commit and for a statement that commits on its own (its `transaction` is then `None`).
+
+The engine's own error objects stop at this boundary. A storage failure no variant classifies is `DatabaseError::Storage`: its message, and `storage_cause()` returns the engine's error, for example `StorageError::GroupMemberStore` when a member's store is opened outside its group. A failure the caller cannot act on beyond reporting it is `Other`.
+
+A command one member of a replicated group passes to another (`replication::routing::CommandRouter`) fails with the error the executing member raised, field for field, as if it had run here; only the engine's cause stays on that member. Two variants belong to the hop: `PeerUnreachable` means nothing was sent, or the member refused the command before reading it, so it did not run; `PeerOutcomeUnknown` means the command was sent and its answer was lost (`PeerFailure::Transport`, `Deadline` or `Protocol`), so it may have run. Neither is a refusal or an abort: resolve a write of unknown outcome by its operation rather than running it again.
+
 ## Declaring the Schema
 
 An application declares its labels, edge types and constraints as one package, typically at every open. `Database::publish_schema` checks the whole package against one view of the catalog, with the package itself visible to it (a constraint may name a label the same package defines, in any order), and publishes every change in one catalog commit, or nothing.
@@ -143,7 +151,7 @@ The same database can run as a member of a replicated group inside your process.
 
 - **Build capability.** Replication is compiled in only with the `replication` feature. Without it the crate pulls in no consensus, network or async runtime code at all.
 - **Operating mode.** A build with the feature still runs a single member until you give it peers. A member alone leads its group at once, takes writes through its own log and serves nothing on the network.
-- **History.** A store written without replication becomes the member a group is formed around, in place: no export, no import. Members that join start empty and receive everything from the leader. A member that already holds data of its own is refused as a joiner. Growth goes one way: once a store is a member, its history is the group's log, and `Database::open` (with or without the feature) refuses it with `StorageError::GroupMemberStore`, writing nothing; it opens only as a member, through `ReplicatedDatabase`.
+- **History.** A store written without replication becomes the member a group is formed around, in place: no export, no import. Members that join start empty and receive everything from the leader. A member that already holds data of its own is refused as a joiner. Growth goes one way: once a store is a member, its history is the group's log, and `Database::open` (with or without the feature) refuses it, writing nothing, with a `DatabaseError::Storage` whose `storage_cause()` is `StorageError::GroupMemberStore`; it opens only as a member, through `ReplicatedDatabase`.
 
 ```toml
 [dependencies]

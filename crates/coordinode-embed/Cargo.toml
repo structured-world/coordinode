@@ -21,6 +21,7 @@ replication = [
     "dep:tokio",
     "dep:tokio-stream",
     "dep:tonic",
+    "dep:prost",
 ]
 
 [dependencies]
@@ -34,6 +35,8 @@ tokio = { workspace = true, optional = true }
 # The answer of a routed statement streams to the member that sent it.
 tokio-stream = { version = "0.1", optional = true }
 tonic = { workspace = true, optional = true }
+# A routed command's failure is encoded by the library and carried as bytes.
+prost = { workspace = true, optional = true }
 coordinode-vector = { workspace = true }
 coordinode-search = { workspace = true }
 coordinode-storage = { workspace = true }

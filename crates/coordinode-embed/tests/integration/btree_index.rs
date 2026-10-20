@@ -383,9 +383,10 @@ fn a_settled_change_of_the_definition_refuses_the_writes_bound_before_it() {
     assert!(
         matches!(
             refused,
-            Err(coordinode_embed::db::DatabaseError::Execution(
-                coordinode_query::executor::runner::ExecutionError::Conflict(_)
-            ))
+            Err(coordinode_embed::db::DatabaseError::TransactionConflict {
+                transaction: None,
+                ..
+            })
         ),
         "{refused:?}"
     );

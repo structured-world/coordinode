@@ -143,10 +143,11 @@ impl OperationServiceImpl {
             Ok(answer) => Ok(answer),
             Err(e) => match leader_hint(&e) {
                 Some(leader) => {
-                    self.executor
-                        .router(leader)?
-                        .operation(&ActingContext::Trusted, onward)
-                        .await
+                    let routed = match self.executor.router(leader) {
+                        Ok(router) => router.operation(&ActingContext::Trusted, onward).await,
+                        Err(e) => Err(e),
+                    };
+                    routed.map_err(db_error_to_status)
                 }
                 None => Err(db_error_to_status(e)),
             },

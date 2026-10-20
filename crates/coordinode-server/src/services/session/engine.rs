@@ -79,7 +79,7 @@ impl DatabaseCursorEngine {
         let checked = self
             .executor
             .check(query, requested)
-            .map_err(|s| EngineError(failure(&s)))?;
+            .map_err(engine_error)?;
         if !self.executor.needs_fence() {
             return Ok(Admission::Run(self.executor.admit_standalone(checked)));
         }
@@ -87,7 +87,7 @@ impl DatabaseCursorEngine {
             .map_err(|e| EngineError::internal(format!("no runtime to fence the read on: {e}")))?;
         runtime
             .block_on(self.executor.fence(checked, false))
-            .map_err(|s| EngineError(failure(&s)))
+            .map_err(engine_error)
     }
 
     /// Run `statement` at `member` and page its answer out of memory. A
@@ -134,7 +134,7 @@ impl DatabaseCursorEngine {
     fn block_on_routed<T>(
         &self,
         cancel: &coordinode_core::budget::CancelFlag,
-        call: impl std::future::Future<Output = Result<T, tonic::Status>>,
+        call: impl std::future::Future<Output = Result<T, DatabaseError>>,
     ) -> Result<T, EngineError> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
             EngineError::internal(format!("no runtime to reach another member on: {e}"))
@@ -142,12 +142,10 @@ impl DatabaseCursorEngine {
         runtime.block_on(async {
             tokio::select! {
                 biased;
-                () = cancel.thrown() => Err(engine_error(DatabaseError::Execution(
-                    coordinode_query::executor::runner::ExecutionError::Budget(
-                        coordinode_core::budget::BudgetStop::Cancelled,
-                    ),
+                () = cancel.thrown() => Err(engine_error(DatabaseError::Budget(
+                    coordinode_core::budget::BudgetStop::Cancelled,
                 ))),
-                answered = call => answered.map_err(|s| EngineError(failure(&s))),
+                answered = call => answered.map_err(engine_error),
             }
         })
     }
@@ -155,9 +153,7 @@ impl DatabaseCursorEngine {
     /// The member every command of a transaction runs at, when it is not this
     /// one.
     fn transaction_leader(&self) -> Result<Option<u64>, EngineError> {
-        self.executor
-            .transaction_leader()
-            .map_err(|s| EngineError(failure(&s)))
+        self.executor.transaction_leader().map_err(engine_error)
     }
 
     /// An autonomous session statement as routed to the leader: the settings
@@ -198,9 +194,7 @@ impl CursorEngine for DatabaseCursorEngine {
                 query_memory_limit: Some(bytes),
                 ..ConnectionSettings::default()
             }),
-            Err(refused) => Err(EngineError(failure(
-                &crate::services::cypher::db_error_to_status(refused.into()),
-            ))),
+            Err(refused) => Err(engine_error(refused.into())),
         })
     }
 
@@ -360,10 +354,7 @@ impl CursorEngine for DatabaseCursorEngine {
         // A transaction is held by the leader: on another member it opens
         // there.
         if let Some(leader) = self.transaction_leader()? {
-            let router = self
-                .executor
-                .router(leader)
-                .map_err(|s| EngineError(failure(&s)))?;
+            let router = self.executor.router(leader).map_err(engine_error)?;
             let begin = RoutedBegin {
                 transaction,
                 actor: ActingContext::Trusted,
@@ -400,10 +391,7 @@ impl CursorEngine for DatabaseCursorEngine {
         admission: &AdmissionSignal,
     ) -> Result<CommitReceipt, EngineError> {
         if let Some(leader) = self.transaction_leader()? {
-            let router = self
-                .executor
-                .router(leader)
-                .map_err(|s| EngineError(failure(&s)))?;
+            let router = self.executor.router(leader).map_err(engine_error)?;
             let commit = RoutedCommit {
                 actor: ActingContext::Trusted,
                 transaction,
@@ -452,10 +440,7 @@ impl DatabaseCursorEngine {
         end: TransactionEnd,
     ) -> Result<(), EngineError> {
         if let Some(leader) = self.transaction_leader()? {
-            let router = self
-                .executor
-                .router(leader)
-                .map_err(|s| EngineError(failure(&s)))?;
+            let router = self.executor.router(leader).map_err(engine_error)?;
             let rollback = RoutedRollback {
                 actor: ActingContext::Trusted,
                 transaction,

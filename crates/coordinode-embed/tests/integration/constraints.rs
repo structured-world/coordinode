@@ -17,7 +17,7 @@ use coordinode_embed::Database;
 use coordinode_embed::db::DatabaseError;
 use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 use coordinode_query::executor::row::Row;
-use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
+use coordinode_query::executor::runner::CatalogObject;
 
 fn open_db() -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -30,7 +30,7 @@ fn open_db() -> (Database, tempfile::TempDir) {
 fn names_existing(err: &DatabaseError, object: CatalogObject, name: &str) -> bool {
     matches!(
         err,
-        DatabaseError::Execution(ExecutionError::CatalogObjectExists { object: o, name: n })
+        DatabaseError::CatalogObjectExists { object: o, name: n }
             if *o == object && n == name
     )
 }
@@ -103,19 +103,19 @@ fn count(db: &mut Database, query: &str) -> i64 {
 /// The constraint violation `result` must be, as (constraint, kind, property).
 fn expect_violation(result: Result<Vec<Row>, DatabaseError>) -> (String, ConstraintKind, String) {
     match result {
-        Err(DatabaseError::Execution(ExecutionError::ConstraintViolation {
+        Err(DatabaseError::ConstraintViolation {
             constraint,
             kind,
             property,
             ..
-        })) => (constraint, *kind, property),
+        }) => (constraint, *kind, property),
         other => panic!("expected a constraint violation, got {other:?}"),
     }
 }
 
 fn expect_unique_violation(result: Result<Vec<Row>, DatabaseError>) -> String {
     match result {
-        Err(DatabaseError::Execution(ExecutionError::UniqueViolation { index, .. })) => index,
+        Err(DatabaseError::UniqueViolation { index, .. }) => index,
         other => panic!("expected a unique violation, got {other:?}"),
     }
 }
@@ -524,7 +524,13 @@ fn concurrent_creates_under_one_name_have_exactly_one_winner() {
             if let Err(err) = outcome {
                 assert!(
                     names_existing(err, CatalogObject::Constraint, &name)
-                        || matches!(err, DatabaseError::Execution(ExecutionError::Conflict(_))),
+                        || matches!(
+                            err,
+                            DatabaseError::TransactionConflict {
+                                transaction: None,
+                                ..
+                            }
+                        ),
                     "round {round}: the loser is refused for the clash, got {err:?}"
                 );
             }
@@ -579,11 +585,11 @@ fn names_and_if_not_exists() {
     assert!(
         matches!(
             err,
-            DatabaseError::Execution(ExecutionError::CatalogObjectDiffers {
+            DatabaseError::CatalogObjectDiffers {
                 object: CatalogObject::Constraint,
                 ref name,
                 ..
-            }) if name == "c1"
+            } if name == "c1"
         ),
         "{err}"
     );
@@ -719,11 +725,13 @@ fn an_unreadable_index_definition_refuses_the_open() {
     };
 
     match Database::open(dir.path()) {
-        Err(DatabaseError::Storage(StorageError::UnreadableCatalog { kind, key, .. })) => {
-            assert_eq!(kind, "index definition");
-            assert_eq!(key, coordinode_storage::error::printable_key(&planted));
-        }
-        Err(other) => panic!("refused for another reason: {other}"),
+        Err(err) => match err.storage_cause() {
+            Some(StorageError::UnreadableCatalog { kind, key, .. }) => {
+                assert_eq!(*kind, "index definition");
+                assert_eq!(*key, coordinode_storage::error::printable_key(&planted));
+            }
+            _ => panic!("refused for another reason: {err}"),
+        },
         Ok(_) => panic!("opened without the unique index it cannot read"),
     }
 }
@@ -773,8 +781,7 @@ fn a_presence_constraint_checked_past_the_wait_is_returned_validating() {
     assert!(
         matches!(
             second,
-            DatabaseError::Execution(ExecutionError::CatalogRefused(ref why))
-                if why.contains("being certified")
+            DatabaseError::CatalogRefused(ref why) if why.contains("being certified")
         ),
         "{second}"
     );

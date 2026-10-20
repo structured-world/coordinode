@@ -262,7 +262,9 @@ fn concurrent_auto_commit_increments_lose_nothing() {
                             );
                             matched_nothing.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(DatabaseError::Execution(ExecutionError::Conflict(_))) => {
+                        Err(DatabaseError::TransactionConflict {
+                            transaction: None, ..
+                        }) => {
                             refused.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(e) => panic!("unexpected failure: {e}"),

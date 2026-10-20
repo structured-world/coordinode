@@ -10,7 +10,6 @@ use coordinode_core::graph::types::Value;
 use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_embed::{Database, DatabaseError};
-use coordinode_query::executor::runner::ExecutionError;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::partition::Partition;
 use std::time::Duration;
@@ -169,11 +168,11 @@ fn as_of_below_the_horizon_is_refused_after_the_window_elapses() {
     // by a few microseconds, so the error reports a horizon at or slightly
     // past the one sampled above, still well before the recent commit.
     match anchors_as_of(&mut db, first) {
-        Err(DatabaseError::Execution(ExecutionError::OutsideRetention {
+        Err(DatabaseError::OutsideRetention {
             requested,
             oldest_readable,
-        })) => {
-            assert_eq!(requested, i64::try_from(first).expect("fits"));
+        }) => {
+            assert_eq!(requested, first);
             assert!(horizon <= oldest_readable && oldest_readable < second);
         }
         other => panic!("expected OutsideRetention, got {other:?}"),
@@ -220,9 +219,7 @@ fn runtime_window_change_moves_the_horizon() {
     commit_anchor(&mut db, 2);
     assert!(matches!(
         anchors_as_of(&mut db, first),
-        Err(DatabaseError::Execution(
-            ExecutionError::OutsideRetention { .. }
-        ))
+        Err(DatabaseError::OutsideRetention { .. })
     ));
 
     // No compaction ran since the window closed, so the history is still
@@ -236,9 +233,7 @@ fn runtime_window_change_moves_the_horizon() {
     assert!(db.oldest_readable_timestamp().as_raw() > first);
     assert!(matches!(
         anchors_as_of(&mut db, first),
-        Err(DatabaseError::Execution(
-            ExecutionError::OutsideRetention { .. }
-        ))
+        Err(DatabaseError::OutsideRetention { .. })
     ));
 }
 
@@ -343,13 +338,8 @@ fn a_zero_window_refuses_no_statement_under_concurrent_writes() {
             let (db, failures) = (&db, &failures);
             s.spawn(move || {
                 let bump = format!("MATCH (n:Tally {{id: {w}}}) SET n.v = n.v + 1");
-                let retryable = |e: &DatabaseError| {
-                    matches!(
-                        e,
-                        DatabaseError::TransactionConflict { .. }
-                            | DatabaseError::Execution(ExecutionError::Conflict(_))
-                    )
-                };
+                let retryable =
+                    |e: &DatabaseError| matches!(e, DatabaseError::TransactionConflict { .. });
                 for _ in 0..ROUNDS {
                     loop {
                         match db.execute_cypher_shared(&bump, None, None, None, None) {
@@ -481,9 +471,7 @@ fn edge_property_history_survives_compaction_and_reopen() {
         assert!(
             matches!(
                 link_weight_as_of(&mut db, second - 1),
-                Err(DatabaseError::Execution(
-                    ExecutionError::OutsideRetention { .. }
-                ))
+                Err(DatabaseError::OutsideRetention { .. })
             ),
             "the collected version is refused, not answered"
         );

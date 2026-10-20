@@ -274,7 +274,9 @@ fn concurrent_attempts_take_effect_once() {
             }) => {}
             // A concurrent attempt can also lose first-committer-wins on the
             // label's counter; nothing of it applied either.
-            Err(DatabaseError::Execution(_)) => {}
+            Err(DatabaseError::TransactionConflict {
+                transaction: None, ..
+            }) => {}
             Err(other) => panic!("unexpected: {other:?}"),
         }
     }

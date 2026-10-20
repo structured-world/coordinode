@@ -247,6 +247,16 @@ pub enum Reason {
     /// its record is not here, and nothing here resolves it. Metadata carries
     /// `deployment`, the one the reference names. Terminal.
     ForeignOperation,
+    /// The member a command had to run at, the leader, could not be reached
+    /// or refused it before reading it: the command did not run. Metadata
+    /// carries `member`. The same command may be sent again.
+    MemberUnreachable,
+    /// The command reached the member that runs it, and its answer was lost:
+    /// it may have run, and a write may have committed. Neither a refusal
+    /// nor an abort. Metadata carries `member` and `failure` (TRANSPORT,
+    /// DEADLINE or PROTOCOL). Terminal for a write: its outcome is resolved
+    /// through its operation, never by sending it again.
+    RoutedOutcomeUnknown,
 }
 
 impl Reason {
@@ -299,6 +309,8 @@ impl Reason {
             Reason::IndexUnresolved => "INDEX_UNRESOLVED",
             Reason::OperationSettled => "OPERATION_SETTLED",
             Reason::ForeignOperation => "FOREIGN_OPERATION",
+            Reason::MemberUnreachable => "MEMBER_UNREACHABLE",
+            Reason::RoutedOutcomeUnknown => "ROUTED_OUTCOME_UNKNOWN",
         }
     }
 
@@ -352,6 +364,9 @@ impl Reason {
             // The index answers again once its check proves it, which takes
             // a verification pass, not a moment.
             Reason::IndexUnresolved => Some(std::time::Duration::from_secs(5)),
+            // Nothing ran; a member that could not be reached is usually back
+            // or replaced within an election.
+            Reason::MemberUnreachable => Some(std::time::Duration::from_millis(100)),
             _ => None,
         }
     }

@@ -4,7 +4,7 @@ use coordinode_core::schema::definition::{
     ConstraintKind, ConstraintState, EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType,
     SchemaMode,
 };
-use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
+use coordinode_query::executor::runner::CatalogObject;
 
 use super::{
     Disposition, EdgeTypeDeclaration, Intent, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,
@@ -60,13 +60,6 @@ fn package() -> SchemaPackage {
             schema: EdgeTypeSchema::new("FOLLOWS"),
             intent: Intent::Ensure,
         }],
-    }
-}
-
-fn execution(e: DatabaseError) -> ExecutionError {
-    match e {
-        DatabaseError::Execution(e) => e,
-        other => panic!("expected an execution error, got {other:?}"),
     }
 }
 
@@ -171,11 +164,11 @@ fn a_differing_declaration_refuses_the_whole_package() {
         schema: EdgeTypeSchema::new("BLOCKS"),
         intent: Intent::Ensure,
     });
-    let refused = execution(db.publish_schema(changed).unwrap_err());
+    let refused = db.publish_schema(changed).unwrap_err();
     assert!(
         matches!(
             refused,
-            ExecutionError::CatalogObjectDiffers {
+            DatabaseError::CatalogObjectDiffers {
                 object: CatalogObject::Label,
                 ref name,
                 ..
@@ -210,11 +203,11 @@ fn a_change_is_published_only_at_the_expected_revision() {
         }],
         ..SchemaPackage::default()
     };
-    let refused = execution(db.publish_schema(stale).unwrap_err());
+    let refused = db.publish_schema(stale).unwrap_err();
     assert!(
         matches!(
             refused,
-            ExecutionError::CatalogRevisionMismatch {
+            DatabaseError::CatalogRevisionMismatch {
                 expected: 1,
                 current: Some(3),
                 ..
@@ -261,8 +254,8 @@ fn a_change_of_an_absent_label_is_refused() {
         ..SchemaPackage::default()
     };
     assert!(matches!(
-        execution(db.publish_schema(change).unwrap_err()),
-        ExecutionError::CatalogRevisionMismatch { current: None, .. }
+        db.publish_schema(change).unwrap_err(),
+        DatabaseError::CatalogRevisionMismatch { current: None, .. }
     ));
     assert!(db.label_schemas().unwrap().is_empty());
 }
@@ -277,8 +270,8 @@ fn a_constraint_name_holding_another_requirement_is_a_conflict() {
     other.constraints[0].properties = vec!["handle".into()];
     other.constraints.truncate(1);
     assert!(matches!(
-        execution(db.publish_schema(other).unwrap_err()),
-        ExecutionError::CatalogObjectDiffers {
+        db.publish_schema(other).unwrap_err(),
+        DatabaseError::CatalogObjectDiffers {
             object: CatalogObject::Constraint,
             ..
         }
@@ -295,8 +288,8 @@ fn a_malformed_package_is_refused_before_publication() {
         .constraints
         .push(constraint("user_email", "handle", ConstraintKind::Unique));
     assert!(matches!(
-        execution(db.publish_schema(twice).unwrap_err()),
-        ExecutionError::CatalogRefused(ref why) if why.contains("twice")
+        db.publish_schema(twice).unwrap_err(),
+        DatabaseError::CatalogRefused(ref why) if why.contains("twice")
     ));
 
     let oversize = SchemaPackage {
@@ -309,8 +302,8 @@ fn a_malformed_package_is_refused_before_publication() {
         ..SchemaPackage::default()
     };
     assert!(matches!(
-        execution(db.publish_schema(oversize).unwrap_err()),
-        ExecutionError::CatalogRefused(ref why) if why.contains("at most")
+        db.publish_schema(oversize).unwrap_err(),
+        DatabaseError::CatalogRefused(ref why) if why.contains("at most")
     ));
     assert!(db.label_schemas().unwrap().is_empty());
     assert!(db.edge_type_schemas().unwrap().is_empty());
@@ -516,8 +509,8 @@ fn a_definition_stored_nodes_break_is_withdrawn() {
         .expect("nothing more than before holds writes");
 
     assert!(matches!(
-        execution(db.publish_schema(strict_user()).unwrap_err()),
-        ExecutionError::CatalogObjectDiffers {
+        db.publish_schema(strict_user()).unwrap_err(),
+        DatabaseError::CatalogObjectDiffers {
             object: CatalogObject::Label,
             ..
         }
@@ -732,13 +725,11 @@ fn concurrent_publications_converge_or_conflict() {
     for (i, outcome) in outcomes.iter().enumerate() {
         match outcome {
             Ok(_) => {}
-            Err(DatabaseError::Execution(
-                ExecutionError::Conflict(_)
-                | ExecutionError::InvariantRefused(_)
-                | ExecutionError::CatalogObjectDiffers { .. },
-            ))
-            | Err(DatabaseError::TransactionConflict { .. })
-            | Err(DatabaseError::InvariantRefused { .. }) => {}
+            Err(
+                DatabaseError::TransactionConflict { .. }
+                | DatabaseError::InvariantRefused { .. }
+                | DatabaseError::CatalogObjectDiffers { .. },
+            ) => {}
             Err(other) => panic!("publication {i}: {other:?}"),
         }
     }
@@ -746,7 +737,7 @@ fn concurrent_publications_converge_or_conflict() {
     let settled = match settled {
         Ok(p) => p,
         // The differing package won: the equal one now differs from it.
-        Err(DatabaseError::Execution(ExecutionError::CatalogObjectDiffers { .. })) => {
+        Err(DatabaseError::CatalogObjectDiffers { .. }) => {
             let mut other = package();
             other.labels[0].schema = user(Some("age"));
             db.publish_schema(other)
@@ -794,8 +785,8 @@ fn a_label_being_certified_cannot_be_changed_until_it_ends() {
         expected_revision: published.objects[0].revision,
     };
     assert!(matches!(
-        execution(db.publish_schema(change).unwrap_err()),
-        ExecutionError::CatalogRefused(ref why) if why.contains("still being certified")
+        db.publish_schema(change).unwrap_err(),
+        DatabaseError::CatalogRefused(ref why) if why.contains("still being certified")
     ));
 
     assert!(db.cancel_index_build(operation).expect("cancel"));

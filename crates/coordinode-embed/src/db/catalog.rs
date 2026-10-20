@@ -267,11 +267,9 @@ impl Database {
         self.constraints()?
             .into_iter()
             .find(|c| c.constraint.name == created)
-            .ok_or_else(|| {
-                DatabaseError::Execution(ExecutionError::CatalogObjectMissing {
-                    object: CatalogObject::Constraint,
-                    name: created,
-                })
+            .ok_or_else(|| DatabaseError::CatalogObjectMissing {
+                object: CatalogObject::Constraint,
+                name: created,
             })
     }
 
@@ -378,7 +376,7 @@ fn only_revision(published: &super::SchemaPublication) -> u64 {
 
 /// A catalog change refused by the catalog's current state.
 pub(super) fn refused(reason: String) -> DatabaseError {
-    DatabaseError::Execution(ExecutionError::CatalogRefused(reason))
+    DatabaseError::CatalogRefused(reason)
 }
 
 /// Refuse a label definition that is not a type definition alone: one

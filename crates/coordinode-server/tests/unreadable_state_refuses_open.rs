@@ -12,7 +12,6 @@ use std::time::Duration;
 use coordinode_core::txn::proposal::ProposalPipeline;
 use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_embed::Database;
-use coordinode_embed::db::DatabaseError;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proposal::RaftProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
@@ -97,10 +96,12 @@ async fn a_member_refuses_an_unreadable_index_definition() {
     let engine = open_engine(dir.path(), &oracle);
     let raft = open_member(&engine, port).await.expect("reopen member");
     match Database::from_engine(dir.path(), Arc::clone(&engine), oracle, pipeline(&raft)) {
-        Err(DatabaseError::Storage(StorageError::UnreadableCatalog { key, .. })) => {
-            assert_eq!(key, coordinode_storage::error::printable_key(&planted));
-        }
-        Err(other) => panic!("refused for another reason: {other}"),
+        Err(err) => match err.storage_cause() {
+            Some(StorageError::UnreadableCatalog { key, .. }) => {
+                assert_eq!(*key, coordinode_storage::error::printable_key(&planted));
+            }
+            _ => panic!("refused for another reason: {err}"),
+        },
         Ok(_) => panic!("served without the unique index it cannot read"),
     }
     raft.shutdown().await.expect("shutdown");

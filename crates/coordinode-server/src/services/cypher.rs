@@ -17,7 +17,7 @@ use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::ReadPreference;
 
-use coordinode_core::txn::command::{ActingContext, AdmissionSignal};
+use coordinode_core::txn::command::{ActingContext, AdmissionSignal, TransactionId};
 use coordinode_embed::replication::routing::{RoutedAnswer, RoutedStatement};
 
 use super::routing::routed_settings;
@@ -199,9 +199,8 @@ fn convert_params(
 /// [`crate::services::error_details`].
 pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
     use crate::services::error_details::{Reason, status_with_reason};
+    use coordinode_embed::{PeerFailure, ReadFenceFailure};
     use coordinode_query::executor::eval::EvalError;
-    use coordinode_query::executor::runner::ExecutionError;
-    use coordinode_storage::error::StorageError;
     use tonic::Code;
 
     let rendered = err.to_string();
@@ -225,7 +224,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
-        DatabaseError::Execution(ExecutionError::Arithmetic(eval)) => {
+        DatabaseError::Arithmetic(eval) => {
             let (reason, metadata) = match eval {
                 EvalError::DivideByZero => (Reason::DivideByZero, Vec::new()),
                 EvalError::LongOverflow => (Reason::LongOverflow, Vec::new()),
@@ -242,7 +241,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
         }
         // A CALL the catalog refused: a fault in the query, like a syntax
         // error, with the procedure and the argument or column it names.
-        DatabaseError::Execution(ExecutionError::Procedure(refusal)) => {
+        DatabaseError::Procedure(refusal) => {
             use coordinode_query::procedure::ProcedureError as P;
             let (reason, metadata): (Reason, Vec<(&str, String)>) = match refusal {
                 P::Unknown { procedure } => (
@@ -285,7 +284,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
             };
             return status_with_reason(Code::InvalidArgument, rendered, reason, metadata);
         }
-        DatabaseError::Execution(ExecutionError::SchemaViolation(detail)) => {
+        DatabaseError::SchemaViolation(detail) => {
             return status_with_reason(
                 Code::FailedPrecondition,
                 format!("Schema violation: {detail}"),
@@ -293,11 +292,11 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
-        DatabaseError::Execution(ExecutionError::DuplicateKey {
+        DatabaseError::DuplicateKey {
             table,
             key,
             element_id,
-        }) => {
+        } => {
             return status_with_reason(
                 Code::AlreadyExists,
                 rendered,
@@ -309,12 +308,12 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 ],
             );
         }
-        DatabaseError::Execution(ExecutionError::UniqueViolation {
+        DatabaseError::UniqueViolation {
             index,
             property,
             value,
             element_id,
-        }) => {
+        } => {
             return status_with_reason(
                 Code::AlreadyExists,
                 rendered,
@@ -331,7 +330,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
         // same write succeeds once the build covers the stored nodes.
         // A spent budget is not a server fault: the statement asked for more
         // than its limit, or for longer than its caller waits.
-        DatabaseError::Execution(ExecutionError::Budget(stop)) => {
+        DatabaseError::Budget(stop) => {
             use coordinode_core::budget::BudgetStop;
             return match stop {
                 BudgetStop::Memory {
@@ -359,11 +358,11 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 }
             };
         }
-        DatabaseError::Execution(ExecutionError::IndexUnresolved {
+        DatabaseError::IndexUnresolved {
             label,
             property,
             operator,
-        }) => {
+        } => {
             return status_with_reason(
                 Code::Unavailable,
                 rendered,
@@ -371,12 +370,12 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [
                     ("label", label.clone()),
                     ("property", property.clone()),
-                    ("operator", operator.to_string()),
+                    ("operator", operator.clone()),
                 ],
             );
         }
-        DatabaseError::SessionSetting(refused) => {
-            return super::error_details::invalid_field(refused.setting, refused.reason.clone());
+        DatabaseError::SessionSetting { setting, reason } => {
+            return super::error_details::invalid_field(setting, reason.clone());
         }
         // A retry of a settled operation ran nothing; the outcome is its
         // answer, carried as metadata a client branches on.
@@ -384,18 +383,13 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
             outcome,
             intent_differs,
             ..
-        }
-        | DatabaseError::Execution(ExecutionError::OperationSettled {
-            outcome,
-            intent_differs,
-            ..
-        }) => {
+        } => {
             return super::operation::settled_status(rendered, *outcome, *intent_differs);
         }
         DatabaseError::ForeignOperation { descriptor } => {
             return super::operation::foreign_status(rendered, *descriptor);
         }
-        DatabaseError::Execution(ExecutionError::UniquenessUnresolved { index, limit }) => {
+        DatabaseError::UniquenessUnresolved { index, limit } => {
             return status_with_reason(
                 Code::Unavailable,
                 rendered,
@@ -403,14 +397,13 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [("index", index.clone()), ("limit", limit.to_string())],
             );
         }
-        DatabaseError::Execution(ExecutionError::ConstraintViolation {
+        DatabaseError::ConstraintViolation {
             constraint,
             kind,
             label,
             property,
             element_id,
-            ..
-        }) => {
+        } => {
             return status_with_reason(
                 Code::FailedPrecondition,
                 rendered,
@@ -424,7 +417,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 ],
             );
         }
-        DatabaseError::Execution(ExecutionError::KeyImmutable { table, column }) => {
+        DatabaseError::KeyImmutable { table, column } => {
             return status_with_reason(
                 Code::FailedPrecondition,
                 rendered,
@@ -432,7 +425,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [("table", table.clone()), ("column", column.clone())],
             );
         }
-        DatabaseError::Execution(ExecutionError::CatalogObjectExists { object, name }) => {
+        DatabaseError::CatalogObjectExists { object, name } => {
             return crate::services::error_details::catalog_object_status(
                 Code::AlreadyExists,
                 rendered,
@@ -441,7 +434,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 name,
             );
         }
-        DatabaseError::Execution(ExecutionError::CatalogObjectMissing { object, name }) => {
+        DatabaseError::CatalogObjectMissing { object, name } => {
             return crate::services::error_details::catalog_object_status(
                 Code::NotFound,
                 rendered,
@@ -450,7 +443,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 name,
             );
         }
-        DatabaseError::Execution(ExecutionError::CatalogRefused(_)) => {
+        DatabaseError::CatalogRefused(_) => {
             return status_with_reason(
                 Code::FailedPrecondition,
                 rendered,
@@ -458,11 +451,11 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
-        DatabaseError::Execution(ExecutionError::CatalogObjectDiffers {
+        DatabaseError::CatalogObjectDiffers {
             object,
             name,
             revision,
-        }) => {
+        } => {
             return status_with_reason(
                 Code::FailedPrecondition,
                 rendered,
@@ -474,12 +467,12 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 ],
             );
         }
-        DatabaseError::Execution(ExecutionError::CatalogRevisionMismatch {
+        DatabaseError::CatalogRevisionMismatch {
             object,
             name,
             expected,
             current,
-        }) => {
+        } => {
             return status_with_reason(
                 Code::FailedPrecondition,
                 rendered,
@@ -584,54 +577,36 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [("transaction", id.to_string())],
             );
         }
-        DatabaseError::TransactionConflict { id, .. } => {
+        // Nothing was applied and the retry is the whole transaction, or the
+        // statement outside one: ABORTED, naming the transaction when there
+        // is one.
+        DatabaseError::TransactionConflict { transaction, .. } => {
             return status_with_reason(
                 Code::Aborted,
                 rendered,
                 Reason::TransactionConflict,
-                [("transaction", id.to_string())],
+                transaction_metadata(transaction.as_ref()),
             );
         }
-        // The auto-commit spelling of the same refusal: nothing was applied
-        // and the retry is the whole statement, so it is ABORTED too, with no
-        // transaction id to name.
-        DatabaseError::Execution(coordinode_query::executor::runner::ExecutionError::Conflict(
-            _,
-        )) => {
-            return status_with_reason(Code::Aborted, rendered, Reason::TransactionConflict, []);
-        }
-        // Both spellings of one refusal: an interactive commit fails with the
-        // typed variant, an auto-commit statement carries it inside the
-        // execution error. ABORTED like a conflict (the retry is the whole
-        // transaction), but under its own reason, because the cause is a
-        // condition rather than a contended key.
-        DatabaseError::InvariantRefused { id, .. } => {
+        // ABORTED like a conflict (the retry is the whole transaction), but
+        // under its own reason, because the cause is a condition rather than
+        // a contended key.
+        DatabaseError::InvariantRefused { transaction, .. } => {
             return status_with_reason(
                 Code::Aborted,
                 rendered,
                 Reason::InvariantRefused,
-                [("transaction", id.to_string())],
+                transaction_metadata(transaction.as_ref()),
             );
         }
-        DatabaseError::Execution(
-            coordinode_query::executor::runner::ExecutionError::InvariantRefused(_),
-        ) => {
-            return status_with_reason(Code::Aborted, rendered, Reason::InvariantRefused, []);
-        }
-        // Both spellings of a version mismatch. The versions travel in the
-        // metadata rather than only in the message, because the caller's next
-        // move is computed from them: retry against what is there, merge, or
-        // stop. An absent version is absent from the metadata rather than
-        // rendered as a zero, which would read as a real version.
+        // The versions travel in the metadata rather than only in the
+        // message, because the caller's next move is computed from them:
+        // retry against what is there, merge, or stop. An absent version is
+        // absent from the metadata rather than rendered as a zero, which
+        // would read as a real version.
         DatabaseError::RevisionMismatch {
             expected, current, ..
-        }
-        | DatabaseError::Execution(
-            coordinode_query::executor::runner::ExecutionError::RevisionMismatch {
-                expected,
-                current,
-            },
-        ) => {
+        } => {
             let mut metadata: Vec<(&str, String)> = Vec::with_capacity(2);
             if let Some(expected) = expected {
                 metadata.push(("expected_version", expected.to_string()));
@@ -657,14 +632,9 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 ],
             );
         }
-        // Both spellings of the same condition: an interactive commit fails
-        // with the typed variant, an auto-commit statement carries it inside
-        // the execution error. Retryable with a delay (RetryInfo), unlike a
-        // conflict: the server is shedding writes until compaction catches up.
-        DatabaseError::WriteBackpressure
-        | DatabaseError::Execution(
-            coordinode_query::executor::runner::ExecutionError::Backpressure,
-        ) => {
+        // Retryable with a delay (RetryInfo), unlike a conflict: the server
+        // is shedding writes until compaction catches up.
+        DatabaseError::WriteBackpressure => {
             return status_with_reason(
                 Code::ResourceExhausted,
                 rendered,
@@ -672,15 +642,12 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
-        // Both spellings again, for a write that reached a node which is not
-        // the leader. FAILED_PRECONDITION rather than UNAVAILABLE: the server
-        // is perfectly available, it is the request that came to the wrong
-        // node, and the leader id says where the right one is. Nothing was
-        // applied, so the retry is the same write, not a repair.
-        DatabaseError::NotLeader { leader_id }
-        | DatabaseError::Execution(
-            coordinode_query::executor::runner::ExecutionError::NotLeader { leader_id },
-        ) => {
+        // A write that reached a node which is not the leader.
+        // FAILED_PRECONDITION rather than UNAVAILABLE: the server is
+        // perfectly available, it is the request that came to the wrong node,
+        // and the leader id says where the right one is. Nothing was applied,
+        // so the retry is the same write, not a repair.
+        DatabaseError::NotLeader { leader_id } => {
             let metadata = leader_id
                 .map(|id| vec![("leader_id", id.to_string())])
                 .unwrap_or_default();
@@ -695,7 +662,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
         // write to a follower: the request is fine and the server available,
         // it came to a member that takes no writes, and the metadata names
         // where to send it and why this member refuses.
-        DatabaseError::Mismatched(m) | DatabaseError::Execution(ExecutionError::Mismatched(m)) => {
+        DatabaseError::Mismatched(m) => {
             return status_with_reason(
                 Code::FailedPrecondition,
                 rendered,
@@ -709,10 +676,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
         // clamp instead of guessing.
         DatabaseError::OutsideRetention {
             oldest_readable, ..
-        }
-        | DatabaseError::Execution(ExecutionError::OutsideRetention {
-            oldest_readable, ..
-        }) => {
+        } => {
             return status_with_reason(
                 Code::OutOfRange,
                 rendered,
@@ -733,29 +697,70 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
             }
             return status_with_reason(Code::Unavailable, rendered, Reason::ReadNotReady, metadata);
         }
-        // The engine's own guard on a snapshot read below the watermark:
-        // the same condition reached through a storage-level read.
-        DatabaseError::Storage(StorageError::SnapshotOutsideRetention { watermark, .. })
-        | DatabaseError::Execution(ExecutionError::Storage(
-            StorageError::SnapshotOutsideRetention { watermark, .. },
-        )) => {
-            // Refused only for a snapshot below the watermark, so the
-            // watermark is at least 1.
-            debug_assert!(*watermark > 0, "a retention refusal at watermark 0");
+        // Settings that cannot be served together: the request is fine on
+        // its own terms, the combination is not.
+        DatabaseError::SettingsRefused(_) => return Status::failed_precondition(rendered),
+        DatabaseError::ReadFence { kind, .. } => {
+            return match kind {
+                ReadFenceFailure::Role => Status::failed_precondition(rendered),
+                ReadFenceFailure::Stale => Status::unavailable(rendered),
+                ReadFenceFailure::Timeout => Status::deadline_exceeded(rendered),
+            };
+        }
+        // Nothing ran at the member that had to run it: the same command
+        // may be sent again. What the transport reported can name the
+        // member's internal address, which a client is not told: it goes to
+        // the log, the client gets the member's id.
+        DatabaseError::PeerUnreachable { member, .. } => {
+            tracing::warn!(error = %rendered, "a routed command did not reach its member");
             return status_with_reason(
-                Code::OutOfRange,
-                rendered,
-                Reason::OutsideRetention,
-                [("oldest_readable_ts", (*watermark - 1).to_string())],
+                Code::Unavailable,
+                format!("member {member} could not be reached; the command did not run"),
+                Reason::MemberUnreachable,
+                [("member", member.to_string())],
+            );
+        }
+        // The answer was lost after the command was sent: UNAVAILABLE, never
+        // ABORTED, and under a reason that says the outcome is open.
+        DatabaseError::PeerOutcomeUnknown {
+            member, failure, ..
+        } => {
+            tracing::warn!(error = %rendered, "the answer of a routed command was lost");
+            return status_with_reason(
+                Code::Unavailable,
+                format!(
+                    "the answer of member {member} was lost ({failure}); the command may have \
+                     run: resolve a write by its operation"
+                ),
+                Reason::RoutedOutcomeUnknown,
+                [
+                    ("member", member.to_string()),
+                    (
+                        "failure",
+                        match failure {
+                            PeerFailure::Transport => "TRANSPORT",
+                            PeerFailure::Deadline => "DEADLINE",
+                            PeerFailure::Protocol => "PROTOCOL",
+                        }
+                        .to_owned(),
+                    ),
+                ],
             );
         }
         _ => {}
     }
-    // Capacity exhaustion arrives wrapped in either a Storage or an Execution
-    // variant, and the shared helper knows how to find it in both. Everything
-    // it does not recognise stays INTERNAL, which is the honest answer for a
-    // failure the server cannot attribute to the request.
+    // Capacity and space refusals have a shared projection; everything else
+    // stays INTERNAL, which is the honest answer for a failure the server
+    // cannot attribute to the request.
     crate::services::db_err_to_status("Cypher", err)
+}
+
+/// The metadata naming the interactive transaction a refusal belongs to, when
+/// it belongs to one.
+fn transaction_metadata(transaction: Option<&TransactionId>) -> Vec<(&'static str, String)> {
+    transaction
+        .map(|id| vec![("transaction", id.to_string())])
+        .unwrap_or_default()
 }
 
 /// The read concern level a request names in `field`: `None` for
@@ -997,7 +1002,8 @@ impl CypherServiceImpl {
         let answer = self
             .executor
             .route(leader, statement, &AdmissionSignal::new(|| {}))
-            .await?;
+            .await
+            .map_err(db_error_to_status)?;
         Ok(routed_response(answer, start))
     }
 }
@@ -1144,7 +1150,12 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // Resolve and check the settings, fence the read and wait for the
         // causal position. A statement that needs the leader runs there.
         let requested = requested_from_proto(&req, deadline, &cancel)?;
-        let admitted = match self.executor.admit(&req.query, &requested, false).await? {
+        let admitted = match self
+            .executor
+            .admit(&req.query, &requested, false)
+            .await
+            .map_err(db_error_to_status)?
+        {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
                 return self

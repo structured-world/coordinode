@@ -95,4 +95,9 @@ third-party = [
     # The async runtime. The embedded library without `replication` needs
     # none, and unified here it would reach that build through every crate.
     { name = "tokio" },
+    # The inter-node channel and its encoding, the embedded library's other
+    # `replication` dependencies, for the same reason.
+    { name = "tonic" },
+    { name = "tokio-stream" },
+    { name = "prost" },
 ]

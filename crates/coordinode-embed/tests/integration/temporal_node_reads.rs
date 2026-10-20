@@ -99,7 +99,6 @@ fn names(db: &mut Database, query: &str) -> Vec<String> {
 fn a_deep_single_node_history_is_read_within_the_statement_budget() {
     use coordinode_core::budget::BudgetStop;
     use coordinode_embed::db::{DatabaseError, StatementOptions};
-    use coordinode_query::executor::runner::ExecutionError;
     let mut db = open_db();
     let now = now_us();
     let id = create(&mut db, "current", now - YEAR, Some(now + 10 * YEAR));
@@ -116,9 +115,7 @@ fn a_deep_single_node_history_is_read_within_the_statement_budget() {
     assert!(
         matches!(
             refused,
-            Err(DatabaseError::Execution(ExecutionError::Budget(
-                BudgetStop::Memory { .. }
-            )))
+            Err(DatabaseError::Budget(BudgetStop::Memory { .. }))
         ),
         "{refused:?}"
     );
@@ -392,9 +389,7 @@ fn a_unique_value_stays_reserved_after_a_rename() {
     // Refused for the unique constraint, not for any other reason.
     let refused_as_unique =
         |result: Result<_, coordinode_embed::DatabaseError>, what: &str| match result {
-            Err(coordinode_embed::DatabaseError::Execution(
-                coordinode_query::executor::runner::ExecutionError::UniqueViolation { .. },
-            )) => {}
+            Err(coordinode_embed::DatabaseError::UniqueViolation { .. }) => {}
             other => panic!("{what}: expected a unique violation, got {other:?}"),
         };
     refused_as_unique(

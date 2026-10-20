@@ -31,8 +31,9 @@ pub use coordinode_query::executor::runner::CatalogObject;
 pub use db::{
     ActingContext, AfterCommitDispatchReport, ConstraintDeclaration, DEFAULT_VECTOR_BUILD_WAIT,
     Database, DatabaseError, Disposition, EdgeTypeDeclaration, Intent, LabelConstraint,
-    LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS, PackageConstraint, Principal,
-    PublishedObject, Readiness, ResumedIndexBuilds, SchemaPackage, SchemaPublication,
-    SchemaReadiness, TransactionEnd, TransactionId, TransactionOptions, TriggerDispatchConfig,
+    LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS, PackageConstraint, PeerFailure, Principal,
+    PublishedObject, ReadFenceFailure, Readiness, ResumedIndexBuilds, SchemaPackage,
+    SchemaPublication, SchemaReadiness, StorageFailure, TransactionEnd, TransactionId,
+    TransactionOptions, TriggerDispatchConfig,
 };
 pub use repair::RepairReport;

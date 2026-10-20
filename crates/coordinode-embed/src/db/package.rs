@@ -728,7 +728,10 @@ impl Database {
     fn name_refusing_node(&self, refused: DatabaseError, labels: &[LabelSchema]) -> DatabaseError {
         if !matches!(
             refused,
-            DatabaseError::Execution(ExecutionError::InvariantRefused(_))
+            DatabaseError::InvariantRefused {
+                transaction: None,
+                ..
+            }
         ) {
             return refused;
         }

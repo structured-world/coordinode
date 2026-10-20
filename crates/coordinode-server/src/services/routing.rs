@@ -14,9 +14,7 @@ use coordinode_embed::replication::routing::{
 };
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_raft::read_fence::ReadPreference;
-use tonic::Status;
 
-use crate::services::cypher::db_error_to_status;
 use crate::services::statement::{Admission, Requested, StatementExecutor, columns_and_values};
 
 /// Runs routed commands through this member's [`StatementExecutor`]. A
@@ -40,7 +38,7 @@ impl CommandExecutor for ServerCommandExecutor {
         statement: RoutedStatement,
         cancel: &CancelFlag,
         admitted: &AdmissionSignal,
-    ) -> Result<RoutedAnswer, Status> {
+    ) -> Result<RoutedAnswer, DatabaseError> {
         let RoutedStatement {
             actor,
             query,
@@ -68,9 +66,7 @@ impl CommandExecutor for ServerCommandExecutor {
                 admission: Some(admitted.clone()),
                 ..StatementOptions::default()
             };
-            let rows = db
-                .execute_in_transaction_with(id, &query, params, &options)
-                .map_err(db_error_to_status)?;
+            let rows = db.execute_in_transaction_with(id, &query, params, &options)?;
             let (columns, rows) = columns_and_values(&rows);
             return Ok(RoutedAnswer {
                 columns,
@@ -95,21 +91,20 @@ impl CommandExecutor for ServerCommandExecutor {
             operation,
         };
         let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|e| Status::internal(format!("no runtime to fence the read on: {e}")))?;
+            .map_err(|e| DatabaseError::Other(format!("no runtime to fence the read on: {e}")))?;
         let fenced = match runtime.block_on(self.executor.admit(&query, &requested, true))? {
             Admission::Run(fenced) => fenced,
             // An admission that may not route on never asks to.
             Admission::Forward(leader) => {
-                return Err(Status::failed_precondition(format!(
-                    "not the leader; leader is node {leader}"
-                )));
+                return Err(DatabaseError::NotLeader {
+                    leader_id: Some(leader),
+                });
             }
         };
         let start = Instant::now();
         let result = self
             .executor
-            .execute(&query, params, source.as_ref(), &fenced)
-            .map_err(db_error_to_status)?;
+            .execute(&query, params, source.as_ref(), &fenced)?;
         self.executor.record(&query, source.as_ref(), start);
         let (columns, rows) = columns_and_values(&result.rows);
         let ws = &result.write_stats;
@@ -130,60 +125,48 @@ impl CommandExecutor for ServerCommandExecutor {
         })
     }
 
-    fn begin(&self, begin: RoutedBegin) -> Result<(), Status> {
-        self.executor
-            .database()
-            .read()
-            .begin_transaction_as(
-                begin.transaction,
-                &TransactionOptions {
-                    actor: Some(begin.actor),
-                    read_concern: begin.read_concern,
-                    write_concern: begin.write_concern,
-                    timeout_outcome: begin.timeout_outcome,
-                    operation: begin.operation,
-                },
-            )
-            .map_err(db_error_to_status)
+    fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
+        self.executor.database().read().begin_transaction_as(
+            begin.transaction,
+            &TransactionOptions {
+                actor: Some(begin.actor),
+                read_concern: begin.read_concern,
+                write_concern: begin.write_concern,
+                timeout_outcome: begin.timeout_outcome,
+                operation: begin.operation,
+            },
+        )
     }
 
-    fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, Status> {
-        self.executor
-            .database()
-            .read()
-            .commit_transaction_with(
-                commit.transaction,
-                &CommitOptions {
-                    operation: commit.operation.as_ref(),
-                    actor: Some(&commit.actor),
-                    admission: None,
-                    expect: &commit.expect,
-                },
-            )
-            .map_err(db_error_to_status)
+    fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, DatabaseError> {
+        self.executor.database().read().commit_transaction_with(
+            commit.transaction,
+            &CommitOptions {
+                operation: commit.operation.as_ref(),
+                actor: Some(&commit.actor),
+                admission: None,
+                expect: &commit.expect,
+            },
+        )
     }
 
     fn operation(
         &self,
         _actor: ActingContext,
         call: RoutedOperationCall,
-    ) -> Result<RoutedOperationAnswer, Status> {
-        run_operation(&self.executor.database().read(), call).map_err(db_error_to_status)
+    ) -> Result<RoutedOperationAnswer, DatabaseError> {
+        run_operation(&self.executor.database().read(), call)
     }
 
-    fn rollback(&self, rollback: RoutedRollback) -> Result<(), Status> {
-        self.executor
-            .database()
-            .read()
-            .rollback_transaction_with(
-                rollback.transaction,
-                &RollbackOptions {
-                    actor: Some(&rollback.actor),
-                    admission: None,
-                    end: rollback.end(),
-                },
-            )
-            .map_err(db_error_to_status)
+    fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError> {
+        self.executor.database().read().rollback_transaction_with(
+            rollback.transaction,
+            &RollbackOptions {
+                actor: Some(&rollback.actor),
+                admission: None,
+                end: rollback.end(),
+            },
+        )
     }
 }
 
@@ -237,3 +220,7 @@ pub(crate) fn routed_settings(requested: &Requested) -> RoutedSettings {
         query_memory_limit: requested.query_memory_limit,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests;

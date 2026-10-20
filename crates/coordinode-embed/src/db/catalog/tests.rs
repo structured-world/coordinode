@@ -37,13 +37,6 @@ fn constraint_names(db: &Database) -> Vec<String> {
         .collect()
 }
 
-fn catalog_error(e: DatabaseError) -> ExecutionError {
-    match e {
-        DatabaseError::Execution(e) => e,
-        other => panic!("expected an execution error, got {other:?}"),
-    }
-}
-
 /// A created uniqueness constraint is listed active, bound to the index it
 /// owns; dropping it removes both, and a second drop finds nothing.
 #[test]
@@ -71,8 +64,8 @@ fn a_constraint_is_listed_with_its_index_and_dropped_with_it() {
         "the owned index goes with the constraint"
     );
     assert!(matches!(
-        catalog_error(db.drop_constraint("user_email", false).unwrap_err()),
-        ExecutionError::CatalogObjectMissing {
+        db.drop_constraint("user_email", false).unwrap_err(),
+        DatabaseError::CatalogObjectMissing {
             object: CatalogObject::Constraint,
             ..
         }
@@ -189,8 +182,11 @@ fn a_replacement_racing_a_constraint_creation_does_not_lose_it() {
         .expect("the concurrent constraint commits first");
 
     assert!(matches!(
-        catalog_error(db.finish_publication(txn, staged).unwrap_err()),
-        ExecutionError::Conflict(_)
+        db.finish_publication(txn, staged).unwrap_err(),
+        DatabaseError::TransactionConflict {
+            transaction: None,
+            ..
+        }
     ));
     assert_eq!(constraint_names(&db), vec!["user_age".to_string()]);
 }
@@ -223,8 +219,11 @@ fn a_replacement_racing_a_constraint_drop_does_not_bring_it_back() {
     assert!(db.drop_constraint("user_age", false).expect("drop"));
 
     assert!(matches!(
-        catalog_error(db.finish_publication(txn, staged).unwrap_err()),
-        ExecutionError::Conflict(_)
+        db.finish_publication(txn, staged).unwrap_err(),
+        DatabaseError::TransactionConflict {
+            transaction: None,
+            ..
+        }
     ));
     assert!(constraint_names(&db).is_empty());
 }
@@ -254,8 +253,8 @@ fn a_replacement_its_constraints_cannot_hold_under_is_refused_atomically() {
     let mut replacement = user_definition();
     replacement.add_property(PropertyDef::new("email", PropertyType::Int));
     assert!(matches!(
-        catalog_error(db.create_label_schema(replacement).unwrap_err()),
-        ExecutionError::CatalogRefused(_)
+        db.create_label_schema(replacement).unwrap_err(),
+        DatabaseError::CatalogRefused(_)
     ));
 
     assert_eq!(user(&db), before_schema);
@@ -283,9 +282,9 @@ fn a_replacement_stored_nodes_break_leaves_the_previous_definition() {
 
     let mut replacement = user_definition();
     replacement.add_property(PropertyDef::new("age", PropertyType::Int).not_null());
-    let refused = catalog_error(db.create_label_schema(replacement).unwrap_err());
+    let refused = db.create_label_schema(replacement).unwrap_err();
     assert!(
-        matches!(refused, ExecutionError::SchemaViolation(_)),
+        matches!(refused, DatabaseError::SchemaViolation(_)),
         "{refused:?}"
     );
 
@@ -316,8 +315,8 @@ fn a_definition_carrying_constraints_or_defined_twice_is_refused() {
         scope: None,
     });
     assert!(matches!(
-        catalog_error(db.create_label_schema(carrying).unwrap_err()),
-        ExecutionError::CatalogRefused(_)
+        db.create_label_schema(carrying).unwrap_err(),
+        DatabaseError::CatalogRefused(_)
     ));
     assert!(
         db.label_schemas().expect("labels").is_empty(),
@@ -326,8 +325,8 @@ fn a_definition_carrying_constraints_or_defined_twice_is_refused() {
 
     db.define_label(user_definition()).expect("define");
     assert!(matches!(
-        catalog_error(db.define_label(user_definition()).unwrap_err()),
-        ExecutionError::CatalogObjectExists {
+        db.define_label(user_definition()).unwrap_err(),
+        DatabaseError::CatalogObjectExists {
             object: CatalogObject::Label,
             ..
         }
@@ -341,15 +340,13 @@ fn a_constraint_the_definition_contradicts_is_refused() {
     let (db, _dir) = open();
     db.define_label(user_definition()).expect("define");
     assert!(matches!(
-        catalog_error(
-            db.create_constraint(declare(
-                "user_age_type",
-                "age",
-                ConstraintKind::Type(PropertyType::String),
-            ))
-            .unwrap_err()
-        ),
-        ExecutionError::CatalogRefused(_)
+        db.create_constraint(declare(
+            "user_age_type",
+            "age",
+            ConstraintKind::Type(PropertyType::String),
+        ))
+        .unwrap_err(),
+        DatabaseError::CatalogRefused(_)
     ));
     assert!(constraint_names(&db).is_empty());
 }
@@ -361,11 +358,9 @@ fn an_edge_type_is_defined_once() {
     db.define_edge_type(EdgeTypeSchema::new("KNOWS"))
         .expect("define");
     assert!(matches!(
-        catalog_error(
-            db.define_edge_type(EdgeTypeSchema::new("KNOWS"))
-                .unwrap_err()
-        ),
-        ExecutionError::CatalogObjectExists {
+        db.define_edge_type(EdgeTypeSchema::new("KNOWS"))
+            .unwrap_err(),
+        DatabaseError::CatalogObjectExists {
             object: CatalogObject::EdgeType,
             ..
         }
@@ -397,7 +392,7 @@ fn a_replacement_cannot_change_what_identifies_an_edge() {
     for other in [Some("kind"), None] {
         let error = db.create_edge_type_schema(knows(other)).unwrap_err();
         assert!(
-            matches!(catalog_error(error), ExecutionError::CatalogRefused(ref why)
+            matches!(error, DatabaseError::CatalogRefused(ref why)
                 if why.contains("fixed when it is created")),
             "{other:?}"
         );

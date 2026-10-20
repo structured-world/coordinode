@@ -2956,7 +2956,7 @@ fn redirect_edges_temporal_moves_all_versions() {
 /// read as a contention the caller should retry.
 #[test]
 fn a_trigger_of_a_name_in_use_is_refused_as_existing() {
-    use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
+    use coordinode_query::executor::runner::CatalogObject;
     let mut db = open_db();
     let ddl = "CREATE TRIGGER audit ON :User CREATE AFTER COMMIT EXECUTE CREATE (e:AuditEntry)";
     db.execute_cypher(ddl).expect("create");
@@ -2964,10 +2964,10 @@ fn a_trigger_of_a_name_in_use_is_refused_as_existing() {
     assert!(
         matches!(
             err,
-            coordinode_embed::DatabaseError::Execution(ExecutionError::CatalogObjectExists {
+            coordinode_embed::DatabaseError::CatalogObjectExists {
                 object: CatalogObject::Trigger,
                 ref name,
-            }) if name == "audit"
+            } if name == "audit"
         ),
         "got {err:?}"
     );

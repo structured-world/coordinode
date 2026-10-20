@@ -949,11 +949,12 @@ fn write_through_wrong_entry(
     query: &str,
 ) -> Vec<coordinode_query::executor::Row> {
     use coordinode_embed::db::DatabaseError;
-    use coordinode_query::executor::runner::ExecutionError;
     wrong_again(db, wrong);
     match db.execute_cypher(query) {
         Ok(rows) => rows,
-        Err(DatabaseError::Execution(ExecutionError::Conflict(_))) => {
+        Err(DatabaseError::TransactionConflict {
+            transaction: None, ..
+        }) => {
             check(db, "u_email");
             db.execute_cypher(query)
                 .unwrap_or_else(|e| panic!("{query}: {e:?}"))
@@ -1221,7 +1222,6 @@ fn a_lookup_answered_by_the_records_passes_over_other_labels_within_the_limit() 
 fn damage_found_after_spent_work_answers_from_what_is_left() {
     use coordinode_core::budget::BudgetStop;
     use coordinode_embed::db::{DatabaseError, StatementOptions};
-    use coordinode_query::executor::runner::ExecutionError;
     let (mut db, _dir) = open_db();
     // The held value is kept twice (its row and the row joined to the node),
     // which fits; one copy beside one record of about 64 KiB does not.
@@ -1260,9 +1260,7 @@ fn damage_found_after_spent_work_answers_from_what_is_left() {
     assert!(
         matches!(
             refused,
-            Err(DatabaseError::Execution(ExecutionError::Budget(
-                BudgetStop::Memory { limit: l, .. }
-            ))) if l == limit
+            Err(DatabaseError::Budget(BudgetStop::Memory { limit: l, .. })) if l == limit
         ),
         "{refused:?}"
     );
@@ -1375,7 +1373,6 @@ fn a_deep_history_is_answered_from_the_records_within_the_limit() {
 fn a_deadline_reached_while_reading_the_records_stops_the_lookup() {
     use coordinode_core::budget::BudgetStop;
     use coordinode_embed::db::{DatabaseError, StatementOptions};
-    use coordinode_query::executor::runner::ExecutionError;
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
         .expect("index");
@@ -1397,12 +1394,7 @@ fn a_deadline_reached_while_reading_the_records_stops_the_lookup() {
         },
     );
     assert!(
-        matches!(
-            stopped,
-            Err(DatabaseError::Execution(ExecutionError::Budget(
-                BudgetStop::Deadline
-            )))
-        ),
+        matches!(stopped, Err(DatabaseError::Budget(BudgetStop::Deadline))),
         "{:?}",
         stopped.map(|r| r.rows)
     );
@@ -1423,16 +1415,16 @@ fn a_deadline_reached_while_reading_the_records_stops_the_lookup() {
 fn a_lookup_answered_by_the_records_past_its_memory_limit_is_refused() {
     use coordinode_core::budget::BudgetStop;
     use coordinode_embed::db::DatabaseError;
-    use coordinode_query::executor::runner::ExecutionError;
     let (mut db, _dir) = open_db();
     label_answered_by_its_records(&mut db, 16);
     let refused = found_within(&db, 1024);
     assert!(
         matches!(
             refused,
-            Err(DatabaseError::Execution(ExecutionError::Budget(
-                BudgetStop::Memory { limit: 1024, .. }
-            )))
+            Err(DatabaseError::Budget(BudgetStop::Memory {
+                limit: 1024,
+                ..
+            }))
         ),
         "{refused:?}"
     );

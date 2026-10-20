@@ -1170,12 +1170,69 @@ fn unsupported_write_concerns_are_refused_with_a_reason() {
     }
 }
 
+/// A routed command whose member could not be reached ran nothing and may be
+/// sent again; one whose answer was lost may have run, and is UNAVAILABLE
+/// under its own reason, never ABORTED and never advised to retry.
+#[test]
+fn a_lost_routed_answer_is_unavailable_and_never_an_abort() {
+    use coordinode_embed::PeerFailure;
+    use tonic_types::StatusExt;
+
+    // What the transport said names the member's internal address; the
+    // client is told the member's id, never where it is dialed.
+    let internal = "dial 10.0.0.2:7080: connection refused";
+    let status = db_error_to_status(DatabaseError::PeerUnreachable {
+        member: 2,
+        message: internal.into(),
+    });
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert!(
+        !status.message().contains("10.0.0.2"),
+        "{}",
+        status.message()
+    );
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "MEMBER_UNREACHABLE");
+    assert_eq!(info.metadata.get("member").map(String::as_str), Some("2"));
+    assert!(
+        details.retry_info().is_some(),
+        "nothing ran: a retry is safe"
+    );
+
+    for (failure, wire) in [
+        (PeerFailure::Transport, "TRANSPORT"),
+        (PeerFailure::Deadline, "DEADLINE"),
+        (PeerFailure::Protocol, "PROTOCOL"),
+    ] {
+        let status = db_error_to_status(DatabaseError::PeerOutcomeUnknown {
+            member: 2,
+            failure,
+            message: internal.into(),
+        });
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{wire}");
+        assert!(
+            !status.message().contains("10.0.0.2"),
+            "{}",
+            status.message()
+        );
+        let details = status.get_error_details();
+        let info = details.error_info().expect("ErrorInfo expected");
+        assert_eq!(info.reason, "ROUTED_OUTCOME_UNKNOWN");
+        assert_eq!(info.metadata.get("failure").map(String::as_str), Some(wire));
+        assert!(
+            details.retry_info().is_none(),
+            "{wire}: a write of unknown outcome is resolved, not resent"
+        );
+    }
+}
+
 #[test]
 fn error_to_status_mapping() {
     let parse_err = db_error_to_status(DatabaseError::Semantic("bad query".into()));
     assert_eq!(parse_err.code(), tonic::Code::InvalidArgument);
 
-    let exec_err = db_error_to_status(DatabaseError::Execution(
+    let exec_err = db_error_to_status(DatabaseError::from(
         coordinode_query::executor::runner::ExecutionError::Unsupported("test".into()),
     ));
     assert_eq!(exec_err.code(), tonic::Code::Internal);
@@ -1200,7 +1257,7 @@ fn query_faults_are_invalid_argument_with_a_reason() {
             "UNKNOWN_FUNCTION",
         ),
     ] {
-        let status = db_error_to_status(DatabaseError::Execution(ExecutionError::Arithmetic(err)));
+        let status = db_error_to_status(DatabaseError::from(ExecutionError::Arithmetic(err)));
         assert_eq!(
             status.code(),
             tonic::Code::InvalidArgument,
@@ -1228,7 +1285,7 @@ fn an_unknown_function_names_itself_in_the_metadata() {
     use coordinode_query::executor::runner::ExecutionError;
     use tonic_types::StatusExt;
 
-    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::Arithmetic(
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::Arithmetic(
         EvalError::UnknownFunction("lenght".into()),
     )));
     let details = status.get_error_details();
@@ -1249,7 +1306,7 @@ fn a_refused_call_names_the_procedure_and_the_part_at_fault() {
     use tonic_types::StatusExt;
 
     let status = |refusal: ProcedureError| {
-        db_error_to_status(DatabaseError::Execution(ExecutionError::Procedure(refusal)))
+        db_error_to_status(DatabaseError::from(ExecutionError::Procedure(refusal)))
     };
 
     let unknown = status(ProcedureError::Unknown {
@@ -1383,8 +1440,8 @@ fn transaction_failures_carry_distinct_reasons() {
         ),
         (
             DatabaseError::TransactionConflict {
-                id,
-                source_message: "write-write".into(),
+                transaction: Some(id),
+                message: "write-write".into(),
             },
             tonic::Code::Aborted,
             "TRANSACTION_CONFLICT",
@@ -2517,14 +2574,14 @@ fn outside_retention_maps_to_out_of_range_with_horizon() {
             "99",
         ),
         (
-            db_error_to_status(DatabaseError::Execution(ExecutionError::OutsideRetention {
+            db_error_to_status(DatabaseError::from(ExecutionError::OutsideRetention {
                 requested: 5,
                 oldest_readable: 99,
             })),
             "99",
         ),
         (
-            db_error_to_status(DatabaseError::Storage(
+            db_error_to_status(DatabaseError::from(
                 StorageError::SnapshotOutsideRetention {
                     snapshot: 5,
                     watermark: 100,
@@ -2557,7 +2614,7 @@ fn a_duplicate_key_maps_to_already_exists_with_the_holder() {
     use coordinode_query::executor::runner::ExecutionError;
     use tonic_types::StatusExt;
 
-    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::DuplicateKey {
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::DuplicateKey {
         table: "Account".into(),
         key: "7".into(),
         element_id: "0000000000007".into(),
@@ -2583,7 +2640,7 @@ fn a_spent_budget_maps_to_its_own_class() {
     use coordinode_query::executor::runner::ExecutionError;
     use tonic_types::StatusExt;
 
-    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::Budget(
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::Budget(
         BudgetStop::Memory {
             requested: 4096,
             used: 1_000_000,
@@ -2615,7 +2672,7 @@ fn a_spent_budget_maps_to_its_own_class() {
             "QUERY_CANCELLED",
         ),
     ] {
-        let status = db_error_to_status(DatabaseError::Execution(ExecutionError::Budget(stop)));
+        let status = db_error_to_status(DatabaseError::from(ExecutionError::Budget(stop)));
         assert_eq!(status.code(), code, "{status:?}");
         let info = status
             .get_error_details()
@@ -2634,7 +2691,7 @@ fn an_unresolved_index_maps_to_unavailable_with_retry_advice() {
     use coordinode_query::executor::runner::ExecutionError;
     use tonic_types::StatusExt;
 
-    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::IndexUnresolved {
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::IndexUnresolved {
         label: "U".into(),
         property: "email".into(),
         operator: "Aggregate",
@@ -2713,12 +2770,10 @@ fn an_unresolved_unique_value_maps_to_unavailable_with_retry_advice() {
     use coordinode_query::executor::runner::ExecutionError;
     use tonic_types::StatusExt;
 
-    let status = db_error_to_status(DatabaseError::Execution(
-        ExecutionError::UniquenessUnresolved {
-            index: "user_email".into(),
-            limit: 100_000,
-        },
-    ));
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::UniquenessUnresolved {
+        index: "user_email".into(),
+        limit: 100_000,
+    }));
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     let details = status.get_error_details();
     let info = details.error_info().expect("ErrorInfo expected");
@@ -2736,7 +2791,7 @@ fn a_key_change_maps_to_failed_precondition_with_the_column() {
     use coordinode_query::executor::runner::ExecutionError;
     use tonic_types::StatusExt;
 
-    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::KeyImmutable {
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::KeyImmutable {
         table: "Account".into(),
         column: "id".into(),
     }));
@@ -2756,15 +2811,13 @@ fn a_constraint_violation_maps_to_failed_precondition_with_the_constraint() {
     use coordinode_query::executor::runner::ExecutionError;
     use tonic_types::StatusExt;
 
-    let status = db_error_to_status(DatabaseError::Execution(
-        ExecutionError::ConstraintViolation {
-            constraint: "item_qty".into(),
-            kind: Box::new(ConstraintKind::Type(PropertyType::Int)),
-            label: "Item".into(),
-            property: "qty".into(),
-            element_id: "0000000000007".into(),
-        },
-    ));
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::ConstraintViolation {
+        constraint: "item_qty".into(),
+        kind: Box::new(ConstraintKind::Type(PropertyType::Int)),
+        label: "Item".into(),
+        property: "qty".into(),
+        element_id: "0000000000007".into(),
+    }));
     assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
     let details = status.get_error_details();
     let info = details.error_info().expect("ErrorInfo expected");
@@ -3187,7 +3240,7 @@ fn an_auto_commit_write_conflict_is_aborted_like_an_interactive_one() {
     // An auto-commit statement carries the conflict inside the execution
     // error; it is the same retryable refusal as an interactive commit's,
     // not an internal error of unknown outcome.
-    let status = db_error_to_status(DatabaseError::Execution(
+    let status = db_error_to_status(DatabaseError::from(
         coordinode_query::executor::runner::ExecutionError::Conflict(
             "write conflict: a key in the Node partition is already being written by a \
              transaction committing at 7. Nothing was applied; retry the whole transaction."
@@ -3210,7 +3263,7 @@ fn a_write_to_a_follower_is_a_redirect_with_the_leader_named() {
 
     let cases = [
         DatabaseError::NotLeader { leader_id: Some(3) },
-        DatabaseError::Execution(
+        DatabaseError::from(
             coordinode_query::executor::runner::ExecutionError::NotLeader { leader_id: Some(3) },
         ),
     ];

@@ -3,12 +3,20 @@ use std::sync::atomic::AtomicUsize;
 
 use super::*;
 
+/// What every statement the scripted executor runs answers.
+enum Script {
+    /// These rows.
+    Rows(RoutedAnswer),
+    /// The error this builds.
+    Refuse(fn() -> DatabaseError),
+}
+
 /// An executor that answers from what the test gave it and records what
 /// arrived.
 #[derive(Default)]
 struct Scripted {
-    /// The answer every statement gets.
-    answer: Mutex<Option<Result<RoutedAnswer, Status>>>,
+    /// The answer every statement gets; none runs it until cancelled.
+    answer: Mutex<Option<Script>>,
     /// Each statement as it arrived.
     statements: Mutex<Vec<RoutedStatement>>,
     /// Held by a transaction's statement until the test lets it take its
@@ -16,7 +24,9 @@ struct Scripted {
     gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// Set when a statement ran to its end with its cancel switch thrown.
     cancelled: AtomicBool,
-    /// Commits that arrived.
+    /// How long a commit takes before it commits.
+    commit_delay: Mutex<Duration>,
+    /// Commits that took effect.
     commits: AtomicUsize,
     /// Rollbacks that arrived, in order.
     rollbacks: Mutex<Vec<RoutedRollback>>,
@@ -28,7 +38,7 @@ impl CommandExecutor for Scripted {
         statement: RoutedStatement,
         cancel: &CancelFlag,
         admitted: &AdmissionSignal,
-    ) -> Result<RoutedAnswer, Status> {
+    ) -> Result<RoutedAnswer, DatabaseError> {
         let in_transaction = statement.transaction.is_some();
         self.statements.lock().unwrap().push(statement);
         if in_transaction {
@@ -44,21 +54,27 @@ impl CommandExecutor for Scripted {
                 std::thread::sleep(Duration::from_millis(5));
             }
             self.cancelled.store(true, Ordering::Release);
-            return Err(Status::cancelled("cancelled"));
+            return Err(DatabaseError::Budget(
+                coordinode_core::budget::BudgetStop::Cancelled,
+            ));
         }
-        self.answer.lock().unwrap().clone().expect("an answer")
+        match self.answer.lock().unwrap().as_ref().expect("an answer") {
+            Script::Rows(answer) => Ok(answer.clone()),
+            Script::Refuse(refusal) => Err(refusal()),
+        }
     }
 
-    fn begin(&self, begin: RoutedBegin) -> Result<(), Status> {
+    fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
         assert_eq!(begin.transaction, txid());
         assert_eq!(begin.timeout_outcome, Some(TimeoutOutcome::Commit));
         assert_eq!(begin.operation, Some(operation(1)));
         Ok(())
     }
 
-    fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, Status> {
+    fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, DatabaseError> {
         assert_eq!(commit.transaction, txid());
         assert_eq!(commit.expect, expectations());
+        std::thread::sleep(*self.commit_delay.lock().unwrap());
         self.commits.fetch_add(1, Ordering::AcqRel);
         Ok(CommitReceipt {
             commit_ts: Timestamp::from_raw(77),
@@ -66,10 +82,11 @@ impl CommandExecutor for Scripted {
         })
     }
 
-    fn rollback(&self, rollback: RoutedRollback) -> Result<(), Status> {
+    fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError> {
         assert_eq!(rollback.transaction, txid());
+        let id = rollback.transaction;
         self.rollbacks.lock().unwrap().push(rollback);
-        Err(Status::aborted("already ended"))
+        Err(DatabaseError::UnknownTransaction(id))
     }
 
     /// Answers each kind of call with something that names what arrived, so
@@ -78,7 +95,7 @@ impl CommandExecutor for Scripted {
         &self,
         actor: ActingContext,
         call: RoutedOperationCall,
-    ) -> Result<RoutedOperationAnswer, Status> {
+    ) -> Result<RoutedOperationAnswer, DatabaseError> {
         assert_eq!(actor, principal());
         Ok(match call {
             RoutedOperationCall::Enroll(issuer) => RoutedOperationAnswer::Enrolled {
@@ -227,8 +244,11 @@ async fn serve(executor: Arc<Scripted>) -> CommandRouter {
         .connect()
         .await
         .expect("connect");
-    CommandRouter::new(channel)
+    CommandRouter::new(MEMBER, channel)
 }
+
+/// The member the routers in these tests reach.
+const MEMBER: u64 = 3;
 
 fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
     RoutedStatement {
@@ -268,7 +288,7 @@ fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
 async fn a_statement_and_its_answer_cross_unchanged() {
     let executor = Arc::new(Scripted::default());
     let rows: Vec<Vec<Value>> = (0..5).map(|k| vec![Value::Int(k)]).collect();
-    *executor.answer.lock().unwrap() = Some(Ok(RoutedAnswer {
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer {
         columns: vec!["k".into()],
         rows: rows.clone(),
         stats: RoutedStats {
@@ -309,7 +329,7 @@ async fn a_large_answer_is_split_and_reassembled_in_order() {
     let rows: Vec<Vec<Value>> = (0..48)
         .map(|k| vec![Value::Int(k), Value::String("x".repeat(64 << 10))])
         .collect();
-    *executor.answer.lock().unwrap() = Some(Ok(RoutedAnswer {
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer {
         columns: vec!["k".into(), "pad".into()],
         rows: rows.clone(),
         stats: RoutedStats::default(),
@@ -328,7 +348,7 @@ async fn a_large_answer_is_split_and_reassembled_in_order() {
 #[tokio::test]
 async fn the_ingress_learns_of_the_admission_before_the_answer() {
     let executor = Arc::new(Scripted::default());
-    *executor.answer.lock().unwrap() = Some(Ok(RoutedAnswer::default()));
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer::default()));
     let (release, gate) = std::sync::mpsc::channel();
     *executor.gate.lock().unwrap() = Some(gate);
     let router = serve(Arc::clone(&executor)).await;
@@ -399,25 +419,118 @@ async fn an_ingress_that_leaves_mid_statement_abandons_its_transaction() {
     }
 }
 
-/// A refusal reaches the ingress with its code, message and details, so the
-/// client is told what the executing member said.
+/// A refusal reaches the ingress as the error the executing member raised,
+/// with every field: the client of the ingress is told what it would have
+/// been told at the executing member.
 #[tokio::test]
-async fn a_refusal_crosses_with_its_details() {
+async fn a_refusal_crosses_as_the_same_error() {
     let executor = Arc::new(Scripted::default());
-    let refused = Status::with_details(
-        tonic::Code::Aborted,
-        "the transaction ended",
-        tonic::codegen::Bytes::from_static(b"details"),
-    );
-    *executor.answer.lock().unwrap() = Some(Err(refused));
+    *executor.answer.lock().unwrap() = Some(Script::Refuse(|| DatabaseError::RevisionMismatch {
+        transaction: Some(txid()),
+        expected: Some(4),
+        current: None,
+    }));
     let router = serve(executor).await;
     let err = router
-        .execute(statement(None), &AdmissionSignal::new(|| {}))
+        .execute(statement(Some(txid())), &AdmissionSignal::new(|| {}))
         .await
         .expect_err("refused");
-    assert_eq!(err.code(), tonic::Code::Aborted);
-    assert_eq!(err.message(), "the transaction ended");
-    assert_eq!(err.details(), b"details");
+    assert!(
+        matches!(
+            err,
+            DatabaseError::RevisionMismatch {
+                transaction: Some(id),
+                expected: Some(4),
+                current: None,
+            } if id == txid()
+        ),
+        "{err:?}"
+    );
+}
+
+/// A commit whose answer does not arrive before the deadline is an unknown
+/// outcome, never a refusal or an abort: here the member did commit it.
+#[tokio::test]
+async fn a_commit_whose_answer_is_lost_is_not_an_abort() {
+    let executor = Arc::new(Scripted::default());
+    *executor.commit_delay.lock().unwrap() = Duration::from_millis(300);
+    let router = serve(Arc::clone(&executor)).await;
+    let err = router
+        .commit(RoutedCommit {
+            actor: principal(),
+            transaction: txid(),
+            operation: None,
+            deadline: Some(Duration::from_millis(50)),
+            expect: expectations(),
+        })
+        .await
+        .expect_err("the answer came too late");
+    assert!(
+        matches!(
+            err,
+            DatabaseError::PeerOutcomeUnknown {
+                member: MEMBER,
+                failure: PeerFailure::Deadline,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while executor.commits.load(Ordering::Acquire) == 0 {
+        assert!(std::time::Instant::now() < deadline, "never committed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A call from an ingress that reads another error encoding is refused before
+/// anything runs, and the ingress learns that nothing ran.
+#[tokio::test]
+async fn a_call_under_another_codec_is_refused_unread() {
+    let executor = Arc::new(Scripted::default());
+    let router = serve(Arc::clone(&executor)).await;
+    let mut request = Request::new(statement_to_wire(statement(None)).expect("encoded"));
+    request
+        .metadata_mut()
+        .insert(CODEC_HEADER, MetadataValue::from(ERROR_CODEC_VERSION + 1));
+    let status = router
+        .client
+        .clone()
+        .execute(request)
+        .await
+        .expect_err("refused");
+    assert!(status.metadata().contains_key(REFUSED_HEADER), "{status:?}");
+    assert!(
+        matches!(
+            router.lost(&status),
+            DatabaseError::PeerUnreachable { member: MEMBER, .. }
+        ),
+        "the command did not run"
+    );
+    assert!(executor.statements.lock().unwrap().is_empty());
+}
+
+/// An error body the ingress cannot read is a lost answer, not a refusal: the
+/// command may have run.
+#[tokio::test]
+async fn an_unreadable_error_is_an_unknown_outcome() {
+    let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+    let router = CommandRouter::new(MEMBER, channel);
+    for bytes in [vec![0xff, 0xff, 0xff], vec![0; MAX_ROUTED_ERROR + 1]] {
+        let err = router.failure(&bytes).expect_err("a failure");
+        assert!(
+            matches!(
+                err,
+                DatabaseError::PeerOutcomeUnknown {
+                    member: MEMBER,
+                    failure: PeerFailure::Protocol,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+    assert!(router.failure(&[]).is_ok(), "no bytes, no failure");
 }
 
 /// An ingress that stops waiting (its client went away) stops the statement
@@ -479,7 +592,10 @@ async fn transaction_commands_cross_both_ways() {
             })
             .await
             .expect_err("refused");
-        assert_eq!(err.code(), tonic::Code::Aborted);
+        assert!(
+            matches!(err, DatabaseError::UnknownTransaction(id) if id == txid()),
+            "{err:?}"
+        );
     }
     let arrived: Vec<bool> = executor
         .rollbacks

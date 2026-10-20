@@ -30,9 +30,10 @@ fn a_single_auto_commit_attempt_returns_the_refusal() {
     assert!(
         matches!(
             err,
-            DatabaseError::Execution(
-                coordinode_query::executor::runner::ExecutionError::Conflict(_)
-            )
+            DatabaseError::TransactionConflict {
+                transaction: None,
+                ..
+            }
         ),
         "got {err:?}"
     );
@@ -742,10 +743,8 @@ fn set_query_memory_limit_invalid_value_is_refused() {
         assert!(
             matches!(
                 &refused,
-                Err(DatabaseError::SessionSetting(SessionSettingRefused {
-                    setting,
-                    ..
-                })) if setting.starts_with("query_memory_limit")
+                Err(DatabaseError::SessionSetting { setting, .. })
+                    if setting.starts_with("query_memory_limit")
             ),
             "{bad}: {refused:?}"
         );
@@ -769,7 +768,7 @@ fn a_statement_memory_limit_past_the_ceiling_is_refused() {
     };
     assert!(matches!(
         db.execute_cypher_shared_with("RETURN 1 AS x", None, None, &over),
-        Err(DatabaseError::SessionSetting(_))
+        Err(DatabaseError::SessionSetting { .. })
     ));
     let within = StatementOptions {
         query_memory_limit: Some(1 << 20),
@@ -799,9 +798,7 @@ fn writes_past_the_statement_memory_limit_are_refused_and_leave_nothing() {
     assert!(
         matches!(
             refused,
-            Err(DatabaseError::Execution(ExecutionError::Budget(
-                BudgetStop::Memory { .. }
-            )))
+            Err(DatabaseError::Budget(BudgetStop::Memory { .. }))
         ),
         "{refused:?}"
     );
@@ -894,9 +891,7 @@ fn a_vector_search_through_the_index_is_held_to_the_memory_limit() {
     assert!(
         matches!(
             refused,
-            Err(DatabaseError::Execution(ExecutionError::Budget(
-                BudgetStop::Memory { .. }
-            )))
+            Err(DatabaseError::Budget(BudgetStop::Memory { .. }))
         ),
         "{refused:?}"
     );
@@ -934,9 +929,7 @@ fn a_text_search_through_the_index_is_held_to_the_memory_limit() {
     assert!(
         matches!(
             refused,
-            Err(DatabaseError::Execution(ExecutionError::Budget(
-                BudgetStop::Memory { .. }
-            )))
+            Err(DatabaseError::Budget(BudgetStop::Memory { .. }))
         ),
         "{refused:?}"
     );
@@ -964,10 +957,7 @@ fn a_transaction_with_writes_cut_short_by_the_budget_cannot_commit() {
         &small,
     );
     assert!(
-        matches!(
-            refused,
-            Err(DatabaseError::Execution(ExecutionError::Budget(_)))
-        ),
+        matches!(refused, Err(DatabaseError::Budget(_))),
         "{refused:?}"
     );
     let committed = db.commit_transaction(txid);
@@ -2301,10 +2291,12 @@ fn the_vector_index_loader_refuses_an_unreadable_definition() {
     let (engine, key) = engine_with_unreadable_index_definition(dir.path());
 
     match Database::load_vector_indexes(engine, &FieldInterner::new(), 1) {
-        Err(DatabaseError::Storage(StorageError::UnreadableCatalog { key: named, .. })) => {
-            assert_eq!(named, coordinode_storage::error::printable_key(&key));
-        }
-        Err(other) => panic!("refused for another reason: {other}"),
+        Err(err) => match err.storage_cause() {
+            Some(StorageError::UnreadableCatalog { key: named, .. }) => {
+                assert_eq!(*named, coordinode_storage::error::printable_key(&key));
+            }
+            _ => panic!("refused for another reason: {err}"),
+        },
         Ok(_) => panic!("loaded without the definition it cannot read"),
     }
 }
@@ -2315,7 +2307,6 @@ fn the_vector_index_loader_refuses_an_unreadable_definition() {
 #[test]
 fn a_statement_stopped_before_it_runs_writes_nothing() {
     use coordinode_core::budget::{BudgetStop, CancelFlag};
-    use coordinode_query::executor::runner::ExecutionError;
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
 
@@ -2342,7 +2333,7 @@ fn a_statement_stopped_before_it_runs_writes_nothing() {
         assert!(
             matches!(
                 &stopped,
-                Err(DatabaseError::Execution(ExecutionError::Budget(s))) if *s == stop
+                Err(DatabaseError::Budget(s)) if *s == stop
             ),
             "{stopped:?}"
         );
@@ -2369,10 +2360,12 @@ fn the_text_index_loader_refuses_an_unreadable_definition() {
         1,
         &dir.path().join("text_indexes"),
     ) {
-        Err(DatabaseError::Storage(StorageError::UnreadableCatalog { key: named, .. })) => {
-            assert_eq!(named, coordinode_storage::error::printable_key(&key));
-        }
-        Err(other) => panic!("refused for another reason: {other}"),
+        Err(err) => match err.storage_cause() {
+            Some(StorageError::UnreadableCatalog { key: named, .. }) => {
+                assert_eq!(*named, coordinode_storage::error::printable_key(&key));
+            }
+            _ => panic!("refused for another reason: {err}"),
+        },
         Ok(_) => panic!("loaded without the definition it cannot read"),
     }
 }
