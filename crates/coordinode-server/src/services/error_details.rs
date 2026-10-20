@@ -257,6 +257,12 @@ pub enum Reason {
     /// DEADLINE or PROTOCOL). Terminal for a write: its outcome is resolved
     /// through its operation, never by sending it again.
     RoutedOutcomeUnknown,
+    /// A blob write on a member of a group with other members: blob payload
+    /// is held durably on the member that wrote it and is not yet carried to
+    /// the others, so the group could lose it on a leader change. Refused
+    /// before anything is written. Metadata carries `members`. Terminal: no
+    /// retry succeeds until the group is one member again.
+    BlobNotReplicated,
 }
 
 impl Reason {
@@ -311,6 +317,7 @@ impl Reason {
             Reason::ForeignOperation => "FOREIGN_OPERATION",
             Reason::MemberUnreachable => "MEMBER_UNREACHABLE",
             Reason::RoutedOutcomeUnknown => "ROUTED_OUTCOME_UNKNOWN",
+            Reason::BlobNotReplicated => "BLOB_NOT_REPLICATED",
         }
     }
 

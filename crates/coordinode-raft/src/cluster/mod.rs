@@ -2122,6 +2122,15 @@ impl RaftNode {
         m.membership_config.membership().voter_ids().collect()
     }
 
+    /// How many members the live membership config names, voters and
+    /// learners alike: every one of them receives the group's log.
+    pub fn member_count(&self) -> usize {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let rx = self.raft.metrics();
+        let m = rx.borrow_watched();
+        m.membership_config.membership().nodes().count()
+    }
+
     /// Wait until who leads, or under which term, differs from what the caller
     /// last saw; return the new pair.
     ///

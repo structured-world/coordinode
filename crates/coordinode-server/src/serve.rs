@@ -1047,7 +1047,8 @@ pub(crate) async fn serve(
     // BlobService shares the same storage engine as the Database.
     // Read guard is dropped immediately — only need engine_shared().
     let blob_engine = database.read().engine_shared();
-    let blob_service = services::blob::BlobServiceImpl::new(blob_engine);
+    let blob_service =
+        services::blob::BlobServiceImpl::new(blob_engine).with_node(Arc::clone(&raft_node));
 
     // Spawn operational HTTP server (default :7084, configurable via --ops-addr).
     let readiness = ops::Readiness::default();

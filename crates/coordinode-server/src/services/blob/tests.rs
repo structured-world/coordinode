@@ -82,3 +82,87 @@ async fn deleting_a_blob_leaves_chunks_other_blobs_share() {
         "the surviving blob must read back whole"
     );
 }
+
+/// Blob payload is held only on the member that writes it, so a member of a
+/// group with other members refuses blob writes before anything is written,
+/// with a reason a client branches on; a member alone serves them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_write_in_a_group_is_refused_before_it_is_written() {
+    use coordinode_embed::replication::{
+        Founding, MemberOptions, PeerTimeouts, Peering, ReplicatedDatabase,
+    };
+    use coordinode_test_fixtures::{TestPki, alloc_port};
+
+    let pki = TestPki::new();
+    let storage = |dir: &tempfile::TempDir| {
+        StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )])
+    };
+    let open = |id: u64, port: u16, founding: Founding, dir: &tempfile::TempDir| {
+        let mut options = MemberOptions::new(id);
+        options.peering = Some(Peering {
+            security: pki.context(id),
+            advertise: format!("127.0.0.1:{port}"),
+            founding,
+            timeouts: PeerTimeouts::default(),
+        });
+        let config = storage(dir);
+        async move {
+            ReplicatedDatabase::open(
+                &config,
+                options,
+                Some(format!("127.0.0.1:{port}").parse().expect("addr")),
+            )
+            .await
+            .expect("open member")
+        }
+    };
+    let (dir1, dir2) = (
+        tempfile::tempdir().expect("dir"),
+        tempfile::tempdir().expect("dir"),
+    );
+    let (p1, p2) = (alloc_port(), alloc_port());
+    let founder = open(1, p1, Founding::Form { deployment: None }, &dir1).await;
+    let service = BlobServiceImpl::new(Arc::clone(founder.member().engine()))
+        .with_node(Arc::clone(founder.member().node()));
+
+    let alone = service
+        .delete_blob(Request::new(graph::DeleteBlobRequest {
+            blob_id: "absent".into(),
+        }))
+        .await
+        .expect_err("nothing to delete");
+    assert_eq!(
+        alone.code(),
+        tonic::Code::NotFound,
+        "a member alone serves blob writes"
+    );
+
+    let enrollment = founder
+        .enrollment(format!("127.0.0.1:{p1}"))
+        .expect("enrollment");
+    let joiner = open(2, p2, Founding::Join(enrollment), &dir2).await;
+    founder
+        .add_learner(2, format!("127.0.0.1:{p2}"), pki.identity(2))
+        .await
+        .expect("add learner");
+
+    let refused = service
+        .delete_blob(Request::new(graph::DeleteBlobRequest {
+            blob_id: "absent".into(),
+        }))
+        .await
+        .expect_err("refused in a group");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    let info = tonic_types::StatusExt::get_details_error_info(&refused).expect("error info");
+    assert_eq!(info.reason, "BLOB_NOT_REPLICATED");
+    assert_eq!(info.metadata.get("members").map(String::as_str), Some("2"));
+
+    joiner.shutdown().await.expect("shutdown");
+    founder.shutdown().await.expect("shutdown");
+}

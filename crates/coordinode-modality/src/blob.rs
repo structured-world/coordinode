@@ -42,6 +42,11 @@
 //!   produced it, and reads see it through the same MVCC snapshot as the
 //!   node (time-travel consistent).
 //!
+//! Interim blob payload path: until that placement layer carries chunks,
+//! a chunk write is made durable on this member before it returns, so a ref
+//! committed after it never names bytes a crash took. The storage
+//! substrate's extent/stream write replaces it.
+//!
 //! Atomicity between a chunk and the ref pointing at it is **eventual**:
 //! chunks are placed first, the ref commits second, and orphan chunks
 //! (ref never committed, or ref later deleted) are reclaimed by the
@@ -51,7 +56,6 @@
 
 use coordinode_core::graph::blob::{BlobRef, ChunkId, encode_blob_key, encode_blobref_key};
 use coordinode_core::graph::node::NodeId;
-use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
@@ -123,6 +127,9 @@ impl BlobStore for LocalBlobStore {
         data: &[u8],
     ) -> StoreResult<()> {
         engine.put(Partition::Blob, &encode_blob_key(chunk_id), data)?;
+        // Interim blob payload path: durable here before a ref can name it;
+        // the substrate's durable sealing replaces this flush.
+        engine.persist_partition(Partition::Blob)?;
         Ok(())
     }
 
@@ -130,11 +137,9 @@ impl BlobStore for LocalBlobStore {
         if chunks.is_empty() {
             return Ok(());
         }
-        let mut batch = WriteBatch::new(engine);
-        for (id, data) in chunks {
-            batch.put(Partition::Blob, encode_blob_key(id), data.clone());
-        }
-        batch.commit()?;
+        // Interim blob payload path: written and made durable through the
+        // one place every blob payload writer shares.
+        coordinode_storage::blob::put_chunks_durably(engine, chunks)?;
         Ok(())
     }
 

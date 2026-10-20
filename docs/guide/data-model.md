@@ -97,6 +97,20 @@ CREATE (d:Document {
 | Map | Nested document | Config, structured data |
 | Bytes/Blob | BlobStore | Large binary objects |
 
+### Blob durability
+
+A blob uploaded through `BlobService.UploadBlob` or the S3 gateway is split
+into content-addressed chunks; identical chunks are stored once. The upload
+is answered only once its chunks and then its metadata are durable on the
+member that took it, so a reference committed after the answer never names
+bytes a crash lost. A delete is durable before its answer in the same way.
+
+Blob payload is not yet carried to other members of a replicated group: on a
+member whose group has other members (voters or learners), blob uploads and
+deletes are refused with `FAILED_PRECONDITION` and reason
+`BLOB_NOT_REPLICATED` (metadata `members`), before anything is written.
+Reads are served as before.
+
 ## Tables and Keys
 
 A table is a label with declared, typed columns. It is created with the same

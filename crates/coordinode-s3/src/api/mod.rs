@@ -67,7 +67,7 @@ async fn handle_request(
         }
         (&Method::GET, _) if mapping::parse_s3_path(&path).is_some() => get_object(&engine, &path),
         (&Method::DELETE, _) if mapping::parse_s3_path(&path).is_some() => {
-            delete_object(&engine, &path)
+            delete_object(&engine, &path).await
         }
         _ => Ok(xml_response(
             StatusCode::NOT_FOUND,
@@ -98,10 +98,14 @@ fn list_buckets() -> Result<Response<Full<Bytes>>, String> {
     Ok(xml_response(StatusCode::OK, xml))
 }
 
-/// `PUT /<bucket>/<key>`: upload an object as a blob.
+/// `PUT /<bucket>/<key>`: upload an object as a blob. The object is durable
+/// on this gateway's store before the answer.
+///
+/// Interim blob payload path: the storage substrate's extent/stream write,
+/// with the bucket's write concern and protection, replaces this one.
 async fn put_object(
     req: Request<Incoming>,
-    engine: &StorageEngine,
+    engine: &Arc<StorageEngine>,
     path: &str,
 ) -> Result<Response<Full<Bytes>>, String> {
     let body = req
@@ -119,26 +123,18 @@ async fn put_object(
 
     let (blob_ref, chunks) = blob::create_blob(&body);
 
-    // Store chunks (with dedup)
-    for (chunk_id, chunk_data) in &chunks {
-        let key = encode_blob_key(chunk_id);
-        if engine
-            .get(Partition::Blob, &key)
-            .map_err(|e| e.to_string())?
-            .is_none()
-        {
-            engine
-                .put(Partition::Blob, &key, chunk_data)
-                .map_err(|e| e.to_string())?;
-        }
-    }
-
-    // Store blob metadata keyed by path
+    // The chunks are durable before the metadata naming them, and both
+    // before the answer. Flushing blocks, so it runs off the async runtime.
     let meta_key = s3_meta_key(path);
     let meta_value = blob_ref.to_msgpack().map_err(|e| e.to_string())?;
-    engine
-        .put(Partition::BlobRef, &meta_key, &meta_value)
-        .map_err(|e| e.to_string())?;
+    let writer = Arc::clone(engine);
+    tokio::task::spawn_blocking(move || {
+        coordinode_storage::blob::put_chunks_durably(&writer, &chunks)?;
+        coordinode_storage::blob::put_meta_durably(&writer, &meta_key, &meta_value)
+    })
+    .await
+    .map_err(|e| format!("object write did not finish: {e}"))?
+    .map_err(|e| e.to_string())?;
 
     // Compute ETag (SHA-256 of full content)
     let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&body)));
@@ -192,8 +188,11 @@ fn get_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Bytes>
     Ok(resp)
 }
 
-/// `DELETE /<bucket>/<key>`: delete an object.
-fn delete_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Bytes>>, String> {
+/// `DELETE /<bucket>/<key>`: delete an object, durably before the answer.
+async fn delete_object(
+    engine: &Arc<StorageEngine>,
+    path: &str,
+) -> Result<Response<Full<Bytes>>, String> {
     let meta_key = s3_meta_key(path);
     let exists = engine
         .get(Partition::BlobRef, &meta_key)
@@ -205,9 +204,13 @@ fn delete_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Byt
         // with every other object, blob or property holding the same bytes,
         // so this object cannot tell whether a chunk is still referenced;
         // unreferenced chunks are reclaimed by chunk GC instead.
-        engine
-            .delete(Partition::BlobRef, &meta_key)
-            .map_err(|e| e.to_string())?;
+        let writer = Arc::clone(engine);
+        tokio::task::spawn_blocking(move || {
+            coordinode_storage::blob::delete_meta_durably(&writer, &meta_key)
+        })
+        .await
+        .map_err(|e| format!("object delete did not finish: {e}"))?
+        .map_err(|e| e.to_string())?;
 
         info!(path = %path, "S3 DeleteObject");
     }
