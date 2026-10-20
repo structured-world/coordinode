@@ -3,6 +3,9 @@ use std::sync::atomic::AtomicUsize;
 
 use super::*;
 
+/// The deadline the tests' commits are sent with.
+const COMMIT_DEADLINE: Duration = Duration::from_secs(10);
+
 /// What every statement the scripted executor runs answers.
 enum Script {
     /// These rows.
@@ -66,6 +69,11 @@ impl CommandExecutor for Scripted {
 
     fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
         assert_eq!(begin.transaction, txid());
+        assert_eq!(begin.actor, principal());
+        // The concerns the ingress chose cross as chosen; one left unset is
+        // not filled in on the way.
+        assert_eq!(begin.read_concern, Some(ReadConcernLevel::Snapshot));
+        assert_eq!(begin.write_concern, None);
         assert_eq!(begin.timeout_outcome, Some(TimeoutOutcome::Commit));
         assert_eq!(begin.operation, Some(operation(1)));
         Ok(())
@@ -74,6 +82,14 @@ impl CommandExecutor for Scripted {
     fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, DatabaseError> {
         assert_eq!(commit.transaction, txid());
         assert_eq!(commit.expect, expectations());
+        // The time left is never more than the ingress gave the commit.
+        assert!(
+            commit
+                .deadline
+                .is_some_and(|left| left <= COMMIT_DEADLINE && !left.is_zero()),
+            "{:?}",
+            commit.deadline
+        );
         std::thread::sleep(*self.commit_delay.lock().unwrap());
         self.commits.fetch_add(1, Ordering::AcqRel);
         Ok(CommitReceipt {
@@ -316,6 +332,14 @@ async fn a_statement_and_its_answer_cross_unchanged() {
     assert_eq!(arrived.query, sent.query);
     assert_eq!(arrived.params, sent.params);
     assert_eq!(arrived.settings, sent.settings);
+    // The time left, never more than the ingress had.
+    assert!(
+        arrived
+            .deadline
+            .is_some_and(|left| sent.deadline.is_some_and(|sent| left <= sent) && !left.is_zero()),
+        "{:?}",
+        arrived.deadline
+    );
     assert_eq!(arrived.transaction, None);
     assert_eq!(arrived.source.map(|s| s.line), Some(12));
 }
@@ -631,7 +655,7 @@ async fn transaction_commands_cross_both_ways() {
             actor: principal(),
             transaction: txid(),
             operation: None,
-            deadline: None,
+            deadline: Some(COMMIT_DEADLINE),
             expect: expectations(),
         })
         .await
