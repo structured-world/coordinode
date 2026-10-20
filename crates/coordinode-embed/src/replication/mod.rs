@@ -247,6 +247,14 @@ impl Member {
         // opens no transaction, and one that leads opens them in its term.
         let (leader, term) = node.next_leadership_change((None, u64::MAX)).await;
         database.set_execution_tenure(node.node_id(), leader, term);
+        // The idle reaper sleeps while no transaction is open; a begin wakes
+        // it.
+        let begun = Arc::new(tokio::sync::Notify::new());
+        let mut database = database;
+        {
+            let begun = Arc::clone(&begun);
+            database.set_interactive_begun_hook(Arc::new(move || begun.notify_one()));
+        }
         // A copy of an index found damaged on this member alone is replaced
         // from a peer's copy; a member without peers answers from its records
         // instead.
@@ -266,6 +274,14 @@ impl Member {
             Arc::clone(&node),
             stop.subscribe(),
         );
+        // Not optional either: an idle transaction ends with its timeout
+        // outcome whether or not anything else ever begins.
+        let reaper = background::spawn_idle_reaper(
+            Arc::clone(&database),
+            begun,
+            background::REAPER_GRANULARITY,
+            stop.subscribe(),
+        );
         Ok(Self {
             database,
             node,
@@ -273,7 +289,7 @@ impl Member {
             handler,
             preference,
             follower: None,
-            background: vec![tenure],
+            background: vec![tenure, reaper],
             stop,
         })
     }

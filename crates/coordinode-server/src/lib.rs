@@ -77,7 +77,6 @@ mod serve;
 /// the way a client does. Nothing here is a stable API for other crates: the
 /// binary is the product, and no crate may depend on it.
 pub mod services;
-mod txn_reaper;
 mod writer;
 
 use admin::{admin_node_decommission, admin_node_join, admin_open_engine, admin_storage_config};

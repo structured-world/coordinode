@@ -55,6 +55,57 @@ pub(super) fn spawn_execution_tenure(
     })
 }
 
+/// How far apart reaper passes are at least: transactions expiring close
+/// together end in one pass.
+pub(super) const REAPER_GRANULARITY: Duration = Duration::from_millis(250);
+
+/// End interactive transactions left idle past the database's idle timeout
+/// with their timeout outcome, without waiting for another begin: an
+/// abandoned transaction pins a snapshot and holds buffered writes. Sleeps
+/// until the earliest open transaction can expire, and while none is open
+/// until `begun` (the database's begin hook) wakes it. Ends when `stop`
+/// says so.
+pub(super) fn spawn_idle_reaper(
+    database: Arc<RwLock<Database>>,
+    begun: Arc<tokio::sync::Notify>,
+    granularity: Duration,
+    mut stop: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let db = Arc::clone(&database);
+            // A pass that commits at expiry waits on the log: off the runtime.
+            let next = match tokio::task::spawn_blocking(move || {
+                let db = db.read();
+                db.reap_idle_transactions(db.interactive_idle_timeout())
+            })
+            .await
+            {
+                Ok(next) => next,
+                Err(e) => {
+                    tracing::error!(%e, "an idle-transaction pass failed");
+                    Some(std::time::Instant::now() + RETRY)
+                }
+            };
+            let woken = async {
+                match next {
+                    Some(at) => {
+                        let at = at.max(std::time::Instant::now() + granularity);
+                        tokio::time::sleep_until(at.into()).await;
+                    }
+                    // A begin while the pass ran left its permit, so this
+                    // returns.
+                    None => begun.notified().await,
+                }
+            };
+            tokio::select! {
+                () = woken => {}
+                () = stopped(&mut stop) => break,
+            }
+        }
+    })
+}
+
 /// Watch `raft_node`'s leadership and, each time this member becomes the
 /// leader, finish the builds left unfinished: those a process left when it
 /// stopped, and those a former leader held when it lost the lead. Ends when

@@ -772,15 +772,13 @@ pub(crate) async fn serve(
 
     // Interactive-transaction tunables. Always resolved (the
     // config gate carries the built-in defaults: 30s idle timeout,
-    // 256 MiB buffered-write ceiling per open transaction).
-    let interactive_begun = Arc::new(tokio::sync::Notify::new());
+    // 256 MiB buffered-write ceiling per open transaction). The member's idle
+    // reaper reads the timeout set here at every pass.
     {
         let mut db = database.write();
         db.set_interactive_idle_timeout(std::time::Duration::from_secs(
             interactive_txn_idle_timeout_secs,
         ));
-        let begun = Arc::clone(&interactive_begun);
-        db.set_interactive_begun_hook(Arc::new(move || begun.notify_one()));
         db.set_max_interactive_txn_bytes(interactive_txn_max_bytes as usize);
         db.set_interactive_timeout_outcome(interactive_txn_timeout_outcome.into());
         db.set_autocommit_retry(
@@ -813,16 +811,6 @@ pub(crate) async fn serve(
             info!(procedure = %procedure.signature().name, "procedure registered");
         }
     }
-
-    // Idle reaper: end interactive transactions left untouched past the idle
-    // timeout with their timeout outcome, so an abandoned client cannot pin
-    // a transaction (and its snapshot) forever. Asleep while none is open.
-    crate::txn_reaper::spawn(
-        Arc::clone(&database),
-        std::time::Duration::from_secs(interactive_txn_idle_timeout_secs),
-        interactive_begun,
-        std::time::Duration::from_secs(1),
-    );
 
     // Per-shard consumer-retention registry: every change-stream consumer is
     // registered here with its retention policy, over the history this node

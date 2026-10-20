@@ -1975,3 +1975,138 @@ async fn a_routed_transaction_ends_with_its_lead_and_stays_ended() {
     .await;
     assert!(result.is_ok(), "TIMED OUT");
 }
+
+/// A transaction a host opened through a follower and then left idle ends at
+/// the leader with its timeout outcome, without any further command: one
+/// begun to roll back leaves nothing and answers a late commit as expired;
+/// one begun to commit at expiry lands on every member exactly once, and its
+/// operation resolves to that commit through any member.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_routed_transaction_ends_with_its_timeout_outcome() {
+    use coordinode_core::txn::command::TimeoutOutcome;
+    use coordinode_embed::TransactionEnd;
+    use coordinode_embed::operation::{
+        IssuerId, OperationDescriptor, OperationId, OperationOutcome, Resolve,
+    };
+    use coordinode_embed::replication::routing::{RoutedOperationAnswer, RoutedOperationCall};
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        for m in &members {
+            m.database()
+                .write()
+                .set_interactive_idle_timeout(Duration::from_millis(300));
+        }
+        let ingress = members[1].ingress();
+
+        let issuer = IssuerId([0x3c; 16]);
+        let enrolled = ingress
+            .operation(
+                ActingContext::Trusted,
+                RoutedOperationCall::Enroll(issuer),
+                Placement::Anywhere,
+            )
+            .await
+            .expect("enrolled through a follower");
+        let RoutedOperationAnswer::Enrolled {
+            incarnation,
+            next_sequence,
+            deployment,
+        } = enrolled.value
+        else {
+            panic!("an enrollment answers with its incarnation: {enrolled:?}");
+        };
+        let op = OperationDescriptor {
+            op: OperationId {
+                issuer,
+                incarnation,
+                sequence: next_sequence,
+            },
+            deployment,
+        };
+
+        let rolled = draw_transaction_id();
+        ingress
+            .begin(begin_of(rolled), Placement::Anywhere)
+            .await
+            .expect("begun to roll back");
+        run_in(&members[1], rolled, "CREATE (:RolledAtExpiry {k: 1})")
+            .await
+            .expect("written");
+        let committed = draw_transaction_id();
+        ingress
+            .begin(
+                RoutedBegin {
+                    timeout_outcome: Some(TimeoutOutcome::Commit),
+                    operation: Some(op),
+                    ..begin_of(committed)
+                },
+                Placement::Anywhere,
+            )
+            .await
+            .expect("begun to commit at expiry");
+        run_in(&members[1], committed, "CREATE (:CommittedAtExpiry {k: 1})")
+            .await
+            .expect("written");
+
+        // Nothing more is sent: the leader's reaper ends both.
+        for m in &members {
+            wait_until("the transaction committed at expiry lands", || {
+                count(m, "CommittedAtExpiry") == 1
+            })
+            .await;
+        }
+        let late = ingress.commit(commit_of(rolled), Placement::Anywhere).await;
+        assert!(
+            matches!(
+                late,
+                Err(DatabaseError::TransactionAborted {
+                    end: TransactionEnd::IdleExpired,
+                    ..
+                })
+            ),
+            "a late commit of the rolled-back one, got {late:?}"
+        );
+        let resolved = members[2]
+            .ingress()
+            .operation(
+                ActingContext::Trusted,
+                RoutedOperationCall::Resolve(op, Resolve::Lookup),
+                Placement::Anywhere,
+            )
+            .await
+            .expect("resolved through another follower");
+        assert!(
+            matches!(
+                resolved.value,
+                RoutedOperationAnswer::Outcome(OperationOutcome::Committed { .. })
+            ),
+            "the operation resolves to the commit at expiry: {resolved:?}"
+        );
+
+        members[0]
+            .execute(Statement::new("CREATE (:Marker {k: 1})"))
+            .await
+            .expect("a marker through the leader");
+        for m in &members {
+            wait_until("the marker reaches every member", || {
+                count(m, "Marker") == 1
+            })
+            .await;
+            assert_eq!(
+                count(m, "RolledAtExpiry"),
+                0,
+                "the rolled-back one left nothing"
+            );
+            assert_eq!(count(m, "CommittedAtExpiry"), 1, "committed once");
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}

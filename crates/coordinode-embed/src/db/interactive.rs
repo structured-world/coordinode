@@ -664,10 +664,16 @@ impl Database {
         Ok(())
     }
 
-    /// Call `begun` after every interactive transaction opens. The server's
+    /// Call `begun` after every interactive transaction opens. A member's
     /// idle reaper uses it to sleep while no transaction is open.
     pub fn set_interactive_begun_hook(&mut self, begun: std::sync::Arc<dyn Fn() + Send + Sync>) {
         self.interactive_begun = Some(begun);
+    }
+
+    /// How long an interactive transaction may stay idle before it ends
+    /// with its timeout outcome.
+    pub fn interactive_idle_timeout(&self) -> Duration {
+        self.interactive_idle_timeout
     }
 
     /// Run one statement of an interactive transaction.

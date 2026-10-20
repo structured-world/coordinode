@@ -285,3 +285,85 @@ async fn every_new_leader_finishes_the_build_the_old_one_held() {
         .unwrap();
     assert_eq!(rows.len(), 1);
 }
+
+/// Whether `tx` was ended by the idle timeout: its commit is refused as such.
+fn idle_expired(db: &Arc<parking_lot::RwLock<Database>>, tx: crate::TransactionId) -> bool {
+    matches!(
+        db.read().commit_transaction(tx),
+        Err(crate::DatabaseError::TransactionAborted {
+            end: crate::TransactionEnd::IdleExpired,
+            ..
+        })
+    )
+}
+
+/// A transaction the client walked away from is rolled back by the reaper
+/// alone, with no later begin to trigger a sweep: it pins a snapshot and
+/// buffered writes for as long as it stays open. The reaper then stops when
+/// told to.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_transaction_is_rolled_back_without_further_traffic() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.set_interactive_idle_timeout(Duration::from_millis(50));
+    let tx = db.begin_transaction().unwrap();
+    db.execute_in_transaction(tx, "CREATE (n:Abandoned {k: 1})", None)
+        .unwrap();
+    let database = Arc::new(parking_lot::RwLock::new(db));
+
+    let stop = watch::Sender::new(false);
+    let reaper = spawn_idle_reaper(
+        Arc::clone(&database),
+        Arc::new(tokio::sync::Notify::new()),
+        Duration::from_millis(20),
+        stop.subscribe(),
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), reaper)
+        .await
+        .expect("the reaper stops when told to")
+        .unwrap();
+
+    assert!(
+        idle_expired(&database, tx),
+        "the idle transaction is still open after the reaper ran"
+    );
+    let rows = database
+        .write()
+        .execute_cypher("MATCH (n:Abandoned) RETURN n")
+        .unwrap();
+    assert!(rows.is_empty(), "the abandoned write took effect");
+}
+
+/// With no transaction open the reaper sleeps until one begins; the begin hook
+/// wakes it, and the transaction opened then is still reaped once idle.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_begun_while_the_reaper_sleeps_is_reaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.set_interactive_idle_timeout(Duration::from_millis(50));
+    let begun = Arc::new(tokio::sync::Notify::new());
+    let hook = Arc::clone(&begun);
+    db.set_interactive_begun_hook(Arc::new(move || hook.notify_one()));
+    let database = Arc::new(parking_lot::RwLock::new(db));
+
+    let stop = watch::Sender::new(false);
+    let reaper = spawn_idle_reaper(
+        Arc::clone(&database),
+        begun,
+        Duration::from_millis(20),
+        stop.subscribe(),
+    );
+    // The reaper has found nothing open and is waiting for a begin.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let tx = database.read().begin_transaction().unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stop.send_replace(true);
+    reaper.await.unwrap();
+
+    assert!(
+        idle_expired(&database, tx),
+        "the transaction begun while the reaper slept is still open"
+    );
+}
