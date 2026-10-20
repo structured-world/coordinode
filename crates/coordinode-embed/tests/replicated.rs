@@ -13,14 +13,18 @@ use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_embed::backup::restore::{RestoreError, RestoreOptions};
 use coordinode_embed::backup::{BackupFormat, export};
 use coordinode_embed::db::draw_transaction_id;
-use coordinode_embed::replication::ingress::{Placement, Statement};
-use coordinode_embed::replication::routing::{RoutedBegin, RoutedCommit, RoutedStatement};
+use coordinode_embed::replication::admission::Requested;
+use coordinode_embed::replication::ingress::{Placement, Routed, Statement};
+use coordinode_embed::replication::routing::{
+    RoutedAnswer, RoutedBegin, RoutedCommit, RoutedStatement,
+};
 use coordinode_embed::replication::{
     ElectionPreference, Founding, MemberOptions, PeerTimeouts, Peering, ReplicatedDatabase,
     ReplicationError,
 };
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_raft::cluster::nemesis;
+use coordinode_raft::read_fence::ReadPreference;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::partition::Partition;
 use coordinode_test_fixtures::alloc_port;
@@ -1313,7 +1317,7 @@ async fn run_in(
     member: &ReplicatedDatabase,
     id: TransactionId,
     query: &str,
-) -> Result<coordinode_embed::replication::routing::RoutedAnswer, DatabaseError> {
+) -> Result<Routed<RoutedAnswer>, DatabaseError> {
     member
         .ingress()
         .execute_in_transaction(
@@ -1341,11 +1345,14 @@ async fn a_host_works_through_any_member() {
             .execute(Statement::new("CREATE (:ViaFollower {k: 7})"))
             .await
             .expect("a follower's write runs at the leader");
-        assert_eq!(written.stats.nodes_created, 1);
+        assert_eq!(written.value.stats.nodes_created, 1);
         assert!(
-            written.stats.commit_ts > 0,
+            written.value.stats.commit_ts > 0,
             "the leader's commit is reported"
         );
+        // The answer says it was forwarded and names the leader.
+        assert_eq!(written.forwarded_to, Some(1));
+        assert_eq!(written.leader, Some(1));
         for m in &members {
             wait_until("the routed write reaches every member", || {
                 count(m, "ViaFollower") == 1
@@ -1358,8 +1365,24 @@ async fn a_host_works_through_any_member() {
             .execute(Statement::new("MATCH (n:ViaFollower) RETURN n.k AS k"))
             .await
             .expect("a follower's read is answered");
-        assert_eq!(read.columns, vec!["k".to_owned()]);
-        assert_eq!(read.rows, vec![vec![Value::Int(7)]]);
+        assert_eq!(read.value.columns, vec!["k".to_owned()]);
+        assert_eq!(read.value.rows, vec![vec![Value::Int(7)]]);
+        assert_eq!(read.forwarded_to, Some(1));
+
+        // A read this member may serve is served here, and says so.
+        let near = members[2]
+            .execute(Statement {
+                requested: Requested {
+                    read_preference: Some(ReadPreference::Nearest),
+                    ..Requested::default()
+                },
+                ..Statement::new("MATCH (n:ViaFollower) RETURN n.k AS k")
+            })
+            .await
+            .expect("a nearest read on a follower");
+        assert_eq!(near.forwarded_to, None, "served by the member reached");
+        assert_eq!(near.leader, Some(1), "still names the leader");
+        assert_eq!(near.value.rows, vec![vec![Value::Int(7)]]);
 
         let refused = members[1]
             .execute(Statement {
@@ -1422,10 +1445,11 @@ async fn a_transaction_runs_through_two_followers() {
             .await
             .expect("read back through follower 3");
         assert_eq!(
-            own.rows,
+            own.value.rows,
             vec![vec![Value::Int(1)]],
             "it reads its own write"
         );
+        assert_eq!(own.forwarded_to, Some(1), "run at the leader that holds it");
         assert_eq!(
             count(&members[0], "InTxn"),
             0,
@@ -1446,7 +1470,9 @@ async fn a_transaction_runs_through_two_followers() {
             .commit(commit_of(id), Placement::Anywhere)
             .await
             .expect("committed through follower 2");
-        assert!(receipt.commit_ts.as_raw() > 0);
+        assert!(receipt.value.commit_ts.as_raw() > 0);
+        assert_eq!(receipt.forwarded_to, Some(1));
+        assert_eq!(receipt.leader, Some(1));
         for m in &members {
             wait_until("the transaction reaches every member", || {
                 count(m, "InTxn") == 1

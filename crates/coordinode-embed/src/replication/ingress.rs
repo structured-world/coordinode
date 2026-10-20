@@ -72,6 +72,19 @@ impl Statement {
     }
 }
 
+/// What a command answered, and where it went to be answered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Routed<T> {
+    /// The answer.
+    pub value: T,
+    /// The member that ran the command when it was not this one.
+    pub forwarded_to: Option<u64>,
+    /// The member this one knew to lead once the answer came back; `None`
+    /// when it knew of none. Advisory: it can change at once, and it is not
+    /// evidence of a commit.
+    pub leader: Option<u64>,
+}
+
 /// Runs a host's commands on this member or routes them to the leader.
 ///
 /// Cheap to clone: the admitter is shared.
@@ -95,6 +108,16 @@ impl Ingress {
         Arc::clone(self.admitter.database())
     }
 
+    /// `value` as answered by `ran_at`, `None` for this member, with the
+    /// leader this member knows of now: no round trip is spent on it.
+    fn answered<T>(&self, value: T, ran_at: Option<u64>) -> Routed<T> {
+        Routed {
+            value,
+            forwarded_to: ran_at,
+            leader: self.admitter.node().and_then(|n| n.current_leader()),
+        }
+    }
+
     /// Run `statement` and return its answer.
     ///
     /// # Errors
@@ -103,7 +126,10 @@ impl Ingress {
     /// lost when it ran at another member; [`DatabaseError::NotLeader`] when
     /// no member leads, or when a leader-local statement reached a member
     /// that does not.
-    pub async fn execute(&self, statement: Statement) -> Result<RoutedAnswer, DatabaseError> {
+    pub async fn execute(
+        &self,
+        statement: Statement,
+    ) -> Result<Routed<RoutedAnswer>, DatabaseError> {
         if statement
             .requested
             .deadline
@@ -143,7 +169,7 @@ impl Ingress {
                 Some(leader) => self.route(leader, statement).await,
                 None => Err(e),
             },
-            (ran, _) => ran,
+            (ran, _) => ran.map(|answer| self.answered(answer, None)),
         }
     }
 
@@ -153,7 +179,7 @@ impl Ingress {
         &self,
         leader: u64,
         statement: Statement,
-    ) -> Result<RoutedAnswer, DatabaseError> {
+    ) -> Result<Routed<RoutedAnswer>, DatabaseError> {
         let Statement {
             query,
             params,
@@ -178,11 +204,12 @@ impl Ingress {
             source,
         };
         let router = self.admitter.router(leader)?;
-        cancellable(
+        let answer = cancellable(
             requested.cancel.as_ref(),
             router.execute(routed, &AdmissionSignal::new(|| {})),
         )
-        .await
+        .await?;
+        Ok(self.answered(answer, Some(leader)))
     }
 
     /// Open a transaction under the ID the host drew, at the leader.
@@ -194,14 +221,16 @@ impl Ingress {
         &self,
         begin: RoutedBegin,
         placement: Placement,
-    ) -> Result<(), DatabaseError> {
-        match self.leader_for(placement)? {
+    ) -> Result<Routed<()>, DatabaseError> {
+        let ran_at = self.leader_for(placement)?;
+        match ran_at {
             None => {
                 let db = self.database();
-                blocking(move || executor::begin(&db.read(), begin)).await
+                blocking(move || executor::begin(&db.read(), begin)).await?;
             }
-            Some(leader) => self.admitter.router(leader)?.begin(begin).await,
+            Some(leader) => self.admitter.router(leader)?.begin(begin).await?,
         }
+        Ok(self.answered((), ran_at))
     }
 
     /// Run a statement of a transaction, at the leader that holds it.
@@ -217,21 +246,23 @@ impl Ingress {
         admitted: &AdmissionSignal,
         cancel: &CancelFlag,
         placement: Placement,
-    ) -> Result<RoutedAnswer, DatabaseError> {
-        match self.leader_for(placement)? {
+    ) -> Result<Routed<RoutedAnswer>, DatabaseError> {
+        let ran_at = self.leader_for(placement)?;
+        let answer = match ran_at {
             None => {
                 let db = self.database();
                 let (admitted, cancel) = (admitted.clone(), cancel.clone());
                 blocking(move || {
                     executor::run_in_transaction(&db.read(), statement, &cancel, &admitted)
                 })
-                .await
+                .await?
             }
             Some(leader) => {
                 let router = self.admitter.router(leader)?;
-                cancellable(Some(cancel), router.execute(statement, admitted)).await
+                cancellable(Some(cancel), router.execute(statement, admitted)).await?
             }
-        }
+        };
+        Ok(self.answered(answer, ran_at))
     }
 
     /// Commit a transaction at the leader that holds it.
@@ -245,14 +276,16 @@ impl Ingress {
         &self,
         commit: RoutedCommit,
         placement: Placement,
-    ) -> Result<CommitReceipt, DatabaseError> {
-        match self.leader_for(placement)? {
+    ) -> Result<Routed<CommitReceipt>, DatabaseError> {
+        let ran_at = self.leader_for(placement)?;
+        let receipt = match ran_at {
             None => {
                 let db = self.database();
-                blocking(move || executor::commit(&db.read(), commit)).await
+                blocking(move || executor::commit(&db.read(), commit)).await?
             }
-            Some(leader) => self.admitter.router(leader)?.commit(commit).await,
-        }
+            Some(leader) => self.admitter.router(leader)?.commit(commit).await?,
+        };
+        Ok(self.answered(receipt, ran_at))
     }
 
     /// Roll back a transaction at the leader that holds it.
@@ -264,14 +297,16 @@ impl Ingress {
         &self,
         rollback: RoutedRollback,
         placement: Placement,
-    ) -> Result<(), DatabaseError> {
-        match self.leader_for(placement)? {
+    ) -> Result<Routed<()>, DatabaseError> {
+        let ran_at = self.leader_for(placement)?;
+        match ran_at {
             None => {
                 let db = self.database();
-                blocking(move || executor::rollback(&db.read(), rollback)).await
+                blocking(move || executor::rollback(&db.read(), rollback)).await?;
             }
-            Some(leader) => self.admitter.router(leader)?.rollback(rollback).await,
+            Some(leader) => self.admitter.router(leader)?.rollback(rollback).await?,
         }
+        Ok(self.answered((), ran_at))
     }
 
     /// Carry out a call on operation records at the leader, whose log
@@ -285,14 +320,21 @@ impl Ingress {
         actor: ActingContext,
         call: RoutedOperationCall,
         placement: Placement,
-    ) -> Result<RoutedOperationAnswer, DatabaseError> {
-        match self.leader_for(placement)? {
+    ) -> Result<Routed<RoutedOperationAnswer>, DatabaseError> {
+        let ran_at = self.leader_for(placement)?;
+        let answer = match ran_at {
             None => {
                 let db = self.database();
-                blocking(move || executor::run_operation(&db.read(), call)).await
+                blocking(move || executor::run_operation(&db.read(), call)).await?
             }
-            Some(leader) => self.admitter.router(leader)?.operation(&actor, call).await,
-        }
+            Some(leader) => {
+                self.admitter
+                    .router(leader)?
+                    .operation(&actor, call)
+                    .await?
+            }
+        };
+        Ok(self.answered(answer, ran_at))
     }
 
     /// The member a command that needs the leader runs at: `None` for this

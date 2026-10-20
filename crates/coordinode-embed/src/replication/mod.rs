@@ -629,7 +629,7 @@ impl ReplicatedDatabase {
     pub async fn execute(
         &self,
         statement: ingress::Statement,
-    ) -> Result<routing::RoutedAnswer, DatabaseError> {
+    ) -> Result<ingress::Routed<routing::RoutedAnswer>, DatabaseError> {
         self.ingress.execute(statement).await
     }
 

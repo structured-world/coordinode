@@ -214,6 +214,7 @@ let refused = db
     .await;
 ```
 
+- **Where it ran.** Every ingress call answers a `Routed` value: the answer, `forwarded_to` (the member that ran it, when not this one) and `leader` (the member this one knew to lead when the answer came back, `None` when it knew of none). The leader is advisory and costs no extra round trip; a host that cares can move its traffic there.
 - **Settings.** `Statement::requested` names the read concern, read preference, write concern, causal position and deadline of the statement; an unnamed one is the executing member's. The same combinations a server refuses are refused here before anything runs (`SettingsRefused`). A read the default preference sends to the leader is answered there; name `ReadPreference::Nearest` to read this member's copy.
 - **Transactions.** `db.ingress()` begins, runs, commits and rolls back interactive transactions under the ID the host drew (`coordinode_embed::db::draw_transaction_id`). Every command of a transaction runs at the leader that holds it, so a transaction begun through one member continues through another. A start naming an ID already open is refused with `TransactionIdInUse`. When the lead moves the transaction ends: the new leader answers `UnknownTransaction`, and the old member leading again does not revive it; run the transaction again under a new ID.
 - **Operation records.** `ingress().operation` enrolls issuers and resolves, acknowledges and retires operations at the leader, whose log decides them.
