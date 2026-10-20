@@ -1038,6 +1038,9 @@ async fn a_repeated_commit_is_answered() {
     }
 }
 
+/// The transaction whose commit [`Gated`] holds after admitting it.
+const HELD_COMMIT: TransactionId = TransactionId::from_raw([0x9c; 16]);
+
 /// An engine that holds a statement before it admits it, until the test
 /// lets it go, and records the order statements and commits got their
 /// place in, and the transactions it was told to abandon.
@@ -1097,13 +1100,20 @@ impl CursorEngine for Gated {
 
     fn commit_transaction(
         &self,
-        _transaction: TransactionId,
+        transaction: TransactionId,
         _operation: Option<&OperationDescriptor>,
         _expect: &[ExpectedVersion],
         admission: &AdmissionSignal,
     ) -> Result<CommitReceipt, EngineError> {
         self.order.lock().push("commit".to_string());
         admission.admitted();
+        if transaction == HELD_COMMIT {
+            let permit = tokio::runtime::Handle::current()
+                .block_on(Arc::clone(&self.gate).acquire_owned())
+                .expect("gate");
+            drop(permit);
+            self.order.lock().push("committed".to_string());
+        }
         Ok(MOCK_RECEIPT)
     }
 
@@ -1226,6 +1236,43 @@ async fn a_statement_whose_stream_goes_away_abandons_its_transaction() {
     assert!(
         abandoned.try_recv().is_err(),
         "an autonomous statement abandons nothing"
+    );
+}
+
+/// A COMMIT whose stream goes away while it runs is never abandoned: it may
+/// already have escaped, so it runs to its end and its client resolves the
+/// outcome by its operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_whose_stream_goes_away_runs_to_its_end() {
+    let (gated, mut abandoned) = Gated::new();
+    let manager = SessionManager::new(
+        Arc::clone(&gated) as Arc<dyn CursorEngine>,
+        Arc::new(SessionRegistry::new()),
+    );
+    let session = manager.open("test".into());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, ev_rx) = mpsc::channel(64);
+    let run = tokio::spawn(session.run(op_rx, ev_tx));
+
+    op_tx.send((1, commit(HELD_COMMIT))).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !gated.order.lock().iter().any(|o| o == "commit") {
+        assert!(std::time::Instant::now() < deadline, "the commit started");
+        tokio::task::yield_now().await;
+    }
+    // The client goes away while the commit is held, then it finishes.
+    drop(ev_rx);
+    gated.gate.add_permits(1);
+    drop(op_tx);
+    run.await.unwrap();
+
+    while !gated.order.lock().iter().any(|o| o == "committed") {
+        assert!(std::time::Instant::now() < deadline, "the commit finished");
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        abandoned.try_recv().is_err(),
+        "a commit in flight is not abandoned"
     );
 }
 
