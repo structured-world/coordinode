@@ -54,10 +54,17 @@ fn drop_cancels_a_running_build_and_it_stays_dropped() {
         )
         .expect("create vector index");
 
-        assert!(
-            !db.index_builds().is_empty(),
-            "the build should still be running for this test to mean anything"
-        );
+        // Held, the build cannot finish, so it is running when looked at
+        // however fast the machine is.
+        {
+            let registry = db.vector_index_registry();
+            let graph = registry.get("Item", "embedding").expect("the index");
+            let _hold = graph.read().expect("the graph");
+            assert!(
+                !db.index_builds().is_empty(),
+                "the build should still be running for this test to mean anything"
+            );
+        }
 
         db.execute_cypher("DROP VECTOR INDEX live_build")
             .expect("drop while building");
@@ -157,13 +164,29 @@ fn every_write_across_a_build_is_in_the_index() {
     .expect("create vector index");
 
     let mut late = N;
-    let mut during = 0;
+    // The first writes land while the build is held, so some are written
+    // during it however fast the machine builds; the rest go on until the
+    // build is done.
+    {
+        let registry = db.vector_index_registry();
+        let graph = registry.get("Item", "embedding").expect("the index");
+        let health = registry
+            .health_handle("Item", "embedding")
+            .expect("the build's health");
+        let _hold = graph.read().expect("the graph");
+        assert!(
+            health.snapshot().is_rebuilding(),
+            "the build finished before the writes started"
+        );
+        for _ in 0..2 {
+            create_items(&mut db, late..late + 20);
+            late += 20;
+        }
+    }
     while !db.index_builds().is_empty() {
         create_items(&mut db, late..late + 20);
         late += 20;
-        during += 1;
     }
-    assert!(during > 1, "the build finished before the writes started");
 
     let ids = node_ids_from(&mut db, N);
     assert_eq!(ids.len(), late - N, "every row written is in the store");
@@ -288,28 +311,47 @@ fn writes_during_a_build_are_drained_into_the_index() {
     let mut db = Database::open(dir.path()).expect("open db");
 
     db.execute_cypher(
-        "UNWIND range(1, 3000) AS i CREATE (:Doc {tag: 'seed', embedding: [toFloat(i), 0.0, 0.0]})",
+        "UNWIND range(1, 500) AS i CREATE (:Doc {tag: 'seed', embedding: [toFloat(i), 0.0, 0.0]})",
     )
     .expect("seed vectors");
 
     db.execute_cypher(
-        "CREATE VECTOR INDEX doc_emb ON :Doc(embedding) OPTIONS {metric: \"cosine\", online_during_build: \"partial-recall\"}",
+        "CREATE VECTOR INDEX doc_emb ON :Doc(embedding) OPTIONS {metric: \"cosine\", online_during_build: \"block\"}",
     )
     .expect("create vector index");
 
-    // Written while the build is in flight, so only the tap can place them.
+    // The build cannot insert while its graph is held, so it is still in
+    // flight when the late vectors land, however fast the machine is: only
+    // the tap can place them.
+    let registry = db.vector_index_registry();
+    let graph = registry.get("Doc", "embedding").expect("the index");
+    let health = registry
+        .health_handle("Doc", "embedding")
+        .expect("the build's health");
+    let hold = graph.read().expect("the graph");
+    assert!(
+        health.snapshot().is_rebuilding(),
+        "the build finished before the hold, so the late writes prove nothing"
+    );
     db.execute_cypher(
         "UNWIND range(1, 200) AS i \
          CREATE (:Doc {tag: 'late', embedding: [0.0, toFloat(i), 0.0]})",
     )
     .expect("write during build");
+    drop(hold);
 
-    // Wait for the build to finish rather than sleeping a guess.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !db.index_builds().is_empty() {
-        assert!(std::time::Instant::now() < deadline, "build never finished");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // The build's own end, waited for by a query that waits for it (an index
+    // that blocks reads during its build): the bound only stops a hung build
+    // from hanging the run.
+    db.execute_cypher(
+        "MATCH (n:Doc) WITH n, vector_similarity(n.embedding, [0.0, 1.0, 0.0]) AS s \
+         ORDER BY s DESC LIMIT 1 RETURN n.tag AS tag /*+ vector_build_wait('10m') */",
+    )
+    .expect("the build finishes");
+    assert!(
+        !health.snapshot().is_rebuilding(),
+        "a query that waited for the build was served before it ended"
+    );
 
     // Every late vector must be its own nearest neighbour. A vector the build
     // missed answers with something else entirely.
