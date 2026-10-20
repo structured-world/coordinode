@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coordinode_core::budget::CancelFlag;
@@ -1451,6 +1452,369 @@ async fn a_member_that_just_joined_sends_once_it_knows_where_the_leader_is() {
         for m in &members {
             wait_until("the write reaches every member", || {
                 count(m, "JustJoined") == 1
+            })
+            .await;
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// A write through a follower's ingress whose answer the host never heard,
+/// with the lead moving meanwhile, takes effect once: sent again under its
+/// operation it is answered with the outcome, never run twice; any member
+/// resolves it; an operation never sent is excluded and then refused. A
+/// command that reaches the old leader directly is refused before it is
+/// admitted, naming the new leader, and runs nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routed_write_takes_effect_once_across_a_leader_change() {
+    use coordinode_embed::operation::{
+        IssuerId, OperationDescriptor, OperationId, OperationOutcome, Resolve,
+    };
+    use coordinode_embed::replication::routing::{RoutedOperationAnswer, RoutedOperationCall};
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let ingress = members[2].ingress();
+
+        let issuer = IssuerId([0x2b; 16]);
+        let enrolled = ingress
+            .operation(
+                ActingContext::Trusted,
+                RoutedOperationCall::Enroll(issuer),
+                Placement::Anywhere,
+            )
+            .await
+            .expect("enrolled through a follower");
+        let RoutedOperationAnswer::Enrolled {
+            incarnation,
+            next_sequence,
+            deployment,
+        } = enrolled.value
+        else {
+            panic!("an enrollment answers with its incarnation: {enrolled:?}");
+        };
+        let descriptor = |sequence| OperationDescriptor {
+            op: OperationId {
+                issuer,
+                incarnation,
+                sequence,
+            },
+            deployment,
+        };
+        let (sent, unsent) = (descriptor(next_sequence), descriptor(next_sequence + 1));
+        let write = |op| Statement {
+            requested: Requested {
+                operation: Some(op),
+                ..Requested::default()
+            },
+            ..Statement::new("CREATE (:Once {k: 1})")
+        };
+
+        ingress.execute(write(sent)).await.expect("the write");
+        // The host never heard the answer, and the lead moves.
+        members[0].transfer_leadership(2).await.unwrap();
+        wait_until("every member follows 2", || {
+            members.iter().all(|m| m.leader() == Some(2))
+                && members[2].member().node().member_target(2).is_some()
+        })
+        .await;
+
+        let again = ingress.execute(write(sent)).await;
+        assert!(
+            matches!(
+                again,
+                Err(DatabaseError::OperationSettled {
+                    outcome: OperationOutcome::Committed { .. },
+                    intent_differs: false,
+                    ..
+                })
+            ),
+            "sent again, the write answers its outcome: {again:?}"
+        );
+        let resolved = members[0]
+            .ingress()
+            .operation(
+                ActingContext::Trusted,
+                RoutedOperationCall::Resolve(sent, Resolve::Lookup),
+                Placement::Anywhere,
+            )
+            .await
+            .expect("resolved through the old leader");
+        assert!(matches!(
+            resolved.value,
+            RoutedOperationAnswer::Outcome(OperationOutcome::Committed { .. })
+        ));
+        assert_eq!(resolved.forwarded_to, Some(2));
+
+        let excluded = ingress
+            .operation(
+                ActingContext::Trusted,
+                RoutedOperationCall::Resolve(unsent, Resolve::Exclude),
+                Placement::Anywhere,
+            )
+            .await
+            .expect("excluded");
+        assert_eq!(
+            excluded.value,
+            RoutedOperationAnswer::Outcome(OperationOutcome::Aborted)
+        );
+        assert!(matches!(
+            ingress.execute(write(unsent)).await,
+            Err(DatabaseError::OperationSettled {
+                outcome: OperationOutcome::Aborted,
+                ..
+            })
+        ));
+        // An operation of another deployment is refused before it runs.
+        let foreign = OperationDescriptor {
+            deployment: coordinode_core::group::DeploymentId([0xee; 16]),
+            ..descriptor(next_sequence + 2)
+        };
+        let refused = ingress.execute(write(foreign)).await;
+        assert!(
+            matches!(refused, Err(DatabaseError::ForeignOperation { .. })),
+            "another deployment's operation: {refused:?}"
+        );
+
+        // Straight to the member that stopped leading: refused before it is
+        // admitted, naming the leader, and never passed on.
+        let stale = ingress
+            .admitter()
+            .router(1)
+            .expect("a router to member 1")
+            .execute(
+                RoutedStatement {
+                    actor: ActingContext::Trusted,
+                    query: "CREATE (:Stale {k: 1})".into(),
+                    params: Default::default(),
+                    settings: Default::default(),
+                    transaction: None,
+                    operation: None,
+                    deadline: None,
+                    source: None,
+                },
+                &AdmissionSignal::new(|| {}),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(DatabaseError::NotLeader { leader_id: Some(2) })),
+            "a stale target names the leader: {stale:?}"
+        );
+
+        members[1]
+            .execute(Statement::new("CREATE (:Marker {k: 1})"))
+            .await
+            .expect("a marker on the new leader");
+        for m in &members {
+            wait_until("the marker reaches every member", || {
+                count(m, "Marker") == 1
+            })
+            .await;
+            assert_eq!(count(m, "Once"), 1, "the write took effect once");
+            assert_eq!(count(m, "Stale"), 0, "the stale command ran nowhere");
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// A transaction belongs to the caller that opened it, whichever member a
+/// command comes through: a command acting for another subject, issuer or
+/// namespace under the same ID is refused as if no such transaction were
+/// open, before it reads or writes anything, and the owner's transaction
+/// carries on untouched. Knowing an ID grants nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_answers_only_the_caller_that_opened_it() {
+    use coordinode_core::txn::command::Principal;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let acting = |subject: &str, trust_scope: &str, namespace: &str| {
+            ActingContext::Principal(Principal {
+                subject: subject.into(),
+                trust_scope: trust_scope.into(),
+                namespace: namespace.into(),
+            })
+        };
+        let alice = acting("alice", "idp", "app");
+        let id = draw_transaction_id();
+        let as_actor = |actor: &ActingContext, query: &str| RoutedStatement {
+            actor: actor.clone(),
+            ..in_transaction(id, query)
+        };
+        let run = |member: &ReplicatedDatabase, statement: RoutedStatement| {
+            let ingress = member.ingress().clone();
+            async move {
+                ingress
+                    .execute_in_transaction(
+                        statement,
+                        &AdmissionSignal::new(|| {}),
+                        &CancelFlag::new(),
+                        Placement::Anywhere,
+                    )
+                    .await
+            }
+        };
+
+        members[1]
+            .ingress()
+            .begin(
+                RoutedBegin {
+                    actor: alice.clone(),
+                    ..begin_of(id)
+                },
+                Placement::Anywhere,
+            )
+            .await
+            .expect("alice begins through follower 2");
+        run(&members[1], as_actor(&alice, "CREATE (:Owned {k: 1})"))
+            .await
+            .expect("alice writes");
+
+        for intruder in [
+            acting("mallory", "idp", "app"),
+            acting("alice", "other-idp", "app"),
+            acting("alice", "idp", "other-app"),
+            ActingContext::Trusted,
+        ] {
+            let read = run(
+                &members[2],
+                as_actor(&intruder, "MATCH (n:Owned) RETURN count(n) AS c"),
+            )
+            .await;
+            assert!(
+                matches!(read, Err(DatabaseError::UnknownTransaction(t)) if t == id),
+                "{intruder:?} reads nothing of it: {read:?}"
+            );
+            let commit = members[2]
+                .ingress()
+                .commit(
+                    RoutedCommit {
+                        actor: intruder.clone(),
+                        ..commit_of(id)
+                    },
+                    Placement::Anywhere,
+                )
+                .await;
+            assert!(
+                matches!(commit, Err(DatabaseError::UnknownTransaction(t)) if t == id),
+                "{intruder:?} commits nothing: {commit:?}"
+            );
+        }
+
+        let own = run(
+            &members[2],
+            as_actor(&alice, "MATCH (n:Owned) RETURN count(n) AS c"),
+        )
+        .await
+        .expect("alice carries on through another member");
+        assert_eq!(own.value.rows, vec![vec![Value::Int(1)]]);
+        members[2]
+            .ingress()
+            .commit(
+                RoutedCommit {
+                    actor: alice.clone(),
+                    ..commit_of(id)
+                },
+                Placement::Anywhere,
+            )
+            .await
+            .expect("alice commits");
+        for m in &members {
+            wait_until("the owner's write reaches every member", || {
+                count(m, "Owned") == 1
+            })
+            .await;
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// A transaction's commands pipelined through followers run in the order
+/// they were sent: each is sent once the one before it has its place at the
+/// leader, not once it answered, alternating between two members, and each
+/// sees exactly the commands sent before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn pipelined_commands_run_in_the_order_they_were_sent() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let id = draw_transaction_id();
+        members[1]
+            .ingress()
+            .begin(begin_of(id), Placement::Anywhere)
+            .await
+            .expect("begun");
+
+        let mut answers = Vec::new();
+        for k in 0..12_i64 {
+            let ingress = members[1 + (k as usize % 2)].ingress().clone();
+            let placed = Arc::new(tokio::sync::Notify::new());
+            let signal = {
+                let placed = Arc::clone(&placed);
+                AdmissionSignal::new(move || placed.notify_one())
+            };
+            let mut statement = in_transaction(
+                id,
+                "MATCH (n:Seq) WITH count(n) AS i CREATE (:Seq {i: i, k: $k})",
+            );
+            statement.params.insert("k".into(), Value::Int(k));
+            answers.push(tokio::spawn(async move {
+                ingress
+                    .execute_in_transaction(
+                        statement,
+                        &signal,
+                        &CancelFlag::new(),
+                        Placement::Anywhere,
+                    )
+                    .await
+            }));
+            // The next command goes once this one has its place, before it
+            // has answered.
+            placed.notified().await;
+        }
+        for answer in answers {
+            answer.await.unwrap().expect("each command ran");
+        }
+        let order = run_in(
+            &members[2],
+            id,
+            "MATCH (n:Seq) WHERE n.i <> n.k RETURN count(n) AS out_of_order",
+        )
+        .await
+        .expect("read back");
+        assert_eq!(
+            order.value.rows,
+            vec![vec![Value::Int(0)]],
+            "every command saw exactly the ones sent before it"
+        );
+        members[1]
+            .ingress()
+            .commit(commit_of(id), Placement::Anywhere)
+            .await
+            .expect("committed");
+        for m in &members {
+            wait_until("the pipeline's writes reach every member", || {
+                count(m, "Seq") == 12
             })
             .await;
         }
