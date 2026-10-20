@@ -1795,6 +1795,86 @@ fn a_journal_retirement_cut_short_is_finished_by_the_next_one() {
     );
 }
 
+/// A power cut after the retirement removed the journal's segments but
+/// before the directory sync can bring any subset of them back: the removals
+/// were not durable. Whichever come back, a gap among them included, the
+/// next retirement finishes the job, and the store holds every entry and
+/// takes writes again.
+#[test]
+fn retired_segments_that_come_back_after_a_cut_are_retired_again() {
+    let names = ["a", "b", "c", "d", "e", "f", "g"];
+    // Which of the removed segments the cut brings back, by position.
+    let subsets: [fn(usize) -> bool; 4] = [|_| true, |i| i % 2 == 0, |i| i % 2 == 1, |i| i > 0];
+    for (round, comes_back) in subsets.into_iter().enumerate() {
+        let dir = TempDir::new().expect("tmp");
+        let mut config = durable_cfg(&dir);
+        config.oplog_segment_max_entries = 2;
+        {
+            let oracle = Arc::new(TimestampOracle::new());
+            let engine = StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("open");
+            for (n, name) in names.iter().enumerate() {
+                commit_at(
+                    &engine,
+                    &oracle,
+                    &two_tree_commit(name, n as u64),
+                    Journal::Journal,
+                );
+            }
+        }
+        let journal = dir.path().join("oplog").join("0");
+        let mut segments: Vec<_> = std::fs::read_dir(&journal)
+            .expect("journal")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        segments.sort();
+        assert!(segments.len() >= 3, "segments: {segments:?}");
+        let saved: Vec<(std::path::PathBuf, Vec<u8>)> = segments
+            .iter()
+            .map(|p| (p.clone(), std::fs::read(p).expect("read segment")))
+            .collect();
+
+        assert!(StorageEngine::retire_embedded_journal(&config).expect("retire"));
+        // The cut: the removals were not durable, some segments are back.
+        for (i, (path, bytes)) in saved.iter().enumerate() {
+            if comes_back(i) {
+                std::fs::write(path, bytes).expect("bring back");
+            }
+        }
+
+        StorageEngine::retire_embedded_journal(&config)
+            .unwrap_or_else(|e| panic!("round {round}: retire again: {e}"));
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine = StorageEngine::open_embedded(&config, Arc::clone(&oracle))
+            .unwrap_or_else(|e| panic!("round {round}: open: {e}"));
+        for name in names {
+            assert_eq!(
+                engine
+                    .get(Partition::Node, format!("node:00:{name}").as_bytes())
+                    .expect("get")
+                    .as_deref(),
+                Some(name.as_bytes()),
+                "round {round}: {name}"
+            );
+        }
+        commit_at(
+            &engine,
+            &oracle,
+            &two_tree_commit("z", 99),
+            Journal::Journal,
+        );
+        drop(engine);
+        let engine = StorageEngine::open_embedded(&config, Arc::new(TimestampOracle::new()))
+            .unwrap_or_else(|e| panic!("round {round}: reopen after a write: {e}"));
+        assert!(
+            engine
+                .get(Partition::Node, b"node:00:z")
+                .expect("get")
+                .is_some(),
+            "round {round}"
+        );
+    }
+}
+
 /// A member's own record is written while client writes are refused for
 /// space, out of the upper half of the reserve; once free space falls into
 /// the lower half, which the flushes retiring those records need, it is
