@@ -30,8 +30,9 @@
 #
 # The host needs git, the pinned Rust toolchain, cargo-nextest and protoc
 # (scripts/linux/provision.sh installs them); the run stops before uploading
-# anything when one is missing. Logs and the status file land in
-# target/linux-check/<host>/ locally; the run's directory on the host, build output
+# anything when one is missing. Logs, the status file and tree.txt (what was
+# checked) land in target/linux-check/<host>/<UTC start>-<kind>/ locally, one
+# directory per run; the run's directory on the host, build output
 # included, is removed afterwards. The exit code is 0 only when the run got to
 # its end and every step in the status file passed.
 set -euo pipefail
@@ -90,16 +91,26 @@ fi"; then
   exit 1
 fi
 
-# One local directory and one snapshot ref per host, so runs on two hosts at
-# once (a gate on one, a measurement on another) keep their logs apart.
+# One snapshot ref per host, so runs on two hosts at once (a gate on one, a
+# measurement on another) keep apart. Each run keeps its reports in a
+# directory of its own, named by when it started and what it ran, so a later
+# run (the cluster profile after the full gate) never overwrites the evidence
+# of an earlier one.
 host_dir="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
-out="$repo/target/linux-check/$host_dir"
+if [ -n "$only_bench" ]; then
+  run_kind=bench
+elif [ -n "$only_profile" ]; then
+  run_kind=profile
+elif [ -n "$only_nextest" ]; then
+  run_kind="nextest$(printf '%s' "$only_nextest" | tr -c 'A-Za-z0-9._-' '_')"
+else
+  run_kind=full
+fi
+out="$repo/target/linux-check/$host_dir/$(date -u +%Y%m%dT%H%M%SZ)-$run_kind"
 ref="refs/check/linux/$host_dir"
 mkdir -p "$out"
 # shellcheck source=../check-verdict.sh
 . "$repo/scripts/check-verdict.sh"
-# A log this run did not write must not be read as its result.
-rm -f "$out"/status.txt "$out"/*.log
 bundle="$out/tree.bundle"
 
 # Snapshot the working tree as a commit on a private ref, through a scratch
@@ -112,7 +123,7 @@ remove_root() {
   ssh "$host" "[ ! -e '$remote_root' ] || { find '$remote_root' -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + && rm -rf '$remote_root'; }"
 }
 cleanup() {
-  rm -f "$index"
+  rm -f "$index" "$out"/*.bundle
   git -C "$repo" update-ref -d "$ref" 2>/dev/null || true
   # Only the run that took the lock removes the directory. A lookup or
   # connection failure at this point would leave the lock behind and refuse
@@ -133,6 +144,13 @@ tree="$(GIT_INDEX_FILE="$index" git -C "$repo" write-tree)"
 commit="$(git -C "$repo" commit-tree "$tree" -p HEAD -m 'linux check snapshot')"
 git -C "$repo" update-ref "$ref" "$commit"
 git -C "$repo" bundle create -q "$bundle" "$ref" HEAD
+# What this run checked, beside its results: the tree it uploaded, the commit
+# that tree sits on, and every submodule's commit.
+{
+  echo "tree=$tree"
+  echo "head=$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" submodule status --recursive | sed 's/^/submodule=/'
+} > "$out/tree.txt"
 
 # A submodule's commit may exist only here, committed and not yet pushed, so
 # each submodule travels as a bundle of its checked-out history and the host

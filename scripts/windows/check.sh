@@ -12,8 +12,9 @@
 # with COORDINODE_CHECK_NEXTEST='-P cluster'.
 #
 # The host needs git, a Rust toolchain, cargo-nextest and protoc, and an
-# OpenSSH server whose default shell is PowerShell. Logs and the status file
-# land in target/windows-check/ locally; nothing stays on the host. The exit
+# OpenSSH server whose default shell is PowerShell. Logs, the status file and
+# tree.txt (what was checked) land in target/windows-check/<UTC start>-<kind>/
+# locally, one directory per run; nothing stays on the host. The exit
 # code is 0 only when the run got to its end and every step passed.
 set -euo pipefail
 
@@ -37,7 +38,15 @@ remote_scp="C:/$run_dir"
 ref='refs/check/windows'
 
 repo="$(git rev-parse --show-toplevel)"
-out="$repo/target/windows-check"
+# Each run keeps its reports in a directory of its own, named by when it
+# started and what it ran, so a later run never overwrites the evidence of an
+# earlier one.
+if [ -n "${COORDINODE_CHECK_NEXTEST:-}" ]; then
+  run_kind="nextest$(printf '%s' "$COORDINODE_CHECK_NEXTEST" | tr -c 'A-Za-z0-9._-' '_')"
+else
+  run_kind=full
+fi
+out="$repo/target/windows-check/$(date -u +%Y%m%dT%H%M%SZ)-$run_kind"
 mkdir -p "$out"
 # shellcheck source=../check-verdict.sh
 . "$repo/scripts/check-verdict.sh"
@@ -46,7 +55,7 @@ bundle="$out/tree.bundle"
 # Snapshot the working tree as a commit on a private ref, through a scratch
 # index so the real one is left as it is.
 index="$(mktemp)"
-trap 'rm -f "$index"; git -C "$repo" update-ref -d "$ref" 2>/dev/null || true' EXIT
+trap 'rm -f "$index" "$out"/*.bundle; git -C "$repo" update-ref -d "$ref" 2>/dev/null || true' EXIT
 # The git dir, not `$repo/.git`: in a worktree `.git` is a file.
 cp "$(git -C "$repo" rev-parse --absolute-git-dir)/index" "$index"
 GIT_INDEX_FILE="$index" git -C "$repo" add -A
@@ -54,12 +63,18 @@ tree="$(GIT_INDEX_FILE="$index" git -C "$repo" write-tree)"
 commit="$(git -C "$repo" commit-tree "$tree" -p HEAD -m 'windows check snapshot')"
 git -C "$repo" update-ref "$ref" "$commit"
 git -C "$repo" bundle create -q "$bundle" "$ref" HEAD
+# What this run checked, beside its results: the tree it uploaded, the commit
+# that tree sits on, and every submodule's commit.
+{
+  echo "tree=$tree"
+  echo "head=$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" submodule status --recursive | sed 's/^/submodule=/'
+} > "$out/tree.txt"
 
 # A submodule's commit may exist only here, committed and not yet pushed, so
 # each submodule travels as a bundle of its checked-out history
 # (sub-<name>.bundle) and check.ps1 takes it from there rather than from the
 # submodule's upstream.
-rm -f "$out"/sub-*.bundle
 while read -r key path; do
   name="${key#submodule.}"
   name="${name%.path}"
@@ -98,11 +113,6 @@ nextest_arg=''
 if [ -n "${COORDINODE_CHECK_NEXTEST:-}" ]; then
   nextest_arg=" -Nextest '$COORDINODE_CHECK_NEXTEST'"
 fi
-
-# A log this run did not write must not be read as its result.
-for f in status.txt clippy.log build.log test.log doctest.log; do
-  rm -f "$out/$f"
-done
 
 # check.ps1 keeps the machine awake while it runs, and the machine sleeps
 # the moment that hold goes. So the run prints CHECK-DONE and holds on until
