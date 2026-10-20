@@ -532,6 +532,231 @@ fn a_command_during_a_commit_on_timeout_waits_for_its_result() {
     assert_eq!(count(&db, "Held"), 1);
 }
 
+/// An explicit COMMIT or ROLLBACK reaching a transaction while its commit at
+/// idle expiry is in flight competes for the same context: it waits for that
+/// commit and answers its outcome. Neither starts an outcome of its own: the
+/// rollback undoes nothing, and the commit applies nothing a second time.
+#[test]
+fn an_explicit_end_during_a_commit_on_timeout_answers_its_outcome() {
+    let (mut db, _dir) = open();
+    let gate = Gate::install(&mut db);
+    let (id, op) = committing_on_timeout(&db, "Once");
+    gate.arm(Armed::Hold);
+    std::thread::scope(|s| {
+        let sweep = s.spawn(|| db.reap_idle_transactions(Duration::ZERO));
+        gate.until_entered();
+        let plain = s.spawn(|| db.commit_transaction(id));
+        let named = s.spawn(|| db.commit_transaction_as(id, &op));
+        let rollback = s.spawn(|| db.rollback_transaction(id));
+        until_waiting(&db, &id, 3);
+        gate.release();
+        sweep.join().expect("join");
+        let plain = plain.join().expect("join");
+        assert!(
+            matches!(plain, Err(DatabaseError::TransactionCommittedOnTimeout(h)) if h == id),
+            "{plain:?}"
+        );
+        let named = named.join().expect("join");
+        assert!(
+            matches!(
+                named,
+                Err(DatabaseError::OperationSettled {
+                    outcome: OperationOutcome::Committed { .. },
+                    intent_differs: false,
+                    ..
+                })
+            ),
+            "{named:?}"
+        );
+        let rollback = rollback.join().expect("join");
+        assert!(
+            matches!(rollback, Err(DatabaseError::TransactionCommittedOnTimeout(h)) if h == id),
+            "{rollback:?}"
+        );
+    });
+    assert_eq!(count(&db, "Once"), 1, "committed exactly once");
+}
+
+/// An explicit COMMIT that took the context first owns the outcome: a sweep
+/// while that commit is in flight finds nothing to end, and the transaction
+/// commits once, under the operation its start named.
+#[test]
+fn a_sweep_during_an_explicit_commit_finds_nothing_to_end() {
+    let (mut db, _dir) = open();
+    let gate = Gate::install(&mut db);
+    let (id, op) = committing_on_timeout(&db, "Explicit");
+    gate.arm(Armed::Hold);
+    std::thread::scope(|s| {
+        let commit = s.spawn(|| db.commit_transaction(id));
+        gate.until_entered();
+        assert_eq!(db.reap_idle_transactions(Duration::ZERO), None);
+        gate.release();
+        commit.join().expect("join").expect("the explicit commit");
+    });
+    assert_eq!(db.reap_idle_transactions(Duration::ZERO), None);
+    assert_eq!(count(&db, "Explicit"), 1, "committed exactly once");
+    assert!(matches!(
+        db.resolve_operation(&op, Resolve::Lookup).expect("resolve"),
+        OperationOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        db.commit_transaction(id),
+        Err(DatabaseError::UnknownTransaction(h)) if h == id
+    ));
+}
+
+/// A transaction rolled back explicitly before it expired is gone: a later
+/// sweep commits nothing of it, even though its start chose to commit at
+/// expiry.
+#[test]
+fn a_sweep_after_an_explicit_rollback_commits_nothing() {
+    let (db, _dir) = open();
+    let (id, op) = committing_on_timeout(&db, "RolledBack");
+    db.rollback_transaction(id).expect("rollback");
+    assert_eq!(db.reap_idle_transactions(Duration::ZERO), None);
+    assert_eq!(count(&db, "RolledBack"), 0);
+    assert!(!matches!(
+        db.resolve_operation(&op, Resolve::Lookup).expect("resolve"),
+        OperationOutcome::Committed { .. }
+    ));
+}
+
+/// Leadership lost while a commit at idle expiry is in flight drops the
+/// context with its tenure, and the commit's late result does not bring it
+/// back: a command for it is told no such transaction is known, as the new
+/// leader tells it, and the commit that may have escaped is resolved by its
+/// operation, which here says it landed.
+#[test]
+fn a_tenure_change_during_a_commit_on_timeout_leaves_it_to_its_operation() {
+    let (mut db, _dir) = open();
+    let gate = Gate::install(&mut db);
+    let (id, op) = committing_on_timeout(&db, "Escaped");
+    gate.arm(Armed::Hold);
+    std::thread::scope(|s| {
+        let sweep = s.spawn(|| db.reap_idle_transactions(Duration::ZERO));
+        gate.until_entered();
+        db.set_execution_tenure(1, Some(2), 9);
+        assert!(matches!(
+            db.execute_in_transaction(id, "RETURN 1 AS one", None),
+            Err(DatabaseError::UnknownTransaction(h)) if h == id
+        ));
+        gate.release();
+        sweep.join().expect("join");
+    });
+    assert!(
+        !db.interactive.contexts.lock().contains_key(&id),
+        "the late result put the context back"
+    );
+    for refused in [
+        db.commit_transaction(id).map(drop),
+        db.rollback_transaction(id),
+    ] {
+        assert!(
+            matches!(refused, Err(DatabaseError::UnknownTransaction(h)) if h == id),
+            "{refused:?}"
+        );
+    }
+    assert!(matches!(
+        db.resolve_operation(&op, Resolve::Lookup).expect("resolve"),
+        OperationOutcome::Committed { .. }
+    ));
+    assert_eq!(count(&db, "Escaped"), 1);
+}
+
+/// An explicit COMMIT under an operation, begun with one write.
+fn submitting(db: &Database, label: &str) -> (TransactionId, OperationDescriptor) {
+    let op = operation(db);
+    let id = db
+        .begin_transaction_with(&TransactionOptions {
+            operation: Some(op),
+            ..TransactionOptions::trusted()
+        })
+        .expect("begin");
+    db.execute_in_transaction(id, &format!("CREATE (:{label} {{k: 1}})"), None)
+        .expect("statement");
+    (id, op)
+}
+
+/// Leadership lost while an explicit COMMIT is being submitted: the commit
+/// already left the context, so the tenure change cannot abort it or bring
+/// the context back, and its operation says it committed.
+#[test]
+fn a_tenure_change_during_an_explicit_commit_does_not_undo_it() {
+    let (mut db, _dir) = open();
+    let gate = Gate::install(&mut db);
+    let (id, op) = submitting(&db, "Submitted");
+    gate.arm(Armed::Hold);
+    std::thread::scope(|s| {
+        let commit = s.spawn(|| db.commit_transaction(id));
+        gate.until_entered();
+        db.set_execution_tenure(1, Some(2), 9);
+        gate.release();
+        commit
+            .join()
+            .expect("join")
+            .expect("the commit that escaped commits");
+    });
+    assert!(
+        !db.interactive.contexts.lock().contains_key(&id),
+        "the late result put the context back"
+    );
+    assert!(matches!(
+        db.commit_transaction(id),
+        Err(DatabaseError::UnknownTransaction(h)) if h == id
+    ));
+    assert!(matches!(
+        db.resolve_operation(&op, Resolve::Lookup).expect("resolve"),
+        OperationOutcome::Committed { .. }
+    ));
+    assert_eq!(count(&db, "Submitted"), 1);
+}
+
+/// An explicit COMMIT whose leader lost its authority after handing the entry
+/// to its log fails without saying how it went. Committing it again under its
+/// operation answers the outcome and runs nothing twice, also once the lead
+/// has moved; a commit without the operation learns only that the
+/// transaction is gone.
+#[test]
+fn a_commit_whose_reply_is_lost_is_resolved_by_its_operation() {
+    let (mut db, _dir) = open();
+    let gate = Gate::install(&mut db);
+    let (id, op) = submitting(&db, "LostReply");
+    gate.arm(Armed::LoseReply);
+    let lost = db.commit_transaction(id);
+    // Not an abort: the entry may have been applied.
+    assert!(
+        matches!(
+            lost,
+            Err(ref e) if !matches!(
+                e,
+                DatabaseError::TransactionAborted { .. }
+                    | DatabaseError::TransactionConflict { .. }
+                    | DatabaseError::UnknownTransaction(_)
+                    | DatabaseError::NotLeader { .. }
+            )
+        ),
+        "the reply was lost: {lost:?}"
+    );
+    db.set_execution_tenure(1, Some(1), 9);
+    let again = db.commit_transaction_as(id, &op);
+    assert!(
+        matches!(
+            again,
+            Err(DatabaseError::OperationSettled {
+                outcome: OperationOutcome::Committed { .. },
+                intent_differs: false,
+                ..
+            })
+        ),
+        "{again:?}"
+    );
+    assert!(matches!(
+        db.commit_transaction(id),
+        Err(DatabaseError::UnknownTransaction(h)) if h == id
+    ));
+    assert_eq!(count(&db, "LostReply"), 1, "committed exactly once");
+}
+
 /// A commit made at idle expiry that failed after its entry may have been
 /// applied is reported with an unknown outcome, never as aborted, and its
 /// operation tells how it went: here the write had landed.
