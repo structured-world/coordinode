@@ -44,10 +44,10 @@ use coordinode_embed::replication::routing::{
 
 use super::failure;
 use crate::services::cypher::{db_error_to_status, read_concern_level, read_preference};
-use crate::services::routing::routed_settings;
 use crate::services::statement::{
     Admission, Requested, StatementExecutor, columns_and_values, leader_hint,
 };
+use coordinode_embed::replication::executor::routed_settings;
 
 /// Storage keys scanned per keyset page. Independent of the client's batch size:
 /// a page may yield fewer output rows than this when a `Filter` rejects some, so

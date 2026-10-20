@@ -1,5 +1,9 @@
 use super::*;
 use crate::services::cypher::db_error_to_status;
+use coordinode_core::txn::read_concern::ReadConcernLevel as ExecutorReadConcernLevel;
+use coordinode_core::txn::write_concern::WriteConcern;
+use coordinode_raft::read_fence::{ReadConcern, ReadFenceError, ReadPreference};
+use std::time::Duration;
 
 /// A standalone executor over a fresh database.
 pub(crate) fn standalone() -> (StatementExecutor, tempfile::TempDir) {
@@ -261,44 +265,32 @@ fn a_slow_statement_is_logged_and_a_fast_one_is_not() {
     );
 }
 
-/// What a statement leaves out comes from the defaults, what it names wins,
-/// and the write concern it leaves out stays unset for the database to fill.
-#[test]
-fn a_setting_left_out_is_the_default_and_a_named_one_wins() {
-    let (executor, _dir) = standalone();
+/// The server's configured defaults reach the checks: a statement that names
+/// no read preference is fenced with the configured one, so a SECONDARY
+/// default is refused on the leader where PRIMARY would be served.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_configured_defaults_reach_the_checks() {
+    let (executor, node, _dir) = raft().await;
     let executor = executor.with_statement_defaults(StatementDefaults {
         read_concern: ExecutorReadConcernLevel::Majority,
-        read_preference: ReadPreference::Nearest,
+        read_preference: ReadPreference::Secondary,
         write_concern: WriteConcern::w1(),
     });
-
-    let unnamed = executor
-        .check("RETURN 1", &Requested::default())
-        .expect("checked");
-    assert_eq!(
-        unnamed.read_concern.level,
-        ExecutorReadConcernLevel::Majority
+    let refused = executor
+        .admit("RETURN 1", &Requested::default(), false)
+        .await
+        .expect_err("the configured SECONDARY default is not the leader");
+    assert!(
+        matches!(
+            refused,
+            DatabaseError::ReadFence {
+                kind: coordinode_embed::ReadFenceFailure::Role,
+                ..
+            }
+        ),
+        "{refused:?}"
     );
-    assert_eq!(unnamed.read_preference, ReadPreference::Nearest);
-    assert_eq!(unnamed.write_concern, None);
-
-    let named = executor
-        .check(
-            "RETURN 1",
-            &Requested {
-                read_concern: Some(ExecutorReadConcernLevel::Linearizable),
-                read_preference: Some(ReadPreference::Primary),
-                write_concern: Some(WriteConcern::majority()),
-                ..Requested::default()
-            },
-        )
-        .expect("checked");
-    assert_eq!(
-        named.read_concern.level,
-        ExecutorReadConcernLevel::Linearizable
-    );
-    assert_eq!(named.read_preference, ReadPreference::Primary);
-    assert_eq!(named.write_concern, Some(WriteConcern::majority()));
+    node.shutdown().await.expect("shutdown");
 }
 
 /// A combination that cannot be served is refused before anything waits or

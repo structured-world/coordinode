@@ -190,10 +190,36 @@ An already open `Database` becomes a member on the same store with `ReplicatedDa
 
 Behaviour every host can rely on:
 
-- Only the leader applies writes. A write on another member, whatever its write concern, is refused with `NotLeader` naming the leader when it is known, and lands on no member. A restore is refused the same way: it runs on the leader, and its records, edges, schemas and the indexes built over them reach every member.
+- Only the leader applies writes. A write made through `database()` on another member, whatever its write concern, is refused with `NotLeader` naming the leader when it is known, and lands on no member. A restore is refused the same way: it runs on the leader, and its records, edges, schemas and the indexes built over them reach every member. To have a write run at the leader instead, send it through the member's ingress (below).
 - `leadership()` streams leadership changes; `transfer_leadership(id)` hands leadership to a named member (for example before a laptop sleeps) and returns once that member leads.
 - A member cut off from its group asks the others whether they would vote before it starts an election, so its return does not depose a leader the rest still follow.
 - `shutdown()` stops the member, its listener and its background work, and closes the store before it returns, so the same directory can be opened again at once. Dropping the handle stops the background work too, without waiting for it.
+
+### Working through any member
+
+A host can send every command through the member it opened, whichever member leads. `ReplicatedDatabase::execute` runs a statement here when this member may serve it and at the leader otherwise; the leader evaluates, validates and commits it, and the answer (columns, rows, what it wrote, its commit timestamp) is the one the leader gave. A follower never applies a write it evaluated itself. Commands travel over the member's inter-node listener, under the same node identity as consensus.
+
+```rust
+use coordinode_embed::replication::ingress::{Placement, Statement};
+
+// On any member: runs at the leader if this member does not lead.
+let answer = db.execute(Statement::new("CREATE (:Person {name: 'Bob'})")).await?;
+
+// Leader-local: runs only if this member leads, never routed.
+let refused = db
+    .execute(Statement {
+        placement: Placement::LeaderLocal,
+        ..Statement::new("CREATE (:Lease {holder: 1})")
+    })
+    .await;
+```
+
+- **Settings.** `Statement::requested` names the read concern, read preference, write concern, causal position and deadline of the statement; an unnamed one is the executing member's. The same combinations a server refuses are refused here before anything runs (`SettingsRefused`). A read the default preference sends to the leader is answered there; name `ReadPreference::Nearest` to read this member's copy.
+- **Transactions.** `db.ingress()` begins, runs, commits and rolls back interactive transactions under the ID the host drew (`coordinode_embed::db::draw_transaction_id`). Every command of a transaction runs at the leader that holds it, so a transaction begun through one member continues through another. A start naming an ID already open is refused with `TransactionIdInUse`. When the lead moves the transaction ends: the new leader answers `UnknownTransaction`, and the old member leading again does not revive it; run the transaction again under a new ID.
+- **Operation records.** `ingress().operation` enrolls issuers and resolves, acknowledges and retires operations at the leader, whose log decides them.
+- **Leader-local.** `Placement::LeaderLocal` keeps a command on this member: it runs only while this member leads and otherwise fails with `NotLeader` naming the leader. A host whose writes must originate at the leader (a singleton holding a lease there) uses it, so a deposed writer's work cannot reach the new leader by another road.
+- **No leader.** While no member is known to lead, a write or a transaction command fails with `NotLeader { leader_id: None }`; nothing waits for the election or applies locally. A member that still names a leader it can no longer reach fails the call with `PeerUnreachable` when it could not send it, and otherwise with `PeerOutcomeUnknown`, since a transport failure cannot prove the command never ran.
+- **Failures on the way.** `PeerUnreachable` means the command was not sent (for example a member that has just joined does not know the leader's address yet), so it did not run and can be sent again. `PeerOutcomeUnknown` means it was sent and its answer was lost: a write may have committed, so resolve it by its operation rather than running it again. See [Errors](#errors).
 
 Election timing comes in two profiles: `ElectionTiming::RACK` (heartbeat 150 ms, failover within a second) for servers next to each other, and `ElectionTiming::PERSONAL_FLEET` (heartbeat 2 s, election after 20 to 40 s) for members on laptops, phones and home links. Set it in `MemberOptions::timing` and give every member of a group the same one. `MemberOptions::preference = ElectionPreference::Last` makes a member lead only when no other can, and hand leadership back once another member has caught up. The server exposes the same choices as `election_profile` and `election_preference`; see [Configuration](./configuration).
 

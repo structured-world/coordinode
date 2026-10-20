@@ -19,9 +19,12 @@
 //! during an election, when there is none, names none; it never applies a
 //! caller's write locally, whatever the write concern.
 
+pub mod admission;
 mod background;
+pub mod executor;
 mod follower;
 mod index_copy;
+pub mod ingress;
 pub mod routing;
 
 use std::net::SocketAddr;
@@ -462,6 +465,7 @@ impl LeadershipChanges {
 /// the handle.
 pub struct ReplicatedDatabase {
     member: Member,
+    ingress: ingress::Ingress,
     timing: ElectionTiming,
     security: Option<Arc<SecurityContext>>,
     local_addr: Option<SocketAddr>,
@@ -504,6 +508,9 @@ impl ReplicatedDatabase {
         };
         let mut member = Member::open(storage, options).await?;
         member.start_background(DEFAULT_TRIGGER_DISPATCH_INTERVAL);
+        let admitter = admission::Admitter::new(Arc::clone(member.database()))
+            .with_node(Arc::clone(member.node()));
+        let ingress = ingress::Ingress::new(admitter.clone());
 
         let (mut local_addr, mut listener) = (None, None);
         if let (Some(security), Some(timeouts), Some(addr)) = (&security, timeouts, listen) {
@@ -529,6 +536,15 @@ impl ReplicatedDatabase {
             })?;
             let mut routes = tonic::service::Routes::builder();
             member.add_inter_node_services(&mut routes, MAX_INTER_NODE_MESSAGE);
+            // Commands its peers' hosts route here run as this member's own
+            // host's calls do.
+            member.add_command_routing(
+                &mut routes,
+                Arc::new(executor::MemberCommandExecutor::new(
+                    admitter,
+                    tokio::runtime::Handle::current(),
+                )),
+            );
             let router = tonic::transport::Server::builder().add_routes(routes.routes());
             let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
             let task = tokio::spawn(async move {
@@ -549,6 +565,7 @@ impl ReplicatedDatabase {
         }
         Ok(Self {
             member,
+            ingress,
             timing,
             security,
             local_addr,
@@ -589,9 +606,31 @@ impl ReplicatedDatabase {
         Self::open(storage, options, listen).await
     }
 
-    /// The database.
+    /// The database. Its calls run on this member only: a write on a member
+    /// that does not lead is refused with [`DatabaseError::NotLeader`]. Use
+    /// [`ReplicatedDatabase::execute`] or [`ReplicatedDatabase::ingress`] to
+    /// have commands run wherever they must.
     pub fn database(&self) -> &Arc<RwLock<Database>> {
         self.member.database()
+    }
+
+    /// Where a host's commands enter the group through this member: each
+    /// runs here when this member may run it and at the leader otherwise,
+    /// transactions and operation records included.
+    pub fn ingress(&self) -> &ingress::Ingress {
+        &self.ingress
+    }
+
+    /// Run `statement` here or at the leader, as it needs.
+    ///
+    /// # Errors
+    ///
+    /// As [`ingress::Ingress::execute`].
+    pub async fn execute(
+        &self,
+        statement: ingress::Statement,
+    ) -> Result<routing::RoutedAnswer, DatabaseError> {
+        self.ingress.execute(statement).await
     }
 
     /// This member's id.

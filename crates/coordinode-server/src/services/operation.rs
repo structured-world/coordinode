@@ -18,9 +18,9 @@ use coordinode_embed::replication::routing::{RoutedOperationAnswer, RoutedOperat
 
 use super::cypher::db_error_to_status;
 use super::error_details::{Reason, invalid_field, status_with_reason};
-use super::routing::run_operation;
 use super::statement::{StatementExecutor, leader_hint};
 use crate::proto::operation as wire;
+use coordinode_embed::replication::executor::run_operation;
 
 /// The descriptor `reference` names, refusing a malformed one. `field` is the
 /// request path of the reference, for the refusal.

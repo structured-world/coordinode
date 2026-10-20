@@ -7,19 +7,22 @@ use std::time::Instant;
 use coordinode_core::budget::CancelFlag;
 use coordinode_core::txn::command::{ActingContext, AdmissionSignal};
 use coordinode_core::txn::transaction::CommitReceipt;
-use coordinode_embed::db::{CommitOptions, RollbackOptions, StatementOptions, TransactionOptions};
+use coordinode_embed::DatabaseError;
+use coordinode_embed::replication::executor;
 use coordinode_embed::replication::routing::{
     CommandExecutor, RoutedAnswer, RoutedBegin, RoutedCommit, RoutedOperationAnswer,
-    RoutedOperationCall, RoutedRollback, RoutedSettings, RoutedStatement, RoutedStats,
+    RoutedOperationCall, RoutedRollback, RoutedStatement,
 };
-use coordinode_embed::{Database, DatabaseError};
-use coordinode_raft::read_fence::ReadPreference;
 
-use crate::services::statement::{Admission, Requested, StatementExecutor, columns_and_values};
+use crate::services::statement::{Admission, StatementExecutor};
 
 /// Runs routed commands through this member's [`StatementExecutor`]. A
 /// member serves it to its peers with
 /// [`coordinode_embed::replication::Member::add_command_routing`].
+///
+/// Only an autonomous statement takes the server's own path, which records
+/// it for the advisor and the query metrics; every other command runs as an
+/// embedded member runs it.
 pub struct ServerCommandExecutor {
     executor: StatementExecutor,
 }
@@ -39,115 +42,51 @@ impl CommandExecutor for ServerCommandExecutor {
         cancel: &CancelFlag,
         admitted: &AdmissionSignal,
     ) -> Result<RoutedAnswer, DatabaseError> {
-        let RoutedStatement {
-            actor,
-            query,
-            params,
-            settings,
-            transaction,
-            operation,
-            deadline,
-            source,
-        } = statement;
-        let params = (!params.is_empty()).then_some(params);
-        let deadline = deadline.map(|left| Instant::now() + left);
-
-        // A transaction's statement reads at its pinned snapshot and buffers
-        // its writes: no fence and no commit of its own.
-        if let Some(id) = transaction {
-            let db = self.executor.database().read();
-            let options = StatementOptions {
-                vector_consistency: settings.vector_consistency,
-                vector_build_wait: settings.vector_build_wait,
-                query_memory_limit: settings.query_memory_limit,
-                deadline,
-                cancel: Some(cancel.clone()),
-                actor: Some(actor),
-                admission: Some(admitted.clone()),
-                ..StatementOptions::default()
-            };
-            let rows = db.execute_in_transaction_with(id, &query, params, &options)?;
-            let (columns, rows) = columns_and_values(&rows);
-            return Ok(RoutedAnswer {
-                columns,
-                rows,
-                stats: RoutedStats::default(),
-            });
+        if statement.transaction.is_some() {
+            return executor::run_in_transaction(
+                &self.executor.database().read(),
+                statement,
+                cancel,
+                admitted,
+            );
         }
 
         // A statement routed here needs this member to lead: it is fenced as
         // such and never routed on.
-        let requested = Requested {
-            read_concern: settings.read_concern,
-            after_index: settings.after_index.unwrap_or(0),
-            at_timestamp: settings.at_timestamp.unwrap_or(0),
-            read_preference: Some(ReadPreference::Primary),
-            write_concern: settings.write_concern,
-            vector_consistency: settings.vector_consistency,
-            vector_build_wait: settings.vector_build_wait,
-            query_memory_limit: settings.query_memory_limit,
-            deadline,
-            cancel: Some(cancel.clone()),
-            operation,
-        };
+        let requested = executor::routed_requested(&statement, cancel);
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|e| DatabaseError::Other(format!("no runtime to fence the read on: {e}")))?;
-        let fenced = match runtime.block_on(self.executor.admit(&query, &requested, true))? {
-            Admission::Run(fenced) => fenced,
-            // An admission that may not route on never asks to.
-            Admission::Forward(leader) => {
-                return Err(DatabaseError::NotLeader {
-                    leader_id: Some(leader),
-                });
-            }
-        };
+        let fenced =
+            match runtime.block_on(self.executor.admit(&statement.query, &requested, true))? {
+                Admission::Run(fenced) => fenced,
+                // An admission that may not route on never asks to.
+                Admission::Forward(leader) => {
+                    return Err(DatabaseError::NotLeader {
+                        leader_id: Some(leader),
+                    });
+                }
+            };
+        let RoutedStatement {
+            query,
+            params,
+            source,
+            ..
+        } = statement;
+        let params = (!params.is_empty()).then_some(params);
         let start = Instant::now();
         let result = self
             .executor
             .execute(&query, params, source.as_ref(), &fenced)?;
         self.executor.record(&query, source.as_ref(), start);
-        let (columns, rows) = columns_and_values(&result.rows);
-        let ws = &result.write_stats;
-        Ok(RoutedAnswer {
-            columns,
-            rows,
-            stats: RoutedStats {
-                nodes_created: ws.nodes_created as i64,
-                nodes_deleted: ws.nodes_deleted as i64,
-                edges_created: ws.edges_created as i64,
-                edges_deleted: ws.edges_deleted as i64,
-                properties_set: ws.properties_set as i64,
-                applied_index: ws.applied_index.unwrap_or(0),
-                commit_ts: ws.commit_ts.unwrap_or(0),
-                read_index: fenced.applied_index,
-                read_as_of_ts: fenced.read_as_of_ts,
-            },
-        })
+        Ok(executor::answer(&result, &fenced))
     }
 
     fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
-        self.executor.database().read().begin_transaction_as(
-            begin.transaction,
-            &TransactionOptions {
-                actor: Some(begin.actor),
-                read_concern: begin.read_concern,
-                write_concern: begin.write_concern,
-                timeout_outcome: begin.timeout_outcome,
-                operation: begin.operation,
-            },
-        )
+        executor::begin(&self.executor.database().read(), begin)
     }
 
     fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, DatabaseError> {
-        self.executor.database().read().commit_transaction_with(
-            commit.transaction,
-            &CommitOptions {
-                operation: commit.operation.as_ref(),
-                actor: Some(&commit.actor),
-                admission: None,
-                expect: &commit.expect,
-            },
-        )
+        executor::commit(&self.executor.database().read(), commit)
     }
 
     fn operation(
@@ -155,69 +94,11 @@ impl CommandExecutor for ServerCommandExecutor {
         _actor: ActingContext,
         call: RoutedOperationCall,
     ) -> Result<RoutedOperationAnswer, DatabaseError> {
-        run_operation(&self.executor.database().read(), call)
+        executor::run_operation(&self.executor.database().read(), call)
     }
 
     fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError> {
-        self.executor.database().read().rollback_transaction_with(
-            rollback.transaction,
-            &RollbackOptions {
-                actor: Some(&rollback.actor),
-                admission: None,
-                end: rollback.end(),
-            },
-        )
-    }
-}
-
-/// Carry out `call` on `db`'s operation records: what a member does with the
-/// call whether its client reached it or another member passed it here.
-///
-/// # Errors
-///
-/// What the database refused the call with; a member that does not lead
-/// refuses every call that changes the records.
-pub(crate) fn run_operation(
-    db: &Database,
-    call: RoutedOperationCall,
-) -> Result<RoutedOperationAnswer, DatabaseError> {
-    Ok(match call {
-        RoutedOperationCall::Enroll(issuer) => {
-            let enrolled = db.enroll_issuer(issuer)?;
-            RoutedOperationAnswer::Enrolled {
-                incarnation: enrolled.incarnation(),
-                next_sequence: enrolled.next_sequence(),
-                deployment: enrolled.deployment(),
-            }
-        }
-        RoutedOperationCall::Resolve(descriptor, resolve) => {
-            RoutedOperationAnswer::Outcome(db.resolve_operation(&descriptor, resolve)?)
-        }
-        RoutedOperationCall::Acknowledge(descriptors) => {
-            for descriptor in &descriptors {
-                db.acknowledge_operation(descriptor)?;
-            }
-            RoutedOperationAnswer::Done
-        }
-        RoutedOperationCall::Retire(below) => {
-            db.retire_operations(&below)?;
-            RoutedOperationAnswer::Done
-        }
-    })
-}
-
-/// The settings a statement routed from here runs under: what the statement
-/// and its session named. A setting neither named is the executing member's
-/// to choose, as it would be for a client connected there.
-pub(crate) fn routed_settings(requested: &Requested) -> RoutedSettings {
-    RoutedSettings {
-        read_concern: requested.read_concern,
-        after_index: (requested.after_index > 0).then_some(requested.after_index),
-        at_timestamp: (requested.at_timestamp > 0).then_some(requested.at_timestamp),
-        write_concern: requested.write_concern,
-        vector_consistency: requested.vector_consistency,
-        vector_build_wait: requested.vector_build_wait,
-        query_memory_limit: requested.query_memory_limit,
+        executor::rollback(&self.executor.database().read(), rollback)
     }
 }
 

@@ -6,9 +6,15 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use coordinode_core::budget::CancelFlag;
+use coordinode_core::graph::types::Value;
+use coordinode_core::txn::command::{ActingContext, AdmissionSignal, TransactionId};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_embed::backup::restore::{RestoreError, RestoreOptions};
 use coordinode_embed::backup::{BackupFormat, export};
+use coordinode_embed::db::draw_transaction_id;
+use coordinode_embed::replication::ingress::{Placement, Statement};
+use coordinode_embed::replication::routing::{RoutedBegin, RoutedCommit, RoutedStatement};
 use coordinode_embed::replication::{
     ElectionPreference, Founding, MemberOptions, PeerTimeouts, Peering, ReplicatedDatabase,
     ReplicationError,
@@ -1253,4 +1259,286 @@ async fn a_member_store_is_refused_by_the_non_replicated_open() {
         .execute_cypher("CREATE (:Later {k: 1})")
         .unwrap();
     member.shutdown().await.unwrap();
+}
+
+/// Wait until every follower knows member 1 leads and where it is: a member
+/// that has heard the leader's heartbeat before applying the membership that
+/// names its address has nowhere to send a command yet, and says so.
+async fn followers_reach_the_leader(members: &[ReplicatedDatabase]) {
+    for m in &members[1..] {
+        wait_until("the follower knows the leader and its address", || {
+            m.leader() == Some(1) && m.member().node().member_target(1).is_some()
+        })
+        .await;
+    }
+}
+
+/// A transaction command a host sends through `ingress`.
+fn in_transaction(id: TransactionId, query: &str) -> RoutedStatement {
+    RoutedStatement {
+        actor: ActingContext::Trusted,
+        query: query.to_owned(),
+        params: Default::default(),
+        settings: Default::default(),
+        transaction: Some(id),
+        operation: None,
+        deadline: None,
+        source: None,
+    }
+}
+
+fn begin_of(id: TransactionId) -> RoutedBegin {
+    RoutedBegin {
+        transaction: id,
+        actor: ActingContext::Trusted,
+        read_concern: None,
+        write_concern: None,
+        timeout_outcome: None,
+        operation: None,
+    }
+}
+
+fn commit_of(id: TransactionId) -> RoutedCommit {
+    RoutedCommit {
+        actor: ActingContext::Trusted,
+        transaction: id,
+        operation: None,
+        deadline: None,
+        expect: Vec::new(),
+    }
+}
+
+/// Run `query` in transaction `id` through `member`'s ingress.
+async fn run_in(
+    member: &ReplicatedDatabase,
+    id: TransactionId,
+    query: &str,
+) -> Result<coordinode_embed::replication::routing::RoutedAnswer, DatabaseError> {
+    member
+        .ingress()
+        .execute_in_transaction(
+            in_transaction(id, query),
+            &AdmissionSignal::new(|| {}),
+            &CancelFlag::new(),
+            Placement::Anywhere,
+        )
+        .await
+}
+
+/// A host works through whichever member it opened: a write on a follower
+/// runs at the leader and lands on every member, a read the follower may not
+/// serve is answered by the leader, and the answer is the one the leader
+/// gave. A leader-local write is never routed: off the leader it is refused
+/// naming the leader and lands nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_works_through_any_member() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+
+        let written = members[1]
+            .execute(Statement::new("CREATE (:ViaFollower {k: 7})"))
+            .await
+            .expect("a follower's write runs at the leader");
+        assert_eq!(written.stats.nodes_created, 1);
+        assert!(
+            written.stats.commit_ts > 0,
+            "the leader's commit is reported"
+        );
+        for m in &members {
+            wait_until("the routed write reaches every member", || {
+                count(m, "ViaFollower") == 1
+            })
+            .await;
+        }
+
+        // The default preference reads from the leader: the follower routes.
+        let read = members[2]
+            .execute(Statement::new("MATCH (n:ViaFollower) RETURN n.k AS k"))
+            .await
+            .expect("a follower's read is answered");
+        assert_eq!(read.columns, vec!["k".to_owned()]);
+        assert_eq!(read.rows, vec![vec![Value::Int(7)]]);
+
+        let refused = members[1]
+            .execute(Statement {
+                placement: Placement::LeaderLocal,
+                ..Statement::new("CREATE (:Stray {k: 1})")
+            })
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(DatabaseError::NotLeader { leader_id: Some(1) })
+            ),
+            "a leader-local write off the leader, got {refused:?}"
+        );
+        members[0]
+            .execute(Statement {
+                placement: Placement::LeaderLocal,
+                ..Statement::new("CREATE (:OnTheLeader {k: 1})")
+            })
+            .await
+            .expect("a leader-local write on the leader");
+        for m in &members {
+            wait_until("the leader-local write reaches every member", || {
+                count(m, "OnTheLeader") == 1
+            })
+            .await;
+            assert_eq!(count(m, "Stray"), 0, "the refused write landed nowhere");
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// One transaction through two followers: begun through one, written and
+/// read back through the other, committed through the first. Its writes are
+/// its own until the commit, then land on every member once. A start naming
+/// the open ID is refused, a second commit finds nothing, and a leader-local
+/// start off the leader is refused naming the leader.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_runs_through_two_followers() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let id = draw_transaction_id();
+
+        members[1]
+            .ingress()
+            .begin(begin_of(id), Placement::Anywhere)
+            .await
+            .expect("begun through follower 2");
+        run_in(&members[2], id, "CREATE (:InTxn {k: 1})")
+            .await
+            .expect("written through follower 3");
+        let own = run_in(&members[2], id, "MATCH (n:InTxn) RETURN count(n) AS c")
+            .await
+            .expect("read back through follower 3");
+        assert_eq!(
+            own.rows,
+            vec![vec![Value::Int(1)]],
+            "it reads its own write"
+        );
+        assert_eq!(
+            count(&members[0], "InTxn"),
+            0,
+            "nothing applied before commit"
+        );
+
+        let taken = members[2]
+            .ingress()
+            .begin(begin_of(id), Placement::Anywhere)
+            .await;
+        assert!(
+            matches!(taken, Err(DatabaseError::TransactionIdInUse(t)) if t == id),
+            "a start naming an open ID, got {taken:?}"
+        );
+
+        let receipt = members[1]
+            .ingress()
+            .commit(commit_of(id), Placement::Anywhere)
+            .await
+            .expect("committed through follower 2");
+        assert!(receipt.commit_ts.as_raw() > 0);
+        for m in &members {
+            wait_until("the transaction reaches every member", || {
+                count(m, "InTxn") == 1
+            })
+            .await;
+        }
+        let again = members[2]
+            .ingress()
+            .commit(commit_of(id), Placement::Anywhere)
+            .await;
+        assert!(
+            matches!(again, Err(DatabaseError::UnknownTransaction(t)) if t == id),
+            "a committed transaction is gone, got {again:?}"
+        );
+
+        let local = members[1]
+            .ingress()
+            .begin(begin_of(draw_transaction_id()), Placement::LeaderLocal)
+            .await;
+        assert!(
+            matches!(local, Err(DatabaseError::NotLeader { leader_id: Some(1) })),
+            "a leader-local start off the leader, got {local:?}"
+        );
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// A transaction does not outlive the lead it was begun in, whichever member
+/// the host reaches it through: after the lead moves the new leader answers
+/// that it knows no such transaction, the old leader leading again does not
+/// revive it, and nothing of it lands anywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routed_transaction_ends_with_its_lead_and_stays_ended() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let id = draw_transaction_id();
+        members[1]
+            .ingress()
+            .begin(begin_of(id), Placement::Anywhere)
+            .await
+            .expect("begun through follower 2");
+        run_in(&members[1], id, "CREATE (:LostWithItsLead {k: 1})")
+            .await
+            .expect("written through follower 2");
+
+        members[0].transfer_leadership(3).await.unwrap();
+        wait_until("member 2 follows the new leader", || {
+            members[1].leader() == Some(3)
+        })
+        .await;
+        let gone = run_in(&members[1], id, "RETURN 1 AS one").await;
+        assert!(
+            matches!(gone, Err(DatabaseError::UnknownTransaction(t)) if t == id),
+            "the new leader never held it, got {gone:?}"
+        );
+
+        members[2].transfer_leadership(1).await.unwrap();
+        wait_until("member 2 follows member 1 again", || {
+            members[1].leader() == Some(1)
+        })
+        .await;
+        let still = members[1]
+            .ingress()
+            .commit(commit_of(id), Placement::Anywhere)
+            .await;
+        assert!(
+            matches!(still, Err(DatabaseError::UnknownTransaction(t)) if t == id),
+            "leading again does not revive it, got {still:?}"
+        );
+        members[0]
+            .execute(Statement::new("CREATE (:Marker {k: 1})"))
+            .await
+            .expect("a marker through the leader");
+        for m in &members {
+            wait_until("the marker reaches every member", || {
+                count(m, "Marker") == 1
+            })
+            .await;
+            assert_eq!(count(m, "LostWithItsLead"), 0, "nothing of it landed");
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
 }

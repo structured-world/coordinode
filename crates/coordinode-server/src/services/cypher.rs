@@ -20,12 +20,12 @@ use coordinode_raft::read_fence::ReadPreference;
 use coordinode_core::txn::command::{ActingContext, AdmissionSignal, TransactionId};
 use coordinode_embed::replication::routing::{RoutedAnswer, RoutedStatement};
 
-use super::routing::routed_settings;
 use super::statement::{
     Admission, Admitted, HOPS_HEADER, Requested, StatementExecutor, leader_hint, mismatch_metadata,
 };
 use crate::config::StatementDefaults;
 use crate::proto::{common, query, replication};
+use coordinode_embed::replication::executor::routed_settings;
 
 /// Extract source location context from gRPC request metadata.
 ///
