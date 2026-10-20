@@ -1420,6 +1420,49 @@ async fn a_host_works_through_any_member() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A member that has just joined may know who leads before it learns where
+/// the leader is; a command it could not send then goes again once it can,
+/// within a bounded series, so the host need not wait for the membership to
+/// settle. A command that may have run is never sent twice: one write lands
+/// once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_that_just_joined_sends_once_it_knows_where_the_leader_is() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        // Only the leader's id, not its address: the command may find the
+        // address unknown and has to go again.
+        wait_until("member 3 knows who leads", || {
+            members[2].leader() == Some(1)
+        })
+        .await;
+
+        let written = members[2]
+            .execute(Statement::new("CREATE (:JustJoined {k: 1})"))
+            .await
+            .expect("sent once the leader's address is known");
+        assert_eq!(written.forwarded_to, Some(1));
+        let begun = members[2]
+            .ingress()
+            .begin(begin_of(draw_transaction_id()), Placement::Anywhere)
+            .await
+            .expect("a transaction through the new member");
+        assert_eq!(begun.forwarded_to, Some(1));
+        for m in &members {
+            wait_until("the write reaches every member", || {
+                count(m, "JustJoined") == 1
+            })
+            .await;
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// One transaction through two followers: begun through one, written and
 /// read back through the other, committed through the first. Its writes are
 /// its own until the commit, then land on every member once. A start naming

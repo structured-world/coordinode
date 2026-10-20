@@ -431,8 +431,10 @@ fn fence_concern(level: ReadConcernLevel) -> FenceConcern {
 /// Rather than make every client learn the topology, the member that knows
 /// who leads routes a statement that needs the leader there. Once routed, it
 /// is answered rather than routed again: two members with stale hints would
-/// otherwise trade it back and forth. With no leader known the answer is the
-/// explicit no-leader refusal, which a client retries after the election.
+/// otherwise trade it back and forth, so a member reached by a routed
+/// statement it cannot run refuses it naming the leader it knows. With no
+/// leader known the answer is the explicit no-leader refusal, which a client
+/// retries after the election.
 fn fence_refusal(
     err: ReadFenceError,
     leader: Option<u64>,
@@ -444,7 +446,9 @@ fn fence_refusal(
     );
     match leader {
         Some(leader) if needs_leader && !already_forwarded => Ok(Admission::Forward(leader)),
-        None if needs_leader => Err(DatabaseError::NotLeader { leader_id: None }),
+        // Routed once already: the refusal names the leader this member
+        // knows, and the ingress decides what to do with it.
+        leader_id if needs_leader => Err(DatabaseError::NotLeader { leader_id }),
         _ => Err(fence_error(err)),
     }
 }

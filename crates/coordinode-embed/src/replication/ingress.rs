@@ -23,8 +23,8 @@ use parking_lot::RwLock;
 use super::admission::{Admission, Admitter, Requested, leader_hint};
 use super::executor;
 use super::routing::{
-    RoutedAnswer, RoutedBegin, RoutedCommit, RoutedOperationAnswer, RoutedOperationCall,
-    RoutedRollback, RoutedStatement,
+    CommandRouter, RoutedAnswer, RoutedBegin, RoutedCommit, RoutedOperationAnswer,
+    RoutedOperationCall, RoutedRollback, RoutedStatement,
 };
 use crate::{Database, DatabaseError};
 
@@ -200,16 +200,62 @@ impl Ingress {
             settings: executor::routed_settings(&requested),
             transaction: None,
             operation: requested.operation,
-            deadline: time_left(requested.deadline)?,
+            deadline: None,
             source,
         };
-        let router = self.admitter.router(leader)?;
-        let answer = cancellable(
-            requested.cancel.as_ref(),
-            router.execute(routed, &AdmissionSignal::new(|| {})),
-        )
-        .await?;
-        Ok(self.answered(answer, Some(leader)))
+        let admitted = AdmissionSignal::new(|| {});
+        let (answer, ran_at) = self
+            .at_leader(leader, requested.deadline, |router| {
+                let mut routed = routed.clone();
+                let (cancel, admitted) = (requested.cancel.as_ref(), &admitted);
+                async move {
+                    // What is left of the caller's time when this attempt goes.
+                    routed.deadline = time_left(requested.deadline)?;
+                    cancellable(cancel, router.execute(routed, admitted)).await
+                }
+            })
+            .await?;
+        Ok(self.answered(answer, Some(ran_at)))
+    }
+
+    /// Run `call` at `leader`. A call proven not sent there
+    /// ([`DatabaseError::PeerUnreachable`], such as a leader whose address
+    /// this member has not learned yet) goes again to the leader known then,
+    /// a bounded number of times within `deadline`; a call that may have run
+    /// is never sent again. Returns the answer and the member that gave it.
+    async fn at_leader<T, Fut>(
+        &self,
+        mut leader: u64,
+        deadline: Option<Instant>,
+        mut call: impl FnMut(CommandRouter) -> Fut,
+    ) -> Result<(T, u64), DatabaseError>
+    where
+        Fut: std::future::Future<Output = Result<T, DatabaseError>>,
+    {
+        let mut pauses = REROUTE_PAUSES.iter();
+        loop {
+            let sent = match self.admitter.router(leader) {
+                Ok(router) => call(router).await,
+                Err(e) => Err(e),
+            };
+            let unsent = match sent {
+                Err(e @ DatabaseError::PeerUnreachable { .. }) => e,
+                other => return other.map(|answer| (answer, leader)),
+            };
+            let Some(pause) = pauses.next() else {
+                return Err(unsent);
+            };
+            if deadline.is_some_and(|d| Instant::now() + *pause >= d) {
+                return Err(unsent);
+            }
+            tokio::time::sleep(*pause).await;
+            // This member leading now, or none leading, ends the retries:
+            // the caller hears why the command was not sent.
+            match self.admitter.transaction_leader() {
+                Ok(Some(next)) => leader = next,
+                Ok(None) | Err(_) => return Err(unsent),
+            }
+        }
     }
 
     /// Open a transaction under the ID the host drew, at the leader.
@@ -222,14 +268,22 @@ impl Ingress {
         begin: RoutedBegin,
         placement: Placement,
     ) -> Result<Routed<()>, DatabaseError> {
-        let ran_at = self.leader_for(placement)?;
-        match ran_at {
+        let ran_at = match self.leader_for(placement)? {
             None => {
                 let db = self.database();
                 blocking(move || executor::begin(&db.read(), begin)).await?;
+                None
             }
-            Some(leader) => self.admitter.router(leader)?.begin(begin).await?,
-        }
+            Some(leader) => {
+                let ((), ran_at) = self
+                    .at_leader(leader, None, |router| {
+                        let begin = begin.clone();
+                        async move { router.begin(begin).await }
+                    })
+                    .await?;
+                Some(ran_at)
+            }
+        };
         Ok(self.answered((), ran_at))
     }
 
@@ -247,19 +301,26 @@ impl Ingress {
         cancel: &CancelFlag,
         placement: Placement,
     ) -> Result<Routed<RoutedAnswer>, DatabaseError> {
-        let ran_at = self.leader_for(placement)?;
-        let answer = match ran_at {
+        let (answer, ran_at) = match self.leader_for(placement)? {
             None => {
                 let db = self.database();
                 let (admitted, cancel) = (admitted.clone(), cancel.clone());
-                blocking(move || {
+                let answer = blocking(move || {
                     executor::run_in_transaction(&db.read(), statement, &cancel, &admitted)
                 })
-                .await?
+                .await?;
+                (answer, None)
             }
             Some(leader) => {
-                let router = self.admitter.router(leader)?;
-                cancellable(Some(cancel), router.execute(statement, admitted)).await?
+                let (answer, ran_at) = self
+                    .at_leader(leader, None, |router| {
+                        let statement = statement.clone();
+                        async move {
+                            cancellable(Some(cancel), router.execute(statement, admitted)).await
+                        }
+                    })
+                    .await?;
+                (answer, Some(ran_at))
             }
         };
         Ok(self.answered(answer, ran_at))
@@ -277,13 +338,23 @@ impl Ingress {
         commit: RoutedCommit,
         placement: Placement,
     ) -> Result<Routed<CommitReceipt>, DatabaseError> {
-        let ran_at = self.leader_for(placement)?;
-        let receipt = match ran_at {
+        let (receipt, ran_at) = match self.leader_for(placement)? {
             None => {
                 let db = self.database();
-                blocking(move || executor::commit(&db.read(), commit)).await?
+                (
+                    blocking(move || executor::commit(&db.read(), commit)).await?,
+                    None,
+                )
             }
-            Some(leader) => self.admitter.router(leader)?.commit(commit).await?,
+            Some(leader) => {
+                let (receipt, ran_at) = self
+                    .at_leader(leader, None, |router| {
+                        let commit = commit.clone();
+                        async move { router.commit(commit).await }
+                    })
+                    .await?;
+                (receipt, Some(ran_at))
+            }
         };
         Ok(self.answered(receipt, ran_at))
     }
@@ -298,14 +369,22 @@ impl Ingress {
         rollback: RoutedRollback,
         placement: Placement,
     ) -> Result<Routed<()>, DatabaseError> {
-        let ran_at = self.leader_for(placement)?;
-        match ran_at {
+        let ran_at = match self.leader_for(placement)? {
             None => {
                 let db = self.database();
                 blocking(move || executor::rollback(&db.read(), rollback)).await?;
+                None
             }
-            Some(leader) => self.admitter.router(leader)?.rollback(rollback).await?,
-        }
+            Some(leader) => {
+                let ((), ran_at) = self
+                    .at_leader(leader, None, |router| {
+                        let rollback = rollback.clone();
+                        async move { router.rollback(rollback).await }
+                    })
+                    .await?;
+                Some(ran_at)
+            }
+        };
         Ok(self.answered((), ran_at))
     }
 
@@ -321,17 +400,22 @@ impl Ingress {
         call: RoutedOperationCall,
         placement: Placement,
     ) -> Result<Routed<RoutedOperationAnswer>, DatabaseError> {
-        let ran_at = self.leader_for(placement)?;
-        let answer = match ran_at {
+        let (answer, ran_at) = match self.leader_for(placement)? {
             None => {
                 let db = self.database();
-                blocking(move || executor::run_operation(&db.read(), call)).await?
+                (
+                    blocking(move || executor::run_operation(&db.read(), call)).await?,
+                    None,
+                )
             }
             Some(leader) => {
-                self.admitter
-                    .router(leader)?
-                    .operation(&actor, call)
-                    .await?
+                let (answer, ran_at) = self
+                    .at_leader(leader, None, |router| {
+                        let (call, actor) = (call.clone(), &actor);
+                        async move { router.operation(actor, call).await }
+                    })
+                    .await?;
+                (answer, Some(ran_at))
             }
         };
         Ok(self.answered(answer, ran_at))
@@ -353,6 +437,15 @@ impl Ingress {
         self.leader_for(Placement::LeaderLocal).map(|_| ())
     }
 }
+
+/// Pauses before sending a command again that was proven not sent: a
+/// member that just joined learns its leader's address within the first of
+/// them, and the whole series stays well inside a statement's time.
+const REROUTE_PAUSES: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(25),
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(100),
+];
 
 /// What is left until `deadline`; `None` without one.
 ///

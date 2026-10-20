@@ -122,15 +122,11 @@ fn a_role_refusal_names_the_leader_or_none() {
         "{none:?}"
     );
 
+    // Routed once already: answered with the refusal and the leader this
+    // member knows, for the ingress to decide on, never routed on.
     let once = fence_refusal(ReadFenceError::NotLeader, Some(2), true);
     assert!(
-        matches!(
-            once,
-            Err(DatabaseError::ReadFence {
-                kind: ReadFenceFailure::Role,
-                ..
-            })
-        ),
+        matches!(once, Err(DatabaseError::NotLeader { leader_id: Some(2) })),
         "{once:?}"
     );
     // A follower-only read on the leader is a role refusal whoever leads.
