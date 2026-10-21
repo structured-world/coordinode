@@ -158,16 +158,41 @@ async fn group(dirs: &[tempfile::TempDir]) -> Vec<ReplicatedDatabase> {
     members
 }
 
-/// A read the leader has to serve: a follower may not answer it.
-fn leader_read(k: usize) -> Statement {
+/// `statement` with `$k` bound to `k`: one text per arm, as a client sends
+/// it, so its plan is cached.
+fn with_k(mut statement: Statement, k: usize) -> Statement {
+    statement.params.insert(
+        "k".into(),
+        coordinode_core::graph::types::Value::Int(k as i64),
+    );
+    statement
+}
+
+/// A statement that touches no data: the arms differ by the route alone.
+/// The leader has to serve it, so a follower routes it.
+fn bare_statement() -> Statement {
     Statement {
         requested: Requested {
-            read_concern: Some(ReadConcernLevel::Majority),
             read_preference: Some(ReadPreference::Primary),
             ..Requested::default()
         },
-        ..Statement::new(format!("MATCH (n:Bench {{k: {k}}}) RETURN n.k AS k"))
+        ..Statement::new("RETURN 1 AS one")
     }
+}
+
+/// A read the leader has to serve: a follower may not answer it.
+fn leader_read(k: usize) -> Statement {
+    with_k(
+        Statement {
+            requested: Requested {
+                read_concern: Some(ReadConcernLevel::Majority),
+                read_preference: Some(ReadPreference::Primary),
+                ..Requested::default()
+            },
+            ..Statement::new("MATCH (n:Bench {k: $k}) RETURN n.k AS k")
+        },
+        k,
+    )
 }
 
 async fn transaction(member: &ReplicatedDatabase, k: usize) {
@@ -191,8 +216,11 @@ async fn transaction(member: &ReplicatedDatabase, k: usize) {
         .execute_in_transaction(
             RoutedStatement {
                 actor: ActingContext::Trusted,
-                query: format!("CREATE (:InTxn {{k: {k}}})"),
-                params: Default::default(),
+                query: "CREATE (:InTxn {k: $k})".to_owned(),
+                params: std::collections::HashMap::from([(
+                    "k".to_owned(),
+                    coordinode_core::graph::types::Value::Int(k as i64),
+                )]),
                 settings: RoutedSettings::default(),
                 transaction: Some(id),
                 operation: None,
@@ -226,6 +254,33 @@ async fn main() {
     let members = group(&dirs).await;
     let (leader, follower) = (&members[0], &members[1]);
 
+    // ROUTING_BENCH_BARE=N sends only N bare statements through the
+    // follower, after a line a profiler can start at: the route alone, long
+    // enough to sample.
+    if let Some(n) = std::env::var("ROUTING_BENCH_BARE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        println!("bare route: start");
+        let mut bare = Arm::default();
+        for _ in 0..n {
+            bare.measure(async {
+                follower
+                    .ingress()
+                    .execute(bare_statement())
+                    .await
+                    .expect("bare");
+            })
+            .await;
+        }
+        bare.report("RETURN 1 through a follower");
+        for m in members.into_iter().rev() {
+            m.shutdown().await.expect("shutdown");
+        }
+        return;
+    }
+
+    let (mut bare_direct, mut bare_routed) = (Arm::default(), Arm::default());
     let (mut write_direct, mut write_routed) = (Arm::default(), Arm::default());
     let (mut read_direct, mut read_routed) = (Arm::default(), Arm::default());
     let (mut txn_direct, mut txn_routed) = (Arm::default(), Arm::default());
@@ -233,22 +288,37 @@ async fn main() {
         // Neither arm always runs first.
         let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
         for arm in order {
-            let (member, write, read, txn) = if arm == 0 {
-                (leader, &mut write_direct, &mut read_direct, &mut txn_direct)
+            let (member, bare, write, read, txn) = if arm == 0 {
+                (
+                    leader,
+                    &mut bare_direct,
+                    &mut write_direct,
+                    &mut read_direct,
+                    &mut txn_direct,
+                )
             } else {
                 (
                     follower,
+                    &mut bare_routed,
                     &mut write_routed,
                     &mut read_routed,
                     &mut txn_routed,
                 )
             };
             let k = round * 2 + arm;
+            bare.measure(async {
+                member
+                    .ingress()
+                    .execute(bare_statement())
+                    .await
+                    .expect("bare");
+            })
+            .await;
             write
                 .measure(async {
                     member
                         .ingress()
-                        .execute(Statement::new(format!("CREATE (:Bench {{k: {k}}})")))
+                        .execute(with_k(Statement::new("CREATE (:Bench {k: $k})"), k))
                         .await
                         .expect("write");
                 })
@@ -264,6 +334,8 @@ async fn main() {
             txn.measure(transaction(member, k)).await;
         }
     }
+    bare_direct.report("RETURN 1 at the leader");
+    bare_routed.report("RETURN 1 through a follower");
     write_direct.report("write at the leader");
     write_routed.report("write through a follower");
     read_direct.report("leader read at the leader");
