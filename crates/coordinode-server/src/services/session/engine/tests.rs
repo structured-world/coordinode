@@ -164,6 +164,7 @@ fn a_cancelled_statement_answers_with_a_cancellation() {
     let transaction = coordinode_session::InTransaction {
         id,
         admission: AdmissionSignal::new(|| {}),
+        start: None,
     };
     let refused = engine
         .open_cursor(

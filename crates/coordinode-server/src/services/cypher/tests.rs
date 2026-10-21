@@ -134,6 +134,7 @@ fn in_txn(
     let transaction = coordinode_session::InTransaction {
         id: tx,
         admission: AdmissionSignal::new(|| {}),
+        start: None,
     };
     let mut cursor = session_engine(svc)
         .open_cursor(

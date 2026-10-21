@@ -30,7 +30,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use coordinode_core::budget::CancelFlag;
 use coordinode_core::txn::operation::OperationDescriptor;
 
-use crate::engine::{CursorEngine, EngineError, InTransaction};
+use crate::engine::{CursorEngine, EngineError, InTransaction, TransactionStart};
 use crate::registry::SessionRegistry;
 use crate::types::{
     ConnectionSettings, ConnectionState, ErrorCode, Failure, SessionEvent, SessionOp, SessionStats,
@@ -259,6 +259,8 @@ impl Session {
                         execute(&engine, statement, None, &out).await;
                     }),
                     Some(id) => {
+                        // The transaction's first statement carries its begin.
+                        let start = lanes.starts.remove(&id).map(|pending| pending.start);
                         let lane = lanes.step(id);
                         self.registry.attach(self.session_id, id);
                         self.spawn(out, move |engine, _, out| async move {
@@ -266,6 +268,7 @@ impl Session {
                             let transaction = InTransaction {
                                 id,
                                 admission: lane.signal(),
+                                start,
                             };
                             // The stream going away stops the statement: its
                             // answer has nowhere to go.
@@ -289,31 +292,32 @@ impl Session {
                 }
             }
 
-            // In the transaction's lane like any of its commands, so the
-            // statements the client sends right after it run once it is open.
-            // Only a refusal answers. The session's settings are taken now:
-            // they are the transaction's for its life.
+            // Nothing is sent: the transaction's first command carries the
+            // begin, so opening it costs no call of its own. The session's
+            // settings are taken now: they are the transaction's for its
+            // life. A refused start answers on the command that carried it.
             SessionOp::Begin {
                 transaction,
                 operation,
             } => {
-                let settings = self.settings.lock().clone();
-                let lane = lanes.step(transaction);
-                let session_id = self.session_id;
-                self.spawn(out, move |engine, registry, out| async move {
-                    lane.after_previous().await;
-                    let begun = blocking(move || {
-                        engine.begin_transaction(transaction, &settings, operation.as_ref())
-                    })
-                    .await;
-                    lane.mine.release();
-                    match begun {
-                        Ok(()) => registry.attach(session_id, transaction),
-                        Err(failure) => {
-                            send_error(&out, request_id, failure).await;
-                        }
+                let pending = PendingStart {
+                    start: TransactionStart {
+                        settings: self.settings.lock().clone(),
+                        operation,
+                    },
+                    request_id,
+                };
+                self.registry.attach(self.session_id, transaction);
+                // A second begin under an ID whose first was not sent yet:
+                // the first opens it, and this one is refused on its own
+                // request as a start naming an open ID, as when the first
+                // had run.
+                if let Some(earlier) = lanes.starts.insert(transaction, pending) {
+                    self.open(transaction, earlier, lanes, out);
+                    if let Some(this) = lanes.starts.remove(&transaction) {
+                        self.open(transaction, this, lanes, out);
                     }
-                });
+                }
             }
 
             SessionOp::Commit {
@@ -321,6 +325,10 @@ impl Session {
                 operation,
                 expect,
             } => {
+                // A transaction whose begin no statement carried opens first.
+                if let Some(pending) = lanes.starts.remove(&transaction) {
+                    self.open(transaction, pending, lanes, out);
+                }
                 let lane = lanes.step(transaction);
                 let session_id = self.session_id;
                 self.spawn(out, move |engine, registry, out| async move {
@@ -349,6 +357,11 @@ impl Session {
             // client asked to discard, and nothing it can do depends on the
             // answer.
             SessionOp::Rollback { transaction } => {
+                // A begin no command carried yet opened nothing to discard.
+                if lanes.starts.remove(&transaction).is_some() {
+                    self.registry.detach(self.session_id, &transaction);
+                    return;
+                }
                 let lane = lanes.step(transaction);
                 let session_id = self.session_id;
                 self.spawn(out, move |engine, registry, _| async move {
@@ -382,6 +395,31 @@ impl Session {
                 let _ = out.send((request_id, event)).await;
             }
         }
+    }
+
+    /// Open `transaction` with `pending` as a command of its own, in its lane:
+    /// for a transaction whose first command is not a statement. Only a
+    /// refusal answers, on the begin's request.
+    fn open(
+        &self,
+        transaction: TransactionId,
+        pending: PendingStart,
+        lanes: &mut Lanes,
+        out: &mpsc::Sender<OutEvent>,
+    ) {
+        let lane = lanes.step(transaction);
+        self.spawn(out, move |engine, _, out| async move {
+            lane.after_previous().await;
+            let PendingStart { start, request_id } = pending;
+            let begun = blocking(move || {
+                engine.begin_transaction(transaction, &start.settings, start.operation.as_ref())
+            })
+            .await;
+            lane.mine.release();
+            if let Err(failure) = begun {
+                send_error(&out, request_id, failure).await;
+            }
+        });
     }
 
     /// Run `request` on its own task, counted as in flight for its lifetime.
@@ -418,20 +456,31 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// The commands this stream sent for each transaction, each one a step that
-/// the next waits on.
+/// the next waits on, and the begins its transactions' first commands carry.
 #[derive(Default)]
-struct Lanes(HashMap<TransactionId, Arc<LaneStep>>);
+struct Lanes {
+    steps: HashMap<TransactionId, Arc<LaneStep>>,
+    starts: HashMap<TransactionId, PendingStart>,
+}
 
 impl Lanes {
     /// The step of the next command for transaction `id`, after the one sent
     /// before.
     fn step(&mut self, id: TransactionId) -> LanePosition {
         // Steps already passed hold nobody back.
-        self.0.retain(|_, step| !step.is_released());
+        self.steps.retain(|_, step| !step.is_released());
         let mine = Arc::new(LaneStep::default());
-        let previous = self.0.insert(id, Arc::clone(&mine));
+        let previous = self.steps.insert(id, Arc::clone(&mine));
         LanePosition { previous, mine }
     }
+}
+
+/// A begin this stream received and has not sent yet: the transaction's
+/// first command carries it.
+struct PendingStart {
+    start: TransactionStart,
+    /// The begin's request, answered when the start is refused on its own.
+    request_id: u64,
 }
 
 /// Where a command stands in its stream's order for one transaction.

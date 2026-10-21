@@ -21,7 +21,7 @@ use coordinode_embed::db::draw_transaction_id;
 use coordinode_embed::replication::admission::Requested;
 use coordinode_embed::replication::ingress::{Placement, Statement};
 use coordinode_embed::replication::routing::{
-    RoutedBegin, RoutedCommit, RoutedSettings, RoutedStatement,
+    RoutedCommit, RoutedSettings, RoutedStatement, TransactionStart,
 };
 use coordinode_embed::replication::{
     ElectionPreference, Founding, MemberOptions, PeerTimeouts, Peering, ReplicatedDatabase,
@@ -195,23 +195,10 @@ fn leader_read(k: usize) -> Statement {
     )
 }
 
+/// A transaction of one statement: the statement opens it, then a commit.
 async fn transaction(member: &ReplicatedDatabase, k: usize) {
     let id = draw_transaction_id();
     let ingress = member.ingress();
-    ingress
-        .begin(
-            RoutedBegin {
-                transaction: id,
-                actor: ActingContext::Trusted,
-                read_concern: None,
-                write_concern: None,
-                timeout_outcome: None,
-                operation: None,
-            },
-            Placement::Anywhere,
-        )
-        .await
-        .expect("begin");
     ingress
         .execute_in_transaction(
             RoutedStatement {
@@ -226,6 +213,7 @@ async fn transaction(member: &ReplicatedDatabase, k: usize) {
                 operation: None,
                 deadline: None,
                 source: None,
+                start: Some(TransactionStart::default()),
             },
             &AdmissionSignal::new(|| {}),
             &coordinode_core::budget::CancelFlag::new(),
@@ -274,6 +262,34 @@ async fn main() {
             .await;
         }
         bare.report("RETURN 1 through a follower");
+        // The transport alone: a unary call on the same channel that does
+        // almost nothing at the leader.
+        let router = follower.ingress().admitter().router(1).expect("router");
+        let unknown = coordinode_embed::operation::OperationDescriptor {
+            op: coordinode_core::txn::operation::OperationId {
+                issuer: coordinode_embed::operation::IssuerId([9; 16]),
+                incarnation: 1,
+                sequence: 1,
+            },
+            deployment: coordinode_core::group::DeploymentId([0xee; 16]),
+        };
+        let mut unary = Arm::default();
+        for _ in 0..n {
+            unary
+                .measure(async {
+                    let _ = router
+                        .operation(
+                            &ActingContext::Trusted,
+                            coordinode_embed::replication::routing::RoutedOperationCall::Resolve(
+                                unknown,
+                                coordinode_embed::operation::Resolve::Lookup,
+                            ),
+                        )
+                        .await;
+                })
+                .await;
+        }
+        unary.report("unary operation call on the same channel");
         for m in members.into_iter().rev() {
             m.shutdown().await.expect("shutdown");
         }
@@ -398,6 +414,7 @@ async fn slow_consumer(leader: &ReplicatedDatabase, follower: &ReplicatedDatabas
         operation: None,
         deadline: None,
         source: None,
+        start: None,
     };
     let router = follower
         .ingress()

@@ -107,6 +107,37 @@ pub struct RoutedStatement {
     pub deadline: Option<Duration>,
     /// Where in the client's code it was issued.
     pub source: Option<SourceContext>,
+    /// On the first statement of a transaction: how the transaction opens.
+    /// It opens and the statement runs in it in one call, with no separate
+    /// begin before it.
+    pub start: Option<TransactionStart>,
+}
+
+/// How the command that starts a transaction opens it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransactionStart {
+    /// The read concern of its statements; the leader's when `None`.
+    pub read_concern: Option<ReadConcernLevel>,
+    /// The write concern of its commit; the leader's when `None`.
+    pub write_concern: Option<WriteConcern>,
+    /// What ends it when it stays idle; the leader's setting when `None`.
+    pub timeout_outcome: Option<TimeoutOutcome>,
+    /// The client operation its commit carries out.
+    pub operation: Option<OperationDescriptor>,
+}
+
+impl RoutedBegin {
+    /// Open `transaction` for `actor` as `start` says.
+    pub fn new(transaction: TransactionId, actor: ActingContext, start: TransactionStart) -> Self {
+        Self {
+            transaction,
+            actor,
+            read_concern: start.read_concern,
+            write_concern: start.write_concern,
+            timeout_outcome: start.timeout_outcome,
+            operation: start.operation,
+        }
+    }
 }
 
 /// What a finished statement reports.
@@ -1201,7 +1232,49 @@ fn statement_to_wire(statement: RoutedStatement) -> Result<wire::RoutedStatement
             app: s.app,
             version: s.version,
         }),
+        start: statement.start.map(start_to_wire),
     })
+}
+
+fn start_to_wire(start: TransactionStart) -> wire::RoutedStart {
+    wire::RoutedStart {
+        settings: Some(settings_to_wire(RoutedSettings {
+            read_concern: start.read_concern,
+            write_concern: start.write_concern,
+            ..RoutedSettings::default()
+        })),
+        timeout_outcome: timeout_outcome_to_wire(start.timeout_outcome),
+        operation: start.operation.map(|o| o.to_bytes()).unwrap_or_default(),
+    }
+}
+
+fn start_from_wire(start: wire::RoutedStart) -> Result<TransactionStart, Status> {
+    let settings = settings_from_wire(start.settings)?;
+    Ok(TransactionStart {
+        read_concern: settings.read_concern,
+        write_concern: settings.write_concern,
+        timeout_outcome: timeout_outcome_from_wire(start.timeout_outcome)?,
+        operation: operation_from_wire(&start.operation)?,
+    })
+}
+
+fn timeout_outcome_to_wire(outcome: Option<TimeoutOutcome>) -> u32 {
+    match outcome {
+        None => 0,
+        Some(TimeoutOutcome::Rollback) => 1,
+        Some(TimeoutOutcome::Commit) => 2,
+    }
+}
+
+fn timeout_outcome_from_wire(outcome: u32) -> Result<Option<TimeoutOutcome>, Status> {
+    match outcome {
+        0 => Ok(None),
+        1 => Ok(Some(TimeoutOutcome::Rollback)),
+        2 => Ok(Some(TimeoutOutcome::Commit)),
+        other => Err(Status::invalid_argument(format!(
+            "timeout outcome {other} is not one this member knows"
+        ))),
+    }
 }
 
 fn statement_from_wire(statement: wire::RoutedStatement) -> Result<RoutedStatement, Status> {
@@ -1229,6 +1302,7 @@ fn statement_from_wire(statement: wire::RoutedStatement) -> Result<RoutedStateme
             app: s.app,
             version: s.version,
         }),
+        start: statement.start.map(start_from_wire).transpose()?,
     })
 }
 
@@ -1269,11 +1343,7 @@ fn begin_to_wire(begin: RoutedBegin) -> wire::RoutedBegin {
             write_concern: begin.write_concern,
             ..RoutedSettings::default()
         })),
-        timeout_outcome: match begin.timeout_outcome {
-            None => 0,
-            Some(TimeoutOutcome::Rollback) => 1,
-            Some(TimeoutOutcome::Commit) => 2,
-        },
+        timeout_outcome: timeout_outcome_to_wire(begin.timeout_outcome),
         operation: begin.operation.map(|o| o.to_bytes()).unwrap_or_default(),
     }
 }
@@ -1285,16 +1355,7 @@ fn begin_from_wire(begin: wire::RoutedBegin) -> Result<RoutedBegin, Status> {
         actor: actor_from_wire(begin.actor)?,
         read_concern: settings.read_concern,
         write_concern: settings.write_concern,
-        timeout_outcome: match begin.timeout_outcome {
-            0 => None,
-            1 => Some(TimeoutOutcome::Rollback),
-            2 => Some(TimeoutOutcome::Commit),
-            other => {
-                return Err(Status::invalid_argument(format!(
-                    "timeout outcome {other} is not one this member knows"
-                )));
-            }
-        },
+        timeout_outcome: timeout_outcome_from_wire(begin.timeout_outcome)?,
         operation: operation_from_wire(&begin.operation)?,
     })
 }

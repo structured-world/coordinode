@@ -40,6 +40,7 @@ use parking_lot::RwLock;
 use coordinode_core::txn::command::ActingContext;
 use coordinode_embed::replication::routing::{
     RoutedBegin, RoutedCommit, RoutedRollback, RoutedRows, RoutedSettings, RoutedStatement,
+    TransactionStart as RoutedStart,
 };
 
 use super::failure;
@@ -159,7 +160,25 @@ impl DatabaseCursorEngine {
             // and Cancel stops it.
             deadline: None,
             source,
+            start: None,
         }
+    }
+}
+
+/// How a transaction opens with `settings`, the session's at its begin: its
+/// concerns and timeout outcome, a setting the session never named being the
+/// leader's, and the operation its commit carries out.
+fn transaction_start(
+    settings: &ConnectionSettings,
+    operation: Option<&OperationDescriptor>,
+) -> RoutedStart {
+    RoutedStart {
+        read_concern: settings
+            .read_concern
+            .and_then(|level| read_concern_level("", i32::from(level)).ok().flatten()),
+        write_concern: settings.write_concern,
+        timeout_outcome: settings.timeout_outcome,
+        operation: operation.copied(),
     }
 }
 
@@ -203,6 +222,11 @@ impl CursorEngine for DatabaseCursorEngine {
         // fence and no commit of its own here. Its session's vector settings
         // still apply.
         if let Some(transaction) = transaction {
+            // The transaction's first statement opens it, in the same step.
+            let start = transaction
+                .start
+                .as_ref()
+                .map(|start| transaction_start(&start.settings, start.operation.as_ref()));
             // Another member leads: the statement runs there, and has its
             // place once the leader says so.
             if let Some(leader) = self.transaction_leader()? {
@@ -220,8 +244,12 @@ impl CursorEngine for DatabaseCursorEngine {
                     operation: None,
                     deadline: None,
                     source,
+                    start,
                 };
                 return self.routed(leader, statement, &transaction.admission, cancel);
+            }
+            if let Some(start) = start {
+                self.begin_here(transaction.id, start)?;
             }
             let options = StatementOptions {
                 vector_consistency: settings.vector_consistency,
@@ -330,41 +358,17 @@ impl CursorEngine for DatabaseCursorEngine {
         settings: &ConnectionSettings,
         operation: Option<&OperationDescriptor>,
     ) -> Result<(), EngineError> {
-        // The session's settings now are the transaction's for its life; a
-        // setting the session never named is the leader's.
-        let read_concern = settings
-            .read_concern
-            .and_then(|level| read_concern_level("", i32::from(level)).ok().flatten());
+        let start = transaction_start(settings, operation);
         // A transaction is held by the leader: on another member it opens
         // there.
         if let Some(leader) = self.transaction_leader()? {
             let router = self.executor.router(leader).map_err(engine_error)?;
-            let begin = RoutedBegin {
-                transaction,
-                actor: ActingContext::Trusted,
-                read_concern,
-                write_concern: settings.write_concern,
-                timeout_outcome: settings.timeout_outcome,
-                operation: operation.copied(),
-            };
             return self.block_on_routed(
                 &coordinode_core::budget::CancelFlag::new(),
-                router.begin(begin),
+                router.begin(RoutedBegin::new(transaction, ActingContext::Trusted, start)),
             );
         }
-        self.database()
-            .read()
-            .begin_transaction_as(
-                transaction,
-                &TransactionOptions {
-                    read_concern,
-                    write_concern: settings.write_concern,
-                    timeout_outcome: settings.timeout_outcome,
-                    operation: operation.copied(),
-                    ..TransactionOptions::trusted()
-                },
-            )
-            .map_err(engine_error)
+        self.begin_here(transaction, start)
     }
 
     fn commit_transaction(
@@ -416,6 +420,27 @@ impl CursorEngine for DatabaseCursorEngine {
 }
 
 impl DatabaseCursorEngine {
+    /// Open `transaction` on this member, which leads, as `start` says.
+    fn begin_here(
+        &self,
+        transaction: TransactionId,
+        start: RoutedStart,
+    ) -> Result<(), EngineError> {
+        self.database()
+            .read()
+            .begin_transaction_as(
+                transaction,
+                &TransactionOptions {
+                    read_concern: start.read_concern,
+                    write_concern: start.write_concern,
+                    timeout_outcome: start.timeout_outcome,
+                    operation: start.operation,
+                    ..TransactionOptions::trusted()
+                },
+            )
+            .map_err(engine_error)
+    }
+
     /// Roll back `transaction` for `end`, at the leader that holds it.
     fn end_transaction(
         &self,

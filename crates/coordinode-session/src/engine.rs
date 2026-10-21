@@ -23,6 +23,21 @@ pub struct InTransaction {
     /// Told when the statement has its place in the transaction's order; the
     /// session sends this stream's next command for the transaction then.
     pub admission: AdmissionSignal,
+    /// On the transaction's first statement: how it opens. The engine opens
+    /// it and runs the statement in it in one step, so a begin costs no
+    /// call of its own.
+    pub start: Option<TransactionStart>,
+}
+
+/// How a transaction opens: the session's settings when its begin arrived,
+/// of which the concerns and the timeout outcome become the transaction's
+/// for its life, and the client operation its commit carries out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransactionStart {
+    /// The session's settings at the begin.
+    pub settings: ConnectionSettings,
+    /// The client operation the transaction's commit carries out.
+    pub operation: Option<OperationDescriptor>,
 }
 
 /// An error from the query engine, neutral over the engine implementation. It
@@ -94,7 +109,9 @@ pub trait CursorEngine: Send + Sync {
     /// life (a field still unset is the engine's default). `operation` is
     /// the client operation its commit carries out. Subsequent `open_cursor`
     /// calls carrying this ID run inside it, reading its pinned snapshot and
-    /// buffering writes until `commit_transaction`.
+    /// buffering writes until `commit_transaction`. A transaction normally
+    /// opens with its first statement ([`InTransaction::start`]); this is
+    /// for one whose first command is not a statement.
     fn begin_transaction(
         &self,
         transaction: TransactionId,

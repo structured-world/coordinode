@@ -1301,6 +1301,7 @@ fn in_transaction(id: TransactionId, query: &str) -> RoutedStatement {
         operation: None,
         deadline: None,
         source: None,
+        start: None,
     }
 }
 
@@ -1611,6 +1612,7 @@ async fn a_routed_write_takes_effect_once_across_a_leader_change() {
                     operation: None,
                     deadline: None,
                     source: None,
+                    start: None,
                 },
                 &AdmissionSignal::new(|| {}),
             )
@@ -2306,6 +2308,74 @@ async fn a_write_on_a_follower_is_sent_to_the_leader_before_it_runs() {
             matches!(routed, Err(DatabaseError::NotLeader { leader_id: Some(1) })),
             "{routed:?}"
         );
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// A transaction opened through a follower opens with its first statement:
+/// the statement carries the start, and the leader opens the transaction and
+/// runs the statement in it in one call, with no begin before it. A second
+/// start under the same ID is refused before its statement runs, and the
+/// transaction it names carries on untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_opens_with_its_first_statement() {
+    use coordinode_embed::replication::routing::TransactionStart;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let id = draw_transaction_id();
+        let starting = |query: &str| RoutedStatement {
+            start: Some(TransactionStart::default()),
+            ..in_transaction(id, query)
+        };
+        let ingress = members[1].ingress();
+
+        let first = ingress
+            .execute_in_transaction(
+                starting("CREATE (:Started {k: 1})"),
+                &AdmissionSignal::new(|| {}),
+                &CancelFlag::new(),
+                Placement::Anywhere,
+            )
+            .await
+            .expect("opened by its first statement");
+        assert_eq!(first.forwarded_to, Some(1));
+
+        let again = ingress
+            .execute_in_transaction(
+                starting("CREATE (:Started {k: 2})"),
+                &AdmissionSignal::new(|| {}),
+                &CancelFlag::new(),
+                Placement::Anywhere,
+            )
+            .await;
+        assert!(
+            matches!(again, Err(DatabaseError::TransactionIdInUse(t)) if t == id),
+            "a second start under an open ID, got {again:?}"
+        );
+
+        let own = run_in(&members[2], id, "MATCH (n:Started) RETURN count(n) AS c")
+            .await
+            .expect("read back through another follower");
+        assert_eq!(own.value.rows, vec![vec![Value::Int(1)]]);
+        members[2]
+            .ingress()
+            .commit(commit_of(id), Placement::Anywhere)
+            .await
+            .expect("committed");
+        for m in &members {
+            wait_until("the transaction reaches every member", || {
+                count(m, "Started") == 1
+            })
+            .await;
+        }
 
         for m in members.into_iter().rev() {
             m.shutdown().await.unwrap();

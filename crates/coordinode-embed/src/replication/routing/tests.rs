@@ -353,7 +353,38 @@ fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
             app: "svc".into(),
             version: "1".into(),
         }),
+        start: None,
     }
+}
+
+/// The start a transaction's first statement carries crosses the wire as
+/// the ingress set it, every field, an unset one staying unset.
+#[test]
+fn a_start_crosses_unchanged() {
+    for start in [
+        TransactionStart::default(),
+        TransactionStart {
+            read_concern: Some(ReadConcernLevel::Snapshot),
+            write_concern: Some(WriteConcern {
+                w: WriteAck::Acks(2),
+                journal: Journal::Cache,
+                timeout_ms: 250,
+            }),
+            timeout_outcome: Some(TimeoutOutcome::Commit),
+            operation: Some(operation(7)),
+        },
+    ] {
+        let sent = RoutedStatement {
+            start: Some(start),
+            ..statement(Some(txid()))
+        };
+        let arrived =
+            statement_from_wire(statement_to_wire(sent).expect("encoded")).expect("decoded");
+        assert_eq!(arrived.start, Some(start));
+    }
+    let none = statement_from_wire(statement_to_wire(statement(Some(txid()))).expect("encoded"))
+        .expect("decoded");
+    assert_eq!(none.start, None);
 }
 
 /// An answer that fits one batch travels as one message: its columns, rows

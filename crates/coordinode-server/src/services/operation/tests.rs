@@ -196,6 +196,7 @@ async fn a_repeated_commit_answers_with_the_outcome() {
             Some(&coordinode_session::InTransaction {
                 id: txn,
                 admission: AdmissionSignal::new(|| {}),
+                start: None,
             }),
             &coordinode_session::ConnectionSettings::default(),
             None,

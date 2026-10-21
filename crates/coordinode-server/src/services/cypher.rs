@@ -998,6 +998,7 @@ impl CypherServiceImpl {
             operation: requested.operation,
             deadline: time_left(requested.deadline),
             source,
+            start: None,
         };
         let answer = self
             .executor

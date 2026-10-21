@@ -14,7 +14,7 @@ mod registry;
 mod session;
 mod types;
 
-pub use engine::{CursorEngine, EngineError, InTransaction, QueryCursor};
+pub use engine::{CursorEngine, EngineError, InTransaction, QueryCursor, TransactionStart};
 pub use registry::SessionRegistry;
 pub use session::{InOp, OutEvent, Session, SessionManager};
 pub use types::{

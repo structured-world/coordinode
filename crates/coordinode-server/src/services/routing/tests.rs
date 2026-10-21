@@ -55,6 +55,7 @@ fn statement(query: &str) -> RoutedStatement {
         operation: None,
         deadline: Some(Duration::from_secs(30)),
         source: None,
+        start: None,
     }
 }
 

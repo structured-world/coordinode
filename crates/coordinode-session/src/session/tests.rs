@@ -189,6 +189,8 @@ enum Call {
         settings: Box<ConnectionSettings>,
         source: Option<StatementSource>,
         operation: Option<OperationDescriptor>,
+        /// The begin the statement carried, when it opened its transaction.
+        start: Option<Box<TransactionStart>>,
     },
     Begin(
         TransactionId,
@@ -254,6 +256,7 @@ impl CursorEngine for RecordingEngine {
             settings: Box::new(settings.clone()),
             source: source.cloned(),
             operation: operation.copied(),
+            start: transaction.and_then(|t| t.start.clone()).map(Box::new),
         });
         if let Some(transaction) = transaction {
             transaction.admission.admitted();
@@ -854,11 +857,11 @@ async fn execute_surfaces_an_engine_error() {
     }
 }
 
-/// Begin passes on the client's transaction ID, its operation and the
-/// session's settings as they stand when it arrives: those become the
-/// transaction's. A Configure after a Begin does not reach back into it, and
-/// a Begin that opens is not answered: the client sends the transaction's
-/// statements right after it.
+/// Begin takes the client's transaction ID, its operation and the session's
+/// settings as they stand when it arrives: those become the transaction's,
+/// and a Configure after it does not reach back. Nothing is sent for it and
+/// nothing answers it: the transaction's first statement carries it, so
+/// opening the transaction costs no call of its own.
 #[tokio::test]
 async fn begin_takes_the_session_settings_in_effect_and_its_operation() {
     let recording = Arc::new(RecordingEngine::default());
@@ -881,55 +884,105 @@ async fn begin_takes_the_session_settings_in_effect_and_its_operation() {
                 timeout_outcome: Some(TimeoutOutcome::Rollback),
                 ..ConnectionSettings::default()
             }),
+            statement("one", Some(txid(1))),
+            statement("three", Some(txid(3))),
         ],
     )
     .await;
     assert!(
         !by_id.contains_key(&1) && !by_id.contains_key(&3),
-        "an opened transaction is not answered: {by_id:?}"
-    );
-    let begins: Vec<Call> = recording
-        .calls()
-        .into_iter()
-        .filter(|call| matches!(call, Call::Begin(..)))
-        .collect();
-    assert!(
-        begins.contains(&Call::Begin(txid(1), Box::default(), None)),
-        "{begins:?}"
+        "a begin is not answered: {by_id:?}"
     );
     assert!(
-        begins.contains(&Call::Begin(txid(3), Box::new(configured), Some(op(8)))),
-        "{begins:?}"
+        !recording
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Begin(..))),
+        "a begin travelled on its own: {:?}",
+        recording.calls()
+    );
+    let start = |query| match recording.statement(query) {
+        Call::Statement { start, .. } => start,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        start("one"),
+        Some(Box::new(TransactionStart {
+            settings: ConnectionSettings::default(),
+            operation: None,
+        }))
+    );
+    assert_eq!(
+        start("three"),
+        Some(Box::new(TransactionStart {
+            settings: configured,
+            operation: Some(op(8)),
+        }))
     );
 }
 
-/// A statement sent right after its Begin runs once the transaction is
-/// open: the Begin holds the transaction's lane until the engine has opened
-/// it, so the statement cannot reach the engine first.
+/// The begin travels with the transaction's first statement and only with
+/// it: the statements after run in the transaction it opened.
 #[tokio::test]
-async fn a_statement_sent_right_after_its_begin_runs_after_it() {
+async fn the_first_statement_carries_the_begin() {
     let recording = Arc::new(RecordingEngine::default());
     run_session(
         Arc::clone(&recording) as Arc<dyn CursorEngine>,
-        vec![begin(txid(7)), statement("first", Some(txid(7)))],
+        vec![
+            begin(txid(7)),
+            statement("first", Some(txid(7))),
+            statement("second", Some(txid(7))),
+        ],
+    )
+    .await;
+    let start = |query| match recording.statement(query) {
+        Call::Statement { start, .. } => start,
+        other => panic!("{other:?}"),
+    };
+    assert!(start("first").is_some(), "{:?}", recording.calls());
+    assert_eq!(start("second"), None, "{:?}", recording.calls());
+}
+
+/// A transaction whose first command is its commit opens on its own first,
+/// then commits; a rollback before any command discards a begin nothing
+/// opened, and nothing reaches the engine for it.
+#[tokio::test]
+async fn a_begin_no_statement_carried_still_opens_or_is_dropped() {
+    let recording = Arc::new(RecordingEngine::default());
+    run_session(
+        Arc::clone(&recording) as Arc<dyn CursorEngine>,
+        vec![
+            begin(txid(4)),
+            commit(txid(4)),
+            begin(txid(5)),
+            SessionOp::Rollback {
+                transaction: txid(5),
+            },
+        ],
     )
     .await;
     let calls = recording.calls();
     let begun = calls
         .iter()
-        .position(|call| matches!(call, Call::Begin(id, ..) if *id == txid(7)))
-        .expect("the begin reached the engine");
-    let first = calls
+        .position(|call| matches!(call, Call::Begin(id, ..) if *id == txid(4)))
+        .expect("the empty transaction opened");
+    let committed = calls
         .iter()
-        .position(|call| matches!(call, Call::Statement { query, .. } if query == "first"))
-        .expect("the statement reached the engine");
+        .position(|call| matches!(call, Call::Commit(id, ..) if *id == txid(4)))
+        .expect("the empty transaction committed");
+    assert!(begun < committed, "{calls:?}");
     assert!(
-        begun < first,
-        "the statement ran before its begin: {calls:?}"
+        !calls.iter().any(|call| matches!(
+            call,
+            Call::Begin(id, ..) | Call::Rollback(id) if *id == txid(5)
+        )),
+        "{calls:?}"
     );
 }
 
-/// A Begin the engine refuses is answered with the refusal.
+/// A start the engine refuses is answered on the request that sent it: on
+/// the begin when it opened on its own, and a second begin under an ID whose
+/// first was not sent yet is refused as a start naming an open ID.
 #[tokio::test]
 async fn a_refused_begin_is_answered() {
     struct Refuses;
@@ -978,17 +1031,30 @@ async fn a_refused_begin_is_answered() {
         }
     }
 
-    let events = run_one(Arc::new(Refuses), begin(txid(1))).await;
+    // Opened on its own by the commit that follows it.
+    let by_id = run_session(Arc::new(Refuses), vec![begin(txid(1)), commit(txid(1))]).await;
     assert!(
         matches!(
-            events.as_slice(),
-            [SessionEvent::Error(Failure {
+            by_id.get(&1).map(Vec::as_slice),
+            Some([SessionEvent::Error(Failure {
                 code: ErrorCode::AlreadyExists,
                 ..
-            })]
+            })])
         ),
-        "{events:?}"
+        "{by_id:?}"
     );
+    // Two begins under one ID: both reach the engine, each answered on its
+    // own request.
+    let by_id = run_session(Arc::new(Refuses), vec![begin(txid(2)), begin(txid(2))]).await;
+    for request in [1, 2] {
+        assert!(
+            matches!(
+                by_id.get(&request).map(Vec::as_slice),
+                Some([SessionEvent::Error(_)])
+            ),
+            "request {request}: {by_id:?}"
+        );
+    }
 }
 
 #[tokio::test]

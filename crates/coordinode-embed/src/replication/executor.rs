@@ -274,6 +274,7 @@ fn rows_in_transaction(
         settings,
         transaction,
         deadline,
+        start,
         ..
     } = statement;
     let Some(id) = transaction else {
@@ -281,6 +282,11 @@ fn rows_in_transaction(
             "a statement outside a transaction is not run as one".to_owned(),
         ));
     };
+    // The first statement opens the transaction it runs in; a start naming
+    // an open ID is refused before the statement runs.
+    if let Some(start) = start {
+        begin(db, RoutedBegin::new(id, actor.clone(), start))?;
+    }
     let options = StatementOptions {
         vector_consistency: settings.vector_consistency,
         vector_build_wait: settings.vector_build_wait,
