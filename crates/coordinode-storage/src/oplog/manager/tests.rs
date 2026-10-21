@@ -1191,6 +1191,104 @@ fn a_hole_below_what_must_be_kept_refuses_the_open_and_changes_nothing() {
     assert_eq!(indexes_of(&entries), (0..9).collect::<Vec<_>>());
 }
 
+/// Zero `len` bytes of the segment starting at `first`, from its `entry`th
+/// frame on, leaving its header and footer: what a disk shows for writes it
+/// lost after a failed fsync when the footer, written later, was kept.
+fn zero_from_entry(dir: &Path, first: u64, entry: usize, len: usize) {
+    let path = segment_path(dir, first);
+    let mut data = std::fs::read(&path).expect("read segment");
+    let ends = crate::oplog::segment::frame_ends(
+        &data[usize::try_from(crate::oplog::segment::HEADER_SIZE).expect("small")..],
+    );
+    let at = usize::try_from(crate::oplog::segment::HEADER_SIZE).expect("small")
+        + if entry == 0 {
+            0
+        } else {
+            usize::try_from(ends[entry - 1]).expect("small")
+        };
+    data[at..at + len].fill(0);
+    std::fs::write(&path, &data).expect("write segment");
+}
+
+/// A sealed segment whose footer reached the disk while entries before it
+/// did not reads as zeros where those entries were: the log keeps every
+/// complete entry before them and ends there, and a segment after them is
+/// set aside, as for a segment that lost its footer too. Entries past the
+/// zeros in the same segment continue past entries the log lacks and go with
+/// them.
+#[test]
+fn lost_writes_inside_a_sealed_segment_end_the_log_there() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    sealed_segments(dir.path(), &[0, 5, 10, 12]);
+    // Entries 7 and 8 lost; entry 9 still reads after them.
+    let frame = {
+        let data = std::fs::read(segment_path(dir.path(), 5)).expect("read");
+        let ends = crate::oplog::segment::frame_ends(
+            &data[usize::try_from(crate::oplog::segment::HEADER_SIZE).expect("small")..],
+        );
+        usize::try_from(ends[1] - ends[0]).expect("small")
+    };
+    zero_from_entry(dir.path(), 5, 2, 2 * frame);
+
+    let mut mgr = OplogManager::open_multi(
+        dir.path(),
+        &[],
+        0,
+        64 * 1024 * 1024,
+        50_000,
+        7 * 24 * 3600,
+        Some(6),
+    )
+    .expect("nothing that must be kept is lost");
+    let entries = mgr.read_range(0, u64::MAX).expect("read after the loss");
+    assert_eq!(indexes_of(&entries), (0..7).collect::<Vec<_>>());
+    mgr.verify_all().expect("every kept segment verifies");
+    assert!(
+        set_aside(dir.path(), 10).exists(),
+        "the segment past the loss is kept aside"
+    );
+
+    // The log continues at the first index it lost.
+    mgr.append(&make_entry(7, 1007))
+        .expect("append at the loss");
+    mgr.flush().expect("flush");
+}
+
+/// Lost writes at or below what must be kept refuse the open, and leave the
+/// segments as they were.
+#[test]
+fn lost_writes_inside_a_sealed_segment_below_what_must_be_kept_refuse_the_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    sealed_segments(dir.path(), &[0, 5, 10]);
+    let frame = {
+        let data = std::fs::read(segment_path(dir.path(), 5)).expect("read");
+        let ends = crate::oplog::segment::frame_ends(
+            &data[usize::try_from(crate::oplog::segment::HEADER_SIZE).expect("small")..],
+        );
+        usize::try_from(ends[1] - ends[0]).expect("small")
+    };
+    zero_from_entry(dir.path(), 5, 2, frame);
+    let before = std::fs::read(segment_path(dir.path(), 5)).expect("read");
+
+    let err = OplogManager::open_multi(
+        dir.path(),
+        &[],
+        0,
+        64 * 1024 * 1024,
+        50_000,
+        7 * 24 * 3600,
+        Some(8),
+    )
+    .err()
+    .expect("a loss below index 8 must refuse the open");
+    assert!(err.to_string().contains("from index 7"), "{err}");
+    assert_eq!(
+        std::fs::read(segment_path(dir.path(), 5)).expect("read"),
+        before,
+        "a refused recovery changes no file"
+    );
+}
+
 /// Recovery is for the tail a crash can leave, and only for it. A segment
 /// that was sealed (valid footer) and later lost an entry to corruption is
 /// damage, not an interrupted write: it stays an error rather than being

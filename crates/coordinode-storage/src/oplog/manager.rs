@@ -14,7 +14,9 @@ use std::sync::Arc;
 use crate::engine::config::SyncMethod;
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, ShardId};
-use crate::oplog::segment::{SegmentFooter, SegmentReader, SegmentWriter, TailState, is_sealed};
+use crate::oplog::segment::{
+    SegmentFooter, SegmentReader, SegmentWriter, TailState, is_sealed, sealed_footer,
+};
 
 // ── Filename helpers ──────────────────────────────────────────────────────────
 
@@ -94,12 +96,25 @@ fn recover_segments(
             });
             continue;
         }
-        if is_sealed(&path)? {
-            next = None;
-            kept.push((first, path));
-            continue;
-        }
-        match SegmentWriter::inspect_tail(&path, shard_id)? {
+        let tail = match sealed_footer(&path)? {
+            // A sealed segment is read whole only where it can hold entries
+            // above what must be kept: below, a loss could not be cut, and
+            // the reader refuses it as it refuses any damage. Its last index
+            // is `first + count - 1`; log indexes stay far below `u64::MAX`.
+            Some(footer)
+                if must_hold.is_none_or(|must_hold| {
+                    first + u64::from(footer.entry_count) > must_hold + 1
+                }) =>
+            {
+                match SegmentWriter::inspect_lost_writes(&path, shard_id)? {
+                    Some(lost) => lost,
+                    None => TailState::Sealed,
+                }
+            }
+            Some(_) => TailState::Sealed,
+            None => SegmentWriter::inspect_tail(&path, shard_id)?,
+        };
+        match tail {
             TailState::Sealed => {
                 next = None;
                 kept.push((first, path));

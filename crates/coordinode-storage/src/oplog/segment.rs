@@ -209,6 +209,16 @@ fn has_valid_footer(data: &[u8]) -> bool {
 ///
 /// The file cannot be opened or read.
 pub(crate) fn is_sealed(path: &Path) -> StorageResult<bool> {
+    Ok(sealed_footer(path)?.is_some())
+}
+
+/// The footer of the segment at `path` when it is sealed (see
+/// [`is_sealed`]); `None` otherwise. Reads only the footer.
+///
+/// # Errors
+///
+/// The file cannot be opened or read.
+pub(crate) fn sealed_footer(path: &Path) -> StorageResult<Option<SegmentFooter>> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| StorageError::Io(format!("open segment {path:?}: {e}")))?;
     let len = file
@@ -216,15 +226,22 @@ pub(crate) fn is_sealed(path: &Path) -> StorageResult<bool> {
         .map_err(|e| StorageError::Io(format!("stat segment {path:?}: {e}")))?
         .len();
     let Some(entries) = len.checked_sub(HEADER_SIZE + FOOTER_SIZE) else {
-        return Ok(false);
+        return Ok(None);
     };
     file.seek(SeekFrom::Start(len - FOOTER_SIZE))
         .map_err(|e| StorageError::Io(format!("seek segment {path:?}: {e}")))?;
     let mut tail = [0u8; FOOTER_SIZE as usize];
     file.read_exact(&mut tail)
         .map_err(|e| StorageError::Io(format!("read footer {path:?}: {e}")))?;
-    Ok(read_footer(&mut Cursor::new(&tail[..])).is_ok_and(|f| f.total_bytes == entries))
+    Ok(read_footer(&mut Cursor::new(&tail[..]))
+        .ok()
+        .filter(|f| f.total_bytes == entries))
 }
+
+/// Bytes of a frame a disk lost: a zero length and a zero checksum, which is
+/// the checksum of no bytes. No entry encodes to nothing, so a written frame
+/// never looks like this.
+const LOST_FRAME: [u8; 5] = [0; 5];
 
 /// The complete entries at the start of an entries section, and where they end.
 ///
@@ -733,6 +750,71 @@ impl SegmentWriter {
             discarded_bytes: data.len() as u64 - prefix.end,
             last_index: last.index,
         })
+    }
+
+    /// Writes a disk lost inside the sealed segment at `path`, read without
+    /// changing it: `None` when every entry the footer counts reads whole.
+    ///
+    /// After a failed `fsync` the page cache can keep writes the disk never
+    /// got, and a footer written afterwards can reach the disk while they do
+    /// not: the segment then reads as zeros from the first lost entry, under a
+    /// valid footer. That shows as a frame of [`LOST_FRAME`] where the
+    /// complete entries end, and is recovered as [`inspect_tail`] recovers a
+    /// segment without a footer: the entries before it are kept, and the
+    /// segment ends there. Anything else that stops the entries short of the
+    /// footer (a checksum that does not hold over bytes that are not zero) is
+    /// corruption, not a lost write, and is left for the reader to refuse.
+    ///
+    /// [`inspect_tail`]: Self::inspect_tail
+    ///
+    /// # Errors
+    ///
+    /// I/O failures, and a header that is not an oplog segment of `shard_id`
+    /// in the supported format.
+    pub fn inspect_lost_writes(path: &Path, shard_id: u32) -> StorageResult<Option<TailState>> {
+        let data = std::fs::read(path)
+            .map_err(|e| StorageError::Io(format!("read segment {:?}: {e}", path)))?;
+        let header = read_header(&mut Cursor::new(&data))?;
+        if header.version != FORMAT_VERSION {
+            return Err(StorageError::Io(format!(
+                "unsupported oplog version {} in {:?}",
+                header.version, path
+            )));
+        }
+        if header.shard_id != shard_id {
+            return Err(StorageError::Io(format!(
+                "segment {:?} belongs to shard {}, not {shard_id}",
+                path, header.shard_id
+            )));
+        }
+        let Some(footer_at) = data.len().checked_sub(FOOTER_SIZE as usize) else {
+            return Ok(None);
+        };
+        let prefix = read_frame_prefix(&data[..footer_at]);
+        let stop = usize::try_from(prefix.end).map_err(io_err)?;
+        if stop >= footer_at || !data[stop..footer_at].starts_with(&LOST_FRAME) {
+            return Ok(None);
+        }
+        let Some(last) = prefix.entries.last() else {
+            return Ok(Some(TailState::Empty));
+        };
+        let entries = u32::try_from(prefix.entries.len()).map_err(|_| {
+            StorageError::Io(format!(
+                "segment {:?} holds more entries than a footer counts",
+                path
+            ))
+        })?;
+        Ok(Some(TailState::Unsealed {
+            footer: SegmentFooter {
+                entry_count: entries,
+                first_ts: prefix.first_ts,
+                last_ts: prefix.last_ts,
+                total_bytes: prefix.end - HEADER_SIZE,
+            },
+            end: prefix.end,
+            discarded_bytes: data.len() as u64 - prefix.end,
+            last_index: last.index,
+        }))
     }
 
     /// Seal the segment at `path` at its complete entries, as
