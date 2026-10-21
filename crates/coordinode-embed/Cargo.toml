@@ -117,6 +117,11 @@ harness = false
 name = "index_check"
 harness = false
 
+# Reopening after a process died with its index copies in use.
+[[bench]]
+name = "index_recovery"
+harness = false
+
 [[bench]]
 name = "operation_identity"
 harness = false
