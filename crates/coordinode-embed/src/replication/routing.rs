@@ -372,14 +372,19 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
         let statement = statement_from_wire(request.into_inner()).map_err(malformed)?;
         let (frames, answer) = tokio::sync::mpsc::channel(FRAMES_IN_FLIGHT);
 
-        // The ingress going away cancels the statement.
+        // The ingress going away cancels the statement. The watch ends with
+        // the statement too: its copy of the queue's sender would otherwise
+        // keep the answer open after its last frame.
         let cancel = CancelFlag::new();
+        let (finished, ended) = tokio::sync::oneshot::channel::<()>();
         {
             let frames = frames.clone();
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                frames.closed().await;
-                cancel.cancel();
+                tokio::select! {
+                    () = frames.closed() => cancel.cancel(),
+                    _ = ended => {}
+                }
             });
         }
 
@@ -418,6 +423,8 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
         tokio::task::spawn_blocking(move || {
             let mut answer = AnswerWriter::new(frames);
             let result = executor.execute(statement, &cancel, &admitted, &mut answer);
+            drop(admitted);
+            drop(finished);
             if !answer.finish(result) {
                 tracing::debug!("a routed statement's ingress left before its answer");
                 if let Some(rollback) = abandon {
