@@ -575,9 +575,9 @@ CALL db.reindex('user_email', waitMs)      -- REINDEX as a procedure, by name or
   generation at once; a constraint the index enforces stays enforced.
 - `db.indexChecks()` and `db.indexCheck` return `operation` (the generation
   checked), `indexId`, `integrity` (`UNCHECKED`, `SUSPECT`, `VERIFIED`),
-  `state`, `phase` (`RECORDS`, `ENTRIES`), `passes`, `checked`,
-  `mismatches`, `repaired`, `conflicts`, `rebuiltInto` and `failure`. A
-  string argument names an index, an integer is its id.
+  `state`, `passes`, `checked`, `mismatches`, `repaired`, `conflicts`,
+  `rebuiltInto` and `failure`. A string argument names an index, an integer
+  is its id.
 - Over gRPC the same operations are `SchemaService.CheckIndex`,
   `ListIndexChecks`, `GetIndexCheck`, `CancelIndexCheck` and `Reindex`,
   selecting an index by `index_id` or `index_name`. A missing index or

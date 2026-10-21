@@ -198,8 +198,13 @@ struct Shared {
     check_done: parking_lot::Condvar,
     /// When this process last asked for the periodic check of every index.
     last_sweep: parking_lot::Mutex<Option<Instant>>,
+    /// Checks waiting for the next shared pass, which reads the records once
+    /// for all of them.
+    check_queue: parking_lot::Mutex<integrity::CheckQueue>,
     /// Generations whose copy on this member a local check reads now.
     local_checks: parking_lot::Mutex<rustc_hash::FxHashSet<GenerationId>>,
+    /// Local checks waiting for the next pass over this member's copies.
+    local_queue: parking_lot::Mutex<integrity::CheckQueue>,
     /// Where a replacement of a copy of this member is filled from, when
     /// the member has peers to fill it from.
     copy_source: parking_lot::RwLock<Option<Arc<dyn IndexCopySource>>>,
@@ -249,9 +254,11 @@ pub struct IndexBuildConfig {
     /// with the build still running and the operation that identifies it;
     /// the build goes on without the statement.
     pub statement_wait: Duration,
-    /// Records, or entries, a check of an index reads per page: the most
-    /// one page holds in memory and the most one repair commit writes.
-    pub check_page: usize,
+    /// The most repairs one commit of a check writes.
+    pub check_repair_batch: usize,
+    /// Bytes of expected entries a check pass holds in memory before it
+    /// spills sorted runs to scratch files under the data directory.
+    pub check_memory: usize,
     /// The most disagreements a check repairs entry by entry; past it the
     /// damage is wide and the index is rebuilt into a fresh generation.
     pub check_max_repairs: u64,
@@ -268,8 +275,11 @@ pub const DEFAULT_UNIQUE_ADMISSION_READ_LIMIT: u64 = 100_000;
 /// How long a statement creating an index waits for its build by default.
 pub const DEFAULT_STATEMENT_WAIT: Duration = Duration::from_secs(60);
 
-/// Records, or entries, a check reads per page by default.
-pub const DEFAULT_CHECK_PAGE: usize = 512;
+/// The most repairs one commit of a check writes by default.
+pub const DEFAULT_CHECK_REPAIR_BATCH: usize = 512;
+
+/// Bytes of expected entries a check pass holds in memory by default.
+pub const DEFAULT_CHECK_MEMORY: usize = 64 * 1024 * 1024;
 
 /// The most disagreements a check repairs entry by entry by default.
 pub const DEFAULT_CHECK_MAX_REPAIRS: u64 = 10_000;
@@ -284,7 +294,8 @@ impl Default for IndexBuildConfig {
             older_transactions_wait: super::build::DEFAULT_OLDER_TRANSACTIONS_WAIT,
             unique_admission_read_limit: DEFAULT_UNIQUE_ADMISSION_READ_LIMIT,
             statement_wait: DEFAULT_STATEMENT_WAIT,
-            check_page: DEFAULT_CHECK_PAGE,
+            check_repair_batch: DEFAULT_CHECK_REPAIR_BATCH,
+            check_memory: DEFAULT_CHECK_MEMORY,
             check_max_repairs: DEFAULT_CHECK_MAX_REPAIRS,
             check_interval: Some(DEFAULT_CHECK_INTERVAL),
         }
@@ -292,12 +303,12 @@ impl Default for IndexBuildConfig {
 }
 
 impl IndexBuildConfig {
-    /// At least one build runs, or none would ever start; a check reads at
-    /// least one record per page, or it would never advance.
+    /// At least one build runs, or none would ever start; a check repairs at
+    /// least one entry per commit, or it would never advance.
     fn normalized(self) -> Self {
         Self {
             max_running: self.max_running.max(1),
-            check_page: self.check_page.max(1),
+            check_repair_batch: self.check_repair_batch.max(1),
             ..self
         }
     }
@@ -521,7 +532,9 @@ impl IndexBuildService {
                 checks: parking_lot::Mutex::new(FxHashMap::default()),
                 check_done: parking_lot::Condvar::new(),
                 last_sweep: parking_lot::Mutex::new(None),
+                check_queue: parking_lot::Mutex::new(integrity::CheckQueue::default()),
                 local_checks: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
+                local_queue: parking_lot::Mutex::new(integrity::CheckQueue::default()),
                 copy_source: parking_lot::RwLock::new(None),
             }),
         }

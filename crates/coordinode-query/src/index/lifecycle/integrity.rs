@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::index::derive::{EntryOwner, IndexInterpretation, tuples};
 use coordinode_modality::{
-    CheckPhase, CheckState, IndexCheck, IndexIntegrityRecord, IndexStore as _, Integrity,
-    LatestEntry, LocalIndexStore, LocalNodeStore, Mismatch, NodeStore as _, StoreError,
+    CheckState, IndexCheck, IndexIntegrityRecord, IndexStore as _, Integrity, LatestEntry,
+    LocalIndexStore, LocalNodeStore, Mismatch, NodeStore as _, StoreError,
 };
 use coordinode_storage::engine::transaction::Transaction;
 use rustc_hash::FxHashMap;
@@ -41,6 +41,8 @@ use crate::index::definition::{
     BuildFailure, GenerationId, IndexBuildRecord, IndexDefinition, IndexId, IndexState, IndexType,
 };
 use crate::index::registry::IntegrityReport;
+
+mod verify;
 
 /// Complete passes a check makes before it gives up repairing entry by
 /// entry and rebuilds: a pass that repaired something is followed by one
@@ -165,6 +167,57 @@ fn log_check_end(generation: GenerationId, executed: &Executed, took: core::time
     }
 }
 
+/// Log how the check of this member's own copy of `generation` ended.
+fn log_local_end(generation: GenerationId, outcome: &Result<LocalOutcome, String>) {
+    let generation = generation.as_raw();
+    match outcome {
+        Ok(LocalOutcome::Verified) => tracing::info!(
+            generation,
+            "this member's index copy agrees with its records; it serves again"
+        ),
+        Ok(LocalOutcome::Replaced) => tracing::info!(
+            generation,
+            "this member's index copy was replaced from a peer and agrees with its records; it \
+             serves again"
+        ),
+        Ok(LocalOutcome::Disagrees { found }) => tracing::warn!(
+            generation,
+            found,
+            "this member's index copy disagrees with its records; it answers from the records \
+             until it is replaced"
+        ),
+        Ok(LocalOutcome::Stopped) => {}
+        Err(e) => tracing::warn!(
+            generation,
+            error = %e,
+            "the check of this member's index copy failed"
+        ),
+    }
+}
+
+/// Log what one pass over the records cost, for the generations it read.
+fn log_pass(targets: &[verify::Target<'_>], stats: &verify::VerifyStats) {
+    tracing::info!(
+        generations = targets.len(),
+        source_rows = stats.source_rows,
+        source_bytes = stats.source_bytes,
+        decoded_rows = stats.decoded_rows,
+        decoded_bytes = stats.decoded_bytes,
+        expected_entries = stats.expected_entries,
+        stored_entries = stats.stored_entries,
+        spilled_runs = stats.spilled_runs,
+        spilled_bytes = stats.spilled_bytes,
+        scan_ms = stats.scan.as_millis(),
+        sort_ms = stats.sort.as_millis(),
+        compare_ms = stats.compare.as_millis(),
+        "index check pass read the records"
+    );
+}
+
+/// The directory under the data directory a check pass spills to. Its files
+/// are unnamed and vanish with the process, so nothing there outlives one.
+const CHECK_SCRATCH_DIR: &str = "index-check";
+
 /// How a check of this member's own copy ended.
 enum LocalOutcome {
     /// Every entry agrees with this member's records: the mark is lifted.
@@ -179,11 +232,24 @@ enum LocalOutcome {
     Stopped,
 }
 
-/// What one page of a check found.
+/// Generations waiting for the next shared pass, and whether a thread runs
+/// the passes.
 #[derive(Default)]
-struct Found {
-    checked: u64,
-    mismatches: Vec<Mismatch>,
+pub(super) struct CheckQueue {
+    pending: Vec<GenerationId>,
+    running: bool,
+}
+
+/// A check the pass thread holds: one generation, carried from pass to pass
+/// until it concludes.
+struct Active {
+    generation: GenerationId,
+    taken: Taken,
+    /// Disagreements repaired by this executor across its passes.
+    repaired: u64,
+    started: Instant,
+    /// This member's evidence revision when the latest pass began reading.
+    local_revision: u64,
 }
 
 /// What became of disagreements a read reported.
@@ -197,22 +263,10 @@ enum ReportFate {
     Resolved,
 }
 
-/// What one pass of a check did.
-#[derive(Default)]
-struct Pass {
-    checked: u64,
-    /// Disagreements the whole pass found, including pages read before a
-    /// restart.
-    found: u64,
-    /// Of those, records breaking the constraint.
-    conflict_count: u64,
-    repaired: u64,
-    /// The conflicts the pages read in this process found, to report.
-    conflicts: Vec<Mismatch>,
-    /// This member's own evidence revision when the pass started from its
-    /// beginning in this process; `None` for a pass resumed from a cursor,
-    /// which proves nothing about this member's copy before the resume.
-    local_revision: Option<u64>,
+/// Run `f`, a panic in it reported as its error.
+fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|panic| Err(panic_message(&*panic)))
 }
 
 impl IndexBuildService {
@@ -542,32 +596,24 @@ impl IndexBuildService {
             }
             checks.insert(generation, CheckSlot::Running);
         }
+        // Lookups that cannot use the generation meanwhile read the records,
+        // so an operator needs to see the check run and end.
+        tracing::info!(
+            generation = generation.as_raw(),
+            "checking an index generation"
+        );
+        let start = {
+            let mut queue = self.shared.check_queue.lock();
+            queue.pending.push(generation);
+            !core::mem::replace(&mut queue.running, true)
+        };
+        if !start {
+            return Ok(());
+        }
         let shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
-            .name(format!("index-check-{}", generation.as_raw()))
-            .spawn(move || {
-                // Lookups that cannot use the generation meanwhile read the
-                // records, so an operator needs to see the check run and end.
-                tracing::info!(
-                    generation = generation.as_raw(),
-                    "checking an index generation"
-                );
-                let started = std::time::Instant::now();
-                let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    shared.execute_check(generation)
-                }))
-                .unwrap_or_else(|panic| {
-                    Executed::Outcome(CheckOutcome::Failed(panic_message(&*panic)))
-                });
-                log_check_end(generation, &executed, started.elapsed());
-                let slot = match executed {
-                    Executed::Outcome(outcome) => CheckSlot::Done(outcome),
-                    Executed::Lost => CheckSlot::Lost,
-                };
-                let mut checks = shared.checks.lock();
-                checks.insert(generation, slot);
-                shared.check_done.notify_all();
-            });
+            .name("index-check".into())
+            .spawn(move || shared.check_rounds());
         match spawned {
             Ok(executor) => {
                 let mut executors = self.shared.executors.lock();
@@ -576,7 +622,15 @@ impl IndexBuildService {
                 Ok(())
             }
             Err(e) => {
-                self.shared.checks.lock().remove(&generation);
+                let pending = {
+                    let mut queue = self.shared.check_queue.lock();
+                    queue.running = false;
+                    core::mem::take(&mut queue.pending)
+                };
+                let mut checks = self.shared.checks.lock();
+                for generation in pending {
+                    checks.remove(&generation);
+                }
                 Err(format!("start the check executor: {e}"))
             }
         }
@@ -596,39 +650,18 @@ impl IndexBuildService {
         {
             return;
         }
+        let start = {
+            let mut queue = self.shared.local_queue.lock();
+            queue.pending.push(generation);
+            !core::mem::replace(&mut queue.running, true)
+        };
+        if !start {
+            return;
+        }
         let shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
-            .name(format!("index-local-check-{}", generation.as_raw()))
-            .spawn(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    shared.run_local_check(generation)
-                }))
-                .unwrap_or_else(|panic| Err(panic_message(&*panic)));
-                shared.local_checks.lock().remove(&generation);
-                match outcome {
-                    Ok(LocalOutcome::Verified) => tracing::info!(
-                        generation = generation.as_raw(),
-                        "this member's index copy agrees with its records; it serves again"
-                    ),
-                    Ok(LocalOutcome::Replaced) => tracing::info!(
-                        generation = generation.as_raw(),
-                        "this member's index copy was replaced from a peer and agrees with its \
-                         records; it serves again"
-                    ),
-                    Ok(LocalOutcome::Disagrees { found }) => tracing::warn!(
-                        generation = generation.as_raw(),
-                        found,
-                        "this member's index copy disagrees with its records; it answers from \
-                         the records until it is replaced"
-                    ),
-                    Ok(LocalOutcome::Stopped) => {}
-                    Err(e) => tracing::warn!(
-                        generation = generation.as_raw(),
-                        error = %e,
-                        "the check of this member's index copy failed"
-                    ),
-                }
-            });
+            .name("index-local-check".into())
+            .spawn(move || shared.local_rounds());
         match spawned {
             Ok(executor) => {
                 let mut executors = self.shared.executors.lock();
@@ -636,9 +669,17 @@ impl IndexBuildService {
                 executors.push(executor);
             }
             Err(e) => {
-                self.shared.local_checks.lock().remove(&generation);
-                tracing::warn!(generation = generation.as_raw(), error = %e,
-                    "could not start the check of this member's index copy");
+                let pending = {
+                    let mut queue = self.shared.local_queue.lock();
+                    queue.running = false;
+                    core::mem::take(&mut queue.pending)
+                };
+                let mut local = self.shared.local_checks.lock();
+                for generation in pending {
+                    local.remove(&generation);
+                    tracing::warn!(generation = generation.as_raw(), error = %e,
+                        "could not start the check of this member's index copy");
+                }
             }
         }
     }
@@ -714,8 +755,8 @@ impl IndexBuildService {
     }
 
     /// Cancel the check of `generation`. `false` when it already had an
-    /// outcome or none was admitted. An executor running it stops at its
-    /// next page.
+    /// outcome or none was admitted. An executor running it repairs nothing
+    /// more once its current pass over the records ends.
     ///
     /// # Errors
     ///
@@ -1045,38 +1086,121 @@ impl Shared {
         })
     }
 
-    /// Read this member's copy of `generation` both ways against this
-    /// member's records, writing nothing shared, and lift its local mark
-    /// when it agrees. Records breaking a unique constraint are the records'
-    /// disagreement, not the copy's: the catalog keeps such a generation
-    /// suspect on every member.
-    fn run_local_check(&self, generation: GenerationId) -> Result<LocalOutcome, String> {
+    /// Run local checks until none waits: each round reads this member's
+    /// records once for every copy waiting, then concludes each.
+    fn local_rounds(&self) {
+        loop {
+            let pending = {
+                let mut queue = self.local_queue.lock();
+                if queue.pending.is_empty() {
+                    queue.running = false;
+                    return;
+                }
+                core::mem::take(&mut queue.pending)
+            };
+            let ended = {
+                let _seat = self.quiet_seat();
+                guarded(|| Ok(self.local_round(&pending)))
+            };
+            let ended = ended.unwrap_or_else(|e| {
+                pending
+                    .iter()
+                    .map(|&generation| (generation, Err(e.clone())))
+                    .collect()
+            });
+            let mut local = self.local_checks.lock();
+            for (generation, outcome) in ended {
+                local.remove(&generation);
+                log_local_end(generation, &outcome);
+            }
+        }
+    }
+
+    /// Read this member's copies of `pending` both ways against this
+    /// member's records in one pass, writing nothing shared, and lift the
+    /// local mark of each that agrees. Records breaking a unique constraint
+    /// are the records' disagreement, not the copy's: the catalog keeps such
+    /// a generation suspect on every member.
+    fn local_round(
+        &self,
+        pending: &[GenerationId],
+    ) -> Vec<(GenerationId, Result<LocalOutcome, String>)> {
         let env = self.env.as_ref();
         let registry = env.registry();
-        let Some(def) = registry
-            .index_of_generation(generation)
-            .and_then(|id| registry.get_by_id(id))
-            .filter(|d| {
-                d.generation == generation
-                    && d.index_type == IndexType::BTree
-                    && d.state == IndexState::Ready
-            })
-        else {
-            return Ok(LocalOutcome::Stopped);
+        let mut ended = Vec::with_capacity(pending.len());
+        let mut defs = Vec::with_capacity(pending.len());
+        for &generation in pending {
+            match registry
+                .index_of_generation(generation)
+                .and_then(|id| registry.get_by_id(id))
+                .filter(|d| {
+                    d.generation == generation
+                        && d.index_type == IndexType::BTree
+                        && d.state == IndexState::Ready
+                }) {
+                Some(def) => defs.push(def),
+                None => ended.push((generation, Ok(LocalOutcome::Stopped))),
+            }
+        }
+        if defs.is_empty() {
+            return ended;
+        }
+        let fields = match env.fields() {
+            Ok(fields) => fields,
+            Err(e) => {
+                ended.extend(defs.iter().map(|d| (d.generation, Err(e.clone()))));
+                return ended;
+            }
         };
-        let taken = Taken { def, token: 0 };
-        let fields = env.fields()?;
         let field_of = |name: &str| fields.lookup(name);
-        let interpretation = taken.def.interpretation(&field_of);
+        let interpretations: Vec<IndexInterpretation> =
+            defs.iter().map(|d| d.interpretation(&field_of)).collect();
         // Taken before anything is read: a finding after it keeps the copy
         // unfit whatever the pass concludes.
-        let revision = registry.local_revision(generation);
-        let Some(found) = self.local_pass(&taken, &interpretation)? else {
-            return Ok(LocalOutcome::Stopped);
+        let revisions: Vec<u64> = defs
+            .iter()
+            .map(|d| registry.local_revision(d.generation))
+            .collect();
+        let found = match self.local_pass(&defs, &interpretations) {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                ended.extend(
+                    defs.iter()
+                        .map(|d| (d.generation, Ok(LocalOutcome::Stopped))),
+                );
+                return ended;
+            }
+            Err(e) => {
+                ended.extend(defs.iter().map(|d| (d.generation, Err(e.clone()))));
+                return ended;
+            }
         };
+        for (((def, interpretation), revision), found) in
+            defs.iter().zip(&interpretations).zip(revisions).zip(found)
+        {
+            let outcome = guarded(|| self.local_conclude(def, interpretation, revision, found));
+            ended.push((def.generation, outcome));
+        }
+        ended
+    }
+
+    /// Conclude the local check of `def`'s copy, which a pass taken at
+    /// `revision` found `found` entries of missing or wrong: lift the mark,
+    /// or replace the copy from a peer and lift it once the replacement is
+    /// proved.
+    fn local_conclude(
+        &self,
+        def: &IndexDefinition,
+        interpretation: &IndexInterpretation,
+        revision: u64,
+        found: u64,
+    ) -> Result<LocalOutcome, String> {
+        let env = self.env.as_ref();
+        let registry = env.registry();
+        let generation = def.generation;
         if found == 0 {
             let lifted = registry
-                .verified_here(env.engine(), &taken.def, revision, self.read_time())
+                .verified_here(env.engine(), def, revision, self.read_time())
                 .map_err(|e| e.to_string())?;
             return Ok(if lifted {
                 LocalOutcome::Verified
@@ -1096,23 +1220,38 @@ impl Shared {
         let revision = registry.local_revision(generation);
         let proved_by_peer = proof
             .as_deref()
-            .is_some_and(|proof| crate::index::transfer::import_proves(proof, &taken.def));
+            .is_some_and(|proof| crate::index::transfer::import_proves(proof, def));
         if !proved_by_peer {
-            let Some(found) = self.local_pass(&taken, &interpretation)? else {
+            let Some(found) = self.local_pass(
+                core::slice::from_ref(def),
+                core::slice::from_ref(interpretation),
+            )?
+            else {
                 return Ok(LocalOutcome::Stopped);
             };
+            let found = found.first().copied().unwrap_or(0);
             if found > 0 {
                 return Ok(LocalOutcome::Disagrees { found });
             }
         }
         let lifted = registry
-            .verified_here(env.engine(), &taken.def, revision, self.read_time())
+            .verified_here(env.engine(), def, revision, self.read_time())
             .map_err(|e| e.to_string())?;
         Ok(if lifted {
             LocalOutcome::Replaced
         } else {
             LocalOutcome::Stopped
         })
+    }
+
+    /// What a check pass may hold in memory, and where it spills the rest:
+    /// a directory under the data directory, so scratch files never outgrow
+    /// the volume the store already lives on.
+    fn check_budget(&self) -> verify::Budget {
+        verify::Budget {
+            memory_bytes: self.config.read().check_memory,
+            scratch: Some(self.env.engine().data_dir().join(CHECK_SCRATCH_DIR)),
+        }
     }
 
     /// The snapshot a pass ending now has read up to: the oracle's time, or
@@ -1152,62 +1291,224 @@ impl Shared {
         Ok(proof)
     }
 
-    /// One pass both ways over this member's copy of `taken`'s generation
-    /// and this member's records, writing nothing: the entries missing or
-    /// wrong. Records breaking a unique constraint are not counted. `None`
-    /// when the process is stopping.
+    /// One pass both ways over this member's copies of `defs` and this
+    /// member's records, writing nothing: per generation, the entries
+    /// missing or wrong. Records breaking a unique constraint are not
+    /// counted. `None` when the process is stopping.
     fn local_pass(
         &self,
-        taken: &Taken,
-        interpretation: &IndexInterpretation,
-    ) -> Result<Option<u64>, String> {
-        let page = self.config.read().check_page;
-        let mut found = 0u64;
-        for phase in [CheckPhase::Records, CheckPhase::Entries] {
-            let mut cursor: Option<Vec<u8>> = None;
-            loop {
-                if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
-                    return Ok(None);
-                }
-                let (page_found, next, exhausted) = match phase {
-                    CheckPhase::Records => {
-                        self.records_page(taken, interpretation, cursor.as_deref(), page)?
-                    }
-                    CheckPhase::Entries => {
-                        self.entries_page(taken, interpretation, cursor.as_deref(), page)?
-                    }
-                };
-                // Counts of entries a page holds, far below the type's range.
-                found += page_found
-                    .mismatches
-                    .iter()
-                    .filter(|m| !matches!(m, Mismatch::SourceDuplicate { .. }))
-                    .count() as u64;
-                if exhausted {
-                    break;
-                }
-                cursor = next;
-            }
-        }
-        Ok(Some(found))
+        defs: &[IndexDefinition],
+        interpretations: &[IndexInterpretation],
+    ) -> Result<Option<Vec<u64>>, String> {
+        let targets: Vec<verify::Target<'_>> = defs
+            .iter()
+            .zip(interpretations)
+            .map(|(def, interpretation)| verify::Target {
+                def,
+                interpretation,
+            })
+            .collect();
+        let Some((findings, stats)) = self.read_pass(&targets)? else {
+            return Ok(None);
+        };
+        log_pass(&targets, &stats);
+        Ok(Some(
+            findings
+                .iter()
+                .map(|found| {
+                    // Disagreements of one pass, far below the type's range.
+                    found
+                        .mismatches
+                        .iter()
+                        .filter(|m| !matches!(m, Mismatch::SourceDuplicate { .. }))
+                        .count() as u64
+                })
+                .collect(),
+        ))
     }
 
-    /// Take the check of `generation`, run it to its outcome and record it.
-    fn execute_check(self: &Arc<Self>, generation: GenerationId) -> Executed {
-        let _seat = self.quiet_seat();
-        if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
-            return Executed::Lost;
-        }
-        match self.take_check(generation) {
-            Ok(Ok(taken)) => self.run_check(generation, &taken).unwrap_or_else(|e| {
-                match self.conclude_failed(generation, &taken, &e) {
-                    Ok(executed) => executed,
-                    Err(e) => Executed::Outcome(CheckOutcome::Failed(e)),
+    /// Read `targets` against this member's records in one pass at one
+    /// snapshot. `None` when the process is stopping.
+    fn read_pass(
+        &self,
+        targets: &[verify::Target<'_>],
+    ) -> Result<Option<(Vec<verify::Findings>, verify::VerifyStats)>, String> {
+        verify::verify(
+            self.env.engine(),
+            self.env.shard_id(),
+            targets,
+            &self.check_budget(),
+            &self.stopping,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Run checks until none waits or is held: each round reads the records
+    /// once for every check this executor holds, then repairs and concludes
+    /// each by what that pass found. One seat for the whole round: the
+    /// checks share it as they share the read.
+    fn check_rounds(self: &Arc<Self>) {
+        let mut active: Vec<Active> = Vec::new();
+        loop {
+            let pending = {
+                let mut queue = self.check_queue.lock();
+                if queue.pending.is_empty() && active.is_empty() {
+                    queue.running = false;
+                    return;
                 }
-            }),
-            Ok(Err(executed)) => executed,
-            Err(e) => Executed::Outcome(CheckOutcome::Failed(e)),
+                core::mem::take(&mut queue.pending)
+            };
+            let _seat = self.quiet_seat();
+            if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
+                let started = Instant::now();
+                for generation in pending {
+                    self.finish_check(generation, Executed::Lost, started);
+                }
+                for held in active.drain(..) {
+                    let executed = self
+                        .lost_check(held.generation, &held.taken)
+                        .unwrap_or_else(|e| Executed::Outcome(CheckOutcome::Failed(e)));
+                    self.finish_check(held.generation, executed, held.started);
+                }
+                continue;
+            }
+            for generation in pending {
+                let started = Instant::now();
+                match guarded(|| self.take_check(generation)) {
+                    Ok(Ok(taken)) => active.push(Active {
+                        generation,
+                        taken,
+                        repaired: 0,
+                        started,
+                        local_revision: 0,
+                    }),
+                    Ok(Err(executed)) => self.finish_check(generation, executed, started),
+                    Err(e) => self.finish_check(
+                        generation,
+                        Executed::Outcome(CheckOutcome::Failed(e)),
+                        started,
+                    ),
+                }
+            }
+            if !active.is_empty() {
+                active = self.shared_pass(active);
+            }
         }
+    }
+
+    /// One pass over the records for every check in `active`, then each
+    /// repaired and concluded by what it found. Returns the checks that need
+    /// another pass.
+    fn shared_pass(self: &Arc<Self>, active: Vec<Active>) -> Vec<Active> {
+        let env = self.env.as_ref();
+        let mut held = Vec::with_capacity(active.len());
+        for mut check in active {
+            // Only checks still this executor's, of generations the index
+            // still serves from, are read: repairs to a generation the index
+            // left are refused at commit and would count as damage.
+            let ready = guarded(|| {
+                if self.held_record(check.generation, &check.taken)?.is_none() {
+                    return self.lost_check(check.generation, &check.taken).map(Some);
+                }
+                if !self.still_serves(check.generation, &check.taken)? {
+                    return self
+                        .conclude_retired(check.generation, &check.taken)
+                        .map(Some);
+                }
+                Ok(None)
+            });
+            match ready {
+                Ok(None) => {
+                    // Taken before the pass reads anything: a report after it
+                    // keeps this member's copy unfit whatever the pass finds.
+                    check.local_revision = env.registry().local_revision(check.generation);
+                    held.push(check);
+                }
+                Ok(Some(executed)) => self.finish_check(check.generation, executed, check.started),
+                Err(e) => self.fail_check(&check, &e),
+            }
+        }
+        if held.is_empty() {
+            return held;
+        }
+        let fields = match env.fields() {
+            Ok(fields) => fields,
+            Err(e) => {
+                for check in &held {
+                    self.fail_check(check, &e);
+                }
+                return Vec::new();
+            }
+        };
+        let field_of = |name: &str| fields.lookup(name);
+        let interpretations: Vec<IndexInterpretation> = held
+            .iter()
+            .map(|check| check.taken.def.interpretation(&field_of))
+            .collect();
+        let read = {
+            let targets: Vec<verify::Target<'_>> = held
+                .iter()
+                .zip(&interpretations)
+                .map(|(check, interpretation)| verify::Target {
+                    def: &check.taken.def,
+                    interpretation,
+                })
+                .collect();
+            let read = guarded(|| self.read_pass(&targets));
+            if let Ok(Some((_, stats))) = &read {
+                log_pass(&targets, stats);
+            }
+            read
+        };
+        let findings = match read {
+            Ok(Some((findings, _))) => findings,
+            Ok(None) => {
+                for check in held {
+                    let executed = self
+                        .lost_check(check.generation, &check.taken)
+                        .unwrap_or_else(|e| Executed::Outcome(CheckOutcome::Failed(e)));
+                    self.finish_check(check.generation, executed, check.started);
+                }
+                return Vec::new();
+            }
+            Err(e) => {
+                for check in &held {
+                    self.fail_check(check, &e);
+                }
+                return Vec::new();
+            }
+        };
+        let mut again = Vec::with_capacity(held.len());
+        for ((mut check, interpretation), found) in
+            held.into_iter().zip(&interpretations).zip(findings)
+        {
+            match guarded(|| self.after_pass(&mut check, interpretation, found)) {
+                Ok(None) => again.push(check),
+                Ok(Some(executed)) => self.finish_check(check.generation, executed, check.started),
+                Err(e) => self.fail_check(&check, &e),
+            }
+        }
+        again
+    }
+
+    /// Record that the check `check` holds failed with `reason`, and end it.
+    fn fail_check(&self, check: &Active, reason: &str) {
+        let executed = self
+            .conclude_failed(check.generation, &check.taken, reason)
+            .unwrap_or_else(|e| Executed::Outcome(CheckOutcome::Failed(e)));
+        self.finish_check(check.generation, executed, check.started);
+    }
+
+    /// Hand `executed` to the waiters of `generation`'s check.
+    fn finish_check(&self, generation: GenerationId, executed: Executed, started: Instant) {
+        log_check_end(generation, &executed, started.elapsed());
+        let slot = match executed {
+            Executed::Outcome(outcome) => CheckSlot::Done(outcome),
+            Executed::Lost => CheckSlot::Lost,
+        };
+        let mut checks = self.checks.lock();
+        checks.insert(generation, slot);
+        self.check_done.notify_all();
     }
 
     /// Take the check of `generation`: its state moves to running under a
@@ -1266,333 +1567,128 @@ impl Shared {
         ))
     }
 
-    /// Run the passes of the check `taken` holds and record its outcome.
-    fn run_check(
+    /// Repair and record what one pass found for the check `check` holds,
+    /// and conclude it when the pass settles it. `None` when it needs
+    /// another pass.
+    fn after_pass(
         self: &Arc<Self>,
-        generation: GenerationId,
-        taken: &Taken,
-    ) -> Result<Executed, String> {
+        check: &mut Active,
+        interpretation: &IndexInterpretation,
+        found: verify::Findings,
+    ) -> Result<Option<Executed>, String> {
         let config = *self.config.read();
-        let mut repaired_total = 0u64;
-        loop {
-            let pass = match self.pass(
-                generation,
-                taken,
-                config.check_page,
-                config.check_max_repairs,
-                &mut repaired_total,
-            )? {
-                Some(pass) => pass,
-                None if !self.still_serves(generation, taken)? => {
-                    return self.conclude_retired(generation, taken);
-                }
-                None => return self.lost_check(generation, taken),
-            };
-            let Some(record) = self.held_record(generation, taken)? else {
-                return self.lost_check(generation, taken);
-            };
-            let passes = record.0.check.as_ref().map_or(0, |c| c.passes);
-            // Every disagreement repaired, none left: the generation agrees
-            // with its records, unless a report arrived meanwhile, which the
-            // next pass looks for.
-            if pass.found == 0 {
-                let started = record.0.check.as_ref().map_or(0, |c| c.started_revision);
-                if record.0.evidence_revision == started {
-                    // A generation found damaged, or repaired by this check,
-                    // is proved from now on; an older snapshot still reads
-                    // the entries as they were then. A direct-mode engine
-                    // keeps no older snapshots to protect.
-                    let now = self.env.oracle().map(|oracle| oracle.current().as_raw());
-                    let once_damaged = record.0.evidence_revision > 0 || repaired_total > 0;
-                    let outcome = self.conclude_check(generation, taken, move |rec, check| {
-                        rec.integrity = Integrity::Verified;
-                        rec.evidence.clear();
-                        if once_damaged {
-                            rec.trusted_from = now.or(rec.trusted_from);
-                        }
-                        check.state = CheckState::Done;
-                    })?;
-                    // The pass read this member's copy from its start, after
-                    // the revision it took: that copy is proved, unless a
-                    // report found it disagreeing since.
-                    if let (Executed::Outcome(CheckOutcome::Verified { .. }), Some(revision)) =
-                        (&outcome, pass.local_revision)
-                    {
-                        self.env
-                            .registry()
-                            .verified_here(
-                                self.env.engine(),
-                                &taken.def,
-                                revision,
-                                now.unwrap_or(0),
-                            )
-                            .map_err(|e| e.to_string())?;
+        let generation = check.generation;
+        let taken = &check.taken;
+        let Some((_, held_version)) = self.held_record(generation, taken)? else {
+            return self.lost_check(generation, taken).map(Some);
+        };
+        let mut conflicts = Vec::new();
+        let mut missing = Vec::new();
+        let mut extra = Vec::new();
+        for mismatch in found.mismatches {
+            match mismatch {
+                Mismatch::SourceDuplicate { .. } => conflicts.push(mismatch),
+                Mismatch::Missing { .. } => missing.push(mismatch),
+                Mismatch::Extra { .. } => extra.push(mismatch),
+            }
+        }
+        // Disagreements one pass finds, far below the type's range.
+        let found_count = (conflicts.len() + missing.len() + extra.len()) as u64;
+        let mut repaired = 0u64;
+        // Missing entries first and extra ones after, never in one commit: a
+        // unique value whose entry names the wrong holder is both, and the
+        // removal must not meet the replacement in the same write.
+        for batch in missing
+            .chunks(config.check_repair_batch)
+            .chain(extra.chunks(config.check_repair_batch))
+        {
+            if check.repaired + repaired > config.check_max_repairs {
+                break;
+            }
+            repaired += self.repair(taken, held_version, interpretation, batch, &mut conflicts)?;
+        }
+        check.repaired += repaired;
+        let conflict_count = conflicts.len() as u64;
+        let mut passes = 0;
+        let mut revisions = (0, 0);
+        let moved = self.checkpoint(generation, taken, |rec, held| {
+            held.checked += found.checked;
+            held.mismatches += found_count;
+            held.repaired += repaired;
+            for conflict in &conflicts {
+                rec.report(conflict.clone());
+            }
+            held.passes += 1;
+            passes = held.passes;
+            revisions = (rec.evidence_revision, held.started_revision);
+        })?;
+        if !moved {
+            return self.lost_check(generation, taken).map(Some);
+        }
+        // Every disagreement repaired, none left: the generation agrees with
+        // its records, unless a report arrived meanwhile, which the next pass
+        // looks for.
+        if found_count == 0 {
+            let (evidence, started) = revisions;
+            if evidence == started {
+                // A generation found damaged, or repaired by this check, is
+                // proved from now on; an older snapshot still reads the
+                // entries as they were then. A direct-mode engine keeps no
+                // older snapshots to protect.
+                let now = self.env.oracle().map(|oracle| oracle.current().as_raw());
+                let once_damaged = evidence > 0 || check.repaired > 0;
+                let outcome = self.conclude_check(generation, taken, move |rec, held| {
+                    rec.integrity = Integrity::Verified;
+                    rec.evidence.clear();
+                    if once_damaged {
+                        rec.trusted_from = now.or(rec.trusted_from);
                     }
-                    return Ok(outcome);
-                }
-                self.checkpoint(generation, taken, |rec, check| {
-                    check.started_revision = rec.evidence_revision;
+                    held.state = CheckState::Done;
                 })?;
-            } else if pass.found == pass.conflict_count {
-                // Only records breaking the constraint remain: no entry can
-                // fix them.
-                let conflicts = pass.conflicts.clone();
-                return self.conclude_check(generation, taken, move |rec, check| {
+                // The pass read this member's copy whole, after the revision
+                // it took: that copy is proved, unless a report found it
+                // disagreeing since.
+                if let Executed::Outcome(CheckOutcome::Verified { .. }) = &outcome {
+                    self.env
+                        .registry()
+                        .verified_here(
+                            self.env.engine(),
+                            &taken.def,
+                            check.local_revision,
+                            now.unwrap_or(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                return Ok(Some(outcome));
+            }
+            let moved = self.checkpoint(generation, taken, |rec, held| {
+                held.started_revision = rec.evidence_revision;
+            })?;
+            if !moved {
+                return self.lost_check(generation, taken).map(Some);
+            }
+        } else if found_count == conflict_count {
+            // Only records breaking the constraint remain: no entry can fix
+            // them.
+            return self
+                .conclude_check(generation, taken, move |rec, held| {
                     for conflict in &conflicts {
                         rec.report(conflict.clone());
                     }
                     rec.integrity = Integrity::Suspect;
-                    check.state = CheckState::Done;
-                });
-            }
-            if repaired_total > config.check_max_repairs || passes >= MAX_PASSES {
-                // A check of a generation the index left must not rebuild the
-                // index it now serves from.
-                if !self.still_serves(generation, taken)? {
-                    return self.conclude_retired(generation, taken);
-                }
-                return self.escalate(generation, taken);
-            }
+                    held.state = CheckState::Done;
+                })
+                .map(Some);
         }
-    }
-
-    /// One complete pass over both halves, resuming from the record's cursor:
-    /// what it found and repaired. `None` when the check stopped being this
-    /// executor's.
-    fn pass(
-        &self,
-        generation: GenerationId,
-        taken: &Taken,
-        page: usize,
-        max_repairs: u64,
-        repaired_total: &mut u64,
-    ) -> Result<Option<Pass>, String> {
-        let env = self.env.as_ref();
-        let field_of_fields = env.fields()?;
-        let field_of = |name: &str| field_of_fields.lookup(name);
-        let interpretation = taken.def.interpretation(&field_of);
-        let mut pass = Pass::default();
-        let mut first_page = true;
-        loop {
-            if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
-                return Ok(None);
-            }
-            let Some((record, held_version)) = self.held_record(generation, taken)? else {
-                return Ok(None);
-            };
-            let Some(check) = record.check.clone() else {
-                return Ok(None);
-            };
-            // Repairs to a generation the index left are refused at commit;
-            // the pass stops rather than read on and count them as damage.
+        if check.repaired > config.check_max_repairs || passes >= MAX_PASSES {
+            // A check of a generation the index left must not rebuild the
+            // index it now serves from.
             if !self.still_serves(generation, taken)? {
-                return Ok(None);
+                return self.conclude_retired(generation, taken).map(Some);
             }
-            if first_page {
-                first_page = false;
-                // Taken before the pass reads anything: a report after it
-                // keeps this member's copy unfit whatever the pass finds.
-                if check.phase == CheckPhase::Records && check.cursor.is_none() {
-                    pass.local_revision = Some(env.registry().local_revision(generation));
-                }
-            }
-            let (found, next, exhausted) = match check.phase {
-                CheckPhase::Records => {
-                    self.records_page(taken, &interpretation, check.cursor.as_deref(), page)?
-                }
-                CheckPhase::Entries => {
-                    self.entries_page(taken, &interpretation, check.cursor.as_deref(), page)?
-                }
-            };
-            let mut repaired = 0u64;
-            let mut conflicts = Vec::new();
-            let mut repairable = Vec::new();
-            for mismatch in found.mismatches {
-                match mismatch {
-                    Mismatch::SourceDuplicate { .. } => conflicts.push(mismatch),
-                    other => repairable.push(other),
-                }
-            }
-            // Counts of rows and entries a check reads: far below the type's
-            // range.
-            pass.checked += found.checked;
-            pass.found += (repairable.len() + conflicts.len()) as u64;
-            if !repairable.is_empty() && *repaired_total <= max_repairs {
-                repaired = self.repair(
-                    taken,
-                    held_version,
-                    &interpretation,
-                    &repairable,
-                    &mut conflicts,
-                )?;
-                *repaired_total += repaired;
-                pass.repaired += repaired;
-            }
-            pass.conflicts.extend(conflicts.iter().cloned());
-            let phase_done = exhausted;
-            let page_found = (repairable.len() + conflicts.len()) as u64;
-            let page_conflicts = conflicts.len() as u64;
-            // The whole pass's counts, as the stored check holds them across
-            // a restart, read when this page completes the pass.
-            let mut totals = None;
-            let moved = self.checkpoint(generation, taken, |rec, check| {
-                check.checked += found.checked;
-                check.mismatches += page_found;
-                check.repaired += repaired;
-                check.pass_found += page_found;
-                check.pass_conflicts += page_conflicts;
-                for conflict in &conflicts {
-                    rec.report(conflict.clone());
-                }
-                if phase_done {
-                    check.cursor = None;
-                    match check.phase {
-                        CheckPhase::Records => check.phase = CheckPhase::Entries,
-                        CheckPhase::Entries => {
-                            check.phase = CheckPhase::Records;
-                            check.passes += 1;
-                            totals = Some((check.pass_found, check.pass_conflicts));
-                            check.pass_found = 0;
-                            check.pass_conflicts = 0;
-                        }
-                    }
-                } else {
-                    check.cursor = next.clone();
-                }
-            })?;
-            if !moved {
-                return Ok(None);
-            }
-            if phase_done && check.phase == CheckPhase::Entries {
-                let (found, conflicts) =
-                    totals.unwrap_or((pass.found, pass.conflicts.len() as u64));
-                pass.found = found;
-                pass.conflict_count = conflicts;
-                return Ok(Some(pass));
-            }
+            return self.escalate(generation, taken).map(Some);
         }
-    }
-
-    /// One page of records of the checked label after `after`, each checked
-    /// for the entries its values give it: what was wrong, the key the next
-    /// page resumes after, and whether the records are exhausted.
-    fn records_page(
-        &self,
-        taken: &Taken,
-        interpretation: &IndexInterpretation,
-        after: Option<&[u8]>,
-        page: usize,
-    ) -> Result<(Found, Option<Vec<u8>>, bool), String> {
-        let env = self.env.as_ref();
-        let shard_id = env.shard_id();
-        let def = &taken.def;
-        let store = LocalIndexStore::new(env.engine());
-        let mut txn = begin(env);
-        let rows = LocalNodeStore
-            .rows_page(&mut txn, shard_id, after, page)
-            .map_err(text)?;
-        let mut found = Found::default();
-        for (owner, record) in &rows.rows {
-            if record.primary_label() != def.label {
-                continue;
-            }
-            // A count of the rows a check reads, far below the type's range.
-            found.checked += 1;
-            let Some(values) = interpretation.record_membership(record) else {
-                continue;
-            };
-            let node = NodeId::from_raw(owner.node_id);
-            for tuple in tuples(&values) {
-                let missing = if def.unique {
-                    match store.unique_holder(&txn, def, &tuple).map_err(text)? {
-                        Some(Some(h)) if h == node => false,
-                        Some(Some(h))
-                            if node_holds(&txn, shard_id, def, interpretation, h, &tuple)
-                                .map_err(text)? =>
-                        {
-                            found.mismatches.push(Mismatch::SourceDuplicate {
-                                nodes: [
-                                    h.as_raw().min(owner.node_id),
-                                    h.as_raw().max(owner.node_id),
-                                ],
-                                tuple,
-                            });
-                            continue;
-                        }
-                        _ => true,
-                    }
-                } else {
-                    !store.has_entry(&txn, def, &tuple, *owner).map_err(text)?
-                };
-                if missing {
-                    found.mismatches.push(Mismatch::Missing {
-                        node: owner.node_id,
-                        valid_from: owner.valid_from,
-                        tuple,
-                    });
-                }
-            }
-        }
-        Ok((found, rows.resume, rows.exhausted))
-    }
-
-    /// One page of the generation's entries after `after`, each checked for
-    /// a record holding its value.
-    fn entries_page(
-        &self,
-        taken: &Taken,
-        interpretation: &IndexInterpretation,
-        after: Option<&[u8]>,
-        page: usize,
-    ) -> Result<(Found, Option<Vec<u8>>, bool), String> {
-        let env = self.env.as_ref();
-        let shard_id = env.shard_id();
-        let def = &taken.def;
-        let store = LocalIndexStore::new(env.engine());
-        let mut txn = begin(env);
-        let entries = store
-            .entries_page(&mut txn, def, after, page)
-            .map_err(text)?;
-        let mut found = Found::default();
-        for entry in &entries.entries {
-            // A count of the entries a check reads, far below the type's
-            // range.
-            found.checked += 1;
-            // An entry whose holder does not decode names no node: it is as
-            // wrong as one naming a node that does not hold the value.
-            let Some(owner) = entry.owner else {
-                found.mismatches.push(Mismatch::Extra {
-                    node: u64::MAX,
-                    valid_from: None,
-                    tuple: entry.tuple.clone(),
-                });
-                continue;
-            };
-            let holds = if def.unique {
-                node_holds(
-                    &txn,
-                    shard_id,
-                    def,
-                    interpretation,
-                    NodeId::from_raw(owner.node_id),
-                    &entry.tuple,
-                )
-                .map_err(text)?
-            } else {
-                LocalNodeStore
-                    .row(&txn, shard_id, owner)
-                    .map_err(text)?
-                    .is_some_and(|r| record_holds(def, interpretation, &r, &entry.tuple))
-            };
-            if !holds {
-                found.mismatches.push(Mismatch::Extra {
-                    node: owner.node_id,
-                    valid_from: owner.valid_from,
-                    tuple: entry.tuple.clone(),
-                });
-            }
-        }
-        Ok((found, entries.resume, entries.exhausted))
+        Ok(None)
     }
 
     /// Repair `mismatches` in one commit, each only while its record and its

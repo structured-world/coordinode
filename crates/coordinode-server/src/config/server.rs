@@ -434,8 +434,12 @@ pub struct ServerConfig {
     /// when nothing reported it wrong, in seconds (`None` = 86400; `0` checks
     /// only on reports and requests).
     pub index_check_interval_secs: Option<u64>,
-    /// Records, or entries, an index check reads per page (`None` = 512).
-    pub index_check_page: Option<std::num::NonZeroUsize>,
+    /// The most repairs one commit of an index check writes (`None` = 512).
+    pub index_check_repair_batch: Option<std::num::NonZeroUsize>,
+    /// Memory an index check pass holds its expected entries in before it
+    /// spills sorted runs to scratch files under the data directory, in MiB
+    /// (`None` = 64).
+    pub index_check_memory_mb: Option<std::num::NonZeroUsize>,
     /// The most disagreements an index check repairs entry by entry before
     /// it rebuilds the index into a fresh generation (`None` = 10000).
     pub index_check_max_repairs: Option<u64>,
@@ -644,7 +648,8 @@ impl Default for ServerConfig {
             index_build_unique_read_limit: None,
             index_build_statement_wait_secs: None,
             index_check_interval_secs: None,
-            index_check_page: None,
+            index_check_repair_batch: None,
+            index_check_memory_mb: None,
             index_check_max_repairs: None,
             nofile: None,
             max_connections: None,

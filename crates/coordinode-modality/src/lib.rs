@@ -92,7 +92,7 @@ pub use index::{
     StoredEntryPage,
 };
 pub use index_def::{
-    BuildFailure, BuildState, CheckPhase, CheckState, CopyQualification, DuplicateRepair,
+    BuildFailure, BuildState, CheckState, CopyQualification, DuplicateRepair,
     DuplicateRepairRecord, ENTRY_LAYOUT, GenerationId, IndexBuildRecord, IndexCheck,
     IndexDefinition, IndexDescriptor, IndexId, IndexIntegrityRecord, IndexMaintenance,
     IndexProfile, IndexState, IndexType, Integrity, LabelCertificationRecord, Mismatch,

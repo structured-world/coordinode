@@ -227,7 +227,8 @@ pub(crate) async fn serve(
         index_build_unique_read_limit,
         index_build_statement_wait_secs,
         index_check_interval_secs,
-        index_check_page,
+        index_check_repair_batch,
+        index_check_memory_mb,
         index_check_max_repairs,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
@@ -748,6 +749,14 @@ pub(crate) async fn serve(
         // Before any build resumes: this process takes up interrupted builds only
         // once it leads, below.
         let defaults = database.index_build_config();
+        let check_memory = match index_check_memory_mb {
+            None => defaults.check_memory,
+            // Refused at start rather than clamped, as the query limit is.
+            Some(mib) => mib
+                .get()
+                .checked_mul(1 << 20)
+                .ok_or_else(|| format!("index_check_memory_mb = {mib} does not fit in bytes"))?,
+        };
         database.set_index_build_config(coordinode_query::index::IndexBuildConfig {
             max_running: index_build_max_running.map_or(defaults.max_running, |n| n.get()),
             older_transactions_wait: index_build_older_transactions_wait_secs.map_or(
@@ -758,7 +767,9 @@ pub(crate) async fn serve(
                 .unwrap_or(defaults.unique_admission_read_limit),
             statement_wait: index_build_statement_wait_secs
                 .map_or(defaults.statement_wait, std::time::Duration::from_secs),
-            check_page: index_check_page.map_or(defaults.check_page, |n| n.get()),
+            check_repair_batch: index_check_repair_batch
+                .map_or(defaults.check_repair_batch, |n| n.get()),
+            check_memory,
             check_max_repairs: index_check_max_repairs.unwrap_or(defaults.check_max_repairs),
             // Zero turns the periodic check off; reports and requests still
             // check.

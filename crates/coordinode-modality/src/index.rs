@@ -2015,6 +2015,34 @@ impl IndexStore for LocalIndexStore<'_> {
 }
 
 impl LocalIndexStore<'_> {
+    /// Every entry `index`'s generation stores at `snapshot`, in key order,
+    /// as its encoded key and value: shared slices of what the scan read.
+    /// This member's own copy is read, wherever it is installed.
+    ///
+    /// # Errors
+    ///
+    /// The snapshot is no longer retained or the scan could not start; each
+    /// item carries a read failure.
+    pub fn stored_entries_at(
+        &self,
+        snapshot: u64,
+        index: &IndexDefinition,
+    ) -> StoreResult<
+        impl Iterator<
+            Item = StoreResult<(
+                impl core::ops::Deref<Target = [u8]>,
+                impl core::ops::Deref<Target = [u8]>,
+            )>,
+        > + use<>,
+    > {
+        let [plain, unique, _] = generation_ranges(index.generation);
+        let (prefix, _) = if index.unique { unique } else { plain };
+        let entries = self
+            .engine
+            .snapshot_prefix_iter(&snapshot, Partition::Idx, &prefix)?;
+        Ok(entries.map(|guard| guard.into_inner().map_err(StoreError::from)))
+    }
+
     /// Stage the removal of the repair records of the build of `generation`,
     /// which go with its build record. The data changes they record stay.
     fn delete_repairs_txn(

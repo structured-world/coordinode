@@ -444,12 +444,13 @@ fn a_copy_found_unfit_here_stays_unfit_across_a_restart() {
     assert_eq!(found(&mut db, "c@x"), vec![c]);
 }
 
-/// A check resumed after a restart half way through a pass counts what the
-/// pass found before the restart: a pass that found a disagreement is not
-/// clean, however clean its remainder, so only a later full pass verifies.
+/// A check interrupted half way through a pass proves nothing about what it
+/// read before the restart: the executor taking it after the restart reads
+/// every record and every entry again, so the pass that verifies is a whole
+/// one.
 #[test]
-fn a_pass_resumed_after_a_restart_counts_what_it_found_before() {
-    use coordinode_modality::index_def::{CheckPhase, IndexCheck, IndexIntegrityRecord};
+fn a_check_interrupted_mid_pass_reads_everything_again_after_a_restart() {
+    use coordinode_modality::index_def::{CheckState, IndexCheck, IndexIntegrityRecord};
     let dir = tempfile::tempdir().expect("tempdir");
     let generation;
     {
@@ -460,11 +461,10 @@ fn a_pass_resumed_after_a_restart_counts_what_it_found_before() {
             .expect("a");
         let index = index_named(db.engine(), "u_city").expect("index");
         generation = index.generation;
-        // The records half ran before the restart and found one entry
-        // missing; the entries half is next.
+        // An executor of the previous process held the check and had found
+        // and repaired one disagreement when the process ended.
         let mut check = IndexCheck::accepted(0);
-        check.phase = CheckPhase::Entries;
-        check.pass_found = 1;
+        check.state = CheckState::Running { executor: 1 };
         check.mismatches = 1;
         check.repaired = 1;
         let mut record = IndexIntegrityRecord::new(index.id, generation);
@@ -488,11 +488,113 @@ fn a_pass_resumed_after_a_restart_counts_what_it_found_before() {
         matches!(outcome, Some(CheckOutcome::Verified { .. })),
         "{outcome:?}"
     );
-    let passes = status.record.check.as_ref().map_or(0, |c| c.passes);
-    assert!(
-        passes >= 2,
-        "the resumed pass found a disagreement, so a later pass verified: {passes}"
+    let check = status.record.check.expect("the check");
+    assert_eq!(check.passes, 1, "one whole pass after the restart verified");
+    assert_eq!(
+        check.checked, 2,
+        "the pass read the one record and the one entry, none credited from before"
     );
+}
+
+/// A check whose pass outgrows its memory and cannot write its scratch
+/// files fails with that cause; it never verifies from a part of the
+/// comparison, a suspect index stays suspect, and lookups keep answering
+/// from the records.
+#[test]
+fn a_check_that_cannot_spill_fails_and_lookups_keep_answering_from_the_records() {
+    let (mut db, _dir) = open_db();
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        check_memory: 256,
+        ..db.index_build_config()
+    });
+    db.execute_cypher("CREATE INDEX u_city ON :U(city)")
+        .expect("index");
+    db.execute_cypher(
+        "UNWIND range(1, 50) AS i CREATE (:U {name: 'n' + toString(i), city: 'oslo'})",
+    )
+    .expect("users");
+    db.execute_cypher("CREATE (:U {name: 'r', city: 'rome'})")
+        .expect("r");
+    // Scratch files go under the data directory; a file in the way of
+    // their directory makes every spill fail.
+    std::fs::write(db.engine().data_dir().join("index-check"), b"in the way").expect("block");
+    // An entry naming r under oslo: the lookup that meets it reports the
+    // index and answers from the records.
+    let r = scan_id(&mut db, "name", "r");
+    db.engine()
+        .put(Partition::Idx, &entry_key(&db, "u_city", "oslo", r), &[])
+        .expect("plant a stray entry");
+    assert_eq!(found_by(&mut db, "city", "oslo").len(), 50);
+
+    let (status, outcome) = check(&db, "u_city");
+    assert!(
+        matches!(&outcome, CheckOutcome::Failed(reason) if reason.contains("scratch")),
+        "{outcome:?}"
+    );
+    assert_eq!(status.record.integrity, Integrity::Suspect);
+    assert_eq!(
+        found_by(&mut db, "city", "oslo").len(),
+        50,
+        "still answered from the records, without r"
+    );
+}
+
+/// Records and entries are compared at one snapshot, and writers maintain
+/// the index in the commits that change the records: writes racing a check
+/// are never taken for damage, so a check of an index nothing damaged
+/// repairs nothing, here with its pass spilling to scratch files.
+#[test]
+fn a_check_racing_writers_repairs_nothing() {
+    let (mut db, _dir) = open_db();
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        check_memory: 4096,
+        ..db.index_build_config()
+    });
+    db.execute_cypher("CREATE INDEX u_city ON :U(city)")
+        .expect("index");
+    db.execute_cypher(
+        "UNWIND range(1, 500) AS i CREATE (:U {name: 'n' + toString(i), city: 'c' + toString(i % 7)})",
+    )
+    .expect("users");
+    let writing = std::sync::atomic::AtomicBool::new(true);
+    let outcomes = std::thread::scope(|s| {
+        let db = &db;
+        let writer = s.spawn(|| {
+            let mut i = 0u64;
+            while writing.load(std::sync::atomic::Ordering::Relaxed) {
+                for query in [
+                    format!("CREATE (:U {{name: 'w{i}', city: 'c{}'}})", i % 7),
+                    format!(
+                        "MATCH (u:U {{name: 'n{}'}}) SET u.city = 'c{}'",
+                        i % 500 + 1,
+                        i % 5
+                    ),
+                    format!(
+                        "MATCH (u:U {{name: 'w{}'}}) DETACH DELETE u",
+                        i.wrapping_sub(3)
+                    ),
+                ] {
+                    db.execute_cypher_shared(&query, None, None, None, None)
+                        .expect("write");
+                }
+                i += 1;
+            }
+            i
+        });
+        let outcomes: Vec<_> = (0..3).map(|_| check(db, "u_city")).collect();
+        writing.store(false, std::sync::atomic::Ordering::Relaxed);
+        let written = writer.join().expect("writer");
+        assert!(written > 0, "the writer ran during the checks");
+        outcomes
+    });
+    for (status, outcome) in outcomes {
+        assert!(
+            matches!(outcome, CheckOutcome::Verified { repaired: 0, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(status.record.integrity, Integrity::Verified);
+    }
+    assert!(!found_by(&mut db, "city", "c1").is_empty());
 }
 
 /// Damage wider than a check may repair entry by entry rebuilds the index

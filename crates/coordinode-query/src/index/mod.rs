@@ -20,17 +20,18 @@ pub mod text_registry;
 pub use crate::planner::logical::{NumericCmp, VectorPredicate};
 pub use coverage::{IndexCoverage, IndexDelta};
 pub use definition::{
-    BuildFailure, BuildState, CheckPhase, CheckState, DuplicateRepair, DuplicateRepairRecord,
-    GenerationId, IndexBuildRecord, IndexCheck, IndexDefinition, IndexDescriptor, IndexId,
-    IndexIntegrityRecord, IndexMaintenance, IndexProfile, IndexState, IndexType, Integrity,
-    Mismatch, NamespaceIndexPolicy, OnlineDuringBuild, ProfileSource, TextFieldConfig,
-    TextIndexConfig, VectorIndexConfig,
+    BuildFailure, BuildState, CheckState, DuplicateRepair, DuplicateRepairRecord, GenerationId,
+    IndexBuildRecord, IndexCheck, IndexDefinition, IndexDescriptor, IndexId, IndexIntegrityRecord,
+    IndexMaintenance, IndexProfile, IndexState, IndexType, Integrity, Mismatch,
+    NamespaceIndexPolicy, OnlineDuringBuild, ProfileSource, TextFieldConfig, TextIndexConfig,
+    VectorIndexConfig,
 };
 pub use lifecycle::{
     BuildEnvironment, BuildError, BuildIndex, BuildPhase, BuildStatus, CheckOutcome,
     CheckRequestError, CheckStatus, DEFAULT_CHECK_INTERVAL, DEFAULT_CHECK_MAX_REPAIRS,
-    DEFAULT_CHECK_PAGE, DEFAULT_STATEMENT_WAIT, DEFAULT_UNIQUE_ADMISSION_READ_LIMIT,
-    IndexBuildConfig, IndexBuildOutcome, IndexBuildService, IndexCopySource,
+    DEFAULT_CHECK_MEMORY, DEFAULT_CHECK_REPAIR_BATCH, DEFAULT_STATEMENT_WAIT,
+    DEFAULT_UNIQUE_ADMISSION_READ_LIMIT, IndexBuildConfig, IndexBuildOutcome, IndexBuildService,
+    IndexCopySource,
 };
 
 /// How a maintenance operation names the index it acts on: by its stable

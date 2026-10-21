@@ -19,8 +19,8 @@ use super::{
 };
 use crate::executor::runner::{ExecutionContext, ExecutionError, operation_value};
 use crate::index::{
-    CheckOutcome, CheckPhase, CheckState, CheckStatus, GenerationId, IndexId, IndexSelector,
-    Integrity, Mismatch,
+    CheckOutcome, CheckState, CheckStatus, GenerationId, IndexId, IndexSelector, Integrity,
+    Mismatch,
 };
 
 /// The index check procedures, for the built-in catalog.
@@ -59,7 +59,6 @@ fn with_status_columns(signature: ProcedureSignature) -> ProcedureSignature {
         .output("indexId", ValueType::Integer)
         .output("integrity", ValueType::String)
         .output("state", ValueType::String)
-        .output("phase", ValueType::String)
         .output("passes", ValueType::Integer)
         .output("checked", ValueType::Integer)
         .output("mismatches", ValueType::Integer)
@@ -295,15 +294,6 @@ fn status_row(status: &CheckStatus, outcome: Option<&CheckOutcome>) -> Vec<Value
                     CheckState::Done => "DONE",
                     CheckState::Failed { .. } => "FAILED",
                     CheckState::Cancelled => "CANCELLED",
-                }
-                .into(),
-            )
-        }),
-        check.map_or(Value::Null, |c| {
-            Value::String(
-                match c.phase {
-                    CheckPhase::Records => "RECORDS",
-                    CheckPhase::Entries => "ENTRIES",
                 }
                 .into(),
             )

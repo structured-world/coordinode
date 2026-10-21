@@ -481,6 +481,44 @@ impl LocalNodeStore {
         })
     }
 
+    /// Every stored row of shard `shard_id` at `snapshot`, in key order: its
+    /// owner and its encoded record. The record bytes are shared slices of
+    /// what the scan read, so a caller looking at a record's labels alone
+    /// copies nothing, however large the record. Keys that are no node row
+    /// of the shard are skipped.
+    ///
+    /// # Errors
+    ///
+    /// The snapshot is no longer retained or the scan could not start; each
+    /// item carries a read failure.
+    pub fn encoded_rows_at(
+        engine: &StorageEngine,
+        snapshot: u64,
+        shard_id: u16,
+    ) -> StoreResult<
+        impl Iterator<Item = StoreResult<(EntryOwner, impl core::ops::Deref<Target = [u8]>)>> + use<>,
+    > {
+        let prefix = LocalNodeStore.shard_scan_prefix(shard_id);
+        let rows = engine.snapshot_prefix_iter(&snapshot, Partition::Node, &prefix)?;
+        Ok(rows.filter_map(move |guard| {
+            let (key, value) = match guard.into_inner() {
+                Ok(pair) => pair,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let owner = match decode_node_key(&key) {
+                Some((shard, id)) if shard == shard_id => EntryOwner::node(id.as_raw()),
+                Some(_) => return None,
+                None => match decode_temporal_node_key(&key) {
+                    Some((shard, id, valid_from)) if shard == shard_id => {
+                        EntryOwner::version(id.as_raw(), valid_from)
+                    }
+                    _ => return None,
+                },
+            };
+            Some(Ok((owner, value)))
+        }))
+    }
+
     /// The storage key of `node_id`'s record on `shard_id`: what a writer
     /// that stages changes by key (a conditioned page, a document delta)
     /// names the record by.

@@ -1334,7 +1334,7 @@ fn check_to_proto(
     status: &coordinode_query::index::CheckStatus,
     outcome: Option<&coordinode_query::index::CheckOutcome>,
 ) -> schema::IndexCheck {
-    use coordinode_query::index::{CheckOutcome, CheckPhase, CheckState, Integrity, Mismatch};
+    use coordinode_query::index::{CheckOutcome, CheckState, Integrity, Mismatch};
     let record = &status.record;
     let check = record.check.as_ref();
     schema::IndexCheck {
@@ -1361,10 +1361,6 @@ fn check_to_proto(
             CheckState::Done => schema::IndexCheckState::Done,
             CheckState::Failed { .. } => schema::IndexCheckState::Failed,
             CheckState::Cancelled => schema::IndexCheckState::Cancelled,
-        }) as i32,
-        phase: check.map_or(schema::IndexCheckPhase::Unspecified, |c| match c.phase {
-            CheckPhase::Records => schema::IndexCheckPhase::Records,
-            CheckPhase::Entries => schema::IndexCheckPhase::Entries,
         }) as i32,
         passes: check.map_or(0, |c| c.passes),
         checked: check.map_or(0, |c| c.checked),

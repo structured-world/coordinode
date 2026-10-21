@@ -874,19 +874,10 @@ impl CheckState {
     }
 }
 
-/// Which half of a check is running: records against entries, then entries
-/// against records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CheckPhase {
-    /// Every stored record of the label, checked for the entries it should
-    /// have.
-    Records,
-    /// Every entry of the generation, checked for a record holding it.
-    Entries,
-}
-
-/// One check of a generation: its state, how far it got, and what it found
-/// and repaired. Progress is not proof; only [`Integrity::Verified`] is.
+/// One check of a generation: its state, its passes, and what it found and
+/// repaired. Progress is not proof; only [`Integrity::Verified`] is. A pass
+/// reads the records and the entries whole at one snapshot, so a check
+/// interrupted mid-pass starts that pass again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexCheck {
     /// Where the check stands.
@@ -894,11 +885,7 @@ pub struct IndexCheck {
     /// The evidence revision when the check was taken: evidence arriving
     /// after it keeps the generation suspect whatever the check finds.
     pub started_revision: u64,
-    /// The half running now.
-    pub phase: CheckPhase,
-    /// The key the running half resumes after; `None` from its start.
-    pub cursor: Option<Vec<u8>>,
-    /// Complete passes over both halves so far.
+    /// Complete passes over the records and the entries so far.
     pub passes: u32,
     /// Records and entries checked so far.
     pub checked: u64,
@@ -906,11 +893,6 @@ pub struct IndexCheck {
     pub mismatches: u64,
     /// Disagreements repaired so far.
     pub repaired: u64,
-    /// Disagreements the running pass found so far, across restarts: a pass
-    /// is clean only when it found none over both halves.
-    pub pass_found: u64,
-    /// Of those, records breaking the constraint, which no entry can fix.
-    pub pass_conflicts: u64,
     /// The fresh generation a rebuild fills, when the damage was too wide
     /// to repair entry by entry; the checked generation is retired by it.
     pub rebuilt_into: Option<GenerationId>,
@@ -925,14 +907,10 @@ impl IndexCheck {
         Self {
             state: CheckState::Accepted,
             started_revision: revision,
-            phase: CheckPhase::Records,
-            cursor: None,
             passes: 0,
             checked: 0,
             mismatches: 0,
             repaired: 0,
-            pass_found: 0,
-            pass_conflicts: 0,
             rebuilt_into: None,
             finished_at_ms: None,
         }
