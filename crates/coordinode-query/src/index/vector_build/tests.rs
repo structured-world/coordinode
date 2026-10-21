@@ -204,7 +204,11 @@ impl Fixture {
         std::thread::scope(|scope| {
             let lock = held.write().expect("graph");
             let build = scope.spawn(|| {
-                tracing::subscriber::with_default(SnapshotTaken(taken), || {
+                let signal = SnapshotTaken {
+                    taken,
+                    release: None,
+                };
+                tracing::subscriber::with_default(signal, || {
                     VectorBuild {
                         engine: &self.engine,
                         token: &token,
@@ -221,6 +225,44 @@ impl Fixture {
                 .expect("the build took its snapshot");
             during();
             drop(lock);
+            build.join().expect("build thread")
+        })
+    }
+
+    /// Run a build of the `Doc.embedding` index held between its snapshot
+    /// and the start of its scan, run `during` there, then let it go.
+    fn build_doc_with_snapshot_held(&self, during: impl FnOnce()) -> Result<BuildOutcome, String> {
+        let hnsw = self.registry.get("Doc", "embedding").expect("hnsw");
+        let health = self.health();
+        let token = self.registry.new_build_token();
+        let (taken, snapshot) = std::sync::mpsc::sync_channel(1);
+        let (go, release) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let build = scope.spawn(|| {
+                let signal = SnapshotTaken {
+                    taken,
+                    release: Some(std::sync::Mutex::new(release)),
+                };
+                tracing::subscriber::with_default(signal, || {
+                    VectorBuild {
+                        engine: &self.engine,
+                        token: &token,
+                        shard_id: 0,
+                        targets: &[BuildTarget {
+                            hnsw: &hnsw,
+                            health: &health,
+                            label: "Doc",
+                            field_id: self.field,
+                        }],
+                    }
+                    .run()
+                })
+            });
+            snapshot
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the build took its snapshot");
+            during();
+            go.send(()).expect("the build waits");
             build.join().expect("build thread")
         })
     }
@@ -255,8 +297,12 @@ impl Fixture {
 }
 
 /// Tells the test, on the build's thread, when the build has opened its tap
-/// and taken its snapshot: the build reports that moment as an event.
-struct SnapshotTaken(std::sync::mpsc::SyncSender<()>);
+/// and taken its snapshot: the build reports that moment as an event. With
+/// `release`, the build then waits there until the test lets it scan.
+struct SnapshotTaken {
+    taken: std::sync::mpsc::SyncSender<()>,
+    release: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+}
 
 impl tracing::Subscriber for SnapshotTaken {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -282,10 +328,19 @@ impl tracing::Subscriber for SnapshotTaken {
         }
         let mut opened = Opened(false);
         event.record(&mut opened);
+        if !opened.0 {
+            return;
+        }
         // A full channel was told already; a closed one has a test no
-        // longer waiting.
-        if opened.0 && self.0.try_send(()).is_err() {
-            tracing::trace!("snapshot already reported");
+        // longer waiting, and neither needs telling again.
+        if self.taken.try_send(()).is_ok() {
+            if let Some(release) = &self.release {
+                release
+                    .lock()
+                    .expect("release")
+                    .recv()
+                    .expect("the test lets the build scan");
+            }
         }
     }
 
@@ -319,14 +374,28 @@ fn a_write_landing_below_every_build_snapshot_reaches_the_index() {
     let fx = fixture();
     fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
     let early = fx.oracle.next().as_raw();
+    // A commit after `early` lands before the build, so every snapshot the
+    // build takes is above `early` whatever the clock's resolution: the late
+    // write is below all of them.
+    fx.apply_doc_at(2, [0.0, 0.5, 0.5], fx.oracle.next().as_raw());
 
     let outcome = fx.build_doc_with_scan_held(|| {
         fx.apply_doc_at(7, [1.0, 0.0, 0.0], early);
         fx.maintain(&fx.fields, 7);
     });
 
-    assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 1 }));
-    assert_eq!(fx.graph_len(), 2, "the scanned node and the late one");
+    // A write below the snapshot that lands during the scan is in the scan
+    // if the scan reaches its key afterwards, and in the tap either way;
+    // the fold reconciles it, so both counts are a complete build.
+    assert!(
+        matches!(outcome, Ok(BuildOutcome::Complete { scanned: 2 | 3 })),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        fx.graph_len(),
+        3,
+        "the nodes written before the build and the late one, once each"
+    );
     assert!(fx.indexed([1.0, 0.0, 0.0], 7), "the late write is indexed");
 }
 
@@ -347,11 +416,43 @@ fn a_build_whose_partition_is_replaced_scans_again() {
         fx.apply_doc_at(9, [0.0, 0.0, 1.0], fx.oracle.next().as_raw());
     });
 
-    assert!(matches!(outcome, Ok(BuildOutcome::Complete { .. })));
+    assert!(
+        matches!(outcome, Ok(BuildOutcome::Complete { .. })),
+        "{outcome:?}"
+    );
     assert!(
         fx.indexed([0.0, 0.0, 1.0], 9),
         "the node written after the clear is indexed"
     );
+}
+
+/// A partition cleared after the build took its snapshot and before its
+/// scan began moves the retention horizon past that snapshot: the build
+/// starts over from a fresh one, as for a clear during the scan, rather than
+/// failing on history the clear released.
+// Clearing a partition wholesale is a storage operation no store exposes.
+#[allow(clippy::disallowed_types)]
+#[test]
+fn a_partition_replaced_before_the_scan_begins_scans_afresh() {
+    let fx = fixture();
+    fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
+
+    let outcome = fx.build_doc_with_snapshot_held(|| {
+        fx.engine
+            .clear_partition(coordinode_storage::engine::partition::Partition::Node)
+            .expect("clear");
+        fx.apply_doc_at(9, [0.0, 0.0, 1.0], fx.oracle.next().as_raw());
+    });
+
+    assert!(
+        matches!(outcome, Ok(BuildOutcome::Complete { .. })),
+        "{outcome:?}"
+    );
+    assert!(
+        fx.indexed([0.0, 0.0, 1.0], 9),
+        "the node written after the clear is indexed"
+    );
+    assert_eq!(fx.graph_len(), 1, "the cleared node is gone");
 }
 
 /// A scan started over reports progress again, which keeps the index

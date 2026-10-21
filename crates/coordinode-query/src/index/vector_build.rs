@@ -13,7 +13,7 @@ use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::try_extract_vector;
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::tap::Tapped;
+use coordinode_storage::engine::tap::{Tapped, WriteTap};
 use coordinode_vector::health::HealthSignal;
 use coordinode_vector::hnsw::HnswIndex;
 
@@ -115,7 +115,7 @@ impl VectorBuild<'_> {
             indexes = self.targets.len(),
             "vector build: tap open"
         );
-        let mut outcome = self.scan(at)?;
+        let mut outcome = self.scan_from(&tap, at)?;
         tracing::debug!(?outcome, "vector build: scanned");
         loop {
             if outcome == BuildOutcome::Cancelled || self.token.is_cancelled() {
@@ -135,7 +135,7 @@ impl VectorBuild<'_> {
                         .engine
                         .rebase_tap(&tap)
                         .map_err(|e| format!("rebase the write tap: {e}"))?;
-                    outcome = self.scan(at)?;
+                    outcome = self.scan_from(&tap, at)?;
                 }
                 Tapped::Keys(keys) => {
                     if !keys.is_empty() {
@@ -155,6 +155,35 @@ impl VectorBuild<'_> {
                     }
                     return Ok(outcome);
                 }
+            }
+        }
+    }
+
+    /// Scan at `at`, starting over from a fresh snapshot while the partition
+    /// was replaced underneath: a replace releases the history before it, so
+    /// a scan whose snapshot it left behind fails, and only the tap says
+    /// whether that is why. A failure with no replace behind it is the
+    /// build's.
+    ///
+    /// # Errors
+    ///
+    /// A scan failure the tap does not explain, or a failure to rebase it.
+    fn scan_from(&self, tap: &WriteTap, mut at: u64) -> Result<BuildOutcome, String> {
+        loop {
+            let err = match self.scan(at) {
+                Ok(outcome) => return Ok(outcome),
+                Err(err) => err,
+            };
+            match tap.take() {
+                Tapped::Replaced => {
+                    tracing::debug!(%err, "vector build: partition replaced, scanning afresh");
+                    at = self
+                        .engine
+                        .rebase_tap(tap)
+                        .map_err(|e| format!("rebase the write tap: {e}"))?;
+                }
+                // The keys go with the failed build.
+                Tapped::Keys(_) => return Err(err),
             }
         }
     }
