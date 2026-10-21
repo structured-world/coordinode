@@ -677,6 +677,43 @@ fn a_record_write_that_keeps_the_check_does_not_cost_the_check() {
     assert_eq!(env.holders(&def, "b@x"), vec![2], "repaired by this check");
 }
 
+/// A report of a disagreement a check already repaired, recorded after the
+/// check verified the generation (a read met the damage before the check and
+/// its report waited in the queue), changes nothing: the generation stays
+/// verified and no check is admitted for it.
+#[test]
+fn a_report_of_damage_already_repaired_leaves_the_generation_verified() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    let operation = builds.request_check(def.id).expect("check");
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { repaired: 1, .. })),
+        "{outcome:?}"
+    );
+
+    let tuple = coordinode_core::index::encoding::encode_tuple(&[Value::String("b@x".into())])
+        .expect("tuple");
+    builds.record_reports(vec![crate::index::registry::IntegrityReport {
+        index: def.id,
+        generation: def.generation,
+        found: coordinode_modality::Mismatch::Missing {
+            node: 2,
+            valid_from: None,
+            tuple,
+        },
+    }]);
+
+    let (record, _) = LocalIndexStore::new(&env.engine)
+        .load_integrity(def.generation)
+        .expect("read")
+        .expect("a record");
+    assert_eq!(record.integrity, coordinode_modality::Integrity::Verified);
+    assert!(!record.check_pending(), "no check admitted for it");
+}
+
 /// A new check admitted right after a check concluded (a report of the
 /// damage it just repaired, recorded late, admits one) leaves the outcome the
 /// first check recorded: its waiter is told that outcome, not a cancellation

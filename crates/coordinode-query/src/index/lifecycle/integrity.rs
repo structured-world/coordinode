@@ -144,6 +144,17 @@ struct Found {
     mismatches: Vec<Mismatch>,
 }
 
+/// What became of disagreements a read reported.
+enum ReportFate {
+    /// Recorded against the generation, with a check admitted.
+    Recorded,
+    /// Not recorded: the index no longer serves from the generation, or this
+    /// member takes no writes and checks its own copy instead.
+    NotHere,
+    /// Nothing to record: every one was resolved before it was looked at.
+    Resolved,
+}
+
 /// What one pass of a check did.
 #[derive(Default)]
 struct Pass {
@@ -201,7 +212,7 @@ impl IndexBuildService {
     /// Record `reports` in the integrity records of their generations, and
     /// admit and run a check of each. A member that takes no writes records
     /// nothing; its own reads keep answering from the records.
-    fn record_reports(&self, reports: Vec<IntegrityReport>) {
+    pub(super) fn record_reports(&self, reports: Vec<IntegrityReport>) {
         let mut by_generation: FxHashMap<GenerationId, (IndexId, Vec<Mismatch>)> =
             FxHashMap::default();
         for report in reports {
@@ -213,14 +224,17 @@ impl IndexBuildService {
         }
         for (generation, (index, found)) in by_generation {
             match self.record(index, generation, found) {
-                Ok(true) => {
+                Ok(ReportFate::Recorded) => {
                     if let Err(e) = self.submit_check(generation) {
                         tracing::warn!(generation = generation.as_raw(), error = %e,
                             "could not start the check of a reported index generation");
                     }
                 }
                 // Not recorded here: this member's own copy is checked here.
-                Ok(false) => self.submit_local_check(generation),
+                Ok(ReportFate::NotHere) => self.submit_local_check(generation),
+                // Every reported disagreement was resolved before it was
+                // recorded: by a check that ran meanwhile, or by a writer.
+                Ok(ReportFate::Resolved) => {}
                 Err(e) => tracing::warn!(generation = generation.as_raw(), error = %e,
                     "could not record an index disagreement; this member answers from the \
                      records until a check runs"),
@@ -240,7 +254,7 @@ impl IndexBuildService {
                 continue;
             };
             match self.record(index, generation, Vec::new()) {
-                Ok(true) => {
+                Ok(ReportFate::Recorded) => {
                     if let Err(e) = self.submit_check(generation) {
                         tracing::warn!(generation = generation.as_raw(), error = %e,
                             "could not start the check of an index generation found unfit");
@@ -249,7 +263,9 @@ impl IndexBuildService {
                 // A member that takes no writes checks its own copy itself:
                 // the shared check another member runs proves only that
                 // member's copy.
-                Ok(false) => self.submit_local_check(generation),
+                Ok(ReportFate::NotHere) => self.submit_local_check(generation),
+                // A mark is never resolved before it is recorded.
+                Ok(ReportFate::Resolved) => {}
                 Err(e) => tracing::warn!(generation = generation.as_raw(), error = %e,
                     "could not record an index generation found unfit"),
             }
@@ -258,24 +274,47 @@ impl IndexBuildService {
 
     /// Record `found` against `generation` of `index` and admit a check
     /// unless one is pending. With nothing in `found`, the generation is
-    /// recorded suspect on this member's mark alone. `false` when nothing was recorded: the index
-    /// no longer serves from that generation, or this member takes no
-    /// writes.
+    /// recorded suspect on this member's mark alone.
+    ///
+    /// A reported disagreement is what a read saw earlier; one a check or a
+    /// writer has resolved since no longer counts, or a check that verified
+    /// the generation meanwhile would be undone by evidence it already
+    /// covered. Each is looked at again as the entries and records stand.
     fn record(
         &self,
         index: IndexId,
         generation: GenerationId,
         found: Vec<Mismatch>,
-    ) -> Result<bool, String> {
+    ) -> Result<ReportFate, String> {
         let env = self.shared.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
-        let serving = store
+        let Some(def) = store
             .load_definition(index)
             .map_err(text)?
-            .is_some_and(|d| d.generation == generation);
-        if !serving {
-            return Ok(false);
-        }
+            .filter(|d| d.generation == generation)
+        else {
+            return Ok(ReportFate::NotHere);
+        };
+        let found = if found.is_empty() {
+            found
+        } else {
+            let fields = env.fields()?;
+            let field_of = |name: &str| fields.lookup(name);
+            let interpretation = def.interpretation(&field_of);
+            let mut live = Vec::with_capacity(found.len());
+            for mismatch in found {
+                if self
+                    .shared
+                    .still_disagrees(&def, &interpretation, &mismatch)?
+                {
+                    live.push(mismatch);
+                }
+            }
+            if live.is_empty() {
+                return Ok(ReportFate::Resolved);
+            }
+            live
+        };
         for () in move_attempts() {
             let (mut record, version) = match store.load_integrity(generation).map_err(text)? {
                 Some((record, version)) => (record, Some(version)),
@@ -293,7 +332,7 @@ impl IndexBuildService {
                 new = true;
             }
             if !new && record.integrity == Integrity::Suspect && record.check_pending() {
-                return Ok(true);
+                return Ok(ReportFate::Recorded);
             }
             if !record.check_pending() {
                 record.check = Some(IndexCheck::accepted(record.evidence_revision));
@@ -308,10 +347,10 @@ impl IndexBuildService {
             match committed {
                 Ok(()) => {
                     self.refresh_integrity()?;
-                    return Ok(true);
+                    return Ok(ReportFate::Recorded);
                 }
                 Err(e) if is_contention(&e) => continue,
-                Err(e) if cannot_move_here(&e) => return Ok(false),
+                Err(e) if cannot_move_here(&e) => return Ok(ReportFate::NotHere),
                 Err(e) => return Err(e.to_string()),
             }
         }
@@ -882,6 +921,80 @@ fn owner_of(node: u64, valid_from: Option<i64>) -> EntryOwner {
 }
 
 impl Shared {
+    /// Whether `mismatch` still holds between `def`'s entries and the
+    /// records as they stand now. Records that hold one unique value twice
+    /// stay a disagreement: no entry resolves them.
+    fn still_disagrees(
+        &self,
+        def: &IndexDefinition,
+        interpretation: &IndexInterpretation,
+        mismatch: &Mismatch,
+    ) -> Result<bool, String> {
+        let engine = self.env.engine();
+        let shard_id = self.env.shard_id();
+        let store = LocalIndexStore::new(engine);
+        Ok(match mismatch {
+            Mismatch::Missing {
+                node,
+                valid_from,
+                tuple,
+            } => {
+                let owner = owner_of(*node, *valid_from);
+                let holds = LocalNodeStore
+                    .latest_row(engine, shard_id, owner)
+                    .map_err(text)?
+                    .is_some_and(|(r, _)| record_holds(def, interpretation, &r, tuple));
+                holds
+                    && match store.latest_entry(def, tuple, owner).map_err(text)? {
+                        None => true,
+                        Some(_) if !def.unique => false,
+                        Some(entry) => entry.holder.map(NodeId::as_raw) != Some(*node),
+                    }
+            }
+            Mismatch::Extra {
+                node,
+                valid_from,
+                tuple,
+            } => {
+                let owner = owner_of(*node, *valid_from);
+                match store.latest_entry(def, tuple, owner).map_err(text)? {
+                    None => false,
+                    Some(entry)
+                        if def.unique && entry.holder.map_or(u64::MAX, NodeId::as_raw) != *node =>
+                    {
+                        false
+                    }
+                    Some(_) => {
+                        let holds = if def.unique {
+                            let latest = Transaction::new(
+                                engine,
+                                None,
+                                coordinode_core::txn::timestamp::Timestamp::ZERO,
+                                None,
+                            );
+                            node_holds(
+                                &latest,
+                                shard_id,
+                                def,
+                                interpretation,
+                                NodeId::from_raw(*node),
+                                tuple,
+                            )
+                            .map_err(text)?
+                        } else {
+                            LocalNodeStore
+                                .latest_row(engine, shard_id, owner)
+                                .map_err(text)?
+                                .is_some_and(|(r, _)| record_holds(def, interpretation, &r, tuple))
+                        };
+                        !holds
+                    }
+                }
+            }
+            Mismatch::SourceDuplicate { .. } => true,
+        })
+    }
+
     /// Read this member's copy of `generation` both ways against this
     /// member's records, writing nothing shared, and lift its local mark
     /// when it agrees. Records breaking a unique constraint are the records'
