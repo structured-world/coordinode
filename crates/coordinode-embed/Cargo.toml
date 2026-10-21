@@ -70,6 +70,8 @@ tempfile = { workspace = true }
 coordinode-test-fixtures = { workspace = true }
 metrics = { workspace = true }
 metrics-util = "0.20"
+# The routing bench counts allocations per command.
+stats_alloc = "0.1"
 
 # A replicated group through the entry point a host opens.
 [[test]]
@@ -123,6 +125,12 @@ harness = false
 [[bench]]
 name = "schema_package"
 harness = false
+
+# A command routed to the leader against the same command run there.
+[[bench]]
+name = "routing"
+harness = false
+required-features = ["replication"]
 
 [lints]
 workspace = true
