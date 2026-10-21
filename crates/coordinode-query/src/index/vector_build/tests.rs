@@ -11,6 +11,9 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
 use coordinode_vector::health::HealthSignal;
 
+use coordinode_modality::{LocalNodeStore, NodeStore as _};
+use coordinode_storage::engine::tap::Tapped;
+
 use super::{BuildOutcome, BuildTarget, VectorBuild};
 use crate::index::{VectorIndexConfig, VectorIndexRegistry};
 
@@ -452,6 +455,45 @@ fn a_partition_replaced_before_the_scan_begins_scans_afresh() {
         fx.indexed([0.0, 0.0, 1.0], 9),
         "the node written after the clear is indexed"
     );
+    assert_eq!(fx.graph_len(), 1, "the cleared node is gone");
+}
+
+/// A scan refused because the history under its snapshot was released starts
+/// over from a fresh snapshot even when the tap does not say the partition
+/// was replaced: the tap is marked only after the history goes, so a scan
+/// can fail before the mark is there.
+// Clearing a partition wholesale is a storage operation no store exposes.
+#[allow(clippy::disallowed_types)]
+#[test]
+fn a_scan_refused_for_released_history_starts_over_without_the_tap() {
+    let fx = fixture();
+    fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
+    let (tap, at) = LocalNodeStore.tap_writes(&fx.engine).expect("tap");
+    fx.engine
+        .clear_partition(coordinode_storage::engine::partition::Partition::Node)
+        .expect("clear");
+    fx.apply_doc_at(9, [0.0, 0.0, 1.0], fx.oracle.next().as_raw());
+    // As if the scan failed before the clear marked the tap.
+    assert_eq!(tap.take(), Tapped::Replaced);
+
+    let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
+    let health = fx.health();
+    let token = fx.registry.new_build_token();
+    let outcome = VectorBuild {
+        engine: &fx.engine,
+        token: &token,
+        shard_id: 0,
+        targets: &[BuildTarget {
+            hnsw: &hnsw,
+            health: &health,
+            label: "Doc",
+            field_id: fx.field,
+        }],
+    }
+    .scan_from(&tap, at);
+
+    assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 1 }));
+    assert!(fx.indexed([0.0, 0.0, 1.0], 9), "the node after the clear");
     assert_eq!(fx.graph_len(), 1, "the cleared node is gone");
 }
 

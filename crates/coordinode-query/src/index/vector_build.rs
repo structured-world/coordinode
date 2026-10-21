@@ -11,9 +11,10 @@ use std::sync::RwLock;
 
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::try_extract_vector;
-use coordinode_modality::{LocalNodeStore, NodeStore as _};
+use coordinode_modality::{LocalNodeStore, NodeStore as _, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::tap::{Tapped, WriteTap};
+use coordinode_storage::error::StorageError;
 use coordinode_vector::health::HealthSignal;
 use coordinode_vector::hnsw::HnswIndex;
 
@@ -25,6 +26,21 @@ const TAP_FOLD_CHUNK: usize = 1024;
 
 /// Nodes scanned between two progress reports and cancellation checks.
 const PROGRESS_INTERVAL: u64 = 1000;
+
+/// Fresh snapshots a build takes in a row while the history under each one
+/// is released before its scan reads it; each release is a clear or range
+/// drop of the partition racing the scan, so a run this long means the
+/// partition is being replaced faster than it can be read.
+const RESCANS: usize = 16;
+
+/// Why a scan did not complete.
+enum ScanFailure {
+    /// The history under the scan's snapshot was released: a scan from a
+    /// fresh snapshot can succeed.
+    Released(String),
+    /// Anything else; the build fails with it.
+    Failed(String),
+}
 
 /// How a build ended: it finished, or it was asked to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,33 +175,34 @@ impl VectorBuild<'_> {
         }
     }
 
-    /// Scan at `at`, starting over from a fresh snapshot while the partition
-    /// was replaced underneath: a replace releases the history before it, so
-    /// a scan whose snapshot it left behind fails, and only the tap says
-    /// whether that is why. A failure with no replace behind it is the
-    /// build's.
+    /// Scan at `at`, starting over from a fresh snapshot while the history
+    /// under the snapshot was released (a partition cleared or range-dropped
+    /// since it was taken). The refusal itself says so: the tap is marked
+    /// only after the history goes, so it can lag a scan that already failed.
+    /// A fresh snapshot sits above every seqno handed out, the release's
+    /// included, and the rebase restarts the tap with it.
     ///
     /// # Errors
     ///
-    /// A scan failure the tap does not explain, or a failure to rebase it.
+    /// A scan failure of another kind, a failure to rebase the tap, or a
+    /// history released under every one of [`RESCANS`] snapshots in a row.
     fn scan_from(&self, tap: &WriteTap, mut at: u64) -> Result<BuildOutcome, String> {
-        loop {
-            let err = match self.scan(at) {
+        for _ in 0..RESCANS {
+            match self.scan(at) {
                 Ok(outcome) => return Ok(outcome),
-                Err(err) => err,
-            };
-            match tap.take() {
-                Tapped::Replaced => {
-                    tracing::debug!(%err, "vector build: partition replaced, scanning afresh");
+                Err(ScanFailure::Released(why)) => {
+                    tracing::debug!(%why, "vector build: history released, scanning afresh");
                     at = self
                         .engine
                         .rebase_tap(tap)
                         .map_err(|e| format!("rebase the write tap: {e}"))?;
                 }
-                // The keys go with the failed build.
-                Tapped::Keys(_) => return Err(err),
+                Err(ScanFailure::Failed(err)) => return Err(err),
             }
         }
+        Err(format!(
+            "the history under the build's snapshot was released {RESCANS} times in a row"
+        ))
     }
 
     /// Hand the scanned graphs to their maintainer, which inserts what it
@@ -209,11 +226,12 @@ impl VectorBuild<'_> {
     /// seen. The denominator is the partition's approximate item count, so
     /// the fraction is an under-estimate that snaps to 1.0 at the end: honest
     /// for a progress bar, never a row count.
-    fn scan(&self, snapshot: u64) -> Result<BuildOutcome, String> {
-        let _pin = self
-            .engine
-            .pin_snapshot_at(snapshot)
-            .ok_or_else(|| format!("the build snapshot {snapshot} is already outside retention"))?;
+    fn scan(&self, snapshot: u64) -> Result<BuildOutcome, ScanFailure> {
+        let _pin = self.engine.pin_snapshot_at(snapshot).ok_or_else(|| {
+            ScanFailure::Released(format!(
+                "the build snapshot {snapshot} is already outside retention"
+            ))
+        })?;
         let started = std::time::Instant::now();
         // Upper bound over every version and tombstone the levels hold, for
         // the whole partition rather than these labels: deliberately
@@ -266,7 +284,12 @@ impl VectorBuild<'_> {
                     Ok(std::ops::ControlFlow::Continue(()))
                 },
             )
-            .map_err(|e| format!("shard scan: {e}"))?;
+            .map_err(|e| match e {
+                StoreError::Storage(StorageError::SnapshotOutsideRetention { .. }) => {
+                    ScanFailure::Released(format!("shard scan: {e}"))
+                }
+                e => ScanFailure::Failed(format!("shard scan: {e}")),
+            })?;
         if cancelled || self.token.is_cancelled() {
             return Ok(BuildOutcome::Cancelled);
         }
