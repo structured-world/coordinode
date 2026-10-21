@@ -302,6 +302,11 @@ fn principal() -> ActingContext {
 
 /// Serve `executor` on a local port and return a router to it.
 async fn serve(executor: Arc<Scripted>) -> CommandRouter {
+    serve_handler(CommandRoutingHandler::new(executor)).await
+}
+
+/// Serve `handler` on a local port and return a router to it.
+async fn serve_handler(handler: CommandRoutingHandler<Scripted>) -> CommandRouter {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -309,7 +314,7 @@ async fn serve(executor: Arc<Scripted>) -> CommandRouter {
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(CommandRoutingHandler::new(executor).into_service(MAX_ROUTED_MESSAGE))
+            .add_service(handler.into_service(MAX_ROUTED_MESSAGE))
             .serve_with_incoming(incoming)
             .await
             .expect("serve");
@@ -320,6 +325,35 @@ async fn serve(executor: Arc<Scripted>) -> CommandRouter {
         .await
         .expect("connect");
     CommandRouter::new(MEMBER, channel)
+}
+
+/// Open a session to the member `router` reaches by hand, naming `codec` as
+/// the error encoding read: the requests to send on it, and its replies.
+async fn open_session(
+    router: &CommandRouter,
+    codec: u32,
+) -> Result<
+    (
+        tokio::sync::mpsc::UnboundedSender<wire::RoutedRequest>,
+        tonic::Streaming<wire::RoutedReply>,
+    ),
+    Status,
+> {
+    let (requests, outbound) = tokio::sync::mpsc::unbounded_channel();
+    let mut request = Request::new(tokio_stream::wrappers::UnboundedReceiverStream::new(
+        outbound,
+    ));
+    request
+        .metadata_mut()
+        .insert(CODEC_HEADER, MetadataValue::from(codec));
+    let replies = router
+        .link
+        .client
+        .clone()
+        .session(request)
+        .await?
+        .into_inner();
+    Ok((requests, replies))
 }
 
 /// The member the routers in these tests reach.
@@ -402,22 +436,23 @@ async fn a_small_answer_is_one_message() {
         },
     }));
     let router = serve(executor).await;
-    let mut frames = router
-        .client
-        .clone()
-        .execute(CommandRouter::request(
-            statement_to_wire(statement(None)).expect("encoded"),
-            None,
-        ))
+    let (requests, mut replies) = open_session(&router, ERROR_CODEC_VERSION)
         .await
-        .expect("answering")
-        .into_inner();
-    let mut messages = Vec::new();
-    while let Some(frame) = frames.message().await.expect("frame") {
-        messages.push(frame);
-    }
-    assert_eq!(messages.len(), 1, "{messages:?}");
-    let kinds: Vec<&str> = messages[0]
+        .expect("opened");
+    requests
+        .send(wire::RoutedRequest {
+            call: 1,
+            request: Some(wire::routed_request::Request::Execute(Box::new(
+                statement_to_wire(statement(None)).expect("encoded"),
+            ))),
+        })
+        .expect("sent");
+    let reply = replies.message().await.expect("reply").expect("a reply");
+    assert_eq!(reply.call, 1);
+    let Some(wire::routed_reply::Reply::Frame(frame)) = reply.reply else {
+        panic!("{reply:?}");
+    };
+    let kinds: Vec<&str> = frame
         .events
         .iter()
         .map(|event| match event.event {
@@ -578,9 +613,9 @@ async fn an_ingress_that_does_not_read_holds_the_member_back() {
         seen = now;
     }
     let per_batch = ROW_BATCH_BYTES / WIDTH;
-    // The queue, the batch being sent, and what HTTP/2 lets through before
-    // the ingress's window is spent.
-    let ahead = (FRAMES_IN_FLIGHT + 6) * per_batch;
+    // The frames the credit lets ahead, and the batch filling while the
+    // member waits for more.
+    let ahead = (FRAMES_AHEAD as usize + 1) * per_batch + 1;
     assert!(
         seen < ROWS && seen <= ahead,
         "{seen} of {ROWS} rows written with none read, at most {ahead} expected"
@@ -783,31 +818,34 @@ async fn a_commit_whose_answer_is_lost_is_not_an_abort() {
     }
 }
 
-/// A call from an ingress that reads another error encoding is refused before
-/// anything runs, and the ingress learns that nothing ran.
+/// A session from an ingress that reads another error encoding is refused
+/// before any command of it is read, and the ingress learns that nothing ran.
 #[tokio::test]
-async fn a_call_under_another_codec_is_refused_unread() {
+async fn a_session_under_another_codec_is_refused_unread() {
     let executor = Arc::new(Scripted::default());
     let router = serve(Arc::clone(&executor)).await;
-    let mut request = Request::new(statement_to_wire(statement(None)).expect("encoded"));
-    request
-        .metadata_mut()
-        .insert(CODEC_HEADER, MetadataValue::from(ERROR_CODEC_VERSION + 1));
-    let status = router
-        .client
-        .clone()
-        .execute(request)
+    let status = open_session(&router, ERROR_CODEC_VERSION + 1)
         .await
         .expect_err("refused");
     assert!(status.metadata().contains_key(REFUSED_HEADER), "{status:?}");
-    assert!(
-        matches!(
-            router.lost(&status),
-            DatabaseError::PeerUnreachable { member: MEMBER, .. }
-        ),
-        "the command did not run"
-    );
     assert!(executor.statements.lock().unwrap().is_empty());
+}
+
+/// A session that does not open reached no member: every command sent on it
+/// is told it did not run, never that its outcome is unknown, so the ingress
+/// may send it again.
+#[tokio::test]
+async fn a_session_that_never_opened_ran_nothing() {
+    let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+    let router = CommandRouter::new(MEMBER, channel);
+    let err = router
+        .execute(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect_err("nobody listens");
+    assert!(
+        matches!(err, DatabaseError::PeerUnreachable { member: MEMBER, .. }),
+        "{err:?}"
+    );
 }
 
 /// An error body the ingress cannot read is a lost answer, not a refusal: the
@@ -946,4 +984,217 @@ fn unset_settings_stay_unset() {
 fn a_tiny_deadline_is_kept() {
     assert_eq!(deadline_to_wire(Some(Duration::from_micros(10))), 1);
     assert_eq!(deadline_to_wire(None), 0);
+}
+
+/// The session a router's commands travel on, while one is open.
+fn current_session(router: &CommandRouter) -> Option<Arc<Session>> {
+    router.link.session.lock().clone()
+}
+
+/// Commands sent at once through one router share one session and each gets
+/// its own answer, none another's.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_commands_share_one_session() {
+    let executor = Arc::new(Scripted::default());
+    let rows: Vec<Vec<Value>> = (0..3).map(|k| vec![Value::Int(k)]).collect();
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer {
+        columns: vec!["k".into()],
+        rows: rows.clone(),
+        stats: RoutedStats {
+            nodes_created: 1,
+            ..RoutedStats::default()
+        },
+    }));
+    let router = serve(Arc::clone(&executor)).await;
+    router
+        .execute(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect("first");
+    let session = current_session(&router).expect("a session");
+
+    let calls: Vec<_> = (0..64)
+        .map(|_| {
+            let router = router.clone();
+            tokio::spawn(async move {
+                router
+                    .execute(statement(None), &AdmissionSignal::new(|| {}))
+                    .await
+            })
+        })
+        .collect();
+    for call in calls {
+        let answer = call.await.expect("joined").expect("answered");
+        assert_eq!(answer.rows, rows);
+        assert_eq!(answer.stats.nodes_created, 1);
+    }
+    assert!(
+        Arc::ptr_eq(&session, &current_session(&router).expect("a session")),
+        "every command went on the first session"
+    );
+    assert_eq!(executor.statements.lock().unwrap().len(), 65);
+}
+
+/// An answer nobody reads holds back its own statement only: another
+/// statement on the same session streams its whole answer meanwhile, and the
+/// unread one still arrives whole once read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unread_answer_holds_back_no_other_command() {
+    const ROWS: usize = 200;
+    const WIDTH: usize = 32 << 10;
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Script::Many {
+        rows: ROWS,
+        width: WIDTH,
+    });
+    let router = serve(Arc::clone(&executor)).await;
+    let mut unread = router
+        .execute_rows(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect("answering");
+    let other = tokio::time::timeout(
+        Duration::from_secs(30),
+        router.execute(statement(None), &AdmissionSignal::new(|| {})),
+    )
+    .await
+    .expect("not held back by the unread answer")
+    .expect("answered");
+    assert_eq!(other.rows.len(), ROWS);
+
+    let mut read = 0;
+    loop {
+        let piece = unread.next_rows(64).await.expect("rows");
+        if piece.is_empty() {
+            break;
+        }
+        read += piece.len();
+    }
+    assert_eq!(read, ROWS);
+}
+
+/// Whether the test's admission lets the connection route commands.
+static ADMITTED: AtomicBool = AtomicBool::new(true);
+
+fn scripted_admission(_: Option<&PeerConnectInfo>) -> Result<(), Status> {
+    if ADMITTED.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated("withdrawn"))
+    }
+}
+
+/// Admission is checked before every command of an open session, not only
+/// when it opened: once the connection is no longer admitted, the next
+/// command is refused and does not run, though the session stays open.
+#[tokio::test]
+async fn every_command_of_an_open_session_is_admitted_again() {
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer::default()));
+    let router = serve_handler(
+        CommandRoutingHandler::new(Arc::clone(&executor)).admitting(scripted_admission),
+    )
+    .await;
+    router
+        .execute(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect("admitted");
+    let session = current_session(&router).expect("a session");
+
+    ADMITTED.store(false, Ordering::Release);
+    let err = router
+        .execute(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect_err("no longer admitted");
+    assert!(
+        matches!(&err, DatabaseError::PeerUnreachable { member: MEMBER, message } if message.contains("admission")),
+        "{err:?}"
+    );
+    assert_eq!(
+        executor.statements.lock().unwrap().len(),
+        1,
+        "the refused command did not run"
+    );
+    assert!(Arc::ptr_eq(
+        &session,
+        &current_session(&router).expect("a session")
+    ));
+}
+
+/// A second command under a number already running on the session is
+/// refused without running, and the first one runs on; a cancel then stops
+/// it.
+#[tokio::test]
+async fn a_number_in_use_is_refused_and_a_cancel_stops_its_command() {
+    let executor = Arc::new(Scripted::default());
+    let router = serve(Arc::clone(&executor)).await;
+    let (requests, mut replies) = open_session(&router, ERROR_CODEC_VERSION)
+        .await
+        .expect("opened");
+    let execute = || wire::RoutedRequest {
+        call: 7,
+        request: Some(wire::routed_request::Request::Execute(Box::new(
+            statement_to_wire(statement(None)).expect("encoded"),
+        ))),
+    };
+    requests.send(execute()).expect("sent");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while executor.statements.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "never arrived");
+        tokio::task::yield_now().await;
+    }
+    requests.send(execute()).expect("sent again");
+    let reply = replies.message().await.expect("reply").expect("a reply");
+    assert_eq!(reply.call, 7);
+    assert!(
+        matches!(&reply.reply, Some(wire::routed_reply::Reply::Refused(r)) if r.reason == "duplicate"),
+        "{reply:?}"
+    );
+    assert_eq!(executor.statements.lock().unwrap().len(), 1);
+
+    requests
+        .send(wire::RoutedRequest {
+            call: 7,
+            request: Some(wire::routed_request::Request::Cancel(wire::RoutedCancel {})),
+        })
+        .expect("cancel sent");
+    while !executor.cancelled.load(Ordering::Acquire) {
+        assert!(std::time::Instant::now() < deadline, "never cancelled");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A session whose ingress goes away stops what still runs for it and
+/// aborts the transactions those statements ran in.
+#[tokio::test]
+async fn a_lost_session_stops_its_statements() {
+    let executor = Arc::new(Scripted::default());
+    let router = serve(Arc::clone(&executor)).await;
+    let (requests, replies) = open_session(&router, ERROR_CODEC_VERSION)
+        .await
+        .expect("opened");
+    requests
+        .send(wire::RoutedRequest {
+            call: 1,
+            request: Some(wire::routed_request::Request::Execute(Box::new(
+                statement_to_wire(statement(Some(txid()))).expect("encoded"),
+            ))),
+        })
+        .expect("sent");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while executor.statements.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "never arrived");
+        tokio::task::yield_now().await;
+    }
+    drop(requests);
+    drop(replies);
+    loop {
+        let rollbacks = executor.rollbacks.lock().unwrap().clone();
+        if let Some(rollback) = rollbacks.first() {
+            assert!(rollback.abandoned);
+            assert_eq!(rollback.transaction, txid());
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never abandoned");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(executor.cancelled.load(Ordering::Acquire));
 }

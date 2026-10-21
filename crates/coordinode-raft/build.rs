@@ -55,9 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Commands routed between members carry row batches: the transport codec
     // compresses them like the consensus traffic.
     let routing_proto = format!("{proto_root_str}/coordinode/internode/routing/routing.proto");
+    // A statement is far larger than the credits and cancels that share its
+    // message on a session: boxed, it does not size every one of them.
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .boxed(".coordinode.internode.routing.RoutedRequest.request.execute")
         .codec_path("coordinode_wire::ZstdCodec")
         .compile_protos(&[routing_proto], &[proto_root_str])?;
 

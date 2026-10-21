@@ -488,8 +488,20 @@ impl Ask {
 ///
 /// The connection is a client's, or its node identity no longer verifies.
 pub fn nodes_only(request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-    caller_identity(request.extensions().get::<PeerConnectInfo>())?;
+    node_admitted(request.extensions().get::<PeerConnectInfo>())?;
     Ok(request)
+}
+
+/// Refuse unless the connection `info` describes still proves a node
+/// identity, as of now: the check a long-lived stream repeats before each
+/// command it carries, since the one made when it opened does not cover a
+/// credential that expired or was withdrawn since.
+///
+/// # Errors
+///
+/// The connection is a client's, or its node identity no longer verifies.
+pub fn node_admitted(info: Option<&PeerConnectInfo>) -> Result<(), Status> {
+    caller_identity(info).map(|_| ())
 }
 
 /// The node identity the connection proved, as of now.

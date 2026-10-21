@@ -35,7 +35,7 @@ use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 use coordinode_query::advisor::source::SourceContext;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proto::internode::routing as wire;
-use tokio_stream::wrappers::ReceiverStream;
+use coordinode_wire::peer::PeerConnectInfo;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
@@ -60,9 +60,9 @@ const REFUSED_HEADER: &str = "cn-routing-refused";
 /// The encoded size a batch of rows grows to before it is sent.
 const ROW_BATCH_BYTES: usize = 1 << 20;
 
-/// Frames of one answer queued for the ingress before the executing member
-/// waits for it to take them.
-const FRAMES_IN_FLIGHT: usize = 4;
+/// Frames of one answer the executing member sends ahead of the ingress
+/// before it waits for the ingress to take them.
+const FRAMES_AHEAD: u32 = 4;
 
 /// The largest message a member takes from another on this service: a batch
 /// of rows that holds one very large row.
@@ -326,15 +326,32 @@ pub trait CommandExecutor: Send + Sync + 'static {
     ) -> Result<RoutedOperationAnswer, DatabaseError>;
 }
 
+/// Decides, before each command of a session, whether the connection it
+/// arrived on may still route commands here.
+pub type CommandAdmission = fn(Option<&PeerConnectInfo>) -> Result<(), Status>;
+
 /// The service a member serves its peers the commands they route with.
 pub struct CommandRoutingHandler<E> {
     executor: Arc<E>,
+    admit: Option<CommandAdmission>,
 }
 
 impl<E: CommandExecutor> CommandRoutingHandler<E> {
     /// A handler that runs routed commands through `executor`.
     pub fn new(executor: Arc<E>) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            admit: None,
+        }
+    }
+
+    /// Check every command of a session with `admit` before it runs, not
+    /// only the session's opening: a credential that expired or was
+    /// withdrawn while the session stayed open stops the commands after it.
+    #[must_use]
+    pub fn admitting(mut self, admit: CommandAdmission) -> Self {
+        self.admit = Some(admit);
+        self
     }
 
     /// The handler as a gRPC service taking messages up to
@@ -342,22 +359,10 @@ impl<E: CommandExecutor> CommandRoutingHandler<E> {
     pub fn into_service(self, max_decoding_bytes: usize) -> CommandRoutingServiceServer<Self> {
         CommandRoutingServiceServer::new(self).max_decoding_message_size(max_decoding_bytes)
     }
-
-    /// Run `call` on the blocking pool and answer with what it returns. A
-    /// call that did not finish is a lost answer: it may have run.
-    async fn blocking<T: Send + 'static>(
-        &self,
-        call: impl FnOnce(&E) -> Result<T, DatabaseError> + Send + 'static,
-    ) -> Result<Result<T, DatabaseError>, Status> {
-        let executor = Arc::clone(&self.executor);
-        tokio::task::spawn_blocking(move || call(&executor))
-            .await
-            .map_err(|e| Status::internal(format!("the routed command did not finish: {e}")))
-    }
 }
 
-/// A call refused before it was read, for `why`: the command did not run,
-/// which the ingress learns from the metadata rather than the text.
+/// A session refused before any command of it was read, for `why`: none of
+/// them ran, which the ingress learns from the metadata rather than the text.
 fn refused(status: Status, why: &'static str) -> Status {
     let mut status = status;
     status
@@ -386,57 +391,291 @@ fn check_codec<T>(request: &Request<T>) -> Result<(), Status> {
     ))
 }
 
-/// A request that does not decode: refused before anything ran.
-fn malformed(status: Status) -> Status {
-    refused(status, "request")
+/// The replies of one session, queued for its stream. Unbounded on its own,
+/// and bounded by what produces them: one reply per short command, one
+/// admission per statement, and a statement's frames only as far ahead as
+/// its credit allows.
+type Replies = tokio::sync::mpsc::UnboundedSender<Result<wire::RoutedReply, Status>>;
+
+fn reply(call: u64, reply: wire::routed_reply::Reply) -> Result<wire::RoutedReply, Status> {
+    Ok(wire::RoutedReply {
+        call,
+        reply: Some(reply),
+    })
 }
 
-#[tonic::async_trait]
-impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
-    type ExecuteStream = ReceiverStream<Result<wire::RoutedStatementFrame, Status>>;
+/// Queue `answer` to `call`'s ingress. A closed queue means the session is
+/// over: the reply has nobody to reach, and whatever still runs for the
+/// session is being stopped.
+fn queue(replies: &Replies, call: u64, answer: wire::routed_reply::Reply) {
+    if replies.send(reply(call, answer)).is_err() {
+        tracing::debug!(call, "a routing session ended before its reply");
+    }
+}
 
-    async fn execute(
-        &self,
-        request: Request<wire::RoutedStatement>,
-    ) -> Result<Response<Self::ExecuteStream>, Status> {
-        check_codec(&request)?;
-        let statement = statement_from_wire(request.into_inner()).map_err(malformed)?;
-        let (frames, answer) = tokio::sync::mpsc::channel(FRAMES_IN_FLIGHT);
+/// How many more frames of one answer the member may send, and whether the
+/// ingress still reads it. The statement's thread waits here.
+struct Credit {
+    // no-std: spin::Mutex with a caller-provided wait; taken twice per frame.
+    state: parking_lot::Mutex<CreditState>,
+    ready: parking_lot::Condvar,
+}
 
-        // The ingress going away cancels the statement. The watch ends with
-        // the statement too: its copy of the queue's sender would otherwise
-        // keep the answer open after its last frame.
-        let cancel = CancelFlag::new();
-        let (finished, ended) = tokio::sync::oneshot::channel::<()>();
-        {
-            let frames = frames.clone();
-            let cancel = cancel.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    () = frames.closed() => cancel.cancel(),
-                    _ = ended => {}
+struct CreditState {
+    left: u32,
+    /// The ingress no longer reads the answer.
+    closed: bool,
+}
+
+impl Credit {
+    fn new(left: u32) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(CreditState {
+                left,
+                closed: false,
+            }),
+            ready: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// The ingress took `frames` more frames. A grant past what a counter
+    /// holds is not something a well-behaved ingress sends: the answer is
+    /// treated as no longer read.
+    fn grant(&self, frames: u32) {
+        let mut state = self.state.lock();
+        match state.left.checked_add(frames) {
+            Some(left) => state.left = left,
+            None => state.closed = true,
+        }
+        self.ready.notify_one();
+    }
+
+    fn close(&self) {
+        self.state.lock().closed = true;
+        self.ready.notify_one();
+    }
+
+    /// Wait for room for one frame; `false` once the answer is no longer
+    /// read.
+    fn take(&self) -> bool {
+        let mut state = self.state.lock();
+        loop {
+            if state.closed {
+                return false;
+            }
+            if state.left > 0 {
+                state.left -= 1;
+                return true;
+            }
+            self.ready.wait(&mut state);
+        }
+    }
+}
+
+/// A statement running for a session: how to stop it.
+struct Running {
+    cancel: CancelFlag,
+    credit: Arc<Credit>,
+}
+
+impl Running {
+    fn stop(&self) {
+        self.cancel.cancel();
+        self.credit.close();
+    }
+}
+
+/// The statements a session has running, by the ingress's number.
+// no-std: spin::Mutex; taken once per statement start, end, credit and cancel.
+type RunningCalls = Arc<parking_lot::Mutex<rustc_hash::FxHashMap<u64, Running>>>;
+
+/// One session at the executing member: reads the ingress's commands, runs
+/// each on the blocking pool and queues its replies.
+struct ServedSession<E> {
+    executor: Arc<E>,
+    admit: Option<CommandAdmission>,
+    /// The connection the session arrived on, rechecked before each command.
+    connection: Option<PeerConnectInfo>,
+    replies: Replies,
+    running: RunningCalls,
+}
+
+impl<E: CommandExecutor> ServedSession<E> {
+    async fn run(self, mut requests: tonic::Streaming<wire::RoutedRequest>) {
+        loop {
+            let next = tokio::select! {
+                next = requests.message() => next,
+                () = self.replies.closed() => break,
+            };
+            match next {
+                Ok(Some(request)) => self.dispatch(request),
+                Ok(None) => break,
+                Err(status) => {
+                    tracing::debug!(%status, "a routing session's ingress went away");
+                    break;
                 }
-            });
+            }
+        }
+        // Whatever still runs has lost its ingress: its client cannot know
+        // what it did, so it stops, and its transaction is aborted.
+        for (_, running) in self.running.lock().drain() {
+            running.stop();
+        }
+    }
+
+    fn refuse(&self, call: u64, reason: &str, message: String) {
+        queue(
+            &self.replies,
+            call,
+            wire::routed_reply::Reply::Refused(wire::RoutedRefusal {
+                reason: reason.to_owned(),
+                message,
+            }),
+        );
+    }
+
+    fn dispatch(&self, request: wire::RoutedRequest) {
+        use wire::routed_request::Request as R;
+
+        let call = request.call;
+        match request.request {
+            Some(R::Credit(frames)) => {
+                if let Some(running) = self.running.lock().get(&call) {
+                    running.credit.grant(frames);
+                }
+                return;
+            }
+            Some(R::Cancel(_)) => {
+                if let Some(running) = self.running.lock().get(&call) {
+                    running.stop();
+                }
+                return;
+            }
+            _ => {}
+        }
+        // A credential that expired or was withdrawn since the session
+        // opened stops the commands that come after it.
+        if let Some(admit) = self.admit {
+            if let Err(status) = admit(self.connection.as_ref()) {
+                self.refuse(call, "admission", status.message().to_owned());
+                return;
+            }
+        }
+        let result = match request.request {
+            Some(R::Execute(statement)) => {
+                statement_from_wire(*statement).map(|statement| self.execute(call, statement))
+            }
+            Some(R::Begin(begin)) => begin_from_wire(begin).map(|begin| {
+                self.answer(call, move |e| {
+                    wire::routed_reply::Reply::Begun(wire::RoutedBegun {
+                        error: e.begin(begin).err().map(errors::encode).unwrap_or_default(),
+                    })
+                });
+            }),
+            Some(R::Commit(commit)) => commit_from_wire(commit).map(|commit| {
+                self.answer(call, move |e| {
+                    wire::routed_reply::Reply::Committed(match e.commit(commit) {
+                        Ok(receipt) => wire::RoutedCommitted {
+                            commit_ts: receipt.commit_ts.as_raw(),
+                            applied_index: receipt.applied_index.unwrap_or(0),
+                            error: Vec::new(),
+                        },
+                        Err(err) => wire::RoutedCommitted {
+                            error: errors::encode(err),
+                            ..wire::RoutedCommitted::default()
+                        },
+                    })
+                });
+            }),
+            Some(R::Rollback(rollback)) => rollback_from_wire(rollback).map(|rollback| {
+                self.answer(call, move |e| {
+                    wire::routed_reply::Reply::RolledBack(wire::RoutedRolledBack {
+                        error: e
+                            .rollback(rollback)
+                            .err()
+                            .map(errors::encode)
+                            .unwrap_or_default(),
+                    })
+                });
+            }),
+            Some(R::Operation(operation)) => actor_from_wire(operation.actor)
+                .and_then(|actor| Ok((actor, operation_call_from_wire(operation.call)?)))
+                .map(|(actor, operation)| {
+                    self.answer(call, move |e| {
+                        wire::routed_reply::Reply::Operation(match e.operation(actor, operation) {
+                            Ok(answer) => operation_answer_to_wire(answer),
+                            Err(err) => wire::RoutedOperationAnswer {
+                                answer: Some(wire::routed_operation_answer::Answer::Error(
+                                    errors::encode(err),
+                                )),
+                            },
+                        })
+                    });
+                }),
+            Some(R::Credit(_) | R::Cancel(_)) => Ok(()),
+            None => Err(Status::invalid_argument(
+                "a routed request names no command",
+            )),
+        };
+        if let Err(status) = result {
+            self.refuse(call, "request", status.message().to_owned());
+        }
+    }
+
+    /// Run a short command on the blocking pool and queue its one reply.
+    fn answer(
+        &self,
+        call: u64,
+        run: impl FnOnce(&E) -> wire::routed_reply::Reply + Send + 'static,
+    ) {
+        let executor = Arc::clone(&self.executor);
+        let replies = self.replies.clone();
+        tokio::task::spawn_blocking(move || {
+            queue(&replies, call, run(&executor));
+        });
+    }
+
+    /// Start `statement` on the blocking pool; its answer streams under
+    /// `call`.
+    fn execute(&self, call: u64, statement: RoutedStatement) {
+        let cancel = CancelFlag::new();
+        let credit = Arc::new(Credit::new(FRAMES_AHEAD));
+        {
+            let mut running = self.running.lock();
+            if running.contains_key(&call) {
+                drop(running);
+                self.refuse(
+                    call,
+                    "duplicate",
+                    format!("command {call} is already running on this session"),
+                );
+                return;
+            }
+            running.insert(
+                call,
+                Running {
+                    cancel: cancel.clone(),
+                    credit: Arc::clone(&credit),
+                },
+            );
         }
 
         // A statement of a transaction tells the ingress when it has its
-        // place, at once and on its own, so the next command can follow. The
-        // admitted frame is the first one sent, so the queue has room for it;
-        // told twice, it is sent once. An autonomous statement waits behind
-        // nothing and its answer says all there is.
+        // place, at once and ahead of any frame, so the next command can
+        // follow. Told twice, it is sent once. An autonomous statement waits
+        // behind nothing and its answer says all there is.
         let admitted = if statement.transaction.is_some() {
             let told = Arc::new(AtomicBool::new(false));
-            let frames = frames.clone();
+            let replies = self.replies.clone();
             AdmissionSignal::new(move || {
                 if !told.swap(true, Ordering::AcqRel) {
-                    // A full or closed queue: the ingress is gone, and the
-                    // cancellation above stops the statement.
-                    if frames
-                        .try_send(Ok(frame(vec![Event::Admitted(wire::Admitted {})])))
-                        .is_err()
-                    {
-                        tracing::debug!("a routed statement's ingress left before its admission");
-                    }
+                    queue(
+                        &replies,
+                        call,
+                        wire::routed_reply::Reply::Frame(frame(vec![Event::Admitted(
+                            wire::Admitted {},
+                        )])),
+                    );
                 }
             })
         } else {
@@ -452,12 +691,19 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
             abandoned: true,
         });
         let executor = Arc::clone(&self.executor);
+        let replies = self.replies.clone();
+        let running = Arc::clone(&self.running);
         tokio::task::spawn_blocking(move || {
-            let mut answer = AnswerWriter::new(frames);
+            let mut answer = AnswerWriter::new(Some(AnswerOut {
+                call,
+                replies,
+                credit,
+            }));
             let result = executor.execute(statement, &cancel, &admitted, &mut answer);
             drop(admitted);
-            drop(finished);
-            if !answer.finish(result) {
+            let delivered = answer.finish(result);
+            running.lock().remove(&call);
+            if !delivered {
                 tracing::debug!("a routed statement's ingress left before its answer");
                 if let Some(rollback) = abandon {
                     // A transaction the failed statement already ended is
@@ -468,85 +714,52 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
                 }
             }
         });
-        Ok(Response::new(ReceiverStream::new(answer)))
     }
+}
 
-    async fn begin(
+#[tonic::async_trait]
+impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
+    type SessionStream =
+        tokio_stream::wrappers::UnboundedReceiverStream<Result<wire::RoutedReply, Status>>;
+
+    async fn session(
         &self,
-        request: Request<wire::RoutedBegin>,
-    ) -> Result<Response<wire::RoutedBegun>, Status> {
+        request: Request<tonic::Streaming<wire::RoutedRequest>>,
+    ) -> Result<Response<Self::SessionStream>, Status> {
         check_codec(&request)?;
-        let begin = begin_from_wire(request.into_inner()).map_err(malformed)?;
-        let error = match self.blocking(move |e| e.begin(begin)).await? {
-            Ok(()) => Vec::new(),
-            Err(err) => errors::encode(err),
+        let connection = request.extensions().get::<PeerConnectInfo>().cloned();
+        let (replies, answers) = tokio::sync::mpsc::unbounded_channel();
+        let session = ServedSession {
+            executor: Arc::clone(&self.executor),
+            admit: self.admit,
+            connection,
+            replies,
+            running: RunningCalls::default(),
         };
-        Ok(Response::new(wire::RoutedBegun { error }))
-    }
-
-    async fn commit(
-        &self,
-        request: Request<wire::RoutedCommit>,
-    ) -> Result<Response<wire::RoutedCommitted>, Status> {
-        check_codec(&request)?;
-        let commit = commit_from_wire(request.into_inner()).map_err(malformed)?;
+        tokio::spawn(session.run(request.into_inner()));
         Ok(Response::new(
-            match self.blocking(move |e| e.commit(commit)).await? {
-                Ok(receipt) => wire::RoutedCommitted {
-                    commit_ts: receipt.commit_ts.as_raw(),
-                    applied_index: receipt.applied_index.unwrap_or(0),
-                    error: Vec::new(),
-                },
-                Err(err) => wire::RoutedCommitted {
-                    error: errors::encode(err),
-                    ..wire::RoutedCommitted::default()
-                },
-            },
+            tokio_stream::wrappers::UnboundedReceiverStream::new(answers),
         ))
     }
+}
 
-    async fn rollback(
-        &self,
-        request: Request<wire::RoutedRollback>,
-    ) -> Result<Response<wire::RoutedRolledBack>, Status> {
-        check_codec(&request)?;
-        let rollback = rollback_from_wire(request.into_inner()).map_err(malformed)?;
-        let error = match self.blocking(move |e| e.rollback(rollback)).await? {
-            Ok(()) => Vec::new(),
-            Err(err) => errors::encode(err),
-        };
-        Ok(Response::new(wire::RoutedRolledBack { error }))
-    }
-
-    async fn operation(
-        &self,
-        request: Request<wire::RoutedOperation>,
-    ) -> Result<Response<wire::RoutedOperationAnswer>, Status> {
-        check_codec(&request)?;
-        let request = request.into_inner();
-        let actor = actor_from_wire(request.actor).map_err(malformed)?;
-        let call = operation_call_from_wire(request.call).map_err(malformed)?;
-        let answer = match self.blocking(move |e| e.operation(actor, call)).await? {
-            Ok(answer) => operation_answer_to_wire(answer),
-            Err(err) => wire::RoutedOperationAnswer {
-                answer: Some(wire::routed_operation_answer::Answer::Error(
-                    errors::encode(err),
-                )),
-            },
-        };
-        Ok(Response::new(answer))
-    }
+/// Where the frames of one statement's answer go.
+struct AnswerOut {
+    call: u64,
+    replies: Replies,
+    credit: Arc<Credit>,
 }
 
 /// Where a member puts the answer of a routed statement while the statement
 /// runs: its columns, then its rows in batches sent as they fill. A batch
-/// waits for room in the call's bounded queue, so an ingress that reads
-/// slowly holds the statement back rather than the answer piling up here.
+/// waits for the ingress's credit, so an ingress that reads slowly holds the
+/// statement back rather than the answer piling up here.
 /// Events go out together: the columns with the first batch, the last batch
 /// with the end, so an answer that fits one batch is one message.
 /// Called from the blocking pool.
 pub struct AnswerWriter {
-    frames: tokio::sync::mpsc::Sender<Result<wire::RoutedStatementFrame, Status>>,
+    /// `None` for an answer nobody reads.
+    out: Option<AnswerOut>,
     /// Events ready and not sent yet.
     pending: Vec<Event>,
     batch: Vec<u8>,
@@ -558,9 +771,9 @@ pub struct AnswerWriter {
 }
 
 impl AnswerWriter {
-    fn new(frames: tokio::sync::mpsc::Sender<Result<wire::RoutedStatementFrame, Status>>) -> Self {
+    fn new(out: Option<AnswerOut>) -> Self {
         Self {
-            frames,
+            out,
             pending: Vec::new(),
             batch: Vec::new(),
             columns: false,
@@ -570,10 +783,9 @@ impl AnswerWriter {
     }
 
     /// An answer nobody reads, for a caller that runs an executor directly
-    /// for its result alone: the statement stops at its first row.
+    /// for its result alone: the statement stops at its first batch.
     pub fn unread() -> Self {
-        let (frames, _) = tokio::sync::mpsc::channel(1);
-        Self::new(frames)
+        Self::new(None)
     }
 
     /// Give the column names, once and before any row; later calls are
@@ -621,10 +833,26 @@ impl AnswerWriter {
         }
     }
 
-    /// Send the pending events as one frame.
+    /// Send the pending events as one frame, once the ingress has room for
+    /// it.
     fn send(&mut self) {
         let events = std::mem::take(&mut self.pending);
-        if !self.gone && self.frames.blocking_send(Ok(frame(events))).is_err() {
+        if self.gone {
+            return;
+        }
+        let Some(out) = &self.out else {
+            self.gone = true;
+            return;
+        };
+        if !out.credit.take()
+            || out
+                .replies
+                .send(reply(
+                    out.call,
+                    wire::routed_reply::Reply::Frame(frame(events)),
+                ))
+                .is_err()
+        {
             self.gone = true;
         }
     }
@@ -637,11 +865,13 @@ impl AnswerWriter {
         if let Some(broken) = self.broken.take() {
             // What the statement did is not what the ingress is told: its
             // outcome is unknown there, as for any answer lost on the way.
-            return !self.gone
-                && self
-                    .frames
-                    .blocking_send(Err(Status::internal(broken)))
-                    .is_ok();
+            return match &self.out {
+                Some(out) if !self.gone => out
+                    .replies
+                    .send(reply(out.call, wire::routed_reply::Reply::Broken(broken)))
+                    .is_ok(),
+                _ => false,
+            };
         }
         match result {
             Ok(stats) => {
@@ -679,17 +909,34 @@ fn frame(events: Vec<Event>) -> wire::RoutedStatementFrame {
 #[derive(Debug, Clone)]
 pub struct CommandRouter {
     member: u64,
+    link: Arc<Link>,
+}
+
+/// The way to one member: the connection, and the session open on it.
+struct Link {
     client: CommandRoutingServiceClient<Channel>,
+    // no-std: spin::Mutex; taken once per command to find the session.
+    session: parking_lot::Mutex<Option<Arc<Session>>>,
+}
+
+impl std::fmt::Debug for Link {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Link").finish_non_exhaustive()
+    }
 }
 
 impl CommandRouter {
     /// A router over `channel`, a connection to `member`, the executing
-    /// member.
+    /// member. Its commands share one session on the connection, opened on
+    /// the first and again after the one before was lost.
     pub fn new(member: u64, channel: Channel) -> Self {
         Self {
             member,
-            client: CommandRoutingServiceClient::new(channel)
-                .max_decoding_message_size(MAX_ROUTED_MESSAGE),
+            link: Arc::new(Link {
+                client: CommandRoutingServiceClient::new(channel)
+                    .max_decoding_message_size(MAX_ROUTED_MESSAGE),
+                session: parking_lot::Mutex::new(None),
+            }),
         }
     }
 
@@ -702,6 +949,19 @@ impl CommandRouter {
     /// know where `member` is or what identity it proves, or cannot make a
     /// connection.
     pub fn to_member(node: &RaftNode, member: u64) -> Result<Self, DatabaseError> {
+        let (_target, channel) = Self::member_channel(node, member)?;
+        Ok(Self::new(member, channel))
+    }
+
+    /// Where `member` is, and `node`'s connection to it.
+    ///
+    /// # Errors
+    ///
+    /// As [`CommandRouter::to_member`].
+    pub(crate) fn member_channel(
+        node: &RaftNode,
+        member: u64,
+    ) -> Result<(coordinode_wire::peer::PeerTarget, Channel), DatabaseError> {
         let unreachable = |message: String| DatabaseError::PeerUnreachable { member, message };
         let (Some(target), Some(connections)) = (node.member_target(member), node.connections())
         else {
@@ -712,40 +972,35 @@ impl CommandRouter {
         let channel = connections
             .channel(&target)
             .map_err(|e| unreachable(e.to_string()))?;
-        Ok(Self::new(member, channel))
+        Ok((target, channel))
     }
 
-    /// `message` as a request this member reads the error encoding of, bound
-    /// to `deadline` when there is one.
-    fn request<T>(message: T, deadline: Option<Duration>) -> Request<T> {
-        let mut request = Request::new(message);
-        request
-            .metadata_mut()
-            .insert(CODEC_HEADER, MetadataValue::from(ERROR_CODEC_VERSION));
-        if let Some(deadline) = deadline {
-            request.set_timeout(deadline);
-        }
-        request
-    }
-
-    /// The error a failed call answers: a refusal before the call was read
-    /// did not run it; anything else lost an answer that may have run.
-    fn lost(&self, status: &Status) -> DatabaseError {
-        if status.metadata().contains_key(REFUSED_HEADER) {
-            return DatabaseError::PeerUnreachable {
-                member: self.member,
-                message: status.message().to_owned(),
-            };
-        }
-        let failure = match status.code() {
-            Code::DeadlineExceeded | Code::Cancelled => PeerFailure::Deadline,
-            _ => PeerFailure::Transport,
+    /// Send `request` on the session to the member and return the call its
+    /// replies arrive on. A statement's call is cancelled at the member if
+    /// it is dropped before its answer ended.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::PeerUnreachable`] when the request could not be
+    /// sent: it did not run.
+    fn start(
+        &self,
+        request: wire::routed_request::Request,
+        deadline: Option<Duration>,
+    ) -> Result<Call, DatabaseError> {
+        let statement = matches!(request, wire::routed_request::Request::Execute(_));
+        let session = {
+            let mut slot = self.link.session.lock();
+            match slot.as_ref() {
+                Some(session) if session.alive() => Arc::clone(session),
+                _ => {
+                    let session = Session::open(self.link.client.clone(), self.member);
+                    *slot = Some(Arc::clone(&session));
+                    session
+                }
+            }
         };
-        DatabaseError::PeerOutcomeUnknown {
-            member: self.member,
-            failure,
-            message: status.message().to_owned(),
-        }
+        session.start(request, statement, deadline, self.member)
     }
 
     /// An answer this member cannot read: whatever the command did is
@@ -800,18 +1055,23 @@ impl CommandRouter {
         admitted: &AdmissionSignal,
     ) -> Result<RoutedRows, DatabaseError> {
         let deadline = statement.deadline;
-        let request = Self::request(statement_to_wire(statement)?, deadline);
-        let mut frames = self
-            .client
-            .clone()
-            .execute(request)
-            .await
-            .map_err(|s| self.lost(&s))?
-            .into_inner();
+        let mut call = self.start(
+            wire::routed_request::Request::Execute(Box::new(statement_to_wire(statement)?)),
+            deadline,
+        )?;
         // The answer opens with its columns, after the admission of a
         // transaction's statement and unless the statement failed. What
         // came in the same frame after them is the start of the rows.
-        while let Some(frame) = frames.message().await.map_err(|s| self.lost(&s))? {
+        loop {
+            let frame = match call.next().await? {
+                wire::routed_reply::Reply::Frame(frame) => frame,
+                _ => {
+                    return Err(
+                        self.unreadable("a statement answered as another command".to_owned())
+                    );
+                }
+            };
+            call.took(&frame);
             let mut events: std::collections::VecDeque<_> = frame.events.into();
             while let Some(event) = events.pop_front() {
                 match event.event {
@@ -820,7 +1080,7 @@ impl CommandRouter {
                         return Ok(RoutedRows {
                             router: self.clone(),
                             columns: columns.names,
-                            frames,
+                            call,
                             pending: events,
                             buffered: std::collections::VecDeque::new(),
                             stats: None,
@@ -838,7 +1098,18 @@ impl CommandRouter {
                 }
             }
         }
-        Err(self.unreadable("the executing member ended the answer before its columns".to_owned()))
+    }
+
+    /// Send a short command and return its one reply.
+    async fn short(
+        &self,
+        request: wire::routed_request::Request,
+        deadline: Option<Duration>,
+    ) -> Result<wire::routed_reply::Reply, DatabaseError> {
+        let mut call = self.start(request, deadline)?;
+        let reply = call.next().await?;
+        call.ended();
+        Ok(reply)
     }
 
     /// Open a transaction at the member, which must lead, under the ID the
@@ -848,14 +1119,16 @@ impl CommandRouter {
     ///
     /// Why the member did not open it, or how its answer was lost.
     pub async fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
-        let begun = self
-            .client
-            .clone()
-            .begin(Self::request(begin_to_wire(begin), None))
-            .await
-            .map_err(|s| self.lost(&s))?
-            .into_inner();
-        self.failure(&begun.error)
+        match self
+            .short(
+                wire::routed_request::Request::Begin(begin_to_wire(begin)),
+                None,
+            )
+            .await?
+        {
+            wire::routed_reply::Reply::Begun(begun) => self.failure(&begun.error),
+            _ => Err(self.unreadable("a begin answered as another command".to_owned())),
+        }
     }
 
     /// Commit a transaction at the leader.
@@ -865,13 +1138,16 @@ impl CommandRouter {
     /// What the commit failed with, or how its answer was lost.
     pub async fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, DatabaseError> {
         let deadline = commit.deadline;
-        let committed = self
-            .client
-            .clone()
-            .commit(Self::request(commit_to_wire(commit), deadline))
-            .await
-            .map_err(|s| self.lost(&s))?
-            .into_inner();
+        let committed = match self
+            .short(
+                wire::routed_request::Request::Commit(commit_to_wire(commit)),
+                deadline,
+            )
+            .await?
+        {
+            wire::routed_reply::Reply::Committed(committed) => committed,
+            _ => return Err(self.unreadable("a commit answered as another command".to_owned())),
+        };
         self.failure(&committed.error)?;
         Ok(CommitReceipt {
             commit_ts: Timestamp::from_raw(committed.commit_ts),
@@ -885,14 +1161,16 @@ impl CommandRouter {
     ///
     /// Why the rollback was refused, or how its answer was lost.
     pub async fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError> {
-        let rolled_back = self
-            .client
-            .clone()
-            .rollback(Self::request(rollback_to_wire(rollback), None))
-            .await
-            .map_err(|s| self.lost(&s))?
-            .into_inner();
-        self.failure(&rolled_back.error)
+        match self
+            .short(
+                wire::routed_request::Request::Rollback(rollback_to_wire(rollback)),
+                None,
+            )
+            .await?
+        {
+            wire::routed_reply::Reply::RolledBack(rolled_back) => self.failure(&rolled_back.error),
+            _ => Err(self.unreadable("a rollback answered as another command".to_owned())),
+        }
     }
 
     /// Carry out a call on operation records at the member, which must lead.
@@ -905,19 +1183,23 @@ impl CommandRouter {
         actor: &ActingContext,
         call: RoutedOperationCall,
     ) -> Result<RoutedOperationAnswer, DatabaseError> {
-        let answer = self
-            .client
-            .clone()
-            .operation(Self::request(
-                wire::RoutedOperation {
+        let answer = match self
+            .short(
+                wire::routed_request::Request::Operation(wire::RoutedOperation {
                     actor: Some(actor_to_wire(actor)),
                     call: Some(operation_call_to_wire(call)),
-                },
+                }),
                 None,
-            ))
-            .await
-            .map_err(|s| self.lost(&s))?
-            .into_inner();
+            )
+            .await?
+        {
+            wire::routed_reply::Reply::Operation(answer) => answer,
+            _ => {
+                return Err(
+                    self.unreadable("an operation call answered as another command".to_owned())
+                );
+            }
+        };
         if let Some(wire::routed_operation_answer::Answer::Error(bytes)) = &answer.answer {
             return Err(errors::decode(bytes).unwrap_or_else(|e| self.unreadable(e)));
         }
@@ -925,13 +1207,313 @@ impl CommandRouter {
     }
 }
 
+/// What arrives for one call: a reply, or how the session was lost.
+enum Arrival {
+    Reply(wire::routed_reply::Reply),
+    Lost(DatabaseError),
+}
+
+/// How a session ended for the calls still waiting on it.
+enum Loss {
+    /// It never opened: the member read none of its commands.
+    NotOpened(String),
+    /// It broke after it opened: a command in flight may have run.
+    Broke(PeerFailure, String),
+}
+
+impl Loss {
+    fn error(&self, member: u64) -> DatabaseError {
+        match self {
+            Self::NotOpened(message) => DatabaseError::PeerUnreachable {
+                member,
+                message: message.clone(),
+            },
+            Self::Broke(failure, message) => DatabaseError::PeerOutcomeUnknown {
+                member,
+                failure: *failure,
+                message: message.clone(),
+            },
+        }
+    }
+}
+
+/// The calls of a session waiting for replies, by number.
+struct Waiting {
+    /// The session can take no more calls: its stream ended or never opened.
+    closed: bool,
+    calls: rustc_hash::FxHashMap<u64, tokio::sync::mpsc::UnboundedSender<Arrival>>,
+}
+
+/// One session from this member, the ingress, to an executing member: the
+/// stream every command routed there travels on.
+struct Session {
+    /// Commands, credits and cancellations for the stream. Unbounded on its
+    /// own, and bounded by the callers: each waits for its command's reply,
+    /// and a statement sends a credit only for a frame it took.
+    requests: tokio::sync::mpsc::UnboundedSender<wire::RoutedRequest>,
+    // no-std: spin::Mutex; taken once per command and once per reply.
+    waiting: Arc<parking_lot::Mutex<Waiting>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl Session {
+    /// Open a session on `client` to `member`. The stream opens in the
+    /// background; commands sent before it did wait in the queue.
+    fn open(client: CommandRoutingServiceClient<Channel>, member: u64) -> Arc<Self> {
+        let (requests, outbound) = tokio::sync::mpsc::unbounded_channel();
+        let waiting = Arc::new(parking_lot::Mutex::new(Waiting {
+            closed: false,
+            calls: rustc_hash::FxHashMap::default(),
+        }));
+        tokio::spawn(Self::read(client, member, outbound, Arc::clone(&waiting)));
+        Arc::new(Self {
+            requests,
+            waiting,
+            next: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    fn alive(&self) -> bool {
+        !self.waiting.lock().closed
+    }
+
+    /// Open the stream and hand each reply to the call it answers, until
+    /// the stream ends; then every call still waiting learns how.
+    async fn read(
+        mut client: CommandRoutingServiceClient<Channel>,
+        member: u64,
+        outbound: tokio::sync::mpsc::UnboundedReceiver<wire::RoutedRequest>,
+        waiting: Arc<parking_lot::Mutex<Waiting>>,
+    ) {
+        let mut request = Request::new(tokio_stream::wrappers::UnboundedReceiverStream::new(
+            outbound,
+        ));
+        request
+            .metadata_mut()
+            .insert(CODEC_HEADER, MetadataValue::from(ERROR_CODEC_VERSION));
+        let lost = match client.session(request).await {
+            // The member answers the session's opening before it reads any
+            // command, so a session that did not open ran none of them.
+            Err(status) => Loss::NotOpened(status.message().to_owned()),
+            Ok(response) => {
+                let mut replies = response.into_inner();
+                loop {
+                    match replies.message().await {
+                        Ok(Some(reply)) => {
+                            let Some(answer) = reply.reply else {
+                                continue;
+                            };
+                            if let Some(call) = waiting.lock().calls.get(&reply.call) {
+                                // A call that stopped waiting dropped its
+                                // receiver; its late reply goes nowhere.
+                                if call.send(Arrival::Reply(answer)).is_err() {
+                                    tracing::trace!(call = reply.call, "late routed reply");
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            break Loss::Broke(
+                                PeerFailure::Transport,
+                                "the executing member ended the session".to_owned(),
+                            );
+                        }
+                        Err(status) => {
+                            break Loss::Broke(
+                                match status.code() {
+                                    Code::DeadlineExceeded | Code::Cancelled => {
+                                        PeerFailure::Deadline
+                                    }
+                                    _ => PeerFailure::Transport,
+                                },
+                                status.message().to_owned(),
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        let calls = {
+            let mut waiting = waiting.lock();
+            waiting.closed = true;
+            std::mem::take(&mut waiting.calls)
+        };
+        for (_, call) in calls {
+            // A call that already stopped waiting needs no word.
+            if call.send(Arrival::Lost(lost.error(member))).is_err() {
+                tracing::trace!("a routed call left before its session was lost");
+            }
+        }
+    }
+
+    /// Number `request`, register its call and send it.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::PeerUnreachable`] when the session is over before
+    /// the request was sent: it did not run.
+    fn start(
+        self: &Arc<Self>,
+        request: wire::routed_request::Request,
+        statement: bool,
+        deadline: Option<Duration>,
+        member: u64,
+    ) -> Result<Call, DatabaseError> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let (arrivals, replies) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut waiting = self.waiting.lock();
+            if waiting.closed {
+                return Err(DatabaseError::PeerUnreachable {
+                    member,
+                    message: "the session to the member closed".to_owned(),
+                });
+            }
+            waiting.calls.insert(id, arrivals);
+        }
+        let call = Call {
+            session: Arc::clone(self),
+            id,
+            member,
+            replies,
+            deadline: deadline.map(|d| tokio::time::Instant::now() + d),
+            open: statement,
+        };
+        self.requests
+            .send(wire::RoutedRequest {
+                call: id,
+                request: Some(request),
+            })
+            .map_err(|_| DatabaseError::PeerUnreachable {
+                member,
+                message: "the session to the member closed".to_owned(),
+            })?;
+        Ok(call)
+    }
+
+    fn send(&self, call: u64, request: wire::routed_request::Request) {
+        // A closed queue: the session is over, and the member stopped the
+        // call with it.
+        if self
+            .requests
+            .send(wire::RoutedRequest {
+                call,
+                request: Some(request),
+            })
+            .is_err()
+        {
+            tracing::trace!(call, "routing session closed");
+        }
+    }
+}
+
+/// One command's replies on a session.
+struct Call {
+    session: Arc<Session>,
+    id: u64,
+    member: u64,
+    replies: tokio::sync::mpsc::UnboundedReceiver<Arrival>,
+    deadline: Option<tokio::time::Instant>,
+    /// A statement whose answer has not ended: leaving it cancels it at the
+    /// member.
+    open: bool,
+}
+
+impl Call {
+    /// The next reply.
+    ///
+    /// # Errors
+    ///
+    /// The member refused the command ([`DatabaseError::PeerUnreachable`]:
+    /// it did not run), or its answer broke, ran past the deadline, or was
+    /// lost with the session ([`DatabaseError::PeerOutcomeUnknown`]).
+    async fn next(&mut self) -> Result<wire::routed_reply::Reply, DatabaseError> {
+        let arrival = match self.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.replies.recv())
+                .await
+                .map_err(|_| DatabaseError::PeerOutcomeUnknown {
+                    member: self.member,
+                    failure: PeerFailure::Deadline,
+                    message: "the deadline passed before the member answered".to_owned(),
+                })?,
+            None => self.replies.recv().await,
+        };
+        match arrival {
+            Some(Arrival::Reply(wire::routed_reply::Reply::Refused(refusal))) => {
+                self.open = false;
+                Err(DatabaseError::PeerUnreachable {
+                    member: self.member,
+                    message: format!("{}: {}", refusal.reason, refusal.message),
+                })
+            }
+            Some(Arrival::Reply(wire::routed_reply::Reply::Broken(message))) => {
+                self.open = false;
+                Err(DatabaseError::PeerOutcomeUnknown {
+                    member: self.member,
+                    failure: PeerFailure::Transport,
+                    message,
+                })
+            }
+            Some(Arrival::Reply(reply)) => Ok(reply),
+            Some(Arrival::Lost(lost)) => {
+                self.open = false;
+                Err(lost)
+            }
+            // The session dropped the call's sender without a word only when
+            // it is over.
+            None => Err(DatabaseError::PeerOutcomeUnknown {
+                member: self.member,
+                failure: PeerFailure::Transport,
+                message: "the session to the member was lost".to_owned(),
+            }),
+        }
+    }
+
+    /// The caller took `frame` of the statement's answer: unless it ended
+    /// the answer, the member may send one more. An admission travels
+    /// outside the credit and returns none.
+    fn took(&mut self, frame: &wire::RoutedStatementFrame) {
+        let mut counted = false;
+        for event in &frame.events {
+            match event.event {
+                Some(Event::End(_) | Event::Error(_)) => {
+                    self.open = false;
+                    return;
+                }
+                Some(Event::Admitted(_)) | None => {}
+                Some(Event::Columns(_) | Event::Rows(_)) => counted = true,
+            }
+        }
+        if counted {
+            self.session
+                .send(self.id, wire::routed_request::Request::Credit(1));
+        }
+    }
+
+    /// The answer ended: nothing more arrives for the call.
+    fn ended(&mut self) {
+        self.open = false;
+    }
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        self.session.waiting.lock().calls.remove(&self.id);
+        if self.open {
+            self.session.send(
+                self.id,
+                wire::routed_request::Request::Cancel(wire::RoutedCancel {}),
+            );
+        }
+    }
+}
+
 /// The rows of a statement another member runs, read off the wire as the
-/// caller asks for them. At most one received batch is held here; the rest
-/// waits in the member's bounded queue, which holds the member back.
+/// caller asks for them. At most one received batch is held here; the member
+/// sends ahead only as many frames as the caller took, which holds it back.
 pub struct RoutedRows {
     router: CommandRouter,
     columns: Vec<String>,
-    frames: tonic::Streaming<wire::RoutedStatementFrame>,
+    call: Call,
     /// Events of a received frame not read yet.
     pending: std::collections::VecDeque<wire::RoutedStatementEvent>,
     buffered: std::collections::VecDeque<Vec<Value>>,
@@ -960,16 +1542,15 @@ impl RoutedRows {
     pub async fn next_rows(&mut self, max: usize) -> Result<Vec<Vec<Value>>, DatabaseError> {
         while self.buffered.is_empty() && self.stats.is_none() {
             let Some(event) = self.pending.pop_front() else {
-                let Some(frame) = self
-                    .frames
-                    .message()
-                    .await
-                    .map_err(|s| self.router.lost(&s))?
-                else {
-                    return Err(self.router.unreadable(
-                        "the executing member ended the answer before its statistics".to_owned(),
-                    ));
+                let frame = match self.call.next().await? {
+                    wire::routed_reply::Reply::Frame(frame) => frame,
+                    _ => {
+                        return Err(self
+                            .router
+                            .unreadable("a statement answered as another command".to_owned()));
+                    }
                 };
+                self.call.took(&frame);
                 self.pending.extend(frame.events);
                 continue;
             };

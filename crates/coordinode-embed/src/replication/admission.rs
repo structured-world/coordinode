@@ -18,6 +18,7 @@ use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::{
     READ_FENCE_TIMEOUT, ReadConcern as FenceConcern, ReadFenceError, ReadPreference,
 };
+use coordinode_wire::peer::PeerTarget;
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
 
@@ -144,6 +145,10 @@ pub struct Admitter {
     database: Arc<RwLock<Database>>,
     node: Option<Arc<RaftNode>>,
     defaults: AdmissionDefaults,
+    /// The router to each member commands were routed to, kept with where
+    /// it was found, so its session carries every later command there.
+    // no-std: spin::Mutex; taken once per routed command.
+    routers: Arc<parking_lot::Mutex<rustc_hash::FxHashMap<u64, (PeerTarget, CommandRouter)>>>,
 }
 
 impl Admitter {
@@ -154,6 +159,7 @@ impl Admitter {
             database,
             node: None,
             defaults: AdmissionDefaults::default(),
+            routers: Arc::default(),
         }
     }
 
@@ -375,7 +381,8 @@ impl Admitter {
     }
 
     /// A router to `member` over this member's authenticated connection to
-    /// it.
+    /// it: the same one, and so the same session, for as long as the member
+    /// is found at the same place under the same identity.
     ///
     /// # Errors
     ///
@@ -389,7 +396,22 @@ impl Admitter {
                 member,
                 message: "this node has no peers".to_owned(),
             })?;
-        CommandRouter::to_member(node, member)
+        let Some(target) = node.member_target(member) else {
+            return Err(DatabaseError::PeerUnreachable {
+                member,
+                message: "this node does not know how to reach it".to_owned(),
+            });
+        };
+        let mut routers = self.routers.lock();
+        if let Some((found, router)) = routers.get(&member) {
+            if *found == target {
+                return Ok(router.clone());
+            }
+        }
+        let (target, channel) = CommandRouter::member_channel(node, member)?;
+        let router = CommandRouter::new(member, channel);
+        routers.insert(member, (target, router.clone()));
+        Ok(router)
     }
 
     /// The member every command of a transaction runs at, the leader: `None`

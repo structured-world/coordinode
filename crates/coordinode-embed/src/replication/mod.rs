@@ -424,7 +424,9 @@ impl Member {
             return false;
         }
         routes.add_service(InterceptedService::new(
-            routing::CommandRoutingHandler::new(executor).into_service(routing::MAX_ROUTED_MESSAGE),
+            routing::CommandRoutingHandler::new(executor)
+                .admitting(coordinode_raft::cluster::admission::node_admitted)
+                .into_service(routing::MAX_ROUTED_MESSAGE),
             nodes_only,
         ));
         true
