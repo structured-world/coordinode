@@ -116,6 +116,17 @@ pub enum DictionaryError {
     /// The 32-bit id space has no room for the names asked for.
     #[error("the field id space is exhausted")]
     Exhausted,
+    /// This member does not lead, or stopped leading while the registration
+    /// waited, so it publishes no binding; the leader is named when one is
+    /// known. The statement that needed the names ran nothing.
+    #[error("field registration failed: not the leader{}", match leader_id {
+        Some(id) => format!("; leader is node {id}"),
+        None => String::from("; no leader known"),
+    })]
+    NotLeader {
+        /// The member the group last named leader.
+        leader_id: Option<u64>,
+    },
     /// The authority did not publish the bindings asked for: the proposal
     /// failed, or its application rejected them.
     #[error("field registration failed: {0}")]

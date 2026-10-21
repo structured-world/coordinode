@@ -2384,3 +2384,98 @@ async fn a_transaction_opens_with_its_first_statement() {
     .await;
     assert!(result.is_ok(), "TIMED OUT");
 }
+
+/// A leader cut off from its group, once the others elected another, takes
+/// nothing more: a write, a transaction's statement and its commit through
+/// it are refused, none applies there, and none reaches the group when the
+/// link returns. A read it may serve itself is still answered, without
+/// waiting for a leader.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_cut_off_from_its_group_takes_nothing_more() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        members[0]
+            .execute(Statement::new("CREATE (:BeforeTheSplit {k: 1})"))
+            .await
+            .expect("written while the group stands");
+        let id = draw_transaction_id();
+        members[0]
+            .ingress()
+            .begin(begin_of(id), Placement::Anywhere)
+            .await
+            .expect("begun on the leader before the split");
+
+        nemesis::isolate(1, &[2, 3]);
+        wait_until("the others elect another leader", || {
+            matches!(members[1].leader(), Some(2 | 3))
+        })
+        .await;
+        let cut_off = &members[0];
+
+        // Refused as off the leader, typed, so the host knows it ran nothing.
+        let write = cut_off
+            .execute(Statement::new("CREATE (:CutOff {k: 1})"))
+            .await;
+        assert!(
+            matches!(write, Err(DatabaseError::NotLeader { .. })),
+            "the cut-off leader takes no write: {write:?}"
+        );
+        let statement = run_in(cut_off, id, "CREATE (:CutOff {k: 2})").await;
+        assert!(
+            matches!(statement, Err(DatabaseError::NotLeader { .. })),
+            "nor a transaction's statement: {statement:?}"
+        );
+        // The refused statement ended its transaction: nothing commits.
+        let commit = cut_off
+            .ingress()
+            .commit(commit_of(id), Placement::Anywhere)
+            .await;
+        assert!(
+            matches!(
+                commit,
+                Err(DatabaseError::TransactionAborted { .. } | DatabaseError::UnknownTransaction(_))
+            ),
+            "a transaction begun before the split does not commit there: {commit:?}"
+        );
+
+        let near = cut_off
+            .execute(Statement {
+                requested: Requested {
+                    read_preference: Some(ReadPreference::Nearest),
+                    ..Requested::default()
+                },
+                ..Statement::new("MATCH (n:BeforeTheSplit) RETURN n.k AS k")
+            })
+            .await
+            .expect("a read the member serves itself");
+        assert_eq!(near.forwarded_to, None);
+        assert_eq!(near.value.rows, vec![vec![Value::Int(1)]]);
+
+        nemesis::heal();
+        let leader = members[1].leader().expect("the group leads");
+        members[(leader - 1) as usize]
+            .execute(Statement::new("CREATE (:Marker {k: 1})"))
+            .await
+            .expect("a marker on the new leader");
+        for m in &members {
+            wait_until("the marker reaches every member", || {
+                count(m, "Marker") == 1
+            })
+            .await;
+            assert_eq!(
+                count(m, "CutOff"),
+                0,
+                "nothing of the cut-off leader landed"
+            );
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    nemesis::heal();
+    assert!(result.is_ok(), "TIMED OUT");
+}

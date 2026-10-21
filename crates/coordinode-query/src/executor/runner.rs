@@ -132,9 +132,10 @@ pub enum ExecutionError {
 
     /// A property name could not be given an id, or stored data carries an
     /// id the dictionary cannot name. Nothing encoded with the missing
-    /// binding was written or served.
+    /// binding was written or served. A member that does not lead is
+    /// refused as [`ExecutionError::NotLeader`].
     #[error("{0}")]
-    FieldDictionary(#[from] coordinode_core::graph::intern::DictionaryError),
+    FieldDictionary(coordinode_core::graph::intern::DictionaryError),
 
     #[error("unsupported operation: {0}")]
     Unsupported(String),
@@ -416,6 +417,19 @@ impl From<coordinode_core::graph::node::IdLeaseError> for ExecutionError {
                 ExecutionError::NotLeader { leader_id }
             }
             other => ExecutionError::NodeIdLease(other),
+        }
+    }
+}
+
+impl From<coordinode_core::graph::intern::DictionaryError> for ExecutionError {
+    fn from(e: coordinode_core::graph::intern::DictionaryError) -> Self {
+        match e {
+            // The same refusal as a commit or a NodeId lease met off the
+            // leader: the statement ran nothing and may be sent again.
+            coordinode_core::graph::intern::DictionaryError::NotLeader { leader_id } => {
+                ExecutionError::NotLeader { leader_id }
+            }
+            other => ExecutionError::FieldDictionary(other),
         }
     }
 }

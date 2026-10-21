@@ -19,7 +19,7 @@ use coordinode_core::graph::intern::{
     DictionaryError, FieldInterner, FieldRegistrar, MAX_REGISTRATION_BATCH, validate_registration,
 };
 use coordinode_core::txn::proposal::{
-    MetadataCommand, Mutation, ProposalIdGenerator, ProposalPipeline, RaftProposal,
+    MetadataCommand, Mutation, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::core::StorageEngine;
@@ -29,6 +29,21 @@ use coordinode_storage::error::StorageError;
 /// Schema key the dictionary was kept under by releases that wrote it as one
 /// whole-table value after the data.
 const LEGACY_DICTIONARY_KEY: &[u8] = b"meta:field_interner";
+
+/// Why the log did not publish a registration, as the statement that needed
+/// it is refused. One this member stopped leading under may still be taken
+/// by another leader, which only binds names early; the statement waiting
+/// for it ran nothing, so it is refused as any write on a member that does
+/// not lead is, not with an unknown outcome.
+fn registration_refusal(e: ProposalError) -> DictionaryError {
+    match e {
+        ProposalError::NotLeader { leader_id } => DictionaryError::NotLeader { leader_id },
+        ProposalError::LeadershipLost { .. } | ProposalError::ShuttingDown => {
+            DictionaryError::NotLeader { leader_id: None }
+        }
+        other => DictionaryError::Registration(other.to_string()),
+    }
+}
 
 /// A published view and the engine generations it covers.
 struct Published {
@@ -158,7 +173,7 @@ impl FieldDictionary {
                 &self.engine.bookkeeping_concern(),
             )
             .map(|_| ())
-            .map_err(|e| DictionaryError::Registration(e.to_string()))
+            .map_err(registration_refusal)
     }
 
     fn view_or_err(&self) -> Result<FieldInterner, DictionaryError> {
@@ -261,3 +276,6 @@ fn refuse_unbound_properties(engine: &StorageEngine) -> Result<(), StorageError>
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

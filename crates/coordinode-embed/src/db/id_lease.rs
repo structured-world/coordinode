@@ -32,6 +32,21 @@ pub(crate) const NODE_LEASE_SIZE: u64 = 10_000;
 /// a contention that only a change of leader produces.
 const MAX_GRANT_ATTEMPTS: u32 = 16;
 
+/// Why the log did not grant a lease, as the statement that needed it is
+/// refused. A grant this member stopped leading under may still be taken by
+/// another leader, which only leaves a range nobody draws from; the statement
+/// waiting for it ran nothing, so it is refused as any write on a member that
+/// does not lead is, not with an unknown outcome.
+fn lease_refusal(e: ProposalError) -> IdLeaseError {
+    match e {
+        ProposalError::NotLeader { leader_id } => IdLeaseError::NotLeader { leader_id },
+        ProposalError::LeadershipLost { .. } | ProposalError::ShuttingDown => {
+            IdLeaseError::NotLeader { leader_id: None }
+        }
+        other => IdLeaseError::NotGranted(other.to_string()),
+    }
+}
+
 /// Takes NodeId leases through a proposal pipeline.
 pub(crate) struct LogLeaseReserver {
     engine: Arc<StorageEngine>,
@@ -100,12 +115,7 @@ impl LogLeaseReserver {
                 start_ts: Timestamp::from_raw(0),
                 bypass_rate_limiter: false,
             })
-            .map_err(|e| match e {
-                // Typed, so the statement that needed the identifier is
-                // refused as any write on a member that does not lead is.
-                ProposalError::NotLeader { leader_id } => IdLeaseError::NotLeader { leader_id },
-                other => IdLeaseError::NotGranted(other.to_string()),
-            })?;
+            .map_err(lease_refusal)?;
 
         let holder = node_lease_holder(&self.engine, target)
             .map_err(|e| IdLeaseError::NotGranted(format!("read the lease record: {e}")))?;
@@ -260,3 +270,6 @@ impl Drop for PrefetchingReserver {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
