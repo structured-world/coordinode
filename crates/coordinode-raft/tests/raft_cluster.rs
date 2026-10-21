@@ -2670,22 +2670,24 @@ async fn cluster_snapshot_multi_chunk_transfer() {
             .await
             .expect("add node 2");
 
-        // Wait for multi-chunk snapshot transfer
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
-        // Verify data reached the new node
-        let mut found = 0;
-        for i in 0..1200u64 {
-            let key = format!("node:1:big-{i:05}");
-            if let Ok(Some(_)) = e2.get(Partition::Node, key.as_bytes()) {
-                found += 1;
-            }
+        // Wait until the new node has installed the snapshot (applied up to
+        // the index it covers), up to a bound a slow host still meets.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while n2.applied_index() < applied && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
+        let found = (0..1200u64)
+            .filter(|i| {
+                let key = format!("node:1:big-{i:05}");
+                matches!(e2.get(Partition::Node, key.as_bytes()), Ok(Some(_)))
+            })
+            .count();
         assert!(
-            found >= 1000,
-            "new node should have received most data via multi-chunk \
-             snapshot transfer, found {found}/1200 entries"
+            found == 1200,
+            "new node should hold every entry after installing the \
+             multi-chunk snapshot (applied {} of {applied}), found {found}/1200",
+            n2.applied_index()
         );
 
         tracing::info!(

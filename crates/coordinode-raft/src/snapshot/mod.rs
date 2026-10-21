@@ -639,8 +639,9 @@ pub struct SnapshotTransferHeader {
 pub enum SnapshotChunkMessage {
     /// First message: metadata about the snapshot transfer.
     Header(SnapshotTransferHeader),
-    /// Subsequent messages: raw CNSN data bytes (up to SNAPSHOT_CHUNK_SIZE).
-    DataChunk(Vec<u8>),
+    /// Subsequent messages: raw CNSN data bytes (up to SNAPSHOT_CHUNK_SIZE),
+    /// one binary blob on the wire rather than an array of integers.
+    DataChunk(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 /// Install a full snapshot from a reader (file or buffer).

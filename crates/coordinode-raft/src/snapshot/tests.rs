@@ -457,6 +457,26 @@ fn test_snapshot_chunk_message_serde_roundtrip() {
     }
 }
 
+/// A data chunk travels as one binary blob, not as an array of integers:
+/// encoded byte by byte, a 2 MiB chunk took seconds to encode and decode and
+/// every byte above 127 cost two on the wire.
+#[test]
+fn snapshot_chunk_data_is_one_binary_blob() {
+    let chunk_data = vec![0xFFu8; 1 << 20];
+    let bytes = rmp_serde::to_vec(&SnapshotChunkMessage::DataChunk(chunk_data.clone()))
+        .expect("serialize chunk");
+    assert!(
+        bytes.len() <= chunk_data.len() + 16,
+        "a {} byte chunk encoded to {} bytes",
+        chunk_data.len(),
+        bytes.len()
+    );
+    match rmp_serde::from_slice(&bytes).expect("deserialize chunk") {
+        SnapshotChunkMessage::DataChunk(d) => assert_eq!(d, chunk_data),
+        SnapshotChunkMessage::Header(_) => panic!("expected DataChunk variant"),
+    }
+}
+
 #[test]
 fn test_install_full_snapshot_from_reader() {
     // Build snapshot, install via reader, verify data matches
