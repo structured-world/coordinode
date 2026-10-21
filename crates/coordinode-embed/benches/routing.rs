@@ -558,26 +558,52 @@ async fn leader_changes(members: &[ReplicatedDatabase]) {
         tokio::spawn(async move {
             let mut committed = Arm::default();
             let (mut not_run, mut unknown, mut other) = (0usize, 0usize, 0usize);
+            // The longest a host went without a commit: what a leader change
+            // costs it, refusals and retries included.
+            let mut last_commit = Instant::now();
+            let mut longest_gap = Duration::ZERO;
             let mut k = 0usize;
             while !stop.load(std::sync::atomic::Ordering::Acquire) {
                 k += 1;
+                let region = Region::new(GLOBAL);
                 let sent = Instant::now();
-                match ingress
+                let outcome = ingress
                     .execute(with_k(Statement::new("CREATE (:Moving {k: $k})"), k))
-                    .await
-                {
-                    Ok(_) => committed.times.push(sent.elapsed()),
+                    .await;
+                let refused = match outcome {
+                    Ok(_) => {
+                        let now = Instant::now();
+                        committed.times.push(now - sent);
+                        let change = region.change();
+                        committed.allocs += change.allocations;
+                        committed.bytes += change.bytes_allocated;
+                        longest_gap = longest_gap.max(now - last_commit);
+                        last_commit = now;
+                        false
+                    }
                     Err(
                         DatabaseError::NotLeader { .. } | DatabaseError::PeerUnreachable { .. },
-                    ) => not_run += 1,
-                    Err(DatabaseError::PeerOutcomeUnknown { .. }) => unknown += 1,
+                    ) => {
+                        not_run += 1;
+                        true
+                    }
+                    Err(DatabaseError::PeerOutcomeUnknown { .. }) => {
+                        unknown += 1;
+                        true
+                    }
                     Err(e) => {
                         other += 1;
                         println!("leader change: unexpected refusal: {e}");
+                        true
                     }
+                };
+                if refused {
+                    // A host waits a moment before it sends again, as the
+                    // refusal tells it no leader is reachable yet.
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }
-            (committed, not_run, unknown, other)
+            (committed, not_run, unknown, other, longest_gap)
         })
     };
 
@@ -600,11 +626,11 @@ async fn leader_changes(members: &[ReplicatedDatabase]) {
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     stop.store(true, std::sync::atomic::Ordering::Release);
-    let (committed, not_run, unknown, other) = writer.await.expect("writer");
-    let longest = committed.times.iter().max().copied().unwrap_or_default();
+    let (committed, not_run, unknown, other, longest_gap) = writer.await.expect("writer");
     println!(
         "writes through member 3 across {TRANSFERS} leader changes: committed={} refused, did not run={not_run} \
-         outcome unknown={unknown} other={other} longest committed={longest:?} transfer times={moves:?}",
+         outcome unknown={unknown} other={other} longest without a commit={longest_gap:?} \
+         transfer times={moves:?}",
         committed.times.len()
     );
     committed.report("committed writes across leader changes");
