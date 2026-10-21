@@ -3212,6 +3212,10 @@ fn spawn_snapshot_trigger(
     tokio::spawn(async move {
         use openraft::rt::watch::WatchReceiver;
 
+        // Taken whole: a block that named only `held.engine` would capture
+        // that field alone and drop the work guard at the spawn, so the
+        // shutdown would not wait for this task.
+        let held = held;
         let engine = &held.engine;
 
         let probe = config.min_interval.min(SNAPSHOT_SIZE_PROBE);

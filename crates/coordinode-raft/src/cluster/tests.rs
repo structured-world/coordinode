@@ -200,6 +200,40 @@ async fn single_node_bootstrap_becomes_leader() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// The snapshot trigger counts as work holding the engine for as long as its
+/// task lives, so a shutdown that waits for that work to end finds the
+/// engine let go: the work is busy while the task runs and idle once the
+/// task is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_snapshot_trigger_is_work_until_its_task_ends() {
+    let (_dir, engine) = test_engine();
+    let node = RaftNode::single_node(Arc::clone(&engine))
+        .await
+        .expect("bootstrap");
+    let work = crate::storage::EngineWork::default();
+    let (_applied, applied_rx) = tokio::sync::watch::channel(0u64);
+    let task = spawn_snapshot_trigger(
+        Arc::clone(node.raft()),
+        Arc::clone(&engine),
+        &work,
+        SnapshotTriggerConfig::default(),
+        applied_rx,
+    );
+
+    assert!(
+        !work.wait_idle(std::time::Duration::from_millis(50)).await,
+        "the running trigger holds the engine as work"
+    );
+    task.abort();
+    assert!(task.await.is_err_and(|e| e.is_cancelled()));
+    assert!(
+        work.wait_idle(std::time::Duration::from_secs(10)).await,
+        "the trigger's work ends with its task"
+    );
+
+    node.shutdown().await.expect("shutdown");
+}
+
 /// A leader that is its own quorum never loses it: a write waiting on it
 /// longer than the lease is not answered as if the leadership were lost,
 /// though no other member ever acknowledges anything.
