@@ -2255,3 +2255,62 @@ async fn a_routed_transaction_outlives_a_renewal_and_a_revoked_member() {
     .await;
     assert!(result.is_ok(), "TIMED OUT");
 }
+
+/// A write that reaches a follower goes to the leader before anything of it
+/// runs there: the follower's admission names the leader for it, while a
+/// read the follower may serve runs where it is. Running it first and
+/// learning from consensus that it cannot be taken would cost the whole
+/// statement twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_on_a_follower_is_sent_to_the_leader_before_it_runs() {
+    use coordinode_embed::replication::admission::{Admission, Requested};
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let admitter = members[1].ingress().admitter().clone();
+        // A session that reads from the nearest member sends its writes with
+        // the same settings.
+        let nearest = Requested {
+            read_preference: Some(ReadPreference::Nearest),
+            ..Requested::default()
+        };
+
+        for write in [
+            "CREATE (:Forwarded {k: 1})",
+            "MATCH (n:Forwarded) SET n.k = 2",
+            "CALL { CREATE (:Forwarded {k: 3}) }",
+        ] {
+            let admitted = admitter
+                .admit(write, &nearest, false)
+                .await
+                .expect("admitted");
+            assert!(
+                matches!(admitted, Admission::Forward(1)),
+                "{write}: {admitted:?}"
+            );
+        }
+        let read = admitter
+            .admit("MATCH (n:Forwarded) RETURN n", &nearest, false)
+            .await
+            .expect("admitted");
+        assert!(matches!(read, Admission::Run(_)), "{read:?}");
+
+        // Routed once already, a write the member cannot take is refused
+        // naming the leader, never routed on.
+        let routed = admitter
+            .admit("CREATE (:Forwarded {k: 4})", &nearest, true)
+            .await;
+        assert!(
+            matches!(routed, Err(DatabaseError::NotLeader { leader_id: Some(1) })),
+            "{routed:?}"
+        );
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}

@@ -484,6 +484,21 @@ struct CachedPlan {
     vector_consistency_hinted: bool,
     /// The bound the query named in a `vector_build_wait` hint, if any.
     vector_build_wait: Option<Duration>,
+    /// Whether the statement writes, for routing it before it runs.
+    writes: coordinode_query::frontend::StatementWrites,
+}
+
+impl From<coordinode_query::frontend::ParsedQuery> for CachedPlan {
+    fn from(parsed: coordinode_query::frontend::ParsedQuery) -> Self {
+        Self {
+            canonical: parsed.canonical,
+            fingerprint: parsed.fingerprint,
+            plan: parsed.plan,
+            vector_consistency_hinted: parsed.vector_consistency_hinted,
+            vector_build_wait: parsed.vector_build_wait,
+            writes: parsed.writes,
+        }
+    }
 }
 
 /// Bounded query-string → [`CachedPlan`] cache shared across all
@@ -1592,16 +1607,8 @@ impl Database {
     pub fn execute_sql(&mut self, query: &str) -> Result<Vec<Row>, DatabaseError> {
         use coordinode_query::frontend::QueryFrontend;
         let parsed = coordinode_query::sql::SqlFrontend::new().parse(query)?;
-        self.plan_cache.put(
-            query.to_string(),
-            Arc::new(CachedPlan {
-                canonical: parsed.canonical,
-                fingerprint: parsed.fingerprint,
-                plan: parsed.plan,
-                vector_consistency_hinted: parsed.vector_consistency_hinted,
-                vector_build_wait: parsed.vector_build_wait,
-            }),
-        );
+        self.plan_cache
+            .put(query.to_string(), Arc::new(CachedPlan::from(parsed)));
         let session = self.capture_session();
         self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit, &mut None)
             .map(|(rows, _, _)| rows)
@@ -2225,10 +2232,33 @@ impl Database {
     /// query that fails to parse or plan is reported ineligible (the cursor
     /// surfaces the real error on execution).
     pub fn keyset_pageable(&self, query: &str) -> bool {
-        let Ok(parsed) = CypherFrontend::new().parse(query) else {
-            return false;
-        };
-        Self::spine_is_keyset_pageable(&parsed.plan.root)
+        self.cached_plan(query)
+            .is_ok_and(|cached| Self::spine_is_keyset_pageable(&cached.plan.root))
+    }
+
+    /// Whether `query` writes, known before it runs: a member that does not
+    /// lead sends such a statement to the leader rather than run it to have
+    /// consensus refuse it. `None` when the query does not parse; it fails
+    /// where it runs.
+    pub fn statement_writes(&self, query: &str) -> Option<bool> {
+        let cached = self.cached_plan(query).ok()?;
+        Some(
+            cached
+                .writes
+                .resolve(&|name| self.procedures().writes(name)),
+        )
+    }
+
+    /// `query` parsed, validated and lowered, from the plan cache or into
+    /// it. The frontend is the only dialect-aware component; everything
+    /// below the returned plan is language-neutral.
+    fn cached_plan(&self, query: &str) -> Result<Arc<CachedPlan>, DatabaseError> {
+        if let Some(cached) = self.plan_cache.get(query) {
+            return Ok(cached);
+        }
+        let cached = Arc::new(CachedPlan::from(CypherFrontend::new().parse(query)?));
+        self.plan_cache.put(query.to_string(), Arc::clone(&cached));
+        Ok(cached)
     }
 
     /// Walk a plan spine: keyset-pageable iff it is a single `NodeScan` under a
@@ -2307,39 +2337,14 @@ impl Database {
         // canonical form, fingerprint, and unoptimized logical plan.
         // Optimizer passes below still run on the cloned plan so they
         // observe the current index registry / stats.
-        let (canonical, fp, mut plan, hinted, hinted_build_wait) = match self.plan_cache.get(query)
-        {
-            Some(cached) => (
-                cached.canonical.clone(),
-                cached.fingerprint,
-                cached.plan.clone(),
-                cached.vector_consistency_hinted,
-                cached.vector_build_wait,
-            ),
-            None => {
-                // Parse, validate, lower, and fingerprint through the query
-                // frontend. The frontend is the only dialect-aware component;
-                // everything below the returned plan is language-neutral.
-                let parsed = CypherFrontend::new().parse(query)?;
-                self.plan_cache.put(
-                    query.to_string(),
-                    Arc::new(CachedPlan {
-                        canonical: parsed.canonical.clone(),
-                        fingerprint: parsed.fingerprint,
-                        plan: parsed.plan.clone(),
-                        vector_consistency_hinted: parsed.vector_consistency_hinted,
-                        vector_build_wait: parsed.vector_build_wait,
-                    }),
-                );
-                (
-                    parsed.canonical,
-                    parsed.fingerprint,
-                    parsed.plan,
-                    parsed.vector_consistency_hinted,
-                    parsed.vector_build_wait,
-                )
-            }
-        };
+        let cached = self.cached_plan(query)?;
+        let (canonical, fp, mut plan, hinted, hinted_build_wait) = (
+            cached.canonical.clone(),
+            cached.fingerprint,
+            cached.plan.clone(),
+            cached.vector_consistency_hinted,
+            cached.vector_build_wait,
+        );
         apply_session_vector_consistency(&mut plan, hinted, session.vector_consistency);
         self.run_plan(
             Statement {

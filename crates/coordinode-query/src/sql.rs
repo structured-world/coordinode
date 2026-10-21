@@ -22,7 +22,7 @@ use sqlparser::parser::Parser;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 use coordinode_core::txn::read_consistency::ReadConsistencyMode;
 
-use crate::frontend::{FrontendError, ParsedQuery, QueryFrontend};
+use crate::frontend::{FrontendError, ParsedQuery, QueryFrontend, StatementWrites};
 use crate::plan::expr::{BinOp, Expr};
 use crate::plan::{SetItem, ViolationMode};
 use crate::planner::logical::{LogicalOp, LogicalPlan, ProjectItem};
@@ -63,6 +63,12 @@ impl QueryFrontend for SqlFrontend {
             // SQL has no query hints.
             vector_consistency_hinted: false,
             vector_build_wait: None,
+            // Every statement but a query changes rows or tables; SQL here
+            // calls no procedures.
+            writes: StatementWrites {
+                clauses: !matches!(statement, Statement::Query(_)),
+                calls: Vec::new(),
+            },
         })
     }
 

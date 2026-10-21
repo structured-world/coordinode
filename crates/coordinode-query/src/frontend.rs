@@ -32,6 +32,26 @@ pub struct ParsedQuery {
     /// How long the query itself asked to wait for a vector index still
     /// being built; `None` leaves it to the session.
     pub vector_build_wait: Option<core::time::Duration>,
+    /// Whether the statement writes, known before it runs.
+    pub writes: StatementWrites,
+}
+
+/// Whether a statement writes: through one of its own clauses, or through a
+/// procedure it calls, which only the database's catalog can say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatementWrites {
+    /// One of its own clauses writes.
+    pub clauses: bool,
+    /// The procedures it calls; collected only while no clause writes.
+    pub calls: Vec<String>,
+}
+
+impl StatementWrites {
+    /// Whether the statement writes, `procedure_writes` saying which
+    /// procedures do.
+    pub fn resolve(&self, procedure_writes: &dyn Fn(&str) -> bool) -> bool {
+        self.clauses || self.calls.iter().any(|name| procedure_writes(name))
+    }
 }
 
 /// Why a [`QueryFrontend`] could not turn surface text into a [`ParsedQuery`].
@@ -117,12 +137,23 @@ impl QueryFrontend for CypherFrontend {
             crate::cypher::ast::QueryHint::VectorBuildWait(wait) => Some(*wait),
             _ => None,
         });
+        // Every procedure the statement calls is visited unless a clause
+        // already writes, which settles it.
+        let calls = core::cell::RefCell::new(Vec::new());
+        let clauses = ast.is_write(&|name| {
+            calls.borrow_mut().push(name.to_owned());
+            false
+        });
         Ok(ParsedQuery {
             plan,
             canonical,
             fingerprint,
             vector_consistency_hinted,
             vector_build_wait,
+            writes: StatementWrites {
+                clauses,
+                calls: calls.into_inner(),
+            },
         })
     }
 

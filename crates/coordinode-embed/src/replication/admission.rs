@@ -78,6 +78,8 @@ pub struct Checked {
     deadline: Option<Instant>,
     cancel: Option<CancelFlag>,
     operation: Option<OperationDescriptor>,
+    /// The statement writes, so only the leader can take it.
+    writes: bool,
 }
 
 /// A statement this member may run, with what the fence learned about it.
@@ -204,6 +206,9 @@ impl Admitter {
         }
         let level = requested.read_concern.unwrap_or(self.defaults.read_concern);
         let after_index = requested.after_index;
+        // Known before it runs, from the parse execution reuses. A query that
+        // does not parse runs on and fails there with the richer error.
+        let writes = self.database.read().statement_writes(query) == Some(true);
 
         // A causal read waits for a position a majority committed. A LOCAL
         // read promises nothing about majority, so a fence on top of it is
@@ -229,27 +234,23 @@ impl Admitter {
             // journaled before its position is handed out: a weaker write can
             // be lost on failover, leaving a position no follower ever reaches.
             // Refused before execution, so nothing is written to be refused
-            // afterwards. A query that does not parse runs on and fails there
-            // with the richer error.
-            if let Ok(ast) = coordinode_query::cypher::parse(query) {
-                let db = self.database.read();
-                if ast.is_write(&|name| db.procedures().writes(name)) {
-                    // Unnamed, it runs under the database's default, so that
-                    // is the one to check.
-                    let concern = requested
-                        .write_concern
-                        .unwrap_or_else(|| db.write_concern());
-                    if !concern.is_causal_safe() {
-                        return Err(refused(
-                            "Causal sessions require writeConcern w:majority with \
-                             j:journal for write statements. A weaker write (w:1, w:0, \
-                             or a volatile journal level) may be lost before replication: \
-                             the resulting applied_index would be a dangling causal \
-                             dependency that followers can never satisfy. Use a \
-                             non-causal session for such writes, or upgrade to \
-                             w:majority.",
-                        ));
-                    }
+            // afterwards.
+            if writes {
+                // Unnamed, it runs under the database's default, so that is
+                // the one to check.
+                let concern = requested
+                    .write_concern
+                    .unwrap_or_else(|| self.database.read().write_concern());
+                if !concern.is_causal_safe() {
+                    return Err(refused(
+                        "Causal sessions require writeConcern w:majority with \
+                         j:journal for write statements. A weaker write (w:1, w:0, \
+                         or a volatile journal level) may be lost before replication: \
+                         the resulting applied_index would be a dangling causal \
+                         dependency that followers can never satisfy. Use a \
+                         non-causal session for such writes, or upgrade to \
+                         w:majority.",
+                    ));
                 }
             }
         }
@@ -278,6 +279,7 @@ impl Admitter {
             deadline: requested.deadline,
             cancel: requested.cancel.clone(),
             operation: requested.operation,
+            writes,
         })
     }
 
@@ -314,6 +316,16 @@ impl Admitter {
         let Some(node) = self.node.as_ref() else {
             return Ok(Admission::Run(self.admit_standalone(checked)));
         };
+        // A write only the leader can take goes there before anything of it
+        // runs here, whatever the read preference says: run here, it would be
+        // refused by consensus after doing all its work.
+        if checked.writes {
+            match node.current_leader() {
+                Some(leader) if leader == node.node_id() => {}
+                Some(leader) if !already_forwarded => return Ok(Admission::Forward(leader)),
+                leader_id => return Err(DatabaseError::NotLeader { leader_id }),
+            }
+        }
         let mut fence = node.read_fence();
         if let Err(e) = fence
             .apply_default(
