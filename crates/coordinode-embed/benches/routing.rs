@@ -277,15 +277,20 @@ async fn main() {
         for _ in 0..n {
             unary
                 .measure(async {
-                    let _ = router
-                        .operation(
-                            &ActingContext::Trusted,
-                            coordinode_embed::replication::routing::RoutedOperationCall::Resolve(
-                                unknown,
-                                coordinode_embed::operation::Resolve::Lookup,
-                            ),
-                        )
-                        .await;
+                    // Either answer is a full round trip; which one is not
+                    // what is measured.
+                    std::hint::black_box(
+                        router
+                            .operation(
+                                &ActingContext::Trusted,
+                                coordinode_embed::replication::routing::RoutedOperationCall::Resolve(
+                                    unknown,
+                                    coordinode_embed::operation::Resolve::Lookup,
+                                ),
+                            )
+                            .await
+                            .is_ok(),
+                    );
                 })
                 .await;
         }
@@ -306,11 +311,15 @@ async fn main() {
         for _ in 0..n {
             floor
                 .measure(async {
-                    let _ = client
-                        .exchange(coordinode_raft::proto::internode::HandshakeRecord {
-                            record: Vec::new(),
-                        })
-                        .await;
+                    // Refused or answered, it is one call on the channel.
+                    std::hint::black_box(
+                        client
+                            .exchange(coordinode_raft::proto::internode::HandshakeRecord {
+                                record: Vec::new(),
+                            })
+                            .await
+                            .is_ok(),
+                    );
                 })
                 .await;
         }
@@ -345,6 +354,55 @@ async fn main() {
                 .await;
             }
             tcp.report("TCP ping-pong over loopback");
+        }
+        // The floor a framed protocol on the members' connection could
+        // reach: the same mutual TLS (identities, provider, no resumption)
+        // between members 2 and 1, echoing a message the size of a routed
+        // statement's request, one task on each side.
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            const MESSAGE: usize = 256;
+            let server_config = PKI
+                .context(1)
+                .server_config(coordinode_wire::peer::InboundAuth::NodeOnly)
+                .expect("server config");
+            let client_config = PKI
+                .context(2)
+                .client_config(PKI.identity(1))
+                .expect("client config");
+            let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+            let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("accept");
+                socket.set_nodelay(true).expect("nodelay");
+                let mut tls = acceptor.accept(socket).await.expect("tls accept");
+                let mut message = [0u8; MESSAGE];
+                while tls.read_exact(&mut message).await.is_ok() {
+                    if tls.write_all(&message).await.is_err() || tls.flush().await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let socket = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            socket.set_nodelay(true).expect("nodelay");
+            let name = rustls_pki_types::ServerName::try_from("peer.invalid").expect("name");
+            let mut tls = connector.connect(name, socket).await.expect("tls connect");
+            let mut tls_echo = Arm::default();
+            let mut message = [7u8; MESSAGE];
+            for _ in 0..n {
+                tls_echo
+                    .measure(async {
+                        tls.write_all(&message).await.expect("write");
+                        tls.flush().await.expect("flush");
+                        tls.read_exact(&mut message).await.expect("read");
+                    })
+                    .await;
+            }
+            tls_echo.report("mutual TLS echo of 256 bytes over loopback");
         }
         for m in members.into_iter().rev() {
             m.shutdown().await.expect("shutdown");
