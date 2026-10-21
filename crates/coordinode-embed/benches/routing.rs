@@ -290,6 +290,62 @@ async fn main() {
                 .await;
         }
         unary.report("unary operation call on the same channel");
+        // The floor: the version exchange answers on the runtime without the
+        // blocking pool, on the same authenticated connection.
+        let node = follower.member().node();
+        let channel = node
+            .connections()
+            .expect("peers")
+            .channel(&node.member_target(1).expect("the leader's target"))
+            .expect("channel");
+        let mut client =
+            coordinode_raft::proto::internode::version_handshake_client::VersionHandshakeClient::new(
+                channel,
+            );
+        let mut floor = Arm::default();
+        for _ in 0..n {
+            floor
+                .measure(async {
+                    let _ = client
+                        .exchange(coordinode_raft::proto::internode::HandshakeRecord {
+                            record: Vec::new(),
+                        })
+                        .await;
+                })
+                .await;
+        }
+        floor.report("version exchange on the same channel");
+        // The host's own floor: a byte there and back over loopback TCP,
+        // between two tasks of this runtime.
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                socket.set_nodelay(true).expect("nodelay");
+                let mut byte = [0u8; 1];
+                while socket.read_exact(&mut byte).await.is_ok() {
+                    if socket.write_all(&byte).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut socket = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            socket.set_nodelay(true).expect("nodelay");
+            let mut tcp = Arm::default();
+            let mut byte = [7u8; 1];
+            for _ in 0..n {
+                tcp.measure(async {
+                    socket.write_all(&byte).await.expect("write");
+                    socket.read_exact(&mut byte).await.expect("read");
+                })
+                .await;
+            }
+            tcp.report("TCP ping-pong over loopback");
+        }
         for m in members.into_iter().rev() {
             m.shutdown().await.expect("shutdown");
         }
