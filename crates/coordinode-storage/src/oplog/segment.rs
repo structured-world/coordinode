@@ -758,8 +758,8 @@ impl SegmentWriter {
     /// After a failed `fsync` the page cache can keep writes the disk never
     /// got, and a footer written afterwards can reach the disk while they do
     /// not: the segment then reads as zeros from the first lost entry, under a
-    /// valid footer. That shows as a frame of [`LOST_FRAME`] where the
-    /// complete entries end, and is recovered as [`inspect_tail`] recovers a
+    /// valid footer. That shows as a frame of zero length and zero checksum
+    /// where the complete entries end, and is recovered as [`inspect_tail`] recovers a
     /// segment without a footer: the entries before it are kept, and the
     /// segment ends there. Anything else that stops the entries short of the
     /// footer (a checksum that does not hold over bytes that are not zero) is
