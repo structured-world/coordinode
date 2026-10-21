@@ -100,4 +100,7 @@ third-party = [
     { name = "tonic" },
     { name = "tokio-stream" },
     { name = "prost" },
+    # TLS over tokio, which the inter-node channel and the routing bench use:
+    # unified here it would bring tokio back into that build.
+    { name = "tokio-rustls" },
 ]

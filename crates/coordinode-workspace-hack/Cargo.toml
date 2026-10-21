@@ -171,9 +171,7 @@ rmpv = { version = "1", default-features = false, features = ["with-serde"] }
 rust-stemmers-7bc1df87d11e1479 = { package = "rust-stemmers", git = "https://github.com/structured-world/rust-stemmers.git", branch = "main", default-features = false }
 rust-stemmers-dff4ba8e3ae991db = { package = "rust-stemmers", version = "1", default-features = false }
 rustc-hash = { version = "2" }
-rustls = { version = "0.23", default-features = false, features = ["std"] }
 rustls-pki-types = { version = "1", features = ["std"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 rusty-fork = { version = "0.3", default-features = false, features = ["timeout"] }
 s2 = { version = "0.2" }
 same-file = { version = "1", default-features = false }
@@ -193,7 +191,6 @@ stable_deref_trait = { version = "1" }
 stacker = { version = "0.1", default-features = false }
 stats_alloc = { version = "0.1" }
 streamvbyte64 = { version = "0.2", default-features = false }
-subtle = { version = "2", default-features = false }
 tantivy = { version = "0.26", default-features = false, features = ["lz4-compression", "mmap", "stemmer", "stopwords"] }
 tantivy-bitpacker = { version = "0.10", default-features = false }
 tantivy-columnar = { version = "0.7", default-features = false }
@@ -210,7 +207,6 @@ time = { version = "0.3", features = ["serde-well-known"] }
 time-core = { version = "0.1", default-features = false }
 tinytemplate = { version = "1", default-features = false }
 tinyvec = { version = "1", features = ["alloc"] }
-tokio-rustls = { version = "0.26", default-features = false }
 tracing = { version = "0.1" }
 tracing-core = { version = "0.1", default-features = false, features = ["std"] }
 twox-hash = { version = "2", default-features = false, features = ["xxhash32"] }
@@ -221,7 +217,6 @@ ucd-trie = { version = "0.1", default-features = false, features = ["std"] }
 unarray = { version = "0.1", default-features = false }
 unicode-normalization = { version = "0.1" }
 universal-hash = { version = "0.6", default-features = false }
-untrusted = { version = "0.9", default-features = false }
 utf8-ranges = { version = "1", default-features = false }
 utf8parse = { version = "0.2" }
 uuid = { version = "1", features = ["serde", "v4"] }
@@ -409,9 +404,7 @@ rust-stemmers-7bc1df87d11e1479 = { package = "rust-stemmers", git = "https://git
 rust-stemmers-dff4ba8e3ae991db = { package = "rust-stemmers", version = "1", default-features = false }
 rustc-hash = { version = "2" }
 rustc_version = { version = "0.4", default-features = false }
-rustls = { version = "0.23", default-features = false, features = ["std"] }
 rustls-pki-types = { version = "1", features = ["std"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 rustversion = { version = "1", default-features = false }
 rusty-fork = { version = "0.3", default-features = false, features = ["timeout"] }
 s2 = { version = "0.2" }
@@ -436,7 +429,6 @@ stacker = { version = "0.1", default-features = false }
 stats_alloc = { version = "0.1" }
 streamvbyte64 = { version = "0.2", default-features = false }
 strsim = { version = "0.11", default-features = false }
-subtle = { version = "2", default-features = false }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit-mut"] }
 tantivy = { version = "0.26", default-features = false, features = ["lz4-compression", "mmap", "stemmer", "stopwords"] }
@@ -458,7 +450,6 @@ time = { version = "0.3", features = ["serde-well-known"] }
 time-core = { version = "0.1", default-features = false }
 tinytemplate = { version = "1", default-features = false }
 tinyvec = { version = "1", features = ["alloc"] }
-tokio-rustls = { version = "0.26", default-features = false }
 tracing = { version = "0.1" }
 tracing-attributes = { version = "0.1", default-features = false }
 tracing-core = { version = "0.1", default-features = false, features = ["std"] }
@@ -472,7 +463,6 @@ unarray = { version = "0.1", default-features = false }
 unicode-ident = { version = "1", default-features = false }
 unicode-normalization = { version = "0.1" }
 universal-hash = { version = "0.6", default-features = false }
-untrusted = { version = "0.9", default-features = false }
 utf8-ranges = { version = "1", default-features = false }
 utf8parse = { version = "0.2" }
 uuid = { version = "1", features = ["serde", "v4"] }
