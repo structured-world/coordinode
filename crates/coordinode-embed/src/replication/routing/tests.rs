@@ -356,6 +356,51 @@ fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
     }
 }
 
+/// An answer that fits one batch travels as one message: its columns, rows
+/// and end together, with no admission event for a statement that commits
+/// on its own. Every message is a frame and a socket write on both members.
+#[tokio::test]
+async fn a_small_answer_is_one_message() {
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer {
+        columns: vec!["k".into()],
+        rows: (0..5).map(|k| vec![Value::Int(k)]).collect(),
+        stats: RoutedStats {
+            nodes_created: 2,
+            ..RoutedStats::default()
+        },
+    }));
+    let router = serve(executor).await;
+    let mut frames = router
+        .client
+        .clone()
+        .execute(CommandRouter::request(
+            statement_to_wire(statement(None)).expect("encoded"),
+            None,
+        ))
+        .await
+        .expect("answering")
+        .into_inner();
+    let mut messages = Vec::new();
+    while let Some(frame) = frames.message().await.expect("frame") {
+        messages.push(frame);
+    }
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    let kinds: Vec<&str> = messages[0]
+        .events
+        .iter()
+        .map(|event| match event.event {
+            Some(Event::Admitted(_)) => "admitted",
+            Some(Event::Columns(_)) => "columns",
+            Some(Event::Rows(_)) => "rows",
+            Some(Event::End(_)) => "end",
+            Some(Event::Error(_)) => "error",
+            None => "none",
+        })
+        .collect();
+    assert_eq!(kinds, ["columns", "rows", "end"]);
+}
+
 /// A statement reaches the executing member as the ingress sent it: who it
 /// acts for, its parameters, every setting, its transaction and source; and
 /// its answer comes back whole, rows in order.

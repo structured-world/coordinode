@@ -45,7 +45,7 @@ use crate::operation::{IssuerId, OperationOutcome, Resolve};
 use coordinode_core::group::DeploymentId;
 use wire::command_routing_service_client::CommandRoutingServiceClient;
 use wire::command_routing_service_server::{CommandRoutingService, CommandRoutingServiceServer};
-use wire::routed_statement_frame::Event;
+use wire::routed_statement_event::Event;
 
 mod errors;
 pub use errors::{ERROR_CODEC_VERSION, MAX_ROUTED_ERROR};
@@ -388,28 +388,29 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
             });
         }
 
-        // The admitted frame is the first one sent, so the queue has room
-        // for it; told twice, it is sent once.
-        let told = Arc::new(AtomicBool::new(false));
-        let admitted = {
+        // A statement of a transaction tells the ingress when it has its
+        // place, at once and on its own, so the next command can follow. The
+        // admitted frame is the first one sent, so the queue has room for it;
+        // told twice, it is sent once. An autonomous statement waits behind
+        // nothing and its answer says all there is.
+        let admitted = if statement.transaction.is_some() {
+            let told = Arc::new(AtomicBool::new(false));
             let frames = frames.clone();
             AdmissionSignal::new(move || {
                 if !told.swap(true, Ordering::AcqRel) {
                     // A full or closed queue: the ingress is gone, and the
                     // cancellation above stops the statement.
                     if frames
-                        .try_send(Ok(frame(Event::Admitted(wire::Admitted {}))))
+                        .try_send(Ok(frame(vec![Event::Admitted(wire::Admitted {})])))
                         .is_err()
                     {
                         tracing::debug!("a routed statement's ingress left before its admission");
                     }
                 }
             })
+        } else {
+            AdmissionSignal::new(|| {})
         };
-        // An autonomous statement waits behind nothing.
-        if statement.transaction.is_none() {
-            admitted.admitted();
-        }
 
         // A statement of a transaction whose answer does not reach the
         // ingress leaves its client unable to know what it did, and a
@@ -510,9 +511,13 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
 /// runs: its columns, then its rows in batches sent as they fill. A batch
 /// waits for room in the call's bounded queue, so an ingress that reads
 /// slowly holds the statement back rather than the answer piling up here.
+/// Events go out together: the columns with the first batch, the last batch
+/// with the end, so an answer that fits one batch is one message.
 /// Called from the blocking pool.
 pub struct AnswerWriter {
     frames: tokio::sync::mpsc::Sender<Result<wire::RoutedStatementFrame, Status>>,
+    /// Events ready and not sent yet.
+    pending: Vec<Event>,
     batch: Vec<u8>,
     columns: bool,
     /// The ingress left: nothing more reaches it.
@@ -525,6 +530,7 @@ impl AnswerWriter {
     fn new(frames: tokio::sync::mpsc::Sender<Result<wire::RoutedStatementFrame, Status>>) -> Self {
         Self {
             frames,
+            pending: Vec::new(),
             batch: Vec::new(),
             columns: false,
             gone: false,
@@ -539,12 +545,12 @@ impl AnswerWriter {
         Self::new(frames)
     }
 
-    /// Send the column names, once and before any row; later calls are
+    /// Give the column names, once and before any row; later calls are
     /// ignored. `false` once nothing more is worth producing.
     pub fn columns(&mut self, names: &[String]) -> bool {
         if !self.columns {
             self.columns = true;
-            self.send(Event::Columns(wire::Columns {
+            self.pending.push(Event::Columns(wire::Columns {
                 names: names.to_vec(),
             }));
         }
@@ -566,7 +572,8 @@ impl AnswerWriter {
             return false;
         }
         if self.batch.len() >= ROW_BATCH_BYTES {
-            self.flush();
+            self.take_batch();
+            self.send();
         }
         self.wanted()
     }
@@ -575,15 +582,18 @@ impl AnswerWriter {
         !self.gone && self.broken.is_none()
     }
 
-    fn flush(&mut self) {
+    /// The rows written so far become one pending event.
+    fn take_batch(&mut self) {
         if !self.batch.is_empty() {
             let batch = std::mem::take(&mut self.batch);
-            self.send(Event::Rows(batch));
+            self.pending.push(Event::Rows(batch));
         }
     }
 
-    fn send(&mut self, event: Event) {
-        if !self.gone && self.frames.blocking_send(Ok(frame(event))).is_err() {
+    /// Send the pending events as one frame.
+    fn send(&mut self) {
+        let events = std::mem::take(&mut self.pending);
+        if !self.gone && self.frames.blocking_send(Ok(frame(events))).is_err() {
             self.gone = true;
         }
     }
@@ -605,20 +615,26 @@ impl AnswerWriter {
         match result {
             Ok(stats) => {
                 self.columns(&[]);
-                self.flush();
-                self.send(Event::End(stats_to_wire(stats)));
+                self.take_batch();
+                self.pending.push(Event::End(stats_to_wire(stats)));
             }
             Err(err) => {
-                self.flush();
-                self.send(Event::Error(errors::encode(err)));
+                self.take_batch();
+                self.pending.push(Event::Error(errors::encode(err)));
             }
         }
+        self.send();
         !self.gone
     }
 }
 
-fn frame(event: Event) -> wire::RoutedStatementFrame {
-    wire::RoutedStatementFrame { event: Some(event) }
+fn frame(events: Vec<Event>) -> wire::RoutedStatementFrame {
+    wire::RoutedStatementFrame {
+        events: events
+            .into_iter()
+            .map(|event| wire::RoutedStatementEvent { event: Some(event) })
+            .collect(),
+    }
 }
 
 /// The ingress's side of routing: sends commands to one member and returns
@@ -762,28 +778,33 @@ impl CommandRouter {
             .map_err(|s| self.lost(&s))?
             .into_inner();
         // The answer opens with its columns, after the admission of a
-        // transaction's statement and unless the statement failed.
+        // transaction's statement and unless the statement failed. What
+        // came in the same frame after them is the start of the rows.
         while let Some(frame) = frames.message().await.map_err(|s| self.lost(&s))? {
-            match frame.event {
-                Some(Event::Admitted(_)) => admitted.admitted(),
-                Some(Event::Columns(columns)) => {
-                    return Ok(RoutedRows {
-                        router: self.clone(),
-                        columns: columns.names,
-                        frames,
-                        buffered: std::collections::VecDeque::new(),
-                        stats: None,
-                    });
+            let mut events: std::collections::VecDeque<_> = frame.events.into();
+            while let Some(event) = events.pop_front() {
+                match event.event {
+                    Some(Event::Admitted(_)) => admitted.admitted(),
+                    Some(Event::Columns(columns)) => {
+                        return Ok(RoutedRows {
+                            router: self.clone(),
+                            columns: columns.names,
+                            frames,
+                            pending: events,
+                            buffered: std::collections::VecDeque::new(),
+                            stats: None,
+                        });
+                    }
+                    Some(Event::Error(bytes)) => {
+                        return Err(errors::decode(&bytes).unwrap_or_else(|e| self.unreadable(e)));
+                    }
+                    Some(Event::Rows(_) | Event::End(_)) => {
+                        return Err(self.unreadable(
+                            "the executing member sent rows before their columns".to_owned(),
+                        ));
+                    }
+                    None => {}
                 }
-                Some(Event::Error(bytes)) => {
-                    return Err(errors::decode(&bytes).unwrap_or_else(|e| self.unreadable(e)));
-                }
-                Some(Event::Rows(_) | Event::End(_)) => {
-                    return Err(self.unreadable(
-                        "the executing member sent rows before their columns".to_owned(),
-                    ));
-                }
-                None => {}
             }
         }
         Err(self.unreadable("the executing member ended the answer before its columns".to_owned()))
@@ -880,6 +901,8 @@ pub struct RoutedRows {
     router: CommandRouter,
     columns: Vec<String>,
     frames: tonic::Streaming<wire::RoutedStatementFrame>,
+    /// Events of a received frame not read yet.
+    pending: std::collections::VecDeque<wire::RoutedStatementEvent>,
     buffered: std::collections::VecDeque<Vec<Value>>,
     stats: Option<RoutedStats>,
 }
@@ -905,17 +928,21 @@ impl RoutedRows {
     /// delivered leaves the statement's outcome to be resolved, never rerun.
     pub async fn next_rows(&mut self, max: usize) -> Result<Vec<Vec<Value>>, DatabaseError> {
         while self.buffered.is_empty() && self.stats.is_none() {
-            let Some(frame) = self
-                .frames
-                .message()
-                .await
-                .map_err(|s| self.router.lost(&s))?
-            else {
-                return Err(self.router.unreadable(
-                    "the executing member ended the answer before its statistics".to_owned(),
-                ));
+            let Some(event) = self.pending.pop_front() else {
+                let Some(frame) = self
+                    .frames
+                    .message()
+                    .await
+                    .map_err(|s| self.router.lost(&s))?
+                else {
+                    return Err(self.router.unreadable(
+                        "the executing member ended the answer before its statistics".to_owned(),
+                    ));
+                };
+                self.pending.extend(frame.events);
+                continue;
             };
-            match frame.event {
+            match event.event {
                 Some(Event::Rows(batch)) => {
                     let mut rows = Vec::new();
                     decode_rows(&batch, &mut rows).map_err(|e| self.router.unreadable(e))?;
