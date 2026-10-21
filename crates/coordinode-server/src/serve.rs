@@ -207,6 +207,10 @@ pub(crate) async fn serve(
         raft_snapshot_entries,
         raft_snapshot_log_bytes,
         raft_snapshot_min_interval_secs,
+        routed_commands_max,
+        routed_session_commands_max,
+        routed_frames_ahead,
+        routed_row_batch_bytes,
         // Already captured above (election_timing / _preference) before the move.
         election_profile: _,
         election_heartbeat_ms: _,
@@ -411,6 +415,13 @@ pub(crate) async fn serve(
         min_interval: raft_snapshot_min_interval_secs.map_or(defaults.min_interval, |n| {
             std::time::Duration::from_secs(n.get())
         }),
+    };
+    let routing = coordinode_embed::replication::routing::RoutingLimits::default();
+    member_options.routing = coordinode_embed::replication::routing::RoutingLimits {
+        commands: routed_commands_max.map_or(routing.commands, |n| n.get()),
+        session_commands: routed_session_commands_max.map_or(routing.session_commands, |n| n.get()),
+        frames_ahead: routed_frames_ahead.map_or(routing.frames_ahead, |n| n.get()),
+        row_batch_bytes: routed_row_batch_bytes.map_or(routing.row_batch_bytes, |n| n.get()),
     };
     member_options.timing = election_timing;
     member_options.preference = election_preference;

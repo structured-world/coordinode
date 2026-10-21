@@ -100,6 +100,10 @@ the key is unset.
 | `raft_snapshot_entries` | `10000` | restart | Entries applied since the last Raft snapshot that trigger the next. A snapshot lets the log before it be dropped. Taking one pauses applying entries while every partition is flushed and hard-linked (no pass over the data; its bytes are produced only when a member far behind needs it sent), so a busy node snapshots every `entries / write rate` seconds: raise it to pause less often, at the cost of a longer log to keep and to replay after a restart. Zero is refused. |
 | `raft_snapshot_log_bytes` | `268435456` (256 MiB) | restart | Bytes the Raft log's segments grow by since the last snapshot that trigger the next, so a few large entries compact the log as a count of small ones would. Sized every second. Zero is refused. |
 | `raft_snapshot_min_interval_secs` | `60` | restart | Shortest time between two Raft snapshots the entry count or the log size asks for, however fast the log grows. Time alone never takes a snapshot: a node whose log stays below both thresholds takes none. Zero is refused. |
+| `routed_commands_max` | `512` | restart (`MemberOptions::routing` in embedded mode) | Commands other members route to this one (writes and transactions their clients send, which run here as the leader) that run at once, from all of them together. A command past it is refused before it runs, and the member that routed it returns its client an error saying the command did not run, so it is safe to retry. The default matches the number of threads routed commands run on. Zero is refused. |
+| `routed_session_commands_max` | `256` | restart (`MemberOptions::routing` in embedded mode) | Commands one member routes here that run at once, so a single busy member leaves room for the others. Refused past it as above. It also bounds the replies a member may leave unread: past `routed_session_commands_max × (routed_frames_ahead + 3)` the member's session is ended with `RESOURCE_EXHAUSTED`, and what still ran for it is stopped, as when the session is lost. Zero is refused. |
+| `routed_frames_ahead` | `4` | restart (`MemberOptions::routing` in embedded mode) | Batches of a routed statement's rows sent ahead of the member that routed it taking them. A member that reads slowly holds the statement back rather than its rows piling up here; raise it for large results across links with a long round trip. Zero is refused. |
+| `routed_row_batch_bytes` | `1048576` (1 MiB) | restart (`MemberOptions::routing` in embedded mode) | Encoded size a batch of a routed statement's rows grows to before it is sent; a single larger row is sent in a batch of its own. With `routed_frames_ahead` it bounds what one routed answer holds in memory. Zero is refused. |
 | `election_profile` | `rack` | restart (`MemberOptions::timing` in embedded mode) | Election and heartbeat timing of the group. `rack`, for servers in one rack or data centre, sends a heartbeat every 150 ms and starts an election after 300 to 600 ms without one, so a failover takes under a second. `personal_fleet`, for members on laptops, phones and home links that sleep, roam and lose packets for seconds, sends one every 2 s and waits 20 to 40 s, so a short outage does not depose the leader. Give every member of a group the same profile. A member cut off from its leader asks the others whether they would vote before it raises the term (pre-vote), so its return never deposes a leader the rest still follow. |
 | `election_heartbeat_ms` | the profile's | restart | Replaces the profile's heartbeat interval, in ms. A start whose timing would let a healthy group keep electing (a heartbeat not well below the shortest election timeout, or an empty election window) is refused. Zero is refused. |
 | `election_timeout_min_ms` | the profile's | restart | Replaces the profile's shortest election timeout, in ms. Zero is refused. |
@@ -347,6 +351,12 @@ peers: []
 # raft_snapshot_entries: 10000
 # raft_snapshot_log_bytes: 268435456
 # raft_snapshot_min_interval_secs: 60
+# Commands other members route here: how many run at once (all, one member),
+# and how a routed statement's rows go back (batch bytes, batches ahead).
+# routed_commands_max: 512
+# routed_session_commands_max: 256
+# routed_frames_ahead: 4
+# routed_row_batch_bytes: 1048576
 # How long the planner reuses its storage statistics.
 # planner_stats_ttl_secs: 60
 # Log statements running at least this long (ms); 0 logs every statement.

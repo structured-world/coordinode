@@ -372,6 +372,17 @@ pub struct ServerConfig {
     /// Shortest time between two Raft snapshots the log size asks for, in
     /// seconds (`None` = 60). Time alone never takes a snapshot.
     pub raft_snapshot_min_interval_secs: Option<NonZeroU64>,
+    /// Commands peers route here that run at once, from all of them
+    /// (`None` = 512). One past it is refused before it runs.
+    pub routed_commands_max: Option<NonZeroUsize>,
+    /// Commands one peer routes here that run at once (`None` = 256).
+    pub routed_session_commands_max: Option<NonZeroUsize>,
+    /// Frames of a routed statement's answer sent ahead of the peer taking
+    /// them (`None` = 4).
+    pub routed_frames_ahead: Option<NonZeroU32>,
+    /// Encoded size a batch of a routed statement's rows grows to before it
+    /// is sent (`None` = 1 MiB).
+    pub routed_row_batch_bytes: Option<NonZeroUsize>,
     /// The group's election timing profile: `rack` (a failover within a
     /// second) or `personal_fleet` (a leader is given tens of seconds).
     pub election_profile: ElectionProfile,
@@ -614,6 +625,10 @@ impl Default for ServerConfig {
             raft_snapshot_entries: None,
             raft_snapshot_log_bytes: None,
             raft_snapshot_min_interval_secs: None,
+            routed_commands_max: None,
+            routed_session_commands_max: None,
+            routed_frames_ahead: None,
+            routed_row_batch_bytes: None,
             election_profile: ElectionProfile::Rack,
             election_heartbeat_ms: None,
             election_timeout_min_ms: None,

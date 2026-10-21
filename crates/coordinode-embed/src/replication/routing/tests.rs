@@ -1198,3 +1198,242 @@ async fn a_lost_session_stops_its_statements() {
     }
     assert!(executor.cancelled.load(Ordering::Acquire));
 }
+
+/// An autonomous statement sent by hand under `call`.
+fn execute_request(call: u64) -> wire::RoutedRequest {
+    in_transaction(call, None)
+}
+
+/// A statement of `transaction` sent by hand under `call`.
+fn in_transaction(call: u64, transaction: Option<TransactionId>) -> wire::RoutedRequest {
+    wire::RoutedRequest {
+        call,
+        request: Some(wire::routed_request::Request::Execute(Box::new(
+            statement_to_wire(statement(transaction)).expect("encoded"),
+        ))),
+    }
+}
+
+/// Whether `reply` is a frame that ends its answer with its statistics.
+fn ends(reply: &wire::routed_reply::Reply) -> bool {
+    matches!(reply, wire::routed_reply::Reply::Frame(f)
+        if f.events.iter().any(|e| matches!(e.event, Some(Event::End(_)))))
+}
+
+/// Read `call`'s replies up to the one that ends its answer.
+async fn end_of(
+    replies: &mut tonic::Streaming<wire::RoutedReply>,
+    call: u64,
+) -> wire::routed_reply::Reply {
+    loop {
+        let reply = reply_to(replies, call).await;
+        if !matches!(reply, wire::routed_reply::Reply::Frame(ref f)
+            if f.events.iter().all(|e| matches!(e.event, Some(Event::Admitted(_)))))
+        {
+            return reply;
+        }
+    }
+}
+
+/// Wait until `executor` has taken `count` statements.
+async fn taken(executor: &Scripted, count: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while executor.statements.lock().unwrap().len() < count {
+        assert!(std::time::Instant::now() < deadline, "never arrived");
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The next reply on `replies` to `call`, skipping the others.
+async fn reply_to(
+    replies: &mut tonic::Streaming<wire::RoutedReply>,
+    call: u64,
+) -> wire::routed_reply::Reply {
+    loop {
+        let reply = replies.message().await.expect("reply").expect("a reply");
+        if reply.call == call {
+            return reply.reply.expect("a reply body");
+        }
+    }
+}
+
+fn is_busy(reply: &wire::routed_reply::Reply) -> bool {
+    matches!(reply, wire::routed_reply::Reply::Refused(r) if r.reason == "busy")
+}
+
+/// A command past the bound on one session's running commands is refused
+/// as busy and does not run. Once the running one has answered, its slot is
+/// free: the next command sent on that answer runs, with no busy in between.
+#[tokio::test]
+async fn a_command_past_the_session_bound_is_refused_until_a_slot_frees() {
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer::default()));
+    // The transaction's statement waits here until the test lets it on.
+    let (release, gate) = std::sync::mpsc::channel();
+    *executor.gate.lock().unwrap() = Some(gate);
+    let router = serve_handler(CommandRoutingHandler::limited(
+        Arc::clone(&executor),
+        RoutingLimits {
+            session_commands: 1,
+            ..RoutingLimits::default()
+        },
+    ))
+    .await;
+    let (requests, mut replies) = open_session(&router, ERROR_CODEC_VERSION)
+        .await
+        .expect("opened");
+    requests
+        .send(in_transaction(1, Some(txid())))
+        .expect("sent");
+    taken(&executor, 1).await;
+
+    requests.send(execute_request(2)).expect("sent");
+    let refused = reply_to(&mut replies, 2).await;
+    assert!(is_busy(&refused), "{refused:?}");
+    assert_eq!(
+        executor.statements.lock().unwrap().len(),
+        1,
+        "the refused command did not run"
+    );
+
+    release.send(()).expect("released");
+    let ended = end_of(&mut replies, 1).await;
+    assert!(ends(&ended), "{ended:?}");
+
+    requests.send(execute_request(3)).expect("sent");
+    let ran = end_of(&mut replies, 3).await;
+    assert!(ends(&ran), "{ran:?}");
+}
+
+/// An ingress that keeps sending commands and stops reading cannot grow the
+/// member's queue of replies without bound, refusals included: once the
+/// stream's window is full and the queue past its bound, the session ends
+/// with a resource error, and it ends what still runs.
+#[tokio::test]
+async fn an_ingress_that_sends_and_never_reads_has_its_session_ended() {
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer::default()));
+    let limits = RoutingLimits {
+        session_commands: 1,
+        frames_ahead: 1,
+        ..RoutingLimits::default()
+    };
+    let router = serve_handler(CommandRoutingHandler::limited(
+        Arc::clone(&executor),
+        limits,
+    ))
+    .await;
+    let (requests, mut replies) = open_session(&router, ERROR_CODEC_VERSION)
+        .await
+        .expect("opened");
+    // Far more answers than the stream's window and the queue hold
+    // together; none is read while they are sent.
+    for call in 1..=20_000 {
+        if requests.send(execute_request(call)).is_err() {
+            break;
+        }
+    }
+
+    let ended = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match replies.message().await {
+                Ok(Some(_)) => {}
+                Ok(None) => return None,
+                Err(status) => return Some(status),
+            }
+        }
+    })
+    .await
+    .expect("the session ended");
+    let status = ended.expect("ended with an error, not cleanly");
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert_eq!(limits.session_replies(), 4);
+}
+
+/// The bound on the member's running commands spans its sessions: with one
+/// slot held by one peer's statement, another peer's command is refused as
+/// busy without running.
+#[tokio::test]
+async fn the_member_bound_spans_sessions() {
+    let executor = Arc::new(Scripted::default());
+    let router = serve_handler(CommandRoutingHandler::limited(
+        Arc::clone(&executor),
+        RoutingLimits {
+            commands: 1,
+            ..RoutingLimits::default()
+        },
+    ))
+    .await;
+    let (first, _first_replies) = open_session(&router, ERROR_CODEC_VERSION)
+        .await
+        .expect("opened");
+    let (second, mut second_replies) = open_session(&router, ERROR_CODEC_VERSION)
+        .await
+        .expect("opened");
+    first.send(execute_request(1)).expect("sent");
+    taken(&executor, 1).await;
+
+    second.send(execute_request(1)).expect("sent");
+    let refused = reply_to(&mut second_replies, 1).await;
+    assert!(is_busy(&refused), "{refused:?}");
+    assert_eq!(executor.statements.lock().unwrap().len(), 1);
+
+    // The held statement ends with its session.
+    drop(first);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !executor.cancelled.load(Ordering::Acquire) {
+        assert!(std::time::Instant::now() < deadline, "never stopped");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The frame that ends an answer goes out without credit, so a statement
+/// whose ingress has taken nothing yet still ends and gives its slot back;
+/// the batch size and credit are the ones the limits set.
+#[tokio::test]
+async fn the_last_frame_of_an_answer_waits_for_no_credit() {
+    let executor = Arc::new(Scripted::default());
+    // Two rows fill a batch; the third goes with the end.
+    *executor.answer.lock().unwrap() = Some(Script::Many {
+        rows: 3,
+        width: 600,
+    });
+    let router = serve_handler(CommandRoutingHandler::limited(
+        Arc::clone(&executor),
+        RoutingLimits {
+            frames_ahead: 1,
+            row_batch_bytes: 1024,
+            ..RoutingLimits::default()
+        },
+    ))
+    .await;
+    let (requests, mut replies) = open_session(&router, ERROR_CODEC_VERSION)
+        .await
+        .expect("opened");
+    requests.send(execute_request(1)).expect("sent");
+
+    // No credit is ever granted: the one frame ahead, then the last.
+    let first = reply_to(&mut replies, 1).await;
+    let wire::routed_reply::Reply::Frame(first) = first else {
+        panic!("{first:?}");
+    };
+    assert!(
+        first
+            .events
+            .iter()
+            .any(|e| matches!(e.event, Some(Event::Rows(_))))
+    );
+    assert!(
+        !first
+            .events
+            .iter()
+            .any(|e| matches!(e.event, Some(Event::End(_))))
+    );
+    let last = tokio::time::timeout(Duration::from_secs(10), reply_to(&mut replies, 1))
+        .await
+        .expect("the answer ended without credit");
+    assert!(
+        matches!(&last, wire::routed_reply::Reply::Frame(f) if f.events.iter().any(|e| matches!(e.event, Some(Event::End(_))))),
+        "{last:?}"
+    );
+}

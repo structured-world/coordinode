@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use coordinode_core::budget::CancelFlag;
@@ -57,16 +57,72 @@ const CODEC_HEADER: &str = "cn-routed-error-codec";
 /// not run. Its value says why.
 const REFUSED_HEADER: &str = "cn-routing-refused";
 
-/// The encoded size a batch of rows grows to before it is sent.
+/// The default of [`RoutingLimits::row_batch_bytes`].
 const ROW_BATCH_BYTES: usize = 1 << 20;
 
-/// Frames of one answer the executing member sends ahead of the ingress
-/// before it waits for the ingress to take them.
+/// The default of [`RoutingLimits::frames_ahead`].
 const FRAMES_AHEAD: u32 = 4;
+
+/// The default of [`RoutingLimits::commands`]: tokio's default bound on
+/// blocking threads, which is where routed commands run.
+const COMMANDS: usize = 512;
+
+/// The default of [`RoutingLimits::session_commands`]: half of
+/// [`COMMANDS`], so one peer leaves room for the others.
+const SESSION_COMMANDS: usize = 256;
 
 /// The largest message a member takes from another on this service: a batch
 /// of rows that holds one very large row.
 pub const MAX_ROUTED_MESSAGE: usize = 64 << 20;
+
+/// What the executing member lets routed commands hold. A command past a
+/// bound on running commands is refused before it runs, and its ingress
+/// learns it did not run; what is queued for a session's replies is bounded
+/// by these together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutingLimits {
+    /// Commands from all peers running on this member at once.
+    pub commands: usize,
+    /// Commands of one session, that is of one peer, running at once.
+    pub session_commands: usize,
+    /// Frames of one answer sent ahead of the ingress taking them.
+    pub frames_ahead: u32,
+    /// The encoded size a batch of rows grows to before it is sent.
+    pub row_batch_bytes: usize,
+}
+
+impl RoutingLimits {
+    /// Replies a session may leave unread before it is ended: what its
+    /// running commands produce at most (an admission, the frames their
+    /// credit allows and the frame that ends each), and as many refusals
+    /// again as it may run commands.
+    fn session_replies(&self) -> usize {
+        let per_command = (self.frames_ahead as usize).checked_add(3);
+        per_command
+            .and_then(|n| n.checked_mul(self.session_commands))
+            // Limits whose product passes the counter leave the queue as
+            // long as the counter goes: they asked for no bound smaller.
+            .unwrap_or(usize::MAX)
+    }
+}
+
+impl Default for RoutingLimits {
+    fn default() -> Self {
+        Self {
+            commands: COMMANDS,
+            session_commands: SESSION_COMMANDS,
+            frames_ahead: FRAMES_AHEAD,
+            row_batch_bytes: ROW_BATCH_BYTES,
+        }
+    }
+}
+
+/// A slot a running command holds until it ends: one of the member's and
+/// one of its session's.
+struct Slot {
+    _member: tokio::sync::OwnedSemaphorePermit,
+    _session: tokio::sync::OwnedSemaphorePermit,
+}
 
 /// The settings a routed statement runs under, as its ingress resolved them.
 /// `None` leaves the setting to the executing member.
@@ -334,14 +390,26 @@ pub type CommandAdmission = fn(Option<&PeerConnectInfo>) -> Result<(), Status>;
 pub struct CommandRoutingHandler<E> {
     executor: Arc<E>,
     admit: Option<CommandAdmission>,
+    limits: RoutingLimits,
+    /// The member's slots for running commands, shared by its sessions.
+    slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl<E: CommandExecutor> CommandRoutingHandler<E> {
-    /// A handler that runs routed commands through `executor`.
+    /// A handler that runs routed commands through `executor`, within the
+    /// default [`RoutingLimits`].
     pub fn new(executor: Arc<E>) -> Self {
+        Self::limited(executor, RoutingLimits::default())
+    }
+
+    /// A handler that runs routed commands through `executor` within
+    /// `limits`.
+    pub fn limited(executor: Arc<E>, limits: RoutingLimits) -> Self {
         Self {
             executor,
             admit: None,
+            slots: Arc::new(tokio::sync::Semaphore::new(limits.commands)),
+            limits,
         }
     }
 
@@ -391,11 +459,104 @@ fn check_codec<T>(request: &Request<T>) -> Result<(), Status> {
     ))
 }
 
-/// The replies of one session, queued for its stream. Unbounded on its own,
-/// and bounded by what produces them: one reply per short command, one
-/// admission per statement, and a statement's frames only as far ahead as
-/// its credit allows.
-type Replies = tokio::sync::mpsc::UnboundedSender<Result<wire::RoutedReply, Status>>;
+/// The replies of one session, queued for its stream until the stream takes
+/// them. A reading ingress keeps few here: a running command has at most
+/// its admission, the frames its credit allows and the one that ends it.
+/// One that sends commands and stops reading would grow the queue with each
+/// command it is answered, refusals included, so past `limit` replies the
+/// session ends instead, as a stream past its flow-control window does.
+#[derive(Clone)]
+struct Replies {
+    sender: tokio::sync::mpsc::UnboundedSender<Result<wire::RoutedReply, Status>>,
+    queue: Arc<ReplyQueue>,
+}
+
+/// How many of a session's replies wait for its stream.
+struct ReplyQueue {
+    queued: AtomicUsize,
+    limit: usize,
+    /// More than `limit` waited: the stream ends at its next poll.
+    overrun: AtomicBool,
+}
+
+/// The session's stream is gone; the reply reaches nobody.
+struct SessionGone;
+
+impl Replies {
+    /// A queue that ends its session past `limit` waiting replies, and the
+    /// stream that takes them.
+    fn new(limit: usize) -> (Self, ReplyStream) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let queue = Arc::new(ReplyQueue {
+            queued: AtomicUsize::new(0),
+            limit,
+            overrun: AtomicBool::new(false),
+        });
+        (
+            Self {
+                sender,
+                queue: Arc::clone(&queue),
+            },
+            ReplyStream {
+                receiver,
+                queue,
+                ended: false,
+            },
+        )
+    }
+
+    fn send(&self, reply: Result<wire::RoutedReply, Status>) -> Result<(), SessionGone> {
+        // The count is the queue's length as the stream sees it: the send
+        // after the increment, the decrement after the take.
+        if self.queue.queued.fetch_add(1, Ordering::AcqRel) >= self.queue.limit {
+            self.queue.overrun.store(true, Ordering::Release);
+        }
+        // Sent even past the limit: it wakes the stream, which ends.
+        self.sender.send(reply).map_err(|_| SessionGone)
+    }
+
+    /// Resolves once the session's stream is gone.
+    async fn closed(&self) {
+        self.sender.closed().await;
+    }
+}
+
+/// The session's replies as its gRPC stream reads them.
+pub struct ReplyStream {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<Result<wire::RoutedReply, Status>>,
+    queue: Arc<ReplyQueue>,
+    ended: bool,
+}
+
+impl tokio_stream::Stream for ReplyStream {
+    type Item = Result<wire::RoutedReply, Status>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+
+        if self.ended {
+            return Poll::Ready(None);
+        }
+        if self.queue.overrun.load(Ordering::Acquire) {
+            // Closing the queue ends the session's reader, which stops
+            // whatever still runs for it.
+            self.ended = true;
+            self.receiver.close();
+            return Poll::Ready(Some(Err(Status::resource_exhausted(format!(
+                "the ingress left more than {} routed replies unread",
+                self.queue.limit
+            )))));
+        }
+        let next = self.receiver.poll_recv(cx);
+        if let Poll::Ready(Some(_)) = next {
+            self.queue.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+        next
+    }
+}
 
 fn reply(call: u64, reply: wire::routed_reply::Reply) -> Result<wire::RoutedReply, Status> {
     Ok(wire::RoutedReply {
@@ -455,6 +616,11 @@ impl Credit {
         self.ready.notify_one();
     }
 
+    /// Whether the ingress still reads the answer.
+    fn open(&self) -> bool {
+        !self.state.lock().closed
+    }
+
     /// Wait for room for one frame; `false` once the answer is no longer
     /// read.
     fn take(&self) -> bool {
@@ -498,6 +664,11 @@ struct ServedSession<E> {
     connection: Option<PeerConnectInfo>,
     replies: Replies,
     running: RunningCalls,
+    limits: RoutingLimits,
+    /// The member's slots, shared with its other sessions.
+    member_slots: Arc<tokio::sync::Semaphore>,
+    /// This session's own slots.
+    session_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl<E: CommandExecutor> ServedSession<E> {
@@ -561,19 +732,29 @@ impl<E: CommandExecutor> ServedSession<E> {
                 return;
             }
         }
+        // Taken without waiting: a reader that waited for a slot would hold
+        // back the credits and cancellations that free one.
+        let Some(slot) = self.slot() else {
+            self.refuse(
+                call,
+                "busy",
+                "the member runs as many routed commands as it takes".to_owned(),
+            );
+            return;
+        };
         let result = match request.request {
             Some(R::Execute(statement)) => {
-                statement_from_wire(*statement).map(|statement| self.execute(call, statement))
+                statement_from_wire(*statement).map(|statement| self.execute(call, statement, slot))
             }
             Some(R::Begin(begin)) => begin_from_wire(begin).map(|begin| {
-                self.answer(call, move |e| {
+                self.answer(call, slot, move |e| {
                     wire::routed_reply::Reply::Begun(wire::RoutedBegun {
                         error: e.begin(begin).err().map(errors::encode).unwrap_or_default(),
                     })
                 });
             }),
             Some(R::Commit(commit)) => commit_from_wire(commit).map(|commit| {
-                self.answer(call, move |e| {
+                self.answer(call, slot, move |e| {
                     wire::routed_reply::Reply::Committed(match e.commit(commit) {
                         Ok(receipt) => wire::RoutedCommitted {
                             commit_ts: receipt.commit_ts.as_raw(),
@@ -588,7 +769,7 @@ impl<E: CommandExecutor> ServedSession<E> {
                 });
             }),
             Some(R::Rollback(rollback)) => rollback_from_wire(rollback).map(|rollback| {
-                self.answer(call, move |e| {
+                self.answer(call, slot, move |e| {
                     wire::routed_reply::Reply::RolledBack(wire::RoutedRolledBack {
                         error: e
                             .rollback(rollback)
@@ -601,7 +782,7 @@ impl<E: CommandExecutor> ServedSession<E> {
             Some(R::Operation(operation)) => actor_from_wire(operation.actor)
                 .and_then(|actor| Ok((actor, operation_call_from_wire(operation.call)?)))
                 .map(|(actor, operation)| {
-                    self.answer(call, move |e| {
+                    self.answer(call, slot, move |e| {
                         wire::routed_reply::Reply::Operation(match e.operation(actor, operation) {
                             Ok(answer) => operation_answer_to_wire(answer),
                             Err(err) => wire::RoutedOperationAnswer {
@@ -622,24 +803,41 @@ impl<E: CommandExecutor> ServedSession<E> {
         }
     }
 
+    /// A slot for one more command, when the member and this session both
+    /// have one free.
+    fn slot(&self) -> Option<Slot> {
+        let member = Arc::clone(&self.member_slots).try_acquire_owned().ok()?;
+        let session = Arc::clone(&self.session_slots).try_acquire_owned().ok()?;
+        Some(Slot {
+            _member: member,
+            _session: session,
+        })
+    }
+
     /// Run a short command on the blocking pool and queue its one reply.
+    /// The command holds `slot` until it is done.
     fn answer(
         &self,
         call: u64,
+        slot: Slot,
         run: impl FnOnce(&E) -> wire::routed_reply::Reply + Send + 'static,
     ) {
         let executor = Arc::clone(&self.executor);
         let replies = self.replies.clone();
         tokio::task::spawn_blocking(move || {
-            queue(&replies, call, run(&executor));
+            let answer = run(&executor);
+            // Free before the reply: an ingress that has its answer may send
+            // the next command at once, and finds the slot free.
+            drop(slot);
+            queue(&replies, call, answer);
         });
     }
 
     /// Start `statement` on the blocking pool; its answer streams under
-    /// `call`.
-    fn execute(&self, call: u64, statement: RoutedStatement) {
+    /// `call`, and it holds `slot` until it ends.
+    fn execute(&self, call: u64, statement: RoutedStatement, slot: Slot) {
         let cancel = CancelFlag::new();
-        let credit = Arc::new(Credit::new(FRAMES_AHEAD));
+        let credit = Arc::new(Credit::new(self.limits.frames_ahead));
         {
             let mut running = self.running.lock();
             if running.contains_key(&call) {
@@ -693,14 +891,21 @@ impl<E: CommandExecutor> ServedSession<E> {
         let executor = Arc::clone(&self.executor);
         let replies = self.replies.clone();
         let running = Arc::clone(&self.running);
+        let row_batch_bytes = self.limits.row_batch_bytes;
         tokio::task::spawn_blocking(move || {
             let mut answer = AnswerWriter::new(Some(AnswerOut {
                 call,
                 replies,
                 credit,
+                row_batch_bytes,
             }));
             let result = executor.execute(statement, &cancel, &admitted, &mut answer);
             drop(admitted);
+            // Free before the answer ends, as for a short command: the last
+            // frame waits for no credit, so nothing runs past this point but
+            // the rollback of an abandoned transaction, one per statement that
+            // just gave its slot back.
+            drop(slot);
             let delivered = answer.finish(result);
             running.lock().remove(&call);
             if !delivered {
@@ -719,8 +924,7 @@ impl<E: CommandExecutor> ServedSession<E> {
 
 #[tonic::async_trait]
 impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
-    type SessionStream =
-        tokio_stream::wrappers::UnboundedReceiverStream<Result<wire::RoutedReply, Status>>;
+    type SessionStream = ReplyStream;
 
     async fn session(
         &self,
@@ -728,18 +932,19 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
     ) -> Result<Response<Self::SessionStream>, Status> {
         check_codec(&request)?;
         let connection = request.extensions().get::<PeerConnectInfo>().cloned();
-        let (replies, answers) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, answers) = Replies::new(self.limits.session_replies());
         let session = ServedSession {
             executor: Arc::clone(&self.executor),
             admit: self.admit,
             connection,
             replies,
             running: RunningCalls::default(),
+            limits: self.limits,
+            member_slots: Arc::clone(&self.slots),
+            session_slots: Arc::new(tokio::sync::Semaphore::new(self.limits.session_commands)),
         };
         tokio::spawn(session.run(request.into_inner()));
-        Ok(Response::new(
-            tokio_stream::wrappers::UnboundedReceiverStream::new(answers),
-        ))
+        Ok(Response::new(answers))
     }
 }
 
@@ -748,6 +953,8 @@ struct AnswerOut {
     call: u64,
     replies: Replies,
     credit: Arc<Credit>,
+    /// The size a batch of rows grows to before it is sent.
+    row_batch_bytes: usize,
 }
 
 /// Where a member puts the answer of a routed statement while the statement
@@ -814,9 +1021,14 @@ impl AnswerWriter {
             self.broken = Some(format!("a result row could not be encoded: {e}"));
             return false;
         }
-        if self.batch.len() >= ROW_BATCH_BYTES {
+        // An answer nobody reads stops at its first batch, whatever its size.
+        let full = self
+            .out
+            .as_ref()
+            .map_or(ROW_BATCH_BYTES, |out| out.row_batch_bytes);
+        if self.batch.len() >= full {
             self.take_batch();
-            self.send();
+            self.send(true);
         }
         self.wanted()
     }
@@ -833,9 +1045,11 @@ impl AnswerWriter {
         }
     }
 
-    /// Send the pending events as one frame, once the ingress has room for
-    /// it.
-    fn send(&mut self) {
+    /// Send the pending events as one frame: once the ingress has room for
+    /// it when `wait`, at once otherwise. Only the frame that ends an answer
+    /// goes without waiting, so an answer has at most one frame past its
+    /// credit.
+    fn send(&mut self, wait: bool) {
         let events = std::mem::take(&mut self.pending);
         if self.gone {
             return;
@@ -844,7 +1058,12 @@ impl AnswerWriter {
             self.gone = true;
             return;
         };
-        if !out.credit.take()
+        let room = if wait {
+            out.credit.take()
+        } else {
+            out.credit.open()
+        };
+        if !room
             || out
                 .replies
                 .send(reply(
@@ -884,7 +1103,7 @@ impl AnswerWriter {
                 self.pending.push(Event::Error(errors::encode(err)));
             }
         }
-        self.send();
+        self.send(false);
         !self.gone
     }
 }

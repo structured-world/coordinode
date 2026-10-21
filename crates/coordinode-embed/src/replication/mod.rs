@@ -123,6 +123,8 @@ pub struct MemberOptions {
     pub host_epoch: u64,
     /// When the member snapshots its state so the log before it can go.
     pub snapshots: SnapshotTriggerConfig,
+    /// What commands its peers route here may hold.
+    pub routing: routing::RoutingLimits,
 }
 
 impl MemberOptions {
@@ -135,6 +137,7 @@ impl MemberOptions {
             preference: ElectionPreference::default(),
             host_epoch: 0,
             snapshots: SnapshotTriggerConfig::default(),
+            routing: routing::RoutingLimits::default(),
         }
     }
 }
@@ -151,6 +154,7 @@ pub struct Member {
     engine: Arc<StorageEngine>,
     handler: Option<RaftGrpcHandler>,
     preference: ElectionPreference,
+    routing: routing::RoutingLimits,
     follower: Option<follower::IndexDefinitionFollower>,
     background: Vec<tokio::task::JoinHandle<()>>,
     /// Tells the background tasks to finish: each stops between passes, so
@@ -189,6 +193,7 @@ impl Member {
             preference,
             host_epoch,
             snapshots,
+            routing,
         } = options;
         let mut node_options = NodeOptions {
             snapshots,
@@ -288,6 +293,7 @@ impl Member {
             engine,
             handler,
             preference,
+            routing,
             follower: None,
             background: vec![tenure, reaper],
             stop,
@@ -424,7 +430,7 @@ impl Member {
             return false;
         }
         routes.add_service(InterceptedService::new(
-            routing::CommandRoutingHandler::new(executor)
+            routing::CommandRoutingHandler::limited(executor, self.routing)
                 .admitting(coordinode_raft::cluster::admission::node_admitted)
                 .into_service(routing::MAX_ROUTED_MESSAGE),
             nodes_only,
