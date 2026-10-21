@@ -91,18 +91,82 @@ pub struct RoutingLimits {
     pub row_batch_bytes: usize,
 }
 
+/// [`RoutingLimits`] the member cannot hold to.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("routing limits: {0}")]
+pub struct InvalidRoutingLimits(String);
+
 impl RoutingLimits {
+    /// Check that every bound is one the member can keep.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidRoutingLimits`] naming a bound that is zero, more commands
+    /// than a semaphore counts, or a reply bound past `usize`.
+    pub fn check(self) -> Result<CheckedRoutingLimits, InvalidRoutingLimits> {
+        for (name, commands) in [
+            ("commands", self.commands),
+            ("session_commands", self.session_commands),
+        ] {
+            if commands == 0 || commands > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(InvalidRoutingLimits(format!(
+                    "{name} is {commands}; it must be from 1 to {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                )));
+            }
+        }
+        if self.frames_ahead == 0 {
+            return Err(InvalidRoutingLimits("frames_ahead is 0".to_owned()));
+        }
+        if self.row_batch_bytes == 0 {
+            return Err(InvalidRoutingLimits("row_batch_bytes is 0".to_owned()));
+        }
+        let Some(session_replies) = self.session_replies() else {
+            return Err(InvalidRoutingLimits(format!(
+                "session_commands {} times frames_ahead {} plus 3 passes usize",
+                self.session_commands, self.frames_ahead
+            )));
+        };
+        Ok(CheckedRoutingLimits {
+            limits: self,
+            session_replies,
+        })
+    }
+
     /// Replies a session may leave unread before it is ended: what its
     /// running commands produce at most (an admission, the frames their
     /// credit allows and the frame that ends each), and as many refusals
-    /// again as it may run commands.
-    fn session_replies(&self) -> usize {
-        let per_command = (self.frames_ahead as usize).checked_add(3);
-        per_command
-            .and_then(|n| n.checked_mul(self.session_commands))
-            // Limits whose product passes the counter leave the queue as
-            // long as the counter goes: they asked for no bound smaller.
-            .unwrap_or(usize::MAX)
+    /// again as it may run commands. `None` past `usize`.
+    fn session_replies(&self) -> Option<usize> {
+        usize::try_from(self.frames_ahead)
+            .ok()?
+            .checked_add(3)?
+            .checked_mul(self.session_commands)
+    }
+}
+
+/// [`RoutingLimits`] that passed [`RoutingLimits::check`], with the reply
+/// bound they give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckedRoutingLimits {
+    limits: RoutingLimits,
+    session_replies: usize,
+}
+
+impl CheckedRoutingLimits {
+    /// The limits checked.
+    pub fn limits(&self) -> RoutingLimits {
+        self.limits
+    }
+}
+
+impl Default for CheckedRoutingLimits {
+    fn default() -> Self {
+        Self {
+            limits: RoutingLimits::default(),
+            // The defaults are small constants: no bound overflows.
+            session_replies: (FRAMES_AHEAD as usize + 3) * SESSION_COMMANDS,
+        }
     }
 }
 
@@ -391,6 +455,8 @@ pub struct CommandRoutingHandler<E> {
     executor: Arc<E>,
     admit: Option<CommandAdmission>,
     limits: RoutingLimits,
+    /// Replies one session may leave unread.
+    session_replies: usize,
     /// The member's slots for running commands, shared by its sessions.
     slots: Arc<tokio::sync::Semaphore>,
 }
@@ -399,17 +465,18 @@ impl<E: CommandExecutor> CommandRoutingHandler<E> {
     /// A handler that runs routed commands through `executor`, within the
     /// default [`RoutingLimits`].
     pub fn new(executor: Arc<E>) -> Self {
-        Self::limited(executor, RoutingLimits::default())
+        Self::limited(executor, CheckedRoutingLimits::default())
     }
 
     /// A handler that runs routed commands through `executor` within
     /// `limits`.
-    pub fn limited(executor: Arc<E>, limits: RoutingLimits) -> Self {
+    pub fn limited(executor: Arc<E>, limits: CheckedRoutingLimits) -> Self {
         Self {
             executor,
             admit: None,
-            slots: Arc::new(tokio::sync::Semaphore::new(limits.commands)),
-            limits,
+            session_replies: limits.session_replies,
+            slots: Arc::new(tokio::sync::Semaphore::new(limits.limits.commands)),
+            limits: limits.limits,
         }
     }
 
@@ -463,34 +530,60 @@ fn check_codec<T>(request: &Request<T>) -> Result<(), Status> {
 /// them. A reading ingress keeps few here: a running command has at most
 /// its admission, the frames its credit allows and the one that ends it.
 /// One that sends commands and stops reading would grow the queue with each
-/// command it is answered, refusals included, so past `limit` replies the
-/// session ends instead, as a stream past its flow-control window does.
+/// command it is answered, refusals included, so a reply past `limit` is
+/// not queued: the session ends instead, as a stream past its flow-control
+/// window does, whether or not its stream is read again.
 #[derive(Clone)]
 struct Replies {
     sender: tokio::sync::mpsc::UnboundedSender<Result<wire::RoutedReply, Status>>,
     queue: Arc<ReplyQueue>,
 }
 
-/// How many of a session's replies wait for its stream.
+/// How many of a session's replies wait for its stream, and the signals that
+/// end the session once there would be more.
 struct ReplyQueue {
     queued: AtomicUsize,
     limit: usize,
-    /// More than `limit` waited: the stream ends at its next poll.
     overrun: AtomicBool,
+    /// Ends the stream; taken once.
+    // no-std: spin::Mutex; taken once, on overrun.
+    end_stream: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Ends the session's reader, which stops what still runs for it.
+    end_reader: tokio::sync::Notify,
 }
 
-/// The session's stream is gone; the reply reaches nobody.
+impl ReplyQueue {
+    /// A reply did not fit: the session ends, its stream and reader told
+    /// apart from any reply.
+    fn overrun(&self) {
+        if self.overrun.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(end) = self.end_stream.lock().take() {
+            if end.send(()).is_err() {
+                tracing::trace!("a routing session's stream was gone before its overrun");
+            }
+        }
+        // Stored for a reader not yet waiting.
+        self.end_reader.notify_one();
+    }
+}
+
+/// The session is over; the reply reaches nobody.
 struct SessionGone;
 
 impl Replies {
-    /// A queue that ends its session past `limit` waiting replies, and the
-    /// stream that takes them.
+    /// A queue that ends its session rather than hold more than `limit`
+    /// replies, and the stream that takes them.
     fn new(limit: usize) -> (Self, ReplyStream) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (end_stream, ended) = tokio::sync::oneshot::channel();
         let queue = Arc::new(ReplyQueue {
             queued: AtomicUsize::new(0),
             limit,
             overrun: AtomicBool::new(false),
+            end_stream: parking_lot::Mutex::new(Some(end_stream)),
+            end_reader: tokio::sync::Notify::new(),
         });
         (
             Self {
@@ -500,24 +593,52 @@ impl Replies {
             ReplyStream {
                 receiver,
                 queue,
+                end: ended,
                 ended: false,
             },
         )
     }
 
     fn send(&self, reply: Result<wire::RoutedReply, Status>) -> Result<(), SessionGone> {
-        // The count is the queue's length as the stream sees it: the send
-        // after the increment, the decrement after the take.
-        if self.queue.queued.fetch_add(1, Ordering::AcqRel) >= self.queue.limit {
-            self.queue.overrun.store(true, Ordering::Release);
+        let queue = &self.queue;
+        if queue.overrun.load(Ordering::Acquire) {
+            return Err(SessionGone);
         }
-        // Sent even past the limit: it wakes the stream, which ends.
-        self.sender.send(reply).map_err(|_| SessionGone)
+        // A place is taken before the reply is queued and given back after
+        // the stream takes it, so the queue never holds more than `limit`.
+        let mut queued = queue.queued.load(Ordering::Acquire);
+        loop {
+            if queued >= queue.limit {
+                queue.overrun();
+                return Err(SessionGone);
+            }
+            // Below the limit, which is a usize: one more does not overflow.
+            match queue.queued.compare_exchange_weak(
+                queued,
+                queued + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => queued = now,
+            }
+        }
+        self.sender.send(reply).map_err(|_| {
+            queue.queued.fetch_sub(1, Ordering::AcqRel);
+            SessionGone
+        })
     }
 
-    /// Resolves once the session's stream is gone.
+    /// Resolves once the session is over: its stream gone, or a reply that
+    /// did not fit.
     async fn closed(&self) {
-        self.sender.closed().await;
+        if self.queue.overrun.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            () = self.sender.closed() => {}
+            () = self.queue.end_reader.notified() => {}
+        }
     }
 }
 
@@ -525,6 +646,8 @@ impl Replies {
 pub struct ReplyStream {
     receiver: tokio::sync::mpsc::UnboundedReceiver<Result<wire::RoutedReply, Status>>,
     queue: Arc<ReplyQueue>,
+    /// Resolves when a reply did not fit.
+    end: tokio::sync::oneshot::Receiver<()>,
     ended: bool,
 }
 
@@ -535,14 +658,15 @@ impl tokio_stream::Stream for ReplyStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
         use std::task::Poll;
 
         if self.ended {
             return Poll::Ready(None);
         }
-        if self.queue.overrun.load(Ordering::Acquire) {
-            // Closing the queue ends the session's reader, which stops
-            // whatever still runs for it.
+        // The end is looked at before any queued reply: those are dropped
+        // with the session.
+        if std::pin::Pin::new(&mut self.end).poll(cx).is_ready() {
             self.ended = true;
             self.receiver.close();
             return Poll::Ready(Some(Err(Status::resource_exhausted(format!(
@@ -932,7 +1056,7 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
     ) -> Result<Response<Self::SessionStream>, Status> {
         check_codec(&request)?;
         let connection = request.extensions().get::<PeerConnectInfo>().cloned();
-        let (replies, answers) = Replies::new(self.limits.session_replies());
+        let (replies, answers) = Replies::new(self.session_replies);
         let session = ServedSession {
             executor: Arc::clone(&self.executor),
             admit: self.admit,

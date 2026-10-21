@@ -327,6 +327,104 @@ async fn serve_handler(handler: CommandRoutingHandler<Scripted>) -> CommandRoute
     CommandRouter::new(MEMBER, channel)
 }
 
+/// Serve `executor` within `limits` on a local port and return a router to
+/// it.
+async fn serve_limited(executor: Arc<Scripted>, limits: RoutingLimits) -> CommandRouter {
+    serve_handler(CommandRoutingHandler::limited(
+        executor,
+        limits.check().expect("valid limits"),
+    ))
+    .await
+}
+
+fn routed_reply(call: u64) -> Result<wire::RoutedReply, Status> {
+    reply(
+        call,
+        wire::routed_reply::Reply::Refused(wire::RoutedRefusal::default()),
+    )
+}
+
+/// The reply queue never holds more than its bound, read or not: the reply
+/// past it is not queued, every later one is refused, and the session's
+/// reader learns the session is over without the stream being polled.
+#[tokio::test]
+async fn the_reply_queue_holds_no_more_than_its_bound_unread() {
+    let (replies, mut stream) = Replies::new(4);
+    for call in 1..=4 {
+        assert!(replies.send(routed_reply(call)).is_ok(), "{call} fits");
+    }
+    for call in 5..=1000 {
+        assert!(replies.send(routed_reply(call)).is_err(), "{call} does not");
+    }
+    assert_eq!(
+        stream.receiver.len(),
+        4,
+        "nothing past the bound was queued"
+    );
+    assert_eq!(replies.queue.queued.load(Ordering::Acquire), 4);
+    tokio::time::timeout(Duration::from_secs(10), replies.closed())
+        .await
+        .expect("the reader learns the session is over");
+
+    use tokio_stream::StreamExt;
+    let ended = stream.next().await.expect("an item");
+    assert_eq!(
+        ended.expect_err("the stream ends with an error").code(),
+        Code::ResourceExhausted
+    );
+    assert!(stream.next().await.is_none(), "and then ends");
+}
+
+/// Replies the stream takes give their places back.
+#[tokio::test]
+async fn a_read_reply_frees_its_place() {
+    use tokio_stream::StreamExt;
+    let (replies, mut stream) = Replies::new(2);
+    for round in 0..100 {
+        assert!(replies.send(routed_reply(round)).is_ok());
+        assert!(replies.send(routed_reply(round)).is_ok());
+        stream.next().await.expect("one").expect("a reply");
+        stream.next().await.expect("two").expect("a reply");
+    }
+    assert_eq!(replies.queue.queued.load(Ordering::Acquire), 0);
+}
+
+/// Bounds the member cannot keep are refused, not quietly lifted.
+#[test]
+fn routing_limits_the_member_cannot_keep_are_refused() {
+    assert!(RoutingLimits::default().check().is_ok());
+    for bad in [
+        RoutingLimits {
+            commands: 0,
+            ..RoutingLimits::default()
+        },
+        RoutingLimits {
+            session_commands: tokio::sync::Semaphore::MAX_PERMITS + 1,
+            ..RoutingLimits::default()
+        },
+        RoutingLimits {
+            frames_ahead: 0,
+            ..RoutingLimits::default()
+        },
+        RoutingLimits {
+            row_batch_bytes: 0,
+            ..RoutingLimits::default()
+        },
+        RoutingLimits {
+            session_commands: tokio::sync::Semaphore::MAX_PERMITS,
+            frames_ahead: u32::MAX,
+            ..RoutingLimits::default()
+        },
+    ] {
+        assert!(bad.check().is_err(), "{bad:?}");
+    }
+    // The checked defaults are the defaults, with the bound they give.
+    assert_eq!(
+        RoutingLimits::default().check().expect("valid"),
+        CheckedRoutingLimits::default()
+    );
+}
+
 /// Open a session to the member `router` reaches by hand, naming `codec` as
 /// the error encoding read: the requests to send on it, and its replies.
 async fn open_session(
@@ -1271,13 +1369,13 @@ async fn a_command_past_the_session_bound_is_refused_until_a_slot_frees() {
     // The transaction's statement waits here until the test lets it on.
     let (release, gate) = std::sync::mpsc::channel();
     *executor.gate.lock().unwrap() = Some(gate);
-    let router = serve_handler(CommandRoutingHandler::limited(
+    let router = serve_limited(
         Arc::clone(&executor),
         RoutingLimits {
             session_commands: 1,
             ..RoutingLimits::default()
         },
-    ))
+    )
     .await;
     let (requests, mut replies) = open_session(&router, ERROR_CODEC_VERSION)
         .await
@@ -1318,11 +1416,7 @@ async fn an_ingress_that_sends_and_never_reads_has_its_session_ended() {
         frames_ahead: 1,
         ..RoutingLimits::default()
     };
-    let router = serve_handler(CommandRoutingHandler::limited(
-        Arc::clone(&executor),
-        limits,
-    ))
-    .await;
+    let router = serve_limited(Arc::clone(&executor), limits).await;
     let (requests, mut replies) = open_session(&router, ERROR_CODEC_VERSION)
         .await
         .expect("opened");
@@ -1347,7 +1441,7 @@ async fn an_ingress_that_sends_and_never_reads_has_its_session_ended() {
     .expect("the session ended");
     let status = ended.expect("ended with an error, not cleanly");
     assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
-    assert_eq!(limits.session_replies(), 4);
+    assert_eq!(limits.session_replies(), Some(4));
 }
 
 /// The bound on the member's running commands spans its sessions: with one
@@ -1356,13 +1450,13 @@ async fn an_ingress_that_sends_and_never_reads_has_its_session_ended() {
 #[tokio::test]
 async fn the_member_bound_spans_sessions() {
     let executor = Arc::new(Scripted::default());
-    let router = serve_handler(CommandRoutingHandler::limited(
+    let router = serve_limited(
         Arc::clone(&executor),
         RoutingLimits {
             commands: 1,
             ..RoutingLimits::default()
         },
-    ))
+    )
     .await;
     let (first, _first_replies) = open_session(&router, ERROR_CODEC_VERSION)
         .await
@@ -1398,14 +1492,14 @@ async fn the_last_frame_of_an_answer_waits_for_no_credit() {
         rows: 3,
         width: 600,
     });
-    let router = serve_handler(CommandRoutingHandler::limited(
+    let router = serve_limited(
         Arc::clone(&executor),
         RoutingLimits {
             frames_ahead: 1,
             row_batch_bytes: 1024,
             ..RoutingLimits::default()
         },
-    ))
+    )
     .await;
     let (requests, mut replies) = open_session(&router, ERROR_CODEC_VERSION)
         .await

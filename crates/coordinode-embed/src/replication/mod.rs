@@ -65,6 +65,9 @@ pub enum ReplicationError {
     /// The database over the store could not be built.
     #[error(transparent)]
     Database(#[from] DatabaseError),
+    /// The bounds on commands peers route here cannot be kept.
+    #[error(transparent)]
+    Routing(#[from] routing::InvalidRoutingLimits),
     /// The inter-node listener could not be bound or configured.
     #[error("inter-node listener on {addr}: {reason}")]
     Listener {
@@ -154,7 +157,7 @@ pub struct Member {
     engine: Arc<StorageEngine>,
     handler: Option<RaftGrpcHandler>,
     preference: ElectionPreference,
-    routing: routing::RoutingLimits,
+    routing: routing::CheckedRoutingLimits,
     follower: Option<follower::IndexDefinitionFollower>,
     background: Vec<tokio::task::JoinHandle<()>>,
     /// Tells the background tasks to finish: each stops between passes, so
@@ -177,6 +180,9 @@ impl Member {
         storage: &StorageConfig,
         options: MemberOptions,
     ) -> Result<Self, ReplicationError> {
+        // Refused before the store is touched: a member whose routing
+        // bounds cannot be kept serves no peer.
+        let checked_routing = options.routing.check()?;
         // A store the non-replicated build wrote keeps its history in a
         // journal where the consensus log is about to live: its entries are
         // brought into the store first, the cut the group starts from.
@@ -193,7 +199,7 @@ impl Member {
             preference,
             host_epoch,
             snapshots,
-            routing,
+            routing: _,
         } = options;
         let mut node_options = NodeOptions {
             snapshots,
@@ -293,7 +299,7 @@ impl Member {
             engine,
             handler,
             preference,
-            routing,
+            routing: checked_routing,
             follower: None,
             background: vec![tenure, reaper],
             stop,
