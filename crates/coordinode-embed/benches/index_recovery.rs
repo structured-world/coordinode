@@ -70,12 +70,20 @@ fn report(name: &str, mut samples: Vec<Duration>) {
         return;
     }
     samples.sort_unstable();
+    // One slow lookup among thousands hides below p999: the slowest and how
+    // many took long are reported on their own.
+    let slow = samples
+        .iter()
+        .filter(|d| **d >= Duration::from_millis(100))
+        .count();
     println!(
-        "{name:<34} lookups={:>6} p50={:>10.3?} p99={:>10.3?} p999={:>10.3?}",
+        "{name:<34} lookups={:>6} p50={:>10.3?} p99={:>10.3?} p999={:>10.3?} max={:>10.3?} \
+         over_100ms={slow}",
         samples.len(),
         percentile(&samples, 0.5),
         percentile(&samples, 0.99),
-        percentile(&samples, 0.999)
+        percentile(&samples, 0.999),
+        samples[samples.len() - 1]
     );
 }
 

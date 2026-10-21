@@ -8,7 +8,6 @@ use coordinode_core::index::encoding::{encode_entry_key, encode_tuple, encode_un
 use coordinode_modality::{
     IndexStore as _, LocalIndexStore, LocalNodeStore, Mismatch, NodeStore as _,
 };
-use coordinode_storage::engine::partition::Partition;
 
 use super::super::super::test_env::{TestEnv, commit};
 use super::*;
@@ -169,37 +168,35 @@ fn sorted(mut mismatches: Vec<Mismatch>) -> Vec<Mismatch> {
 /// one unique value.
 fn damage(s: &Store) -> (Vec<Mismatch>, Vec<Mismatch>) {
     let engine = &s.env.engine;
+    // Raw state planted under the stores, as a defect would leave it.
+    let idx = coordinode_storage::engine::partition::Partition::Idx;
     let (email, city) = (s.email.generation, s.city.generation);
     // Plain: user 3's entry lost; an entry for node 999, which holds nothing.
     let c3 = string_tuple("c3");
     engine
-        .delete(Partition::Idx, &encode_entry_key(city, &c3, 3))
+        .delete(idx, &encode_entry_key(city, &c3, 3))
         .expect("lose");
     let ghost = string_tuple("nowhere");
     engine
-        .put(Partition::Idx, &encode_entry_key(city, &ghost, 999), &[])
+        .put(idx, &encode_entry_key(city, &ghost, 999), &[])
         .expect("plant");
     // Unique: user 5's entry lost; user 6's value naming user 7; user 8's
     // value naming no node that decodes.
     let u5 = string_tuple("u5@x");
     engine
-        .delete(Partition::Idx, &encode_unique_entry_key(email, &u5))
+        .delete(idx, &encode_unique_entry_key(email, &u5))
         .expect("lose");
     let u6 = string_tuple("u6@x");
     engine
         .put(
-            Partition::Idx,
+            idx,
             &encode_unique_entry_key(email, &u6),
             &7u64.to_be_bytes(),
         )
         .expect("misattribute");
     let u8 = string_tuple("u8@x");
     engine
-        .put(
-            Partition::Idx,
-            &encode_unique_entry_key(email, &u8),
-            &[1, 2, 3],
-        )
+        .put(idx, &encode_unique_entry_key(email, &u8), &[1, 2, 3])
         .expect("garble");
     // Records: user 50 takes user 9's email behind the index's back.
     user(&s.env, 50, "u9@x");
