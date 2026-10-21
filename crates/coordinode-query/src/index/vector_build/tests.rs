@@ -418,6 +418,11 @@ fn a_build_whose_partition_is_replaced_scans_again() {
             .expect("clear");
         fx.apply_doc_at(9, [0.0, 0.0, 1.0], fx.oracle.next().as_raw());
     });
+    // The write landed while the build owned the index (the tap or a scan
+    // took it) or after it handed the index over, which a build that
+    // rescanned the empty partition can do first: then its maintainer takes
+    // it, here once the graph is no longer held.
+    fx.maintain(&fx.fields, 9);
 
     assert!(
         matches!(outcome, Ok(BuildOutcome::Complete { .. })),
