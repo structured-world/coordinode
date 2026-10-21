@@ -17,19 +17,24 @@
 //! ([`set_wire_zstd_level`]); the default is a fast level suited to hot paths and
 //! raised on links where bandwidth costs more than CPU.
 //!
-//! The compress side uses the one-shot slice entry point so the
-//! `frame_content_size` is written into the zstd header and the decoder knows the
-//! decompressed size up front; no streaming pledged-size handshake is needed
-//! because a gRPC message is delivered to the codec whole.
+//! The compress side writes one-shot frames, so the `frame_content_size` is in
+//! the zstd header and the decoder sizes its output up front; no streaming
+//! pledged-size handshake is needed because a gRPC message is delivered to the
+//! codec whole.
+//!
+//! Each thread keeps one compressor, one decoder and their scratch buffers
+//! across messages, as a C caller keeps a `ZSTD_CCtx`/`ZSTD_DCtx`: building
+//! the matcher tables and decode window for every message cost more than
+//! compressing a small one.
 
+use core::cell::RefCell;
 use core::marker::PhantomData;
-use std::io::Read;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use bytes::{Buf, BufMut};
 use prost::Message;
-use structured_zstd::decoding::StreamingDecoder;
-use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
+use structured_zstd::decoding::FrameDecoder;
+use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 use tonic::Status;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
@@ -64,20 +69,78 @@ pub fn wire_zstd_level() -> i32 {
     WIRE_ZSTD_LEVEL.load(Ordering::Relaxed)
 }
 
-fn current_level() -> CompressionLevel {
-    CompressionLevel::Level(WIRE_ZSTD_LEVEL.load(Ordering::Relaxed))
+/// Scratch a thread keeps above this many bytes after a large message is
+/// given back, so one snapshot-sized message does not pin its size per
+/// thread.
+const SCRATCH_KEPT: usize = 4 << 20;
+
+/// What one thread reuses from one message to the next.
+struct Contexts {
+    /// The compressor, with the level it was built for.
+    compressor: Option<(i32, FrameCompressor)>,
+    decoder: FrameDecoder,
+    /// Prost bytes of the message being encoded, or the decompressed bytes
+    /// of the one being decoded.
+    raw: Vec<u8>,
+    /// The compressed frame being written.
+    frame: Vec<u8>,
 }
 
-/// Prost-encode `item`, then zstd-compress the bytes at `level`. The one-shot
-/// slice path writes the frame content size into the header.
+impl Contexts {
+    /// Give back what a large message grew the scratch to.
+    fn trim(&mut self) {
+        for buf in [&mut self.raw, &mut self.frame] {
+            if buf.capacity() > SCRATCH_KEPT {
+                buf.clear();
+                buf.shrink_to(SCRATCH_KEPT);
+            }
+        }
+    }
+}
+
+// no-std: a codec context the caller owns and passes in.
+std::thread_local! {
+    static CONTEXTS: RefCell<Contexts> = RefCell::new(Contexts {
+        compressor: None,
+        decoder: FrameDecoder::new(),
+        raw: Vec::new(),
+        frame: Vec::new(),
+    });
+}
+
+/// Prost-encode `item`, zstd-compress the bytes at `level` and append the
+/// frame to `dst`. The frame carries its content size.
 ///
 /// # Errors
 /// [`Status::internal`] if prost encoding fails.
-fn encode_compressed<T: Message>(item: &T, level: CompressionLevel) -> Result<Vec<u8>, Status> {
-    let mut raw = Vec::with_capacity(item.encoded_len());
-    item.encode(&mut raw)
-        .map_err(|e| Status::internal(format!("prost encode: {e}")))?;
-    Ok(compress_slice_to_vec(&raw, level))
+fn encode_compressed<T: Message>(
+    item: &T,
+    level: i32,
+    dst: &mut impl BufMut,
+) -> Result<(), Status> {
+    CONTEXTS.with_borrow_mut(|contexts| {
+        let Contexts {
+            compressor,
+            raw,
+            frame,
+            ..
+        } = contexts;
+        raw.clear();
+        item.encode(raw)
+            .map_err(|e| Status::internal(format!("prost encode: {e}")))?;
+        let compressor = match compressor {
+            Some((built_for, compressor)) if *built_for == level => compressor,
+            slot => {
+                &mut slot
+                    .insert((level, FrameCompressor::new(CompressionLevel::Level(level))))
+                    .1
+            }
+        };
+        compressor.compress_independent_frame_into(raw, frame);
+        dst.put_slice(frame);
+        contexts.trim();
+        Ok(())
+    })
 }
 
 /// zstd-decompress `bytes`, then prost-decode into `U`.
@@ -85,13 +148,23 @@ fn encode_compressed<T: Message>(item: &T, level: CompressionLevel) -> Result<Ve
 /// # Errors
 /// [`Status::internal`] if the zstd frame is malformed or prost decoding fails.
 fn decode_compressed<U: Message + Default>(bytes: &[u8]) -> Result<U, Status> {
-    // A body that is not a zstd frame is refused by the first read.
-    let mut decoder = StreamingDecoder::new(bytes);
-    let mut raw = Vec::new();
-    decoder
-        .read_to_end(&mut raw)
-        .map_err(|e| Status::internal(format!("zstd decode: {e}")))?;
-    U::decode(raw.as_slice()).map_err(|e| Status::internal(format!("prost decode: {e}")))
+    CONTEXTS.with_borrow_mut(|contexts| {
+        let Contexts { decoder, raw, .. } = contexts;
+        let corrupt = |e: structured_zstd::decoding::errors::FrameDecoderError| {
+            Status::internal(format!("zstd decode: {e}"))
+        };
+        // A body that is not a zstd frame is refused by its header.
+        decoder.reset(bytes).map_err(corrupt)?;
+        let size = usize::try_from(decoder.content_size())
+            .map_err(|_| Status::internal("zstd decode: content size past the address space"))?;
+        raw.clear();
+        raw.reserve(size);
+        decoder.decode_all_to_vec(bytes, raw).map_err(corrupt)?;
+        let message =
+            U::decode(raw.as_slice()).map_err(|e| Status::internal(format!("prost decode: {e}")));
+        contexts.trim();
+        message
+    })
 }
 
 /// A [`tonic`] codec that zstd-compresses each message body on the wire.
@@ -133,9 +206,7 @@ impl<T: Message> Encoder for ZstdEncoder<T> {
     type Error = Status;
 
     fn encode(&mut self, item: T, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
-        let compressed = encode_compressed(&item, current_level())?;
-        dst.put_slice(&compressed);
-        Ok(())
+        encode_compressed(&item, wire_zstd_level(), dst)
     }
 }
 
