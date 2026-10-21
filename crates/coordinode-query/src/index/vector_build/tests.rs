@@ -200,20 +200,25 @@ impl Fixture {
         during: impl FnOnce(),
     ) -> Result<BuildOutcome, String> {
         let token = self.registry.new_build_token();
+        let (taken, snapshot) = std::sync::mpsc::sync_channel(1);
         std::thread::scope(|scope| {
             let lock = held.write().expect("graph");
             let build = scope.spawn(|| {
-                VectorBuild {
-                    engine: &self.engine,
-                    token: &token,
-                    shard_id: 0,
-                    targets,
-                }
-                .run()
+                tracing::subscriber::with_default(SnapshotTaken(taken), || {
+                    VectorBuild {
+                        engine: &self.engine,
+                        token: &token,
+                        shard_id: 0,
+                        targets,
+                    }
+                    .run()
+                })
             });
-            // The build opens its tap and starts the scan, whose first insert
-            // waits for this lock; nothing else is waited for.
-            std::thread::sleep(Duration::from_millis(200));
+            // The build has opened its tap and taken its snapshot; its scan's
+            // first insert waits for this lock.
+            snapshot
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the build took its snapshot");
             during();
             drop(lock);
             build.join().expect("build thread")
@@ -247,6 +252,46 @@ impl Fixture {
         let graph = hnsw.read().expect("hnsw");
         graph.len()
     }
+}
+
+/// Tells the test, on the build's thread, when the build has opened its tap
+/// and taken its snapshot: the build reports that moment as an event.
+struct SnapshotTaken(std::sync::mpsc::SyncSender<()>);
+
+impl tracing::Subscriber for SnapshotTaken {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Opened(bool);
+        impl tracing::field::Visit for Opened {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" && format!("{value:?}") == "vector build: tap open" {
+                    self.0 = true;
+                }
+            }
+        }
+        let mut opened = Opened(false);
+        event.record(&mut opened);
+        // A full channel was told already; a closed one has a test no
+        // longer waiting.
+        if opened.0 && self.0.try_send(()).is_err() {
+            tracing::trace!("snapshot already reported");
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 /// A node of `label` carrying `vector` in `field`.
