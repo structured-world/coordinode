@@ -36,7 +36,7 @@ use prost::Message;
 use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 use tonic::Status;
-use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
 pub mod peer;
 pub mod tls;
@@ -208,6 +208,10 @@ impl<T: Message> Encoder for ZstdEncoder<T> {
     fn encode(&mut self, item: T, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
         encode_compressed(&item, wire_zstd_level(), dst)
     }
+
+    fn buffer_settings(&self) -> BufferSettings {
+        call_buffers()
+    }
 }
 
 /// Decoder half of [`ZstdCodec`].
@@ -222,10 +226,28 @@ impl<U: Message + Default> Decoder for ZstdDecoder<U> {
             return Ok(None);
         }
         // tonic delivers one whole gRPC message per decode call (it owns the
-        // length-prefixed framing); take all of it as the compressed frame.
-        let compressed = src.copy_to_bytes(src.remaining());
+        // length-prefixed framing); all of it is the compressed frame, read
+        // in place when it is one contiguous piece.
+        let remaining = src.remaining();
+        if src.chunk().len() == remaining {
+            let message = decode_compressed(src.chunk());
+            src.advance(remaining);
+            return message.map(Some);
+        }
+        let compressed = src.copy_to_bytes(remaining);
         decode_compressed(compressed.as_ref()).map(Some)
     }
+
+    fn buffer_settings(&self) -> BufferSettings {
+        call_buffers()
+    }
+}
+
+/// tonic's per-call buffers, sized for the small message most calls carry:
+/// a larger message reserves its own length, so starting small costs it
+/// nothing, while tonic's 8 KiB default cost every call four times that.
+fn call_buffers() -> BufferSettings {
+    BufferSettings::new(512, 32 << 10)
 }
 
 #[cfg(test)]
