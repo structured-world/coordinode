@@ -123,6 +123,48 @@ enum Executed {
     Lost,
 }
 
+/// Log how the check of `generation` ended and how long it took: lookups
+/// read the records instead of the generation until it is verified.
+fn log_check_end(generation: GenerationId, executed: &Executed, took: core::time::Duration) {
+    let generation = generation.as_raw();
+    let took_ms = took.as_millis();
+    match executed {
+        Executed::Outcome(CheckOutcome::Verified { checked, repaired }) => tracing::info!(
+            generation,
+            checked,
+            repaired,
+            took_ms,
+            "index generation checked: verified"
+        ),
+        Executed::Outcome(CheckOutcome::SourceConflicts { conflicts }) => tracing::warn!(
+            generation,
+            conflicts = conflicts.len(),
+            took_ms,
+            "index generation checked: records break its constraint, it stays suspect"
+        ),
+        Executed::Outcome(CheckOutcome::Rebuilding { generation: into }) => tracing::warn!(
+            generation,
+            into = into.as_raw(),
+            took_ms,
+            "index generation checked: damage too wide to repair, rebuilding"
+        ),
+        Executed::Outcome(CheckOutcome::Failed(reason)) => tracing::warn!(
+            generation,
+            %reason,
+            took_ms,
+            "index generation check failed"
+        ),
+        Executed::Outcome(CheckOutcome::Cancelled) => {
+            tracing::info!(generation, took_ms, "index generation check cancelled")
+        }
+        Executed::Lost => tracing::info!(
+            generation,
+            took_ms,
+            "index generation check stopped: another executor holds it"
+        ),
+    }
+}
+
 /// How a check of this member's own copy ended.
 enum LocalOutcome {
     /// Every entry agrees with this member's records: the mark is lifted.
@@ -504,12 +546,20 @@ impl IndexBuildService {
         let spawned = std::thread::Builder::new()
             .name(format!("index-check-{}", generation.as_raw()))
             .spawn(move || {
+                // Lookups that cannot use the generation meanwhile read the
+                // records, so an operator needs to see the check run and end.
+                tracing::info!(
+                    generation = generation.as_raw(),
+                    "checking an index generation"
+                );
+                let started = std::time::Instant::now();
                 let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     shared.execute_check(generation)
                 }))
                 .unwrap_or_else(|panic| {
                     Executed::Outcome(CheckOutcome::Failed(panic_message(&*panic)))
                 });
+                log_check_end(generation, &executed, started.elapsed());
                 let slot = match executed {
                     Executed::Outcome(outcome) => CheckSlot::Done(outcome),
                     Executed::Lost => CheckSlot::Lost,
