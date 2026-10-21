@@ -4,7 +4,9 @@
 //! serve, and a transaction of one statement, each sent through the leader
 //! and through a follower in alternating order. Then a large answer read
 //! slowly through a follower: the heap it takes stays a few batches,
-//! whatever the answer's size.
+//! whatever the answer's size. Then the same writes from many clients at
+//! once through each, and writes through a third member while the lead
+//! moves: the latency of those that commit and how the others are refused.
 //!
 //! Both members run in this process, so a routed command's allocations
 //! include the leader's share; the difference between the arms is what the
@@ -474,10 +476,138 @@ async fn main() {
     txn_routed.report("transaction through a follower");
 
     slow_consumer(leader, follower).await;
+    concurrent(leader, follower).await;
+    leader_changes(&members).await;
 
     for m in members.into_iter().rev() {
         m.shutdown().await.expect("shutdown");
     }
+}
+
+/// Clients writing at once, and the writes each sends.
+const CLIENTS: usize = 32;
+const WRITES_PER_CLIENT: usize = 50;
+
+/// The same writes from many clients at once, through the leader and then
+/// through a follower: latency under load, throughput and allocations per
+/// write. Every client of an arm shares its member's one session to the
+/// leader, as a host's callers do.
+async fn concurrent(leader: &ReplicatedDatabase, follower: &ReplicatedDatabase) {
+    for (label, member) in [
+        ("concurrent writes at the leader", leader),
+        ("concurrent writes through a follower", follower),
+    ] {
+        let times = std::sync::Arc::new(parking_lot::Mutex::new(Vec::with_capacity(
+            CLIENTS * WRITES_PER_CLIENT,
+        )));
+        let region = Region::new(GLOBAL);
+        let start = Instant::now();
+        let clients: Vec<_> = (0..CLIENTS)
+            .map(|client| {
+                let ingress = member.ingress().clone();
+                let times = std::sync::Arc::clone(&times);
+                tokio::spawn(async move {
+                    for i in 0..WRITES_PER_CLIENT {
+                        let k = client * WRITES_PER_CLIENT + i;
+                        let sent = Instant::now();
+                        ingress
+                            .execute(with_k(Statement::new("CREATE (:Load {k: $k})"), k))
+                            .await
+                            .expect("write");
+                        times.lock().push(sent.elapsed());
+                    }
+                })
+            })
+            .collect();
+        for client in clients {
+            client.await.expect("client");
+        }
+        let elapsed = start.elapsed();
+        let change = region.change();
+        let times = std::mem::take(&mut *times.lock());
+        let n = times.len();
+        println!(
+            "{label} ({CLIENTS} clients): ops/s={:.0} allocs/op={} bytes/op={}",
+            n as f64 / elapsed.as_secs_f64(),
+            change.allocations / n,
+            change.bytes_allocated / n
+        );
+        Arm {
+            times,
+            allocs: change.allocations,
+            bytes: change.bytes_allocated,
+        }
+        .report(label);
+    }
+}
+
+/// Times the lead moves between members 1 and 2 while member 3 writes.
+const TRANSFERS: usize = 6;
+
+/// Writes sent one after another through member 3 while the lead moves
+/// between members 1 and 2: the latency of those that commit, and how many
+/// are refused and how. A refusal before admission says the write did not
+/// run; an unknown outcome is one a host resolves by its operation.
+async fn leader_changes(members: &[ReplicatedDatabase]) {
+    use coordinode_embed::DatabaseError;
+
+    let ingress = members[2].ingress().clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = std::sync::Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut committed = Arm::default();
+            let (mut not_run, mut unknown, mut other) = (0usize, 0usize, 0usize);
+            let mut k = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                k += 1;
+                let sent = Instant::now();
+                match ingress
+                    .execute(with_k(Statement::new("CREATE (:Moving {k: $k})"), k))
+                    .await
+                {
+                    Ok(_) => committed.times.push(sent.elapsed()),
+                    Err(
+                        DatabaseError::NotLeader { .. } | DatabaseError::PeerUnreachable { .. },
+                    ) => not_run += 1,
+                    Err(DatabaseError::PeerOutcomeUnknown { .. }) => unknown += 1,
+                    Err(e) => {
+                        other += 1;
+                        println!("leader change: unexpected refusal: {e}");
+                    }
+                }
+            }
+            (committed, not_run, unknown, other)
+        })
+    };
+
+    let mut moves = Vec::with_capacity(TRANSFERS);
+    for i in 0..TRANSFERS {
+        // 1 leads first; it alternates with 2.
+        let (from, to) = if i % 2 == 0 { (0, 2) } else { (1, 1) };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let start = Instant::now();
+        members[from]
+            .transfer_leadership(to)
+            .await
+            .expect("transfer");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while members[2].leader() != Some(to) {
+            assert!(Instant::now() < deadline, "member 3 follows the new leader");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        moves.push(start.elapsed());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (committed, not_run, unknown, other) = writer.await.expect("writer");
+    let longest = committed.times.iter().max().copied().unwrap_or_default();
+    println!(
+        "writes through member 3 across {TRANSFERS} leader changes: committed={} refused, did not run={not_run} \
+         outcome unknown={unknown} other={other} longest committed={longest:?} transfer times={moves:?}",
+        committed.times.len()
+    );
+    committed.report("committed writes across leader changes");
 }
 
 /// A large answer read through a follower by a consumer that takes a batch
