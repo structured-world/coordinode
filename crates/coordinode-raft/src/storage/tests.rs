@@ -1902,8 +1902,12 @@ async fn raft_cut_at_every(op: lsm_tree::fs::FaultOp) -> u64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_power_cut_at_any_sync_leaves_every_raft_entry_once() {
     // Log appends, table and manifest publishes, folds and purges all end in
-    // a full sync, so this walks the Raft path's whole durability order.
-    assert!(raft_cut_at_every(lsm_tree::fs::FaultOp::SyncAll).await > 0);
+    // a sync: a full one, or a data sync where the trees order their writes
+    // with a barrier. Cutting at both walks the Raft path's whole durability
+    // order.
+    let full = raft_cut_at_every(lsm_tree::fs::FaultOp::SyncAll).await;
+    let data = raft_cut_at_every(lsm_tree::fs::FaultOp::SyncData).await;
+    assert!(full + data > 0, "the workload reached no sync");
 }
 
 #[tokio::test(flavor = "multi_thread")]

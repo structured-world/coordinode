@@ -2272,9 +2272,12 @@ fn cut_at_every(op: lsm_tree::fs::FaultOp) -> u64 {
 
 #[test]
 fn a_power_cut_at_any_sync_leaves_every_commit_once() {
-    // Every journal append and every table/manifest publish ends in a full
-    // sync, so this walks the whole durability order of the workload.
-    assert!(cut_at_every(lsm_tree::fs::FaultOp::SyncAll) > 0);
+    // Every journal append and every table/manifest publish ends in a sync:
+    // a full one, or a data sync where the trees order their writes with a
+    // barrier. Cutting at both walks the whole durability order.
+    let full = cut_at_every(lsm_tree::fs::FaultOp::SyncAll);
+    let data = cut_at_every(lsm_tree::fs::FaultOp::SyncData);
+    assert!(full + data > 0, "the workload reached no sync");
 }
 
 #[test]
