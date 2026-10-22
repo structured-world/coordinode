@@ -1778,10 +1778,11 @@ fn partition_trees_sync_as_durably_as_the_oplog() {
                 "{method:?}: no device flush of the endpoint: {syncs:?}"
             );
             let device = devices[0];
+            // Separators normalized: Windows paths name `node\tables\`.
             let synced_before = |part: &str| {
                 syncs[..device]
                     .iter()
-                    .any(|(path, _)| path.to_string_lossy().contains(part))
+                    .any(|(path, _)| path.to_string_lossy().replace('\\', "/").contains(part))
             };
             assert!(
                 synced_before("node/tables/") && synced_before("node/edits-"),
