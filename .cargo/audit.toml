@@ -20,6 +20,11 @@ ignore = [
     "RUSTSEC-2026-0098", # name constraints for URI names incorrectly accepted
     "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
     "RUSTSEC-2026-0049", # CRLs not considered authoritative by distribution point
+    # Distrusted emSign intermediates accepted in a certificate path. The same
+    # 0.102 copy, which rustls-rustcrypto reads only for its algorithm
+    # identifier constants (`alg_id`): certificate paths are built and checked
+    # by rustls through rustls-webpki 0.103.16, which rejects those keys.
+    "RUSTSEC-2026-0382",
     # rkyv 0.7.x out-of-bounds read on crafted archives. No deny.toml counterpart:
     # cargo-audit reads Cargo.lock, cargo-deny reads the resolved graph, and this
     # crate is only in the lock. It arrives through rust_decimal's optional `rkyv`
