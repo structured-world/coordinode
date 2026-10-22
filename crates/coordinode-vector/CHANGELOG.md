@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.4 - 2026-10-22
+
+### Fixed
+
+- *(vector)* rank distances in a total order, ties by id
+
 ## v0.7.1 - 2026-10-13
 
 ### Added

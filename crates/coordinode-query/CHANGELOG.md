@@ -2,6 +2,41 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.4 - 2026-10-22
+
+### Added
+
+- *(raft)* send snapshots from pinned trees, compact on flush
+- *(query)* log when an index check starts and how it ends
+- *(embed)* one error contract for local and routed calls
+- *(session)* run transactions on the session in arrival order
+- *(txn)* hold interactive transactions on their owner
+- *(schema)* prove presence and type constraints in the background
+- *(schema)* prove label definitions in the background
+- *(embed)* publish schema packages in one catalog commit
+
+### Fixed
+
+- *(vector)* rank distances in a total order, ties by id
+- *(embed)* refuse a write off the leader as not leader when it needs an id
+- *(query)* drop an index report of damage that is already repaired
+- *(query)* rescan when the history under a build's snapshot is released
+- *(query)* rescan a vector build whose partition was replaced before its scan
+- *(embed)* send a write to the leader before it runs elsewhere
+
+### Performance
+
+- *(index)* project, checksum and bind index check passes
+- *(storage)* flush columnar tables in the background
+- *(index)* check every generation in one sorted pass
+- *(schema)* prove a package's labels in one certification
+
+### Testing
+
+- *(index)* report the slowest recovery lookup
+- *(query)* let the maintainer take a write after a rescanned build
+- *(query)* wait for the build's snapshot, not a fixed sleep
+
 ## v0.7.3 - 2026-10-18
 
 ### Added

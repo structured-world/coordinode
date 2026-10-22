@@ -2,6 +2,13 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.4 - 2026-10-22
+
+### Performance
+
+- *(wire)* size tonic's per-call buffers for small messages
+- *(wire)* reuse the zstd contexts across messages
+
 ## v0.7.2 - 2026-10-15
 
 ### Added

@@ -2,6 +2,26 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.4 - 2026-10-22
+
+### Added
+
+- *(schema)* prove presence and type constraints in the background
+- *(schema)* prove label definitions in the background
+
+### Documentation
+
+- *(modality)* fix a broken link in the blob store docs
+
+### Fixed
+
+- *(storage)* answer a blob write only once it is durable
+
+### Performance
+
+- *(index)* check every generation in one sorted pass
+- *(schema)* prove a package's labels in one certification
+
 ## v0.7.3 - 2026-10-18
 
 ### Added

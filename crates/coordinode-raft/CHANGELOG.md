@@ -2,6 +2,30 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.4 - 2026-10-22
+
+### Added
+
+- *(raft)* send snapshots from pinned trees, compact on flush
+- *(cluster)* serve clients through any member
+
+### Fixed
+
+- *(raft)* count the snapshot trigger as engine work until its task ends
+- *(raft)* send a snapshot chunk as one binary blob
+- *(storage)* answer a blob write only once it is durable
+- *(storage)* tell a group member's store by its bound consensus log
+
+### Performance
+
+- *(routing)* carry routed commands on one session per member
+
+### Testing
+
+- *(storage)* cut the power at data syncs as well as full ones
+- *(raft)* cut off only a member that follows the leader
+- *(raft)* name what still holds the engine after a shutdown
+
 ## v0.7.3 - 2026-10-18
 
 ### Added

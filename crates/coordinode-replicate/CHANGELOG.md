@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.4 - 2026-10-22
+
+### Testing
+
+- *(storage)* stop leaning on the 5.x file layout
+
 ## v0.7.3 - 2026-10-18
 
 ### Added

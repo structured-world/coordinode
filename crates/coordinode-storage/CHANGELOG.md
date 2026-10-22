@@ -2,6 +2,44 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.4 - 2026-10-22
+
+### Added
+
+- *(storage)* wire the remaining lsm-tree 6.0 controls
+- *(storage)* one I/O budget for compaction and scrub
+- *(raft)* send snapshots from pinned trees, compact on flush
+- *(schema)* prove presence and type constraints in the background
+- *(schema)* prove label definitions in the background
+
+### Documentation
+
+- *(storage)* describe a lost frame without linking a private item
+
+### Fixed
+
+- *(storage)* recover lost writes inside a sealed oplog segment
+- *(storage)* answer a blob write only once it is durable
+- *(storage)* tell a group member's store by its bound consensus log
+- *(storage)* make the journal's retirement into a group restartable
+- *(storage)* refuse a group member's store an own journal
+
+### Performance
+
+- *(index)* project, checksum and bind index check passes
+- *(storage)* flush columnar tables in the background
+- *(storage)* keep vector truth values in the block cache
+- *(storage)* order tree syncs, flush devices at promises
+- *(schema)* prove a package's labels in one certification
+
+### Testing
+
+- *(storage)* match synced tree paths with either separator
+- *(storage)* cut the power at data syncs as well as full ones
+- *(storage)* a persist flushes the device of every endpoint
+- *(storage)* stop leaning on the 5.x file layout
+- *(storage)* retirement segments brought back by a cut are retired again
+
 ## v0.7.3 - 2026-10-18
 
 ### Added

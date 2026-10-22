@@ -2,6 +2,78 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.4 - 2026-10-22
+
+### Added
+
+- *(embed)* send an unsent command again within its deadline
+- *(routing)* read a routed answer as its rows are asked for
+- *(embed)* say where an ingress command ran
+- *(embed)* run a host's commands through any member
+- *(embed)* one error contract for local and routed calls
+- *(session)* run transactions on the session in arrival order
+- *(transactions)* client-drawn UUID transaction IDs
+- *(cluster)* route operation calls to the leader between members
+- *(cluster)* serve clients through any member
+- *(txn)* hold interactive transactions on their owner
+- *(schema)* prove presence and type constraints in the background
+- *(server)* serve PublishSchema and AwaitSchema
+- *(embed)* publish a schema package as a client operation
+- *(schema)* prove label definitions in the background
+- *(embed)* publish schema packages in one catalog commit
+
+### Fixed
+
+- *(embed)* stop routed statements when their session drops
+- *(embed)* refuse a write off the leader as not leader when it needs an id
+- *(embed)* refuse a routed reply past the bound instead of queueing it
+- *(embed)* bound what routed commands hold on the executing member
+- *(embed)* send a write to the leader before it runs elsewhere
+- *(routing)* end a routed answer with its last frame
+- *(routing)* send a routed answer as it is produced
+- *(embed)* every member reaps idle transactions
+- *(embed)* move a constraint kind's fields into the wire
+- *(embed)* carry a constraint kind as typed bounded fields
+- *(embed)* bound a routed error before encoding it
+- *(storage)* tell a group member's store by its bound consensus log
+- *(storage)* make the journal's retirement into a group restartable
+- *(storage)* refuse a group member's store an own journal
+- *(embed)* release the store before a member's shutdown returns
+- *(embed)* let the catalog decide an owned index name in packages
+
+### Performance
+
+- *(index)* project, checksum and bind index check passes
+- *(index)* check every generation in one sorted pass
+- *(routing)* carry routed commands on one session per member
+- *(session)* open a transaction with its first statement
+- *(routing)* send a routed answer's ready events as one message
+- *(schema)* prove a package's labels in one certification
+
+### Testing
+
+- *(embed)* corrupt the largest table, not an empty reserve file
+- *(storage)* stop leaning on the 5.x file layout
+- *(index)* report the slowest recovery lookup
+- *(embed)* routed commands keep their concerns and time left
+- *(embed)* routed transactions across renewal and revocation
+- *(embed)* races between idle expiry, explicit ends and leader loss
+- *(embed)* routed commands across leader change, ownership, order
+- *(embed)* hold vector builds instead of racing them
+- *(embed)* seat the blocking build before queueing behind it
+- *(embed)* schema packages under concurrency and in a group
+
+### Bench
+
+- *(embed)* measure reopening after a death with index copies in use
+- *(routing)* report how long a leader change keeps a host from writing
+- *(routing)* measure routing under load and across leader changes
+- *(routing)* measure an echo over the members' own mutual TLS
+- *(routing)* measure the transport floor under a routed call
+- *(embed)* measure the bare route and use parameters
+- *(embed)* a routed command against the same command at the leader
+- *(embed)* measure schema packages against single calls
+
 ## v0.7.3 - 2026-10-18
 
 ### Added

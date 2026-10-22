@@ -2,6 +2,14 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.4 - 2026-10-22
+
+### Added
+
+- *(session)* run transactions on the session in arrival order
+- *(transactions)* client-drawn UUID transaction IDs
+- *(txn)* hold interactive transactions on their owner
+
 ## v0.7.3 - 2026-10-18
 
 ### Added
