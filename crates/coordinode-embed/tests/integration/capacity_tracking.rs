@@ -24,6 +24,42 @@ use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::StorageError;
 use tempfile::TempDir;
 
+/// Tables in the tables folder `dir`, 0 when it does not exist. Empty files
+/// are the engine's reserve of files for tables yet to be written, not
+/// tables, and their number moves with no data moving.
+fn tables_in(dir: &std::path::Path) -> usize {
+    if !dir.exists() {
+        return 0;
+    }
+    std::fs::read_dir(dir)
+        .expect("read tables dir")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .expect("dir entry")
+                .metadata()
+                .expect("metadata")
+                .len()
+                > 0
+        })
+        .count()
+}
+
+/// 64 bytes no codec shrinks, distinct per `i`: rows of them take their size
+/// on disk, so a test filling an endpoint does not depend on how well the
+/// storage format compresses or how compact its filters are.
+fn incompressible(i: u32) -> [u8; 64] {
+    let mut state = u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut out = [0u8; 64];
+    for chunk in out.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        chunk.copy_from_slice(&state.to_le_bytes());
+    }
+    out
+}
+
 /// Writing data + persisting + refreshing the capacity tracker MUST
 /// produce a non-zero `used_bytes` reading for the target endpoint.
 /// Smoke check on the scan path.
@@ -188,7 +224,7 @@ fn capacity_recovery_re_enables_writes() {
     for i in 0..5000u32 {
         let key = format!("node:0:{i:010}");
         engine
-            .put(Partition::Node, key.as_bytes(), b"payload-bytes")
+            .put(Partition::Node, key.as_bytes(), &incompressible(i))
             .expect("put");
     }
     engine.persist().expect("persist");
@@ -268,11 +304,7 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
 
     // Record cold endpoint SST count before the refresh+cascade pass.
     let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
-    let cold_before = if cold_tables.exists() {
-        std::fs::read_dir(&cold_tables).unwrap().count()
-    } else {
-        0
-    };
+    let cold_before = tables_in(&cold_tables);
 
     // First refresh triggers cascade-evict if severity crossed.
     engine.refresh_capacity();
@@ -281,11 +313,7 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
     // compaction asynchronously inside cascade_evict_endpoint;
     // bottom-level SSTs should now live on cold endpoint.
     let cold_tables_exists = cold_tables.exists();
-    let cold_after = if cold_tables_exists {
-        std::fs::read_dir(&cold_tables).unwrap().count()
-    } else {
-        0
-    };
+    let cold_after = tables_in(&cold_tables);
     assert!(
         cold_tables_exists,
         "cold endpoint tables dir must exist after cascade — major \
@@ -967,7 +995,7 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
     // Step 1: write to Full (UP-crossing increments counter).
     for i in 0..5000u32 {
         let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+        let _ = engine.put(Partition::Node, key.as_bytes(), &incompressible(i));
     }
     engine.persist().expect("persist");
     engine.refresh_capacity();

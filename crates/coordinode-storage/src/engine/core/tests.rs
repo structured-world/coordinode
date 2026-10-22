@@ -1577,6 +1577,7 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
         .flat_map(|p| {
             [
                 FaultOp::SyncAll,
+                FaultOp::SyncData,
                 FaultOp::Open,
                 FaultOp::Write,
                 FaultOp::Rename,
@@ -1645,11 +1646,24 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
         reached_by.push((partition, failed, reached));
     }
     // Every partition's persist opens, writes and syncs a table; it need not
-    // rename one.
-    for (partition, failed, reached) in &reached_by {
+    // rename one. Which sync it is depends on the platform and the file:
+    // the data alone (fdatasync) or the data with its metadata.
+    let reached = |partition: Partition, op: FaultOp| {
+        reached_by
+            .iter()
+            .find(|(p, o, _)| *p == partition && *o == op)
+            .map_or(0, |(_, _, n)| *n)
+    };
+    for partition in [Partition::Raft, Partition::Schema] {
+        for op in [FaultOp::Open, FaultOp::Write] {
+            assert!(
+                reached(partition, op) > 0,
+                "{partition:?}: no {op:?} of a persist was failed: {reached_by:?}"
+            );
+        }
         assert!(
-            *reached > 0 || *failed == FaultOp::Rename,
-            "{partition:?}: no {failed:?} of a persist was failed: {reached_by:?}"
+            reached(partition, FaultOp::SyncAll) + reached(partition, FaultOp::SyncData) > 0,
+            "{partition:?}: no sync of a persist was failed: {reached_by:?}"
         );
     }
 }

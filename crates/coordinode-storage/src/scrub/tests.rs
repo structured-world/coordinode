@@ -144,12 +144,15 @@ fn scrub_reports_disk_corruption_without_aborting() {
     }
     engine.persist().expect("persist");
 
-    // Flip a byte in the middle of the largest on-disk file (the data SST),
-    // simulating silent bit rot.
-    let victim = largest_file(dir.path());
+    // Flip bytes across the largest table of the Node partition, simulating
+    // silent bit rot. Several offsets, so one lands in a data block whatever
+    // the table's layout puts around it.
+    let victim = largest_file(&dir.path().join(Partition::Node.name()).join("tables"));
     let mut bytes = std::fs::read(&victim).expect("read sst");
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0xFF;
+    let n = bytes.len();
+    for at in [n / 8, n / 4, n / 2] {
+        bytes[at] ^= 0xFF;
+    }
     std::fs::write(&victim, &bytes).expect("write corrupted sst");
 
     // Scan completes (Ok) and surfaces the corruption rather than bailing.

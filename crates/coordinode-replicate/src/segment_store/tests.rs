@@ -577,10 +577,14 @@ async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
     let local = std::sync::Arc::new(test_engine(local_dir.path()));
     put_all(&local);
     local.persist().expect("persist");
-    let victim = largest_file(local_dir.path());
+    // The largest table of the Node partition, several offsets flipped so
+    // one lands in a data block whatever the table's layout puts around it.
+    let victim = largest_file(&local_dir.path().join(Partition::Node.name()).join("tables"));
     let mut bytes = std::fs::read(&victim).expect("read sst");
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0xFF;
+    let n = bytes.len();
+    for at in [n / 8, n / 4, n / 2] {
+        bytes[at] ^= 0xFF;
+    }
     std::fs::write(&victim, &bytes).expect("corrupt sst");
 
     // Scrub detects the injected corruption.

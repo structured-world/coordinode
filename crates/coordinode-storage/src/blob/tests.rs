@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use coordinode_core::graph::blob::{create_blob, encode_blob_key};
 use coordinode_core::txn::timestamp::TimestampOracle;
-use lsm_tree::fs::{CrashFs, StdFs};
+use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs};
 use tempfile::TempDir;
 
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 
-fn config(dir: &TempDir, fs: &Arc<CrashFs>) -> StorageConfig {
+fn config(dir: &TempDir, crash: &Arc<CrashFs>, faults: &Arc<FaultInjector>) -> StorageConfig {
     StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
         dir.path(),
@@ -16,7 +16,10 @@ fn config(dir: &TempDir, fs: &Arc<CrashFs>) -> StorageConfig {
         Durability::Durable,
         Tier::Warm,
     )])
-    .with_fs(fs.clone())
+    .with_fs(Arc::new(FaultFs::with_injector(
+        CrashFs::clone(crash),
+        Arc::clone(faults),
+    )))
 }
 
 /// A blob whose chunks and metadata were written survives a power cut right
@@ -27,7 +30,8 @@ fn config(dir: &TempDir, fs: &Arc<CrashFs>) -> StorageConfig {
 fn a_written_blob_survives_a_crash_right_after() {
     let dir = TempDir::new().expect("tempdir");
     let crash = Arc::new(CrashFs::new(StdFs));
-    let config = config(&dir, &crash);
+    let faults = Arc::new(FaultInjector::new());
+    let config = config(&dir, &crash, &faults);
     let (_, chunks) = create_blob(&vec![0x5a; 300 << 10]);
     {
         let engine =
@@ -42,8 +46,21 @@ fn a_written_blob_survives_a_crash_right_after() {
             put_chunks_durably(&engine, &chunks).expect("again"),
             chunks.len()
         );
-        // Killed, not shut down: nothing a drop would flush gets flushed.
-        std::mem::forget(engine);
+        // Killed, not shut down: nothing the drop would flush reaches the
+        // disk, while its files and its directory locks are let go as a
+        // dead process lets them go.
+        let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
+        for op in [
+            FaultOp::Open,
+            FaultOp::Write,
+            FaultOp::SyncAll,
+            FaultOp::SyncData,
+            FaultOp::Rename,
+        ] {
+            faults.arm(FaultRule::new(op, refuse));
+        }
+        drop(engine);
+        faults.clear();
     }
     crash.crash();
 

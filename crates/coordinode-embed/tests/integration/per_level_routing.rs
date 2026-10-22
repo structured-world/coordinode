@@ -16,6 +16,27 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use tempfile::TempDir;
 
+/// Tables in the tables folder `dir`, 0 when it does not exist. Empty files
+/// are the engine's reserve of files for tables yet to be written, not
+/// tables, and their number moves with no data moving.
+fn tables_in(dir: &std::path::Path) -> usize {
+    if !dir.exists() {
+        return 0;
+    }
+    std::fs::read_dir(dir)
+        .expect("read tables dir")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .expect("dir entry")
+                .metadata()
+                .expect("metadata")
+                .len()
+                > 0
+        })
+        .count()
+}
+
 /// With a three-tier endpoint config (Hot NVMe + Warm SSD + Cold HDD),
 /// writing data and forcing major compaction must cause SST files to
 /// land at the cold-tier endpoint for L4+ levels.
@@ -292,11 +313,7 @@ fn cascade_eviction_moves_data_to_cooler_endpoint() {
     engine.persist().expect("persist");
 
     let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
-    let before = if cold_tables.exists() {
-        std::fs::read_dir(&cold_tables).expect("read cold").count()
-    } else {
-        0
-    };
+    let before = tables_in(&cold_tables);
 
     let report = engine
         .cascade_evict_endpoint("ep-hot")
@@ -311,7 +328,7 @@ fn cascade_eviction_moves_data_to_cooler_endpoint() {
         cold_tables.exists(),
         "cold endpoint tables dir must exist after cascade eviction, expected {cold_tables:?}",
     );
-    let after = std::fs::read_dir(&cold_tables).expect("read cold").count();
+    let after = tables_in(&cold_tables);
     assert!(
         after > before,
         "cold endpoint SST count must increase after cascade eviction (before={before}, after={after})",
@@ -692,9 +709,7 @@ fn cascade_eviction_of_primary_endpoint_is_data_motion_noop() {
     let reopen_and_count = |engine: StorageEngine| {
         drop(engine);
         let engine = StorageEngine::open(&config).expect("reopen");
-        let live = std::fs::read_dir(&cold_tables)
-            .expect("read cold dir")
-            .count();
+        let live = tables_in(&cold_tables);
         (engine, live)
     };
     let (engine, cold_before) = reopen_and_count(engine);
