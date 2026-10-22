@@ -972,17 +972,23 @@ fn backpressure_thresholds_parse_and_reach_the_storage_config() {
     let path = dir.path().join("c.yaml");
     std::fs::write(
         &path,
-        "storage:\n  backpressure:\n    l0_stop: 12\n    bytes_stop: 1024\n",
+        "storage:\n  backpressure:\n    l0_stop: 12\n    bytes_stop: 1024\n    \
+         memtable_stop: 4096\n",
     )
     .unwrap();
     let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
     let sc = c.resolve_storage_config().expect("valid topology");
     assert_eq!(sc.backpressure.l0_stop, 12);
     assert_eq!(sc.backpressure.bytes_stop, 1024);
+    assert_eq!(sc.backpressure.memtable_stop, 4096);
     // Unset keys stay at their defaults.
     let defaults = coordinode_storage::engine::config::BackpressureLimits::default();
     assert_eq!(sc.backpressure.l0_slowdown, defaults.l0_slowdown);
     assert_eq!(sc.backpressure.bytes_slowdown, defaults.bytes_slowdown);
+    assert_eq!(
+        sc.backpressure.memtable_slowdown,
+        defaults.memtable_slowdown
+    );
 
     // An unknown key inside the section is a config error, not a silent no-op.
     std::fs::write(&path, "storage:\n  backpressure:\n    l0_sotp: 12\n").unwrap();

@@ -522,15 +522,17 @@ impl CompressionConfig {
     }
 }
 
-/// Write-backpressure thresholds, per partition tree.
+/// Write-backpressure thresholds.
 ///
-/// Two axes, each with a slowdown and a stop level: the L0 run count (a tall
-/// L0 is what spikes read amplification) and the pending-compaction byte
-/// debt the leveled strategy reports. Crossing a slowdown level raises the
-/// partition's compaction priority and shows up in metrics; crossing a stop
-/// level makes the engine's cached verdict `Stop`, which the commit path
-/// consults to reject new client writes (retryable) until compaction
-/// catches up. Defaults follow the RocksDB family of stall levels.
+/// Three axes, each with a slowdown and a stop level: the L0 run count of a
+/// partition tree (a tall L0 is what spikes read amplification), the
+/// pending-compaction byte debt the leveled strategy reports for it, and the
+/// memtable bytes every tree of the engine holds unflushed together. Crossing
+/// a slowdown level raises the partition's compaction priority and shows up
+/// in metrics; crossing a stop level makes the engine's cached verdict
+/// `Stop`, which the commit path consults to reject new client writes
+/// (retryable) until compaction or flushes catch up. Defaults follow the
+/// RocksDB family of stall levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BackpressureLimits {
@@ -550,6 +552,13 @@ pub struct BackpressureLimits {
     /// Pending-compaction bytes at or above which the verdict is stop.
     /// Default: 256 GiB.
     pub bytes_stop: u64,
+    /// Unflushed memtable bytes, summed over every tree of the engine, at or
+    /// above which the verdict is at least slowdown. Default: 512 MiB.
+    pub memtable_slowdown: u64,
+    /// Unflushed memtable bytes, summed over every tree of the engine, at or
+    /// above which the verdict is stop: flushes have fallen behind the writes
+    /// and memory would otherwise grow without bound. Default: 2 GiB.
+    pub memtable_stop: u64,
 }
 
 impl Default for BackpressureLimits {
@@ -559,6 +568,8 @@ impl Default for BackpressureLimits {
             l0_stop: 200,
             bytes_slowdown: 64 * 1024 * 1024 * 1024,
             bytes_stop: 256 * 1024 * 1024 * 1024,
+            memtable_slowdown: 512 * 1024 * 1024,
+            memtable_stop: 2 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -573,7 +584,21 @@ impl BackpressureLimits {
             l0_stop: Some(self.l0_stop),
             bytes_slowdown: Some(self.bytes_slowdown),
             bytes_stop: Some(self.bytes_stop),
+            memtable_slowdown: Some(self.memtable_slowdown),
+            memtable_stop: Some(self.memtable_stop),
             max_slowdown: Some(core::time::Duration::from_millis(10)),
+        }
+    }
+
+    /// The memtable axis alone, which the flush monitor judges as writes fill
+    /// the memtables; the compaction monitor judges the others as flushes and
+    /// compactions move the tables.
+    #[must_use]
+    pub(crate) fn memtable_thresholds(&self) -> lsm_tree::BackpressureThresholds {
+        lsm_tree::BackpressureThresholds {
+            memtable_slowdown: Some(self.memtable_slowdown),
+            memtable_stop: Some(self.memtable_stop),
+            ..lsm_tree::BackpressureThresholds::OFF
         }
     }
 }

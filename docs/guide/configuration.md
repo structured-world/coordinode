@@ -530,10 +530,11 @@ with a measured reason.
 
 ### Write backpressure
 
-Sustained write bursts can outrun background compaction; the engine tracks
-that debt on two axes per partition tree — the L0 run count (a tall L0
-inflates read amplification) and the pending-compaction byte debt — and turns
-them into a verdict against four thresholds under `storage.backpressure`:
+Sustained write bursts can outrun background compaction and flushes. The
+engine tracks that on three axes: per partition tree, the L0 run count (a tall
+L0 inflates read amplification) and the pending-compaction byte debt; and for
+the whole engine, the memtable bytes not yet flushed to tables. It turns them
+into a verdict against six thresholds under `storage.backpressure`:
 
 ```yaml
 storage:
@@ -542,18 +543,23 @@ storage:
     l0_stop: 200                  # default
     bytes_slowdown: 68719476736   # 64 GiB, default
     bytes_stop: 274877906944      # 256 GiB, default
+    memtable_slowdown: 536870912  # 512 MiB, default
+    memtable_stop: 2147483648     # 2 GiB, default
 ```
 
 The L0 stop level is a deliberately high wall: a DDL burst legitimately
 creates dozens of tiny L0 tables between two compaction passes, and the
-byte-debt axis carries the real ceiling.
+byte-debt axis carries the real ceiling. The memtable levels bound the memory
+writes can take while the flushes fall behind them (a slow disk, a flush that
+fails and is retried); the unflushed bytes are exported as
+`coordinode_storage_unflushed_memtable_bytes`.
 
 Crossing a *slowdown* level raises that partition's compaction priority to
 urgent and is visible in metrics (`coordinode_storage_backpressure_tier`,
 `coordinode_storage_compaction_debt_bytes`); writes still proceed at full
 rate. Crossing a *stop* level makes commits carrying writes fail with a
 retryable `WRITE_BACKPRESSURE` error (gRPC `RESOURCE_EXHAUSTED` with
-`RetryInfo`) until compaction drains the debt below the threshold; official
+`RetryInfo`) until compaction or the flushes drain below the threshold; official
 drivers back off and retry on it automatically. The server never sleeps
 inside the write path on either tier, read-only traffic is unaffected, and
 replicated (Raft) entry application is never gated. Changing the thresholds

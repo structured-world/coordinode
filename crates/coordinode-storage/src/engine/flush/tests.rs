@@ -42,9 +42,90 @@ fn start(
         Arc::clone(&wake),
         Arc::new(Wake::default()),
         None,
+        MemtablePressure {
+            budget: Arc::new(lsm_tree::WriteBufferBudget::default()),
+            thresholds: crate::engine::config::BackpressureLimits::default().memtable_thresholds(),
+            tier: Arc::new(AtomicU8::new(0)),
+        },
     )
     .expect("start FlushManager");
     (mgr, wake)
+}
+
+/// Writes that outrun the flushes raise the memtable axis of the write
+/// pressure to stop once the memtables of every tree in the budget hold more
+/// unflushed bytes than its stop level; flushing them drops it again, with
+/// nothing but the monitor's own wake-ups to notice either.
+#[test]
+fn unflushed_memtable_bytes_past_the_stop_level_stop_writes_until_flushed() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let seqno: lsm_tree::SharedSequenceNumberGenerator =
+        Arc::new(lsm_tree::SequenceNumberCounter::default());
+    let budget = Arc::new(lsm_tree::WriteBufferBudget::default());
+    let mut trees = HashMap::new();
+    for (partition, name) in [(Partition::Node, "node"), (Partition::Adj, "adj")] {
+        let tree = lsm_tree::Config::new_with_generators(
+            dir.path().join(name),
+            Arc::clone(&seqno),
+            Arc::clone(&seqno),
+        )
+        .write_buffer_budget(Arc::clone(&budget))
+        .open()
+        .expect("open tree");
+        trees.insert(partition, tree);
+    }
+    let limits = crate::engine::config::BackpressureLimits {
+        memtable_slowdown: 32 * 1024,
+        memtable_stop: 64 * 1024,
+        ..crate::engine::config::BackpressureLimits::default()
+    };
+    let tier = Arc::new(AtomicU8::new(0));
+    let wake = Arc::new(Wake::default());
+    let gc_watermark = Arc::new(AtomicU64::new(0));
+    // A flush threshold no write reaches and the age trigger off: only the
+    // pressure moves, so the stop level is reached by the writes alone.
+    let mgr = FlushManager::start(
+        &trees,
+        GcWatermarks::uniform(&gc_watermark),
+        u64::MAX,
+        usize::MAX,
+        1,
+        0,
+        Arc::clone(&wake),
+        Arc::new(Wake::default()),
+        None,
+        MemtablePressure {
+            budget: Arc::clone(&budget),
+            thresholds: limits.memtable_thresholds(),
+            tier: Arc::clone(&tier),
+        },
+    )
+    .expect("start FlushManager");
+
+    // 40 KiB in each tree: neither alone reaches the stop level, the two
+    // together do.
+    let value = vec![7u8; 1024];
+    for tree in trees.values() {
+        for i in 0..40u32 {
+            tree.insert(i.to_be_bytes(), value.clone(), u64::from(i));
+        }
+    }
+    wake.notify();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while tier.load(Ordering::Relaxed) != 2 {
+        assert!(std::time::Instant::now() < deadline, "never stopped");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    for tree in trees.values() {
+        tree.flush_active_memtable(0).expect("flush");
+    }
+    wake.notify();
+    while tier.load(Ordering::Relaxed) != 0 {
+        assert!(std::time::Instant::now() < deadline, "never released");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(mgr);
 }
 
 #[test]

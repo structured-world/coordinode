@@ -12,6 +12,29 @@ use tempfile::TempDir;
 
 use super::*;
 
+/// Remove every manifest snapshot (`v{id}`) and edit log (`edits-{id}`) of
+/// the tree at `tree_dir`, its tables left in place: the structural damage
+/// that makes the next open repair the tree.
+fn lose_manifest(tree_dir: &Path) {
+    let numbered = |rest: Option<&str>| {
+        rest.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut lost = 0;
+    for entry in std::fs::read_dir(tree_dir).expect("read tree dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if numbered(name.strip_prefix('v')) || numbered(name.strip_prefix("edits-")) {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+            lost += 1;
+        }
+    }
+    assert!(
+        lost > 0,
+        "layout changed: no manifest file in {}",
+        tree_dir.display()
+    );
+}
+
 fn durable_cfg(dir: &TempDir) -> StorageConfig {
     StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -599,13 +622,13 @@ fn lossy_open_repair_forces_checkpoint_rebuild() {
         engine.persist().expect("persist B");
     } // engine closed: the damage below must hit a quiesced tree
 
-    // Structural damage + content damage: the lost `current` pointer makes
-    // the next open run a repair, and the corrupt post-checkpoint tables
-    // force that repair's salvage to drop blocks (a lossy replay scope).
+    // Structural damage + content damage: the lost manifest makes the next
+    // open run a repair, and the corrupt post-checkpoint tables force that
+    // repair's salvage to drop blocks (a lossy replay scope).
     let node_dir = dir.path().join(Partition::Node.name());
     let corrupted = corrupt_post_checkpoint_tables(&node_dir.join("tables"), &root);
     assert!(corrupted > 0, "test must corrupt a post-checkpoint table");
-    std::fs::remove_file(node_dir.join("current")).expect("remove current");
+    lose_manifest(&node_dir);
 
     // Reopen: open succeeds by structural repair, and the repair is lossy.
     let engine = open(&dir);
@@ -644,6 +667,15 @@ fn lossy_open_repair_forces_checkpoint_rebuild() {
         Some(b"tail-B".as_slice()),
         "post-checkpoint oplog tail must be replayed"
     );
+
+    // The rebuild settled the repair: the tree no longer reports it.
+    drop(engine);
+    let engine = open(&dir);
+    assert!(
+        engine.open_repairs().is_empty(),
+        "a rebuilt partition is not reported again: {:?}",
+        engine.open_repairs()
+    );
 }
 
 /// The reported dead end: a lossy open repair with NO checkpoint to rebuild
@@ -678,7 +710,7 @@ fn lossy_open_repair_without_checkpoint_reports_not_clean() {
     let node_dir = dir.path().join(Partition::Node.name());
     let corrupted = corrupt_post_checkpoint_tables(&node_dir.join("tables"), &root);
     assert!(corrupted > 0, "test must corrupt a table");
-    std::fs::remove_file(node_dir.join("current")).expect("remove current");
+    lose_manifest(&node_dir);
 
     let engine = open(&dir);
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
@@ -695,6 +727,17 @@ fn lossy_open_repair_without_checkpoint_reports_not_clean() {
         "a lossy repair without a rebuild source must not read clean: {report:?}"
     );
     assert!(report.checkpoint_used.is_none());
+
+    // Nothing restored the loss, so it is not forgotten across a restart:
+    // the next open reports the same repair, lossy as before.
+    drop(engine);
+    let engine = open(&dir);
+    let again = engine
+        .open_repairs()
+        .iter()
+        .find(|r| r.partition == Partition::Node)
+        .expect("the unrestored loss is reported again");
+    assert!(again.is_lossy(), "{:?}", again.replay_scope);
 }
 
 /// The repair floor: sealed, durable, time-expired oplog segments that lie at
@@ -1082,7 +1125,7 @@ fn lossy_open_repair_losing_the_coverage_record_rebuilds_in_full() {
     let node_dir = dir.path().join(Partition::Node.name());
     let corrupted = corrupt_post_checkpoint_tables(&node_dir.join("tables"), &root);
     assert!(corrupted > 0, "test must corrupt a post-checkpoint table");
-    std::fs::remove_file(node_dir.join("current")).expect("remove current");
+    lose_manifest(&node_dir);
 
     let engine = open(&dir);
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
@@ -1189,7 +1232,7 @@ fn unscopable_loss_falls_back_to_full_rebuild() {
         obliterated > 0,
         "test must obliterate a post-checkpoint table"
     );
-    std::fs::remove_file(node_dir.join("current")).expect("remove current");
+    lose_manifest(&node_dir);
 
     let engine = open(&dir);
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");

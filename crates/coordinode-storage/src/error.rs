@@ -249,5 +249,31 @@ impl From<lsm_tree::Error> for StorageError {
     }
 }
 
+impl StorageError {
+    /// Whether this is damage to bytes a tree stored (a block that fails its
+    /// checksum or does not decode), as opposed to the environment, the
+    /// configuration or a missing capability: the reading tree needs a
+    /// rebuild, and nothing a retry or another call could change.
+    #[must_use]
+    pub fn is_data_damage(&self) -> bool {
+        use lsm_tree::Error;
+        matches!(
+            self,
+            Self::Engine(
+                Error::ChecksumMismatch { .. }
+                    | Error::HeaderCrcMismatch { .. }
+                    | Error::Decompress(_)
+                    | Error::DecompressedSizeTooLarge { .. }
+                    | Error::InvalidHeader(_)
+                    | Error::InvalidTag(_)
+                    | Error::InvalidTrailer
+                    | Error::RangeTombstoneDecode { .. }
+                    | Error::PageEccUnrecoverable { .. }
+                    | Error::Excised { .. }
+            )
+        )
+    }
+}
+
 /// Result type alias for storage operations.
 pub type StorageResult<T> = Result<T, StorageError>;

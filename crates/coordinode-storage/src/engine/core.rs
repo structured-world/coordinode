@@ -241,6 +241,9 @@ pub struct StorageEngine {
     /// the compaction monitor each poll cycle so the commit-path check is a
     /// single relaxed atomic load.
     write_pressure: Arc<AtomicU8>,
+    /// The memtable axis of the same verdict, latched by the flush monitor
+    /// as writes fill the memtables and flushes drain them.
+    memtable_pressure: Arc<AtomicU8>,
     /// Pauses this node's Raft applies, when a Raft state machine runs over
     /// the engine; read by whatever replaces or copies a partition at an
     /// exact log position. Written once per state machine open.
@@ -713,10 +716,15 @@ impl StorageEngine {
         // (wrong comparator, missing dictionary) still propagate as errors.
         let repair_policy = lsm_tree::RepairPolicy::default().salvage(true);
 
+        // One write buffer for every partition tree: the memtable axis of the
+        // write-pressure verdict bounds their unflushed bytes together.
+        let write_buffer = Arc::new(lsm_tree::WriteBufferBudget::default());
+
         // Pass 1: Schema partition (single-tier, no routing).
         let schema_config = config
             .to_tree_config(Partition::Schema, Arc::clone(&seqno))
-            .use_cache(Arc::clone(&cache));
+            .use_cache(Arc::clone(&cache))
+            .write_buffer_budget(Arc::clone(&write_buffer));
         let (schema_tree, schema_repair) = schema_config.open_or_repair(repair_policy)?;
         if let Some(report) = schema_repair {
             tracing::warn!(
@@ -777,7 +785,8 @@ impl StorageEngine {
             partition_l0_endpoint.insert(part, l0_endpoint);
             let tree_config = config
                 .to_tree_config_with_routing(part, Arc::clone(&seqno), Some(&routing))
-                .use_cache(Arc::clone(&cache));
+                .use_cache(Arc::clone(&cache))
+                .write_buffer_budget(Arc::clone(&write_buffer));
             let (tree, repair) = tree_config.open_or_repair(repair_policy)?;
             if let Some(report) = repair {
                 tracing::warn!(
@@ -845,7 +854,25 @@ impl StorageEngine {
                     let mut covered: HashMap<Partition, TreeCoverage> =
                         HashMap::with_capacity(trees.len());
                     for (&part, tree) in &trees {
-                        covered.insert(part, TreeCoverage::read(tree, Domain::Journal)?);
+                        match TreeCoverage::read(tree, Domain::Journal) {
+                            Ok(record) => {
+                                covered.insert(part, record);
+                            }
+                            // A tree whose record is damaged no longer says
+                            // what it holds: like a rebuild cut short, it is
+                            // left out of the replay below and rebuilt by the
+                            // repair that follows the open.
+                            Err(e) if e.is_data_damage() => {
+                                tracing::warn!(
+                                    partition = part.name(),
+                                    error = %e,
+                                    "a partition's journal coverage record is damaged; the \
+                                     partition is rebuilt from the latest checkpoint"
+                                );
+                                write_rebuild_intent(config.data_dir(), part)?;
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     // A tree without a coverage record is replayed every entry
                     // that touches it. No entry's effect can be durable in it:
@@ -1082,6 +1109,9 @@ impl StorageEngine {
             Arc::clone(&flush_wake),
             config.max_write_buffer_bytes,
         ));
+        // The memtable axis of the write-pressure verdict, latched by the
+        // flush monitor, which writes and finished flushes wake.
+        let memtable_pressure = Arc::new(AtomicU8::new(0));
         let flush_manager = FlushManager::start(
             &trees,
             gc_controller.watermarks(),
@@ -1092,6 +1122,11 @@ impl StorageEngine {
             flush_wake,
             Arc::clone(&compaction_wake),
             flush_journal,
+            crate::engine::flush::MemtablePressure {
+                budget: write_buffer,
+                thresholds: config.backpressure.memtable_thresholds(),
+                tier: Arc::clone(&memtable_pressure),
+            },
         )?;
 
         // Feed the backpressure thresholds to every partition tree so the
@@ -1334,6 +1369,7 @@ impl StorageEngine {
             columnar_tables,
             open_repairs,
             write_pressure,
+            memtable_pressure,
             raft_fence: parking_lot::RwLock::new(None),
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
@@ -1346,7 +1382,33 @@ impl StorageEngine {
             space: Arc::new(crate::engine::space::SpaceGuard::new(config)),
         };
         engine.drain_local_journal()?;
+        // A repair that lost nothing owes only the tail the journal or the
+        // log replays, which the open above has done: the trees stop owing
+        // its report. A lossy one stays owed until a rebuild restores it.
+        for repair in &engine.open_repairs {
+            if !repair.is_lossy() {
+                engine.acknowledge_open_repair(repair.partition)?;
+            }
+        }
         Ok(engine)
+    }
+
+    /// Let `partition`'s tree stop owing the report of the repair this open
+    /// ran on it, once its replay obligation is met: without it every later
+    /// open hands the same report out again. `false` when no repair of the
+    /// partition is owed.
+    ///
+    /// # Errors
+    ///
+    /// The tree cannot install the version without the report.
+    fn acknowledge_open_repair(&self, partition: Partition) -> StorageResult<bool> {
+        use lsm_tree::AbstractTree as _;
+        let Some(repair) = self.open_repairs.iter().find(|r| r.partition == partition) else {
+            return Ok(false);
+        };
+        Ok(self
+            .tree(partition)?
+            .acknowledge_repair_report(repair.report.id)?)
     }
 
     /// On a store with its own journal, fold what a member-local journal
@@ -1380,16 +1442,20 @@ impl StorageEngine {
         &self.space
     }
 
-    /// The cached write-pressure verdict (one relaxed atomic load), latched
-    /// by the compaction monitor from the worst per-partition backpressure
-    /// signal. `Stop` means new client writes should be rejected (retryable)
-    /// until compaction drains the debt; nothing in the engine sleeps on it.
+    /// The cached write-pressure verdict (two relaxed atomic loads): the
+    /// worse of the per-partition table verdict the compaction monitor
+    /// latches and the memtable verdict the flush monitor latches. `Stop`
+    /// means new client writes should be rejected (retryable) until
+    /// compaction or flushes drain; nothing in the engine sleeps on it.
     #[must_use]
     pub fn write_pressure(&self) -> WritePressure {
-        WritePressure::from_u8(
-            self.write_pressure
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        let tables = self
+            .write_pressure
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let memtables = self
+            .memtable_pressure
+            .load(std::sync::atomic::Ordering::Relaxed);
+        WritePressure::from_u8(tables.max(memtables))
     }
 
     /// Test-only override of the cached pressure tier (the production value
@@ -2408,6 +2474,9 @@ impl StorageEngine {
         }
         self.rebind_coverage(partition)?;
         self.finish_rebuild(partition)?;
+        // The rebuilt tree is on disk: whatever an open-time repair of it
+        // lost is restored.
+        self.acknowledge_open_repair(partition)?;
         Ok(base_len)
     }
 
@@ -2469,20 +2538,7 @@ impl StorageEngine {
     /// before the tree is cleared and removed by [`Self::finish_rebuild`]
     /// once the rebuilt tree is on disk.
     fn begin_rebuild(&self, partition: Partition) -> StorageResult<()> {
-        let dir = self.data_dir.join(REBUILD_INTENT_DIR);
-        let io = |what: &str, e: std::io::Error| {
-            StorageError::Io(format!(
-                "rebuild intent for {}: {what}: {e}",
-                partition.name()
-            ))
-        };
-        // no-std: StoragePort trait, caller-injected
-        std::fs::create_dir_all(&dir).map_err(|e| io("create dir", e))?;
-        let file =
-            std::fs::File::create(dir.join(partition.name())).map_err(|e| io("create", e))?;
-        file.sync_all().map_err(|e| io("sync", e))?;
-        sync_dir(&dir)?;
-        sync_dir(&self.data_dir)
+        write_rebuild_intent(&self.data_dir, partition)
     }
 
     /// Persist the rebuilt tree of `partition`, then drop its intent.
@@ -2649,6 +2705,8 @@ impl StorageEngine {
             }
         }
         self.finish_rebuild(partition)?;
+        // The lost ranges are restored and on disk.
+        self.acknowledge_open_repair(partition)?;
         Ok(base_len)
     }
 
@@ -5647,13 +5705,44 @@ fn group_history_evidence(
     if endpoint.join(CONSENSUS_LOG_MARKER).exists() {
         return Ok(Some("its log is bound to a consensus group"));
     }
-    for tree in trees.values() {
-        let raft = TreeCoverage::read(tree, Domain::Raft)?;
+    for (part, tree) in trees {
+        let raft = match TreeCoverage::read(tree, Domain::Raft) {
+            Ok(raft) => raft,
+            // A damaged tree is rebuilt from this store's own checkpoint and
+            // journal, which the other trees and the log marker vouch for.
+            Err(e) if e.is_data_damage() => {
+                tracing::warn!(
+                    partition = part.name(),
+                    error = %e,
+                    "a partition's group coverage record is damaged"
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if raft.has_record() || raft.marked_indices().next().is_some() {
             return Ok(Some("its trees hold entries of a group's log"));
         }
     }
     Ok(None)
+}
+
+/// Record, durably, that `partition` of the store at `data_dir` holds an
+/// unknown part of its data and of its coverage record, and must be rebuilt.
+fn write_rebuild_intent(data_dir: &Path, partition: Partition) -> StorageResult<()> {
+    let dir = data_dir.join(REBUILD_INTENT_DIR);
+    let io = |what: &str, e: std::io::Error| {
+        StorageError::Io(format!(
+            "rebuild intent for {}: {what}: {e}",
+            partition.name()
+        ))
+    };
+    // no-std: StoragePort trait, caller-injected
+    std::fs::create_dir_all(&dir).map_err(|e| io("create dir", e))?;
+    let file = std::fs::File::create(dir.join(partition.name())).map_err(|e| io("create", e))?;
+    file.sync_all().map_err(|e| io("sync", e))?;
+    sync_dir(&dir)?;
+    sync_dir(data_dir)
 }
 
 fn read_rebuild_intents(data_dir: &Path) -> StorageResult<Vec<Partition>> {

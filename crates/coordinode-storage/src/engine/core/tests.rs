@@ -944,11 +944,35 @@ fn all_partitions_support_crud() {
     }
 }
 
-/// Losing a partition's `current` manifest pointer (artifacts intact) must not
-/// make the whole engine unopenable: open repairs the tree from its SSTs and
-/// reports the repair so the caller can decide whether a replay is owed.
+/// Remove every manifest snapshot (`v{id}`) and edit log (`edits-{id}`) of
+/// the tree at `tree_dir`, its tables left in place: the manifest loss an
+/// open repairs.
+fn lose_manifest(tree_dir: &std::path::Path) {
+    let numbered = |rest: Option<&str>| {
+        rest.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut lost = 0;
+    for entry in std::fs::read_dir(tree_dir).expect("read tree dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if numbered(name.strip_prefix('v')) || numbered(name.strip_prefix("edits-")) {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+            lost += 1;
+        }
+    }
+    assert!(
+        lost > 0,
+        "layout changed: no manifest file in {}",
+        tree_dir.display()
+    );
+}
+
+/// Losing a partition's manifest (its tables intact) must not make the whole
+/// engine unopenable: open repairs the tree from its SSTs, reports the repair
+/// so the caller can decide whether a replay is owed, and once the open has
+/// replayed what it owed the tree stops reporting it.
 #[test]
-fn open_repairs_partition_with_lost_manifest_pointer() {
+fn open_repairs_partition_with_lost_manifest() {
     use lsm_tree::AbstractTree;
 
     let dir = TempDir::new().expect("tempdir");
@@ -973,29 +997,38 @@ fn open_repairs_partition_with_lost_manifest_pointer() {
             .expect("flush");
     }
 
-    // Simulate manifest-pointer loss: artifacts present, `current` gone.
-    let current = dir.path().join(Partition::Node.name()).join("current");
-    assert!(current.exists(), "layout changed: no current pointer file");
-    std::fs::remove_file(&current).expect("remove current");
+    // Manifest loss: tables present, every snapshot and edit log gone.
+    lose_manifest(&dir.path().join(Partition::Node.name()));
 
     // Reopen: the engine must come up (repairing the Node tree), the data
     // must still be readable, and the repair must be reported.
-    let engine = StorageEngine::open(&config).expect("open after manifest loss");
-    assert_eq!(
-        engine
-            .get(Partition::Node, b"node:manifest-loss")
-            .expect("get")
-            .as_deref(),
-        Some(&b"survives"[..])
+    {
+        let engine = StorageEngine::open(&config).expect("open after manifest loss");
+        assert_eq!(
+            engine
+                .get(Partition::Node, b"node:manifest-loss")
+                .expect("get")
+                .as_deref(),
+            Some(&b"survives"[..])
+        );
+        let repairs = engine.open_repairs();
+        assert_eq!(repairs.len(), 1, "exactly one partition was repaired");
+        assert_eq!(repairs[0].partition, Partition::Node);
+        // Nothing was lost (every SST intact), so no replay is owed.
+        assert!(matches!(
+            repairs[0].replay_scope,
+            lsm_tree::WalReplayScope::TailOnly
+        ));
+    }
+
+    // The tree keeps a report until it is acknowledged; the open settled
+    // this one, so the next open reports nothing.
+    let engine = StorageEngine::open(&config).expect("reopen");
+    assert!(
+        engine.open_repairs().is_empty(),
+        "a lossless repair is not reported again: {:?}",
+        engine.open_repairs()
     );
-    let repairs = engine.open_repairs();
-    assert_eq!(repairs.len(), 1, "exactly one partition was repaired");
-    assert_eq!(repairs[0].partition, Partition::Node);
-    // Nothing was lost (every SST intact), so no replay is owed.
-    assert!(matches!(
-        repairs[0].replay_scope,
-        lsm_tree::WalReplayScope::TailOnly
-    ));
 }
 
 /// Repair at open makes every recovered table a run of its own in L0, so a
@@ -1034,9 +1067,7 @@ fn open_repairs_partition_with_more_than_255_tables() {
         }
     }
 
-    let current = dir.path().join(Partition::Node.name()).join("current");
-    assert!(current.exists(), "layout changed: no current pointer file");
-    std::fs::remove_file(&current).expect("remove current");
+    lose_manifest(&dir.path().join(Partition::Node.name()));
 
     {
         let engine = StorageEngine::open(&config).expect("open after manifest loss");

@@ -17,7 +17,7 @@ use crate::group::GroupId;
 /// anything in the directory (index key layouts, partition layout, persisted
 /// consensus state). A directory of another format is refused, so a build
 /// never reads keys laid out by another.
-pub const ENGINE_FORMAT_VERSION: u32 = 3;
+pub const ENGINE_FORMAT_VERSION: u32 = 4;
 
 /// The engine format version this process runs: [`ENGINE_FORMAT_VERSION`],
 /// raised by `COORDINODE_TEST_ENGINE_FORMAT_BUMP` in builds with the

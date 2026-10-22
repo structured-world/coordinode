@@ -996,15 +996,14 @@ dependencies = [
 
 [[package]]
 name = "coordinode-lsm-tree"
-version = "5.12.3"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5f4f179a6dfb6bf7757603318757f8e5b389e651e1da4c7a667ee34ee776720"
+checksum = "ae33c5812425cbc9a001d24cb20a97a528396892fc53cc1839a3be3694619930"
 dependencies = [
  "aes-gcm 0.11.1",
  "arc-swap",
  "chacha20poly1305 0.11.0",
  "cpufeatures 0.3.1",
- "enum_dispatch",
  "hashbrown 0.17.1",
  "io-uring",
  "libc",
@@ -1013,6 +1012,7 @@ dependencies = [
  "lz4_flex 0.14.0",
  "once_cell",
  "parking_lot",
+ "parking_lot_core",
  "portable-atomic",
  "rand_chacha 0.10.0",
  "reed-solomon-simd",
@@ -2213,18 +2213,6 @@ name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
-
-[[package]]
-name = "enum_dispatch"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
-dependencies = [
- "once_cell",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "env_filter"

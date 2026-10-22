@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -66,6 +66,45 @@ impl FlushTrigger {
     /// tombstone): wake the monitor rather than guess.
     pub(crate) fn wrote_unmeasured(&self) {
         self.wake.notify();
+    }
+}
+
+/// The memtable axis of the engine's write-pressure verdict: the unflushed
+/// bytes of every tree sharing `budget`, judged against `thresholds` each time
+/// the monitor runs and latched into `tier` (0/1/2 = none/slowdown/stop).
+pub(crate) struct MemtablePressure {
+    pub(crate) budget: Arc<lsm_tree::WriteBufferBudget>,
+    pub(crate) thresholds: lsm_tree::BackpressureThresholds,
+    pub(crate) tier: Arc<AtomicU8>,
+}
+
+impl MemtablePressure {
+    /// Judge the unflushed bytes now and latch the tier.
+    fn latch(&self) {
+        let unflushed = self.budget.unflushed_bytes();
+        let verdict = lsm_tree::Backpressure::compute(
+            &lsm_tree::BackpressureSignals {
+                unflushed_memtable_bytes: unflushed,
+                ..lsm_tree::BackpressureSignals::default()
+            },
+            &self.thresholds,
+        );
+        let tier = match verdict {
+            lsm_tree::Backpressure::None => 0u8,
+            lsm_tree::Backpressure::Slowdown { .. } => 1,
+            lsm_tree::Backpressure::Stop => 2,
+        };
+        let was = self.tier.swap(tier, Ordering::Relaxed);
+        if tier == 2 && was != 2 {
+            // An operator seeing WRITE_BACKPRESSURE rejections needs to know
+            // the flushes, not compaction, fell behind.
+            tracing::warn!(
+                unflushed_memtable_bytes = unflushed,
+                "write-backpressure STOP: shedding client writes until the \
+                 memtables are flushed"
+            );
+        }
+        metrics::gauge!("coordinode_storage_unflushed_memtable_bytes").set(unflushed as f64);
     }
 }
 
@@ -114,7 +153,8 @@ impl FlushManager {
     ///
     /// `journal` is the engine's journal, when it keeps one: a worker syncs it
     /// before it writes a sealed memtable, so no table holds an effect of an
-    /// entry the journal could still lose.
+    /// entry the journal could still lose. `pressure` is the memtable axis
+    /// of the write-pressure verdict the monitor latches on every pass.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         trees: &HashMap<Partition, lsm_tree::AnyTree>,
@@ -126,6 +166,7 @@ impl FlushManager {
         wake: Arc<Wake>,
         compaction_wake: Arc<Wake>,
         journal: Option<Arc<Mutex<EmbeddedOplog>>>,
+        pressure: MemtablePressure,
     ) -> StorageResult<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -168,6 +209,7 @@ impl FlushManager {
                         max_memtable_age_secs,
                         shutdown: shutdown_m,
                         wake: wake_m,
+                        pressure,
                     },
                 );
             })
@@ -215,6 +257,7 @@ struct FlushMonitorConfig {
     max_memtable_age_secs: u64,
     shutdown: Arc<AtomicBool>,
     wake: Arc<Wake>,
+    pressure: MemtablePressure,
 }
 
 /// Monitor loop: checks all partition trees when woken and submits flush
@@ -291,6 +334,10 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                 }
             }
         }
+
+        // After the rotations above, so a backlog this pass queued is judged
+        // with it; a finished flush wakes the monitor to judge it again.
+        cfg.pressure.latch();
 
         cfg.wake.wait(next_due);
     }
