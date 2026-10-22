@@ -31,6 +31,8 @@ pub mod tap;
 pub mod transaction;
 pub mod vector_keys;
 
+pub use compaction::CompactionStrategyKind;
+
 /// Most index entry effects one unit's DERIVED work may derive, on apply and
 /// on journal replay alike: a small unit cannot fan out without bound on
 /// every member.

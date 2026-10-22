@@ -1002,6 +1002,44 @@ fn the_maintenance_budget_parses_and_reaches_the_storage_config() {
     assert_eq!(sc.maintenance_backoff_ms, 0);
 }
 
+/// The compaction strategy, write slowdown rate, vector locality depth and
+/// columnar encoding level parse from the file and reach the engine; left
+/// unset, each keeps the engine's default.
+#[test]
+fn the_compaction_and_write_pacing_keys_reach_the_storage_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "compaction_strategy: planned\nwrite_slowdown_mb_per_sec: 32\n\
+         vector_locality_depth: 4\ncolumnar_encoded_from_level: 1\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(
+        c.byte_sizes().expect("sizes").write_slowdown_bytes_per_sec,
+        Some(32 * 1024 * 1024)
+    );
+    let sc = c.resolve_storage_config().expect("valid topology");
+    assert_eq!(
+        sc.compaction_strategy,
+        coordinode_storage::engine::CompactionStrategyKind::Planned
+    );
+    assert_eq!(sc.vector_locality_depth, 4);
+    assert_eq!(sc.columnar_encoded_from_level, 1);
+
+    let unset = ServerConfig::default()
+        .resolve_storage_config()
+        .expect("valid topology");
+    assert_eq!(
+        unset.compaction_strategy,
+        coordinode_storage::engine::CompactionStrategyKind::Leveled
+    );
+    assert_eq!(unset.write_slowdown_bytes_per_sec, 0);
+    assert_eq!(unset.vector_locality_depth, 0);
+    assert_eq!(unset.columnar_encoded_from_level, 3);
+}
+
 #[test]
 fn backpressure_thresholds_parse_and_reach_the_storage_config() {
     // Partial override: only the set keys change, the rest keep defaults,

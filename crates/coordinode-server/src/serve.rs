@@ -186,6 +186,10 @@ pub(crate) async fn serve(
         resume_free_bytes: _,
         maintenance_mb_per_sec: _,
         maintenance_backoff_ms: _,
+        compaction_strategy: _,
+        write_slowdown_mb_per_sec: _,
+        vector_locality_depth: _,
+        columnar_encoded_from_level: _,
         node_shard: _,
         registry_heartbeat_ms,
         registry_eviction_ms,
@@ -397,6 +401,9 @@ pub(crate) async fn serve(
     }
     if let Some(bytes) = sizes.maintenance_bytes_per_sec {
         storage_config.maintenance_bytes_per_sec = bytes;
+    }
+    if let Some(bytes) = sizes.write_slowdown_bytes_per_sec {
+        storage_config.write_slowdown_bytes_per_sec = bytes;
     }
     // Surface the page-ECC build/config mismatch: an operator who asked
     // for per-block ECC on a binary built without the feature gets a

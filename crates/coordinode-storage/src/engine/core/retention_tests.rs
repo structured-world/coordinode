@@ -1129,6 +1129,50 @@ fn partition_gauge(seen: &[Observed], name: &str, part: Partition) -> Option<f64
         .map(|(_, _, value)| *value)
 }
 
+/// Each partition's own read counters are published under its name: after
+/// reads that went to the node tree's blocks, its cache hit ratio is there.
+#[cfg(feature = "lsm-metrics")]
+#[test]
+fn the_tree_metrics_are_published_per_partition() {
+    let sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let dir = TempDir::new().expect("tempdir");
+    let engine = StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]))
+    .expect("open");
+    for i in 0..100u32 {
+        engine
+            .put(Partition::Node, format!("node:1:{i:05}").as_bytes(), b"v")
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+    for _ in 0..2 {
+        for i in 0..100u32 {
+            engine
+                .get(Partition::Node, format!("node:1:{i:05}").as_bytes())
+                .expect("get");
+        }
+    }
+
+    metrics::with_local_recorder(&GaugeCapture(Arc::clone(&sink)), || {
+        super::publish_tree_metrics(engine.coordinator.trees());
+    });
+    let ratio = partition_gauge(
+        &sink.lock(),
+        "coordinode_storage_block_cache_hit_ratio",
+        Partition::Node,
+    )
+    .expect("the node tree's cache hit ratio");
+    assert!(
+        ratio > 0.0,
+        "a second pass over the same keys hit no cached block: {ratio}"
+    );
+}
+
 /// The footprint gauges are published by the engine's own background
 /// sampling, on a deployment with no capacity limits too: they describe the
 /// trees, not the enforcement of a limit.

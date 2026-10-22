@@ -16,11 +16,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use lsm_tree::config::{ColumnEncoding, ColumnEncodingPolicy};
 use lsm_tree::fs::{Fs, SyncMode};
 use lsm_tree::rate_limiter::RateLimiter;
 use lsm_tree::table::columnar::{ColumnBatch, column_batch_to_entries, entries_to_column_batch};
 use lsm_tree::{
-    AnyTree, Cache, Config, InternalValue, SharedSequenceNumberGenerator, ValueType,
+    AnyTree, Cache, CapacityPool, Config, InternalValue, SharedSequenceNumberGenerator, ValueType,
     WriteBufferBudget,
 };
 
@@ -123,23 +124,42 @@ pub struct ColumnarTableRegistry {
     fs: Arc<dyn Fs>,
     seqno: SharedSequenceNumberGenerator,
     cache: Arc<Cache>,
-    /// Durability of every fsync the table trees issue, the same as the
-    /// engine's partition trees.
-    sync: SyncMode,
-    /// The engine's maintenance budget, which the table trees' compactions
-    /// draw from with the partition trees'.
-    maintenance: Arc<RateLimiter>,
-    /// The engine's write buffer: the table trees' unflushed bytes count
-    /// toward the memtable pressure with the partition trees'.
-    write_buffer: Arc<WriteBufferBudget>,
+    settings: TableTreeSettings,
     trees: Mutex<HashMap<String, AnyTree>>,
+}
+
+/// What every table tree shares with the engine's partition trees.
+pub(crate) struct TableTreeSettings {
+    /// Durability of every fsync the table trees issue.
+    pub(crate) sync: SyncMode,
+    /// The maintenance budget the table trees' compactions draw from.
+    pub(crate) maintenance: Arc<RateLimiter>,
+    /// The write buffer the table trees' unflushed bytes count toward.
+    pub(crate) write_buffer: Arc<WriteBufferBudget>,
+    /// The account of the room the table trees' compactions hold.
+    pub(crate) capacity: Arc<CapacityPool>,
+    /// How each level encodes the column pages.
+    pub(crate) column_encoding: ColumnEncodingPolicy,
+}
+
+impl TableTreeSettings {
+    /// Plain column pages in the levels above `level`, read most while warm,
+    /// and pages encoded per page from `level` down, mostly stored. A level
+    /// past the last one a tree has never encodes.
+    pub(crate) fn column_encoding_from(level: u8) -> ColumnEncodingPolicy {
+        if level >= 7 {
+            return ColumnEncodingPolicy::all(ColumnEncoding::Plain);
+        }
+        let mut policy = vec![ColumnEncoding::Plain; usize::from(level)];
+        policy.push(ColumnEncoding::Auto);
+        ColumnEncodingPolicy::new(policy)
+    }
 }
 
 impl ColumnarTableRegistry {
     /// Open the registry rooted at `base_dir` on `fs`, re-opening every table
     /// tree already present on disk (restart recovery). Trees share `fs`,
-    /// `seqno`, `cache`, the sync mode `sync`, the maintenance budget
-    /// `maintenance` and the write buffer `write_buffer` with the engine.
+    /// `seqno`, `cache` and `settings` with the engine.
     ///
     /// # Errors
     ///
@@ -150,9 +170,7 @@ impl ColumnarTableRegistry {
         fs: Arc<dyn Fs>,
         seqno: SharedSequenceNumberGenerator,
         cache: Arc<Cache>,
-        sync: SyncMode,
-        maintenance: Arc<RateLimiter>,
-        write_buffer: Arc<WriteBufferBudget>,
+        settings: TableTreeSettings,
     ) -> StorageResult<Self> {
         fs.create_dir_all(&base_dir)
             .map_err(lsm_tree::Error::from)?;
@@ -161,9 +179,7 @@ impl ColumnarTableRegistry {
             fs,
             seqno,
             cache,
-            sync,
-            maintenance,
-            write_buffer,
+            settings,
             trees: Mutex::new(HashMap::new()),
         };
         let mut trees = HashMap::new();
@@ -183,19 +199,21 @@ impl ColumnarTableRegistry {
     }
 
     /// Open (creating if absent) a columnar-mode tree at `dir`, sharing the
-    /// engine's filesystem, seqno generator, block cache and maintenance
-    /// budget.
+    /// engine's filesystem, seqno generator, block cache and table settings.
     fn open_tree(&self, dir: &Path) -> StorageResult<AnyTree> {
         // visible_seqno = seqno: every write is immediately visible, matching
         // the partition trees opened by the engine. with_shared_fs keeps the
         // tree on the engine's filesystem backend (e.g. MemFs for in-memory
         // engines).
+        let settings = &self.settings;
         let tree = Config::new_with_generators(dir, self.seqno.clone(), self.seqno.clone())
             .with_shared_fs(Arc::clone(&self.fs))
             .use_cache(Arc::clone(&self.cache))
-            .sync_mode(self.sync)
-            .compaction_rate_limiter(Arc::clone(&self.maintenance))
-            .write_buffer_budget(Arc::clone(&self.write_buffer))
+            .sync_mode(settings.sync)
+            .compaction_rate_limiter(Arc::clone(&settings.maintenance))
+            .write_buffer_budget(Arc::clone(&settings.write_buffer))
+            .compaction_capacity(Arc::clone(&settings.capacity))
+            .column_encoding_policy(settings.column_encoding.clone())
             .open()?;
         enable_columnar(&tree)?;
         Ok(tree)

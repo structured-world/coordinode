@@ -175,6 +175,12 @@ pub struct StorageEngine {
     /// The budget every compaction of every tree and the scrub read and
     /// write under, retuned live (see [`Self::set_maintenance_rate`]).
     maintenance: Arc<lsm_tree::rate_limiter::RateLimiter>,
+    /// The rate client writes are held to while a partition is past its
+    /// slowdown threshold (see [`Self::set_write_slowdown_rate`]).
+    write_slowdown: Arc<lsm_tree::rate_limiter::RateLimiter>,
+    /// Wakes the compaction monitor: a flush the engine runs itself adds
+    /// tables, as the flush manager's do.
+    compaction_wake: Arc<coordinode_core::txn::wake::Wake>,
     /// Configured endpoints — cloned from `StorageConfig.endpoints` at
     /// open time so subsystems (WAL/oplog placement, tier routing,
     /// hard-limit enforcement) can resolve target endpoints without
@@ -731,13 +737,18 @@ impl StorageEngine {
             config.maintenance_bytes_per_sec,
             config.maintenance_backoff_ms,
         );
+        // One account of the room compactions in progress hold, for every
+        // tree: they share the endpoints' volumes, so each reserves against
+        // what the others still have to write rather than the same free bytes.
+        let capacity_pool = Arc::new(lsm_tree::CapacityPool::default());
 
         // Pass 1: Schema partition (single-tier, no routing).
         let schema_config = config
             .to_tree_config(Partition::Schema, Arc::clone(&seqno))
             .use_cache(Arc::clone(&cache))
             .write_buffer_budget(Arc::clone(&write_buffer))
-            .compaction_rate_limiter(Arc::clone(&maintenance));
+            .compaction_rate_limiter(Arc::clone(&maintenance))
+            .compaction_capacity(Arc::clone(&capacity_pool));
         let (schema_tree, schema_repair) = schema_config.open_or_repair(repair_policy)?;
         if let Some(report) = schema_repair {
             tracing::warn!(
@@ -800,7 +811,8 @@ impl StorageEngine {
                 .to_tree_config_with_routing(part, Arc::clone(&seqno), Some(&routing))
                 .use_cache(Arc::clone(&cache))
                 .write_buffer_budget(Arc::clone(&write_buffer))
-                .compaction_rate_limiter(Arc::clone(&maintenance));
+                .compaction_rate_limiter(Arc::clone(&maintenance))
+                .compaction_capacity(Arc::clone(&capacity_pool));
             let (tree, repair) = tree_config.open_or_repair(repair_policy)?;
             if let Some(report) = repair {
                 tracing::warn!(
@@ -1146,18 +1158,29 @@ impl StorageEngine {
                 fs,
                 Arc::clone(&seqno),
                 Arc::clone(&cache),
-                config.oplog_sync_method.tree_sync_mode(),
-                Arc::clone(&maintenance),
-                Arc::clone(&write_buffer),
+                crate::columnar::TableTreeSettings {
+                    sync: config.oplog_sync_method.tree_sync_mode(),
+                    maintenance: Arc::clone(&maintenance),
+                    write_buffer: Arc::clone(&write_buffer),
+                    capacity: Arc::clone(&capacity_pool),
+                    column_encoding: crate::columnar::TableTreeSettings::column_encoding_from(
+                        config.columnar_encoded_from_level,
+                    ),
+                },
             )?)
         };
+        // The columnar tables, listed afresh on each pass of the flush and
+        // compaction monitors.
         #[cfg(feature = "columnar")]
-        let flushed_tables: Option<crate::engine::flush::TableSource> = Some(Box::new({
+        let table_source = || -> Option<crate::engine::flush::TableSource> {
             let tables = Arc::clone(&columnar_tables);
-            move || tables.trees()
-        }));
+            Some(Box::new(move || tables.trees()))
+        };
         #[cfg(not(feature = "columnar"))]
-        let flushed_tables = None;
+        let table_source = || -> Option<crate::engine::flush::TableSource> { None };
+        #[cfg(not(feature = "columnar"))]
+        let _ = &capacity_pool;
+        let flushed_tables = table_source();
 
         let flush_manager = FlushManager::start(
             &trees,
@@ -1200,8 +1223,15 @@ impl StorageEngine {
             config.compaction_l0_urgent_threshold,
             config.backpressure.bytes_slowdown,
             Arc::clone(&write_pressure),
-            compaction_wake,
+            Arc::clone(&compaction_wake),
+            config.compaction_strategy,
+            table_source(),
         )?;
+        // The rate client writes are held to while a partition is past its
+        // slowdown threshold.
+        let write_slowdown = Arc::new(lsm_tree::rate_limiter::RateLimiter::new(
+            config.write_slowdown_bytes_per_sec,
+        ));
 
         info!(
             path = %config.data_dir().display(),
@@ -1253,6 +1283,8 @@ impl StorageEngine {
             Some(
                 crate::engine::capacity::CapacityScanner::start(interval, move || {
                     publish_label_counts(&trees_c, &seqno_c);
+                    #[cfg(feature = "lsm-metrics")]
+                    publish_tree_metrics(&trees_c);
                     if !tracked {
                         publish_footprint(&trees_c);
                         return;
@@ -1382,6 +1414,8 @@ impl StorageEngine {
             fs,
             tree_sync: config.oplog_sync_method.tree_sync_mode(),
             maintenance,
+            write_slowdown,
+            compaction_wake,
             endpoints: config.endpoints.clone(),
             capacity: capacity_arc,
             capacity_scanner,
@@ -1775,6 +1809,21 @@ impl StorageEngine {
     pub fn set_maintenance_backoff(&self, ceiling: Option<std::time::Duration>) {
         self.maintenance
             .set_latency_backoff(ceiling.map(lsm_tree::rate_limiter::LatencyBackoff::new));
+    }
+
+    /// Hold client writes to `bytes_per_sec` while a partition is past its
+    /// slowdown threshold (`0`: full speed until the stop threshold).
+    pub fn set_write_slowdown_rate(&self, bytes_per_sec: u64) {
+        self.write_slowdown.set_rate(bytes_per_sec);
+    }
+
+    /// How long a commit of `bytes` waits under slowdown: its turn at the
+    /// write rate, after every byte debited before it. Zero without a rate.
+    pub(crate) fn write_slowdown_delay(&self, bytes: u64) -> std::time::Duration {
+        if self.write_slowdown.rate() == 0 {
+            return std::time::Duration::ZERO;
+        }
+        self.write_slowdown.reserve(bytes)
     }
 
     /// Every `STORAGE COLUMNAR` table's tree with its id, in id order.
@@ -4278,7 +4327,10 @@ impl StorageEngine {
         if let Some(local) = &self.local_journal {
             local.sync()?;
         }
-        tree.flush(&lock, 0)?;
+        if tree.flush(&lock, 0)?.is_some() {
+            // A new table may need compacting.
+            self.compaction_wake.notify();
+        }
         Ok(())
     }
 
@@ -5295,6 +5347,51 @@ fn publish_footprint(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
                 tracing::warn!(partition = part.name(), error = %e, "retained-history scan failed");
             }
         }
+    }
+}
+
+/// Publish what each partition tree's reads and compactions cost, as its own
+/// metrics count it: the bytes reads load, decode and copy, the useful and
+/// incidental payload of projected scans, the block cache hit ratio, and the
+/// bytes compactions read, wrote, carried without decoding and relocated.
+#[cfg(feature = "lsm-metrics")]
+fn publish_tree_metrics(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
+    use lsm_tree::AbstractTree;
+
+    for (part, tree) in trees {
+        let m = tree.metrics();
+        let name = part.name();
+        let work = m.compaction_work_measured();
+        for (metric, value) in [
+            ("coordinode_storage_read_bytes_total", m.bytes_read()),
+            ("coordinode_storage_decoded_bytes_total", m.bytes_decoded()),
+            ("coordinode_storage_copied_bytes_total", m.bytes_copied()),
+            (
+                "coordinode_storage_scan_useful_bytes_total",
+                m.payload_bytes_useful(),
+            ),
+            (
+                "coordinode_storage_scan_incidental_bytes_total",
+                m.payload_bytes_incidental(),
+            ),
+            ("coordinode_storage_compaction_read_bytes_total", work.read),
+            (
+                "coordinode_storage_compaction_written_bytes_total",
+                work.written,
+            ),
+            (
+                "coordinode_storage_compaction_carried_bytes_total",
+                work.carried,
+            ),
+            (
+                "coordinode_storage_blob_relocated_bytes_total",
+                m.blob_bytes_relocated(),
+            ),
+        ] {
+            metrics::counter!(metric, "partition" => name).absolute(value);
+        }
+        metrics::gauge!("coordinode_storage_block_cache_hit_ratio", "partition" => name)
+            .set(m.block_cache_hit_rate());
     }
 }
 

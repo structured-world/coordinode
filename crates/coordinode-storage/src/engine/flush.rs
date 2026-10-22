@@ -401,9 +401,14 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                 let state = table_states
                     .entry(table.clone())
                     .or_insert_with(|| TreeState::new(now));
-                // A table's rows carry no retention window: its flush keeps
-                // every version, as its other flushes do.
-                let source = || (FlushSource::Table(table), 0);
+                // The tables are node rows kept apart: they keep the
+                // versions the node partition keeps.
+                let source = || {
+                    (
+                        FlushSource::Table(table),
+                        cfg.gc_watermarks.for_partition(Partition::Node),
+                    )
+                };
                 consider_tree(&tree, state, source, now, &cfg, &mut next_due);
             }
         }

@@ -837,6 +837,27 @@ pub struct StorageConfig {
     /// the budget fixed. Default: 0. Retunable at runtime through
     /// `StorageEngine::set_maintenance_backoff`.
     pub maintenance_backoff_ms: u64,
+
+    /// How every tree's compactions are chosen: leveled, or planned for
+    /// query throughput within the maintenance budget. Default: leveled.
+    pub compaction_strategy: crate::engine::CompactionStrategyKind,
+
+    /// Bytes per second client writes are held to while a partition is past
+    /// its slowdown threshold, so writes slow down before the stop threshold
+    /// refuses them. `0` lets them run at full speed until the stop. Default:
+    /// 0. Retunable at runtime through `StorageEngine::set_write_slowdown_rate`.
+    pub write_slowdown_bytes_per_sec: u64,
+
+    /// Interleaving depth past which a compaction of the vector truth tier
+    /// rewrites blob files in key order, so a scan over the vectors (an index
+    /// build, a calibration) reads runs of adjacent values instead of
+    /// alternating between files. `0` never relocates for locality. Default: 0.
+    pub vector_locality_depth: u64,
+
+    /// The first LSM level whose `STORAGE COLUMNAR` column pages are encoded
+    /// with a light codec chosen per page; the levels above it keep plain
+    /// pages, which a read serves as views of themselves. Default: 3.
+    pub columnar_encoded_from_level: u8,
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -1003,6 +1024,10 @@ impl StorageConfig {
             resume_free_bytes: crate::engine::space::DEFAULT_RESUME_FREE_BYTES,
             maintenance_bytes_per_sec: 0,
             maintenance_backoff_ms: 0,
+            compaction_strategy: crate::engine::CompactionStrategyKind::Leveled,
+            write_slowdown_bytes_per_sec: 0,
+            vector_locality_depth: 0,
+            columnar_encoded_from_level: 3,
         }
     }
 
@@ -1294,7 +1319,16 @@ impl StorageConfig {
         // for (segregates large values into a separate file, keeps the
         // main LSM bloom-able and seek-efficient).
         if separates_values(part) {
-            config = config.with_kv_separation(Some(lsm_tree::KvSeparationOptions::default()));
+            let mut separation = lsm_tree::KvSeparationOptions::default();
+            // A scan over the vectors (an index build, a calibration) reads
+            // them in key order; inserts spread over time interleave them
+            // across blob files, which a compaction can rewrite as runs.
+            if part == Partition::VectorF32 {
+                if let Some(depth) = std::num::NonZeroU64::new(self.vector_locality_depth) {
+                    separation = separation.relocate_for_locality(depth, VECTOR_LOCALITY_BUDGET);
+                }
+            }
+            config = config.with_kv_separation(Some(separation));
         }
         // The rerank candidates of different searches overlap on a hot set,
         // so the truth tier keeps the vectors it reads in the block cache;
@@ -1341,6 +1375,10 @@ impl StorageConfig {
         config
     }
 }
+
+/// What relocating vector blob files for locality may cost a compaction, as a
+/// share of the bytes it writes anyway: half again at most.
+const VECTOR_LOCALITY_BUDGET: f32 = 0.5;
 
 /// Whether `part` keeps its large values in blob files beside its tables.
 pub(crate) fn separates_values(part: Partition) -> bool {

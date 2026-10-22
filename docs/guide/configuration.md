@@ -147,6 +147,10 @@ the key is unset.
 | `scrub_throttle_ms` | `50` | restart | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
 | `maintenance_mb_per_sec` | unset (unthrottled) | live (`StorageEngine::set_maintenance_rate`, bytes per second) | MiB per second the node's background maintenance reads and writes at most: every compaction of every partition and `STORAGE COLUMNAR` table, and the scrub, draw from this one budget, so together they cannot saturate the disk the foreground needs. A budget too low for the write rate lets compaction fall behind until write backpressure engages. Unset or `0` leaves maintenance unthrottled. |
 | `maintenance_backoff_ms` | unset (off) | live (`StorageEngine::set_maintenance_backoff`) | Smoothed read latency, in ms, above which the maintenance budget backs off, down to 5% of its rate, until the device answers faster again; it climbs back once the latency is 20% under this. Applies only while `maintenance_mb_per_sec` sets a rate. Unset or `0` keeps the budget at its rate. |
+| `compaction_strategy` | `leveled` | restart | How every partition's and `STORAGE COLUMNAR` table's compactions are chosen. `leveled` keeps each level a fixed size ratio over the one above. `planned` plans merges for query throughput over a round of compactions, from the share of point reads and scans each tree has served, and sizes them to the maintenance budget (`maintenance_mb_per_sec`), so set a budget with it. |
+| `write_slowdown_mb_per_sec` | unset (off) | live (`StorageEngine::set_write_slowdown_rate`, bytes per second) | MiB per second client writes are held to while a partition is past its slowdown threshold (`backpressure`): each commit waits its turn at this rate, so writes slow down well before the stop threshold refuses them. Unset or `0` lets writes run at full speed until the stop. |
+| `vector_locality_depth` | unset (off) | restart | How far the vector truth tier's values may interleave across blob files before a compaction rewrites them in key order, so a scan over the vectors (an index build, a quantizer calibration) reads runs of adjacent values. A relocation costs at most half again what the compaction writes anyway. Unset or `0` never relocates for locality. |
+| `columnar_encoded_from_level` | `3` | restart | The first LSM level whose `STORAGE COLUMNAR` column pages are encoded with a light codec chosen per page; the levels above keep plain pages, which a read serves without decoding. `7` or more keeps every level plain. |
 | `checkpoint_enabled` | `false` | restart | Whether periodic local checkpoints are taken (the base for WAL-replay repair when no healthy replica is available). A checkpoint hard-links the store's tables, so taking one copies nothing, but it keeps every table compaction replaces after it: on data that is rewritten, each retained checkpoint grows toward a second copy of the store. Off by default; enable it where that space buys repair without a replica (a standalone node), and size `checkpoint_keep` to the disk. |
 | `checkpoint_interval_secs` | `3600` (1 hour) | restart | Seconds between periodic checkpoints. A rebuild from the latest checkpoint replays the Raft log from the oldest entry the checkpoint lacks, so the log is kept from there: a longer interval keeps more log on disk. |
 | `checkpoint_dir` | `<data_dir>/checkpoints` | restart | Directory checkpoints are written under. |
@@ -440,6 +444,14 @@ scrub_enabled: false
 # the read latency (ms) above which it backs off.
 # maintenance_mb_per_sec: 200
 # maintenance_backoff_ms: 20
+# How compactions are chosen: leveled (default) or planned.
+# compaction_strategy: leveled
+# Client writes held to this rate (MiB/s) past the slowdown threshold.
+# write_slowdown_mb_per_sec: 64
+# Rewrite interleaved vector blob files in key order past this depth.
+# vector_locality_depth: 4
+# First level whose columnar pages are encoded per page.
+# columnar_encoded_from_level: 3
 
 # Periodic local checkpoints (base for WAL-replay repair); off by default.
 # checkpoint_enabled: false

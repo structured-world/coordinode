@@ -1556,6 +1556,58 @@ fn prefix_scan_paged_exact_limit_reports_exhausted() {
     assert_eq!(page.last_key, Some(b"p:b".to_vec()));
 }
 
+/// Under slowdown a commit carrying writes waits its turn at the write
+/// slowdown rate: a megabyte at a megabyte a second, after the second the
+/// limiter's burst covers, takes most of a second; with no rate set it
+/// commits at once, as it always did.
+#[test]
+fn commit_waits_at_the_slowdown_rate_under_slowdown_pressure() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path().to_string_lossy().as_ref(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap();
+    // Let the compaction monitor's startup pass land before forcing a tier.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    engine.force_write_pressure(1); // Slowdown
+    let value = vec![7u8; 1024 * 1024];
+
+    let commit = |key: &[u8]| {
+        let mut txn = mvcc_txn(&engine, &oracle);
+        txn.put(Partition::Node, key, &value).unwrap();
+        let started = std::time::Instant::now();
+        txn.commit(&ctx).expect("a slowed write commits");
+        started.elapsed()
+    };
+    let free = commit(b"slow:0");
+    assert!(
+        free < std::time::Duration::from_millis(500),
+        "no rate set, yet the commit waited {free:?}"
+    );
+
+    engine.set_write_slowdown_rate(1024 * 1024);
+    // The limiter's first second of burst, then a megabyte at a megabyte a
+    // second.
+    commit(b"slow:1");
+    let held = commit(b"slow:2");
+    assert!(
+        held >= std::time::Duration::from_millis(500),
+        "a megabyte past the burst at a megabyte a second took {held:?}"
+    );
+    assert!(engine.get(Partition::Node, b"slow:2").unwrap().is_some());
+}
+
 /// The write-admission gate at the single commit locus: when the engine's
 /// cached write pressure is `Stop`, a commit CARRYING WRITES is rejected
 /// with a retryable backpressure error and nothing is applied; a read-only

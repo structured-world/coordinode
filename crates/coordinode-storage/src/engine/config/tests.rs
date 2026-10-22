@@ -106,6 +106,30 @@ fn to_tree_config_builds_for_each_partition() {
     }
 }
 
+/// A locality depth reaches the vector truth tier's blob options and no other
+/// separated tree; at its default nothing relocates for locality.
+#[test]
+fn the_vector_locality_depth_reaches_only_the_truth_tier() {
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = StorageConfig::with_endpoints(vec![default_disk_endpoint(dir.path())]);
+    let seqno: lsm_tree::SharedSequenceNumberGenerator =
+        Arc::new(lsm_tree::SequenceNumberCounter::default());
+    let relocation = |config: &StorageConfig, part: Partition| {
+        config
+            .to_tree_config(part, Arc::clone(&seqno))
+            .kv_separation_opts
+            .expect("a separated tree")
+            .locality_relocation
+            .is_some()
+    };
+    assert!(!relocation(&config, Partition::VectorF32));
+
+    config.vector_locality_depth = 4;
+    assert!(relocation(&config, Partition::VectorF32));
+    assert!(!relocation(&config, Partition::Blob));
+}
+
 // ── Endpoint model tests ────────────────────────────────────────
 
 #[test]

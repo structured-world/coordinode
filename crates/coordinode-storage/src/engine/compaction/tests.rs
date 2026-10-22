@@ -33,6 +33,8 @@ fn compaction_scheduler_starts_and_stops() {
         64 * 1024 * 1024 * 1024, // debt_urgent_bytes
         Arc::new(std::sync::atomic::AtomicU8::new(0)),
         Arc::new(Wake::default()),
+        CompactionStrategyKind::Leveled,
+        None,
     )
     .expect("start CompactionScheduler");
 
@@ -173,7 +175,8 @@ fn a_compaction_that_did_work_is_counted_for_its_partition() {
         sender
             .send(CompactionRequest {
                 tree: tree.clone(),
-                partition: Partition::Node,
+                source: CompactionSource::Partition(Partition::Node),
+                strategy: CompactionStrategyKind::Leveled.for_tree(),
                 priority: CompactionPriority::Urgent,
                 gc_watermark: seqno.get(),
             })
@@ -236,11 +239,54 @@ fn compaction_scheduler_no_panic_with_l0_data() {
         64 * 1024 * 1024 * 1024,
         Arc::new(std::sync::atomic::AtomicU8::new(0)),
         Arc::new(Wake::default()),
+        CompactionStrategyKind::Leveled,
+        None,
     )
     .expect("start CompactionScheduler");
 
     std::thread::sleep(Duration::from_millis(300));
     drop(sched); // must not panic or deadlock
+}
+
+/// Under the planned strategy the scheduler compacts too. A planned tree
+/// keeps small runs in its top level until a unit's worth has gathered, so a
+/// stream of tiny flushes is sent down by the L0 table count instead: past
+/// 500 tables, the guard it shares with the leveled strategy.
+#[test]
+fn the_planned_strategy_compacts_a_tree() {
+    let (trees, _dir) = make_test_trees();
+    let tree = trees.get(&Partition::Node).expect("node tree").clone();
+    let seqno = lsm_tree::SequenceNumberCounter::default();
+    for round in 0_u64..510 {
+        tree.insert(b"key", round.to_le_bytes(), seqno.next());
+        tree.rotate_memtable();
+        let lock = tree.get_flush_lock();
+        tree.flush(&lock, 0).expect("flush");
+    }
+    let runs = tree.l0_run_count();
+    let gc_watermark = Arc::new(AtomicU64::new(0));
+    let sched = CompactionScheduler::start(
+        &trees,
+        GcWatermarks::uniform(&gc_watermark),
+        1,
+        8,
+        64 * 1024 * 1024 * 1024,
+        Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        Arc::new(Wake::default()),
+        CompactionStrategyKind::Planned,
+        None,
+    )
+    .expect("start CompactionScheduler");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while tree.l0_run_count() >= runs {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{runs} overlapping L0 runs were never compacted"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(sched);
 }
 
 #[test]
@@ -256,6 +302,8 @@ fn compaction_scheduler_multiple_workers_no_panic() {
         64 * 1024 * 1024 * 1024,
         Arc::new(std::sync::atomic::AtomicU8::new(0)),
         Arc::new(Wake::default()),
+        CompactionStrategyKind::Leveled,
+        None,
     )
     .expect("start CompactionScheduler");
 

@@ -1,6 +1,17 @@
 use super::*;
 use lsm_tree::Config;
 
+/// The engine's defaults for the table trees, syncing at `sync`.
+fn settings(sync: SyncMode) -> TableTreeSettings {
+    TableTreeSettings {
+        sync,
+        maintenance: std::sync::Arc::new(RateLimiter::new(0)),
+        write_buffer: std::sync::Arc::new(lsm_tree::WriteBufferBudget::default()),
+        capacity: std::sync::Arc::new(lsm_tree::CapacityPool::default()),
+        column_encoding: TableTreeSettings::column_encoding_from(3),
+    }
+}
+
 fn open_columnar_tree() -> (tempfile::TempDir, AnyTree) {
     let dir = tempfile::tempdir().unwrap();
     let tree = Config::new(dir.path(), Default::default(), Default::default())
@@ -53,9 +64,7 @@ fn new_registry(base: &std::path::Path) -> ColumnarTableRegistry {
         fs,
         seqno,
         cache,
-        SyncMode::Full,
-        std::sync::Arc::new(RateLimiter::new(0)),
-        std::sync::Arc::new(lsm_tree::WriteBufferBudget::default()),
+        settings(SyncMode::Full),
     )
     .unwrap()
 }
@@ -131,16 +140,8 @@ fn table_trees_sync_at_the_registry_mode() {
             let seqno: SharedSequenceNumberGenerator =
                 std::sync::Arc::new(lsm_tree::SequenceNumberCounter::default());
             let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(1024 * 1024));
-            ColumnarTableRegistry::open(
-                dir.path().to_path_buf(),
-                fs,
-                seqno,
-                cache,
-                mode,
-                std::sync::Arc::new(RateLimiter::new(0)),
-                std::sync::Arc::new(lsm_tree::WriteBufferBudget::default()),
-            )
-            .unwrap()
+            ColumnarTableRegistry::open(dir.path().to_path_buf(), fs, seqno, cache, settings(mode))
+                .unwrap()
         };
 
         let tree = open().create_or_open("orders").unwrap();

@@ -1876,14 +1876,29 @@ impl<'a> Transaction<'a> {
         let has_writes = !self.write_buffer.is_empty()
             || !self.range_removals.is_empty()
             || self.has_pending_merges();
-        if has_writes
-            && !self.pressure_exempt
-            && matches!(
-                self.engine.write_pressure(),
-                crate::engine::core::WritePressure::Stop
-            )
-        {
-            return Err(CommitError::Backpressure);
+        if has_writes && !self.pressure_exempt {
+            match self.engine.write_pressure() {
+                crate::engine::core::WritePressure::Stop => {
+                    return Err(CommitError::Backpressure);
+                }
+                // Under slowdown a commit waits its turn at the write rate,
+                // so writes slow down in bytes per second well before the
+                // stop threshold sheds them.
+                crate::engine::core::WritePressure::Slowdown => {
+                    let bytes: u64 = self
+                        .write_buffer
+                        .iter()
+                        .map(|((_, key), value)| {
+                            (key.len() + value.as_ref().map_or(0, Vec::len)) as u64
+                        })
+                        .sum();
+                    let delay = self.engine.write_slowdown_delay(bytes);
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                }
+                crate::engine::core::WritePressure::None => {}
+            }
         }
 
         // Flush adj merge buffers even in legacy (no MVCC) mode.

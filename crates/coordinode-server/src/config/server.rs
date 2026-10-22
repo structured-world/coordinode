@@ -313,6 +313,9 @@ pub struct ByteSizes {
     pub max_request_bytes: usize,
     /// `maintenance_mb_per_sec` in bytes per second (`None` = unthrottled).
     pub maintenance_bytes_per_sec: Option<u64>,
+    /// `write_slowdown_mb_per_sec` in bytes per second (`None` = full speed
+    /// until the stop threshold).
+    pub write_slowdown_bytes_per_sec: Option<u64>,
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -486,6 +489,16 @@ pub struct ServerConfig {
     /// Read latency, in ms, above which the maintenance budget backs off
     /// while it has a rate (`None` or 0 = never).
     pub maintenance_backoff_ms: Option<u64>,
+    /// How the trees' compactions are chosen (`None` = leveled).
+    pub compaction_strategy: Option<coordinode_storage::engine::CompactionStrategyKind>,
+    /// MiB per second client writes are held to while a partition is past
+    /// its slowdown threshold (`None` or 0 = full speed until the stop).
+    pub write_slowdown_mb_per_sec: Option<u64>,
+    /// Interleaving depth past which a compaction of the vector truth tier
+    /// rewrites its blob files in key order (`None` or 0 = never).
+    pub vector_locality_depth: Option<u64>,
+    /// First LSM level whose columnar pages are encoded per page (`None` = 3).
+    pub columnar_encoded_from_level: Option<u8>,
     /// The shard whose node rows this engine holds (`None` = 0). The invariant
     /// guard resolves a node from its id alone and needs it to build the key.
     pub node_shard: Option<u16>,
@@ -675,6 +688,10 @@ impl Default for ServerConfig {
             resume_free_bytes: None,
             maintenance_mb_per_sec: None,
             maintenance_backoff_ms: None,
+            compaction_strategy: None,
+            write_slowdown_mb_per_sec: None,
+            vector_locality_depth: None,
+            columnar_encoded_from_level: None,
             node_shard: None,
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
@@ -782,6 +799,10 @@ impl ServerConfig {
             maintenance_bytes_per_sec: self
                 .maintenance_mb_per_sec
                 .map(|mib| mib_to_bytes("maintenance_mb_per_sec", mib))
+                .transpose()?,
+            write_slowdown_bytes_per_sec: self
+                .write_slowdown_mb_per_sec
+                .map(|mib| mib_to_bytes("write_slowdown_mb_per_sec", mib))
                 .transpose()?,
         })
     }
@@ -1048,6 +1069,15 @@ impl ServerConfig {
         // settings (`byte_sizes`); its backoff needs no conversion.
         if let Some(ms) = self.maintenance_backoff_ms {
             cfg.maintenance_backoff_ms = ms;
+        }
+        if let Some(strategy) = self.compaction_strategy {
+            cfg.compaction_strategy = strategy;
+        }
+        if let Some(depth) = self.vector_locality_depth {
+            cfg.vector_locality_depth = depth;
+        }
+        if let Some(level) = self.columnar_encoded_from_level {
+            cfg.columnar_encoded_from_level = level;
         }
         if let Some(ms) = self.snapshot_wait_ms {
             cfg.snapshot_wait_ms = ms;

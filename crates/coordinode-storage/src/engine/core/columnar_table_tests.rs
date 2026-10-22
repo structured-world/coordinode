@@ -82,6 +82,61 @@ fn the_flush_manager_flushes_a_columnar_table_past_its_threshold() {
     assert_eq!(engine.columnar_scan("metrics", u64::MAX).unwrap().len(), 64);
 }
 
+/// The tables of the compaction scheduler: a columnar table whose flushes
+/// pile up overlapping runs in L0 is compacted in the background, like a
+/// partition, and every row still reads.
+#[test]
+fn the_compaction_scheduler_compacts_a_columnar_table() {
+    use lsm_tree::AbstractTree;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::open(&persistent_config(dir.path())).unwrap();
+    for round in 0..12u32 {
+        for i in 0..16u32 {
+            engine
+                .columnar_insert(
+                    "metrics",
+                    format!("row:{i:04}").into_bytes(),
+                    round.to_le_bytes().to_vec(),
+                    engine.next_seqno(),
+                )
+                .unwrap();
+        }
+        engine.flush_columnar_table("metrics").unwrap();
+    }
+    let tree = engine.columnar_table_tree("metrics").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tree.l0_run_count() >= 12 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "twelve overlapping L0 runs were never compacted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let rows = engine.columnar_scan("metrics", u64::MAX).unwrap();
+    assert_eq!(rows.len(), 16);
+    assert!(rows.iter().all(|(_, v)| v == &11u32.to_le_bytes().to_vec()));
+}
+
+/// A columnar table's tree encodes its column pages from the configured level
+/// down, plain above it.
+#[test]
+fn a_columnar_table_encodes_its_pages_from_the_configured_level() {
+    use lsm_tree::config::ColumnEncoding;
+
+    let policy = crate::columnar::TableTreeSettings::column_encoding_from(2);
+    assert_eq!(
+        &*policy,
+        &[
+            ColumnEncoding::Plain,
+            ColumnEncoding::Plain,
+            ColumnEncoding::Auto
+        ][..]
+    );
+    let never = crate::columnar::TableTreeSettings::column_encoding_from(7);
+    assert_eq!(&*never, &[ColumnEncoding::Plain][..]);
+}
+
 /// A statement's end makes a columnar table's rows durable: a journal holds
 /// them already, so nothing is flushed and the scan reads them from the
 /// memtable; without a journal the table is flushed then.

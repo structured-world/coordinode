@@ -36,6 +36,11 @@ page_ecc = ["lsm-tree/page_ecc"]
 # shared io_uring ring; if the kernel lacks io_uring at runtime it falls back
 # to StdFs. Off by default.
 io-uring = ["lsm-tree/io-uring"]
+# The engine's own read and compaction counters (bytes read, decoded and
+# copied, cache hits, compaction work), published per partition as metrics.
+# Counting costs a relaxed atomic add per block load, so a build that exports
+# no metrics leaves it off; the server turns it on.
+lsm-metrics = ["lsm-tree/metrics"]
 
 [dependencies]
 coordinode-core = { workspace = true }
