@@ -30,8 +30,8 @@ arc-swap = { version = "1", default-features = false }
 atomic-waker = { version = "1", default-features = false }
 base64 = { version = "0.22" }
 bigdecimal = { version = "0.4", default-features = false, features = ["serde"] }
-bit-set = { version = "0.8" }
-bit-vec = { version = "0.8" }
+bit-set = { version = "0.11" }
+bit-vec = { version = "0.10" }
 bitflags = { version = "2", default-features = false }
 bitpacking = { version = "0.9", default-features = false, features = ["bitpacker1x", "bitpacker4x"] }
 block-buffer = { version = "0.12", default-features = false }
@@ -55,6 +55,7 @@ clap_lex = { version = "1", default-features = false }
 cmov = { version = "0.5", default-features = false }
 colorchoice = { version = "1", default-features = false }
 const-oid = { version = "0.10", default-features = false }
+core_detect = { version = "1" }
 cpubits = { version = "0.1", default-features = false }
 crc32c = { version = "0.6", default-features = false }
 crc32fast = { version = "1" }
@@ -156,7 +157,7 @@ rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 rand_core-274715c4dabd11b0 = { package = "rand_core", version = "0.9", default-features = false, features = ["os_rng", "std"] }
 rand_core-93f6ce9d446188ac = { package = "rand_core", version = "0.10", default-features = false }
-rand_xorshift = { version = "0.4", default-features = false }
+rand_xorshift = { version = "0.5", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }
 rapidhash = { version = "4", default-features = false }
 rayon = { version = "1", default-features = false }
@@ -246,8 +247,8 @@ atomic-waker = { version = "1", default-features = false }
 autocfg = { version = "1", default-features = false }
 base64 = { version = "0.22" }
 bigdecimal = { version = "0.4", default-features = false, features = ["serde"] }
-bit-set = { version = "0.8" }
-bit-vec = { version = "0.8" }
+bit-set = { version = "0.11" }
+bit-vec = { version = "0.10" }
 bitflags = { version = "2", default-features = false }
 bitpacking = { version = "0.9", default-features = false, features = ["bitpacker1x", "bitpacker4x"] }
 block-buffer = { version = "0.12", default-features = false }
@@ -273,6 +274,7 @@ clap_lex = { version = "1", default-features = false }
 cmov = { version = "0.5", default-features = false }
 colorchoice = { version = "1", default-features = false }
 const-oid = { version = "0.10", default-features = false }
+core_detect = { version = "1" }
 cpubits = { version = "0.1", default-features = false }
 crc32c = { version = "0.6", default-features = false }
 crc32fast = { version = "1" }
@@ -387,7 +389,7 @@ rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 rand_core-274715c4dabd11b0 = { package = "rand_core", version = "0.9", default-features = false, features = ["os_rng", "std"] }
 rand_core-93f6ce9d446188ac = { package = "rand_core", version = "0.10", default-features = false }
-rand_xorshift = { version = "0.4", default-features = false }
+rand_xorshift = { version = "0.5", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }
 rapidhash = { version = "4", default-features = false }
 rayon = { version = "1", default-features = false }
