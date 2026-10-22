@@ -63,25 +63,22 @@ fn corrupt_sst_block_surfaces_checksum_mismatch() {
         engine.persist().expect("flush to SST");
     }
 
-    // Walk the partition's tables directory and corrupt the first SST
-    // file we find. lsm-tree's tables folder convention is
-    // `<endpoint>/<partition>/tables/`.
+    // Walk the partition's tables directory and corrupt its largest SST.
+    // lsm-tree's tables folder convention is `<endpoint>/<partition>/tables/`;
+    // the folder also keeps a reserve of empty files for tables yet to be
+    // written, which hold no block to corrupt.
     let tables_dir = dir.path().join(Partition::Node.name()).join("tables");
     assert!(
         tables_dir.exists(),
         "expected tables dir at {tables_dir:?} after persist",
     );
 
-    let mut sst_path: Option<std::path::PathBuf> = None;
-    for entry in std::fs::read_dir(&tables_dir).expect("read tables dir") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.is_file() {
-            sst_path = Some(path);
-            break;
-        }
-    }
-    let sst_path = sst_path.expect("at least one SST file after persist");
+    let sst_path = std::fs::read_dir(&tables_dir)
+        .expect("read tables dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.is_file())
+        .max_by_key(|path| std::fs::metadata(path).expect("stat").len())
+        .expect("at least one SST file after persist");
 
     // Open the file for read+write and flip a chunk of bytes in the
     // middle of the data section. We avoid the very-start bytes
