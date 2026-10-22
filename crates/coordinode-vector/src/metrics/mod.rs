@@ -82,6 +82,54 @@ pub fn log_simd_capabilities() {
     }
 }
 
+/// The order distances rank in: ascending, nearest first. A NaN distance (a
+/// Dot whose terms overflow with opposite signs) carries no distance and ranks
+/// after every number; `-0.0` and `0.0` are equal. Total, as every heap and
+/// sort over distances needs: a comparator calling NaN equal to everything is
+/// no order, which breaks a heap and lets a sort panic.
+#[inline]
+#[must_use]
+pub fn distance_order(a: f32, b: f32) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    // The common case decides in one comparison; equality and NaN are rare.
+    if a < b {
+        Ordering::Less
+    } else if a > b {
+        Ordering::Greater
+    } else {
+        match (a.is_nan(), b.is_nan()) {
+            (false, false) | (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+        }
+    }
+}
+
+/// Whether distance `a` ranks strictly before `b` under [`distance_order`]:
+/// the traversal's hot comparison, one `<` unless it fails, where a NaN `b`
+/// (no distance) still loses to any number.
+#[inline(always)]
+#[must_use]
+pub fn nearer(a: f32, b: f32) -> bool {
+    a < b || (b.is_nan() && !a.is_nan())
+}
+
+/// Whether distance `a` ranks strictly after `b` under [`distance_order`].
+#[inline(always)]
+#[must_use]
+pub fn farther(a: f32, b: f32) -> bool {
+    nearer(b, a)
+}
+
+/// [`distance_order`], equal distances in ascending `id`: the deterministic
+/// tie-break by identity every executor of one ranking applies, so they all
+/// return the same order.
+#[inline]
+#[must_use]
+pub fn ranked_order(a: f32, a_id: u64, b: f32, b_id: u64) -> core::cmp::Ordering {
+    distance_order(a, b).then(a_id.cmp(&b_id))
+}
+
 /// Compute distance between two vectors using the specified metric.
 ///
 /// Lower values = more similar for L2 and L1.

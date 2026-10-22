@@ -2,6 +2,42 @@ use super::*;
 use crate::index::VectorIndexConfig;
 use coordinode_cluster::{PartitionSet, VectorShardRouter};
 use coordinode_core::graph::types::VectorMetric;
+
+/// A merge across partitions ranks equal scores by id: the merged map's
+/// iteration order is arbitrary, and the result must not follow it. A NaN
+/// (no distance) never takes a place from a number, and the best occurrence
+/// of an id replicated to two partitions wins.
+#[test]
+fn a_merge_ranks_equal_scores_by_id_and_a_nan_last() {
+    let mut best = HashMap::new();
+    let tied: Vec<SearchResult> = (0..50u64)
+        .rev()
+        .map(|id| SearchResult { id, score: 1.0 })
+        .collect();
+    VectorIndexRegistry::accumulate_best(&mut best, tied);
+    VectorIndexRegistry::accumulate_best(
+        &mut best,
+        vec![
+            SearchResult {
+                id: 100,
+                score: f32::NAN,
+            },
+            SearchResult { id: 7, score: 0.5 },
+            SearchResult {
+                id: 3,
+                score: f32::NAN,
+            },
+        ],
+    );
+
+    let merged = VectorIndexRegistry::finalize_merge(best, 52);
+    let ids: Vec<u64> = merged.iter().map(|r| r.id).collect();
+    let mut expected = vec![7];
+    expected.extend((0..50u64).filter(|id| *id != 7));
+    expected.push(100);
+    assert_eq!(ids, expected);
+    assert_eq!(merged[0].score, 0.5, "the nearer occurrence of id 7 wins");
+}
 use std::sync::Arc;
 
 /// Test-double router: two partitions split on the sign of the first

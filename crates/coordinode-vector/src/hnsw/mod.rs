@@ -507,7 +507,7 @@ struct Candidate {
 
 impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool {
-        self.idx == other.idx
+        self.cmp(other) == std::cmp::Ordering::Equal
     }
 }
 impl Eq for Candidate {}
@@ -520,11 +520,10 @@ impl PartialOrd for Candidate {
 
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse for min-heap (BinaryHeap is max-heap by default)
-        other
-            .distance
-            .partial_cmp(&self.distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        // Reverse for min-heap (BinaryHeap is max-heap by default). Total:
+        // a NaN distance ranks last and equal distances fall to the index,
+        // so the heap's invariant holds whatever the kernel returns.
+        metrics::distance_order(other.distance, self.distance).then(other.idx.cmp(&self.idx))
     }
 }
 
@@ -656,7 +655,7 @@ struct FarCandidate {
 
 impl PartialEq for FarCandidate {
     fn eq(&self, other: &Self) -> bool {
-        self.idx == other.idx
+        self.cmp(other) == std::cmp::Ordering::Equal
     }
 }
 impl Eq for FarCandidate {}
@@ -669,9 +668,37 @@ impl PartialOrd for FarCandidate {
 
 impl Ord for FarCandidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.distance
-            .partial_cmp(&other.distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        // Total, as for `Candidate`: the worst at the top is a NaN, then the
+        // farthest distance.
+        metrics::distance_order(self.distance, other.distance).then(self.idx.cmp(&other.idx))
+    }
+}
+
+/// A result kept by an exact top-k selection: its distance and the node's
+/// id, ordered as the ranking is, by [`metrics::ranked_order`]. The heap holds
+/// the worst kept result at its top.
+#[derive(Clone, Copy)]
+struct RankedResult {
+    distance: f32,
+    id: u64,
+}
+
+impl PartialEq for RankedResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for RankedResult {}
+
+impl PartialOrd for RankedResult {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedResult {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        metrics::ranked_order(self.distance, self.id, other.distance, other.id)
     }
 }
 
@@ -2158,23 +2185,22 @@ impl HnswIndex {
                     }
                 })
                 .collect();
-            reranked.sort_by(|a, b| {
-                a.score
-                    .partial_cmp(&b.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            reranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
             reranked.truncate(k);
             Ok(reranked)
         } else {
-            // No quantization — return candidates directly
-            Ok(candidates
+            // No quantization: the candidates in the ranking's order, equal
+            // distances by id rather than by slot.
+            let mut ranked: Vec<SearchResult> = candidates
                 .into_iter()
-                .take(k)
                 .map(|c| SearchResult {
                     id: self.node_id(c.idx as usize),
                     score: c.distance,
                 })
-                .collect())
+                .collect();
+            ranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
+            ranked.truncate(k);
+            Ok(ranked)
         }
     }
 
@@ -2211,12 +2237,11 @@ impl HnswIndex {
             self.rabitq_params.as_ref(),
             &self.config.quantization,
         );
-        // Max-heap keyed by distance; pop the current worst when the heap
-        // grows past k. `FarCandidate` already implements `Ord` with
-        // ascending distance, which makes `BinaryHeap` behave as a
-        // max-heap over distance — exactly the shape we want for a
-        // k-smallest selector.
-        let mut heap: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(k + 1);
+        // Max-heap in the ranking's own order, distance then id: its top is
+        // the worst result kept, replaced by any candidate ranked before it.
+        // Keyed by id, not slot, so equal distances select the same results
+        // on every executor, whatever order the vectors were inserted in.
+        let mut heap: BinaryHeap<RankedResult> = BinaryHeap::with_capacity(k + 1);
         let store = self.nodes();
         for idx in 0..n {
             // A scan reaches every slot, not only linked nodes: one still
@@ -2224,33 +2249,26 @@ impl HnswIndex {
             if store.state(idx) != data_level0::NodeState::Live {
                 continue;
             }
-            let distance = self.compute_exact_distance(&qctx, idx);
-            let cand = FarCandidate {
-                distance,
-                idx: idx as u32,
+            let cand = RankedResult {
+                distance: self.compute_exact_distance(&qctx, idx),
+                id: self.node_id(idx),
             };
             if heap.len() < k {
                 heap.push(cand);
             } else if let Some(top) = heap.peek() {
-                if cand.distance < top.distance {
+                if cand < *top {
                     heap.pop();
                     heap.push(cand);
                 }
             }
         }
-        let mut out: Vec<SearchResult> = heap
+        heap.into_sorted_vec()
             .into_iter()
-            .map(|c| SearchResult {
-                id: self.node_id(c.idx as usize),
-                score: c.distance,
+            .map(|r| SearchResult {
+                id: r.id,
+                score: r.distance,
             })
-            .collect();
-        out.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        out
+            .collect()
     }
 
     /// Search with MVCC snapshot visibility checking.
@@ -2370,20 +2388,18 @@ impl HnswIndex {
                         score: self.compute_exact_distance(&qctx, c.idx as usize),
                     })
                     .collect();
-                reranked.sort_by(|a, b| {
-                    a.score
-                        .partial_cmp(&b.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                reranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
                 reranked
             } else {
-                candidates
+                let mut ranked: Vec<SearchResult> = candidates
                     .into_iter()
                     .map(|c| SearchResult {
                         id: self.node_id(c.idx as usize),
                         score: c.distance,
                     })
-                    .collect()
+                    .collect();
+                ranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
+                ranked
             };
 
             stats.candidates_fetched += results.len();
@@ -2497,11 +2513,7 @@ impl HnswIndex {
                 })
             })
             .collect();
-        reranked.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        reranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
         reranked.truncate(k);
         Ok(reranked)
     }
@@ -2594,11 +2606,7 @@ impl HnswIndex {
                     })
                 })
                 .collect();
-            results.sort_by(|a, b| {
-                a.score
-                    .partial_cmp(&b.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            results.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
 
             stats.candidates_fetched += results.len();
 
@@ -2680,7 +2688,8 @@ impl HnswIndex {
                     let neighbor_idx = neighbor_idx_u64 as usize;
                     if neighbor_idx < self.node_len() {
                         let dist = self.compute_distance(ctx, neighbor_idx);
-                        if dist < current_dist {
+                        // A NaN current (no distance) moves to any number.
+                        if metrics::nearer(dist, current_dist) {
                             current = neighbor_idx;
                             current_dist = dist;
                             changed = true;
@@ -2794,7 +2803,7 @@ impl HnswIndex {
             // entry-point whose cheap distance overestimates exact would
             // break out on iteration 1 and return just the seeded EP. That
             // was the SQ8 manual-calibration test regression.
-            if closest.distance > farthest_dist && results.len() >= ef {
+            if metrics::farther(closest.distance, farthest_dist) && results.len() >= ef {
                 break;
             }
             // Every node takes part in layer 0, so only upper layers ask.
@@ -2839,7 +2848,9 @@ impl HnswIndex {
 
                 let dist = self.compute_distance(ctx, neighbor_idx);
 
-                if dist < farthest_dist || results.len() < ef {
+                // A NaN at the top of the results (no distance) gives way to
+                // any number; a plain `<` would keep it there for good.
+                if metrics::nearer(dist, farthest_dist) || results.len() < ef {
                     candidates.push(Candidate {
                         distance: dist,
                         idx: neighbor_idx as u32,
@@ -2850,7 +2861,7 @@ impl HnswIndex {
                             idx: neighbor_idx as u32,
                         });
                     } else if let Some(mut top) = results.peek_mut() {
-                        if dist < top.distance {
+                        if metrics::nearer(dist, top.distance) {
                             *top = FarCandidate {
                                 distance: dist,
                                 idx: neighbor_idx as u32,
@@ -2873,9 +2884,7 @@ impl HnswIndex {
             })
             .collect();
         result_vec.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            metrics::distance_order(a.distance, b.distance).then(a.idx.cmp(&b.idx))
         });
         Ok(result_vec)
     }
@@ -2915,9 +2924,7 @@ impl HnswIndex {
         }
         meter.work(result_vec.len() as u64)?;
         result_vec.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            metrics::distance_order(a.distance, b.distance).then(a.idx.cmp(&b.idx))
         });
         // Truncate to user-requested ef — the oversample factor inflated
         // the frontier only, the caller still wants `ef` results.
@@ -3004,7 +3011,7 @@ impl HnswIndex {
             // size gate, a tiny index or an entry-point whose cheap
             // distance overestimates exact would break out on iteration 1
             // and return just the seeded EP.
-            if closest.distance > farthest_dist && results.len() >= ef {
+            if metrics::farther(closest.distance, farthest_dist) && results.len() >= ef {
                 break;
             }
 
@@ -3071,7 +3078,7 @@ impl HnswIndex {
 
                     let cheap_dist = self.compute_distance(ctx, neighbor_idx);
 
-                    if cheap_dist < farthest_dist || results.len() < ef {
+                    if metrics::nearer(cheap_dist, farthest_dist) || results.len() < ef {
                         // Promising under the cheap metric — verify with
                         // exact f32 before letting it into the kept top-ef.
                         // Unless no quantizer is active: then the frontier
@@ -3106,7 +3113,7 @@ impl HnswIndex {
                             }
                         } else {
                             if let Some(mut top) = results.peek_mut() {
-                                if exact_dist < top.distance {
+                                if metrics::nearer(exact_dist, top.distance) {
                                     *top = FarCandidate {
                                         distance: exact_dist,
                                         idx: neighbor_idx as u32,
@@ -3132,9 +3139,7 @@ impl HnswIndex {
             })
             .collect();
         result_vec.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            metrics::distance_order(a.distance, b.distance).then(a.idx.cmp(&b.idx))
         });
         Ok(result_vec)
     }
@@ -3387,9 +3392,7 @@ impl HnswIndex {
                 .filter(|c| !kept_set.contains(&u64::from(c.idx)))
                 .collect();
             rest.sort_by(|a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                metrics::distance_order(a.distance, b.distance).then(a.idx.cmp(&b.idx))
             });
             for c in rest {
                 if kept.len() >= max_conn {
@@ -3631,7 +3634,7 @@ impl HnswIndex {
                         scored.push((dist, nidx_u64));
                     }
                 }
-                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                scored.sort_by(|a, b| metrics::distance_order(a.0, b.0).then(a.1.cmp(&b.1)));
                 scored.truncate(max_conn);
                 Some(scored.into_iter().map(|(_, nid)| nid).collect())
             });
@@ -3670,9 +3673,7 @@ impl HnswIndex {
         // order without owning a heap.
         let mut pool: Vec<Candidate> = candidates.to_vec();
         pool.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            metrics::distance_order(a.distance, b.distance).then(a.idx.cmp(&b.idx))
         });
 
         let mut kept: Vec<usize> = Vec::with_capacity(max_conn);

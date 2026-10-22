@@ -528,7 +528,7 @@ impl VectorIndexRegistry {
         for r in results {
             best.entry(r.id)
                 .and_modify(|s| {
-                    if r.score < *s {
+                    if coordinode_vector::metrics::nearer(r.score, *s) {
                         *s = r.score;
                     }
                 })
@@ -537,17 +537,15 @@ impl VectorIndexRegistry {
     }
 
     /// Materialise the merged best-by-id map into the final top-`k`: ascending
-    /// by score (distance), truncated to `k`.
+    /// by score (distance), equal scores by id, truncated to `k`. The map's
+    /// iteration order is arbitrary, so the id tie-break is what makes the
+    /// merge return the same results on every run.
     fn finalize_merge(best: HashMap<u64, f32>, k: usize) -> Vec<SearchResult> {
         let mut out: Vec<SearchResult> = best
             .into_iter()
             .map(|(id, score)| SearchResult { id, score })
             .collect();
-        out.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        out.sort_by(|a, b| coordinode_vector::metrics::ranked_order(a.score, a.id, b.score, b.id));
         out.truncate(k);
         out
     }

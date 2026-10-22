@@ -144,3 +144,34 @@ fn high_dimensional() {
     let results = index.search(&query, 5);
     assert_eq!(results.len(), 5);
 }
+
+/// A Dot score whose terms overflow with opposite signs is NaN: it carries no
+/// distance and ranks after every number, never first, whatever the insertion
+/// order. Before, a NaN compared equal to everything and kept the place it was
+/// inserted at.
+#[test]
+fn a_nan_score_ranks_after_every_number() {
+    let mut index = FlatIndex::new(VectorMetric::DotProduct);
+    // 1e20 * 1e20 + 1e20 * -1e20 overflows to inf + -inf.
+    index.insert(1, vec![1e20, -1e20]);
+    index.insert(2, vec![1.0, 0.0]);
+    index.insert(3, vec![0.0, 1.0]);
+
+    let results = index.search(&[1e20, 1e20], 3);
+    assert_eq!(results.len(), 3);
+    assert!(results[2].score.is_nan(), "{results:?}");
+    assert_eq!(results[2].id, 1, "{results:?}");
+}
+
+/// Equal scores rank by ascending id: every executor of the same ranking
+/// returns the same order, whatever order the vectors were inserted in.
+#[test]
+fn equal_scores_rank_by_id() {
+    let mut index = FlatIndex::new(VectorMetric::L2);
+    index.insert(9, vec![1.0, 0.0]);
+    index.insert(3, vec![1.0, 0.0]);
+    index.insert(5, vec![1.0, 0.0]);
+
+    let ids: Vec<u64> = index.search(&[1.0, 0.0], 3).iter().map(|r| r.id).collect();
+    assert_eq!(ids, [3, 5, 9]);
+}

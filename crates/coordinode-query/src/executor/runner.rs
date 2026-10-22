@@ -9899,16 +9899,15 @@ fn execute_maxsim_top_k(
     impl Eq for Scored {}
     impl PartialEq for Scored {
         fn eq(&self, other: &Self) -> bool {
-            self.score == other.score && self.idx == other.idx
+            self.cmp(other) == Ordering::Equal
         }
     }
     impl Ord for Scored {
         fn cmp(&self, other: &Self) -> Ordering {
-            // Reverse score for min-at-top, then natural idx order.
-            other
-                .score
-                .partial_cmp(&self.score)
-                .unwrap_or(Ordering::Equal)
+            // The lowest similarity at the top, a NaN (no score) lowest of
+            // all: the similarity negated is a distance, ranked by the
+            // distance order. Then natural idx order.
+            coordinode_vector::metrics::distance_order(-self.score, -other.score)
                 .then_with(|| self.idx.cmp(&other.idx))
         }
     }

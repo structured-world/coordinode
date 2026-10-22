@@ -81,12 +81,9 @@ impl FlatIndex {
             })
             .collect();
 
-        // Sort by distance (ascending for L2/L1, "ascending" for transformed cosine/dot)
-        scored.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Nearest first (cosine and dot are turned into distances above),
+        // equal distances by id.
+        scored.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
 
         scored.truncate(k);
         scored

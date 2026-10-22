@@ -2093,6 +2093,48 @@ fn search_exact_handles_empty_index_and_zero_k() {
     assert!(idx2.search_with_mode(&q, 0, SearchMode::Exact).is_empty());
 }
 
+/// Exact search selects and orders its top-k by distance, equal distances
+/// by ascending id: of four identical vectors inserted 9, 3, 5, 7 the two
+/// smallest ids come back, in id order. Before, the selection kept the first
+/// inserted and the order followed insertion.
+#[test]
+fn exact_search_breaks_ties_by_id() {
+    let cfg = HnswConfig {
+        metric: VectorMetric::L2,
+        max_elements: 8,
+        ..HnswConfig::default()
+    };
+    let mut idx = HnswIndex::new(cfg);
+    for id in [9, 3, 5, 7] {
+        idx.insert(id, vec![1.0, 0.0, 0.0, 0.0]);
+    }
+    let ids: Vec<u64> = idx
+        .search_with_mode(&[1.0, 0.0, 0.0, 0.0], 2, SearchMode::Exact)
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids, [3, 5]);
+}
+
+/// A Dot distance whose terms overflow with opposite signs is NaN: it never
+/// takes a top-k place from a number, wherever it was inserted. Before, a NaN
+/// at the top of the selection heap could never be replaced.
+#[test]
+fn exact_search_ranks_a_nan_distance_last() {
+    let cfg = HnswConfig {
+        metric: VectorMetric::DotProduct,
+        max_elements: 8,
+        ..HnswConfig::default()
+    };
+    let mut idx = HnswIndex::new(cfg);
+    idx.insert(1, vec![1e20, -1e20, 0.0, 0.0]);
+    idx.insert(2, vec![1.0, 0.0, 0.0, 0.0]);
+    idx.insert(3, vec![0.0, 1.0, 0.0, 0.0]);
+    let results = idx.search_with_mode(&[1e20, 1e20, 0.0, 0.0], 2, SearchMode::Exact);
+    let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+    assert_eq!(ids, [2, 3], "{results:?}");
+}
+
 #[test]
 fn max_elements_preallocates_node_storage() {
     // HnswConfig::max_elements sizes the node store's first segment, so
