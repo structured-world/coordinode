@@ -108,12 +108,31 @@ impl MemtablePressure {
     }
 }
 
-/// Request to flush sealed memtables for a single partition tree.
+/// The trees that come and go while the engine runs (the `STORAGE COLUMNAR`
+/// tables), listed afresh on every monitor pass.
+pub(crate) type TableSource = Box<dyn Fn() -> Vec<(String, lsm_tree::AnyTree)> + Send>;
+
+/// Which tree a flush request is for: the name its log lines carry.
+enum FlushSource {
+    Partition(Partition),
+    Table(String),
+}
+
+impl FlushSource {
+    fn name(&self) -> &str {
+        match self {
+            Self::Partition(partition) => partition.name(),
+            Self::Table(table) => table,
+        }
+    }
+}
+
+/// Request to flush sealed memtables for a single tree.
 struct FlushRequest {
-    /// Clone of the partition tree handle (cheap: all fields are Arc internally).
+    /// Clone of the tree handle (cheap: all fields are Arc internally).
     tree: lsm_tree::AnyTree,
-    /// Partition tag — used for trace logging only.
-    partition: Partition,
+    /// Which tree it is, for trace logging only.
+    source: FlushSource,
     /// GC watermark seqno: versions with seqno ≤ this value may be evicted.
     gc_watermark: u64,
     /// Set by the monitor when it queued this request, cleared by the worker
@@ -155,6 +174,8 @@ impl FlushManager {
     /// before it writes a sealed memtable, so no table holds an effect of an
     /// entry the journal could still lose. `pressure` is the memtable axis
     /// of the write-pressure verdict the monitor latches on every pass.
+    /// `tables` lists the trees created and dropped at run time, which the
+    /// monitor flushes under the same triggers as the partition trees.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         trees: &HashMap<Partition, lsm_tree::AnyTree>,
@@ -167,6 +188,7 @@ impl FlushManager {
         compaction_wake: Arc<Wake>,
         journal: Option<Arc<Mutex<EmbeddedOplog>>>,
         pressure: MemtablePressure,
+        tables: Option<TableSource>,
     ) -> StorageResult<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -210,6 +232,7 @@ impl FlushManager {
                         shutdown: shutdown_m,
                         wake: wake_m,
                         pressure,
+                        tables,
                     },
                 );
             })
@@ -258,6 +281,76 @@ struct FlushMonitorConfig {
     shutdown: Arc<AtomicBool>,
     wake: Arc<Wake>,
     pressure: MemtablePressure,
+    tables: Option<TableSource>,
+}
+
+/// What the monitor keeps per tree between passes.
+struct TreeState {
+    /// When the tree's memtable last rotated, or the monitor started.
+    last_rotate: Instant,
+    /// Whether a flush request for the tree is queued or running.
+    queued: Arc<AtomicBool>,
+}
+
+impl TreeState {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_rotate: now,
+            queued: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// One tree's turn in a monitor pass: rotate its memtable when a trigger
+/// fires, queue a flush of its sealed memtables, and lower `next_due` to when
+/// its memtable comes due by age.
+fn consider_tree(
+    tree: &lsm_tree::AnyTree,
+    state: &mut TreeState,
+    source: impl FnOnce() -> (FlushSource, u64),
+    now: Instant,
+    cfg: &FlushMonitorConfig,
+    next_due: &mut Option<Duration>,
+) {
+    let max_age = Duration::from_secs(cfg.max_memtable_age_secs);
+    let active_bytes = tree.active_memtable().size();
+    let age = now.saturating_duration_since(state.last_rotate);
+    let age_triggered = cfg.max_memtable_age_secs > 0 && active_bytes > 0 && age >= max_age;
+
+    let rotate = active_bytes > cfg.flush_threshold_bytes
+        || tree.sealed_memtable_count() > cfg.max_sealed
+        || age_triggered;
+
+    if rotate {
+        // Rotate: atomically seal the active memtable → it joins the sealed list.
+        // A fresh empty memtable becomes the new active.
+        tree.rotate_memtable();
+        state.last_rotate = now;
+    } else if cfg.max_memtable_age_secs > 0 && active_bytes > 0 {
+        let remaining = max_age.saturating_sub(age);
+        *next_due = Some(next_due.map_or(remaining, |due| due.min(remaining)));
+    }
+
+    // Every sealed memtable is flushed, not only one sealed just now: a
+    // request turned away while the workers were busy leaves its memtable
+    // sealed, and an idle tree never trips the gates above again. One request
+    // per tree at a time, because a flush takes every sealed memtable of its
+    // tree.
+    if tree.sealed_memtable_count() > 0 && !state.queued.load(Ordering::Acquire) {
+        let (source, gc_watermark) = source();
+        let req = FlushRequest {
+            tree: tree.clone(),
+            source,
+            gc_watermark,
+            queued: Arc::clone(&state.queued),
+        };
+        state.queued.store(true, Ordering::Release);
+        // Non-blocking: with the workers busy the request waits for the next
+        // pass, which a finished flush wakes.
+        if cfg.sender.try_send(req).is_err() {
+            state.queued.store(false, Ordering::Release);
+        }
+    }
 }
 
 /// Monitor loop: checks all partition trees when woken and submits flush
@@ -279,14 +372,11 @@ struct FlushMonitorConfig {
 ///    active memtable is never rotated (no data to lose).
 fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMonitorConfig) {
     cfg.wake.bind();
-    let max_age = Duration::from_secs(cfg.max_memtable_age_secs);
     let start = Instant::now();
-    let mut last_rotate: HashMap<Partition, Instant> =
-        trees.iter().map(|(p, _)| (*p, start)).collect();
-    let queued: Vec<Arc<AtomicBool>> = trees
-        .iter()
-        .map(|_| Arc::new(AtomicBool::new(false)))
-        .collect();
+    let mut states: Vec<TreeState> = trees.iter().map(|_| TreeState::new(start)).collect();
+    // A table's state lives as long as the table: one dropped since the last
+    // pass loses it, one created starts its age at the pass that finds it.
+    let mut table_states: HashMap<String, TreeState> = HashMap::new();
 
     while !cfg.shutdown.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -295,43 +385,26 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
         // idle engine sleeps until a write wakes it.
         let mut next_due: Option<Duration> = None;
 
-        for ((partition, tree), queued) in trees.iter().zip(&queued) {
-            let active_bytes = tree.active_memtable().size();
-            let age = now.saturating_duration_since(*last_rotate.get(partition).unwrap_or(&start));
-            let age_triggered = cfg.max_memtable_age_secs > 0 && active_bytes > 0 && age >= max_age;
-
-            let rotate = active_bytes > cfg.flush_threshold_bytes
-                || tree.sealed_memtable_count() > cfg.max_sealed
-                || age_triggered;
-
-            if rotate {
-                // Rotate: atomically seal the active memtable → it joins the sealed list.
-                // A fresh empty memtable becomes the new active.
-                tree.rotate_memtable();
-                last_rotate.insert(*partition, now);
-            } else if cfg.max_memtable_age_secs > 0 && active_bytes > 0 {
-                let remaining = max_age.saturating_sub(age);
-                next_due = Some(next_due.map_or(remaining, |due| due.min(remaining)));
-            }
-
-            // Every sealed memtable is flushed, not only one sealed just now:
-            // a request turned away while the workers were busy leaves its
-            // memtable sealed, and an idle partition never trips the gates
-            // above again. One request per partition at a time, because a
-            // flush takes every sealed memtable of its tree.
-            if tree.sealed_memtable_count() > 0 && !queued.load(Ordering::Acquire) {
-                let req = FlushRequest {
-                    tree: tree.clone(),
-                    partition: *partition,
-                    gc_watermark: cfg.gc_watermarks.for_partition(*partition),
-                    queued: Arc::clone(queued),
-                };
-                queued.store(true, Ordering::Release);
-                // Non-blocking: with the workers busy the request waits for
-                // the next pass, which a finished flush wakes.
-                if cfg.sender.try_send(req).is_err() {
-                    queued.store(false, Ordering::Release);
-                }
+        for ((partition, tree), state) in trees.iter().zip(&mut states) {
+            let source = || {
+                (
+                    FlushSource::Partition(*partition),
+                    cfg.gc_watermarks.for_partition(*partition),
+                )
+            };
+            consider_tree(tree, state, source, now, &cfg, &mut next_due);
+        }
+        if let Some(tables) = &cfg.tables {
+            let listed = tables();
+            table_states.retain(|table, _| listed.iter().any(|(id, _)| id == table));
+            for (table, tree) in listed {
+                let state = table_states
+                    .entry(table.clone())
+                    .or_insert_with(|| TreeState::new(now));
+                // A table's rows carry no retention window: its flush keeps
+                // every version, as its other flushes do.
+                let source = || (FlushSource::Table(table), 0);
+                consider_tree(&tree, state, source, now, &cfg, &mut next_due);
             }
         }
 
@@ -355,7 +428,7 @@ fn flush_worker_loop(
 ) {
     while let Ok(FlushRequest {
         tree,
-        partition,
+        source,
         gc_watermark,
         queued,
     }) = receiver.recv()
@@ -376,7 +449,7 @@ fn flush_worker_loop(
         match result {
             Ok(Some(bytes)) => {
                 tracing::debug!(
-                    partition = partition.name(),
+                    tree = source.name(),
                     flushed_bytes = bytes,
                     "memtable flushed to SST"
                 );
@@ -388,7 +461,7 @@ fn flush_worker_loop(
             }
             Err(e) => {
                 tracing::error!(
-                    partition = partition.name(),
+                    tree = source.name(),
                     error = %e,
                     "memtable flush failed"
                 );

@@ -2593,8 +2593,8 @@ impl<'a> ExecutionContext<'a> {
     /// Visible to subsequent statements (read-committed across statements), not
     /// snapshot-isolated within an open transaction. The write is journalled to
     /// the retained oplog at its commit_ts before it touches the tree, so an
-    /// un-flushed row is replayed on the next open (crash recovery); the
-    /// per-statement flush bounds how much must be replayed.
+    /// un-flushed row is replayed on the next open (crash recovery); without
+    /// a journal the statement's end flushes the table.
     pub fn columnar_put_node(
         &mut self,
         label: &str,
@@ -12865,11 +12865,10 @@ fn execute_create_node(
         results.push(row);
     }
 
-    // Persist a columnar table's rows once per statement (not per row): the
-    // runtime columnar tree is not registered with the background flush
-    // manager, so flush its memtable here to survive a clean restart.
+    // A columnar table's rows are made durable once per statement, not per
+    // row.
     if table_columnar {
-        ctx.engine.flush_columnar_table(&table_label)?;
+        ctx.engine.finish_columnar_statement(&table_label)?;
     }
 
     Ok(results)

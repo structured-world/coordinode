@@ -47,6 +47,7 @@ fn start(
             thresholds: crate::engine::config::BackpressureLimits::default().memtable_thresholds(),
             tier: Arc::new(AtomicU8::new(0)),
         },
+        None,
     )
     .expect("start FlushManager");
     (mgr, wake)
@@ -99,6 +100,7 @@ fn unflushed_memtable_bytes_past_the_stop_level_stop_writes_until_flushed() {
             thresholds: limits.memtable_thresholds(),
             tier: Arc::clone(&tier),
         },
+        None,
     )
     .expect("start FlushManager");
 

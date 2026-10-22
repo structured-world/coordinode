@@ -236,7 +236,7 @@ pub struct StorageEngine {
     /// engine's seqno generator and block cache. Re-opened from disk at engine
     /// open so a restart recovers the tables.
     #[cfg(feature = "columnar")]
-    columnar_tables: crate::columnar::ColumnarTableRegistry,
+    columnar_tables: Arc<crate::columnar::ColumnarTableRegistry>,
     /// Partitions whose tree failed to open with positively-identified
     /// structural damage and was repaired (manifest rebuild, block salvage)
     /// during THIS open. Consumed by the repair orchestrator: a lossy
@@ -1126,6 +1126,39 @@ impl StorageEngine {
         // The memtable axis of the write-pressure verdict, latched by the
         // flush monitor, which writes and finished flushes wake.
         let memtable_pressure = Arc::new(AtomicU8::new(0));
+
+        // Per-table columnar trees live under `<primary endpoint>/tables`,
+        // sharing this engine's seqno generator, block cache, maintenance
+        // budget and write buffer; re-opens any table tree already on disk.
+        // Opened before the flush manager, which flushes them with the
+        // partition trees.
+        #[cfg(feature = "columnar")]
+        let columnar_tables = {
+            // Use the engine's configured filesystem backend (MemFs for
+            // in-memory engines) so columnar table trees never touch the host
+            // filesystem when the engine is virtual.
+            let fs: Arc<dyn lsm_tree::fs::Fs> = config
+                .fs
+                .clone()
+                .unwrap_or_else(|| Arc::new(lsm_tree::fs::StdFs));
+            Arc::new(crate::columnar::ColumnarTableRegistry::open(
+                config.endpoints[0].path.join("tables"),
+                fs,
+                Arc::clone(&seqno),
+                Arc::clone(&cache),
+                config.oplog_sync_method.tree_sync_mode(),
+                Arc::clone(&maintenance),
+                Arc::clone(&write_buffer),
+            )?)
+        };
+        #[cfg(feature = "columnar")]
+        let flushed_tables: Option<crate::engine::flush::TableSource> = Some(Box::new({
+            let tables = Arc::clone(&columnar_tables);
+            move || tables.trees()
+        }));
+        #[cfg(not(feature = "columnar"))]
+        let flushed_tables = None;
+
         let flush_manager = FlushManager::start(
             &trees,
             gc_controller.watermarks(),
@@ -1141,6 +1174,7 @@ impl StorageEngine {
                 thresholds: config.backpressure.memtable_thresholds(),
                 tier: Arc::clone(&memtable_pressure),
             },
+            flushed_tables,
         )?;
 
         // Feed the backpressure thresholds to every partition tree so the
@@ -1235,29 +1269,6 @@ impl StorageEngine {
                 })
                 .map_err(|e| StorageError::InvalidConfig(format!("spawn capacity scanner: {e}")))?,
             )
-        };
-
-        // Per-table columnar trees live under `<primary endpoint>/tables`,
-        // sharing this engine's seqno generator and block cache. Constructed
-        // before the cache moves into the coordinator; re-opens any table tree
-        // already on disk.
-        #[cfg(feature = "columnar")]
-        let columnar_tables = {
-            // Use the engine's configured filesystem backend (MemFs for
-            // in-memory engines) so columnar table trees never touch the host
-            // filesystem when the engine is virtual.
-            let fs: Arc<dyn lsm_tree::fs::Fs> = config
-                .fs
-                .clone()
-                .unwrap_or_else(|| Arc::new(lsm_tree::fs::StdFs));
-            crate::columnar::ColumnarTableRegistry::open(
-                config.endpoints[0].path.join("tables"),
-                fs,
-                Arc::clone(&seqno),
-                Arc::clone(&cache),
-                config.oplog_sync_method.tree_sync_mode(),
-                Arc::clone(&maintenance),
-            )?
         };
 
         // Restore the shared seqno past any persisted columnar write (the
@@ -1587,7 +1598,8 @@ impl StorageEngine {
             }
             None => None,
         };
-        apply_columnar_row(&tree, key, value, seqno, index)?;
+        let (added, memtable) = apply_columnar_row(&tree, key, value, seqno, index)?;
+        self.coordinator.flush_trigger().wrote(added, memtable);
         if let (Some(index), Some(coverage)) = (index, &self.coverage) {
             coverage.note_table_marker(table_id, index);
             self.note_applied(coverage, index);
@@ -1595,16 +1607,27 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Flush a `STORAGE COLUMNAR` table's active memtable to an on-disk SST, so
-    /// its rows survive a clean restart (the runtime table tree is not yet
-    /// registered with the background flush manager). Called once per write
-    /// statement, not per row. A no-op if the table has no tree.
+    /// End a write statement on a `STORAGE COLUMNAR` table: its rows are
+    /// durable when this returns. With a journal they are already, as any
+    /// commit's, and the flush manager flushes the table's memtable under the
+    /// partitions' triggers. Without one the table's memtable is flushed now,
+    /// the only copy its rows have. A no-op if the table has no tree.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError::Engine`] if the flush fails.
     #[cfg(feature = "columnar")]
-    pub fn flush_columnar_table(&self, table_id: &str) -> StorageResult<()> {
+    pub fn finish_columnar_statement(&self, table_id: &str) -> StorageResult<()> {
+        if self.oplog.is_some() {
+            return Ok(());
+        }
+        self.flush_columnar_table(table_id)
+    }
+
+    /// Flush one `STORAGE COLUMNAR` table's memtables durably, the journal
+    /// synced first. A no-op if the table has no tree.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn flush_columnar_table(&self, table_id: &str) -> StorageResult<()> {
         if let Some(tree) = self.columnar_tables.get(table_id) {
             self.flush_memtables(&tree)?;
         }
@@ -5837,7 +5860,8 @@ struct ColumnarReplay {
 
 /// Write one `STORAGE COLUMNAR` row at `seqno`, with the coverage marker of
 /// its journal entry `index` in the same lsm batch, so the table tree holds
-/// both or neither.
+/// both or neither. Returns the bytes the write added and the memtable's size
+/// after it, as the flush trigger takes them.
 #[cfg(feature = "columnar")]
 fn apply_columnar_row(
     tree: &lsm_tree::AnyTree,
@@ -5845,14 +5869,13 @@ fn apply_columnar_row(
     value: Vec<u8>,
     seqno: lsm_tree::SeqNo,
     index: Option<u64>,
-) -> StorageResult<()> {
+) -> StorageResult<(u64, u64)> {
     let mut batch = lsm_tree::WriteBatch::with_capacity(2);
     batch.insert(key, value);
     if let Some(index) = index {
         batch.insert(Domain::Journal.marker_key(index, 0).as_slice(), &[][..]);
     }
-    tree.apply_batch(batch, seqno)?;
-    Ok(())
+    Ok(tree.apply_batch(batch, seqno)?)
 }
 
 mod raft_coverage;

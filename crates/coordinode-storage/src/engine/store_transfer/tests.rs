@@ -94,6 +94,58 @@ fn a_received_store_reads_as_the_source_at_the_pin() {
     assert!(!dir.exists(), "the received store goes when dropped");
 }
 
+/// A `STORAGE COLUMNAR` table travels as it stood at the pin, the rows its
+/// memtable still held included, with no flush taken to pin it.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_table_travels_with_rows_still_in_its_memtable() {
+    let source_dir = tempfile::tempdir().expect("tempdir");
+    let source = open(source_dir.path());
+    source
+        .columnar_insert(
+            "Trade",
+            b"row:1".to_vec(),
+            b"flushed".to_vec(),
+            source.next_seqno(),
+        )
+        .expect("insert");
+    source.flush_columnar_table("Trade").expect("flush");
+    source
+        .columnar_insert(
+            "Trade",
+            b"row:2".to_vec(),
+            b"unflushed".to_vec(),
+            source.next_seqno(),
+        )
+        .expect("insert");
+    let expected = vec![
+        (b"row:1".to_vec(), b"flushed".to_vec()),
+        (b"row:2".to_vec(), b"unflushed".to_vec()),
+    ];
+    assert_eq!(
+        source.columnar_scan("Trade", u64::MAX).expect("scan"),
+        expected
+    );
+
+    let flushes = source.memtable_flushes();
+    let mut transfer = source.pin_store().expect("pin");
+    assert_eq!(
+        source.memtable_flushes(),
+        flushes,
+        "the pin flushed a memtable"
+    );
+    let bytes = stream(&mut transfer);
+
+    let target = tempfile::tempdir().expect("tempdir");
+    let received =
+        receive_store(&mut bytes.as_slice(), &target.path().join("received")).expect("receive");
+    let copy = StorageEngine::open_checkpoint(received.dir()).expect("open the received store");
+    assert_eq!(
+        copy.columnar_scan("Trade", u64::MAX).expect("scan"),
+        expected
+    );
+}
+
 /// A pin keeps what it pinned: writes and compactions after it change the
 /// source, never the stream.
 #[test]

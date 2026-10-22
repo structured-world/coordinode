@@ -55,6 +55,7 @@ fn new_registry(base: &std::path::Path) -> ColumnarTableRegistry {
         cache,
         SyncMode::Full,
         std::sync::Arc::new(RateLimiter::new(0)),
+        std::sync::Arc::new(lsm_tree::WriteBufferBudget::default()),
     )
     .unwrap()
 }
@@ -137,6 +138,7 @@ fn table_trees_sync_at_the_registry_mode() {
                 cache,
                 mode,
                 std::sync::Arc::new(RateLimiter::new(0)),
+                std::sync::Arc::new(lsm_tree::WriteBufferBudget::default()),
             )
             .unwrap()
         };

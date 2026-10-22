@@ -19,7 +19,10 @@ use std::sync::{Arc, Mutex};
 use lsm_tree::fs::{Fs, SyncMode};
 use lsm_tree::rate_limiter::RateLimiter;
 use lsm_tree::table::columnar::{ColumnBatch, column_batch_to_entries, entries_to_column_batch};
-use lsm_tree::{AnyTree, Cache, Config, InternalValue, SharedSequenceNumberGenerator, ValueType};
+use lsm_tree::{
+    AnyTree, Cache, Config, InternalValue, SharedSequenceNumberGenerator, ValueType,
+    WriteBufferBudget,
+};
 
 use crate::error::{StorageError, StorageResult};
 
@@ -126,14 +129,17 @@ pub struct ColumnarTableRegistry {
     /// The engine's maintenance budget, which the table trees' compactions
     /// draw from with the partition trees'.
     maintenance: Arc<RateLimiter>,
+    /// The engine's write buffer: the table trees' unflushed bytes count
+    /// toward the memtable pressure with the partition trees'.
+    write_buffer: Arc<WriteBufferBudget>,
     trees: Mutex<HashMap<String, AnyTree>>,
 }
 
 impl ColumnarTableRegistry {
     /// Open the registry rooted at `base_dir` on `fs`, re-opening every table
     /// tree already present on disk (restart recovery). Trees share `fs`,
-    /// `seqno`, `cache`, the sync mode `sync` and the maintenance budget
-    /// `maintenance` with the engine.
+    /// `seqno`, `cache`, the sync mode `sync`, the maintenance budget
+    /// `maintenance` and the write buffer `write_buffer` with the engine.
     ///
     /// # Errors
     ///
@@ -146,6 +152,7 @@ impl ColumnarTableRegistry {
         cache: Arc<Cache>,
         sync: SyncMode,
         maintenance: Arc<RateLimiter>,
+        write_buffer: Arc<WriteBufferBudget>,
     ) -> StorageResult<Self> {
         fs.create_dir_all(&base_dir)
             .map_err(lsm_tree::Error::from)?;
@@ -156,6 +163,7 @@ impl ColumnarTableRegistry {
             cache,
             sync,
             maintenance,
+            write_buffer,
             trees: Mutex::new(HashMap::new()),
         };
         let mut trees = HashMap::new();
@@ -187,6 +195,7 @@ impl ColumnarTableRegistry {
             .use_cache(Arc::clone(&self.cache))
             .sync_mode(self.sync)
             .compaction_rate_limiter(Arc::clone(&self.maintenance))
+            .write_buffer_budget(Arc::clone(&self.write_buffer))
             .open()?;
         enable_columnar(&tree)?;
         Ok(tree)
@@ -270,6 +279,16 @@ impl ColumnarTableRegistry {
             .values()
             .filter_map(|t| t.get_highest_seqno())
             .max()
+    }
+
+    /// Every registered table with its tree handle, unordered.
+    pub(crate) fn trees(&self) -> Vec<(String, AnyTree)> {
+        self.trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, tree)| (id.clone(), tree.clone()))
+            .collect()
     }
 
     /// Sorted list of currently-registered table ids.

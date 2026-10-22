@@ -406,15 +406,12 @@ impl StorageEngine {
     /// state machine, between two applies); it costs no file I/O on the
     /// partition trees.
     ///
-    /// A columnar table's memtable is flushed first: a restored tree writes
-    /// its memtable contents as row tables, which a columnar tree never holds.
-    ///
     /// Blocks; call it off the async runtime.
     ///
     /// # Errors
     ///
-    /// A tree, a coverage record or the index inventory cannot be read, a
-    /// columnar flush fails, or a header field exceeds the stream's limits.
+    /// A tree, a coverage record or the index inventory cannot be read, or a
+    /// header field exceeds the stream's limits.
     pub fn pin_store(&self) -> StorageResult<StoreTransfer> {
         let (trees, inventory) = match self.raft_fence() {
             Some(fence) => {
@@ -463,7 +460,6 @@ impl StorageEngine {
         }
         #[cfg(feature = "columnar")]
         for (table_id, tree) in self.columnar_table_trees() {
-            self.flush_memtables(&tree)?;
             trees.push(PinnedTree {
                 name: TreeName::Table(table_id),
                 position: None,
@@ -684,16 +680,9 @@ fn restore_tree(root: &Path, tree: ReceivedTree) -> StorageResult<()> {
             .relocated()
             .to_tree_config(*part, seqno)
         }
+        // A columnar table's memtable contents land as row tables beside its
+        // columnar ones; its projected scan reads both.
         TreeName::Table(_) => {
-            // A columnar tree's memtable is flushed before it is pinned: its
-            // contents written here would land as row tables in a tree that
-            // holds only columnar ones.
-            if !tree.entries.is_empty() || !tree.tombstones.is_empty() {
-                return Err(malformed(format!(
-                    "{} carries memtable contents",
-                    tree.name.encode()
-                )));
-            }
             lsm_tree::Config::new_with_generators(tree.name.dir(root), seqno.clone(), seqno)
         }
     };
