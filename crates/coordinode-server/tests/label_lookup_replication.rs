@@ -10,7 +10,7 @@ use std::time::Duration;
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_embed::Database;
-use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::cluster::{ElectionTiming, NodeOptions, RaftNode};
 use coordinode_raft::proposal::RaftProposalPipeline;
 use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
@@ -40,13 +40,26 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> No
         Tier::Warm,
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
-    let connections = PKI.connections(node_id);
+    // The test is about what a follower reads, not about failover: a leader
+    // that misses a few heartbeats on a host short of CPU keeps its group,
+    // where the rack profile would hand leadership over in the middle of a
+    // write and leave its outcome unknown.
+    let options = NodeOptions {
+        connections: Some(PKI.connections(node_id)),
+        timing: ElectionTiming::new(
+            Duration::from_millis(250),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        )
+        .unwrap(),
+        ..NodeOptions::default()
+    };
     let (raft, raft_handler) = match founder {
-        None => RaftNode::open_cluster_embedded(
+        None => RaftNode::open_cluster_embedded_with_options(
             node_id,
             Arc::clone(&engine),
             format!("127.0.0.1:{port}"),
-            connections,
+            options,
         )
         .await
         .unwrap(),
@@ -55,9 +68,16 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> No
                 .raft
                 .enrollment(format!("127.0.0.1:{founder_port}"))
                 .unwrap();
-            RaftNode::open_joining_embedded(node_id, Arc::clone(&engine), connections, enrollment)
-                .await
-                .unwrap()
+            RaftNode::open_joining_embedded_with_options(
+                node_id,
+                Arc::clone(&engine),
+                NodeOptions {
+                    enrollment: Some(enrollment),
+                    ..options
+                },
+            )
+            .await
+            .unwrap()
         }
     };
     let raft = Arc::new(raft);
