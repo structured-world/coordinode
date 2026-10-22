@@ -23,16 +23,17 @@ enum Script {
 /// `width` bytes that do not compress, the same for the same `seed`: an
 /// answer whose size on the wire is its size here.
 fn noise(seed: u64, width: usize) -> Value {
-    // xorshift64*, never zero for a seed that is not.
+    // xorshift64*, never zero for a seed that is not; eight bytes a step, so
+    // the megabytes these answers carry are cheap to make in a debug build.
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    let bytes = (0..width)
-        .map(|_| {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
-        })
-        .collect();
+    let mut bytes = Vec::with_capacity(width.next_multiple_of(8));
+    while bytes.len() < width {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        bytes.extend_from_slice(&state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes());
+    }
+    bytes.truncate(width);
     Value::Blob(bytes)
 }
 
@@ -687,14 +688,26 @@ async fn an_answer_is_read_in_the_pieces_asked_for() {
 /// still arrives, in order.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ingress_that_does_not_read_holds_the_member_back() {
-    const ROWS: usize = 800;
-    const WIDTH: usize = 32 << 10;
+    // Small batches and little credit, so the answer is many times what the
+    // credit lets ahead while staying a megabyte on the wire.
+    const FRAMES: u32 = 2;
+    const BATCH_BYTES: usize = 16 << 10;
+    const WIDTH: usize = 4 << 10;
+    const ROWS: usize = 256;
     let executor = Arc::new(Scripted::default());
     *executor.answer.lock().unwrap() = Some(Script::Many {
         rows: ROWS,
         width: WIDTH,
     });
-    let router = serve(Arc::clone(&executor)).await;
+    let router = serve_limited(
+        Arc::clone(&executor),
+        RoutingLimits {
+            frames_ahead: FRAMES,
+            row_batch_bytes: BATCH_BYTES,
+            ..RoutingLimits::default()
+        },
+    )
+    .await;
     let mut answer = router
         .execute_rows(statement(None), &AdmissionSignal::new(|| {}))
         .await
@@ -710,10 +723,10 @@ async fn an_ingress_that_does_not_read_holds_the_member_back() {
         }
         seen = now;
     }
-    let per_batch = ROW_BATCH_BYTES / WIDTH;
+    let per_batch = BATCH_BYTES / WIDTH;
     // The frames the credit lets ahead, and the batch filling while the
     // member waits for more.
-    let ahead = (FRAMES_AHEAD as usize + 1) * per_batch + 1;
+    let ahead = (FRAMES as usize + 1) * per_batch + 1;
     assert!(
         seen < ROWS && seen <= ahead,
         "{seen} of {ROWS} rows written with none read, at most {ahead} expected"
@@ -732,6 +745,65 @@ async fn an_ingress_that_does_not_read_holds_the_member_back() {
     }
     assert_eq!(read, ROWS);
     assert!(answer.stats().is_some());
+}
+
+/// A session dropped before it could finish, as its runtime shutting down
+/// drops it, still stops the statements it runs: one waiting for credit that
+/// will never come returns, so the shutdown, which waits for the blocking
+/// threads, ends.
+#[test]
+fn a_session_dropped_unfinished_stops_its_statements() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Script::Many {
+        rows: 64,
+        width: 4 << 10,
+    });
+    // The ingress keeps its answer open and unread, so the session never
+    // ends on its own: only the shutdown drops it.
+    let (router, answer) = runtime.block_on(async {
+        let router = serve_limited(
+            Arc::clone(&executor),
+            RoutingLimits {
+                frames_ahead: 1,
+                row_batch_bytes: 16 << 10,
+                ..RoutingLimits::default()
+            },
+        )
+        .await;
+        let answer = router
+            .execute_rows(statement(None), &AdmissionSignal::new(|| {}))
+            .await
+            .expect("answering");
+        let mut seen = executor.written.load(Ordering::Acquire);
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = executor.written.load(Ordering::Acquire);
+            if now == seen {
+                break;
+            }
+            seen = now;
+        }
+        (router, answer)
+    });
+    assert!(
+        executor.written.load(Ordering::Acquire) < 64,
+        "the statement waits for credit"
+    );
+
+    let (done, shut) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(runtime);
+        let _ = done.send(());
+    });
+    assert!(
+        shut.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the shutdown waits on a statement nobody stopped"
+    );
+    drop((answer, router));
 }
 
 /// A statement that fails after part of its answer went out delivers those

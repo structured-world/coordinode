@@ -795,6 +795,19 @@ struct ServedSession<E> {
     session_slots: Arc<tokio::sync::Semaphore>,
 }
 
+impl<E> Drop for ServedSession<E> {
+    /// Whatever still runs has lost its ingress: its client cannot know what
+    /// it did, so it stops, and its transaction is aborted. This runs however
+    /// the session ends, also when its task is dropped unfinished, as a
+    /// runtime shutting down drops it; a statement left waiting for credit
+    /// would otherwise never return.
+    fn drop(&mut self) {
+        for (_, running) in self.running.lock().drain() {
+            running.stop();
+        }
+    }
+}
+
 impl<E: CommandExecutor> ServedSession<E> {
     async fn run(self, mut requests: tonic::Streaming<wire::RoutedRequest>) {
         loop {
@@ -811,11 +824,7 @@ impl<E: CommandExecutor> ServedSession<E> {
                 }
             }
         }
-        // Whatever still runs has lost its ingress: its client cannot know
-        // what it did, so it stops, and its transaction is aborted.
-        for (_, running) in self.running.lock().drain() {
-            running.stop();
-        }
+        // What still runs is stopped when the session drops.
     }
 
     fn refuse(&self, call: u64, reason: &str, message: String) {
