@@ -504,9 +504,15 @@ fn a_snapshot_installed_during_preparation_drops_the_replacement() {
         .put(Partition::Idx, &entry(b"a"), b"a1")
         .expect("put");
     engine.stage_generation(GENERATION).expect("stage");
-    let rows = vec![(entry(b"s"), b"s1".to_vec())];
     engine
-        .install_raft_image(&[(Partition::Idx, rows)], 10, b"payload", None)
+        .install_raft_image(
+            &[Partition::Idx],
+            |_| Ok(vec![(entry(b"s"), b"s1".to_vec())]),
+            10,
+            b"payload",
+            &[],
+            None,
+        )
         .expect("install the snapshot");
     assert!(matches!(
         engine.import_generation_history(GENERATION, &[]),

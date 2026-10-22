@@ -175,10 +175,10 @@ fn main() {
 }
 
 /// How long the Raft applies stand still for a copy of a partition to
-/// another node, a snapshot capture, and a partition install on the node
-/// being repaired: the unrelated writes a repair or snapshot stalls. The
-/// store holds `ROWS` flushed rows per tree plus a memtable of `DIRTY`
-/// applies at each capture, so the flush the capture begins with has work.
+/// another node, a snapshot pin, and a partition install on the node being
+/// repaired: the unrelated writes a repair or snapshot stalls. The store
+/// holds `ROWS` flushed rows per tree plus a memtable of `DIRTY` applies at
+/// each capture, so the flush a partition capture begins with has work.
 fn pauses() {
     use coordinode_storage::engine::partition::Partition;
     const ROWS: u64 = 200_000;
@@ -214,13 +214,12 @@ fn pauses() {
 
         apply(&engine, DIRTY);
         let start = Instant::now();
-        engine
-            .capture(&captures.path().join(format!("s{round}")))
-            .expect("capture");
+        let pinned = engine.pin_store().expect("pin");
         snapshot_pauses.push(start.elapsed());
+        drop(pinned);
     }
     line("pause: partition copy", copy_pauses);
-    line("pause: snapshot capture", snapshot_pauses);
+    line("pause: snapshot pin", snapshot_pauses);
 
     let copy = engine.copy_partition(Partition::Node).expect("copy");
     let rows = copy.rows.len();

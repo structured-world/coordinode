@@ -1,8 +1,13 @@
-//! Snapshot serialization and streaming for Raft log compaction.
+//! Whole-store snapshots: the Raft snapshot a leader streams to a follower,
+//! and the logical dump an operator takes and restores.
 //!
-//! ## Snapshot Format
+//! A Raft snapshot is the store pinned at the applies' position and streamed
+//! as its files (see [`coordinode_storage::engine::store_transfer`]); the
+//! follower rebuilds the trees beside its store and installs them from there.
 //!
-//! A snapshot captures all KV data across all storage partitions at a
+//! ## Dump Format
+//!
+//! A dump captures all KV data across all storage partitions at a
 //! consistent point in time. The binary format is:
 //!
 //! ```text
@@ -48,15 +53,51 @@ use std::io::{self, BufRead, Read as IoRead, Seek, SeekFrom, Write};
 
 use serde::{Deserialize, Serialize};
 
+use std::path::PathBuf;
+
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::{ColumnarTable, StorageEngine};
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::store_transfer::ReceivedStore;
 
 use crate::storage::{SnapshotMeta, Vote};
 
-pub mod store;
+mod data;
 
-pub use store::{SnapshotFile, snapshot_dir};
+pub(crate) use data::ChunkReader;
+pub use data::SnapshotData;
+
+/// The directory under `engine`'s data directory where snapshots received
+/// from a leader are rebuilt before they install. Nothing in it outlives the
+/// install; the state machine clears what a crash left when it opens.
+pub fn snapshot_dir(engine: &StorageEngine) -> PathBuf {
+    engine.data_dir().join("raft-snapshot")
+}
+
+/// A directory name under [`snapshot_dir`] no other received snapshot of
+/// this process or an earlier one has.
+pub(crate) fn receive_target(dir: &std::path::Path) -> PathBuf {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let seq = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    dir.join(format!("{nanos:032x}-{seq:016x}.recv"))
+}
+
+/// Remove everything under `engine`'s [`snapshot_dir`]: a snapshot a crash
+/// left half received, or a file an earlier build kept there.
+///
+/// # Errors
+///
+/// The directory exists and cannot be removed.
+pub(crate) fn clear_snapshot_dir(engine: &StorageEngine) -> io::Result<()> {
+    match std::fs::remove_dir_all(snapshot_dir(engine)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 
 /// A list of KV entries for a single partition.
 type PartitionEntries = Vec<(Vec<u8>, Vec<u8>)>;
@@ -435,10 +476,12 @@ fn read_entries(reader: &mut impl IoRead) -> io::Result<PartitionEntries> {
 ///
 /// **Columnar tables** are then made exactly the snapshot's, when it lists
 /// them.
-/// Check the field dictionary a snapshot carries before any of it is
-/// installed: every id record has the name record that points back at it and
-/// the reverse, so the data installed with it can be read.
-fn verify_field_dictionary(parsed: &ParsedSnapshot) -> io::Result<()> {
+/// Check the field dictionary a snapshot carries in its Schema rows before
+/// any of it is installed: every id record has the name record that points
+/// back at it and the reverse, so the data installed with it can be read.
+fn verify_field_dictionary<'a>(
+    schema: impl IntoIterator<Item = &'a (Vec<u8>, Vec<u8>)>,
+) -> io::Result<()> {
     use coordinode_core::graph::intern::{
         FIELD_ID_KEY_PREFIX, FIELD_NAME_KEY_PREFIX, FieldInterner, decode_field_id,
         decode_field_id_key,
@@ -446,22 +489,17 @@ fn verify_field_dictionary(parsed: &ParsedSnapshot) -> io::Result<()> {
     let invalid = |what: String| io::Error::other(format!("snapshot field dictionary: {what}"));
     let mut by_id = Vec::new();
     let mut by_name = std::collections::HashMap::new();
-    for (partition, entries) in &parsed.partitions {
-        if *partition != Partition::Schema {
-            continue;
-        }
-        for (key, value) in entries {
-            if key.starts_with(FIELD_ID_KEY_PREFIX) {
-                let id = decode_field_id_key(key)
-                    .ok_or_else(|| invalid("an id record key names no id".into()))?;
-                let name = String::from_utf8(value.clone())
-                    .map_err(|_| invalid(format!("the name of id {id} is not UTF-8")))?;
-                by_id.push((name, id));
-            } else if let Some(name) = key.strip_prefix(FIELD_NAME_KEY_PREFIX) {
-                let id = decode_field_id(value)
-                    .ok_or_else(|| invalid("a name record holds no id".into()))?;
-                by_name.insert(name.to_vec(), id);
-            }
+    for (key, value) in schema {
+        if key.starts_with(FIELD_ID_KEY_PREFIX) {
+            let id = decode_field_id_key(key)
+                .ok_or_else(|| invalid("an id record key names no id".into()))?;
+            let name = String::from_utf8(value.clone())
+                .map_err(|_| invalid(format!("the name of id {id} is not UTF-8")))?;
+            by_id.push((name, id));
+        } else if let Some(name) = key.strip_prefix(FIELD_NAME_KEY_PREFIX) {
+            let id = decode_field_id(value)
+                .ok_or_else(|| invalid("a name record holds no id".into()))?;
+            by_name.insert(name.to_vec(), id);
         }
     }
     if by_id.len() != by_name.len() {
@@ -483,7 +521,13 @@ fn verify_field_dictionary(parsed: &ParsedSnapshot) -> io::Result<()> {
 }
 
 fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
-    verify_field_dictionary(&parsed)?;
+    verify_field_dictionary(
+        parsed
+            .partitions
+            .iter()
+            .filter(|(partition, _)| *partition == Partition::Schema)
+            .flat_map(|(_, entries)| entries),
+    )?;
     // The install replaces dictionary records in two steps; a dictionary read
     // between them would see the old and the new mixed.
     engine.with_metadata_exclusive(|| install_verified(engine, parsed))
@@ -605,10 +649,10 @@ fn put_u32(w: &mut impl Write, n: usize) -> io::Result<()> {
 // ── Chunked Snapshot Transfer Protocol ──────────────────────────────
 //
 // A snapshot travels as a header message (vote, meta, data size) followed
-// by raw CNSN chunks of up to SNAPSHOT_CHUNK_SIZE. The sender reads the
-// chunks from its snapshot file as the stream is consumed, and the receiver
-// writes them into a staged file in its own snapshot directory, which the
-// install then publishes in place: neither side holds the snapshot in memory.
+// by chunks of the store transfer stream of up to SNAPSHOT_CHUNK_SIZE. The
+// sender reads them from the pinned files as the stream is consumed, and the
+// receiver rebuilds the trees from them in its snapshot directory as they
+// arrive: neither side holds the snapshot in memory or copies it whole.
 
 /// Maximum size of a single snapshot data chunk in bytes (2 MB).
 ///
@@ -626,21 +670,21 @@ pub struct SnapshotTransferHeader {
     pub vote: Vote,
     /// Snapshot metadata: last_log_id and membership.
     pub meta: SnapshotMeta,
-    /// Total size of the CNSN data that follows in subsequent chunks.
+    /// Total size of the store transfer stream that follows in chunks.
     pub data_size: u64,
 }
 
 /// A single message in the chunked snapshot transfer stream.
 ///
 /// The first message is always a Header. Subsequent messages are DataChunks
-/// containing raw CNSN bytes. The receiver accumulates data chunks until
-/// `data_size` bytes have been received.
+/// carrying the store transfer stream. The receiver consumes data chunks
+/// until `data_size` bytes have been received.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SnapshotChunkMessage {
     /// First message: metadata about the snapshot transfer.
     Header(SnapshotTransferHeader),
-    /// Subsequent messages: raw CNSN data bytes (up to SNAPSHOT_CHUNK_SIZE),
-    /// one binary blob on the wire rather than an array of integers.
+    /// Subsequent messages: stream bytes (up to SNAPSHOT_CHUNK_SIZE), one
+    /// binary blob on the wire rather than an array of integers.
     DataChunk(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
@@ -660,39 +704,56 @@ pub fn install_full_snapshot_from_reader(
     apply_full(engine, parsed)
 }
 
-/// Install a Raft snapshot standing at log position `next` (`payload` is the
-/// log id of entry `next - 1`) from a reader, as the store's complete data
-/// generation: every partition it carries is replaced, not written over, and
-/// every tree is bound to `next`. The entries after `next` then apply at
-/// their own commit timestamps over the installed rows, which a write over
-/// the old contents at this node's next seqno would hide.
+/// Install `received`, a Raft snapshot standing at log position `next`
+/// (`payload` is the log id of entry `next - 1`), as the store's complete
+/// data generation: every replicated partition is replaced, not written
+/// over, one at a time, and every tree is bound to `next`, or to its own
+/// position for a partition the snapshot holds further along. The entries
+/// after it then apply at their own commit timestamps over the installed
+/// rows, which a write over the old contents at this node's next seqno would
+/// hide. This node's own records (its Raft state, its routing) stay.
 ///
 /// # Errors
 ///
-/// The snapshot fails its checksum or its field dictionary check, or the
-/// install fails.
-pub fn install_raft_snapshot_from_reader(
+/// The received store cannot be opened or read, its field dictionary fails
+/// its check, or the install fails.
+pub fn install_received(
     engine: &StorageEngine,
-    reader: &mut impl IoRead,
+    received: &ReceivedStore,
     next: u64,
     payload: &[u8],
 ) -> io::Result<()> {
-    let parsed = parse_verified_stream(reader)?;
-    if reader.read(&mut [0u8; 1])? != 0 {
-        return Err(io::Error::other("snapshot has bytes past its checksum"));
-    }
-    verify_field_dictionary(&parsed)?;
+    let storage = |what: &str, e: coordinode_storage::error::StorageError| {
+        io::Error::other(format!("{what}: {e}"))
+    };
+    let source = StorageEngine::open_checkpoint(received.dir())
+        .map_err(|e| storage("open the received snapshot", e))?;
+    let schema = source
+        .replicated_rows(Partition::Schema)
+        .map_err(|e| storage("read the snapshot's schema", e))?;
+    verify_field_dictionary(&schema)?;
+    drop(schema);
+    let partitions: Vec<Partition> = snapshot_partitions().collect();
     engine.with_metadata_exclusive(|| {
-        let total_written: usize = parsed.partitions.iter().map(|(_, rows)| rows.len()).sum();
+        let mut total_written = 0usize;
         engine
             .install_raft_image(
-                &parsed.partitions,
+                &partitions,
+                |partition| {
+                    let rows = source.replicated_rows(partition)?;
+                    total_written += rows.len();
+                    Ok(rows)
+                },
                 next,
                 payload,
-                parsed.index_inventory.as_deref(),
+                received.positions(),
+                received.index_inventory(),
             )
-            .map_err(|e| io::Error::other(format!("install the snapshot's partitions: {e}")))?;
-        let tables = install_tables(engine, parsed.tables)?;
+            .map_err(|e| storage("install the snapshot's partitions", e))?;
+        let tables = source
+            .columnar_tables_at(source.snapshot())
+            .map_err(|e| storage("read the snapshot's columnar tables", e))?;
+        let tables = install_tables(engine, Some(tables))?;
         engine.note_field_dictionary_change();
         tracing::info!(total_written, tables, next, "snapshot installed");
         Ok(())

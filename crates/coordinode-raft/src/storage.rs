@@ -49,10 +49,7 @@ use coordinode_storage::engine::core::{
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
 
-use crate::snapshot::SnapshotFile;
-#[cfg(test)]
-use crate::snapshot::store::KEY_SNAPSHOT_META;
-use crate::snapshot::store::SnapshotStore;
+use crate::snapshot::SnapshotData;
 
 /// Maximum age for dedup entries before GC (10 minutes): far longer than
 /// any proposal retry window, so an entry this old can no longer meet a
@@ -156,7 +153,7 @@ pub type Entry = openraft::impls::Entry<
     openraft::impls::EntryPayload<Request, u64, MemberNode>,
 >;
 pub type SnapshotMeta = openraft::storage::SnapshotMeta<CommittedLeaderId, u64, MemberNode>;
-pub type Snapshot = openraft::storage::Snapshot<CommittedLeaderId, u64, MemberNode, SnapshotFile>;
+pub type Snapshot = openraft::storage::Snapshot<CommittedLeaderId, u64, MemberNode, SnapshotData>;
 pub type StoredMembership = openraft::StoredMembership<CommittedLeaderId, u64, MemberNode>;
 
 // ── Key Prefixes ────────────────────────────────────────────────────
@@ -1265,10 +1262,9 @@ pub struct CoordinodeStateMachine {
     /// Optional so legacy paths that don't need cross-modality snapshot
     /// semantics can leave it `None` (e.g. embedded-mode fast tests).
     max_assigned: Option<Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
-    /// Count of full snapshot builds performed by this state machine.
-    /// Observability for the snapshot trigger: every build serializes
-    /// ALL partitions (hundreds of MB), so redundant rebuilds are a
-    /// direct latency and leader-stability hazard worth monitoring.
+    /// Count of snapshot builds performed by this state machine.
+    /// Observability for the snapshot trigger: every build flushes every
+    /// tree's memtables, so redundant rebuilds are worth monitoring.
     snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
     /// What each partition tree held when the state machine opened. Entries
     /// below [`Self::skip_until`] are re-delivered from the lowest covered
@@ -1284,12 +1280,10 @@ pub struct CoordinodeStateMachine {
     /// Snapshot work holding the engine off the async runtime, which a
     /// shutdown waits out.
     engine_work: EngineWork,
-    /// The current snapshot's file and record; holds the engine.
-    snapshots: Arc<SnapshotStore>,
     /// This state machine's own share of `engine_work`: it holds the engine
     /// for as long as openraft keeps it. Declared last, so it is dropped after
     /// every field holding the engine: a shutdown waiting on it would
-    /// otherwise return while `snapshots` still held the directory.
+    /// otherwise return while `engine` still held the directory.
     _hold: EngineWorkGuard,
 }
 
@@ -1314,7 +1308,7 @@ struct EngineWorkInner {
 }
 
 /// One piece of [`EngineWork`] under way; finishes on drop.
-pub(crate) struct EngineWorkGuard(Arc<EngineWorkInner>);
+pub struct EngineWorkGuard(Arc<EngineWorkInner>);
 
 impl EngineWork {
     pub(crate) fn start(&self) -> EngineWorkGuard {
@@ -1396,10 +1390,10 @@ impl RaftApplyFence for RaftApplyGate {
     }
 }
 
-/// How long a snapshot capture sleeps before it starts, so a test can shut a
-/// node down while one is under way.
+/// How long a snapshot build sleeps before it persists the store, so a test
+/// can shut a node down while one is under way.
 #[cfg(test)]
-pub(crate) static CAPTURE_DELAY_MS: core::sync::atomic::AtomicU64 =
+pub(crate) static BUILD_DELAY_MS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// The consensus state stored at `key` in `partition`, `None` when nothing
@@ -1509,11 +1503,9 @@ impl CoordinodeStateMachine {
         if let (Some(oracle), Some(at)) = (&oracle, engine.closure_frontier().checked_sub(1)) {
             oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
         }
-        // Opening the store removes every capture a crash left unpublished.
-        let snapshots = Arc::new(
-            SnapshotStore::open(Arc::clone(&engine))
-                .map_err(|e| io::Error::other(format!("open the snapshot store: {e}")))?,
-        );
+        // A snapshot a crash left half received installs nowhere.
+        crate::snapshot::clear_snapshot_dir(&engine)
+            .map_err(|e| io::Error::other(format!("clear the snapshot directory: {e}")))?;
         // The trees may still hold markers below their bases; the first fold
         // removes markers from index 0.
         let folded = 0;
@@ -1562,7 +1554,6 @@ impl CoordinodeStateMachine {
             gate,
             _hold: engine_work.start(),
             engine_work,
-            snapshots,
         })
     }
 
@@ -1941,7 +1932,7 @@ impl CoordinodeStateMachine {
 impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
     // A snapshot is a file in the engine's snapshot directory, never a
     // buffer: it is as large as the store.
-    type SnapshotData = SnapshotFile;
+    type SnapshotData = SnapshotData;
 
     type SnapshotBuilder = CoordinodeSnapshotBuilder;
 
@@ -2105,11 +2096,10 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         #[allow(clippy::unwrap_used)]
         let last_membership = self.last_membership.lock().unwrap().clone();
 
-        // Every tree holds the applied entries now, and the capture below
-        // flushes them together with this fold. A store reopened under the
-        // snapshot this build publishes therefore resumes at or past it;
-        // resuming below it would make openraft install the snapshot over a
-        // store that already holds it and the entries after it.
+        // Every tree holds the applied entries now, and the build flushes
+        // them together with this fold before openraft may purge the log
+        // below it. A store reopened after the build therefore resumes at or
+        // past it, so the purged entries are never needed again.
         let folded = match last_applied {
             Some(log_id) if log_id.index + 1 > self.folded => {
                 let next = log_id.index + 1;
@@ -2127,55 +2117,21 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             _ => Ok(()),
         };
 
-        // openraft builds the snapshot after this returns, while entries keep
-        // applying, and the snapshot must hold exactly the entries up to
-        // `last_applied`. No entry is applied while this runs, so a capture
-        // taken now is that state; reading the live store later is not.
-        let dir = self.snapshots.capture_target();
-        // Counted from before the capture to the builder's end, so the work
-        // never reads idle between the two.
-        let builder_work = self.engine_work.start();
-        // Declared before the engine, so a capture that never runs (the fold
-        // failed) lets go of the engine before its work is counted done.
-        let work = self.engine_work.start();
-        let engine = self.engine.share("snapshot capture");
-        let target = dir.clone();
-        let capture = match folded {
-            Err(e) => Err(e),
-            Ok(()) => match tokio::task::spawn_blocking(move || {
-                #[cfg(test)]
-                std::thread::sleep(std::time::Duration::from_millis(
-                    CAPTURE_DELAY_MS.load(core::sync::atomic::Ordering::Relaxed),
-                ));
-                let captured = engine.capture(&target).map_err(|e| e.to_string());
-                // The engine is released before the work is counted done.
-                drop(engine);
-                drop(work);
-                captured
-            })
-            .await
-            {
-                Ok(Ok(_)) => Ok(dir),
-                Ok(Err(e)) => Err(format!("capture the store for a snapshot: {e}")),
-                Err(e) => Err(format!("capture task: {e}")),
-            },
-        };
-
         CoordinodeSnapshotBuilder {
             last_applied,
             last_membership,
             snapshot_builds: Arc::clone(&self.snapshot_builds),
-            capture,
+            folded,
+            engine: self.engine.share("snapshot build"),
             engine_work: self.engine_work.clone(),
-            snapshots: Arc::clone(&self.snapshots),
-            _work: builder_work,
+            _work: self.engine_work.start(),
         }
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &openraft::type_config::alias::SnapshotMetaOf<TypeConfig>,
-        mut snapshot: SnapshotFile,
+        snapshot: SnapshotData,
     ) -> Result<(), io::Error> {
         let last_log_index = meta.last_log_id.map(|id| id.index);
 
@@ -2196,33 +2152,33 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             None => (0, Vec::new()),
         };
 
-        // An empty snapshot carries metadata only and leaves the data as it
-        // is. The parse reads the file as it goes, off the async runtime, as
-        // does the size, which serializes a snapshot kept as a capture.
+        // A snapshot without data carries metadata only and leaves the data
+        // as it is. The install reads the received trees, off the async
+        // runtime, and the received copy goes once it is in.
         let engine = self.engine.share("snapshot install");
         let work = self.engine_work.start();
-        let mut snapshot = tokio::task::spawn_blocking(move || {
+        let positions = tokio::task::spawn_blocking(move || {
             // Locals drop in reverse: the engine before the guard.
             let _work = work;
             let engine = engine;
-            let data_bytes = snapshot.size()?;
-            tracing::info!(data_bytes, last_log_index, "installing snapshot");
-            if data_bytes > 0 {
-                use std::io::Seek;
-                snapshot.rewind()?;
-                let mut reader = io::BufReader::with_capacity(1 << 20, &mut snapshot);
-                crate::snapshot::install_raft_snapshot_from_reader(
-                    &engine,
-                    &mut reader,
-                    next,
-                    &payload,
-                )?;
-            } else {
-                engine.reset_raft_coverage(next, &payload).map_err(|e| {
-                    io::Error::other(format!("rebind raft coverage to snapshot: {e}"))
-                })?;
+            tracing::info!(last_log_index, "installing snapshot");
+            match snapshot {
+                SnapshotData::Received(received) => {
+                    crate::snapshot::install_received(&engine, &received, next, &payload)?;
+                    Ok(received.positions().to_vec())
+                }
+                SnapshotData::Empty => {
+                    engine.reset_raft_coverage(next, &payload).map_err(|e| {
+                        io::Error::other(format!("rebind raft coverage to snapshot: {e}"))
+                    })?;
+                    Ok(Vec::new())
+                }
+                // openraft installs what a leader sent or this node kept; a
+                // pinned store is what this node sends.
+                SnapshotData::Pinned { .. } => Err(io::Error::other(
+                    "a snapshot pinned for sending cannot be installed over its own store",
+                )),
             }
-            Ok::<_, io::Error>(snapshot)
         })
         .await
         .map_err(|e| io::Error::other(format!("snapshot install task: {e}")))??;
@@ -2237,6 +2193,11 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         self.skip_until = 0;
         self.folded = next;
         gate.applies.reset(next);
+        // A partition the snapshot holds further along is left alone by the
+        // applies until they pass its position.
+        for (partition, position) in &positions {
+            gate.applies.raise_floor(*partition, position.next);
+        }
         gate.last = meta.last_log_id;
         self.refresh_group_pair()?;
         self.refresh_deployment()?;
@@ -2274,163 +2235,112 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             meta.last_membership.clone();
         self.save_membership(&meta.last_membership)?;
 
-        // The store as installed becomes the current snapshot, captured while
-        // no entry applies (the gate is still held), as a build captures it:
-        // get_current_snapshot() serves it from now on, its index inventory
-        // sealed against what this member finds, not the leader's account of
-        // its own copies. An empty snapshot is kept as it arrived.
-        // Counted as work holding the engine: openraft may stop waiting on
-        // the task at a shutdown, and the task runs on regardless.
-        let capture = self.snapshots.capture_target();
-        let engine = self.engine.share("snapshot publish");
-        let work = self.engine_work.start();
-        let snapshots = Arc::clone(&self.snapshots);
-        let published_meta = meta.clone();
-        let published = tokio::task::spawn_blocking(move || {
-            // Locals drop in reverse: the engine and the store go before the
-            // guard on every return, the early ones included.
-            let _work = work;
-            let engine = engine;
-            let snapshots = snapshots;
-            if snapshot.size()? == 0 {
-                return snapshots.publish(&published_meta, &mut snapshot);
-            }
-            drop(snapshot);
-            engine
-                .capture(&capture)
-                .map_err(|e| io::Error::other(format!("capture the installed store: {e}")))?;
-            drop(engine);
-            let published = snapshots.publish_capture(&published_meta, &capture)?;
-            if !published {
-                snapshots.remove_capture(&capture);
-            }
-            Ok(published)
-        })
-        .await
-        .map_err(|e| io::Error::other(format!("snapshot publish task: {e}")))??;
-        if !published {
-            // openraft installs only snapshots past what this node applied,
-            // and it builds none past that either.
-            tracing::warn!(
-                last_log_index = meta.last_log_id.map(|id| id.index),
-                "an installed snapshot is older than the one already kept"
-            );
-        }
-
+        // The installed store is the current snapshot from now on:
+        // get_current_snapshot() pins it at the applies' position.
         tracing::info!("snapshot install complete");
         Ok(())
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, io::Error> {
-        // Counted as work holding the engine, as the install above is.
+        // The snapshot is the applied store itself, pinned here: openraft
+        // asks between two applies, so the pin holds exactly the entries up
+        // to `last_applied`. Nothing applied yet means no snapshot.
+        let last_applied = *self
+            .last_applied
+            .lock()
+            .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))?;
+        if last_applied.is_none() {
+            return Ok(None);
+        }
+        let meta = SnapshotMeta {
+            last_log_id: last_applied,
+            last_membership: self
+                .last_membership
+                .lock()
+                .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))?
+                .clone(),
+        };
+        // The pins hold the store's files until the snapshot is sent or
+        // dropped: work a shutdown waits out.
         let work = self.engine_work.start();
-        let snapshots = Arc::clone(&self.snapshots);
-        let current = tokio::task::spawn_blocking(move || {
-            let _work = work;
-            let snapshots = snapshots;
-            snapshots.current()
-        })
-        .await
-        .map_err(|e| io::Error::other(format!("snapshot open task: {e}")))??;
-        Ok(current.map(|(meta, snapshot)| Snapshot { meta, snapshot }))
+        let engine = self.engine.share("snapshot pin");
+        let transfer = tokio::task::spawn_blocking(move || engine.pin_store())
+            .await
+            .map_err(|e| io::Error::other(format!("snapshot pin task: {e}")))?
+            .map_err(|e| io::Error::other(format!("pin the store for a snapshot: {e}")))?;
+        Ok(Some(Snapshot {
+            meta,
+            snapshot: SnapshotData::Pinned {
+                transfer,
+                _work: work,
+            },
+        }))
     }
 }
 
 // ── Snapshot Builder ────────────────────────────────────────────────
 
-/// Builds a full snapshot of all storage partitions for Raft log compaction.
+/// Compacts the Raft log against the applied store.
 ///
-/// The snapshot holds every KV pair of the replicated partitions (see
-/// `snapshot::snapshot_partitions`) in a checksummed binary format, written
-/// to a file that followers receive through the Snapshot gRPC RPC.
-///
-/// openraft manages the snapshot metadata (index, term, membership); the
-/// data itself travels in this binary format, never through the Raft log.
+/// The store itself is the snapshot: a build makes every entry up to
+/// `last_applied` durable in the trees, with the coverage fold the state
+/// machine wrote for it, so openraft may purge the log below it. Nothing is
+/// copied or serialized; a follower that needs the data gets the store
+/// pinned at send time (`get_current_snapshot`).
 pub struct CoordinodeSnapshotBuilder {
     last_applied: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
     last_membership: StoredMembership,
     /// Shared build counter from the owning state machine.
     snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
-    /// The store captured at `last_applied`, or why it could not be.
-    capture: Result<std::path::PathBuf, String>,
+    /// Whether the coverage fold at `last_applied` was written.
+    folded: Result<(), String>,
+    /// The store the build flushes.
+    engine: crate::engine_hold::EngineHold,
     /// Where the build's blocking work is counted.
     engine_work: EngineWork,
-    /// Where the built snapshot is published; holds the engine.
-    snapshots: Arc<SnapshotStore>,
     /// Counts this builder as work holding the engine. Declared last, so it
-    /// is dropped after `snapshots`.
+    /// is dropped after `engine`.
     _work: EngineWorkGuard,
 }
 
-impl Drop for CoordinodeSnapshotBuilder {
-    fn drop(&mut self) {
-        if let Ok(dir) = &self.capture {
-            self.snapshots.remove_capture(dir);
-        }
-    }
-}
-
 impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
-    type SnapshotData = SnapshotFile;
+    type SnapshotData = SnapshotData;
 
     async fn build_snapshot(&mut self) -> Result<Snapshot, io::Error> {
         let last_log_id = self.last_applied;
-
         tracing::info!(
             last_log_index = last_log_id.map(|id| id.index),
             last_log_term = last_log_id.map(|id| id.committed_leader_id().term),
-            "publishing storage snapshot"
+            "compacting the log against the applied store"
         );
+        self.folded.clone().map_err(io::Error::other)?;
 
-        self.snapshot_builds
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-        // The capture holds every entry up to `last_log_id` and none after
-        // it, which is the whole snapshot: it is published as it stands and
-        // serialized only when a peer needs it sent, so a build costs the
-        // capture's flush and hard links, never a pass over the data.
-        let dir = self.capture.clone().map_err(io::Error::other)?;
-        let meta = SnapshotMeta {
-            last_log_id,
-            last_membership: self.last_membership.clone(),
-        };
         let work = self.engine_work.start();
-        let snapshots = Arc::clone(&self.snapshots);
-        let published_meta = meta.clone();
-        let snapshot = tokio::task::spawn_blocking(move || {
-            // Locals drop in reverse: the store, which holds the engine, goes
-            // before the guard that tells the shutdown it has.
+        let engine = self.engine.share("snapshot build");
+        tokio::task::spawn_blocking(move || {
+            // Locals drop in reverse: the engine before the guard.
             let _work = work;
-            let snapshots = snapshots;
-            // openraft keeps only the metadata of what it built and asks
-            // get_current_snapshot() for the bytes, so the build is
-            // published before it is returned.
-            let published = snapshots.publish_capture(&published_meta, &dir)?;
-            if !published {
-                // An install overtook this build; openraft reads only the
-                // build's metadata, and the newer snapshot stays current.
-                tracing::warn!(
-                    last_log_index = published_meta.last_log_id.map(|id| id.index),
-                    "a newer snapshot was published while this one was built"
-                );
-            }
-            let current = snapshots
-                .current()?
-                .map(|(_, snapshot)| snapshot)
-                .ok_or_else(|| io::Error::other("the published snapshot is missing"))?;
-            Ok::<_, io::Error>((published, current))
+            let engine = engine;
+            #[cfg(test)]
+            std::thread::sleep(std::time::Duration::from_millis(
+                BUILD_DELAY_MS.load(core::sync::atomic::Ordering::Relaxed),
+            ));
+            engine
+                .persist()
+                .map_err(|e| io::Error::other(format!("persist the store for a snapshot: {e}")))
         })
         .await
         .map_err(|e| io::Error::other(format!("snapshot build task: {e}")))??;
-        let (published, snapshot) = snapshot;
-        if published {
-            // The store owns the capture now; the builder's drop must not
-            // remove the current snapshot.
-            self.capture = Err("published as the current snapshot".to_owned());
-        }
 
-        tracing::info!("snapshot published");
-        Ok(Snapshot { meta, snapshot })
+        self.snapshot_builds
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(Snapshot {
+            meta: SnapshotMeta {
+                last_log_id,
+                last_membership: self.last_membership.clone(),
+            },
+            snapshot: SnapshotData::Empty,
+        })
     }
 }
 

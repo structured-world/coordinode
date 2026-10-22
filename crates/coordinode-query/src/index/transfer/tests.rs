@@ -220,12 +220,15 @@ fn a_copy_left_guarded_by_a_dead_run_is_excluded() {
 /// `receiver` as a Raft snapshot with `inventory`.
 fn install(receiver: &StorageEngine, sender: &StorageEngine, inventory: Option<&[u8]>) {
     use coordinode_storage::engine::partition::Partition::{Idx, Node, Schema};
-    let partitions: Vec<_> = [Node, Schema, Idx]
-        .into_iter()
-        .map(|p| (p, sender.replicated_rows(p).expect("rows")))
-        .collect();
     receiver
-        .install_raft_image(&partitions, 10, b"payload", inventory)
+        .install_raft_image(
+            &[Node, Schema, Idx],
+            |p| sender.replicated_rows(p),
+            10,
+            b"payload",
+            &[],
+            inventory,
+        )
         .expect("install");
 }
 

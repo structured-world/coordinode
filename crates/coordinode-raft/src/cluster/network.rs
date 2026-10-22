@@ -526,7 +526,7 @@ impl NetStreamAppend<C> for GrpcNetwork {
 }
 
 impl NetSnapshot<C> for GrpcNetwork {
-    type SnapshotData = crate::snapshot::SnapshotFile;
+    type SnapshotData = crate::snapshot::SnapshotData;
 
     async fn full_snapshot(
         &mut self,
@@ -556,25 +556,42 @@ impl NetSnapshot<C> for GrpcNetwork {
             openraft::error::StreamingError::Unreachable(Unreachable::new(&io_err))
         })?;
 
-        // A header message, then the snapshot file in chunks read as the
-        // stream is consumed: the snapshot is never in memory whole.
+        // A header message, then the pinned store in chunks read off the
+        // runtime as the stream is consumed: the snapshot is never in memory
+        // whole, and never copied on this side.
         let io_unreachable =
             |e: std::io::Error| openraft::error::StreamingError::Unreachable(Unreachable::new(&e));
-        // A snapshot kept as a capture is serialized here, the one time a
-        // peer needs its bytes; that reads the whole store, off the runtime.
-        let mut file = tokio::task::spawn_blocking(move || {
-            let mut file = snapshot.snapshot;
-            file.materialize().map(|()| file)
-        })
-        .await
-        .map_err(|e| io_unreachable(std::io::Error::other(e)))?
-        .map_err(io_unreachable)?;
-        let data_size = file.size().map_err(io_unreachable)?;
-        {
-            use std::io::Seek;
-            file.rewind().map_err(io_unreachable)?;
-        }
-        let reader = tokio::fs::File::from_std(file.try_clone_file().map_err(io_unreachable)?);
+        let crate::snapshot::SnapshotData::Pinned {
+            mut transfer,
+            _work: work,
+        } = snapshot.snapshot
+        else {
+            return Err(io_unreachable(std::io::Error::other(
+                "only a pinned store can be sent as a snapshot",
+            )));
+        };
+        let data_size = transfer.len();
+        // Two chunks ahead at most: the reader waits on the send.
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            // Released once the stream ends or the send is dropped.
+            let _work = work;
+            let mut left = data_size;
+            while left > 0 {
+                // At most SNAPSHOT_CHUNK_SIZE, a usize.
+                let len = left.min(crate::snapshot::SNAPSHOT_CHUNK_SIZE as u64) as usize;
+                let mut chunk = vec![0u8; len];
+                if let Err(e) = transfer.read_exact(&mut chunk) {
+                    tracing::warn!(%e, "reading the pinned store to send it");
+                    return;
+                }
+                if chunk_tx.blocking_send(chunk).is_err() {
+                    return;
+                }
+                left -= len as u64;
+            }
+        });
 
         let header = crate::snapshot::SnapshotTransferHeader {
             vote,
@@ -597,25 +614,14 @@ impl NetSnapshot<C> for GrpcNetwork {
             "sending chunked snapshot to follower"
         );
 
-        // A read or encode failure ends the stream early; the receiver then
-        // refuses the transfer for its short size and the RPC fails.
-        let chunks = futures_util::stream::unfold(
-            (reader, data_size),
-            move |(mut reader, left)| async move {
-                use tokio::io::AsyncReadExt;
-                if left == 0 {
-                    return None;
-                }
-                // At most SNAPSHOT_CHUNK_SIZE, a usize.
-                let len = left.min(crate::snapshot::SNAPSHOT_CHUNK_SIZE as u64) as usize;
-                let mut chunk = vec![0u8; len];
-                if let Err(e) = reader.read_exact(&mut chunk).await {
-                    tracing::warn!(%e, "reading the snapshot file to send it");
-                    return None;
-                }
+        // A read failure ends the stream early and a chunk that fails to
+        // encode is left out: the receiver then refuses the transfer for its
+        // short size and the RPC fails.
+        let chunks = futures_util::stream::poll_fn(move |cx| chunk_rx.poll_recv(cx)).filter_map(
+            move |chunk| async move {
                 let message = crate::snapshot::SnapshotChunkMessage::DataChunk(chunk);
                 match rmp_serde::to_vec(&message) {
-                    Ok(data) => Some((RaftPayload { data, group }, (reader, left - len as u64))),
+                    Ok(data) => Some(RaftPayload { data, group }),
                     Err(e) => {
                         tracing::warn!(%e, "encoding a snapshot chunk");
                         None
@@ -773,7 +779,7 @@ impl NetStreamAppend<C> for StubNetwork {
 }
 
 impl NetSnapshot<C> for StubNetwork {
-    type SnapshotData = crate::snapshot::SnapshotFile;
+    type SnapshotData = crate::snapshot::SnapshotData;
 
     async fn full_snapshot(
         &mut self,

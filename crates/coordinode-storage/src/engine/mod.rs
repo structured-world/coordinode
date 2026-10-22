@@ -26,6 +26,7 @@ pub mod retention_stats;
 pub mod routing;
 pub mod space;
 pub mod stats;
+pub mod store_transfer;
 pub mod tap;
 pub mod transaction;
 pub mod vector_keys;

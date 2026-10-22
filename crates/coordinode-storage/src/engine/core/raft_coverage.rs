@@ -482,30 +482,54 @@ impl StorageEngine {
 
     /// Replace each partition of `partitions` with its rows from a Raft
     /// snapshot standing at `next` (`payload` is the log id of entry
-    /// `next - 1`), and bind every tree to that position. Every replaced
-    /// partition is under a rebuild intent from before its clear until every
-    /// tree's record is on disk, so a crash in between leaves an intent, never
-    /// a tree that claims entries it lost. Call with the applies paused.
+    /// `next - 1`), and bind every tree to that position, or to its own in
+    /// `ahead` for a partition the snapshot holds further along. The rows of
+    /// one partition at a time are read from `rows_of`, so memory holds one
+    /// partition, not the snapshot. Every replaced partition is under a
+    /// rebuild intent from before its clear until every tree's record is on
+    /// disk, so a crash in between leaves an intent, never a tree that claims
+    /// entries it lost. Call with the applies paused.
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::begin_partition_rebuild`] and
-    /// [`Self::reset_raft_coverage`], or an intent removal failure.
+    /// The errors of `rows_of`, [`Self::begin_partition_rebuild`] and
+    /// [`Self::reset_raft_coverage`], a flush failure, or an intent removal
+    /// failure.
     pub fn install_raft_image(
         &self,
-        partitions: &[(Partition, Rows)],
+        partitions: &[Partition],
+        mut rows_of: impl FnMut(Partition) -> StorageResult<Rows>,
         next: u64,
         payload: &[u8],
+        ahead: &[(Partition, RaftPosition)],
         index_inventory: Option<&[u8]>,
     ) -> StorageResult<()> {
-        for (partition, rows) in partitions {
-            self.begin_partition_rebuild(*partition, rows)?;
+        for &partition in partitions {
+            let rows = rows_of(partition)?;
+            self.begin_partition_rebuild(partition, &rows)?;
         }
         self.reset_raft_coverage(next, payload)?;
-        for (partition, _) in partitions {
-            self.finish_rebuild(*partition)?;
+        // Written over the reset's base at a later seqno, and durable before
+        // the intents go: the applies leave such a partition alone until they
+        // pass its position, which the caller raises as its floor.
+        for (partition, position) in ahead {
+            if position.next > next && partitions.contains(partition) {
+                let tree = self.tree(*partition)?;
+                coverage::write_fold(
+                    tree,
+                    Domain::Raft,
+                    0,
+                    position.next,
+                    &position.payload,
+                    self.next_seqno(),
+                );
+                self.flush_memtables(tree)?;
+            }
         }
-        if partitions.iter().any(|(p, _)| *p == Partition::Idx) {
+        for &partition in partitions {
+            self.finish_rebuild(partition)?;
+        }
+        if partitions.contains(&Partition::Idx) {
             self.index_transfer_installed(index_inventory)?;
         }
         Ok(())

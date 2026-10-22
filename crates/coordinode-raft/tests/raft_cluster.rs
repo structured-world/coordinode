@@ -1306,41 +1306,48 @@ async fn cluster_snapshot_build_and_purge() {
             .await
             .expect("trigger snapshot");
 
-        // The build captures the store (a flush of every partition) before
-        // it serializes, which on a slow disk takes seconds: wait for it
-        // rather than for a fixed time.
+        // The build flushes every partition, which on a slow disk takes
+        // seconds: wait for it rather than for a fixed time.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let snap = loop {
-            let snap = n1.node.raft().get_snapshot().await.expect("get_snapshot");
-            if snap.is_some() || std::time::Instant::now() >= deadline {
-                break snap;
-            }
+        while n1.node.snapshot_builds() == 0 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert!(snap.is_some(), "snapshot should exist after trigger");
+        }
+        assert!(
+            n1.node.snapshot_builds() > 0,
+            "the trigger builds a snapshot"
+        );
 
-        let snap = snap.expect("snap");
+        // The data a follower would get: the store pinned and streamed.
+        let snap = n1
+            .node
+            .raft()
+            .get_snapshot()
+            .await
+            .expect("get_snapshot")
+            .expect("a snapshot once entries applied");
         assert!(
             snap.meta.last_log_id.is_some(),
             "snapshot should have last_log_id"
         );
-
-        // Verify snapshot data is non-empty (contains actual storage KV data)
-        let mut snapshot = snap.snapshot;
+        let (mut transfer, work) = match snap.snapshot {
+            coordinode_raft::snapshot::SnapshotData::Pinned { transfer, _work } => {
+                Some((transfer, _work))
+            }
+            _ => None,
+        }
+        .expect("the snapshot to send is the pinned store");
         let mut snap_data = Vec::new();
-        std::io::Read::read_to_end(&mut snapshot, &mut snap_data).expect("read snapshot");
+        std::io::Read::read_to_end(&mut transfer, &mut snap_data).expect("read snapshot");
+        assert_eq!(snap_data.len() as u64, transfer.len());
+        // The pins hold the store's files, and a shutdown waits for them.
+        drop(transfer);
+        drop(work);
         assert!(
             snap_data.len() > 100,
             "snapshot data should contain actual KV data, got {} bytes",
             snap_data.len()
         );
-
-        // Verify snapshot data starts with correct magic
-        assert_eq!(
-            &snap_data[..4],
-            b"CNSN",
-            "snapshot data should start with CNSN magic"
-        );
+        assert_eq!(&snap_data[..4], b"CNST", "the store transfer stream");
 
         // Trigger log purge up to a known index
         let applied = n1.node.applied_index();
@@ -1568,16 +1575,10 @@ async fn cluster_background_snapshot_trigger() {
         tokio::time::sleep(Duration::from_secs(4)).await;
 
         // Verify snapshot was built automatically
-        let snap = n1.raft().get_snapshot().await.expect("get_snapshot");
         assert!(
-            snap.is_some(),
+            n1.snapshot_builds() > 0,
             "background trigger should have built a snapshot within 4 seconds"
         );
-        let mut snapshot = snap.unwrap().snapshot;
-        let mut data = Vec::new();
-        std::io::Read::read_to_end(&mut snapshot, &mut data).expect("read snapshot");
-        assert!(data.len() > 10, "snapshot data should be non-empty");
-        assert_eq!(&data[..4], b"CNSN", "snapshot should have CNSN magic");
 
         n1.shutdown().await.expect("shutdown");
     })
@@ -2006,10 +2007,10 @@ impl coordinode_storage::engine::index_copies::IndexCopyQualifier for InventoryR
     }
 }
 
-/// A snapshot carries the index inventory the leader captured with it,
-/// sealed when it is sent, to the new member's index layer; the new member
-/// keeps a capture of its own installed store as its snapshot, with its own
-/// inventory, rather than serving the leader's account of its copies.
+/// A snapshot carries the index inventory the leader takes and seals when
+/// it pins its store to send it, to the new member's index layer; a snapshot
+/// the new member sends in turn carries its own inventory, never the
+/// leader's account of its copies.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_carries_the_sealed_index_inventory() {
     let result = tokio::time::timeout(Duration::from_secs(45), async {
@@ -2074,13 +2075,6 @@ async fn a_snapshot_carries_the_sealed_index_inventory() {
         let applied = n1.applied_index();
         await_snapshot_covering(&n1, applied).await;
         n1.raft().trigger().purge_log(applied).await.expect("purge");
-        assert!(
-            leader_layer
-                .captures
-                .load(std::sync::atomic::Ordering::Relaxed)
-                >= 1,
-            "the snapshot's capture took the inventory"
-        );
 
         let n2 = RaftNode::open_joining(
             2,
@@ -2100,22 +2094,36 @@ async fn a_snapshot_carries_the_sealed_index_inventory() {
             || !member_layer.received.lock().expect("lock").is_empty(),
         )
         .await;
+        assert!(
+            leader_layer
+                .captures
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1,
+            "the pin sent took the inventory"
+        );
         assert_eq!(
             member_layer.received.lock().expect("lock")[0].as_deref(),
             Some(&b"leader inventory+sealed"[..]),
-            "the inventory captured with the snapshot, sealed when sent"
+            "the inventory taken with the pin, sealed when sent"
         );
-        await_condition(
-            Duration::from_secs(20),
-            "the new member never captured its installed store with its own inventory",
-            || {
-                member_layer
-                    .captures
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    >= 1
-            },
-        )
-        .await;
+
+        let before = member_layer
+            .captures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let snapshot = n2
+            .raft()
+            .get_snapshot()
+            .await
+            .expect("get_snapshot")
+            .expect("the installed store is a snapshot");
+        drop(snapshot);
+        assert!(
+            member_layer
+                .captures
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > before,
+            "the new member pins its store with its own inventory"
+        );
 
         n1.shutdown().await.expect("shutdown 1");
         n2.shutdown().await.expect("shutdown 2");

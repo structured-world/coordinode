@@ -23,10 +23,6 @@ use crate::error::StorageResult;
 /// leaves it, and the next open takes every copy as unknown.
 pub const INDEX_TRANSFER_KEY: &[u8] = b"meta:idxtransfer";
 
-/// The file a store capture keeps the inventory of its index copies in,
-/// beside the captured trees.
-pub const CAPTURED_INVENTORY_FILE: &str = "index-copies.inventory";
-
 /// The index layer's side of a transfer of index copies. The inventory is
 /// opaque to the engine, which stores, carries and hands it back.
 #[diagnostic::on_unimplemented(

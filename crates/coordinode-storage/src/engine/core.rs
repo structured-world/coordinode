@@ -166,9 +166,6 @@ pub struct StorageEngine {
     /// Root data directory — exposed so subsystems (e.g. Raft oplog) can
     /// derive their own sub-directories without re-reading the config.
     data_dir: PathBuf,
-    /// The filesystem the trees write through, so what this engine removes
-    /// from its directories goes through the same one that wrote it.
-    fs: Arc<dyn lsm_tree::fs::Fs>,
     /// Configured endpoints — cloned from `StorageConfig.endpoints` at
     /// open time so subsystems (WAL/oplog placement, tier routing,
     /// hard-limit enforcement) can resolve target endpoints without
@@ -1353,7 +1350,6 @@ impl StorageEngine {
             tiered_cache,
             access_tracker: AccessTracker::new(),
             data_dir: config.data_dir().to_path_buf(),
-            fs,
             endpoints: config.endpoints.clone(),
             capacity: capacity_arc,
             capacity_scanner,
@@ -1715,6 +1711,16 @@ impl StorageEngine {
             let _ = snapshot;
             Ok(Vec::new())
         }
+    }
+
+    /// Every `STORAGE COLUMNAR` table's tree with its id, in id order.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn columnar_table_trees(&self) -> Vec<(String, lsm_tree::AnyTree)> {
+        self.columnar_tables
+            .table_ids()
+            .into_iter()
+            .filter_map(|id| self.columnar_tables.get(&id).map(|tree| (id, tree)))
+            .collect()
     }
 
     /// Make the `STORAGE COLUMNAR` tables exactly `tables`: a table not
@@ -2235,67 +2241,6 @@ impl StorageEngine {
 
         self.checkpoint_trees(target, &mut summary)?;
         Ok(summary)
-    }
-
-    /// Capture the store's data as it stands, without its journal: every
-    /// partition tree and `STORAGE COLUMNAR` table, flushed and hard-linked
-    /// into `target` (which must not exist), opened with
-    /// [`Self::open_checkpoint`].
-    ///
-    /// Taken while nothing is applied, the capture holds exactly the applied
-    /// prefix, which no MVCC snapshot does: an entry applies at its own
-    /// commit timestamp, so one applied later can carry a timestamp below a
-    /// snapshot taken earlier and show through it.
-    ///
-    /// # Errors
-    ///
-    /// `target` exists or cannot be created, or a tree's checkpoint fails.
-    pub fn capture(&self, target: &Path) -> StorageResult<CheckpointSummary> {
-        claim_checkpoint_dir(target)?;
-        let mut summary = CheckpointSummary::default();
-        self.checkpoint_trees(target, &mut summary)?;
-        // Taken at the same moment as the trees: what the index layer knows
-        // about its copies then, including findings no tree holds.
-        if let Some(inventory) = self.capture_index_inventory()? {
-            let path = target.join(crate::engine::index_copies::CAPTURED_INVENTORY_FILE);
-            write_synced(&path, &inventory)?;
-        }
-        Ok(summary)
-    }
-
-    /// Remove a capture [`Self::capture`] made, or what a crash left of one,
-    /// through the filesystem that wrote it. A capture already gone is fine.
-    ///
-    /// # Errors
-    ///
-    /// The directory exists and cannot be removed.
-    pub fn remove_capture(&self, dir: &Path) -> StorageResult<()> {
-        remove_capture_with(&*self.fs, dir)
-    }
-
-    /// Recreate the capture at `src` under `dst` (which must not exist) with
-    /// every file hard-linked, through the filesystem that wrote it: a
-    /// capture's files are never rewritten in place, so the copy reads what
-    /// `src` held when linked, whatever later removes `src`.
-    ///
-    /// # Errors
-    ///
-    /// `src` is missing (the error keeps [`std::io::ErrorKind::NotFound`]),
-    /// `dst` exists, or a link cannot be made.
-    pub fn link_capture(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
-        let entries = self.fs.read_dir(src).map_err(std::io::Error::from)?;
-        self.fs.create_dir(dst).map_err(std::io::Error::from)?;
-        for entry in entries {
-            let target = dst.join(&entry.file_name);
-            if entry.is_dir {
-                self.link_capture(&entry.path, &target)?;
-            } else {
-                self.fs
-                    .hard_link(&entry.path, &target)
-                    .map_err(std::io::Error::from)?;
-            }
-        }
-        Ok(())
     }
 
     /// Flush and hard-link every partition tree and columnar table into
@@ -5631,21 +5576,12 @@ fn create_dir_new(dir: &Path) -> StorageResult<()> {
 
 /// Create the directory a checkpoint is written into, refusing one that
 /// already exists, a concurrent checkpoint's included.
-fn claim_checkpoint_dir(target: &Path) -> StorageResult<()> {
+pub(crate) fn claim_checkpoint_dir(target: &Path) -> StorageResult<()> {
     if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|e| StorageError::Io(format!("create checkpoint parent {parent:?}: {e}")))?;
     }
     create_dir_new(target)
-}
-
-/// Write `bytes` to a new file at `path` and sync it.
-fn write_synced(path: &Path, bytes: &[u8]) -> StorageResult<()> {
-    use std::io::Write as _;
-    let io = |e: std::io::Error| StorageError::Io(format!("write {path:?}: {e}"));
-    let mut file = std::fs::File::create_new(path).map_err(io)?;
-    file.write_all(bytes).map_err(io)?;
-    file.sync_all().map_err(io)
 }
 
 /// Directory under the data dir holding one empty file per partition whose

@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 
 use super::*;
 use coordinode_core::txn::proposal::PartitionId;
@@ -22,9 +22,40 @@ fn log_id(term: u64, index: u64) -> openraft::type_config::alias::LogIdOf<TypeCo
     openraft::LogId::new(CommittedLeaderId { term, node_id: 0 }, index)
 }
 
-/// A snapshot carrying metadata only, staged where a received one would be.
-fn empty_snapshot(engine: &StorageEngine) -> SnapshotFile {
-    SnapshotFile::stage(&crate::snapshot::snapshot_dir(engine)).unwrap()
+/// A snapshot carrying metadata only.
+fn empty_snapshot() -> SnapshotData {
+    SnapshotData::Empty
+}
+
+/// The snapshot `sm` would send a follower now: its store pinned at its
+/// applies.
+async fn pinned(sm: &mut CoordinodeStateMachine) -> Snapshot {
+    sm.get_current_snapshot()
+        .await
+        .expect("pin the store")
+        .expect("a snapshot once something applied")
+}
+
+/// The metadata and the bytes of a pinned snapshot, as the network sends them.
+fn sent(snapshot: Snapshot) -> (SnapshotMeta, Vec<u8>) {
+    let mut transfer = match snapshot.snapshot {
+        SnapshotData::Pinned { transfer, .. } => Some(transfer),
+        _ => None,
+    }
+    .expect("a snapshot to send is the pinned store");
+    let mut bytes = Vec::new();
+    transfer.read_to_end(&mut bytes).expect("stream the store");
+    assert_eq!(bytes.len() as u64, transfer.len());
+    (snapshot.meta, bytes)
+}
+
+/// `bytes` received by `engine`'s member, where the network receives them.
+fn received(engine: &StorageEngine, bytes: &[u8]) -> SnapshotData {
+    let dir = crate::snapshot::receive_target(&crate::snapshot::snapshot_dir(engine));
+    SnapshotData::Received(
+        coordinode_storage::engine::store_transfer::receive_store(&mut &bytes[..], &dir)
+            .expect("receive the snapshot"),
+    )
 }
 
 // -- LogStore --
@@ -610,9 +641,7 @@ async fn installing_a_snapshot_publishes_its_applied_index() {
         last_log_id: Some(log_id(2, 20)),
         last_membership: openraft::StoredMembership::default(),
     };
-    sm.install_snapshot(&meta, empty_snapshot(&engine))
-        .await
-        .unwrap();
+    sm.install_snapshot(&meta, empty_snapshot()).await.unwrap();
 
     assert!(applied.has_changed().unwrap(), "waiters are woken");
     assert_eq!(*applied.borrow(), 20);
@@ -633,9 +662,7 @@ async fn installing_a_snapshot_rebinds_every_tree_to_it() {
         last_log_id: Some(snapshot_id),
         last_membership: openraft::StoredMembership::default(),
     };
-    sm.install_snapshot(&meta, empty_snapshot(&engine))
-        .await
-        .unwrap();
+    sm.install_snapshot(&meta, empty_snapshot()).await.unwrap();
 
     let coverage = engine.raft_coverage().unwrap();
     assert_eq!(
@@ -867,7 +894,6 @@ async fn install_cut_at(op: lsm_tree::fs::FaultOp, skip: u64) -> bool {
 /// A snapshot standing at entry 2 (`node:1:a` = `a1`, `node:1:b` = `b1`):
 /// its metadata and its bytes.
 async fn snapshot_image() -> (SnapshotMeta, Vec<u8>) {
-    use std::io::Seek;
     let (_dir, engine) = test_engine();
     let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
     apply_entries(
@@ -878,24 +904,7 @@ async fn snapshot_image() -> (SnapshotMeta, Vec<u8>) {
         ],
     )
     .await;
-    let mut builder = sm.get_snapshot_builder().await;
-    let mut snapshot = builder.build_snapshot().await.expect("build");
-    snapshot.snapshot.rewind().expect("rewind");
-    let mut bytes = Vec::new();
-    snapshot
-        .snapshot
-        .read_to_end(&mut bytes)
-        .expect("read the snapshot");
-    (snapshot.meta, bytes)
-}
-
-/// `bytes` staged as a received snapshot for `engine`.
-fn staged_snapshot(engine: &StorageEngine, bytes: &[u8]) -> SnapshotFile {
-    use std::io::Seek;
-    let mut file = empty_snapshot(engine);
-    file.write_all(bytes).expect("stage the snapshot");
-    file.rewind().expect("rewind");
-    file
+    sent(pinned(&mut sm).await)
 }
 
 /// Install the snapshot of [`snapshot_image`] over a store holding a row the
@@ -923,7 +932,7 @@ async fn snapshot_install_cut_at(
     )
     .await;
     engine.persist().expect("persist");
-    let snapshot = staged_snapshot(&engine, bytes);
+    let snapshot = received(&engine, bytes);
     rig.fail_from(op, skip);
     let stopped = sm.install_snapshot(meta, snapshot).await.is_err();
     drop(sm);
@@ -932,7 +941,7 @@ async fn snapshot_install_cut_at(
     let (engine, clock) = open_rig_engine(&rig);
     let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(clock))
         .expect("a store with an interrupted snapshot install opens");
-    sm.install_snapshot(meta, staged_snapshot(&engine, bytes))
+    sm.install_snapshot(meta, received(&engine, bytes))
         .await
         .expect("the snapshot installs again");
     let read = |key: &[u8]| engine.get(Partition::Node, key).expect("get");
@@ -990,9 +999,9 @@ async fn a_power_cut_inside_a_partition_install_is_repaired_by_installing_again(
 
 #[test]
 fn captures_a_crash_left_behind_are_cleared_on_open() {
-    // A capture lives only as long as the copy or snapshot build that made
-    // it; one a crash interrupted would otherwise hold its hard links, and
-    // the disk space of every table they pin, for good.
+    // A partition capture lives only as long as the copy that made it, and
+    // a received snapshot only until it installs; one a crash interrupted
+    // would otherwise hold its files, and their disk space, for good.
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -1004,8 +1013,8 @@ fn captures_a_crash_left_behind_are_cleared_on_open() {
     // Captures are left in a directory an engine already opened.
     drop(StorageEngine::open(&config).expect("first open"));
     let partition_capture = dir.path().join("partition-capture").join("node-1");
-    // A capture taken for a snapshot that was never published.
-    let snapshot_capture = dir.path().join("raft-snapshot").join("1.capt");
+    // A snapshot received from a leader and never installed.
+    let snapshot_capture = dir.path().join("raft-snapshot").join("1.recv");
     std::fs::create_dir_all(&partition_capture).expect("mkdir");
     std::fs::create_dir_all(&snapshot_capture).expect("mkdir");
 
@@ -1095,23 +1104,70 @@ async fn a_partition_installed_ahead_is_left_alone_until_the_applies_pass_it() {
     assert!(coverage.holds(Partition::Counter, 8, 0));
 }
 
-#[tokio::test]
-async fn a_snapshot_holds_exactly_the_entries_up_to_its_log_id() {
-    // openraft builds a snapshot after `get_snapshot_builder` returns, while
-    // the state machine keeps applying. A follower installs the snapshot and
-    // then receives every entry past its log id, so an effect the data
-    // already carried from a later entry would be applied twice.
+/// A snapshot sent while a partition stands ahead of the applies carries
+/// that partition's own position: the follower leaves it alone until its
+/// applies pass it, as the leader does, rather than counting the entries the
+/// copy already holds a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partition_ahead_of_the_applies_travels_with_its_position() {
+    use coordinode_storage::engine::core::{PartitionCopy, RaftPosition};
     let (_dir, leader) = test_engine();
     let mut sm = CoordinodeStateMachine::new(Arc::clone(&leader)).expect("open");
     apply_entries(&mut sm, vec![two_tree_merge_entry(1, 1000)]).await;
-    let mut builder = sm.get_snapshot_builder().await;
+    let key = b"counter:degree:1".to_vec();
+    let copy = PartitionCopy {
+        rows: vec![(key.clone(), 6i64.to_le_bytes().to_vec())],
+        position: Some(RaftPosition {
+            next: 7,
+            payload: rmp_serde::to_vec(&log_id(1, 6)).expect("payload"),
+        }),
+    };
+    let installer = Arc::clone(&leader);
+    tokio::task::spawn_blocking(move || {
+        installer.install_partition(Partition::Counter, &copy, true)
+    })
+    .await
+    .expect("install task")
+    .expect("install");
+
+    let (meta, bytes) = sent(pinned(&mut sm).await);
+    assert_eq!(meta.last_log_id, Some(log_id(1, 1)));
+    let (_dir2, follower) = test_engine();
+    let mut fsm = CoordinodeStateMachine::new(Arc::clone(&follower)).expect("open follower");
+    fsm.install_snapshot(&meta, received(&follower, &bytes))
+        .await
+        .expect("install");
+
+    let later: Vec<Entry> = (2..=8).map(|i| two_tree_merge_entry(i, 1000 * i)).collect();
+    apply_entries(&mut sm, later.clone()).await;
+    apply_entries(&mut fsm, later).await;
+    let counter = |engine: &StorageEngine| engine.get(Partition::Counter, &key).expect("get");
+    assert_eq!(
+        counter(&follower).as_deref(),
+        Some(8i64.to_le_bytes().as_slice()),
+        "six from the copy, then entries 7 and 8"
+    );
+    assert_eq!(counter(&follower), counter(&leader));
+}
+
+#[tokio::test]
+async fn a_snapshot_holds_exactly_the_entries_up_to_its_log_id() {
+    // A pinned snapshot is streamed while the state machine keeps applying.
+    // A follower installs it and then receives every entry past its log id,
+    // so an effect the data already carried from a later entry would be
+    // applied twice.
+    let (_dir, leader) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&leader)).expect("open");
+    apply_entries(&mut sm, vec![two_tree_merge_entry(1, 1000)]).await;
+    let snapshot = pinned(&mut sm).await;
     apply_entries(&mut sm, vec![two_tree_merge_entry(2, 2000)]).await;
-    let snapshot = builder.build_snapshot().await.expect("build");
-    assert_eq!(snapshot.meta.last_log_id, Some(log_id(1, 1)));
+    leader.persist().expect("flush the later entry");
+    let (meta, bytes) = sent(snapshot);
+    assert_eq!(meta.last_log_id, Some(log_id(1, 1)));
 
     let (_dir2, follower) = test_engine();
     let mut fsm = CoordinodeStateMachine::new(Arc::clone(&follower)).expect("open follower");
-    fsm.install_snapshot(&snapshot.meta, snapshot.snapshot)
+    fsm.install_snapshot(&meta, received(&follower, &bytes))
         .await
         .expect("install");
     apply_entries(&mut fsm, vec![two_tree_merge_entry(2, 2000)]).await;
@@ -1153,8 +1209,7 @@ async fn an_entry_after_the_snapshot_wins_over_the_installed_value() {
             .expect("open leader");
     let t1 = leader_clock.current().as_raw() + 1;
     apply_entries(&mut sm, vec![put(1, t1, b"v1")]).await;
-    let mut builder = sm.get_snapshot_builder().await;
-    let snapshot = builder.build_snapshot().await.expect("build");
+    let (meta, bytes) = sent(pinned(&mut sm).await);
     let t2 = leader_clock.current().as_raw() + 1;
     apply_entries(&mut sm, vec![put(2, t2, b"v2")]).await;
 
@@ -1164,7 +1219,7 @@ async fn an_entry_after_the_snapshot_wins_over_the_installed_value() {
     let (follower, follower_clock) = open_rig_engine(&follower_rig);
     let mut fsm = CoordinodeStateMachine::with_oracle(Arc::clone(&follower), Some(follower_clock))
         .expect("open follower");
-    fsm.install_snapshot(&snapshot.meta, snapshot.snapshot)
+    fsm.install_snapshot(&meta, received(&follower, &bytes))
         .await
         .expect("install");
     apply_entries(&mut fsm, vec![put(2, t2, b"v2")]).await;
@@ -1351,12 +1406,11 @@ async fn entries_reapplied_after_a_snapshot_install_are_visible() {
         node_key_entry(4, 4000, b"node:1:c", b"c1"),
     ];
     apply_entries(&mut sm, early).await;
-    let mut builder = sm.get_snapshot_builder().await;
-    let snapshot = builder.build_snapshot().await.expect("build");
-    assert_eq!(snapshot.meta.last_log_id, Some(log_id(1, 2)));
+    let (meta, bytes) = sent(pinned(&mut sm).await);
+    assert_eq!(meta.last_log_id, Some(log_id(1, 2)));
     apply_entries(&mut sm, late.clone()).await;
 
-    sm.install_snapshot(&snapshot.meta, snapshot.snapshot)
+    sm.install_snapshot(&meta, received(&engine, &bytes))
         .await
         .expect("install");
     apply_entries(&mut sm, late).await;
@@ -1396,10 +1450,11 @@ async fn entries_replayed_after_a_snapshot_install_on_reopen_are_visible() {
         node_key_entry(4, ts(), b"node:1:c", b"c1"),
     ];
     apply_entries(&mut sm, early).await;
-    let mut builder = sm.get_snapshot_builder().await;
-    builder.build_snapshot().await.expect("build");
+    // A leader's snapshot at entry 2, arriving after this member applied
+    // further and restarted.
+    let (meta, bytes) = sent(pinned(&mut sm).await);
+    assert_eq!(meta.last_log_id, Some(log_id(1, 2)));
     apply_entries(&mut sm, late.clone()).await;
-    drop(builder);
     drop(sm);
     // A clean stop: every applied entry is on disk, and the reopened seqno
     // sits past all of them.
@@ -1409,13 +1464,7 @@ async fn entries_replayed_after_a_snapshot_install_on_reopen_are_visible() {
     let (engine, clock) = open_rig_engine(&rig);
     let mut sm =
         CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(clock)).expect("reopen");
-    let snapshot = sm
-        .get_current_snapshot()
-        .await
-        .expect("read the snapshot")
-        .expect("the built snapshot is current");
-    assert_eq!(snapshot.meta.last_log_id, Some(log_id(1, 2)));
-    sm.install_snapshot(&snapshot.meta, snapshot.snapshot)
+    sm.install_snapshot(&meta, received(&engine, &bytes))
         .await
         .expect("install");
     apply_entries(&mut sm, late).await;
@@ -1963,220 +2012,67 @@ async fn log_store_purge_survives_reopen() {
 
 // -- Snapshot persistence tests --
 
+/// A build compacts the log against the applied store: it copies and
+/// serializes nothing, and leaves nothing beside the store. The data is the
+/// store itself, pinned when a follower needs it, and installs on another
+/// member.
 #[tokio::test]
-async fn snapshot_build_persists_to_storage() {
+async fn a_build_keeps_nothing_and_a_pin_serves_the_data() {
     let (_dir, engine) = test_engine();
-
-    // Write some data
     engine
         .put(Partition::Node, b"node:0:1", b"alice")
         .expect("put");
-
     let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
-
-    // Set applied state so snapshot has a valid log_id
     *sm.last_applied.lock().unwrap() = Some(log_id(1, 5));
 
-    // Build snapshot via the SnapshotBuilder
     let mut builder = sm.get_snapshot_builder().await;
-    let snap = builder.build_snapshot().await.unwrap();
+    let built = builder.build_snapshot().await.unwrap();
+    assert_eq!(built.meta.last_log_id, Some(log_id(1, 5)));
+    assert!(matches!(built.snapshot, SnapshotData::Empty));
+    assert!(
+        snapshot_files(&engine).is_empty(),
+        "nothing kept beside the store: {:?}",
+        snapshot_files(&engine)
+    );
 
-    assert!(snap.meta.last_log_id.is_some());
-    assert_eq!(snap.meta.last_log_id.unwrap().index, 5);
-
-    // The metadata is recorded in the store; the build keeps the capture it
-    // was made from and serializes nothing, so its cost does not grow with
-    // the data.
-    let snap_meta = engine.get(Partition::Schema, KEY_SNAPSHOT_META).unwrap();
-    assert!(snap_meta.is_some(), "snapshot meta should be persisted");
-    drop(snap);
-    let files = snapshot_files(&engine);
-    assert_eq!(files.len(), 1, "one published snapshot: {files:?}");
-    assert!(files[0].is_dir(), "kept as the capture: {files:?}");
-
-    // Read, the capture serializes into a snapshot holding the data, which
-    // installs on another store.
-    let (current_meta, mut current) = sm.snapshots.current().unwrap().expect("a current snapshot");
-    assert_eq!(current_meta.last_log_id, Some(log_id(1, 5)));
-    let mut data = Vec::new();
-    current.read_to_end(&mut data).unwrap();
-    assert_eq!(&data[..4], b"CNSN", "snapshot data should have CNSN magic");
+    let (meta, bytes) = sent(pinned(&mut sm).await);
+    assert_eq!(meta.last_log_id, Some(log_id(1, 5)));
     let (_other_dir, other) = test_engine();
-    crate::snapshot::install_full_snapshot_from_reader(&other, &mut std::io::Cursor::new(&data))
-        .unwrap();
+    let mut other_sm = CoordinodeStateMachine::new(Arc::clone(&other)).expect("open other");
+    other_sm
+        .install_snapshot(&meta, received(&other, &bytes))
+        .await
+        .expect("install");
     assert_eq!(
         other.get(Partition::Node, b"node:0:1").unwrap().as_deref(),
         Some(&b"alice"[..])
     );
-    drop(current);
-    assert_eq!(
-        snapshot_files(&engine),
-        files,
-        "reading leaves only the published capture"
-    );
-}
-
-/// A capture the record names but a crash lost reads as no snapshot, which
-/// openraft answers by building a new one, never as an error that would stop
-/// the node from starting.
-#[tokio::test]
-async fn a_lost_snapshot_capture_reads_as_no_snapshot() {
-    let (_dir, engine) = test_engine();
-    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
-    *sm.last_applied.lock().unwrap() = Some(log_id(1, 5));
-    drop(
-        sm.get_snapshot_builder()
-            .await
-            .build_snapshot()
-            .await
-            .unwrap(),
-    );
-
-    let files = snapshot_files(&engine);
-    assert_eq!(files.len(), 1, "{files:?}");
-    std::fs::remove_dir_all(&files[0]).unwrap();
-
-    assert!(sm.snapshots.current().unwrap().is_none());
-    assert!(sm.get_current_snapshot().await.unwrap().is_none());
     assert!(
-        snapshot_files(&engine).is_empty(),
-        "no half-made copy is left behind"
+        snapshot_files(&other).is_empty(),
+        "the received copy goes once installed: {:?}",
+        snapshot_files(&other)
     );
 }
 
-/// Every file in `engine`'s snapshot directory.
+/// Before anything applied there is no snapshot to send.
+#[tokio::test]
+async fn nothing_applied_is_no_snapshot() {
+    let (_dir, engine) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(engine).expect("open state machine");
+    assert!(sm.get_current_snapshot().await.unwrap().is_none());
+}
+
+/// Every file in `engine`'s snapshot directory; none when it does not exist.
 fn snapshot_files(engine: &StorageEngine) -> Vec<std::path::PathBuf> {
-    let mut files: Vec<_> = std::fs::read_dir(crate::snapshot::snapshot_dir(engine))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
+    let Ok(dir) = std::fs::read_dir(crate::snapshot::snapshot_dir(engine)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = dir.map(|entry| entry.unwrap().path()).collect();
     files.sort();
     files
 }
 
-/// A new build replaces the file of the one before it, so the directory
-/// holds one snapshot however many were built.
-#[tokio::test]
-async fn a_new_snapshot_removes_the_file_it_replaces() {
-    let (_dir, engine) = test_engine();
-    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
-
-    let mut published = Vec::new();
-    for index in [5, 6] {
-        *sm.last_applied.lock().unwrap() = Some(log_id(1, index));
-        let mut builder = sm.get_snapshot_builder().await;
-        builder.build_snapshot().await.unwrap();
-        let files = snapshot_files(&engine);
-        assert_eq!(files.len(), 1, "after the build at {index}: {files:?}");
-        published.push(files[0].clone());
-    }
-    assert_ne!(published[0], published[1], "the second build is a new file");
-}
-
-/// A snapshot older than the current one never replaces it: a build that
-/// finishes after a newer install leaves the newer snapshot current.
-#[tokio::test]
-async fn an_older_snapshot_does_not_replace_a_newer_one() {
-    let (_dir, engine) = test_engine();
-    let store = SnapshotStore::open(Arc::clone(&engine)).unwrap();
-    let meta_at = |index| SnapshotMeta {
-        last_log_id: Some(log_id(1, index)),
-        last_membership: openraft::StoredMembership::default(),
-    };
-
-    let mut newer = store.stage().unwrap();
-    newer.write_all(b"newer").unwrap();
-    assert!(store.publish(&meta_at(9), &mut newer).unwrap());
-    let mut older = store.stage().unwrap();
-    older.write_all(b"older").unwrap();
-    assert!(!store.publish(&meta_at(4), &mut older).unwrap());
-    drop(older);
-
-    let (meta, mut current) = store.current().unwrap().expect("a current snapshot");
-    assert_eq!(meta.last_log_id, Some(log_id(1, 9)));
-    let mut data = Vec::new();
-    current.read_to_end(&mut data).unwrap();
-    assert_eq!(data, b"newer");
-    assert_eq!(snapshot_files(&engine).len(), 1, "the refused file is gone");
-}
-
-/// A received snapshot that never installs, and anything a crash left in
-/// the directory, is gone once the store reopens; the current one stays.
-#[tokio::test]
-async fn reopening_keeps_only_the_current_snapshot() {
-    let (_dir, engine) = test_engine();
-    let dir = crate::snapshot::snapshot_dir(&engine);
-    {
-        let store = SnapshotStore::open(Arc::clone(&engine)).unwrap();
-        let mut current = store.stage().unwrap();
-        current.write_all(b"current").unwrap();
-        let meta = SnapshotMeta {
-            last_log_id: Some(log_id(1, 3)),
-            last_membership: openraft::StoredMembership::default(),
-        };
-        assert!(store.publish(&meta, &mut current).unwrap());
-
-        let received = SnapshotFile::stage(&dir).unwrap();
-        drop(received);
-        assert_eq!(
-            snapshot_files(&engine).len(),
-            1,
-            "a dropped staged file goes"
-        );
-    }
-    std::fs::write(dir.join("left-by-a-crash.part"), b"half").unwrap();
-
-    let store = SnapshotStore::open(Arc::clone(&engine)).unwrap();
-    assert_eq!(
-        snapshot_files(&engine).len(),
-        1,
-        "{:?}",
-        snapshot_files(&engine)
-    );
-    let (_, mut current) = store.current().unwrap().expect("a current snapshot");
-    let mut data = Vec::new();
-    current.read_to_end(&mut data).unwrap();
-    assert_eq!(data, b"current");
-}
-
-/// A store an earlier build wrote kept the snapshot bytes as a Schema value;
-/// opening it moves them to a file and drops the value, which every later
-/// snapshot would otherwise carry.
-#[tokio::test]
-async fn a_snapshot_kept_in_the_store_moves_to_a_file() {
-    let (_dir, engine) = test_engine();
-    let meta = SnapshotMeta {
-        last_log_id: Some(log_id(2, 7)),
-        last_membership: openraft::StoredMembership::default(),
-    };
-    engine
-        .put(
-            Partition::Schema,
-            KEY_SNAPSHOT_META,
-            &rmp_serde::to_vec(&meta).unwrap(),
-        )
-        .unwrap();
-    engine
-        .put(Partition::Schema, b"raft:snapshot:data", b"CNSN-legacy")
-        .unwrap();
-
-    let store = SnapshotStore::open(Arc::clone(&engine)).unwrap();
-    assert!(
-        engine
-            .get(Partition::Schema, b"raft:snapshot:data")
-            .unwrap()
-            .is_none()
-    );
-    let (current_meta, mut current) = store.current().unwrap().expect("a current snapshot");
-    assert_eq!(current_meta.last_log_id, meta.last_log_id);
-    let mut data = Vec::new();
-    current.read_to_end(&mut data).unwrap();
-    assert_eq!(data, b"CNSN-legacy");
-}
-
-/// A build serializes the store, and the store must not hold the previous
+/// A snapshot is the store, and the store must not hold the previous
 /// snapshot: otherwise every snapshot carries all the ones before it and
 /// grows with each build over unchanged data.
 #[tokio::test]
@@ -2191,14 +2087,16 @@ async fn a_snapshot_does_not_carry_the_previous_one() {
     for index in [5, 6] {
         *sm.last_applied.lock().unwrap() = Some(log_id(1, index));
         let mut builder = sm.get_snapshot_builder().await;
-        let mut snap = builder.build_snapshot().await.unwrap();
-        let mut data = Vec::new();
-        snap.snapshot.read_to_end(&mut data).unwrap();
+        builder.build_snapshot().await.unwrap();
+        let (_, data) = sent(pinned(&mut sm).await);
         sizes.push(data.len());
     }
 
+    // A build flushes every tree, so the second pin holds a few more small
+    // tables until compaction merges them; carrying the first snapshot would
+    // add at least the first one's whole size.
     assert!(
-        sizes[1] < sizes[0] + 4096,
+        sizes[1] < 2 * sizes[0],
         "the second snapshot of unchanged data grew from {} to {} bytes",
         sizes[0],
         sizes[1]
@@ -2253,14 +2151,8 @@ async fn snapshot_survives_reopen() {
             "snapshot last_log_id term should be 1"
         );
 
-        let mut snapshot = snap.snapshot;
-        let mut data = Vec::new();
-        snapshot.read_to_end(&mut data).unwrap();
-        assert!(
-            data.len() > 10,
-            "snapshot data should be non-empty after reopen"
-        );
-        assert_eq!(&data[..4], b"CNSN", "snapshot data magic after reopen");
+        let (_, data) = sent(snap);
+        assert_eq!(&data[..4], b"CNST", "the store streams after reopen");
     }
 }
 

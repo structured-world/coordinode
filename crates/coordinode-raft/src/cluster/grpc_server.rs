@@ -602,14 +602,15 @@ impl RaftService for RaftGrpcHandler {
             "receiving chunked snapshot from leader"
         );
 
-        // A staged file is removed if the transfer or the install fails.
-        let mut staged = crate::snapshot::SnapshotFile::stage(&replica.snapshot_dir)
-            .map_err(|e| Status::internal(format!("stage the snapshot file: {e}")))?;
-        let mut writer = tokio::fs::File::from_std(
-            staged
-                .try_clone_file()
-                .map_err(|e| Status::internal(format!("open the snapshot file: {e}")))?,
-        );
+        // The trees are rebuilt from the stream as it arrives, off the
+        // runtime, beside this member's store; what was received is removed
+        // if the transfer or the install fails.
+        let target = crate::snapshot::receive_target(&replica.snapshot_dir);
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        let receiving = tokio::task::spawn_blocking(move || {
+            let mut reader = crate::snapshot::ChunkReader::new(chunk_rx);
+            coordinode_storage::engine::store_transfer::receive_store(&mut reader, &target)
+        });
         let mut received_bytes = 0u64;
         let mut chunk_count = 0usize;
 
@@ -629,13 +630,18 @@ impl RaftService for RaftGrpcHandler {
 
             match chunk_msg {
                 crate::snapshot::SnapshotChunkMessage::DataChunk(data) => {
-                    use tokio::io::AsyncWriteExt;
-                    writer
-                        .write_all(&data)
-                        .await
-                        .map_err(|e| Status::internal(format!("write snapshot chunk: {e}")))?;
                     received_bytes += data.len() as u64;
                     chunk_count += 1;
+                    if received_bytes > expected_data_size {
+                        return Err(Status::data_loss(format!(
+                            "snapshot data past its size of {expected_data_size}"
+                        )));
+                    }
+                    // A receiver that stopped refused the stream: its error
+                    // is the answer.
+                    if chunk_tx.send(data).await.is_err() {
+                        break;
+                    }
                 }
                 crate::snapshot::SnapshotChunkMessage::Header(_) => {
                     return Err(Status::invalid_argument(
@@ -645,22 +651,17 @@ impl RaftService for RaftGrpcHandler {
             }
         }
 
+        // The end of the stream: the receiver verifies what it read.
+        drop(chunk_tx);
+        let received = receiving
+            .await
+            .map_err(|e| Status::internal(format!("snapshot receive task: {e}")))?
+            .map_err(|e| Status::data_loss(format!("receive the snapshot: {e}")))?;
         if received_bytes != expected_data_size {
             return Err(Status::data_loss(format!(
                 "snapshot data size mismatch: expected {expected_data_size}, got {received_bytes}"
             )));
         }
-
-        {
-            use tokio::io::AsyncWriteExt;
-            // The writes complete on tokio's blocking pool; the install reads
-            // the file through another handle.
-            writer
-                .flush()
-                .await
-                .map_err(|e| Status::internal(format!("write snapshot chunk: {e}")))?;
-        }
-        drop(writer);
 
         // The transfer took a while: the caller is admitted once more
         // before what it sent replaces this member's state.
@@ -676,10 +677,11 @@ impl RaftService for RaftGrpcHandler {
             "snapshot chunks received, installing"
         );
 
-        // openraft passes the file to the state machine's install_snapshot.
+        // openraft passes the received store to the state machine's
+        // install_snapshot.
         let snapshot = openraft::storage::Snapshot {
             meta: header.meta.clone(),
-            snapshot: staged,
+            snapshot: crate::snapshot::SnapshotData::Received(received),
         };
 
         // install_full_snapshot returns SnapshotResponse with the

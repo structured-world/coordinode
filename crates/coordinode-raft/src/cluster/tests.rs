@@ -108,9 +108,9 @@ fn a_member_that_stands_last_stays_last_on_the_rack_profile() {
     );
 }
 
-/// A snapshot capture still running when the node shuts down holds the
-/// engine on its blocking thread. Shutdown waits for it, so the caller that
-/// reopens the directory right after finds it free rather than locked.
+/// A snapshot build still running when the node shuts down holds the engine
+/// on its blocking thread. Shutdown waits for it, so the caller that reopens
+/// the directory right after finds it free rather than locked.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_directory_reopens_right_after_a_shutdown_during_a_snapshot() {
     let (dir, engine) = test_engine();
@@ -119,9 +119,9 @@ async fn a_directory_reopens_right_after_a_shutdown_during_a_snapshot() {
         .expect("bootstrap");
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    crate::storage::CAPTURE_DELAY_MS.store(1500, core::sync::atomic::Ordering::Relaxed);
+    crate::storage::BUILD_DELAY_MS.store(1500, core::sync::atomic::Ordering::Relaxed);
     node.raft().trigger().snapshot().await.expect("trigger");
-    // Let the state machine start the capture before the shutdown.
+    // Let the state machine start the build before the shutdown.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     node.shutdown().await.expect("shutdown");
     drop(node);
@@ -169,7 +169,7 @@ async fn a_checkpoint_returns_once_the_snapshot_covers_the_applied_log() {
         .map(|id| id.index);
 
     // A build slower than any fixed pause the checkpoint could take.
-    crate::storage::CAPTURE_DELAY_MS.store(1500, core::sync::atomic::Ordering::Relaxed);
+    crate::storage::BUILD_DELAY_MS.store(1500, core::sync::atomic::Ordering::Relaxed);
     node.checkpoint().await.expect("checkpoint");
 
     let snapshot = node
