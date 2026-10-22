@@ -184,6 +184,8 @@ pub(crate) async fn serve(
         min_free_bytes: _,
         index_feed_capacity: _,
         resume_free_bytes: _,
+        maintenance_mb_per_sec: _,
+        maintenance_backoff_ms: _,
         node_shard: _,
         registry_heartbeat_ms,
         registry_eviction_ms,
@@ -392,6 +394,9 @@ pub(crate) async fn serve(
     }
     if let Some(bytes) = sizes.write_buffer_bytes {
         storage_config.max_write_buffer_bytes = bytes;
+    }
+    if let Some(bytes) = sizes.maintenance_bytes_per_sec {
+        storage_config.maintenance_bytes_per_sec = bytes;
     }
     // Surface the page-ECC build/config mismatch: an operator who asked
     // for per-block ECC on a binary built without the feature gets a

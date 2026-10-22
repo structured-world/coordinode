@@ -166,6 +166,9 @@ pub struct StorageEngine {
     /// Root data directory — exposed so subsystems (e.g. Raft oplog) can
     /// derive their own sub-directories without re-reading the config.
     data_dir: PathBuf,
+    /// The budget every compaction of every tree and the scrub read and
+    /// write under, retuned live (see [`Self::set_maintenance_rate`]).
+    maintenance: Arc<lsm_tree::rate_limiter::RateLimiter>,
     /// Configured endpoints — cloned from `StorageConfig.endpoints` at
     /// open time so subsystems (WAL/oplog placement, tier routing,
     /// hard-limit enforcement) can resolve target endpoints without
@@ -716,12 +719,19 @@ impl StorageEngine {
         // One write buffer for every partition tree: the memtable axis of the
         // write-pressure verdict bounds their unflushed bytes together.
         let write_buffer = Arc::new(lsm_tree::WriteBufferBudget::default());
+        // One maintenance budget for every tree's compaction and the scrub:
+        // the trees share the disks the foreground needs.
+        let maintenance = new_maintenance_budget(
+            config.maintenance_bytes_per_sec,
+            config.maintenance_backoff_ms,
+        );
 
         // Pass 1: Schema partition (single-tier, no routing).
         let schema_config = config
             .to_tree_config(Partition::Schema, Arc::clone(&seqno))
             .use_cache(Arc::clone(&cache))
-            .write_buffer_budget(Arc::clone(&write_buffer));
+            .write_buffer_budget(Arc::clone(&write_buffer))
+            .compaction_rate_limiter(Arc::clone(&maintenance));
         let (schema_tree, schema_repair) = schema_config.open_or_repair(repair_policy)?;
         if let Some(report) = schema_repair {
             tracing::warn!(
@@ -783,7 +793,8 @@ impl StorageEngine {
             let tree_config = config
                 .to_tree_config_with_routing(part, Arc::clone(&seqno), Some(&routing))
                 .use_cache(Arc::clone(&cache))
-                .write_buffer_budget(Arc::clone(&write_buffer));
+                .write_buffer_budget(Arc::clone(&write_buffer))
+                .compaction_rate_limiter(Arc::clone(&maintenance));
             let (tree, repair) = tree_config.open_or_repair(repair_policy)?;
             if let Some(report) = repair {
                 tracing::warn!(
@@ -1239,6 +1250,7 @@ impl StorageEngine {
                 Arc::clone(&seqno),
                 Arc::clone(&cache),
                 config.oplog_sync_method.tree_sync_mode(),
+                Arc::clone(&maintenance),
             )?
         };
 
@@ -1350,6 +1362,7 @@ impl StorageEngine {
             tiered_cache,
             access_tracker: AccessTracker::new(),
             data_dir: config.data_dir().to_path_buf(),
+            maintenance,
             endpoints: config.endpoints.clone(),
             capacity: capacity_arc,
             capacity_scanner,
@@ -1711,6 +1724,26 @@ impl StorageEngine {
             let _ = snapshot;
             Ok(Vec::new())
         }
+    }
+
+    /// The budget background maintenance reads and writes under: every
+    /// tree's compactions and the scrub.
+    pub fn maintenance_budget(&self) -> &Arc<lsm_tree::rate_limiter::RateLimiter> {
+        &self.maintenance
+    }
+
+    /// Retune the maintenance budget to `bytes_per_sec` (`0`: unthrottled).
+    /// Work already waiting on it is held to the new rate at once.
+    pub fn set_maintenance_rate(&self, bytes_per_sec: u64) {
+        self.maintenance.set_rate(bytes_per_sec);
+    }
+
+    /// Back the maintenance budget off, down to 5% of its rate, while the
+    /// smoothed read latency of maintenance stays above `ceiling`; `None`
+    /// keeps the budget at its rate.
+    pub fn set_maintenance_backoff(&self, ceiling: Option<std::time::Duration>) {
+        self.maintenance
+            .set_latency_backoff(ceiling.map(lsm_tree::rate_limiter::LatencyBackoff::new));
     }
 
     /// Every `STORAGE COLUMNAR` table's tree with its id, in id order.
@@ -5584,6 +5617,22 @@ pub(crate) fn claim_checkpoint_dir(target: &Path) -> StorageResult<()> {
     create_dir_new(target)
 }
 
+/// The maintenance budget an engine opens with: `bytes_per_sec` (`0`:
+/// unthrottled), backing off while reads take longer than `backoff_ms`
+/// (`0`: never).
+fn new_maintenance_budget(
+    bytes_per_sec: u64,
+    backoff_ms: u64,
+) -> Arc<lsm_tree::rate_limiter::RateLimiter> {
+    let budget = Arc::new(lsm_tree::rate_limiter::RateLimiter::new(bytes_per_sec));
+    if backoff_ms > 0 {
+        budget.set_latency_backoff(Some(lsm_tree::rate_limiter::LatencyBackoff::new(
+            std::time::Duration::from_millis(backoff_ms),
+        )));
+    }
+    budget
+}
+
 /// Directory under the data dir holding one empty file per partition whose
 /// rebuild is in progress, named after the partition.
 const REBUILD_INTENT_DIR: &str = "rebuild";
@@ -5770,6 +5819,10 @@ mod retention_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod cache_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod maintenance_tests;
 
 #[cfg(all(test, feature = "columnar"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -48,7 +48,15 @@ fn new_registry(base: &std::path::Path) -> ColumnarTableRegistry {
     let seqno: SharedSequenceNumberGenerator =
         std::sync::Arc::new(lsm_tree::SequenceNumberCounter::default());
     let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(8 * 1024 * 1024));
-    ColumnarTableRegistry::open(base.to_path_buf(), fs, seqno, cache, SyncMode::Full).unwrap()
+    ColumnarTableRegistry::open(
+        base.to_path_buf(),
+        fs,
+        seqno,
+        cache,
+        SyncMode::Full,
+        std::sync::Arc::new(RateLimiter::new(0)),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -122,7 +130,15 @@ fn table_trees_sync_at_the_registry_mode() {
             let seqno: SharedSequenceNumberGenerator =
                 std::sync::Arc::new(lsm_tree::SequenceNumberCounter::default());
             let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(1024 * 1024));
-            ColumnarTableRegistry::open(dir.path().to_path_buf(), fs, seqno, cache, mode).unwrap()
+            ColumnarTableRegistry::open(
+                dir.path().to_path_buf(),
+                fs,
+                seqno,
+                cache,
+                mode,
+                std::sync::Arc::new(RateLimiter::new(0)),
+            )
+            .unwrap()
         };
 
         let tree = open().create_or_open("orders").unwrap();

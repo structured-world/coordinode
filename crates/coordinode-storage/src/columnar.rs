@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use lsm_tree::fs::{Fs, SyncMode};
+use lsm_tree::rate_limiter::RateLimiter;
 use lsm_tree::table::columnar::{ColumnBatch, column_batch_to_entries, entries_to_column_batch};
 use lsm_tree::{AnyTree, Cache, Config, InternalValue, SharedSequenceNumberGenerator, ValueType};
 
@@ -122,13 +123,17 @@ pub struct ColumnarTableRegistry {
     /// Durability of every fsync the table trees issue, the same as the
     /// engine's partition trees.
     sync: SyncMode,
+    /// The engine's maintenance budget, which the table trees' compactions
+    /// draw from with the partition trees'.
+    maintenance: Arc<RateLimiter>,
     trees: Mutex<HashMap<String, AnyTree>>,
 }
 
 impl ColumnarTableRegistry {
     /// Open the registry rooted at `base_dir` on `fs`, re-opening every table
     /// tree already present on disk (restart recovery). Trees share `fs`,
-    /// `seqno`, `cache` and the sync mode `sync` with the engine.
+    /// `seqno`, `cache`, the sync mode `sync` and the maintenance budget
+    /// `maintenance` with the engine.
     ///
     /// # Errors
     ///
@@ -140,25 +145,51 @@ impl ColumnarTableRegistry {
         seqno: SharedSequenceNumberGenerator,
         cache: Arc<Cache>,
         sync: SyncMode,
+        maintenance: Arc<RateLimiter>,
     ) -> StorageResult<Self> {
         fs.create_dir_all(&base_dir)
             .map_err(lsm_tree::Error::from)?;
-        let mut trees = HashMap::new();
-        for entry in fs.read_dir(&base_dir).map_err(lsm_tree::Error::from)? {
-            if !entry.is_dir {
-                continue;
-            }
-            let tree = open_columnar_tree(&entry.path, &fs, &seqno, &cache, sync)?;
-            trees.insert(entry.file_name, tree);
-        }
-        Ok(Self {
+        let mut registry = Self {
             base_dir,
             fs,
             seqno,
             cache,
             sync,
-            trees: Mutex::new(trees),
-        })
+            maintenance,
+            trees: Mutex::new(HashMap::new()),
+        };
+        let mut trees = HashMap::new();
+        for entry in registry
+            .fs
+            .read_dir(&registry.base_dir)
+            .map_err(lsm_tree::Error::from)?
+        {
+            if !entry.is_dir {
+                continue;
+            }
+            let tree = registry.open_tree(&entry.path)?;
+            trees.insert(entry.file_name, tree);
+        }
+        registry.trees = Mutex::new(trees);
+        Ok(registry)
+    }
+
+    /// Open (creating if absent) a columnar-mode tree at `dir`, sharing the
+    /// engine's filesystem, seqno generator, block cache and maintenance
+    /// budget.
+    fn open_tree(&self, dir: &Path) -> StorageResult<AnyTree> {
+        // visible_seqno = seqno: every write is immediately visible, matching
+        // the partition trees opened by the engine. with_shared_fs keeps the
+        // tree on the engine's filesystem backend (e.g. MemFs for in-memory
+        // engines).
+        let tree = Config::new_with_generators(dir, self.seqno.clone(), self.seqno.clone())
+            .with_shared_fs(Arc::clone(&self.fs))
+            .use_cache(Arc::clone(&self.cache))
+            .sync_mode(self.sync)
+            .compaction_rate_limiter(Arc::clone(&self.maintenance))
+            .open()?;
+        enable_columnar(&tree)?;
+        Ok(tree)
     }
 
     /// Return the columnar tree for `table_id`, creating + opening it on first
@@ -190,13 +221,7 @@ impl ColumnarTableRegistry {
         if let Some(tree) = trees.get(table_id) {
             return Ok(tree.clone());
         }
-        let tree = open_columnar_tree(
-            &self.base_dir.join(table_id),
-            &self.fs,
-            &self.seqno,
-            &self.cache,
-            self.sync,
-        )?;
+        let tree = self.open_tree(&self.base_dir.join(table_id))?;
         on_create(&tree)?;
         trees.insert(table_id.to_owned(), tree.clone());
         Ok(tree)
@@ -259,27 +284,6 @@ impl ColumnarTableRegistry {
         ids.sort();
         ids
     }
-}
-
-/// Open (creating if absent) a columnar-mode tree at `dir` on `fs`, sharing the
-/// engine seqno generator and block cache.
-fn open_columnar_tree(
-    dir: &Path,
-    fs: &Arc<dyn Fs>,
-    seqno: &SharedSequenceNumberGenerator,
-    cache: &Arc<Cache>,
-    sync: SyncMode,
-) -> StorageResult<AnyTree> {
-    // visible_seqno = seqno: every write is immediately visible, matching the
-    // partition trees opened by the engine. with_shared_fs keeps the tree on
-    // the engine's filesystem backend (e.g. MemFs for in-memory engines).
-    let tree = Config::new_with_generators(dir, seqno.clone(), seqno.clone())
-        .with_shared_fs(Arc::clone(fs))
-        .use_cache(Arc::clone(cache))
-        .sync_mode(sync)
-        .open()?;
-    enable_columnar(&tree)?;
-    Ok(tree)
 }
 
 #[cfg(test)]

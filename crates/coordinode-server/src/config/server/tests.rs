@@ -37,14 +37,23 @@ fn mib_settings_convert_to_bytes_or_name_the_key_that_overflows() {
         cache_size_mb: Some(64),
         write_buffer_mb: Some(8),
         max_request_size_mb: 16,
+        maintenance_mb_per_sec: Some(40),
         ..ServerConfig::default()
     };
     let sizes = c.byte_sizes().expect("in-range sizes");
     assert_eq!(sizes.cache_bytes, Some(64 * 1024 * 1024));
     assert_eq!(sizes.write_buffer_bytes, Some(8 * 1024 * 1024));
     assert_eq!(sizes.max_request_bytes, 16 * 1024 * 1024);
+    assert_eq!(sizes.maintenance_bytes_per_sec, Some(40 * 1024 * 1024));
 
     for (key, c) in [
+        (
+            "maintenance_mb_per_sec",
+            ServerConfig {
+                maintenance_mb_per_sec: Some(u64::MAX),
+                ..ServerConfig::default()
+            },
+        ),
         (
             "cache_size_mb",
             ServerConfig {
@@ -962,6 +971,35 @@ fn extension_settings_survive_the_unknown_key_check() {
     let stray = dir.path().join("stray.yaml");
     std::fs::write(&stray, "pitr:\n  enabled: true\n").unwrap();
     assert!(ServerConfig::load(Some(stray.to_str().unwrap())).is_err());
+}
+
+/// The maintenance budget's keys parse from the file, and an unset budget
+/// leaves the engine unthrottled.
+#[test]
+fn the_maintenance_budget_parses_and_reaches_the_storage_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "maintenance_mb_per_sec: 100\nmaintenance_backoff_ms: 15\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(
+        c.byte_sizes().expect("sizes").maintenance_bytes_per_sec,
+        Some(100 * 1024 * 1024)
+    );
+    let sc = c.resolve_storage_config().expect("valid topology");
+    assert_eq!(sc.maintenance_backoff_ms, 15);
+
+    let unset = ServerConfig::default();
+    assert_eq!(
+        unset.byte_sizes().expect("sizes").maintenance_bytes_per_sec,
+        None
+    );
+    let sc = unset.resolve_storage_config().expect("valid topology");
+    assert_eq!(sc.maintenance_bytes_per_sec, 0);
+    assert_eq!(sc.maintenance_backoff_ms, 0);
 }
 
 #[test]

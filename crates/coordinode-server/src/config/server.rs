@@ -311,6 +311,8 @@ pub struct ByteSizes {
     pub write_buffer_bytes: Option<u64>,
     /// `max_request_size_mb` in bytes.
     pub max_request_bytes: usize,
+    /// `maintenance_mb_per_sec` in bytes per second (`None` = unthrottled).
+    pub maintenance_bytes_per_sec: Option<u64>,
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -478,6 +480,12 @@ pub struct ServerConfig {
     /// Free disk space, in bytes, needed before refused writes are admitted
     /// again (`None` = 2 GiB; at least `min_free_bytes`).
     pub resume_free_bytes: Option<u64>,
+    /// MiB per second every compaction and the scrub read and write at most,
+    /// together (`None` or 0 = unthrottled).
+    pub maintenance_mb_per_sec: Option<u64>,
+    /// Read latency, in ms, above which the maintenance budget backs off
+    /// while it has a rate (`None` or 0 = never).
+    pub maintenance_backoff_ms: Option<u64>,
     /// The shard whose node rows this engine holds (`None` = 0). The invariant
     /// guard resolves a node from its id alone and needs it to build the key.
     pub node_shard: Option<u16>,
@@ -665,6 +673,8 @@ impl Default for ServerConfig {
             min_free_bytes: None,
             index_feed_capacity: None,
             resume_free_bytes: None,
+            maintenance_mb_per_sec: None,
+            maintenance_backoff_ms: None,
             node_shard: None,
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
@@ -769,6 +779,10 @@ impl ServerConfig {
                 .map(|mib| mib_to_bytes("write_buffer_mb", mib))
                 .transpose()?,
             max_request_bytes,
+            maintenance_bytes_per_sec: self
+                .maintenance_mb_per_sec
+                .map(|mib| mib_to_bytes("maintenance_mb_per_sec", mib))
+                .transpose()?,
         })
     }
 
@@ -1029,6 +1043,11 @@ impl ServerConfig {
         }
         if let Some(bytes) = self.resume_free_bytes {
             cfg.resume_free_bytes = bytes;
+        }
+        // The maintenance rate is converted to bytes with the other MiB
+        // settings (`byte_sizes`); its backoff needs no conversion.
+        if let Some(ms) = self.maintenance_backoff_ms {
+            cfg.maintenance_backoff_ms = ms;
         }
         if let Some(ms) = self.snapshot_wait_ms {
             cfg.snapshot_wait_ms = ms;

@@ -145,6 +145,8 @@ the key is unset.
 | `scrub_enabled` | `false` | restart | Whether the background integrity scrub runs (each node verifies its own on-disk block checksums). A pass reads every block, so it is off unless enabled. |
 | `scrub_interval_secs` | `604800` (7 days) | restart | Seconds between background scrub cycles. |
 | `scrub_throttle_ms` | `50` | restart | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
+| `maintenance_mb_per_sec` | unset (unthrottled) | live (`StorageEngine::set_maintenance_rate`, bytes per second) | MiB per second the node's background maintenance reads and writes at most: every compaction of every partition and `STORAGE COLUMNAR` table, and the scrub, draw from this one budget, so together they cannot saturate the disk the foreground needs. A budget too low for the write rate lets compaction fall behind until write backpressure engages. Unset or `0` leaves maintenance unthrottled. |
+| `maintenance_backoff_ms` | unset (off) | live (`StorageEngine::set_maintenance_backoff`) | Smoothed read latency, in ms, above which the maintenance budget backs off, down to 5% of its rate, until the device answers faster again; it climbs back once the latency is 20% under this. Applies only while `maintenance_mb_per_sec` sets a rate. Unset or `0` keeps the budget at its rate. |
 | `checkpoint_enabled` | `false` | restart | Whether periodic local checkpoints are taken (the base for WAL-replay repair when no healthy replica is available). A checkpoint hard-links the store's tables, so taking one copies nothing, but it keeps every table compaction replaces after it: on data that is rewritten, each retained checkpoint grows toward a second copy of the store. Off by default; enable it where that space buys repair without a replica (a standalone node), and size `checkpoint_keep` to the disk. |
 | `checkpoint_interval_secs` | `3600` (1 hour) | restart | Seconds between periodic checkpoints. A rebuild from the latest checkpoint replays the Raft log from the oldest entry the checkpoint lacks, so the log is kept from there: a longer interval keeps more log on disk. |
 | `checkpoint_dir` | `<data_dir>/checkpoints` | restart | Directory checkpoints are written under. |
@@ -433,6 +435,11 @@ wire_compression_level: 3
 scrub_enabled: false
 # scrub_interval_secs: 604800
 # scrub_throttle_ms: 50
+
+# One budget for compaction and the scrub (MiB/s, unset = unthrottled), and
+# the read latency (ms) above which it backs off.
+# maintenance_mb_per_sec: 200
+# maintenance_backoff_ms: 20
 
 # Periodic local checkpoints (base for WAL-replay repair); off by default.
 # checkpoint_enabled: false

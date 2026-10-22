@@ -6,8 +6,9 @@
 //! block-checksum scrubber ([`lsm_tree::AbstractTree::verify_checksum_with`]),
 //! which scans to completion and collects every corrupt block with its exact
 //! `(file, offset)` rather than aborting on the first failure — so one bad block
-//! never hides the rest. An optional inter-SST throttle keeps a background scrub
-//! from saturating production I/O.
+//! never hides the rest. Its reads are charged to the engine's maintenance
+//! budget with compaction's, and an optional inter-SST pause keeps a
+//! background scrub from saturating production I/O.
 //!
 //! ## Usage
 //!
@@ -18,9 +19,11 @@
 //! }
 //! ```
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lsm_tree::AbstractTree;
+use lsm_tree::rate_limiter::RateLimiter;
 use lsm_tree::verify::VerifyOptions;
 
 use crate::engine::core::StorageEngine;
@@ -58,9 +61,13 @@ impl Default for ScrubConfig {
 }
 
 impl ScrubConfig {
-    /// Map this config onto the storage engine's block-scrub options.
-    fn verify_options(&self) -> VerifyOptions {
-        let opts = VerifyOptions::default().parallelism(self.parallelism.max(1));
+    /// Map this config onto the storage engine's block-scrub options, the
+    /// reads charged to the engine's maintenance `budget` with compaction's:
+    /// a device the scrub finds slow backs both off.
+    fn verify_options(&self, budget: &Arc<RateLimiter>) -> VerifyOptions {
+        let opts = VerifyOptions::default()
+            .parallelism(self.parallelism.max(1))
+            .rate_limiter(Arc::clone(budget));
         match self.throttle {
             Some(delay) => opts.throttle(delay),
             None => opts,
@@ -125,7 +132,7 @@ pub fn scrub_partition(
     config: &ScrubConfig,
 ) -> StorageResult<(u64, u64, Vec<VerifyError>)> {
     let tree = engine.tree(part)?;
-    let report = tree.verify_checksum_with(&config.verify_options());
+    let report = tree.verify_checksum_with(&config.verify_options(engine.maintenance_budget()));
 
     let mut errors: Vec<VerifyError> = report
         .errors

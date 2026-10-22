@@ -811,6 +811,20 @@ pub struct StorageConfig {
     /// before refused writes are admitted again; at least `min_free_bytes`.
     /// Default 2 GiB.
     pub resume_free_bytes: u64,
+
+    /// Bytes per second the background maintenance of this engine (every
+    /// compaction and scrub, over every tree together) reads and writes at
+    /// most, so it cannot saturate the disk the foreground needs. `0`
+    /// leaves it unthrottled. Default: 0. Retunable at runtime through
+    /// `StorageEngine::set_maintenance_rate`.
+    pub maintenance_bytes_per_sec: u64,
+
+    /// Smoothed read latency, in milliseconds, above which the maintenance
+    /// budget backs off (down to 5% of its rate) until the device answers
+    /// faster again; it applies only while the budget has a rate. `0` keeps
+    /// the budget fixed. Default: 0. Retunable at runtime through
+    /// `StorageEngine::set_maintenance_backoff`.
+    pub maintenance_backoff_ms: u64,
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -975,6 +989,8 @@ impl StorageConfig {
             relocated: false,
             min_free_bytes: crate::engine::space::DEFAULT_MIN_FREE_BYTES,
             resume_free_bytes: crate::engine::space::DEFAULT_RESUME_FREE_BYTES,
+            maintenance_bytes_per_sec: 0,
+            maintenance_backoff_ms: 0,
         }
     }
 
