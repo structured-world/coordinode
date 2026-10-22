@@ -153,5 +153,9 @@ harness = false
 name = "edge_cardinality"
 harness = false
 
+[[bench]]
+name = "blob_cache_fill"
+harness = false
+
 [lints]
 workspace = true

@@ -1296,6 +1296,13 @@ impl StorageConfig {
         if separates_values(part) {
             config = config.with_kv_separation(Some(lsm_tree::KvSeparationOptions::default()));
         }
+        // The rerank candidates of different searches overlap on a hot set,
+        // so the truth tier keeps the vectors it reads in the block cache;
+        // large blobs, mostly read once, stay out of it (the engine default)
+        // so they do not evict the index and filter blocks of every tree.
+        if part == Partition::VectorF32 {
+            config = config.blob_cache_fill(lsm_tree::config::BlobCacheFill::Always);
+        }
 
         // Prefix extractor for bloom-accelerated prefix scans. Partitions
         // other than the index one use colon-separated keys (node:, adj:,

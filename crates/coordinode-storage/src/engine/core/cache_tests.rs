@@ -50,6 +50,32 @@ fn a_reopened_store_never_serves_a_value_cached_before_a_later_write() {
     );
 }
 
+/// How a separated tree fills the block cache with the values it reads.
+fn blob_cache_fill(engine: &StorageEngine, part: Partition) -> lsm_tree::config::BlobCacheFill {
+    match engine.tree(part).expect("tree") {
+        lsm_tree::AnyTree::Blob(tree) => tree.runtime_config().blob_cache_fill,
+        lsm_tree::AnyTree::Standard(_) => panic!("{part:?} separates its values"),
+    }
+}
+
+/// The vector truth tier keeps the values it reads in the block cache, since
+/// the rerank candidates of different searches overlap on a hot set; the
+/// large blobs, mostly read once, stay out of it so they do not evict the
+/// index and filter blocks of every tree.
+#[test]
+fn only_the_vector_truth_tier_caches_its_values() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = StorageEngine::open(&cached_config(dir.path())).expect("open");
+    assert_eq!(
+        blob_cache_fill(&engine, Partition::VectorF32),
+        lsm_tree::config::BlobCacheFill::Always
+    );
+    assert_eq!(
+        blob_cache_fill(&engine, Partition::Blob),
+        lsm_tree::config::BlobCacheFill::Never
+    );
+}
+
 /// Keys a range drop removed are not served from the cache.
 #[test]
 fn a_dropped_range_is_not_served_from_the_cache() {
