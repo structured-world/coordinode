@@ -166,6 +166,12 @@ pub struct StorageEngine {
     /// Root data directory — exposed so subsystems (e.g. Raft oplog) can
     /// derive their own sub-directories without re-reading the config.
     data_dir: PathBuf,
+    /// The filesystem every tree writes through, whose device caches a
+    /// durable flush empties under each endpoint.
+    fs: Arc<dyn lsm_tree::fs::Fs>,
+    /// How the trees sync their files: under a barrier a flush is ordered,
+    /// and durable once the device caches are flushed.
+    tree_sync: lsm_tree::fs::SyncMode,
     /// The budget every compaction of every tree and the scrub read and
     /// write under, retuned live (see [`Self::set_maintenance_rate`]).
     maintenance: Arc<lsm_tree::rate_limiter::RateLimiter>,
@@ -1362,6 +1368,8 @@ impl StorageEngine {
             tiered_cache,
             access_tracker: AccessTracker::new(),
             data_dir: config.data_dir().to_path_buf(),
+            fs,
+            tree_sync: config.oplog_sync_method.tree_sync_mode(),
             maintenance,
             endpoints: config.endpoints.clone(),
             capacity: capacity_arc,
@@ -2293,7 +2301,7 @@ impl StorageEngine {
             // This also makes the per-partition checkpoint directory appear
             // deterministically (previously it depended on whether a
             // background flush happened to have run before the checkpoint).
-            self.flush_memtables(tree).map_err(|e| {
+            self.flush_memtables_in_order(tree).map_err(|e| {
                 StorageError::Io(format!("flush before checkpoint {}: {e}", part.name()))
             })?;
             let info = tree
@@ -2317,7 +2325,7 @@ impl StorageEngine {
                 let Some(tree) = self.columnar_tables.get(&table_id) else {
                     continue;
                 };
-                self.flush_memtables(&tree)?;
+                self.flush_memtables_in_order(&tree)?;
                 let info = tree
                     .create_checkpoint(&tables.join(&table_id))
                     .map_err(|e| {
@@ -2326,6 +2334,15 @@ impl StorageEngine {
                 summary.total_bytes += info.total_bytes;
                 summary.max_seqno = summary.max_seqno.max(info.seqno);
             }
+        }
+        // A checkpoint is a base the Raft log is kept for: durable, both the
+        // flushed trees under the endpoints and the copy, before its marker
+        // names it a store.
+        self.sync_endpoint_devices()?;
+        if self.tree_sync == lsm_tree::fs::SyncMode::Barrier {
+            self.fs.sync_device(target).map_err(|e| {
+                StorageError::Io(format!("flush the device caches under {target:?}: {e}"))
+            })?;
         }
         // The copy is a directory of this engine's format, opened as one.
         crate::format::write_marker(target, coordinode_core::version::engine_format_version())
@@ -4147,17 +4164,51 @@ impl StorageEngine {
     /// that was in the WAL is now in SST, so the journal can be truncated.
     pub fn persist(&self) -> StorageResult<()> {
         for tree in self.coordinator.trees().values() {
-            self.flush_memtables(tree)?;
+            self.flush_memtables_in_order(tree)?;
         }
         #[cfg(feature = "columnar")]
         for table_id in self.columnar_tables.table_ids() {
             if let Some(tree) = self.columnar_tables.get(&table_id) {
-                self.flush_memtables(&tree)?;
+                self.flush_memtables_in_order(&tree)?;
             }
         }
+        // Once per device, not once per tree: every tree lies under the
+        // endpoints.
+        self.sync_endpoint_devices()?;
         // The retained oplog journal is NOT truncated on flush — it must survive
         // for WAL-replay-repair, and crash recovery skips the entries each
         // partition's coverage record already holds (see `open_embedded`).
+        Ok(())
+    }
+
+    /// Flush every partition tree's memtables, durably: the flushes in
+    /// order, then each endpoint's device caches once.
+    ///
+    /// # Errors
+    ///
+    /// A flush or device flush failure.
+    pub(crate) fn flush_partition_trees(&self) -> StorageResult<()> {
+        for tree in self.coordinator.trees().values() {
+            self.flush_memtables_in_order(tree)?;
+        }
+        self.sync_endpoint_devices()
+    }
+
+    /// Make durable what the trees synced only in order: flush the device
+    /// caches under every endpoint, once each. Nothing to do unless the trees
+    /// sync with barriers; under a full sync each flush is durable already.
+    fn sync_endpoint_devices(&self) -> StorageResult<()> {
+        if self.tree_sync != lsm_tree::fs::SyncMode::Barrier {
+            return Ok(());
+        }
+        for endpoint in &self.endpoints {
+            self.fs.sync_device(&endpoint.path).map_err(|e| {
+                StorageError::Io(format!(
+                    "flush the device caches under {:?}: {e}",
+                    endpoint.path
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -4178,7 +4229,21 @@ impl StorageEngine {
     /// are the tables written. A table never holds an effect of an entry a
     /// crash could still take from the journal, so a crash loses whole
     /// entries from the end of the log and never part of one.
+    ///
+    /// The tables are durable when this returns, on every device the tree
+    /// lies on: what releases a journal or promises a write relies on it.
     pub(crate) fn flush_memtables<T: AbstractTree + ?Sized>(&self, tree: &T) -> StorageResult<()> {
+        self.flush_memtables_in_order(tree)?;
+        if self.tree_sync == lsm_tree::fs::SyncMode::Barrier {
+            tree.sync_devices()?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::flush_memtables`] without the device flush: the tables are
+    /// synced in the trees' mode, durable under a full sync, ordered under a
+    /// barrier until [`Self::sync_endpoint_devices`].
+    fn flush_memtables_in_order<T: AbstractTree + ?Sized>(&self, tree: &T) -> StorageResult<()> {
         let lock = tree.get_flush_lock();
         if tree.rotate_memtable().is_some() {
             self.memtable_flushes

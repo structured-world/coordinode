@@ -1669,18 +1669,20 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
 }
 
 /// A table flushed before its oplog entries are purged must be as durable as
-/// those entries: the partition trees sync every file at the mode the oplog's
-/// sync method calls for. They synced at the engine default (plain fsync)
-/// under a full-flush oplog, so on macOS a power cut after a purge could lose
-/// acknowledged writes.
+/// those entries. Under a full-flush oplog the trees sync their files with
+/// barriers, which keep them in order, and a persist then flushes the device
+/// caches under the endpoint once, after every file sync: without that last
+/// step a power cut on macOS after a purge could lose acknowledged writes.
+/// Under a plain-fsync oplog the trees sync plainly and nothing flushes the
+/// device.
 #[test]
 fn partition_trees_sync_as_durably_as_the_oplog() {
     use crate::engine::config::SyncMethod;
-    use lsm_tree::fs::SyncMode;
+    use lsm_tree::fs::{SyncKind, SyncMode};
 
     for (method, expected) in [
-        (SyncMethod::Full, SyncMode::Full),
-        (SyncMethod::OpenDatasync, SyncMode::Full),
+        (SyncMethod::Full, SyncMode::Barrier),
+        (SyncMethod::OpenDatasync, SyncMode::Barrier),
         (SyncMethod::Fsync, SyncMode::Normal),
     ] {
         let dir = TempDir::new().expect("temp dir");
@@ -1701,6 +1703,8 @@ fn partition_trees_sync_as_durably_as_the_oplog() {
         engine
             .put(Partition::Node, b"node:00:00000001", b"row")
             .expect("put");
+        // Only what the persist below syncs counts.
+        drop(injector.take_syncs());
         engine.persist().expect("flush");
 
         let modes = injector.sync_modes_for("node");
@@ -1709,5 +1713,36 @@ fn partition_trees_sync_as_durably_as_the_oplog() {
             modes.iter().all(|m| *m == expected),
             "{method:?}: tree files synced at {modes:?}, expected {expected:?}"
         );
+        // A compaction the flush starts may sync its own manifest edit after
+        // the persist returns; what the persist promises is the flush's table
+        // and manifest edit, synced before the device flush.
+        let syncs = injector.take_syncs();
+        let devices: Vec<usize> = syncs
+            .iter()
+            .enumerate()
+            .filter(|(_, (path, kind))| *kind == SyncKind::Device && path == dir.path())
+            .map(|(at, _)| at)
+            .collect();
+        if expected == SyncMode::Barrier {
+            assert!(
+                !devices.is_empty(),
+                "{method:?}: no device flush of the endpoint: {syncs:?}"
+            );
+            let device = devices[0];
+            let synced_before = |part: &str| {
+                syncs[..device]
+                    .iter()
+                    .any(|(path, _)| path.to_string_lossy().contains(part))
+            };
+            assert!(
+                synced_before("node/tables/") && synced_before("node/edits-"),
+                "{method:?}: the flushed table and its manifest edit come after the device flush: {syncs:?}"
+            );
+        } else {
+            assert!(
+                devices.is_empty(),
+                "{method:?}: a device flush the method did not ask for: {syncs:?}"
+            );
+        }
     }
 }

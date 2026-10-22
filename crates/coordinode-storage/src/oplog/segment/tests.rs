@@ -237,6 +237,7 @@ fn every_sync_method_round_trips_a_segment() {
         SyncMethod::Full,
         SyncMethod::Fsync,
         SyncMethod::OpenDatasync,
+        SyncMethod::Barrier,
     ] {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("seg.bin");

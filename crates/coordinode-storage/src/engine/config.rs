@@ -397,6 +397,14 @@ pub enum SyncMethod {
     /// separate flush call follows. Durable where the OS honours the flag down
     /// to the medium, which macOS does not.
     OpenDatasync,
+    /// An ordering barrier: `F_BARRIERFSYNC` on macOS, at a fraction of
+    /// [`Self::Full`]'s cost. The writes reach the medium in the order they
+    /// were made, but the drive may still hold the last of them in its cache:
+    /// a power loss can take the last milliseconds of acknowledged writes and
+    /// never leaves a later one without an earlier one. For a developer
+    /// machine; on macOS it does not keep an acknowledged write across a
+    /// power loss. Elsewhere the same as [`Self::Full`].
+    Barrier,
 }
 
 impl SyncMethod {
@@ -405,11 +413,15 @@ impl SyncMethod {
     /// The oplog is purged once a flush returns, so a flushed table must be
     /// at least as durable as the oplog entries it replaces: a full-flush
     /// oplog over plain-fsync tables would lose acknowledged writes to a
-    /// power cut on macOS. The trees write in batches and sync once, so they
-    /// take the full flush rather than `O_DSYNC`.
+    /// power cut on macOS. A tree's own syncs only need to keep its writes in
+    /// order (data, then directory, then manifest), which a barrier does at a
+    /// fraction of a full flush on macOS (`F_BARRIERFSYNC`; elsewhere a sync
+    /// already reaches the medium); the engine flushes the device caches
+    /// once, where it promises durability (every explicit flush before the
+    /// journal behind it is released).
     pub(crate) fn tree_sync_mode(self) -> lsm_tree::fs::SyncMode {
         match self {
-            Self::Full | Self::OpenDatasync => lsm_tree::fs::SyncMode::Full,
+            Self::Full | Self::OpenDatasync | Self::Barrier => lsm_tree::fs::SyncMode::Barrier,
             Self::Fsync => lsm_tree::fs::SyncMode::Normal,
         }
     }

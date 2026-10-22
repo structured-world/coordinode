@@ -594,6 +594,11 @@ fn sync_file(file: &std::fs::File, sync: SyncMethod) -> std::io::Result<()> {
         // std reaches the medium: F_FULLFSYNC on Apple, fdatasync on Linux,
         // FlushFileBuffers on Windows.
         SyncMethod::Full => file.sync_data(),
+        // F_BARRIERFSYNC on Apple, fdatasync elsewhere.
+        SyncMethod::Barrier => {
+            lsm_tree::fs::FsFile::sync_data_with(file, lsm_tree::fs::SyncMode::Barrier)
+                .map_err(std::io::Error::from)
+        }
         SyncMethod::Fsync => {
             // Apple's fsync(2) stops at the drive's cache; elsewhere the plain
             // call already reaches the medium, so it is the full one.

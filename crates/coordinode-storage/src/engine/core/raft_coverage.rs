@@ -712,9 +712,7 @@ impl StorageEngine {
         for tree in self.coordinator.trees().values() {
             coverage::write_fold(tree, Domain::Raft, 0, next, payload, at);
         }
-        for tree in self.coordinator.trees().values() {
-            self.flush_memtables(tree)?;
-        }
+        self.flush_partition_trees()?;
         // A snapshot now stands in the store in place of whatever the
         // applies had built: followers of the applies read it afresh.
         self.applied_feed.replaced(None);
@@ -735,9 +733,7 @@ impl StorageEngine {
             .raft_coverage()?
             .resume_point()
             .map_or(0, |(next, _)| next);
-        for tree in self.coordinator.trees().values() {
-            self.flush_memtables(tree)?;
-        }
+        self.flush_partition_trees()?;
         // A rebuild from the latest checkpoint replays the log from what its
         // trees lack, so the log keeps that too.
         Ok(floor.min(

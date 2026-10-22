@@ -599,11 +599,16 @@ storage:
 | `full` (default) | `F_FULLFSYNC` on macOS, `fdatasync` on Linux, `FlushFileBuffers` on Windows: the drive flushes its own write cache. The same calls MongoDB's WiredTiger journal makes. | yes |
 | `fsync` | `fsync(2)`. On macOS the data reaches the drive but may stay in its volatile cache, which makes an append much cheaper there; on Linux and Windows it is the same as `full`. | on Linux and Windows; not guaranteed on macOS |
 | `open_datasync` | The segment is opened with `O_DSYNC` (write-through on Windows) and no separate flush follows. | where the OS honours the flag down to the medium; not on macOS |
+| `barrier` | `F_BARRIERFSYNC` on macOS: the appends reach the medium in order, at a fraction of `full`'s cost, but the drive may still hold the last of them in its cache. For a developer machine. Elsewhere the same as `full`. | on Linux and Windows; on macOS a power loss can take the last acknowledged writes, never one without the writes before it |
 
 The same setting governs the storage tables: an oplog entry is dropped only
-once the table it went into is flushed, so tables sync at least as strongly
-as the oplog (`full` and `open_datasync` flush tables the full way, `fsync`
-the plain way).
+once the table it went into is durable, so tables are kept at least as
+durable as the oplog. Under `full`, `open_datasync` and `barrier` a table's
+own syncs only keep its writes in order (a barrier on macOS), and every
+point where the store promises its tables durable (before the oplog behind
+them is dropped, a Raft vote, a checkpoint) flushes the device caches under
+each endpoint once; `fsync` syncs tables the plain way and never flushes the
+device.
 
 Segments rotate at whichever size limit is reached first. In the journal of
 an embedded database, `retention_secs` is a floor, not a promise to delete: a
