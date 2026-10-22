@@ -66,6 +66,11 @@ struct IntegrityView {
     local: FxHashMap<GenerationId, LocalMark>,
     /// Source of [`LocalMark::revision`].
     last_revision: u64,
+    /// Per generation, the revision of the last finding against this
+    /// member's copy or of its last verification, never removed: two equal
+    /// readings bracket a span in which the copy was neither found wrong nor
+    /// proved again, which a lifted mark's absent revision cannot show.
+    epochs: FxHashMap<GenerationId, u64>,
     /// Verified generations that were once damaged, with the earliest
     /// snapshot they answer for.
     trusted_from: FxHashMap<GenerationId, u64>,
@@ -416,6 +421,7 @@ impl IndexRegistry {
             let mut view = self.integrity.lock();
             view.last_revision += 1;
             let revision = view.last_revision;
+            view.epochs.insert(index.generation, revision);
             let mark = view.local.entry(index.generation).or_insert(LocalMark {
                 revision,
                 state: MarkState::Unwritten,
@@ -582,6 +588,7 @@ impl IndexRegistry {
             }
             view.last_revision += 1;
             let revision = view.last_revision;
+            view.epochs.insert(copy.generation, revision);
             view.local.insert(
                 copy.generation,
                 LocalMark {
@@ -681,10 +688,25 @@ impl IndexRegistry {
             }
             _ => {
                 view.local.remove(&generation);
+                view.last_revision += 1;
+                let epoch = view.last_revision;
+                view.epochs.insert(generation, epoch);
                 self.refresh_any_suspect(&view);
                 Ok(true)
             }
         }
+    }
+
+    /// Where this member's proof of its copy of `generation` stands: equal
+    /// readings mean no finding against the copy and no new proof of it came
+    /// between them. `0` while neither ever happened in this process.
+    pub fn copy_epoch(&self, generation: GenerationId) -> u64 {
+        self.integrity
+            .lock()
+            .epochs
+            .get(&generation)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn refresh_any_suspect(&self, view: &IntegrityView) {
@@ -821,6 +843,7 @@ impl IndexRegistry {
                 for copy in armed {
                     view.last_revision += 1;
                     let revision = view.last_revision;
+                    view.epochs.insert(copy.generation, revision);
                     view.local.insert(
                         copy.generation,
                         LocalMark {

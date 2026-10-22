@@ -39,6 +39,11 @@ regex = "1"
 unicode-normalization = "0.1"
 # Scratch files an index check spills its sorted runs to.
 tempfile = { workspace = true }
+# Checksums of an index check's scratch runs, so a damaged run fails the
+# check instead of reading as a shorter one.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# What an index check's passes cost, by phase, for the metrics endpoint.
+metrics = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]

@@ -64,10 +64,11 @@ pub trait IndexCopyQualifier: Send + Sync {
 
     /// The proof this member keeps of its copy of `generation`, in the form
     /// every member that proved the same generation encodes it alike, with
-    /// the revision of its latest finding against the copy; `None` when the
-    /// copy is not proved or was found disagreeing. A history export reads
-    /// it before and after the export and carries it only when the two
-    /// agree.
+    /// an epoch that moves on every finding against the copy and every new
+    /// proof of it; `None` when the copy is not proved or was found
+    /// disagreeing. A history export reads it before and after the export
+    /// and carries it only when the two agree, so a finding made and lifted
+    /// while it read is not missed.
     ///
     /// # Errors
     ///

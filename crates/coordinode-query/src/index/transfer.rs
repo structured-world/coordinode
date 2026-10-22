@@ -41,12 +41,11 @@ struct Entry {
 }
 
 /// The inventory as a capture keeps it until a transfer sends it: with the
-/// revision of every finding this member had at the capture, to seal
-/// against.
+/// epoch of every copy it qualifies, to seal against.
 #[derive(Debug, Serialize, Deserialize)]
 struct Captured {
     entries: Vec<Entry>,
-    findings: Vec<(u64, u64)>,
+    epochs: Vec<(u64, u64)>,
 }
 
 /// Takes part in the engine's transfers of the index partition for the
@@ -77,7 +76,7 @@ impl IndexCopyQualifier for CopyQualifier {
             .into_iter()
             .collect();
         let findings = self.registry.findings();
-        let entries = btree_generations(engine)?
+        let entries: Vec<Entry> = btree_generations(engine)?
             .into_iter()
             .map(|def| {
                 let generation = def.generation;
@@ -104,36 +103,38 @@ impl IndexCopyQualifier for CopyQualifier {
                 }
             })
             .collect();
-        let captured = Captured {
-            entries,
-            findings: findings
-                .into_iter()
-                .map(|(g, revision)| (g.as_raw(), revision))
-                .collect(),
-        };
+        let epochs = entries
+            .iter()
+            .filter(|e| matches!(e.state, CopyState::Qualified(_)))
+            .map(|e| {
+                let epoch = self
+                    .registry
+                    .copy_epoch(GenerationId::from_raw(e.generation));
+                (e.generation, epoch)
+            })
+            .collect();
+        let captured = Captured { entries, epochs };
         rmp_serde::to_vec(&captured).map_err(|e| encoding("encode", e))
     }
 
     fn seal(&self, _engine: &StorageEngine, captured: &[u8]) -> StorageResult<Vec<u8>> {
         let captured: Captured =
             rmp_serde::from_slice(captured).map_err(|e| encoding("decode", e))?;
-        let then: FxHashMap<u64, u64> = captured.findings.into_iter().collect();
-        let now: FxHashMap<u64, u64> = self
-            .registry
-            .findings()
-            .into_iter()
-            .map(|(g, revision)| (g.as_raw(), revision))
-            .collect();
+        let then: FxHashMap<u64, u64> = captured.epochs.into_iter().collect();
         let entries: Vec<Entry> = captured
             .entries
             .into_iter()
             .map(|mut entry| {
                 // A finding made after the capture may concern what the
-                // capture holds: nothing shows its damage is outside it.
-                if matches!(entry.state, CopyState::Qualified(_))
-                    && now.get(&entry.generation) != then.get(&entry.generation)
-                {
-                    entry.state = CopyState::Excluded;
+                // capture holds, and one made and lifted since leaves no
+                // mark behind: only an unmoved epoch shows neither happened.
+                if matches!(entry.state, CopyState::Qualified(_)) {
+                    let now = self
+                        .registry
+                        .copy_epoch(GenerationId::from_raw(entry.generation));
+                    if then.get(&entry.generation) != Some(&now) {
+                        entry.state = CopyState::Excluded;
+                    }
                 }
                 entry
             })
@@ -151,10 +152,13 @@ impl IndexCopyQualifier for CopyQualifier {
         generation: u64,
     ) -> StorageResult<Option<(Vec<u8>, u64)>> {
         let generation = GenerationId::from_raw(generation);
-        let revision = self.registry.local_revision(generation);
-        if revision != 0 {
+        if self.registry.local_revision(generation) != 0 {
             return Ok(None);
         }
+        // Taken before the proof is read: an exporter comparing two readings
+        // around what it exported sees any finding, or any new proof after
+        // one, made in between, even one whose mark is already lifted.
+        let epoch = self.registry.copy_epoch(generation);
         let store = LocalIndexStore::new(engine);
         if store
             .list_unfit_here()
@@ -188,7 +192,7 @@ impl IndexCopyQualifier for CopyQualifier {
             maintenance: proof.maintenance,
         };
         let bytes = rmp_serde::to_vec(&carried).map_err(|e| encoding("encode", e))?;
-        Ok(Some((bytes, revision)))
+        Ok(Some((bytes, epoch)))
     }
 }
 

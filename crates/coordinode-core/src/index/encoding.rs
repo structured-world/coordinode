@@ -164,18 +164,41 @@ pub fn entries_prefix(generation: GenerationId) -> [u8; GENERATION_PREFIX_LEN] {
 /// and every entry of one index has the same arity.
 pub fn entry_value_prefix(generation: GenerationId, tuple: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(GENERATION_PREFIX_LEN + tuple.len() + 17);
+    append_entry_value_prefix(&mut out, generation, tuple);
+    out
+}
+
+/// [`entry_value_prefix`] appended to `out`.
+fn append_entry_value_prefix(out: &mut Vec<u8>, generation: GenerationId, tuple: &[u8]) {
     out.extend_from_slice(&entries_prefix(generation));
     out.extend_from_slice(tuple);
     out.push(TUPLE_END);
-    out
 }
 
 /// Entry of `node_id` under `tuple` in the non-unique `generation`:
 /// `<prefix><tuple>:<node_id u64 BE>`, empty value.
 pub fn encode_entry_key(generation: GenerationId, tuple: &[u8], node_id: u64) -> Vec<u8> {
-    let mut out = entry_value_prefix(generation, tuple);
-    out.extend_from_slice(&node_id.to_be_bytes());
+    let mut out = Vec::with_capacity(GENERATION_PREFIX_LEN + tuple.len() + 17);
+    append_entry_key(&mut out, generation, tuple, node_id, None);
     out
+}
+
+/// The entry of `node_id` under `tuple` in the non-unique `generation`,
+/// appended to `out`: [`encode_entry_key`], or [`encode_version_entry_key`]
+/// for the version starting at `valid_from`. What a caller building many keys
+/// in one buffer writes, with no allocation per key.
+pub fn append_entry_key(
+    out: &mut Vec<u8>,
+    generation: GenerationId,
+    tuple: &[u8],
+    node_id: u64,
+    valid_from: Option<i64>,
+) {
+    append_entry_value_prefix(out, generation, tuple);
+    out.extend_from_slice(&node_id.to_be_bytes());
+    if let Some(valid_from) = valid_from {
+        out.extend_from_slice(&((valid_from as u64) ^ (1 << 63)).to_be_bytes());
+    }
 }
 
 /// Entry of the version of temporal node `node_id` that starts at
@@ -189,8 +212,8 @@ pub fn encode_version_entry_key(
     node_id: u64,
     valid_from: i64,
 ) -> Vec<u8> {
-    let mut out = encode_entry_key(generation, tuple, node_id);
-    out.extend_from_slice(&((valid_from as u64) ^ (1 << 63)).to_be_bytes());
+    let mut out = Vec::with_capacity(GENERATION_PREFIX_LEN + tuple.len() + 17);
+    append_entry_key(&mut out, generation, tuple, node_id, Some(valid_from));
     out
 }
 
@@ -207,9 +230,14 @@ pub fn unique_entries_prefix(generation: GenerationId) -> [u8; GENERATION_PREFIX
 /// detection lets one of them commit.
 pub fn encode_unique_entry_key(generation: GenerationId, tuple: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(GENERATION_PREFIX_LEN + tuple.len());
+    append_unique_entry_key(&mut out, generation, tuple);
+    out
+}
+
+/// [`encode_unique_entry_key`] appended to `out`.
+pub fn append_unique_entry_key(out: &mut Vec<u8>, generation: GenerationId, tuple: &[u8]) {
     out.extend_from_slice(&unique_entries_prefix(generation));
     out.extend_from_slice(tuple);
-    out
 }
 
 /// Prefix of every label posting of the lookup generation `generation`.

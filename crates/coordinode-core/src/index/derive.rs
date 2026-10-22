@@ -9,9 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::encoding::{
-    encode_entry_key, encode_tuple, encode_unique_entry_key, encode_version_entry_key,
-};
+use super::encoding::{append_entry_key, append_unique_entry_key, encode_tuple};
 use super::identity::GenerationId;
 use crate::graph::node::NodeRecord;
 use crate::graph::types::Value;
@@ -205,19 +203,29 @@ pub fn entry(
     tuple: &[u8],
     owner: EntryOwner,
 ) -> (Vec<u8>, Vec<u8>) {
-    if unique {
-        (
-            encode_unique_entry_key(generation, tuple),
-            owner.node_id.to_be_bytes().to_vec(),
-        )
+    let mut key = Vec::new();
+    append_entry_key_of(&mut key, generation, unique, tuple, owner);
+    let value = if unique {
+        owner.node_id.to_be_bytes().to_vec()
     } else {
-        let key = match owner.valid_from {
-            Some(valid_from) => {
-                encode_version_entry_key(generation, tuple, owner.node_id, valid_from)
-            }
-            None => encode_entry_key(generation, tuple, owner.node_id),
-        };
-        (key, Vec::new())
+        Vec::new()
+    };
+    (key, value)
+}
+
+/// The key of [`entry`] appended to `out`: what a caller building many entry
+/// keys in one buffer writes, with no allocation per key.
+pub fn append_entry_key_of(
+    out: &mut Vec<u8>,
+    generation: GenerationId,
+    unique: bool,
+    tuple: &[u8],
+    owner: EntryOwner,
+) {
+    if unique {
+        append_unique_entry_key(out, generation, tuple);
+    } else {
+        append_entry_key(out, generation, tuple, owner.node_id, owner.valid_from);
     }
 }
 

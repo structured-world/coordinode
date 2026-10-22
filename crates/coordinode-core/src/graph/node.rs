@@ -749,6 +749,143 @@ impl NodeRecord {
         let mut labels = rmp_serde::Deserializer::from_read_ref(rest);
         Vec::<String>::deserialize(&mut labels)
     }
+
+    /// The properties `fields` and the undeclared properties `names` of a
+    /// stored record, every other value skipped unread, and no labels: what a
+    /// reader that needs a few properties of a record whose other values may
+    /// be large decodes. A property the record lacks is absent here too.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are a document delta, or not a record.
+    pub fn project_from_msgpack(
+        data: &[u8],
+        fields: &[u32],
+        names: &[&str],
+    ) -> Result<Self, rmp_serde::decode::Error> {
+        use serde::Deserialize as _;
+
+        let syntax = |what: &str, e: &dyn core::fmt::Display| {
+            rmp_serde::decode::Error::Syntax(format!("record {what}: {e}"))
+        };
+        let body = match data.first() {
+            Some(&crate::graph::doc_delta::PREFIX_NODE_RECORD) => &data[1..],
+            Some(&crate::graph::doc_delta::PREFIX_DOC_DELTA) => {
+                return Err(rmp_serde::decode::Error::Syntax(
+                    "cannot decode DocDelta merge operand as NodeRecord".to_string(),
+                ));
+            }
+            _ => data,
+        };
+        // `[labels, props, extra?]`, read in place: each value deserialized
+        // or skipped advances `rest` past it.
+        let mut rest = body;
+        let len = rmp::decode::read_array_len(&mut rest).map_err(|e| syntax("header", &e))?;
+        if len < 2 {
+            return Err(syntax("header", &format_args!("{len} elements")));
+        }
+        skip_msgpack_value(&mut rest).map_err(|e| syntax("labels", &e))?;
+        let count = rmp::decode::read_map_len(&mut rest).map_err(|e| syntax("properties", &e))?;
+        let mut props = HashMap::with_capacity(fields.len().min(count as usize));
+        for _ in 0..count {
+            let field: u32 =
+                rmp::decode::read_int(&mut rest).map_err(|e| syntax("property id", &e))?;
+            if fields.contains(&field) {
+                let mut value = rmp_serde::Deserializer::new(&mut rest);
+                props.insert(field, PropertyValue::deserialize(&mut value)?);
+            } else {
+                skip_msgpack_value(&mut rest).map_err(|e| syntax("property", &e))?;
+            }
+        }
+        let mut extra: Option<HashMap<String, PropertyValue>> = None;
+        // Absent, or nil, when the record has no undeclared properties.
+        if len > 2 && !names.is_empty() && rest.first() != Some(&0xc0) {
+            let count =
+                rmp::decode::read_map_len(&mut rest).map_err(|e| syntax("extra properties", &e))?;
+            for _ in 0..count {
+                let (name, tail) = rmp::decode::read_str_from_slice(rest)
+                    .map_err(|e| syntax("extra property name", &e))?;
+                rest = tail;
+                if names.contains(&name) {
+                    let mut value = rmp_serde::Deserializer::new(&mut rest);
+                    let value = PropertyValue::deserialize(&mut value)?;
+                    extra
+                        .get_or_insert_with(HashMap::new)
+                        .insert(name.to_owned(), value);
+                } else {
+                    skip_msgpack_value(&mut rest).map_err(|e| syntax("extra property", &e))?;
+                }
+            }
+        }
+        Ok(Self {
+            labels: Vec::new(),
+            props,
+            extra,
+        })
+    }
+}
+
+/// Advance `rest` past one MessagePack value, nested ones included, reading
+/// only markers and lengths: nothing is copied or allocated. Iterative, so a
+/// deeply nested value cannot exhaust the stack.
+fn skip_msgpack_value(rest: &mut &[u8]) -> Result<(), String> {
+    use rmp::Marker;
+
+    fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
+        if rest.len() < n {
+            return Err(format!("{n} bytes wanted, {} left", rest.len()));
+        }
+        let (head, tail) = rest.split_at(n);
+        *rest = tail;
+        Ok(head)
+    }
+    fn length(rest: &mut &[u8], width: usize) -> Result<usize, String> {
+        let bytes = take(rest, width)?;
+        // Big-endian, at most four bytes: fits a usize on every target.
+        Ok(bytes.iter().fold(0usize, |n, b| (n << 8) | usize::from(*b)))
+    }
+
+    // Values still to skip: one, plus the elements each container adds.
+    let mut pending: u64 = 1;
+    while pending > 0 {
+        pending -= 1;
+        let marker = rmp::decode::read_marker(rest).map_err(|e| format!("{e:?}"))?;
+        // Bytes following the marker, and the values a container holds.
+        let (bytes, values) = match marker {
+            Marker::FixPos(_) | Marker::FixNeg(_) | Marker::Null | Marker::True | Marker::False => {
+                (0, 0)
+            }
+            Marker::U8 | Marker::I8 => (1, 0),
+            Marker::U16 | Marker::I16 => (2, 0),
+            Marker::U32 | Marker::I32 | Marker::F32 => (4, 0),
+            Marker::U64 | Marker::I64 | Marker::F64 => (8, 0),
+            Marker::FixStr(n) => (usize::from(n), 0),
+            Marker::Str8 | Marker::Bin8 => (length(rest, 1)?, 0),
+            Marker::Str16 | Marker::Bin16 => (length(rest, 2)?, 0),
+            Marker::Str32 | Marker::Bin32 => (length(rest, 4)?, 0),
+            Marker::FixArray(n) => (0, u64::from(n)),
+            Marker::Array16 => (0, length(rest, 2)? as u64),
+            Marker::Array32 => (0, length(rest, 4)? as u64),
+            Marker::FixMap(n) => (0, 2 * u64::from(n)),
+            Marker::Map16 => (0, 2 * length(rest, 2)? as u64),
+            Marker::Map32 => (0, 2 * length(rest, 4)? as u64),
+            // An extension: its type byte, then its data.
+            Marker::FixExt1 => (2, 0),
+            Marker::FixExt2 => (3, 0),
+            Marker::FixExt4 => (5, 0),
+            Marker::FixExt8 => (9, 0),
+            Marker::FixExt16 => (17, 0),
+            Marker::Ext8 => (length(rest, 1)? + 1, 0),
+            Marker::Ext16 => (length(rest, 2)? + 1, 0),
+            Marker::Ext32 => (length(rest, 4)? + 1, 0),
+            Marker::Reserved => return Err("reserved marker 0xc1".into()),
+        };
+        take(rest, bytes)?;
+        // A container declares at most 2 * u32::MAX values: the sum stays
+        // far below u64::MAX for any input that fits in memory.
+        pending += values;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

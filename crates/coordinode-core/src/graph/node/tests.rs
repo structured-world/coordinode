@@ -794,3 +794,123 @@ fn labels_read_without_the_properties() {
             .is_err()
     );
 }
+
+/// Skipping a value lands exactly past it for every MessagePack form and
+/// width, nested containers included; a value cut short or a reserved
+/// marker is an error, never a skip into the next value.
+#[test]
+fn a_skipped_value_ends_where_its_encoding_ends() {
+    use rmpv::Value as Mp;
+
+    let long = |n: usize| "s".repeat(n);
+    let values = vec![
+        Mp::Nil,
+        Mp::Boolean(true),
+        Mp::from(7u8),
+        Mp::from(-3i8),
+        Mp::from(200u8),
+        Mp::from(-100i8),
+        Mp::from(60_000u16),
+        Mp::from(-30_000i16),
+        Mp::from(4_000_000_000u32),
+        Mp::from(-2_000_000_000i32),
+        Mp::from(u64::MAX),
+        Mp::from(i64::MIN),
+        Mp::F32(1.5),
+        Mp::F64(2.5),
+        Mp::from(long(5).as_str()),
+        Mp::from(long(200).as_str()),
+        Mp::from(long(60_000).as_str()),
+        Mp::from(long(70_000).as_str()),
+        Mp::Binary(vec![1; 10]),
+        Mp::Binary(vec![1; 300]),
+        Mp::Binary(vec![1; 70_000]),
+        Mp::Array((0..3).map(Mp::from).collect()),
+        Mp::Array((0..20).map(Mp::from).collect()),
+        Mp::Array((0..70_000).map(|_| Mp::Nil).collect()),
+        Mp::Map(vec![(Mp::from("k"), Mp::from(1))]),
+        Mp::Map((0..20).map(|i| (Mp::from(i), Mp::Nil)).collect()),
+        Mp::Map((0..70_000).map(|i| (Mp::from(i), Mp::Nil)).collect()),
+        Mp::Ext(1, vec![0; 1]),
+        Mp::Ext(1, vec![0; 2]),
+        Mp::Ext(1, vec![0; 4]),
+        Mp::Ext(1, vec![0; 8]),
+        Mp::Ext(1, vec![0; 16]),
+        Mp::Ext(1, vec![0; 3]),
+        Mp::Ext(1, vec![0; 300]),
+        Mp::Ext(1, vec![0; 70_000]),
+        Mp::Array(vec![Mp::Map(vec![(
+            Mp::from("deep"),
+            Mp::Array(vec![Mp::Binary(vec![2; 40]), Mp::Ext(3, vec![0; 5])]),
+        )])]),
+    ];
+    for value in &values {
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, value).expect("encode");
+        let encoded = bytes.len();
+        bytes.push(0xc3);
+        let mut rest = bytes.as_slice();
+        super::skip_msgpack_value(&mut rest).expect("skip");
+        assert_eq!(rest, &[0xc3], "past exactly {encoded} bytes of {value:?}");
+
+        let mut cut = &bytes[..encoded - 1];
+        assert!(
+            super::skip_msgpack_value(&mut cut).is_err(),
+            "a value cut short is an error"
+        );
+    }
+    let mut reserved: &[u8] = &[0xc1];
+    assert!(super::skip_msgpack_value(&mut reserved).is_err());
+}
+
+/// A projection of a stored record holds exactly the asked properties, by id
+/// and by name, with the values a whole decode gives them, and none of the
+/// others; a property the record lacks stays absent. Every stored form is
+/// read, and a document delta is refused.
+#[test]
+fn a_projection_holds_the_asked_properties_only() {
+    use crate::graph::types::Value;
+
+    let mut record = NodeRecord::with_labels(vec!["User".into()]);
+    record.set(1, Value::String("a@x".into()));
+    record.set(2, Value::Blob(vec![7; 100_000]));
+    record.set(3, Value::Array(vec![Value::Int(1), Value::Int(2)]));
+    record.set_extra("nick", Value::String("al".into()));
+    record.set_extra("bio", Value::Blob(vec![9; 50_000]));
+    let bare = record.to_msgpack().expect("encode");
+    let mut prefixed = vec![crate::graph::doc_delta::PREFIX_NODE_RECORD];
+    prefixed.extend_from_slice(&bare);
+
+    for stored in [&bare, &prefixed] {
+        let projected = NodeRecord::project_from_msgpack(stored, &[1, 3, 9], &["nick", "absent"])
+            .expect("project");
+        assert_eq!(projected.get(1), record.get(1));
+        assert_eq!(projected.get(3), record.get(3));
+        assert_eq!(projected.get(2), None, "a property not asked for");
+        assert_eq!(projected.get(9), None, "a property the record lacks");
+        assert_eq!(projected.props.len(), 2);
+        assert_eq!(projected.get_extra("nick"), record.get_extra("nick"));
+        assert_eq!(projected.get_extra("bio"), None);
+        assert_eq!(projected.extra.as_ref().map(HashMap::len), Some(1));
+        assert!(projected.labels.is_empty(), "labels are not read");
+    }
+
+    // No overflow map at all, and no undeclared name asked for.
+    let plain = NodeRecord::with_labels(vec!["User".into()]);
+    let projected =
+        NodeRecord::project_from_msgpack(&plain.to_msgpack().expect("encode"), &[1], &["nick"])
+            .expect("project");
+    assert!(projected.props.is_empty());
+    assert!(projected.extra.is_none());
+    let projected = NodeRecord::project_from_msgpack(&bare, &[1], &[]).expect("project");
+    assert!(projected.extra.is_none(), "no name asked for");
+
+    assert!(
+        NodeRecord::project_from_msgpack(
+            &[crate::graph::doc_delta::PREFIX_DOC_DELTA, 0x90],
+            &[1],
+            &[]
+        )
+        .is_err()
+    );
+}

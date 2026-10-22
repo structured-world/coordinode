@@ -539,6 +539,45 @@ fn a_check_that_cannot_spill_fails_and_lookups_keep_answering_from_the_records()
     );
 }
 
+/// A pass that outgrows its memory spills sorted runs and merges them back:
+/// the damage it finds and repairs is the damage an in-memory pass would,
+/// a lost entry restored and a stray one removed.
+#[test]
+fn a_check_spilling_to_scratch_repairs_what_it_finds() {
+    let (mut db, _dir) = open_db();
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        check_memory: 256,
+        ..db.index_build_config()
+    });
+    db.execute_cypher("CREATE INDEX u_city ON :U(city)")
+        .expect("index");
+    db.execute_cypher(
+        "UNWIND range(1, 50) AS i CREATE (:U {name: 'n' + toString(i), city: 'oslo'})",
+    )
+    .expect("users");
+    db.execute_cypher("CREATE (:U {name: 'r', city: 'rome'})")
+        .expect("r");
+    let lost = scan_id(&mut db, "name", "n7");
+    db.engine()
+        .delete(Partition::Idx, &entry_key(&db, "u_city", "oslo", lost))
+        .expect("lose n7's entry");
+    let r = scan_id(&mut db, "name", "r");
+    db.engine()
+        .put(Partition::Idx, &entry_key(&db, "u_city", "oslo", r), &[])
+        .expect("plant a stray entry");
+
+    let (status, outcome) = check(&db, "u_city");
+    assert!(
+        matches!(outcome, CheckOutcome::Verified { repaired: 2, .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(status.record.integrity, Integrity::Verified);
+    let oslo = found_by(&mut db, "city", "oslo");
+    assert_eq!(oslo.len(), 50, "n7 back, r gone");
+    assert!(oslo.contains(&lost));
+    assert!(!oslo.contains(&r));
+}
+
 /// Records and entries are compared at one snapshot, and writers maintain
 /// the index in the commits that change the records: writes racing a check
 /// are never taken for damage, so a check of an index nothing damaged

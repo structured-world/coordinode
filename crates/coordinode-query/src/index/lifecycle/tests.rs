@@ -454,6 +454,69 @@ fn lose_entry(env: &TestEnv, def: &IndexDefinition, email: &str, id: u64) {
         .expect("lose the entry");
 }
 
+/// A check whose environment fails part way concludes nothing: it reports
+/// the failure, writes no repair, and leaves the generation unverified; once
+/// the environment is back, the next check finds and repairs the damage.
+#[test]
+fn a_check_whose_environment_fails_concludes_nothing() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    env.inject(Some(Fault::FieldsUnavailable));
+    let operation = builds.request_check(def.id).expect("check");
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(&outcome, Some(CheckOutcome::Failed(reason)) if reason.contains("field dictionary")),
+        "{outcome:?}"
+    );
+    assert!(env.holders(&def, "b@x").is_empty(), "no repair written");
+    assert!(
+        !matches!(
+            LocalIndexStore::new(&env.engine)
+                .load_integrity(def.generation)
+                .expect("read")
+                .map(|(record, _)| record.integrity),
+            Some(coordinode_modality::Integrity::Verified)
+        ),
+        "a failed check verifies nothing"
+    );
+
+    env.inject(None);
+    let operation = builds.request_check(def.id).expect("check");
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { repaired: 1, .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(env.holders(&def, "b@x"), vec![2]);
+}
+
+/// A check that finds nothing records its pass and its conclusion in one
+/// catalog commit: its acceptance, its take and that commit, three in all.
+/// Each catalog commit is a journal write the member syncs, so a separate
+/// progress commit before the conclusion would cost a clean check a sync.
+#[test]
+fn a_clean_check_concludes_in_the_commit_that_records_its_pass() {
+    let (env, builds, def) = member_with_users();
+    let before = env.catalog_commits();
+    let operation = builds.request_check(def.id).expect("check");
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { repaired: 0, .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        env.catalog_commits() - before,
+        3,
+        "accept, take, and one commit for the pass with its conclusion"
+    );
+}
+
 /// A repair commits only while the record it read is as it read it: a write
 /// moving the record between the check's read and the repair's commit
 /// refuses the repair, and the next pass repairs the record as it stands.
@@ -526,6 +589,38 @@ fn a_repair_raced_by_a_rebuild_is_refused() {
         Some(IndexBuildOutcome::Published { .. })
     ));
     assert_eq!(env.holders(&rebuilt, "b@x"), vec![2], "the rebuild has b");
+}
+
+/// An index dropped while its check's repair waits to commit takes no
+/// repair: the check concludes nothing of the dropped generation and leaves
+/// no entry in it, not even the one the pass found missing.
+#[test]
+fn a_repair_raced_by_a_drop_writes_nothing() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    env.hold_pages_after(0);
+    let operation = builds.request_check(def.id).expect("check");
+    env.await_held_page();
+    let store = LocalIndexStore::new(&env.engine);
+    let mut txn = env.begin();
+    store.delete_definition_txn(&mut txn, &def).expect("drop");
+    store.clear_txn(&mut txn, def.generation).expect("clear");
+    commit(&mut txn).expect("commit the drop");
+    drop(txn);
+    env.release_pages();
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(
+            outcome,
+            Some(CheckOutcome::Cancelled | CheckOutcome::Failed(_))
+        ),
+        "the check of a dropped index concludes nothing: {outcome:?}"
+    );
+    assert!(env.stored(&def).is_none(), "still dropped");
+    assert!(env.holders(&def, "b@x").is_empty(), "no repair landed");
+    assert!(env.holders(&def, "a@x").is_empty(), "the clear stands");
 }
 
 /// A repair is bound to the check its executor holds: one held at its

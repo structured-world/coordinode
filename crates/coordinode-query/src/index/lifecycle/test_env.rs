@@ -22,6 +22,8 @@ pub(crate) struct TestEnv {
     fault: parking_lot::Mutex<Option<Fault>>,
     hold: PageHold,
     after_catalog: parking_lot::Mutex<Option<AfterCatalog>>,
+    /// Catalog commits that landed.
+    catalog_commits: std::sync::atomic::AtomicUsize,
     _dir: Option<tempfile::TempDir>,
 }
 
@@ -81,6 +83,7 @@ impl TestEnv {
             fault: parking_lot::Mutex::new(None),
             hold: PageHold::default(),
             after_catalog: parking_lot::Mutex::new(None),
+            catalog_commits: std::sync::atomic::AtomicUsize::new(0),
             _dir: Some(dir),
         })
     }
@@ -98,6 +101,7 @@ impl TestEnv {
             fault: parking_lot::Mutex::new(None),
             hold: PageHold::default(),
             after_catalog: parking_lot::Mutex::new(None),
+            catalog_commits: std::sync::atomic::AtomicUsize::new(0),
             _dir: None,
         })
     }
@@ -131,6 +135,12 @@ impl TestEnv {
         hook: impl FnMut(&StorageEngine) -> bool + Send + 'static,
     ) {
         *self.after_catalog.lock() = Some(Box::new(hook));
+    }
+
+    /// Catalog commits of this member that landed so far.
+    pub(crate) fn catalog_commits(&self) -> usize {
+        self.catalog_commits
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Make `fields` the dictionary builds resolve properties through.
@@ -246,6 +256,8 @@ impl BuildEnvironment for TestEnv {
             return Err(CommitError::NotLeader { leader_id: None });
         }
         commit(txn)?;
+        self.catalog_commits
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         // Taken out while it runs: the hook commits through `commit`, not
         // through this method, and must not hold the lock across it.
         let hook = self.after_catalog.lock().take();

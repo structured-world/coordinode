@@ -21,10 +21,13 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::node::NodeRecord;
-use coordinode_core::index::derive::{IndexInterpretation, entry, tuples};
+use coordinode_core::index::derive::{
+    EntryOwner, IndexInterpretation, append_entry_key_of, tuples,
+};
 use coordinode_core::index::encoding::{decode_entry_parts, decode_unique_entry_tuple};
 use coordinode_modality::{LocalIndexStore, LocalNodeStore, Mismatch};
 use coordinode_storage::engine::core::StorageEngine;
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::index::definition::IndexDefinition;
 
@@ -125,16 +128,18 @@ impl Run {
         self.bytes.len() + self.items.len() * core::mem::size_of::<Item>()
     }
 
-    fn push(&mut self, key: &[u8], node: u64, valid_from: Option<i64>) {
+    /// The entry of `owner` under `tuple` in `def`'s generation, its key
+    /// written straight into the run.
+    fn push_entry(&mut self, def: &IndexDefinition, tuple: &[u8], owner: EntryOwner) {
         // Keys are at most a record's values long, and a run is spilled
         // long before its bytes reach u32::MAX (the budget is far below).
         let start = self.bytes.len() as u32;
-        self.bytes.extend_from_slice(key);
+        append_entry_key_of(&mut self.bytes, def.generation, def.unique, tuple, owner);
         self.items.push(Item {
             start,
-            len: key.len() as u32,
-            node,
-            valid_from,
+            len: self.bytes.len() as u32 - start,
+            node: owner.node_id,
+            valid_from: owner.valid_from,
         });
     }
 
@@ -160,7 +165,7 @@ impl Run {
 }
 
 /// An expected entry read back from a run, owned.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Owned {
     key: Vec<u8>,
     node: u64,
@@ -179,70 +184,135 @@ impl PartialOrd for Owned {
     }
 }
 
+/// The length field that opens a run's trailer instead of an entry: no key
+/// is this long.
+const RUN_END: u32 = u32::MAX;
+
 /// A sorted run spilled to a scratch file: `[len u32][key][node u64][vf
-/// flag u8][vf i64?]` per entry.
+/// flag u8][vf i64?]` per entry, then `[RUN_END][count u64][xxh3 u64]` over
+/// every entry byte, so a run cut short or damaged fails to read instead of
+/// reading as a shorter one.
 fn spill(run: &Run, dir: &Path) -> Result<(std::fs::File, u64), VerifyError> {
     std::fs::create_dir_all(dir)?;
     let file = tempfile::tempfile_in(dir)?;
     let mut out = BufWriter::new(file);
+    let mut hash = Xxh3::new();
+    let mut put = |bytes: &[u8], out: &mut BufWriter<std::fs::File>| {
+        hash.update(bytes);
+        out.write_all(bytes)
+    };
     let mut written = 0u64;
     for item in &run.items {
         let key = run.key(item);
-        out.write_all(&item.len.to_be_bytes())?;
-        out.write_all(key)?;
-        out.write_all(&item.node.to_be_bytes())?;
+        put(&item.len.to_be_bytes(), &mut out)?;
+        put(key, &mut out)?;
+        put(&item.node.to_be_bytes(), &mut out)?;
         match item.valid_from {
             Some(vf) => {
-                out.write_all(&[1])?;
-                out.write_all(&vf.to_be_bytes())?;
+                put(&[1], &mut out)?;
+                put(&vf.to_be_bytes(), &mut out)?;
                 written += 9;
             }
             None => {
-                out.write_all(&[0])?;
+                put(&[0], &mut out)?;
                 written += 1;
             }
         }
         // A key's length plus the fixed fields, far below u64::MAX in total.
         written += 4 + u64::from(item.len) + 8;
     }
+    out.write_all(&RUN_END.to_be_bytes())?;
+    out.write_all(&(run.items.len() as u64).to_be_bytes())?;
+    out.write_all(&hash.digest().to_be_bytes())?;
+    written += 4 + 8 + 8;
     let mut file = out.into_inner().map_err(|e| e.into_error())?;
     use std::io::Seek as _;
     file.seek(std::io::SeekFrom::Start(0))?;
     Ok((file, written))
 }
 
-/// A spilled run read back in order.
+/// A spilled run read back in order, checked against its trailer.
 struct Spilled {
     reader: BufReader<std::fs::File>,
+    hash: Xxh3,
+    read: u64,
 }
 
 impl Spilled {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            reader: BufReader::new(file),
+            hash: Xxh3::new(),
+            read: 0,
+        }
+    }
+
+    fn take(&mut self, buf: &mut [u8]) -> Result<(), VerifyError> {
+        match self.reader.read_exact(buf) {
+            Ok(()) => {
+                self.hash.update(buf);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(damaged("it ends before its trailer"))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn next(&mut self) -> Result<Option<Owned>, VerifyError> {
         let mut len = [0u8; 4];
-        match self.reader.read_exact(&mut len) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
+        if let Err(e) = self.reader.read_exact(&mut len) {
+            return Err(if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                damaged("it ends before its trailer")
+            } else {
+                e.into()
+            });
         }
+        if u32::from_be_bytes(len) == RUN_END {
+            let mut count = [0u8; 8];
+            let mut digest = [0u8; 8];
+            self.reader.read_exact(&mut count)?;
+            self.reader.read_exact(&mut digest)?;
+            if u64::from_be_bytes(count) != self.read {
+                return Err(damaged("its entry count disagrees with its trailer"));
+            }
+            if u64::from_be_bytes(digest) != self.hash.digest() {
+                return Err(damaged("its checksum disagrees with its trailer"));
+            }
+            return Ok(None);
+        }
+        self.hash.update(&len);
         let mut key = vec![0u8; u32::from_be_bytes(len) as usize];
-        self.reader.read_exact(&mut key)?;
+        self.take(&mut key)?;
         let mut node = [0u8; 8];
-        self.reader.read_exact(&mut node)?;
+        self.take(&mut node)?;
         let mut flag = [0u8; 1];
-        self.reader.read_exact(&mut flag)?;
-        let valid_from = if flag[0] == 1 {
-            let mut vf = [0u8; 8];
-            self.reader.read_exact(&mut vf)?;
-            Some(i64::from_be_bytes(vf))
-        } else {
-            None
+        self.take(&mut flag)?;
+        let valid_from = match flag[0] {
+            0 => None,
+            1 => {
+                let mut vf = [0u8; 8];
+                self.take(&mut vf)?;
+                Some(i64::from_be_bytes(vf))
+            }
+            other => return Err(damaged(&format!("an entry has version flag {other}"))),
         };
+        self.read += 1;
         Ok(Some(Owned {
             key,
             node: u64::from_be_bytes(node),
             valid_from,
         }))
     }
+}
+
+/// A scratch run that does not read back as written.
+fn damaged(why: &str) -> VerifyError {
+    VerifyError::Scratch(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("a scratch run is damaged: {why}"),
+    ))
 }
 
 /// The expected entries of one generation: the runs it spilled and the one
@@ -252,7 +322,8 @@ struct Expected {
     memory: Run,
     at: usize,
     heap: BinaryHeap<core::cmp::Reverse<(Owned, usize)>>,
-    last: Option<Owned>,
+    /// Whether an entry was given out, which `next_into`'s buffer then holds.
+    given: bool,
     primed: bool,
 }
 
@@ -266,7 +337,7 @@ impl Expected {
             memory,
             at: 0,
             heap: BinaryHeap::new(),
-            last: None,
+            given: false,
             primed: false,
         }
     }
@@ -286,7 +357,22 @@ impl Expected {
         self.spilled[source].next()
     }
 
-    fn next(&mut self) -> Result<Option<Owned>, VerifyError> {
+    /// The next entry, written into `out` (whose key buffer is reused);
+    /// `false` once every entry was given out. A generation that never
+    /// spilled reads its one sorted run in place, allocating nothing.
+    fn next_into(&mut self, out: &mut Owned) -> Result<bool, VerifyError> {
+        if self.spilled.is_empty() {
+            // One run, sorted without repeats.
+            let Some(item) = self.memory.items.get(self.at).copied() else {
+                return Ok(false);
+            };
+            self.at += 1;
+            out.key.clear();
+            out.key.extend_from_slice(self.memory.key(&item));
+            out.node = item.node;
+            out.valid_from = item.valid_from;
+            return Ok(true);
+        }
         if !self.primed {
             self.primed = true;
             for source in (0..self.spilled.len()).chain(core::iter::once(MEMORY_RUN)) {
@@ -297,18 +383,72 @@ impl Expected {
         }
         loop {
             let Some(core::cmp::Reverse((item, source))) = self.heap.pop() else {
-                return Ok(None);
+                return Ok(false);
             };
             if let Some(next) = self.pull(source)? {
                 self.heap.push(core::cmp::Reverse((next, source)));
             }
-            // Runs spilled apart may each hold one node's entry.
-            if self.last.as_ref() == Some(&item) {
+            // Runs spilled apart may each hold one node's entry; `out` still
+            // holds the entry given out last.
+            if self.given && *out == item {
                 continue;
             }
-            self.last = Some(item.clone());
-            return Ok(Some(item));
+            self.given = true;
+            *out = item;
+            return Ok(true);
         }
+    }
+}
+
+/// The checked generations of one label and what of its records they read.
+struct Projection<'t> {
+    label: &'t str,
+    /// The generations, by their position in the pass's targets.
+    slots: Vec<usize>,
+    /// The declared properties they read, by field id.
+    fields: Vec<u32>,
+    /// The undeclared properties they read, by name.
+    names: Vec<&'t str>,
+}
+
+impl<'t> Projection<'t> {
+    /// One projection per label `targets` index.
+    fn of(targets: &'t [Target<'_>]) -> Vec<Self> {
+        let mut out: Vec<Self> = Vec::new();
+        for (i, target) in targets.iter().enumerate() {
+            let label = target.def.label.as_str();
+            let at = match out.iter().position(|p| p.label == label) {
+                Some(at) => at,
+                None => {
+                    out.push(Self {
+                        label,
+                        slots: Vec::new(),
+                        fields: Vec::new(),
+                        names: Vec::new(),
+                    });
+                    out.len() - 1
+                }
+            };
+            let projection = &mut out[at];
+            projection.slots.push(i);
+            let interpretation = target.interpretation;
+            let read = interpretation
+                .properties
+                .iter()
+                .chain(interpretation.filter.as_ref().map(|f| f.property()));
+            for property in read {
+                // A property is read by id and, missing there, by name.
+                if let Some(field) = property.field {
+                    if !projection.fields.contains(&field) {
+                        projection.fields.push(field);
+                    }
+                }
+                if !projection.names.contains(&property.name.as_str()) {
+                    projection.names.push(property.name.as_str());
+                }
+            }
+        }
+        out
     }
 }
 
@@ -346,11 +486,15 @@ pub(super) fn verify(
         })
         .collect();
 
+    // Per label, the checked generations indexing it and the properties
+    // they read together: a record decodes only those, every other value
+    // skipped unread however large.
+    let projections = Projection::of(targets);
+
     // The records, once.
     let scanning = Instant::now();
     let rows = LocalNodeStore::encoded_rows_at(engine, snapshot, shard_id)
         .map_err(|e| VerifyError::Store(e.to_string()))?;
-    let mut matching: Vec<usize> = Vec::with_capacity(slots.len());
     for (read, row) in rows.enumerate() {
         if read % 1024 == 0 && stop.load(core::sync::atomic::Ordering::Acquire) {
             return Ok(None);
@@ -363,31 +507,22 @@ pub(super) fn verify(
         let labels = NodeRecord::labels_from_msgpack(&value)
             .map_err(|e| VerifyError::Decode(e.to_string()))?;
         let primary = labels.first().map_or("", String::as_str);
-        matching.clear();
-        matching.extend(
-            slots
-                .iter()
-                .enumerate()
-                .filter(|(_, slot)| slot.target.def.label == primary)
-                .map(|(i, _)| i),
-        );
-        if matching.is_empty() {
+        let Some(projection) = projections.iter().find(|p| p.label == primary) else {
             continue;
-        }
+        };
         let record =
-            NodeRecord::from_msgpack(&value).map_err(|e| VerifyError::Decode(e.to_string()))?;
+            NodeRecord::project_from_msgpack(&value, &projection.fields, &projection.names)
+                .map_err(|e| VerifyError::Decode(e.to_string()))?;
         stats.decoded_rows += 1;
         stats.decoded_bytes += value.len() as u64;
-        for &i in &matching {
+        for &i in &projection.slots {
             let slot = &mut slots[i];
             slot.findings.checked += 1;
             let Some(values) = slot.target.interpretation.record_membership(&record) else {
                 continue;
             };
-            let def = slot.target.def;
             for tuple in tuples(&values) {
-                let key = entry(def.generation, def.unique, &tuple, owner).0;
-                slot.memory.push(&key, owner.node_id, owner.valid_from);
+                slot.memory.push_entry(slot.target.def, &tuple, owner);
                 stats.expected_entries += 1;
             }
         }
@@ -402,9 +537,7 @@ pub(super) fn verify(
                 slot.memory.sort();
                 let (file, written) = spill(&slot.memory, dir)?;
                 slot.memory.clear();
-                slot.spilled.push(Spilled {
-                    reader: BufReader::new(file),
-                });
+                slot.spilled.push(Spilled::new(file));
                 stats.spilled_runs += 1;
                 stats.spilled_bytes += written;
             }
@@ -483,7 +616,7 @@ where
     K: core::ops::Deref<Target = [u8]>,
 {
     let next_stored = |stored: &mut I| stored.next().transpose();
-    let mut want = expected.next()?;
+    let mut want = Want::first(expected)?;
     let mut have = next_stored(stored)?;
     loop {
         // A stored key that is no entry of this generation's shape names no
@@ -495,21 +628,21 @@ where
                 continue;
             }
         }
-        match (&want, &have) {
+        match (want.get(), &have) {
             (None, None) => return Ok(()),
             (Some(w), Some((key, _))) if w.key.as_slice() == &**key => {
                 stats.stored_entries += 1;
                 findings.checked += 1;
-                want = expected.next()?;
+                want.advance(expected)?;
                 have = next_stored(stored)?;
             }
             (Some(w), Some((key, _))) if w.key.as_slice() < &**key => {
                 push_missing(generation, w, findings);
-                want = expected.next()?;
+                want.advance(expected)?;
             }
             (Some(w), None) => {
                 push_missing(generation, w, findings);
-                want = expected.next()?;
+                want.advance(expected)?;
             }
             (_, Some((key, _))) => {
                 stats.stored_entries += 1;
@@ -524,6 +657,32 @@ where
                 have = next_stored(stored)?;
             }
         }
+    }
+}
+
+/// The expected entry a merge is at, in a buffer reused from entry to entry.
+struct Want {
+    entry: Owned,
+    some: bool,
+}
+
+impl Want {
+    fn first(expected: &mut Expected) -> Result<Self, VerifyError> {
+        let mut want = Self {
+            entry: Owned::default(),
+            some: false,
+        };
+        want.advance(expected)?;
+        Ok(want)
+    }
+
+    fn get(&self) -> Option<&Owned> {
+        self.some.then_some(&self.entry)
+    }
+
+    fn advance(&mut self, expected: &mut Expected) -> Result<(), VerifyError> {
+        self.some = expected.next_into(&mut self.entry)?;
+        Ok(())
     }
 }
 
@@ -557,14 +716,14 @@ where
     V: core::ops::Deref<Target = [u8]>,
 {
     let next_stored = |stored: &mut I| stored.next().transpose();
-    let mut want = expected.next()?;
+    let mut want = Want::first(expected)?;
     let mut have = next_stored(stored)?;
     // The value both sides are at, reused from value to value.
     let mut key: Vec<u8> = Vec::new();
     let mut holders: Vec<(u64, Option<i64>)> = Vec::new();
     loop {
         // The smaller of the two keys.
-        let at: &[u8] = match (&want, &have) {
+        let at: &[u8] = match (want.get(), &have) {
             (None, None) => return Ok(()),
             (Some(w), None) => &w.key,
             (None, Some((k, _))) => k,
@@ -578,10 +737,11 @@ where
         };
         key.clear();
         key.extend_from_slice(at);
-        let Some(tuple) = decode_unique_entry_tuple(generation, &key).map(<[u8]>::to_vec) else {
+        // Copied out only for a disagreement, which a repair names it in.
+        let Some(tuple) = decode_unique_entry_tuple(generation, &key) else {
             // No value of this generation's shape: nothing a repair can name.
-            if want.as_ref().is_some_and(|w| w.key == key) {
-                want = expected.next()?;
+            if want.get().is_some_and(|w| w.key == key) {
+                want.advance(expected)?;
             }
             if have.as_ref().is_some_and(|(k, _)| **k == *key) {
                 have = next_stored(stored)?;
@@ -590,9 +750,9 @@ where
         };
         // Every node expecting this value, with the version that holds it.
         holders.clear();
-        while let Some(w) = want.as_ref().filter(|w| w.key == key) {
+        while let Some(w) = want.get().filter(|w| w.key == key) {
             holders.push((w.node, w.valid_from));
-            want = expected.next()?;
+            want.advance(expected)?;
         }
         // The stored holder: `Some(None)` for one that does not decode.
         let stored_holder = match have.as_ref().filter(|(k, _)| **k == *key) {
@@ -611,12 +771,12 @@ where
                 Some(Some(h)) if h == node => {}
                 Some(Some(h)) if holds(h) => findings.mismatches.push(Mismatch::SourceDuplicate {
                     nodes: [h.min(node), h.max(node)],
-                    tuple: tuple.clone(),
+                    tuple: tuple.to_vec(),
                 }),
                 _ => findings.mismatches.push(Mismatch::Missing {
                     node,
                     valid_from,
-                    tuple: tuple.clone(),
+                    tuple: tuple.to_vec(),
                 }),
             }
         }
@@ -624,12 +784,12 @@ where
             Some(None) => findings.mismatches.push(Mismatch::Extra {
                 node: u64::MAX,
                 valid_from: None,
-                tuple,
+                tuple: tuple.to_vec(),
             }),
             Some(Some(h)) if !holds(h) => findings.mismatches.push(Mismatch::Extra {
                 node: h,
                 valid_from: None,
-                tuple,
+                tuple: tuple.to_vec(),
             }),
             _ => {}
         }

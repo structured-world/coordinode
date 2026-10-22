@@ -363,6 +363,97 @@ fn a_pass_that_cannot_spill_fails() {
     ));
 }
 
+/// A run of three entries, one of them a version.
+fn three_entries() -> Run {
+    let mut run = Run::default();
+    for (key, node, valid_from) in [
+        (&b"a"[..], 1, None),
+        (b"bb", 2, Some(-5)),
+        (b"ccc", 3, None),
+    ] {
+        let start = run.bytes.len() as u32;
+        run.bytes.extend_from_slice(key);
+        run.items.push(Item {
+            start,
+            len: key.len() as u32,
+            node,
+            valid_from,
+        });
+    }
+    run
+}
+
+/// `bytes` as a scratch file read from its start.
+fn scratch_file(bytes: &[u8]) -> std::fs::File {
+    use std::io::{Seek as _, Write as _};
+    let mut file = tempfile::tempfile().expect("tempfile");
+    file.write_all(bytes).expect("write");
+    file.seek(std::io::SeekFrom::Start(0)).expect("rewind");
+    file
+}
+
+/// Every entry of `file`, or the error reading it ends with.
+fn read_run(file: std::fs::File) -> Result<Vec<Owned>, VerifyError> {
+    let mut run = Spilled::new(file);
+    let mut out = Vec::new();
+    while let Some(entry) = run.next()? {
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// A spilled run reads back as written. One cut short at an entry boundary
+/// (its trailer lost), or with a byte changed, fails to read: a damaged run
+/// never passes for a shorter one, which would turn the entries it lost
+/// into stored entries no record expects, and repairs into deletions.
+#[test]
+fn a_damaged_scratch_run_fails_to_read() {
+    let dir = tempfile::tempdir().expect("dir");
+    let run = three_entries();
+    let (mut file, written) = spill(&run, dir.path()).expect("spill");
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).expect("read back");
+    assert_eq!(bytes.len() as u64, written);
+
+    let read = read_run(scratch_file(&bytes)).expect("an intact run");
+    assert_eq!(
+        read.iter()
+            .map(|e| (e.key.clone(), e.node, e.valid_from))
+            .collect::<Vec<_>>(),
+        vec![
+            (b"a".to_vec(), 1, None),
+            (b"bb".to_vec(), 2, Some(-5)),
+            (b"ccc".to_vec(), 3, None)
+        ]
+    );
+
+    // The trailer is 20 bytes; without it the run ends after its last entry.
+    let cut = &bytes[..bytes.len() - 20];
+    assert!(matches!(
+        read_run(scratch_file(cut)),
+        Err(VerifyError::Scratch(_))
+    ));
+    // The third entry and the trailer gone: a run that ends at an entry
+    // boundary, two entries long.
+    let two = 4 + 1 + 8 + 1 + 4 + 2 + 8 + 1 + 8;
+    assert!(matches!(
+        read_run(scratch_file(&bytes[..two])),
+        Err(VerifyError::Scratch(_))
+    ));
+    // One byte of the second key changed.
+    let mut flipped = bytes.clone();
+    flipped[4 + 1 + 8 + 1 + 4] ^= 0x40;
+    assert!(matches!(
+        read_run(scratch_file(&flipped)),
+        Err(VerifyError::Scratch(_))
+    ));
+    // An empty file: not even a trailer.
+    assert!(matches!(
+        read_run(scratch_file(&[])),
+        Err(VerifyError::Scratch(_))
+    ));
+}
+
 /// A pass told to stop ends without findings.
 #[test]
 fn a_stopped_pass_finds_nothing() {

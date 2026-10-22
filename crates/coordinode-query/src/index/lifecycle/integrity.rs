@@ -212,6 +212,50 @@ fn log_pass(targets: &[verify::Target<'_>], stats: &verify::VerifyStats) {
         compare_ms = stats.compare.as_millis(),
         "index check pass read the records"
     );
+    for (name, value) in [
+        (
+            "coordinode_index_check_source_rows_total",
+            stats.source_rows,
+        ),
+        (
+            "coordinode_index_check_source_bytes_total",
+            stats.source_bytes,
+        ),
+        (
+            "coordinode_index_check_decoded_rows_total",
+            stats.decoded_rows,
+        ),
+        (
+            "coordinode_index_check_decoded_bytes_total",
+            stats.decoded_bytes,
+        ),
+        (
+            "coordinode_index_check_expected_entries_total",
+            stats.expected_entries,
+        ),
+        (
+            "coordinode_index_check_stored_entries_total",
+            stats.stored_entries,
+        ),
+        (
+            "coordinode_index_check_spilled_runs_total",
+            stats.spilled_runs,
+        ),
+        (
+            "coordinode_index_check_spilled_bytes_total",
+            stats.spilled_bytes,
+        ),
+    ] {
+        metrics::counter!(name).increment(value);
+    }
+    for (phase, took) in [
+        ("scan", stats.scan),
+        ("sort", stats.sort),
+        ("compare", stats.compare),
+    ] {
+        metrics::histogram!("coordinode_index_check_phase_seconds", "phase" => phase)
+            .record(took.as_secs_f64());
+    }
 }
 
 /// The directory under the data directory a check pass spills to. Its files
@@ -1478,6 +1522,9 @@ impl Shared {
                 return Vec::new();
             }
         };
+        let generations = held.len();
+        let recording = Instant::now();
+        let syncs_before = env.engine().journal_syncs();
         let mut again = Vec::with_capacity(held.len());
         for ((mut check, interpretation), found) in
             held.into_iter().zip(&interpretations).zip(findings)
@@ -1488,6 +1535,24 @@ impl Shared {
                 Err(e) => self.fail_check(&check, &e),
             }
         }
+        // The counter only grows, so the later reading is never below the
+        // earlier one.
+        let journal_syncs = env
+            .engine()
+            .journal_syncs()
+            .zip(syncs_before)
+            .map(|(after, before)| after - before);
+        let recorded = recording.elapsed();
+        // Syncs of the whole member while the pass recorded: a concurrent
+        // writer's count with them, so they bound the pass's own from above.
+        tracing::info!(
+            generations,
+            record_ms = recorded.as_millis(),
+            journal_syncs_meanwhile = journal_syncs,
+            "index check pass recorded its repairs and outcomes"
+        );
+        metrics::histogram!("coordinode_index_check_phase_seconds", "phase" => "record")
+            .record(recorded.as_secs_f64());
         again
     }
 
@@ -1609,8 +1674,17 @@ impl Shared {
         }
         check.repaired += repaired;
         let conflict_count = conflicts.len() as u64;
+        // A generation found damaged, or repaired by this check, is proved
+        // from the conclusion on; an older snapshot still reads the entries
+        // as they were then. A direct-mode engine keeps no older snapshots to
+        // protect.
+        let now = self.env.oracle().map(|oracle| oracle.current().as_raw());
+        let finished_at = wall_clock_ms();
         let mut passes = 0;
-        let mut revisions = (0, 0);
+        let mut recorded = None;
+        // The pass's progress and, when it settles the check, its conclusion
+        // in one commit: a clean check costs the journal one write, not one
+        // for its progress and another for its outcome.
         let moved = self.checkpoint(generation, taken, |rec, held| {
             held.checked += found.checked;
             held.mismatches += found_count;
@@ -1620,65 +1694,55 @@ impl Shared {
             }
             held.passes += 1;
             passes = held.passes;
-            revisions = (rec.evidence_revision, held.started_revision);
+            recorded = None;
+            if found_count == 0 {
+                // Every disagreement repaired, none left: the generation
+                // agrees with its records, unless a report arrived since the
+                // pass began, which the next pass looks for.
+                if rec.evidence_revision != held.started_revision {
+                    held.started_revision = rec.evidence_revision;
+                    return;
+                }
+                if rec.evidence_revision > 0 || held.repaired > 0 {
+                    rec.trusted_from = now.or(rec.trusted_from);
+                }
+                rec.integrity = Integrity::Verified;
+                rec.evidence.clear();
+            } else if found_count == conflict_count {
+                // Only records breaking the constraint remain: no entry can
+                // fix them.
+                rec.integrity = Integrity::Suspect;
+            } else {
+                return;
+            }
+            held.state = CheckState::Done;
+            held.finished_at_ms = Some(finished_at);
+            recorded = check_outcome(rec, held);
         })?;
         if !moved {
             return self.lost_check(generation, taken).map(Some);
         }
-        // Every disagreement repaired, none left: the generation agrees with
-        // its records, unless a report arrived meanwhile, which the next pass
-        // looks for.
-        if found_count == 0 {
-            let (evidence, started) = revisions;
-            if evidence == started {
-                // A generation found damaged, or repaired by this check, is
-                // proved from now on; an older snapshot still reads the
-                // entries as they were then. A direct-mode engine keeps no
-                // older snapshots to protect.
-                let now = self.env.oracle().map(|oracle| oracle.current().as_raw());
-                let once_damaged = evidence > 0 || check.repaired > 0;
-                let outcome = self.conclude_check(generation, taken, move |rec, held| {
-                    rec.integrity = Integrity::Verified;
-                    rec.evidence.clear();
-                    if once_damaged {
-                        rec.trusted_from = now.or(rec.trusted_from);
-                    }
-                    held.state = CheckState::Done;
-                })?;
-                // The pass read this member's copy whole, after the revision
-                // it took: that copy is proved, unless a report found it
-                // disagreeing since.
-                if let Executed::Outcome(CheckOutcome::Verified { .. }) = &outcome {
-                    self.env
-                        .registry()
-                        .verified_here(
-                            self.env.engine(),
-                            &taken.def,
-                            check.local_revision,
-                            now.unwrap_or(0),
-                        )
-                        .map_err(|e| e.to_string())?;
-                }
-                return Ok(Some(outcome));
+        if let Some(outcome) = recorded {
+            let env = self.env.as_ref();
+            env.registry().apply_integrity(
+                &LocalIndexStore::new(env.engine())
+                    .list_integrity()
+                    .map_err(text)?,
+            );
+            // The pass read this member's copy whole, after the revision it
+            // took: that copy is proved, unless a report found it disagreeing
+            // since.
+            if let CheckOutcome::Verified { .. } = &outcome {
+                env.registry()
+                    .verified_here(
+                        env.engine(),
+                        &taken.def,
+                        check.local_revision,
+                        now.unwrap_or(0),
+                    )
+                    .map_err(|e| e.to_string())?;
             }
-            let moved = self.checkpoint(generation, taken, |rec, held| {
-                held.started_revision = rec.evidence_revision;
-            })?;
-            if !moved {
-                return self.lost_check(generation, taken).map(Some);
-            }
-        } else if found_count == conflict_count {
-            // Only records breaking the constraint remain: no entry can fix
-            // them.
-            return self
-                .conclude_check(generation, taken, move |rec, held| {
-                    for conflict in &conflicts {
-                        rec.report(conflict.clone());
-                    }
-                    rec.integrity = Integrity::Suspect;
-                    held.state = CheckState::Done;
-                })
-                .map(Some);
+            return Ok(Some(Executed::Outcome(outcome)));
         }
         if check.repaired > config.check_max_repairs || passes >= MAX_PASSES {
             // A check of a generation the index left must not rebuild the

@@ -181,6 +181,67 @@ fn findings_exclude_and_missing_proof_is_unknown() {
     );
 }
 
+/// A finding made after the capture and lifted again before the seal leaves
+/// no mark behind, yet the capture may hold the copy as it was before the
+/// repair: the copy is excluded, not sent as qualified.
+#[test]
+fn a_finding_made_and_lifted_after_the_capture_excludes_the_copy() {
+    let member = member();
+    let (qualifier, registry) = qualifier(&member);
+    let engine = &member.env.engine;
+    let captured = qualifier.capture(engine).expect("capture");
+    registry.report_mismatch(engine, &member.email, stray());
+    let revision = registry.local_revision(member.email.generation);
+    assert!(
+        registry
+            .verified_here(engine, &member.email, revision, 1)
+            .expect("lift"),
+        "the mark is lifted"
+    );
+    assert_eq!(registry.local_revision(member.email.generation), 0);
+    assert_eq!(
+        states(&qualifier.seal(engine, &captured).expect("seal"))
+            .get(&member.email.generation.as_raw()),
+        Some(&CopyState::Excluded)
+    );
+}
+
+/// Two readings of a copy's proof bracket a history export: a finding made
+/// and lifted between them changes the second, so the export carries no
+/// proof for what it may have read while the copy was wrong.
+#[test]
+fn a_finding_made_and_lifted_between_two_readings_changes_the_proof() {
+    let member = member();
+    let (qualifier, registry) = qualifier(&member);
+    let engine = &member.env.engine;
+    let generation = member.email.generation.as_raw();
+    let before = qualifier
+        .copy_proof(engine, generation)
+        .expect("read")
+        .expect("a proved copy");
+    assert_eq!(
+        qualifier.copy_proof(engine, generation).expect("read"),
+        Some(before.clone()),
+        "nothing happened between the readings"
+    );
+    registry.report_mismatch(engine, &member.email, stray());
+    assert_eq!(
+        qualifier.copy_proof(engine, generation).expect("read"),
+        None
+    );
+    let revision = registry.local_revision(member.email.generation);
+    assert!(
+        registry
+            .verified_here(engine, &member.email, revision, 2)
+            .expect("lift")
+    );
+    let after = qualifier
+        .copy_proof(engine, generation)
+        .expect("read")
+        .expect("proved again");
+    assert_ne!(after, before, "the readings around the finding differ");
+}
+
 /// A copy whose use guard a previous run left open is excluded from the
 /// next capture, its proof notwithstanding: the guard says the copy served
 /// while its process died, which nothing since has checked.

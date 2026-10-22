@@ -1078,6 +1078,7 @@ dependencies = [
  "coordinode-vector",
  "coordinode-workspace-hack",
  "criterion",
+ "metrics",
  "parking_lot",
  "pest",
  "pest_derive",
@@ -1095,6 +1096,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "unicode-normalization",
+ "xxhash-rust",
 ]
 
 [[package]]
