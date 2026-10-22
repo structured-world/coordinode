@@ -1668,6 +1668,55 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
     }
 }
 
+/// The device flush a persist ends with reaches every endpoint, not only the
+/// one holding the journal: a barrier orders writes on its own device alone,
+/// so a tree level on a second disk is durable only once that disk's cache
+/// is flushed too.
+#[test]
+fn a_persist_flushes_the_device_of_every_endpoint() {
+    use lsm_tree::fs::SyncKind;
+
+    let (hot, cold) = (TempDir::new().expect("hot"), TempDir::new().expect("cold"));
+    let injector = Arc::new(lsm_tree::fs::FaultInjector::new());
+    let mut config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    config.fs = Some(Arc::new(lsm_tree::fs::FaultFs::with_injector(
+        lsm_tree::fs::StdFs,
+        Arc::clone(&injector),
+    )));
+    let engine = StorageEngine::open(&config).expect("open");
+    engine
+        .put(Partition::Node, b"node:00:00000001", b"row")
+        .expect("put");
+    // Only what the persist below syncs counts.
+    drop(injector.take_syncs());
+    engine.persist().expect("flush");
+
+    let syncs = injector.take_syncs();
+    for endpoint in [hot.path(), cold.path()] {
+        assert!(
+            syncs
+                .iter()
+                .any(|(path, kind)| *kind == SyncKind::Device && path == endpoint),
+            "no device flush under {endpoint:?}: {syncs:?}"
+        );
+    }
+}
+
 /// A table flushed before its oplog entries are purged must be as durable as
 /// those entries. Under a full-flush oplog the trees sync their files with
 /// barriers, which keep them in order, and a persist then flushes the device
