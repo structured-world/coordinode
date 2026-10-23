@@ -64,10 +64,9 @@ jobs:
       - name: Reconcile any earlier partial publication
         if: steps.eligible.outputs.publish == 'true'
         run: python3 -B scripts/release/registry.py preflight --checkout "$GITHUB_WORKSPACE"
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
+      - name: Install the verified release-plz build
         if: steps.eligible.outputs.publish == 'true'
-        with:
-          tool: release-plz@0.3.174
+        run: bash scripts/release/install_release_plz.sh
       - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
         if: steps.eligible.outputs.publish == 'true'
         id: app
@@ -131,7 +130,9 @@ jobs:
           sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
-          tool: release-plz@0.3.174,cargo-semver-checks@0.50.0
+          tool: cargo-semver-checks@0.50.0
+      - name: Install the verified release-plz build
+        run: bash scripts/release/install_release_plz.sh
       - name: Calculate release-PR baselines from registry state
         run: |
           set -euo pipefail
