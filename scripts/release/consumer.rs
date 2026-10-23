@@ -6,7 +6,7 @@ use coordinode_core::graph::{node::NodeId, types::Value};
 use coordinode_core::schema::definition::{
     ConstraintKind, EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType, SchemaMode,
 };
-use coordinode_embed::db::StatementOptions;
+use coordinode_embed::db::{StatementOptions, TransactionEnd};
 use coordinode_embed::operation::{IssuerId, OperationDescriptor, OperationOutcome, Resolve};
 use coordinode_embed::{
     Database, DatabaseError, EdgeTypeDeclaration, Intent, LabelDeclaration, PackageConstraint,
@@ -119,10 +119,18 @@ fn basic(path: &Path) -> Result<()> {
     let discard = db.begin_transaction()?;
     db.execute_in_transaction(discard, "CREATE (:Discarded)", None)?;
     db.rollback_transaction(discard)?;
-    assert!(matches!(
-        db.commit_transaction(discard),
-        Err(DatabaseError::UnknownTransaction(_))
-    ));
+    // Rollback retains its explicit terminal reason for this handle.
+    let ended = db.commit_transaction(discard);
+    assert!(
+        matches!(
+            ended,
+            Err(DatabaseError::TransactionAborted {
+                id,
+                end: TransactionEnd::RolledBack,
+            }) if id == discard
+        ),
+        "unexpected rollback termination: {ended:?}"
+    );
     drop(db);
 
     let mut db = Database::open(path)?;
