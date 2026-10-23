@@ -193,3 +193,33 @@ fn delete_lowers_to_delete_over_filter_nodescan() {
     };
     assert!(matches!(*input, LogicalOp::NodeScan { .. }));
 }
+
+/// A flat expression evades a recursive-descent limit but still creates a
+/// recursively formatted/dropped tree. Admission must precede its construction.
+#[test]
+fn sql_syntax_width_is_refused_by_both_entry_points() {
+    let query = format!("SELECT {} FROM T", vec!["1"; 1024].join(" + "));
+    let frontend = SqlFrontend::new();
+    for result in [
+        frontend.parse(&query).map(|_| ()),
+        frontend.fingerprint(&query).map(|_| ()),
+    ] {
+        let error = result.expect_err("syntax exceeding the safety budget must be refused");
+        assert!(error.to_string().contains("SQL syntax token limit"), "{error}");
+    }
+}
+
+/// One huge literal consumes one syntax token. Check bytes before tokenization,
+/// independently of token/depth limits, and return the same refusal in both APIs.
+#[test]
+fn sql_input_bytes_are_refused_by_both_entry_points() {
+    let query = format!("SELECT '{}' FROM T", "x".repeat(1024 * 1024));
+    let frontend = SqlFrontend::new();
+    for result in [
+        frontend.parse(&query).map(|_| ()),
+        frontend.fingerprint(&query).map(|_| ()),
+    ] {
+        let error = result.expect_err("oversized input must be refused before AST construction");
+        assert!(error.to_string().contains("SQL input byte limit"), "{error}");
+    }
+}
