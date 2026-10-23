@@ -468,7 +468,9 @@ fn removing_nodes_the_index_does_not_hold_changes_nothing() {
 #[test]
 fn replace_all_drops_documents_not_listed() {
     let dir = tempfile::tempdir().unwrap();
-    let config = MultiLangConfig::with_default_language("english");
+    // This tests replacement, not detection of an ambiguous short fragment.
+    let config =
+        MultiLangConfig::with_default_language("english").with_field_analyzer("body", "english");
     let mut idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
     idx.add_nodes_batch(&[
         (1, props(&[("body", "stays here")])),

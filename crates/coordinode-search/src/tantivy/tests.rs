@@ -187,6 +187,31 @@ fn english_stemmed_search() {
     assert_eq!(results[0].node_id, 1);
 }
 
+/// The refreshed analyzer must use the same new stem while indexing and
+/// querying, rather than leaving either path on the previous algorithm.
+#[test]
+fn refreshed_english_stems_match_on_both_query_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut idx = TextIndex::open_or_create(dir.path(), 15_000_000, Some("english")).unwrap();
+    let node_id = 1;
+    idx.add_document(node_id, "added").unwrap();
+
+    for found in [
+        idx.search("add", 10),
+        idx.search_with_language("add", 10, "english"),
+    ] {
+        let found = found.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].node_id, node_id);
+    }
+    assert!(idx.search("ad", 10).unwrap().is_empty());
+    assert!(
+        idx.search_with_language("ad", 10, "english")
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn russian_stemmed_search() {
     let dir = tempfile::tempdir().unwrap();
