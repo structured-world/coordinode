@@ -14,7 +14,7 @@ import tarfile
 import tempfile
 import tomllib
 
-from prepare import check_native_stack_helpers
+from dependency_policy import check_native_stack_helpers
 
 
 def inspect_archive(archive, name, version, names, bindings):

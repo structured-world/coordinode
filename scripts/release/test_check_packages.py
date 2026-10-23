@@ -1,6 +1,8 @@
 """Archive gates reject source-only inputs before a consumer can hide them."""
 import io
 import pathlib
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -60,6 +62,17 @@ class ArchiveTest(unittest.TestCase):
     def test_archive_paths_cannot_escape_the_package(self):
         with self.assertRaisesRegex(ValueError, 'invalid archive path'):
             self.inspect(extra={'../outside': b'not allowed'})
+
+
+class CheckerStartupTest(unittest.TestCase):
+    def test_registry_checker_does_not_require_the_preparation_environment(self):
+        # Upload verification runs after the disposable preparation environment
+        # is gone. It must start with the standard library alone.
+        script = pathlib.Path(__file__).with_name('check_packages.py')
+        result = subprocess.run([sys.executable, '-B', '-S', str(script), '--help'],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--source', result.stdout)
 
 
 if __name__ == '__main__':

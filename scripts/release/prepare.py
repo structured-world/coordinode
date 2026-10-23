@@ -16,6 +16,8 @@ import tomllib
 
 import tomlkit
 
+from dependency_policy import check_native_stack_helpers
+
 
 def command(*args, root):
     return subprocess.check_output(args, cwd=root, text=True)
@@ -40,13 +42,6 @@ def library_closure(metadata, entrypoint):
     internal = {packages[p]["name"] for p in visited if p in members}
     external = [packages[p] for p in visited if p not in members]
     return internal, external
-
-
-def check_native_stack_helpers(packages):
-    """Reject the known native stack helpers from the delivered graph."""
-    native = sorted({p['name'] for p in packages if p['name'] in {'stacker', 'psm'}})
-    if native:
-        raise ValueError(f"registry closure contains a native stack helper: {native}")
 
 
 def prepare_manifest(document, version, names, codegen):
