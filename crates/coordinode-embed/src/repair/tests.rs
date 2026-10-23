@@ -36,13 +36,17 @@ fn lose_manifest(tree_dir: &Path) {
 }
 
 fn durable_cfg(dir: &TempDir) -> StorageConfig {
-    StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
         dir.path(),
         Media::Hdd,
         Durability::Durable,
         Tier::Warm,
-    )])
+    )]);
+    // Fault injection addresses on-disk tables; a background rewrite must not
+    // replace the victim between its selection, corruption and verification.
+    config.compaction_workers = 0;
+    config
 }
 
 fn open(dir: &TempDir) -> Arc<StorageEngine> {
@@ -82,6 +86,14 @@ fn corrupt_post_checkpoint_tables(tables_dir: &Path, checkpoint_root: &Path) -> 
             let meta = entry.metadata().expect("metadata");
             if meta.is_dir() {
                 stack.push(p);
+                continue;
+            }
+            if tables_dir.file_name().is_some_and(|name| name == "tables")
+                && !matches!(
+                    lsm_tree::file::TableDirEntry::classify(&entry.file_name().to_string_lossy()),
+                    lsm_tree::file::TableDirEntry::Table(_)
+                )
+            {
                 continue;
             }
             if ckpt_tables.contains(&entry.file_name()) {
@@ -153,17 +165,30 @@ fn checkpoint_table_names(
 /// in unrelated metadata whose size dominates the file.
 #[test]
 fn the_corruption_fixture_hits_data_in_a_small_table() {
+    use lsm_tree::AbstractTree;
+
     let dir = TempDir::new().expect("tempdir");
     let engine = open(&dir);
     put(&engine, 1, PartitionId::Node, b"node:0:0001", b"v");
     engine.persist().expect("persist");
     let tables = dir.path().join(Partition::Node.name()).join("tables");
-    let before = files_with_bytes(&tables);
+    let version = engine
+        .tree(Partition::Node)
+        .expect("node tree")
+        .current_version();
+    let before: Vec<_> = version
+        .iter_tables()
+        .map(|table| {
+            let path = tables.join(table.id().to_string());
+            let bytes = std::fs::read(&path).expect("read published table");
+            (path, bytes)
+        })
+        .collect();
     assert!(!before.is_empty(), "a durable row must produce a table");
     corrupt_post_checkpoint_tables(&tables, &checkpoint_root(dir.path()));
     for (path, bytes) in before {
         let archive = lsm_tree::sfa::Reader::from_reader(&mut std::io::Cursor::new(&bytes))
-            .expect("read original table layout");
+            .expect("read published table layout");
         let data = archive.toc().section(b"data").expect("table data section");
         let start = usize::try_from(data.pos()).expect("data position");
         let end = start + usize::try_from(data.len()).expect("data length");
