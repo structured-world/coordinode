@@ -2,6 +2,27 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.8.0 - 2026-10-23
+
+### Added
+
+- *(embed)* [**breaking**] publish embedded Rust libraries ([#70](https://github.com/structured-world/coordinode/pull/70))
+- *(session)* run transactions on the session in arrival order
+- *(transactions)* client-drawn UUID transaction IDs
+- *(txn)* hold interactive transactions on their owner
+- *(schema)* prove presence and type constraints in the background
+- *(schema)* prove label definitions in the background
+
+### Fixed
+
+- *(embed)* refuse a write off the leader as not leader when it needs an id
+- *(embed)* move a constraint kind's fields into the wire
+- *(embed)* carry a constraint kind as typed bounded fields
+
+### Performance
+
+- *(index)* project, checksum and bind index check passes
+
 ## v0.7.3 - 2026-10-18
 
 ### Added

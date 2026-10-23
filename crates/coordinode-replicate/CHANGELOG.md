@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.8.0 - 2026-10-23
+
+### Added
+
+- *(embed)* [**breaking**] publish embedded Rust libraries ([#70](https://github.com/structured-world/coordinode/pull/70))
+
+### Testing
+
+- *(storage)* stop leaning on the 5.x file layout
+
 ## v0.7.3 - 2026-10-18
 
 ### Added

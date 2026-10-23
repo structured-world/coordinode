@@ -2,6 +2,27 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.8.0 - 2026-10-23
+
+### Added
+
+- *(embed)* [**breaking**] publish embedded Rust libraries ([#70](https://github.com/structured-world/coordinode/pull/70))
+- *(schema)* prove presence and type constraints in the background
+- *(schema)* prove label definitions in the background
+
+### Documentation
+
+- *(modality)* fix a broken link in the blob store docs
+
+### Fixed
+
+- *(storage)* answer a blob write only once it is durable
+
+### Performance
+
+- *(index)* check every generation in one sorted pass
+- *(schema)* prove a package's labels in one certification
+
 ## v0.7.3 - 2026-10-18
 
 ### Added

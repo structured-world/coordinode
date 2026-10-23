@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.8.0 - 2026-10-23
+
+### Added
+
+- *(embed)* [**breaking**] publish embedded Rust libraries ([#70](https://github.com/structured-world/coordinode/pull/70))
+
+### Fixed
+
+- *(vector)* rank distances in a total order, ties by id
+
 ## v0.7.1 - 2026-10-13
 
 ### Added
