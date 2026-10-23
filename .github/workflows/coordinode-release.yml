@@ -1,10 +1,8 @@
 name: Release PLZ
 
 on:
-  workflow_run:
-    workflows: [CI]
+  push:
     branches: [main]
-    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -13,7 +11,7 @@ permissions:
 
 jobs:
   release:
-    if: github.repository == 'structured-world/coordinode' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository))
+    if: github.repository == 'structured-world/coordinode'
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
@@ -24,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
@@ -34,7 +32,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 -B scripts/release/registry.py eligible --checkout "$GITHUB_WORKSPACE"
       - name: Require the source suite on this exact commit
-        if: steps.eligible.outputs.publish == 'true' && github.event_name == 'workflow_dispatch'
+        if: steps.eligible.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

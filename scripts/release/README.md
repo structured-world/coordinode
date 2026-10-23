@@ -5,9 +5,11 @@ closure, including optional replication. These packages and the server share a
 version. The remaining workspace packages are not registry libraries.
 
 The `Embedded registry packages` workflow tests the actual archives before a PR
-lands. `Release PLZ` publishes only a merged release PR after successful source
-CI. It also supports a manual retry on main; that path requires successful source
-CI on the same commit. Release-PR preparation runs separately on clean main.
+lands. `Release PLZ` runs on a push to main and publishes only a merged release
+PR after successful source CI on that exact commit. A manual retry on main
+requires the same source-CI evidence. Release-PR preparation runs separately on
+clean main. Publication does not use `workflow_run`, which crates.io rejects for
+Trusted Publishing.
 
 `pr_config.py` derives an ignored configuration for release-PR calculation.
 Before a library's first upload, it uses the existing coordinated Git baseline
