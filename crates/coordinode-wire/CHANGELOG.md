@@ -2,6 +2,17 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.8.0 - 2026-10-23
+
+### Added
+
+- *(embed)* [**breaking**] publish embedded Rust libraries ([#70](https://github.com/structured-world/coordinode/pull/70))
+
+### Performance
+
+- *(wire)* size tonic's per-call buffers for small messages
+- *(wire)* reuse the zstd contexts across messages
+
 ## v0.7.2 - 2026-10-15
 
 ### Added

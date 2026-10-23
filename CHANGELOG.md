@@ -1,5 +1,121 @@
 # Changelog
 
+## v0.8.0 - 2026-10-23
+
+### Added
+
+- *(storage)* wire the remaining lsm-tree 6.0 controls
+- *(storage)* one I/O budget for compaction and scrub
+- *(routing)* read a routed answer as its rows are asked for
+- *(embed)* run a host's commands through any member
+- *(embed)* one error contract for local and routed calls
+- *(session)* run transactions on the session in arrival order
+- *(transactions)* client-drawn UUID transaction IDs
+- *(cluster)* route operation calls to the leader between members
+- *(cluster)* serve clients through any member
+- *(txn)* hold interactive transactions on their owner
+- *(server)* serve PublishSchema and AwaitSchema
+- *(schema)* prove label definitions in the background
+- *(embed)* [**breaking**] publish embedded Rust libraries ([#70](https://github.com/structured-world/coordinode/pull/70))
+- *(schema)* prove presence and type constraints in the background
+- *(embed)* send an unsent command again within its deadline
+- *(embed)* say where an ingress command ran
+- *(embed)* publish a schema package as a client operation
+- *(embed)* publish schema packages in one catalog commit
+- *(raft)* send snapshots from pinned trees, compact on flush
+- *(query)* log when an index check starts and how it ends
+- *(operation)* apply each client write once
+- *(storage)* store index generations under local installations
+- *(migrate)* add the node sizes report module
+- *(migrate)* catalog record migrations, check and journal stats
+- *(migrate)* offline tool to bring a data directory current
+
+### Documentation
+
+- *(modality)* fix a broken link in the blob store docs
+- *(storage)* describe a lost frame without linking a private item
+
+### Fixed
+
+- *(embed)* bound what routed commands hold on the executing member
+- *(routing)* send a routed answer as it is produced
+- *(embed)* every member reaps idle transactions
+- *(storage)* answer a blob write only once it is durable
+- *(embed)* carry a constraint kind as typed bounded fields
+- *(server)* take no periodic checkpoints by default
+- *(storage)* refuse a group member's store an own journal
+- *(embed)* release the store before a member's shutdown returns
+- *(embed)* refuse a write off the leader as not leader when it needs an id
+- *(embed)* move a constraint kind's fields into the wire
+- *(query)* [**breaking**] bound SQL without native helpers ([#72](https://github.com/structured-world/coordinode/pull/72))
+- *(embed)* stop routed statements when their session drops
+- *(embed)* refuse a routed reply past the bound instead of queueing it
+- *(embed)* send a write to the leader before it runs elsewhere
+- *(routing)* end a routed answer with its last frame
+- *(embed)* bound a routed error before encoding it
+- *(storage)* tell a group member's store by its bound consensus log
+- *(storage)* make the journal's retirement into a group restartable
+- *(embed)* let the catalog decide an owned index name in packages
+- *(vector)* rank distances in a total order, ties by id
+- *(query)* drop an index report of damage that is already repaired
+- *(query)* rescan when the history under a build's snapshot is released
+- *(query)* rescan a vector build whose partition was replaced before its scan
+- *(raft)* count the snapshot trigger as engine work until its task ends
+- *(raft)* send a snapshot chunk as one binary blob
+- *(storage)* recover lost writes inside a sealed oplog segment
+- *(storage)* never copy a checkpoint over a file it holds
+- *(migrate)* find every marked store, Raft snapshot captures too
+
+### Performance
+
+- *(index)* check every generation in one sorted pass
+- *(session)* open a transaction with its first statement
+- *(index)* project, checksum and bind index check passes
+- *(routing)* carry routed commands on one session per member
+- *(routing)* send a routed answer's ready events as one message
+- *(schema)* prove a package's labels in one certification
+- *(storage)* flush columnar tables in the background
+- *(storage)* keep vector truth values in the block cache
+- *(storage)* order tree syncs, flush devices at promises
+- *(wire)* size tonic's per-call buffers for small messages
+- *(wire)* reuse the zstd contexts across messages
+- *(query)* bound property delta chains with whole writes
+
+### Testing
+
+- *(server)* keep the label replication test's leader on a busy host
+- *(server)* serve command routing in the follower write test
+- *(embed)* corrupt the largest table, not an empty reserve file
+- *(storage)* stop leaning on the 5.x file layout
+- *(index)* report the slowest recovery lookup
+- *(embed)* routed commands keep their concerns and time left
+- *(embed)* routed transactions across renewal and revocation
+- *(embed)* races between idle expiry, explicit ends and leader loss
+- *(embed)* routed commands across leader change, ownership, order
+- *(embed)* hold vector builds instead of racing them
+- *(embed)* seat the blocking build before queueing behind it
+- *(embed)* schema packages under concurrency and in a group
+- *(query)* let the maintainer take a write after a rescanned build
+- *(query)* wait for the build's snapshot, not a fixed sleep
+- *(storage)* cut the power at data syncs as well as full ones
+- *(raft)* cut off only a member that follows the leader
+- *(raft)* name what still holds the engine after a shutdown
+- *(session)* a commit in flight survives its stream going away
+- *(storage)* match synced tree paths with either separator
+- *(storage)* a persist flushes the device of every endpoint
+- *(storage)* retirement segments brought back by a cut are retired again
+
+### Bench
+
+- *(embed)* measure schema packages against single calls
+- *(embed)* measure reopening after a death with index copies in use
+- *(routing)* report how long a leader change keeps a host from writing
+- *(routing)* measure routing under load and across leader changes
+- *(routing)* measure an echo over the members' own mutual TLS
+- *(routing)* measure the transport floor under a routed call
+- *(embed)* measure the bare route and use parameters
+- *(embed)* a routed command against the same command at the leader
+
 ## v0.7.3 - 2026-10-18
 
 ### Added
