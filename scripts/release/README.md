@@ -9,6 +9,13 @@ lands. `Release PLZ` publishes only a merged release PR after successful source
 CI. It also supports a manual retry on main; that path requires successful source
 CI on the same commit. Release-PR preparation runs separately on clean main.
 
+`pr_config.py` derives an ignored configuration for release-PR calculation.
+Before a library's first upload, it uses the existing coordinated Git baseline
+with publishing disabled in that calculation only. A published library retains
+its registry baseline and semantic-version checks. Registry failures stop the
+calculation. Upload always uses the checked-in `.release-plz.toml`, never this
+derived configuration; the server tag does not establish a library upload.
+
 ## Preparation and qualification
 
 Run `prepare.py` only in a disposable, clean checkout. It removes the workspace
