@@ -1,7 +1,8 @@
 //! Embedded database: open CoordiNode storage, execute queries in-process.
 //!
-//! Embedded mode is single-process (no Raft, no clustering).
-//! For CE 3-node HA, use the coordinode server binary.
+//! `Database::open` uses the local, non-replicated operating mode. The optional
+//! `replication` module lets an embedding host run a member of a replicated
+//! group and transition an existing local store into that mode.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -708,9 +709,9 @@ impl Drop for Database {
 impl Database {
     /// Open or create a database at the given path.
     ///
-    /// Uses `OwnedLocalProposalPipeline` for embedded single-node mode.
-    /// For cluster mode (CE 3-node HA), use `open_with_pipeline()` with
-    /// a `RaftProposalPipeline` instead.
+    /// Uses `OwnedLocalProposalPipeline` for non-replicated operation. The
+    /// optional `replication` module supplies the replicated operating mode,
+    /// including transition of this store through `ReplicatedDatabase::from_database`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",

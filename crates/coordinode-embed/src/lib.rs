@@ -1,6 +1,6 @@
 //! CoordiNode embedded library API.
 //!
-//! Use CoordiNode as an in-process library — no server, no network.
+//! Use CoordiNode as an in-process library without a separate database server.
 //!
 //! ```rust,no_run
 //! use coordinode_embed::Database;
