@@ -1,0 +1,30 @@
+name: Embedded registry packages
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-registry
+      - name: Keep package qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: registry-qualification
+          path: |
+            target/registry-preparation.json
+            target/prepared-consumer-metadata.json
+          if-no-files-found: ignore
+      - name: Clean the build output
+        if: always()
+        run: cargo clean

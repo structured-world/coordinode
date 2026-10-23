@@ -34,9 +34,10 @@ exclude = [
 [workspace.package]
 version = "0.7.3"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.92"
 license = "AGPL-3.0-only"
 repository = "https://github.com/structured-world/coordinode"
+readme = "README.md"
 authors = ["Dmitry Prudnikov <mail@polaz.com>"]
 publish = false
 
@@ -63,7 +64,7 @@ tantivy = { version = "0.26", default-features = false, features = [
     "lz4-compression",
     "stemmer",
 ] }
-rust-stemmers = { git = "https://github.com/structured-world/rust-stemmers.git", branch = "main" }
+rust-stemmers = { package = "structured-stemmers", version = "=1.2.0" }
 whatlang = "0.18"
 
 # CJK tokenization (optional, per-language feature flags)
@@ -150,29 +151,29 @@ proptest = "1"
 # Benchmarks
 criterion = { version = "0.8", features = ["html_reports"] }
 
-# Internal crates — path-only (no version). All crates are publish = false so
-# cargo does not need a crates.io version. Adding `version` causes `cargo package`
-# to replace path deps with registry deps and fail with "not found on crates.io".
-coordinode-core = { path = "crates/coordinode-core" }
-coordinode-query = { path = "crates/coordinode-query" }
+# Published libraries share one version, including public types and storage
+# contracts. Cargo packages the complete closure together before publication;
+# release-plz updates these exact requirements with the coordinated version.
+coordinode-core = { path = "crates/coordinode-core", version = "=0.7.3" }
+coordinode-query = { path = "crates/coordinode-query", version = "=0.7.3" }
 coordinode-session = { path = "crates/coordinode-session" }
-coordinode-vector = { path = "crates/coordinode-vector" }
-coordinode-search = { path = "crates/coordinode-search" }
-coordinode-storage = { path = "crates/coordinode-storage" }
-coordinode-modality = { path = "crates/coordinode-modality" }
+coordinode-vector = { path = "crates/coordinode-vector", version = "=0.7.3" }
+coordinode-search = { path = "crates/coordinode-search", version = "=0.7.3" }
+coordinode-storage = { path = "crates/coordinode-storage", version = "=0.7.3" }
+coordinode-modality = { path = "crates/coordinode-modality", version = "=0.7.3" }
 coordinode-timeseries = { path = "crates/coordinode-timeseries" }
-coordinode-cluster = { path = "crates/coordinode-cluster" }
-coordinode-raft = { path = "crates/coordinode-raft" }
+coordinode-cluster = { path = "crates/coordinode-cluster", version = "=0.7.3" }
+coordinode-raft = { path = "crates/coordinode-raft", version = "=0.7.3" }
 coordinode-auth = { path = "crates/coordinode-auth" }
 coordinode-server = { path = "crates/coordinode-server" }
 coordinode-s3 = { path = "crates/coordinode-s3" }
-coordinode-embed = { path = "crates/coordinode-embed" }
-coordinode-swarm = { path = "crates/coordinode-swarm" }
-coordinode-replicate = { path = "crates/coordinode-replicate" }
+coordinode-embed = { path = "crates/coordinode-embed", version = "=0.7.3" }
+coordinode-swarm = { path = "crates/coordinode-swarm", version = "=0.7.3" }
+coordinode-replicate = { path = "crates/coordinode-replicate", version = "=0.7.3" }
 coordinode-client = { path = "crates/coordinode-client" }
 coordinode-test-fixtures = { path = "crates/coordinode-test-fixtures" }
 coordinode-bench = { path = "crates/coordinode-bench" }
-coordinode-wire = { path = "crates/coordinode-wire" }
+coordinode-wire = { path = "crates/coordinode-wire", version = "=0.7.3" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

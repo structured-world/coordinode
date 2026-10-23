@@ -969,6 +969,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1191,9 +1192,9 @@ dependencies = [
  "jieba-rs",
  "lindera",
  "rand 0.10.3",
- "rust-stemmers 1.2.0 (git+https://github.com/structured-world/rust-stemmers.git?branch=main)",
  "serde",
  "sha2 0.11.1",
+ "structured-stemmers",
  "tantivy",
  "tempfile",
  "thiserror 2.0.21",
@@ -1509,6 +1510,7 @@ dependencies = [
  "itertools 0.13.0",
  "itertools 0.14.0",
  "itoa",
+ "lazy_static",
  "levenshtein_automata",
  "libc",
  "libm",
@@ -1518,6 +1520,7 @@ dependencies = [
  "lru",
  "lz4_flex 0.13.1",
  "lz4_flex 0.14.0",
+ "matchers",
  "measure_time",
  "memchr",
  "memmap2",
@@ -1528,6 +1531,7 @@ dependencies = [
  "nanoid",
  "nibble_vec",
  "nom",
+ "nu-ansi-term",
  "num-bigint",
  "num-conv",
  "num-integer",
@@ -1580,8 +1584,7 @@ dependencies = [
  "rmp",
  "rmp-serde",
  "rmpv",
- "rust-stemmers 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "rust-stemmers 1.2.0 (git+https://github.com/structured-world/rust-stemmers.git?branch=main)",
+ "rust-stemmers",
  "rustc-hash",
  "rustc_version",
  "rustix",
@@ -1598,6 +1601,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "sha2 0.11.1",
+ "sharded-slab",
  "shlex",
  "sketches-ddsketch 0.3.1",
  "sketches-ddsketch 0.4.1",
@@ -1610,6 +1614,7 @@ dependencies = [
  "stats_alloc",
  "streamvbyte64",
  "strsim",
+ "structured-stemmers",
  "syn 2.0.119",
  "syn 3.0.9",
  "tantivy",
@@ -1627,6 +1632,7 @@ dependencies = [
  "test-log-macros",
  "thiserror 2.0.21",
  "thiserror-impl 2.0.21",
+ "thread_local",
  "time",
  "time-core",
  "tinytemplate",
@@ -1634,6 +1640,9 @@ dependencies = [
  "tracing",
  "tracing-attributes",
  "tracing-core",
+ "tracing-log",
+ "tracing-serde",
+ "tracing-subscriber",
  "twox-hash",
  "typeid",
  "typenum",
@@ -1887,9 +1896,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.3"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -5170,15 +5179,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-stemmers"
-version = "1.2.0"
-source = "git+https://github.com/structured-world/rust-stemmers.git?branch=main#fc80b8d9c282485f496fb6ff4c6154cc050731a0"
-dependencies = [
- "serde",
- "serde_derive",
-]
-
-[[package]]
 name = "rust_decimal"
 version = "1.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5852,6 +5852,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "structured-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1098e1c08ccc275448f3ab47a0fc9baa775db3ae6afd9ebd6cfd8323db820916"
+dependencies = [
+ "serde",
+ "serde_derive",
+]
+
+[[package]]
 name = "structured-zstd"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5988,7 +5998,7 @@ dependencies = [
  "oneshot",
  "rayon",
  "regex",
- "rust-stemmers 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rust-stemmers",
  "rustc-hash",
  "serde",
  "serde_json",

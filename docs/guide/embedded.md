@@ -1,17 +1,67 @@
 ---
-description: "Run the full CoordiNode engine inside your Rust process with coordinode-embed: graph, vector and full-text queries with no server, no network hop and no external dependency."
+description: "Run CoordiNode inside your Rust process with coordinode-embed: graph, vector and full-text queries without a separate database server."
 ---
 
 # Embedded (Rust)
 
-`coordinode-embed` lets you run CoordiNode in-process — no separate server, no network hop, no external dependency. Ideal for desktop applications, test harnesses, and edge deployments.
+`coordinode-embed` runs CoordiNode in-process without a separate database server
+or a client network hop. It has Cargo dependencies and target-specific build
+requirements; optional replication also adds inter-node networking.
 
-## Add the Dependency
+## Rust package availability
+
+The Rust engine is available in the public source workspace. A `coordinode-embed`
+package has not yet been published to crates.io; server release binaries and the
+separate Python package do not supply a Rust library package. In particular,
+`coordinode-embed = "0.3"` is not an available registry installation.
+
+For source integration, pin the public repository to an exact revision rather
+than following `main`. For example, the following identifies the source inspected
+for this guide; it is not a qualified embedded release or a registry package:
 
 ```toml
 [dependencies]
-coordinode-embed = "0.3"
+coordinode-embed = { git = "https://github.com/structured-world/coordinode", rev = "d6711895fc95f10ba5cba5611dca27ec0e3bb273" }
 ```
+
+Keep your application's lockfile and qualify its resolved dependencies and selected
+features. This source revision's workspace pins Rust 1.99.0; the declared lower
+MSRV is not established by that compiler pin. Source builds with `replication`
+also use the repository's pinned proto submodule and generation tooling. A future
+registry package must contain its complete build inputs without those checkout
+dependencies. The source integration above has not been independently built as an
+external consumer in this documentation correction.
+
+The source revision above also selects `sqlparser`'s `recursive-protection`
+feature, which uses `stacker`/`psm`. On Windows, `stacker` builds a C shim;
+`psm` assembles target-specific stack support on supported native targets. Do not
+infer a Rust-toolchain-only build on every target from the absence of a separate
+database server. The source graph also currently includes workspace development
+dependencies through `coordinode-workspace-hack`.
+
+Before admitting a build to production, verify your actual transaction, recovery,
+backup and resource-limit scenario on that exact build. A configured free-space
+reserve is different from a hard limit on all database-owned files. At the source
+revision above, direct blob deletion removes metadata but does not automatically
+reclaim unreferenced application chunks; do not count it as physical space release.
+
+The CE license is AGPL-3.0-only. See the repository's `LICENSE`, `COPYRIGHT` and
+`NOTICES`; dependency licenses remain their own. A source lockfile is not a
+feature/target-specific license report or a promise of production qualification.
+
+The examples below describe library APIs. They do not imply that an unpublished
+registry version can be installed.
+
+### Analyzer upgrades
+
+This source line pins `structured-stemmers` 1.2.0, generated from Snowball main
+at [`6389c79f`](https://github.com/snowballstem/snowball/commit/6389c79f91cd67ed2de3ebdcf84ec8c2d2d23c11).
+Its algorithms differ from the previous Git dependency: for example, English
+`added` now stems to `add` instead of `ad`. When upgrading existing data, rebuild
+full-text indexes and regenerate encrypted stem tokens from their source text
+before serving them with this analyzer. Do not mix analyzer revisions within an
+index generation or assume that old postings become compatible by reopening
+the database. Package installation does not perform this data migration.
 
 ## Minimal Example
 

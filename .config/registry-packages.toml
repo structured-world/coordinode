@@ -1,0 +1,18 @@
+# The complete normal/build/optional dependency closure of the embedded API.
+# Server, client-only transports, test fixtures and feature-unification helpers
+# are deliberately not part of this library distribution.
+entrypoint = "coordinode-embed"
+packages = [
+  "coordinode-core", "coordinode-storage", "coordinode-vector",
+  "coordinode-modality", "coordinode-search", "coordinode-cluster",
+  "coordinode-query", "coordinode-swarm", "coordinode-wire",
+  "coordinode-raft", "coordinode-replicate", "coordinode-embed",
+]
+
+[bindings]
+coordinode-raft = [
+  "coordinode.v1.replication.rs",
+  "coordinode.internode.rs",
+  "coordinode.internode.routing.rs",
+]
+coordinode-replicate = ["coordinode.v1.replication.rs"]

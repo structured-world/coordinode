@@ -30,7 +30,7 @@ curl http://localhost:7084/health
 
 Or install a package from the [latest release](https://github.com/structured-world/coordinode/releases/latest): RPMs for Fedora 42 to 44, DEBs for Debian and Ubuntu, and static binaries for linux-amd64 and linux-arm64.
 
-From source (Rust 1.90+; the toolchain is pinned in `rust-toolchain.toml`):
+From source (use the Rust toolchain pinned in `rust-toolchain.toml`):
 
 ```bash
 git clone https://github.com/structured-world/coordinode.git
@@ -150,7 +150,7 @@ ORDER BY similarity LIMIT 25
 | Inter-node compression | **Stable** | zstd on the replication transport, level configurable |
 | Consistency test suite | **Stable** | In-process fault injection: partition matrix, crash and clock skew, linearizability checking over a live workload |
 | Scrub and repair | **Stable** | Background checksum verification, damaged segments rebuilt from a healthy replica |
-| Embedded engine | **Stable** | `coordinode-embed` runs the full engine in-process; exposed to Python as `coordinode-embedded` |
+| Embedded engine | **Source integration** | Rust `coordinode-embed` runs the engine in-process; no crates.io package is published yet. See [Rust package availability](docs/guide/embedded.md#rust-package-availability). The Python `coordinode-embedded` package is a separate artifact. |
 
 | Planned | Notes |
 |---------|-------|

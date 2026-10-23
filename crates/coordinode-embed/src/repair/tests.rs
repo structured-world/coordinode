@@ -36,13 +36,17 @@ fn lose_manifest(tree_dir: &Path) {
 }
 
 fn durable_cfg(dir: &TempDir) -> StorageConfig {
-    StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
         dir.path(),
         Media::Hdd,
         Durability::Durable,
         Tier::Warm,
-    )])
+    )]);
+    // Fault injection addresses on-disk tables; a background rewrite must not
+    // replace the victim between its selection, corruption and verification.
+    config.compaction_workers = 0;
+    config
 }
 
 fn open(dir: &TempDir) -> Arc<StorageEngine> {
@@ -66,26 +70,8 @@ fn put(engine: &StorageEngine, commit_ts: u64, part: PartitionId, key: &[u8], va
         .expect("commit_journaled");
 }
 
-/// XOR-corrupt several spread-out bytes in every SST table file beneath
-/// `tables_dir` whose inode the checkpoint does not share. Returns the number of
-/// files corrupted.
-///
-/// Three properties make this robust where a single-file heuristic was not (it
-/// flaked across platforms because compaction timing and SST byte-layout
-/// differ):
-///
-/// - **All non-checkpoint tables, not the largest one.** The live
-///   post-checkpoint table is hit regardless of which file it is or whether a
-///   compaction left obsolete tables around (the scrub ignores obsolete ones, so
-///   corrupting them is harmless).
-/// - **Excludes checkpoint-shared inodes.** Checkpoints hard-link SSTs (O(1), the
-///   intended design); a file hard-linked into the checkpoint shares its physical
-///   blocks with the repair base, so corrupting it would corrupt the base too —
-///   which no single-node repair can recover (that needs a healthy replica or an
-///   off-device PITR backup). Leaving those inodes intact keeps the base clean.
-/// - **Several offsets per file.** A single mid-byte can land in the index /
-///   footer (which the block scrub does not checksum) on a small table; flipping
-///   bytes at 1/8, 1/4, 1/2, 3/4 guarantees at least one hits a data block.
+/// Damage every non-checkpoint table's first data-block header, located through
+/// its archive directory. Blob files are checked by their whole-file digest.
 fn corrupt_post_checkpoint_tables(tables_dir: &Path, checkpoint_root: &Path) -> usize {
     let ckpt_tables = checkpoint_table_names(tables_dir, checkpoint_root);
 
@@ -102,6 +88,14 @@ fn corrupt_post_checkpoint_tables(tables_dir: &Path, checkpoint_root: &Path) -> 
                 stack.push(p);
                 continue;
             }
+            if tables_dir.file_name().is_some_and(|name| name == "tables")
+                && !matches!(
+                    lsm_tree::file::TableDirEntry::classify(&entry.file_name().to_string_lossy()),
+                    lsm_tree::file::TableDirEntry::Table(_)
+                )
+            {
+                continue;
+            }
             if ckpt_tables.contains(&entry.file_name()) {
                 continue;
             }
@@ -110,9 +104,16 @@ fn corrupt_post_checkpoint_tables(tables_dir: &Path, checkpoint_root: &Path) -> 
             if n < 16 {
                 continue;
             }
-            for off in [n / 8, n / 4, n / 2, n * 3 / 4] {
-                bytes[off] ^= 0xFF;
-            }
+            let offset = if tables_dir.file_name().is_some_and(|name| name == "tables") {
+                let archive = lsm_tree::sfa::Reader::from_reader(&mut std::io::Cursor::new(&bytes))
+                    .expect("read table layout before corruption");
+                let data = archive.toc().section(b"data").expect("table data section");
+                assert!(data.len() > 0, "the victim contains a data block");
+                usize::try_from(data.pos()).expect("data position")
+            } else {
+                n / 2
+            };
+            bytes[offset] ^= 0xFF;
             std::fs::write(&p, &bytes).expect("corrupt table");
             corrupted += 1;
         }
@@ -158,6 +159,59 @@ fn checkpoint_table_names(
         }
     }
     names
+}
+
+/// Even a tiny SST must receive damage in its data section, rather than only
+/// in unrelated metadata whose size dominates the file.
+#[test]
+fn the_corruption_fixture_hits_data_in_a_small_table() {
+    use lsm_tree::AbstractTree;
+
+    let dir = TempDir::new().expect("tempdir");
+    let engine = open(&dir);
+    put(&engine, 1, PartitionId::Node, b"node:0:0001", b"v");
+    engine.persist().expect("persist");
+    let tables = dir.path().join(Partition::Node.name()).join("tables");
+    let version = engine
+        .tree(Partition::Node)
+        .expect("node tree")
+        .current_version();
+    let before: Vec<_> = version
+        .iter_tables()
+        .map(|table| {
+            let path = tables.join(table.id().to_string());
+            let bytes = std::fs::read(&path).expect("read published table");
+            (path, bytes)
+        })
+        .collect();
+    assert!(!before.is_empty(), "a durable row must produce a table");
+    corrupt_post_checkpoint_tables(&tables, &checkpoint_root(dir.path()));
+    for (path, bytes) in before {
+        let archive = lsm_tree::sfa::Reader::from_reader(&mut std::io::Cursor::new(&bytes))
+            .expect("read published table layout");
+        let data = archive.toc().section(b"data").expect("table data section");
+        let start = usize::try_from(data.pos()).expect("data position");
+        let end = start + usize::try_from(data.len()).expect("data length");
+        assert!(end > start, "the table contains a data block");
+        let after = std::fs::read(path).expect("read damaged table");
+        assert_ne!(
+            &bytes[start..end],
+            &after[start..end],
+            "the fault injector must damage data even when metadata dominates"
+        );
+    }
+    let report = coordinode_storage::scrub::scrub_all(
+        &engine,
+        &coordinode_storage::scrub::ScrubConfig::default(),
+    )
+    .expect("scrub damaged data");
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.partition == Partition::Node),
+        "the injected data fault must be reported: {report:?}"
+    );
 }
 
 #[test]
