@@ -64,7 +64,7 @@ tantivy = { version = "0.26", default-features = false, features = [
     "lz4-compression",
     "stemmer",
 ] }
-rust-stemmers = { package = "structured-stemmers", version = "1.2.0" }
+rust-stemmers = { package = "structured-stemmers", version = "=1.2.0" }
 whatlang = "0.18"
 
 # CJK tokenization (optional, per-language feature flags)

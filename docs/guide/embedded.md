@@ -52,6 +52,17 @@ feature/target-specific license report or a promise of production qualification.
 The examples below describe library APIs. They do not imply that an unpublished
 registry version can be installed.
 
+### Analyzer upgrades
+
+This source line pins `structured-stemmers` 1.2.0, generated from Snowball main
+at [`6389c79f`](https://github.com/snowballstem/snowball/commit/6389c79f91cd67ed2de3ebdcf84ec8c2d2d23c11).
+Its algorithms differ from the previous Git dependency: for example, English
+`added` now stems to `add` instead of `ad`. When upgrading existing data, rebuild
+full-text indexes and regenerate encrypted stem tokens from their source text
+before serving them with this analyzer. Do not mix analyzer revisions within an
+index generation or assume that old postings become compatible by reopening
+the database. Package installation does not perform this data migration.
+
 ## Minimal Example
 
 ```rust
