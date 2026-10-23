@@ -341,6 +341,55 @@ fn sql_projection_width_has_its_own_boundary() {
     });
 }
 
+/// Flat DDL still consumes the declared structural budget. VALUES also lowers
+/// into a recursive operator chain, so exempting its punctuation is unsafe.
+#[test]
+fn sql_flat_ddl_and_values_obey_the_structural_boundary() {
+    on_minimum_stack(|| {
+        let frontend = SqlFrontend::new();
+        let table = |columns| {
+            let columns = (0..columns)
+                .map(|index| format!("c{index} VARCHAR(64) NOT NULL"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("CREATE TABLE \"schema_columns\" ({columns})")
+        };
+        let insert = |rows| {
+            format!(
+                "INSERT INTO \"rows\" (\"left_column\", \"right_column\") VALUES {}",
+                vec!["(1, 'value')"; rows].join(", ")
+            )
+        };
+        // DDL: four surrounding tokens + five per column = 64. INSERT:
+        // five surrounding tokens + two per row = 63; another row gives 65.
+        for query in [table(12), insert(29)] {
+            let parsed = frontend
+                .parse(&query)
+                .expect("admitted structural boundary");
+            let (canonical, fingerprint) = frontend.fingerprint(&query).expect("fingerprint");
+            assert_eq!(parsed.canonical, canonical);
+            assert_eq!(parsed.fingerprint, fingerprint);
+            let cloned = parsed.clone();
+            assert!(!format!("{cloned:?}").is_empty());
+            drop(cloned);
+            drop(parsed);
+        }
+        for query in [table(13), insert(30)] {
+            for result in [
+                frontend.parse(&query).map(|_| ()),
+                frontend.fingerprint(&query).map(|_| ()),
+            ] {
+                assert!(
+                    result
+                        .expect_err("flat syntax still obeys the structural safety ceiling")
+                        .to_string()
+                        .contains("SQL structural token limit")
+                );
+            }
+        }
+    });
+}
+
 /// Nested syntax is independently bounded even when it fits the token budget.
 /// Unsupported trees must be formatted and dropped safely on refusal too.
 #[test]
