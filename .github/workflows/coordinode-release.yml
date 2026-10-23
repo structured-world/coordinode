@@ -145,13 +145,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.99.0
-      - name: Install the source-only protobuf compiler
+      - name: Install source and release-configuration tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
           tool: release-plz@0.3.174,cargo-semver-checks@0.50.0
+      - name: Calculate release-PR baselines from registry state
+        run: |
+          set -euo pipefail
+          if command -v uv >/dev/null 2>&1; then
+            python=(uv run --no-project --with-requirements scripts/release/requirements.txt python)
+          else
+            environment=$(mktemp -d "$RUNNER_TEMP/coordinode-release-pr-python.XXXXXX")
+            trap 'rm -rf "$environment"' EXIT
+            python3 -m venv "$environment"
+            "$environment/bin/python" -m pip install -r scripts/release/requirements.txt
+            python=("$environment/bin/python")
+          fi
+          "${python[@]}" -B -m unittest discover -s scripts/release -p 'test_*.py' -v
+          "${python[@]}" -B scripts/release/pr_config.py --checkout "$GITHUB_WORKSPACE"
       - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
         id: app
         with:
@@ -163,7 +177,7 @@ jobs:
         env:
           GIT_TOKEN: ${{ steps.app.outputs.token }}
           CARGO_PROFILE_DEV_DEBUG: "0"
-        run: release-plz release-pr --forge github --config .release-plz.toml
+        run: release-plz release-pr --forge github --config target/release-pr-config.toml
       - name: Clean build outputs
         if: always()
         run: cargo clean
