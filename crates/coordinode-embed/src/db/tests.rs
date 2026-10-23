@@ -10,7 +10,7 @@ fn an_auto_commit_statement_refused_by_a_commit_in_flight_runs_again() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
-    set_while_a_commit_holds_the_node(&mut db, Hold::For20Ms)
+    set_while_a_commit_holds_the_node(&mut db, Hold::UntilTheFirstRetry)
         .expect("the statement lands once the holder has");
     let rows = db
         .execute_cypher("MATCH (u:U) RETURN u.n AS n")
@@ -37,15 +37,49 @@ fn a_single_auto_commit_attempt_returns_the_refusal() {
         ),
         "got {err:?}"
     );
+    let rows = db
+        .execute_cypher("MATCH (u:U) RETURN u.n AS n")
+        .expect("read the refused write's original value");
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&coordinode_core::graph::types::Value::Int(1))
+    );
 }
 
 /// How long the commit in flight holds the node.
 enum Hold {
-    /// 20 ms, which a statement retrying its commit outlasts.
-    For20Ms,
+    /// Release after the first refused attempt, before its retry starts.
+    UntilTheFirstRetry,
     /// Until the statement has returned: its every commit meets the holder,
     /// however slowly the statement reaches it.
     UntilTheStatementReturns,
+}
+
+/// Release the holder at an observed refusal, not after a scheduling delay.
+struct ReleaseAtRetry {
+    release: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    released: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReleaseAtRetry {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "coordinode_embed::db"
+            || event.metadata().fields().field("attempt").is_none()
+        {
+            return;
+        }
+        if let Some(release) = self.release.lock().take() {
+            release.send(()).expect("release the conflicting commit");
+            self.released
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the conflicting commit released its admission");
+        }
+    }
 }
 
 /// Create a node, then run `SET` on it while another commit is held in
@@ -56,6 +90,7 @@ fn set_while_a_commit_holds_the_node(
 ) -> Result<Vec<coordinode_query::executor::row::Row>, DatabaseError> {
     use coordinode_core::graph::node::{NodeId, encode_node_key};
     use coordinode_core::graph::types::Value;
+    use tracing_subscriber::prelude::*;
 
     db.execute_cypher("CREATE (:U {name: 'a', n: 1})")
         .expect("create");
@@ -71,6 +106,8 @@ fn set_while_a_commit_holds_the_node(
 
     let (held, release) = std::sync::mpsc::channel::<()>();
     let (returned, statement_done) = std::sync::mpsc::channel::<()>();
+    let (retry, retry_seen) = std::sync::mpsc::channel::<()>();
+    let (released, release_seen) = std::sync::mpsc::channel::<()>();
     let pending = Arc::clone(db.engine().pending_commits());
     let holder_waits = matches!(hold, Hold::UntilTheStatementReturns);
     std::thread::scope(|scope| {
@@ -80,15 +117,32 @@ fn set_while_a_commit_holds_the_node(
                 .expect("admit the holder");
             held.send(()).expect("signal");
             match hold {
-                Hold::For20Ms => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Hold::UntilTheFirstRetry => {
+                    retry_seen
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the first attempt was refused");
+                }
                 Hold::UntilTheStatementReturns => {
-                    statement_done.recv().expect("the statement returned");
+                    statement_done
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the statement returned");
                 }
             }
             drop(admission);
+            if !holder_waits {
+                released
+                    .send(())
+                    .expect("confirm the admission was released");
+            }
         });
-        release.recv().expect("held");
-        let outcome = db.execute_cypher("MATCH (u:U {name: 'a'}) SET u.n = 2");
+        release.recv_timeout(Duration::from_secs(10)).expect("held");
+        let subscriber = tracing_subscriber::registry().with(ReleaseAtRetry {
+            release: parking_lot::Mutex::new(Some(retry)),
+            released: parking_lot::Mutex::new(release_seen),
+        });
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            db.execute_cypher("MATCH (u:U {name: 'a'}) SET u.n = u.n + 1")
+        });
         if holder_waits {
             returned
                 .send(())

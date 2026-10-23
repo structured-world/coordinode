@@ -109,6 +109,7 @@ is_terminal_polyfill = { version = "1" }
 itertools-582f2526e08bb6a0 = { package = "itertools", version = "0.14" }
 itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
 itoa = { version = "1", default-features = false }
+lazy_static = { version = "1", default-features = false }
 levenshtein_automata = { version = "0.2", default-features = false }
 libc = { version = "0.2" }
 libm = { version = "0.2" }
@@ -117,6 +118,7 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 lru = { version = "0.16" }
 lz4_flex-582f2526e08bb6a0 = { package = "lz4_flex", version = "0.14" }
 lz4_flex-594e8ee84c453af0 = { package = "lz4_flex", version = "0.13", default-features = false }
+matchers = { version = "0.2", default-features = false }
 measure_time = { version = "0.9", default-features = false }
 memchr = { version = "2" }
 memmap2 = { version = "0.9", default-features = false }
@@ -127,6 +129,7 @@ murmurhash32 = { version = "0.3", default-features = false }
 nanoid = { version = "0.5" }
 nibble_vec = { version = "0.1", default-features = false }
 nom = { version = "7" }
+nu-ansi-term = { version = "0.50" }
 num-bigint = { version = "0.4", default-features = false }
 num-conv = { version = "0.2", default-features = false }
 num-integer = { version = "0.1", default-features = false, features = ["i128"] }
@@ -164,7 +167,7 @@ rayon = { version = "1", default-features = false }
 rayon-core = { version = "1", default-features = false }
 recursive = { version = "0.1", default-features = false }
 regex = { version = "1" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
+regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 rmp = { version = "0.8" }
 rmp-serde = { version = "1", default-features = false }
@@ -181,6 +184,7 @@ serde_bytes = { version = "0.11" }
 serde_core = { version = "1", default-features = false, features = ["alloc", "result", "std"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = { version = "0.11" }
+sharded-slab = { version = "0.1", default-features = false }
 sketches-ddsketch-468e82937335b1c9 = { package = "sketches-ddsketch", version = "0.3", default-features = false }
 sketches-ddsketch-9fbad63c4bcf4a8f = { package = "sketches-ddsketch", version = "0.4", default-features = false, features = ["use_serde"] }
 slab = { version = "0.4", default-features = false, features = ["std"] }
@@ -204,12 +208,16 @@ tantivy-tokenizer-api = { version = "0.7", default-features = false }
 tempfile = { version = "3" }
 test-log = { version = "0.2" }
 thiserror = { version = "2" }
+thread_local = { version = "1", default-features = false }
 time = { version = "0.3", features = ["serde-well-known"] }
 time-core = { version = "0.1", default-features = false }
 tinytemplate = { version = "1", default-features = false }
 tinyvec = { version = "1", features = ["alloc"] }
 tracing = { version = "0.1" }
-tracing-core = { version = "0.1", default-features = false, features = ["std"] }
+tracing-core = { version = "0.1" }
+tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
+tracing-serde = { version = "0.2", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 twox-hash = { version = "2", default-features = false, features = ["xxhash32"] }
 typeid = { version = "1", default-features = false }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
@@ -334,6 +342,7 @@ is_terminal_polyfill = { version = "1" }
 itertools-582f2526e08bb6a0 = { package = "itertools", version = "0.14" }
 itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
 itoa = { version = "1", default-features = false }
+lazy_static = { version = "1", default-features = false }
 levenshtein_automata = { version = "0.2", default-features = false }
 libc = { version = "0.2" }
 libm = { version = "0.2" }
@@ -342,6 +351,7 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 lru = { version = "0.16" }
 lz4_flex-582f2526e08bb6a0 = { package = "lz4_flex", version = "0.14" }
 lz4_flex-594e8ee84c453af0 = { package = "lz4_flex", version = "0.13", default-features = false }
+matchers = { version = "0.2", default-features = false }
 measure_time = { version = "0.9", default-features = false }
 memchr = { version = "2" }
 memmap2 = { version = "0.9", default-features = false }
@@ -352,6 +362,7 @@ murmurhash32 = { version = "0.3", default-features = false }
 nanoid = { version = "0.5" }
 nibble_vec = { version = "0.1", default-features = false }
 nom = { version = "7" }
+nu-ansi-term = { version = "0.50" }
 num-bigint = { version = "0.4", default-features = false }
 num-conv = { version = "0.2", default-features = false }
 num-integer = { version = "0.1", default-features = false, features = ["i128"] }
@@ -397,7 +408,7 @@ rayon-core = { version = "1", default-features = false }
 recursive = { version = "0.1", default-features = false }
 recursive-proc-macro-impl = { version = "0.1", default-features = false }
 regex = { version = "1" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
+regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 rmp = { version = "0.8" }
 rmp-serde = { version = "1", default-features = false }
@@ -418,6 +429,7 @@ serde_core = { version = "1", default-features = false, features = ["alloc", "re
 serde_derive = { version = "1" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = { version = "0.11" }
+sharded-slab = { version = "0.1", default-features = false }
 shlex = { version = "2" }
 sketches-ddsketch-468e82937335b1c9 = { package = "sketches-ddsketch", version = "0.3", default-features = false }
 sketches-ddsketch-9fbad63c4bcf4a8f = { package = "sketches-ddsketch", version = "0.4", default-features = false, features = ["use_serde"] }
@@ -448,13 +460,17 @@ test-log-core = { version = "0.2", default-features = false, features = ["log"] 
 test-log-macros = { version = "0.2", default-features = false, features = ["log"] }
 thiserror = { version = "2" }
 thiserror-impl = { version = "2", default-features = false }
+thread_local = { version = "1", default-features = false }
 time = { version = "0.3", features = ["serde-well-known"] }
 time-core = { version = "0.1", default-features = false }
 tinytemplate = { version = "1", default-features = false }
 tinyvec = { version = "1", features = ["alloc"] }
 tracing = { version = "0.1" }
 tracing-attributes = { version = "0.1", default-features = false }
-tracing-core = { version = "0.1", default-features = false, features = ["std"] }
+tracing-core = { version = "0.1" }
+tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
+tracing-serde = { version = "0.2", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 twox-hash = { version = "2", default-features = false, features = ["xxhash32"] }
 typeid = { version = "1", default-features = false }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
@@ -561,7 +577,7 @@ winapi = { version = "0.3", default-features = false, features = ["profileapi", 
 winapi-util = { version = "0.1", default-features = false }
 windows-link = { version = "0.2", default-features = false }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 windows-targets = { version = "0.52", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }
 
@@ -575,7 +591,7 @@ winapi = { version = "0.3", default-features = false, features = ["profileapi", 
 winapi-util = { version = "0.1", default-features = false }
 windows-link = { version = "0.2", default-features = false }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 windows-targets = { version = "0.52", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }
 

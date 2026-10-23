@@ -73,6 +73,8 @@ tempfile = { workspace = true }
 coordinode-test-fixtures = { workspace = true }
 metrics = { workspace = true }
 metrics-util = "0.20"
+# Synchronize retry fixtures with the existing diagnostic event.
+tracing-subscriber = { workspace = true }
 # The routing bench counts allocations per command.
 stats_alloc = "0.1"
 # The routing bench's floor: an echo over the members' own mutual TLS.
