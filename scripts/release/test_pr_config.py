@@ -92,10 +92,18 @@ class ReleasePrConfigTest(unittest.TestCase):
             (root / '.release-plz.toml').write_text(SOURCE)
             (root / '.config').mkdir()
             (root / '.config/registry-packages.toml').write_text('packages = ["first", "second"]\n')
+            output = root / 'target/release-pr-config.toml'
+            # A missing first crate followed by a failed read of the second
+            # must not emit a partial configuration that a later step can use.
+            with patch.object(sys, 'argv', ['pr_config.py', '--checkout', directory]), \
+                 patch('pr_config.request', side_effect=[None, RuntimeError('registry unavailable')]):
+                with self.assertRaisesRegex(RuntimeError, 'registry unavailable'):
+                    main()
+            self.assertFalse(output.exists())
+            self.assertEqual((root / '.release-plz.toml').read_text(), SOURCE)
             with patch.object(sys, 'argv', ['pr_config.py', '--checkout', directory]), \
                  patch('pr_config.request', return_value=None):
                 main()
-            output = root / 'target/release-pr-config.toml'
             self.assertTrue(output.is_file())
             subprocess.run(['git', 'check-ignore', '--quiet', str(output)], cwd=root, check=True)
             self.assertEqual((root / '.release-plz.toml').read_text(), SOURCE)
