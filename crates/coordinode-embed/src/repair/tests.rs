@@ -160,6 +160,34 @@ fn checkpoint_table_names(
     names
 }
 
+/// Even a tiny SST must receive damage in its data section, rather than only
+/// in unrelated metadata whose size dominates the file.
+#[test]
+fn the_corruption_fixture_hits_data_in_a_small_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = open(&dir);
+    put(&engine, 1, PartitionId::Node, b"node:0:0001", b"v");
+    engine.persist().expect("persist");
+    let tables = dir.path().join(Partition::Node.name()).join("tables");
+    let before = files_with_bytes(&tables);
+    assert!(!before.is_empty(), "a durable row must produce a table");
+    corrupt_post_checkpoint_tables(&tables, &checkpoint_root(dir.path()));
+    for (path, bytes) in before {
+        let archive = lsm_tree::sfa::Reader::from_reader(&mut std::io::Cursor::new(&bytes))
+            .expect("read original table layout");
+        let data = archive.toc().section(b"data").expect("table data section");
+        let start = usize::try_from(data.pos()).expect("data position");
+        let end = start + usize::try_from(data.len()).expect("data length");
+        assert!(end > start, "the table contains a data block");
+        let after = std::fs::read(path).expect("read damaged table");
+        assert_ne!(
+            &bytes[start..end],
+            &after[start..end],
+            "the fault injector must damage data even when metadata dominates"
+        );
+    }
+}
+
 #[test]
 fn checkpoint_create_latest_and_prune() {
     let dir = TempDir::new().expect("tempdir");
