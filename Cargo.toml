@@ -108,7 +108,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 pest = "2"
 pest_derive = "2"
 # SQL parser for the SQL QueryFrontend, pure Rust, Apache-2.0.
-sqlparser = "0.63"
+sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 
 # Error handling
 thiserror = "2"

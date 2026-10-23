@@ -42,6 +42,13 @@ def library_closure(metadata, entrypoint):
     return internal, external
 
 
+def check_native_stack_helpers(packages):
+    """Reject the known native stack helpers from the delivered graph."""
+    native = sorted({p['name'] for p in packages if p['name'] in {'stacker', 'psm'}})
+    if native:
+        raise ValueError(f"registry closure contains a native stack helper: {native}")
+
+
 def prepare_manifest(document, version, names, codegen):
     """Describe only delivered library targets, preserving runtime features."""
     document = tomlkit.parse(tomlkit.dumps(document))
@@ -91,6 +98,7 @@ def main():
     subprocess.run(["cargo", "hakari", "remove-deps", "--yes"], cwd=root, check=True)
     metadata = json.loads(command("cargo", "metadata", "--all-features", "--format-version=1", root=root))
     internal, external = library_closure(metadata, config["entrypoint"])
+    check_native_stack_helpers(external)
     if internal != names:
         raise ValueError(f"release closure mismatch: missing={internal - names}, extra={names - internal}")
     git_dependencies = [p["name"] for p in external if (p.get("source") or "").startswith("git+")]

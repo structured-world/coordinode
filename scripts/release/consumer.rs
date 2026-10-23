@@ -145,6 +145,23 @@ fn basic(path: &Path) -> Result<()> {
     let rows = db.execute_cypher("MATCH (n:Inventory {key:'host'}) RETURN n.epoch AS epoch")?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("epoch"), Some(&Value::Int(2)));
+
+    // The installed SQL path has the same bounded Rust-only frontend and must
+    // remain usable after refusing a statement before any storage effect.
+    db.execute_sql("CREATE TABLE SqlProbe (id BIGINT, name VARCHAR(64))")?;
+    db.execute_sql("INSERT INTO SqlProbe (id, name) VALUES (1, 'original')")?;
+    let excessive = format!(
+        "UPDATE SqlProbe SET name = 'changed' WHERE {}",
+        vec!["id = 1"; 128].join(" AND ")
+    );
+    let error = db
+        .execute_sql(&excessive)
+        .expect_err("refuse excessive SQL structure");
+    assert!(error.to_string().contains("SQL structural token limit"));
+    assert_eq!(
+        db.execute_sql("SELECT name FROM SqlProbe WHERE id = 1")?[0].get("name"),
+        Some(&Value::String("original".into()))
+    );
     Ok(())
 }
 

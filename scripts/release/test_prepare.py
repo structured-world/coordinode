@@ -57,7 +57,7 @@ name="source-only"
         with self.assertRaisesRegex(ValueError, "hakari"):
             prepare_manifest(doc, "1.0.0", {"x"}, False)
 
-    def run_changed_checkout(self, *, source_dirty=False):
+    def run_changed_checkout(self, *, source_dirty=False, native_stack_helper=None):
         # Changing proto contents without moving HEAD must invalidate generated
         # bindings. A dirty source checkout likewise cannot claim an exact
         # source revision. Simulate both around the real preparation entrypoint.
@@ -77,6 +77,12 @@ name="source-only"
                                      'manifest_path': str(crate / 'Cargo.toml')}],
                         'workspace_members': ['embed'],
                         'resolve': {'nodes': [{'id': 'embed', 'deps': []}]}}
+            if native_stack_helper is not None:
+                metadata['packages'].append({'id': 'native-helper', 'name': native_stack_helper,
+                                             'version': '1.0.0', 'source': 'registry+fixture'})
+                metadata['resolve']['nodes'][0]['deps'].append(
+                    {'pkg': 'native-helper', 'dep_kinds': [{'kind': None, 'target': None}]})
+                metadata['resolve']['nodes'].append({'id': 'native-helper', 'deps': []})
             proto_status = iter(['', ' M replication.proto\n'])
 
             def output(*args, root):
@@ -104,6 +110,13 @@ name="source-only"
     def test_editor_changes_cannot_be_published_as_the_committed_source(self):
         with self.assertRaisesRegex(ValueError, 'source checkout must be clean'):
             self.run_changed_checkout(source_dirty=True)
+
+    def test_native_stack_helpers_cannot_reenter_the_registry_closure(self):
+        # Exercise release admission, not just a name-filter helper. Either
+        # stack-switching package must stop preparation before building bindings.
+        for name in ('stacker', 'psm'):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'native stack helper'):
+                self.run_changed_checkout(native_stack_helper=name)
 
 
 if __name__ == "__main__":

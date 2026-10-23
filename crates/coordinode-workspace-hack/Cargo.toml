@@ -111,7 +111,6 @@ itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
 itoa = { version = "1", default-features = false }
 lazy_static = { version = "1", default-features = false }
 levenshtein_automata = { version = "0.2", default-features = false }
-libc = { version = "0.2" }
 libm = { version = "0.2" }
 lock_api = { version = "0.4" }
 log = { version = "0.4", default-features = false, features = ["std"] }
@@ -151,7 +150,6 @@ polyval = { version = "0.7", default-features = false, features = ["hazmat"] }
 powerfmt = { version = "0.2", default-features = false }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 proptest = { version = "1" }
-psm = { version = "0.1", default-features = false }
 quanta = { version = "0.12", default-features = false }
 quick-error = { version = "1", default-features = false }
 radix_trie = { version = "0.2", default-features = false }
@@ -165,7 +163,6 @@ rand_xoshiro = { version = "0.7", default-features = false }
 rapidhash = { version = "4", default-features = false }
 rayon = { version = "1", default-features = false }
 rayon-core = { version = "1", default-features = false }
-recursive = { version = "0.1", default-features = false }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
@@ -190,9 +187,8 @@ sketches-ddsketch-9fbad63c4bcf4a8f = { package = "sketches-ddsketch", version = 
 slab = { version = "0.4", default-features = false, features = ["std"] }
 smallvec = { version = "1", default-features = false, features = ["serde", "union"] }
 spin = { version = "0.9" }
-sqlparser = { version = "0.63" }
+sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 stable_deref_trait = { version = "1" }
-stacker = { version = "0.1", default-features = false }
 stats_alloc = { version = "0.1" }
 streamvbyte64 = { version = "0.2", default-features = false }
 structured-stemmers = { version = "1", default-features = false }
@@ -248,7 +244,6 @@ anstream = { version = "1", default-features = false, features = ["auto", "winco
 anstyle = { version = "1" }
 anstyle-parse = { version = "1" }
 anstyle-query = { version = "1", default-features = false }
-ar_archive_writer = { version = "0.5", default-features = false }
 arc-swap = { version = "1", default-features = false }
 async-trait = { version = "0.1", default-features = false }
 atomic-waker = { version = "1", default-features = false }
@@ -267,7 +262,6 @@ byteorder-lite = { version = "0.1" }
 bytes = { version = "1" }
 byteview = { version = "0.10" }
 cast = { version = "0.3", default-features = false }
-cc = { version = "1", default-features = false }
 census = { version = "0.4", default-features = false }
 cfg-if = { version = "1", default-features = false }
 chacha20 = { version = "0.10", default-features = false, features = ["rng"] }
@@ -312,7 +306,6 @@ equivalent = { version = "1", default-features = false }
 erased-serde = { version = "0.4", default-features = false, features = ["alloc"] }
 fastdivide = { version = "0.4", default-features = false }
 fastrand = { version = "2" }
-find-msvc-tools = { version = "0.1", default-features = false }
 flume = { version = "0.12", default-features = false }
 fnv = { version = "1" }
 foldhash-6f8ce4dd05d13bba = { package = "foldhash", version = "0.2", default-features = false }
@@ -344,7 +337,6 @@ itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
 itoa = { version = "1", default-features = false }
 lazy_static = { version = "1", default-features = false }
 levenshtein_automata = { version = "0.2", default-features = false }
-libc = { version = "0.2" }
 libm = { version = "0.2" }
 lock_api = { version = "0.4" }
 log = { version = "0.4", default-features = false, features = ["std"] }
@@ -367,7 +359,6 @@ num-bigint = { version = "0.4", default-features = false }
 num-conv = { version = "0.2", default-features = false }
 num-integer = { version = "0.1", default-features = false, features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128"] }
-object = { version = "0.39", default-features = false, features = ["read", "std"] }
 once_cell = { version = "1" }
 oneshot = { version = "0.1" }
 oorandom = { version = "11", default-features = false }
@@ -390,7 +381,6 @@ ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "s
 prettyplease = { version = "0.3", default-features = false }
 proc-macro2 = { version = "1" }
 proptest = { version = "1" }
-psm = { version = "0.1", default-features = false }
 quanta = { version = "0.12", default-features = false }
 quick-error = { version = "1", default-features = false }
 quote = { version = "1" }
@@ -405,8 +395,6 @@ rand_xoshiro = { version = "0.7", default-features = false }
 rapidhash = { version = "4", default-features = false }
 rayon = { version = "1", default-features = false }
 rayon-core = { version = "1", default-features = false }
-recursive = { version = "0.1", default-features = false }
-recursive-proc-macro-impl = { version = "0.1", default-features = false }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
@@ -430,15 +418,13 @@ serde_derive = { version = "1" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = { version = "0.11" }
 sharded-slab = { version = "0.1", default-features = false }
-shlex = { version = "2" }
 sketches-ddsketch-468e82937335b1c9 = { package = "sketches-ddsketch", version = "0.3", default-features = false }
 sketches-ddsketch-9fbad63c4bcf4a8f = { package = "sketches-ddsketch", version = "0.4", default-features = false, features = ["use_serde"] }
 slab = { version = "0.4", default-features = false, features = ["std"] }
 smallvec = { version = "1", default-features = false, features = ["serde", "union"] }
 spin = { version = "0.9" }
-sqlparser = { version = "0.63" }
+sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 stable_deref_trait = { version = "1" }
-stacker = { version = "0.1", default-features = false }
 stats_alloc = { version = "0.1" }
 streamvbyte64 = { version = "0.2", default-features = false }
 strsim = { version = "0.11", default-features = false }
@@ -497,6 +483,7 @@ zmij = { version = "1", default-features = false }
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 cpufeatures = { version = "0.3", default-features = false }
+libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 raw-cpuid = { version = "11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
@@ -504,29 +491,39 @@ rustix = { version = "1", features = ["fs"] }
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
+libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 raw-cpuid = { version = "11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 cpufeatures = { version = "0.3", default-features = false }
+libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 rustix = { version = "1", features = ["fs"] }
 
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
+libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.x86_64-unknown-linux-musl.dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 cpufeatures = { version = "0.3", default-features = false }
+libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 raw-cpuid = { version = "11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
@@ -534,38 +531,52 @@ rustix = { version = "1", features = ["fs"] }
 [target.x86_64-unknown-linux-musl.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
+libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 raw-cpuid = { version = "11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.aarch64-unknown-linux-musl.dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 cpufeatures = { version = "0.3", default-features = false }
+libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 rustix = { version = "1", features = ["fs"] }
 
 [target.aarch64-unknown-linux-musl.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
+libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.aarch64-apple-darwin.dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 cpufeatures = { version = "0.3", default-features = false }
 errno = { version = "0.3", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
 rustix = { version = "1", features = ["fs"] }
 
 [target.aarch64-apple-darwin.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
 errno = { version = "0.3", default-features = false, features = ["std"] }
+find-msvc-tools = { version = "0.1", default-features = false }
+libc = { version = "0.2" }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.x86_64-pc-windows-msvc.dependencies]
 alloca = { version = "0.4", default-features = false }
@@ -577,21 +588,24 @@ winapi = { version = "0.3", default-features = false, features = ["profileapi", 
 winapi-util = { version = "0.1", default-features = false }
 windows-link = { version = "0.2", default-features = false }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_SystemInformation"] }
 windows-targets = { version = "0.52", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 anstyle-wincon = { version = "3", default-features = false }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
 once_cell_polyfill = { version = "1" }
 raw-cpuid = { version = "11", default-features = false }
+shlex = { version = "2" }
 winapi = { version = "0.3", default-features = false, features = ["profileapi", "sysinfoapi"] }
 winapi-util = { version = "0.1", default-features = false }
 windows-link = { version = "0.2", default-features = false }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_SystemInformation"] }
 windows-targets = { version = "0.52", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }
 
