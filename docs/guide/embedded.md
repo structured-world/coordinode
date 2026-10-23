@@ -21,7 +21,7 @@ for this guide; it is not a qualified embedded release or a registry package:
 
 ```toml
 [dependencies]
-coordinode-embed = { git = "https://github.com/structured-world/coordinode", rev = "701a6a425828fdce545deb76b3a1737fb948739b" }
+coordinode-embed = { git = "https://github.com/structured-world/coordinode", rev = "d6711895fc95f10ba5cba5611dca27ec0e3bb273" }
 ```
 
 Keep your application's lockfile and qualify its resolved dependencies and selected
