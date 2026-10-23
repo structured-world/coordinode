@@ -1,0 +1,39 @@
+name: Prepare and qualify embedded registry packages
+description: Build archives and run a separate disk-backed consumer on stable Rust and the MSRV
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+      with:
+        toolchain: 1.99.0
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+      with:
+        toolchain: 1.92.0
+    - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
+      with:
+        tool: cargo-hakari@0.9.39,cargo-local-registry@0.2.12
+    - name: Install the source-only protobuf compiler
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv
+    - name: Prepare archives and qualify their external consumer
+      shell: bash
+      env:
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        CARGO_PROFILE_DEV_DEBUG: "0"
+      run: |
+        set -euo pipefail
+        if command -v uv >/dev/null 2>&1; then
+          python=(uv run --no-project --with-requirements scripts/release/requirements.txt python)
+        else
+          environment=$(mktemp -d "$RUNNER_TEMP/coordinode-registry-python.XXXXXX")
+          trap 'rm -rf "$environment"' EXIT
+          python3 -m venv "$environment"
+          "$environment/bin/python" -m pip install -r scripts/release/requirements.txt
+          python=("$environment/bin/python")
+        fi
+        "${python[@]}" -B -m unittest discover -s scripts/release -p 'test_*.py' -v
+        "${python[@]}" -B scripts/release/prepare.py --checkout "$GITHUB_WORKSPACE"
+        "${python[@]}" -B scripts/release/check_packages.py --checkout "$GITHUB_WORKSPACE" \
+          --consumer-toolchain 1.92.0 --consumer-toolchain 1.99.0

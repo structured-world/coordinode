@@ -12,8 +12,11 @@ Every crate this workspace depends on keeps its own licence. The licences
 accepted for dependencies are declared in `deny.toml` and checked in CI with
 `cargo deny`. Binary packages (RPM, DEB, container images) combine those
 crates into one AGPL-3.0-only program; the full text of each dependency's
-licence is available from its crates.io page and from the `cargo about`
-report that accompanies a release.
+licence is available from its source distribution or crates.io page. Do not
+assume a release includes a `cargo about` report: use an attached report when
+present and check that its package, target and enabled features match the
+artifact being used. A server dependency report does not by itself describe
+the dependencies of an embedding application.
 
 The storage engine is `coordinode-lsm-tree` (Apache-2.0), consumed from
 crates.io. It is a maintained fork of `fjall-rs/lsm-tree`; the attribution to

@@ -1,73 +1,169 @@
 name: Release PLZ
 
 on:
-  push:
-    branches:
-      - main
-  # Re-run against the current main without inventing a commit, for when the
-  # release PR needs regenerating after a change to release-plz itself.
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  actions: read
 
 jobs:
-  release-plz:
-    name: release-plz
+  release:
+    if: github.repository == 'structured-world/coordinode' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: write
+      pull-requests: read
+      actions: read
+      id-token: write
     steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Identify the merged release PR
+        id: eligible
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/release/registry.py eligible --checkout "$GITHUB_WORKSPACE"
+      - name: Require the source suite on this exact commit
+        if: steps.eligible.outputs.publish == 'true' && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          runs = json.loads(subprocess.check_output([
+              'gh', 'run', 'list', '--repo', 'structured-world/coordinode',
+              '--workflow', 'ci.yml', '--commit', revision, '--limit', '20',
+              '--json', 'databaseId,event,headBranch'], text=True))
+          runs = [r for r in runs if r['headBranch'] == 'main' and r['event'] in ('push', 'workflow_dispatch')]
+          if not runs:
+              raise SystemExit('Run CI on this main commit before publishing')
+          subprocess.run(['gh', 'run', 'watch', str(runs[0]['databaseId']),
+                          '--repo', 'structured-world/coordinode', '--exit-status'], check=True)
+          PY
+      - name: Select the exact commit release-plz will publish
+        if: steps.eligible.outputs.publish == 'true'
+        env:
+          PUBLICATION_COMMIT: ${{ steps.eligible.outputs.publication_commit }}
+        run: git checkout --detach "$PUBLICATION_COMMIT"
+      - name: Prepare and qualify the actual archives
+        if: steps.eligible.outputs.publish == 'true'
+        uses: ./.github/actions/prepare-registry
+        env:
+          SOURCE_CI_COMMIT: ${{ steps.eligible.outputs.verified_commit }}
+      - name: Reconcile any earlier partial publication
+        if: steps.eligible.outputs.publish == 'true'
+        run: python3 -B scripts/release/registry.py preflight --checkout "$GITHUB_WORKSPACE"
+      - name: Select bootstrap or OIDC authentication
+        if: steps.eligible.outputs.publish == 'true'
+        id: auth
+        env:
+          BOOTSTRAP_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        run: |
+          if [ -n "$BOOTSTRAP_TOKEN" ]; then
+            echo 'bootstrap=true' >> "$GITHUB_OUTPUT"
+            echo 'Using the explicitly provisioned initial-publication credential'
+          else
+            echo 'bootstrap=false' >> "$GITHUB_OUTPUT"
+            echo 'Using crates.io Trusted Publishing (OIDC)'
+          fi
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
+        if: steps.eligible.outputs.publish == 'true'
+        with:
+          tool: release-plz@0.3.174
+      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
+        if: steps.eligible.outputs.publish == 'true'
+        id: app
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
-
-      - uses: actions/checkout@v6
+          permission-contents: write
+          permission-pull-requests: read
+      - name: First publication through release-plz
+        if: steps.eligible.outputs.publish == 'true' && steps.auth.outputs.bootstrap == 'true'
+        env:
+          GIT_TOKEN: ${{ steps.app.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        run: |
+          release-plz release --forge github --config .release-plz.toml --allow-dirty --no-verify
+          python3 -B scripts/release/registry.py trust --checkout "$GITHUB_WORKSPACE"
+      - name: Publish through OIDC
+        if: steps.eligible.outputs.publish == 'true' && steps.auth.outputs.bootstrap == 'false'
+        env:
+          GIT_TOKEN: ${{ steps.app.outputs.token }}
+        run: release-plz release --forge github --config .release-plz.toml --allow-dirty --no-verify
+      - name: Verify every published checksum and a real registry consumer
+        if: steps.eligible.outputs.publish == 'true'
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          python3 -B scripts/release/registry.py verify --checkout "$GITHUB_WORKSPACE"
+          python3 -B scripts/release/check_packages.py --checkout "$GITHUB_WORKSPACE" \
+            --source crates-io --consumer-toolchain 1.92.0 --consumer-toolchain 1.99.0
+      - name: Keep publication evidence
+        if: always() && steps.eligible.outputs.publish == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
+          name: registry-publication
+          path: |
+            target/registry-preparation.json
+            target/prepared-consumer-metadata.json
+            target/crates-io-consumer-metadata.json
+          if-no-files-found: ignore
+      - name: Clean build outputs
+        if: always() && steps.eligible.outputs.publish == 'true'
+        run: cargo clean
+
+  release-pr:
+    needs: release
+    runs-on: ubuntu-latest
+    # Publication has no coalescing queue: each merged release keeps its own
+    # execution. Only preparation of the next PR can replace a pending run.
+    concurrency:
+      group: coordinode-release-pr
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: main
           fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+          submodules: recursive
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
-          key: release-plz-0.3.168
-
-      # Pinned: a release tool that changes behaviour between two runs of the
-      # same commit is not something to find out about from a release PR. Bump
-      # the version here (and the cache key above) after reproducing both
-      # commands' effect on a throwaway clone.
-      - name: Install release-plz
-        run: cargo install release-plz --version 0.3.168 --locked
-
-      - name: Run release-plz release
-        # Runs first so the git tag exists before release-pr computes the next
-        # version. Running release-pr first caused duplicate release PRs: it saw
-        # the old tag and proposed the same version again (e.g. 0.3.3→0.3.4 twice).
-        # No-op on feature pushes; expected to exit 0 before a release PR is merged.
-        continue-on-error: true
+          toolchain: 1.99.0
+      - name: Install the source-only protobuf compiler
         run: |
-          release-plz release \
-            --git-token "${GITHUB_TOKEN}" \
-            --config .release-plz.toml \
-            --verbose
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
+        with:
+          tool: release-plz@0.3.174,cargo-semver-checks@0.50.0
+      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
+        id: app
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Prepare the release PR from clean source
         env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-
-      - name: Fetch tags after release
-        # release-plz release creates tags via GitHub API (not git tag + push),
-        # so the local git clone does not see the new tag after the previous step.
-        # Without this fetch, release-pr queries local tags, finds the old tag,
-        # and generates a duplicate release PR (e.g. 0.3.4→0.3.5 when already at 0.3.5).
-        run: git fetch --tags
-
-      - name: Run release-plz release-pr
-        run: |
-          release-plz release-pr \
-            --git-token "${GITHUB_TOKEN}" \
-            --config .release-plz.toml \
-            --verbose
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GIT_TOKEN: ${{ steps.app.outputs.token }}
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: release-plz release-pr --forge github --config .release-plz.toml
+      - name: Clean build outputs
+        if: always()
+        run: cargo clean

@@ -2,6 +2,11 @@
 /target/
 **/*.rs.bk
 *.pdb
+# Release-only protobuf inputs are included in crate archives, never in Git.
+/crates/coordinode-raft/bindings/
+/crates/coordinode-replicate/bindings/
+# Release preparation tests use Python but have no generated source inputs.
+__pycache__/
 
 # IDE
 .idea/

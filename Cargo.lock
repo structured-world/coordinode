@@ -1191,9 +1191,9 @@ dependencies = [
  "jieba-rs",
  "lindera",
  "rand 0.10.3",
- "rust-stemmers 1.2.0 (git+https://github.com/structured-world/rust-stemmers.git?branch=main)",
  "serde",
  "sha2 0.11.1",
+ "structured-stemmers",
  "tantivy",
  "tempfile",
  "thiserror 2.0.21",
@@ -1580,8 +1580,7 @@ dependencies = [
  "rmp",
  "rmp-serde",
  "rmpv",
- "rust-stemmers 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "rust-stemmers 1.2.0 (git+https://github.com/structured-world/rust-stemmers.git?branch=main)",
+ "rust-stemmers",
  "rustc-hash",
  "rustc_version",
  "rustix",
@@ -1610,6 +1609,7 @@ dependencies = [
  "stats_alloc",
  "streamvbyte64",
  "strsim",
+ "structured-stemmers",
  "syn 2.0.119",
  "syn 3.0.9",
  "tantivy",
@@ -5170,15 +5170,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-stemmers"
-version = "1.2.0"
-source = "git+https://github.com/structured-world/rust-stemmers.git?branch=main#fc80b8d9c282485f496fb6ff4c6154cc050731a0"
-dependencies = [
- "serde",
- "serde_derive",
-]
-
-[[package]]
 name = "rust_decimal"
 version = "1.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5852,6 +5843,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "structured-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1098e1c08ccc275448f3ab47a0fc9baa775db3ae6afd9ebd6cfd8323db820916"
+dependencies = [
+ "serde",
+ "serde_derive",
+]
+
+[[package]]
 name = "structured-zstd"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5988,7 +5989,7 @@ dependencies = [
  "oneshot",
  "rayon",
  "regex",
- "rust-stemmers 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rust-stemmers",
  "rustc-hash",
  "serde",
  "serde_json",
