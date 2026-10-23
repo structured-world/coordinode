@@ -17,7 +17,11 @@ use sqlparser::ast::{
     Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
+
+use core::fmt::Write;
 
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 use coordinode_core::txn::read_consistency::ReadConsistencyMode;
@@ -28,8 +32,23 @@ use crate::plan::{SetItem, ViolationMode};
 use crate::planner::logical::{LogicalOp, LogicalPlan, ProjectItem};
 
 /// The SQL frontend: `sqlparser` parse + native lowering into the neutral IR.
+///
+/// Both entry points require at least a 2 MiB host thread stack. Before AST
+/// construction they refuse inputs over 1 MiB, 4096 non-whitespace tokens or
+/// 64 structural tokens (keywords and punctuation, excluding commas and
+/// semicolons). Non-keyword identifiers and scalar string/number literals add width,
+/// not structural cost. The parser additionally permits 16 recursive entries.
+/// These safety ceilings also bound canonicalization, lowering and destruction;
+/// they are not truncation rules and cannot be raised by an input query.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SqlFrontend;
+
+// Bound syntax before constructing an AST: recursive-descent limits alone do
+// not bound left-deep expression trees or their formatting and destruction.
+const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_SYNTAX_TOKENS: usize = 4096;
+const MAX_STRUCTURAL_TOKENS: usize = 64;
+const MAX_PARSER_DEPTH: usize = 16;
 
 impl SqlFrontend {
     /// Create a SQL frontend.
@@ -40,17 +59,17 @@ impl SqlFrontend {
 
 impl QueryFrontend for SqlFrontend {
     fn parse(&self, text: &str) -> Result<ParsedQuery, FrontendError> {
-        let statements = Parser::parse_sql(&GenericDialect, text).map_err(sql_err)?;
+        let statements = parse_bounded(text)?;
         let [statement] = statements.as_slice() else {
             return Err(FrontendError::Message(
                 "exactly one SQL statement is supported per query".into(),
             ));
         };
+        let root = lower_statement(statement)?;
         // Canonical form + fingerprint from the re-serialized AST (stable
         // across whitespace / casing differences in the surface text).
-        let canonical = statement.to_string();
+        let canonical = canonical_sql(&statements)?;
         let fingerprint = crate::advisor::fingerprint::fingerprint(&canonical);
-        let root = lower_statement(statement)?;
         Ok(ParsedQuery {
             plan: LogicalPlan {
                 root,
@@ -73,17 +92,73 @@ impl QueryFrontend for SqlFrontend {
     }
 
     fn fingerprint(&self, text: &str) -> Result<(String, u64), FrontendError> {
-        let statements = Parser::parse_sql(&GenericDialect, text).map_err(sql_err)?;
-        let canonical = statements
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        Ok((
-            canonical.clone(),
-            crate::advisor::fingerprint::fingerprint(&canonical),
-        ))
+        let statements = parse_bounded(text)?;
+        let canonical = canonical_sql(&statements)?;
+        let fingerprint = crate::advisor::fingerprint::fingerprint(&canonical);
+        Ok((canonical, fingerprint))
     }
+}
+
+/// Format directly into the owned result, without a string per statement or
+/// another copy of the complete canonical query when joining statements.
+fn canonical_sql(statements: &[Statement]) -> Result<String, FrontendError> {
+    let mut canonical = String::new();
+    for (index, statement) in statements.iter().enumerate() {
+        if index != 0 {
+            canonical.push_str("; ");
+        }
+        write!(&mut canonical, "{statement}")
+            .map_err(|_| FrontendError::Message("SQL canonical formatting failed".into()))?;
+    }
+    Ok(canonical)
+}
+
+/// Admit the complete input before any AST construction, including queries
+/// that later fail to parse or lower. Tokens are moved into the parser once.
+fn parse_bounded(text: &str) -> Result<Vec<Statement>, FrontendError> {
+    if text.len() > MAX_INPUT_BYTES {
+        return Err(FrontendError::Message(format!(
+            "SQL input byte limit exceeded (maximum {MAX_INPUT_BYTES})"
+        )));
+    }
+    let tokens = Tokenizer::new(&GenericDialect, text)
+        .tokenize_with_location()
+        .map_err(|error| FrontendError::Message(format!("SQL tokenize error: {error}")))?;
+    let mut syntax_tokens = 0;
+    let mut structural_tokens = 0;
+    for token in &tokens {
+        if matches!(token.token, Token::Whitespace(_)) {
+            continue;
+        }
+        if syntax_tokens == MAX_SYNTAX_TOKENS {
+            return Err(FrontendError::Message(format!(
+                "SQL syntax token limit exceeded (maximum {MAX_SYNTAX_TOKENS})"
+            )));
+        }
+        syntax_tokens += 1;
+        // Identifiers, literals and list separators add width but cannot
+        // introduce a recursive SQL edge without punctuation or a keyword.
+        match &token.token {
+            Token::Word(word) if word.keyword == Keyword::NoKeyword => continue,
+            Token::Number(..)
+            | Token::SingleQuotedString(_)
+            | Token::DoubleQuotedString(_)
+            | Token::Comma
+            | Token::SemiColon => continue,
+            _ => {}
+        }
+        if structural_tokens == MAX_STRUCTURAL_TOKENS {
+            return Err(FrontendError::Message(format!(
+                "SQL structural token limit exceeded (maximum {MAX_STRUCTURAL_TOKENS})"
+            )));
+        }
+        structural_tokens += 1;
+    }
+    Parser::new(&GenericDialect)
+        .with_recursion_limit(MAX_PARSER_DEPTH)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+        .map_err(sql_err)
 }
 
 fn sql_err(e: sqlparser::parser::ParserError) -> FrontendError {

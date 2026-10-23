@@ -14,6 +14,8 @@ import tarfile
 import tempfile
 import tomllib
 
+from dependency_policy import check_native_stack_helpers
+
 
 def inspect_archive(archive, name, version, names, bindings):
     """Reject incomplete archives and unresolved source-workspace dependencies."""
@@ -127,6 +129,7 @@ def main():
         graph = subprocess.check_output(
             [*prefix, "cargo", "metadata", *network, "--all-features", "--format-version=1"],
             cwd=consumer, env=env, text=True)
+        check_native_stack_helpers(json.loads(graph)['packages'])
         (root / f"target/{args.source}-consumer-metadata.json").write_text(graph)
     report[f"{args.source}_consumer"] = qualified
     report_path.write_text(json.dumps(report, indent=2) + "\n")

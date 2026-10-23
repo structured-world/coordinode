@@ -5,6 +5,64 @@
 use coordinode_core::graph::types::Value;
 use coordinode_embed::db::Database;
 
+/// SQL admission fails before execution, preserving the original row through
+/// reopen rather than applying any prefix of a refused update.
+#[test]
+fn a_sql_structural_refusal_has_no_effect_and_the_database_remains_usable() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).expect("open db");
+        db.execute_sql("CREATE TABLE Account (id BIGINT PRIMARY KEY, name VARCHAR(64))")
+            .expect("create through SQL");
+        db.execute_sql("INSERT INTO Account (id, name) VALUES (1, 'original')")
+            .expect("insert");
+        let query = format!(
+            "UPDATE Account SET name = 'changed' WHERE {}",
+            vec!["id = 1"; 128].join(" AND ")
+        );
+        let error = db.execute_sql(&query).expect_err("refuse before execution");
+        assert!(
+            error.to_string().contains("SQL structural token limit"),
+            "{error}"
+        );
+        let rows = db
+            .execute_sql("SELECT name FROM Account WHERE id = 1")
+            .expect("read after refusal");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("name"), Some(&Value::String("original".into())));
+    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let rows = db
+        .execute_sql("SELECT name FROM Account WHERE id = 1")
+        .expect("persisted row");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("original".into())));
+}
+
+/// Stack qualification includes the real planner/executor and cache ownership,
+/// not just an isolated parse. A boundary expression preserves its exact value.
+#[test]
+fn an_admitted_sql_chain_executes_on_the_minimum_host_stack() {
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Database::open(dir.path()).expect("open");
+            db.execute_sql("CREATE TABLE T (id BIGINT)")
+                .expect("create");
+            db.execute_sql("INSERT INTO T (id) VALUES (1)")
+                .expect("insert");
+            let query = format!("SELECT {} AS total FROM T", vec!["1"; 62].join(" + "));
+            // SELECT, 61 operators, AS, FROM = 64 structural tokens.
+            let rows = db.execute_sql(&query).expect("execute boundary chain");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("total"), Some(&Value::Int(62)));
+        })
+        .expect("create minimum-stack host thread")
+        .join()
+        .expect("engine must not panic on the host thread");
+}
+
 #[test]
 fn create_columnar_table_creates_tree_and_persists_schema() {
     let dir = tempfile::tempdir().unwrap();

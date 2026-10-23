@@ -15,34 +15,25 @@ package has not yet been published to crates.io; server release binaries and the
 separate Python package do not supply a Rust library package. In particular,
 `coordinode-embed = "0.3"` is not an available registry installation.
 
-For source integration, pin the public repository to an exact revision rather
-than following `main`. For example, the following identifies the source inspected
-for this guide; it is not a qualified embedded release or a registry package:
+For source integration, select and pin an exact reviewed revision of the
+[public repository](https://github.com/structured-world/coordinode) rather than
+following `main`. Keep your application's lockfile and qualify its resolved
+dependencies and selected features. A source pin is not a qualified registry
+release. The workspace pins Rust 1.99.0; the declared lower MSRV needs its own
+external consumer check. Source builds with `replication` also use the pinned
+proto submodule and generation tooling. Prepared registry packages include the
+generated bindings and omit the workspace's development feature-unification
+helper; source and packaged dependency graphs are qualified separately.
 
-```toml
-[dependencies]
-coordinode-embed = { git = "https://github.com/structured-world/coordinode", rev = "d6711895fc95f10ba5cba5611dca27ec0e3bb273" }
-```
-
-Keep your application's lockfile and qualify its resolved dependencies and selected
-features. This source revision's workspace pins Rust 1.99.0; the declared lower
-MSRV is not established by that compiler pin. Source builds with `replication`
-also use the repository's pinned proto submodule and generation tooling. A future
-registry package must contain its complete build inputs without those checkout
-dependencies. The source integration above has not been independently built as an
-external consumer in this documentation correction.
-
-The source revision above also selects `sqlparser`'s `recursive-protection`
-feature, which uses `stacker`/`psm`. On Windows, `stacker` builds a C shim;
-`psm` assembles target-specific stack support on supported native targets. Do not
-infer a Rust-toolchain-only build on every target from the absence of a separate
-database server. The source graph also currently includes workspace development
-dependencies through `coordinode-workspace-hack`.
+The SQL frontend uses bounded Rust parsing without `stacker`/`psm`. Its host-stack
+and admission requirements are described below. Verify the actual selected
+dependency features: another dependency in the application can unify features
+that the engine itself does not request.
 
 Before admitting a build to production, verify your actual transaction, recovery,
 backup and resource-limit scenario on that exact build. A configured free-space
-reserve is different from a hard limit on all database-owned files. At the source
-revision above, direct blob deletion removes metadata but does not automatically
+reserve is different from a hard limit on all database-owned files. Direct blob
+deletion removes metadata but does not automatically
 reclaim unreferenced application chunks; do not count it as physical space release.
 
 The CE license is AGPL-3.0-only. See the repository's `LICENSE`, `COPYRIGHT` and
@@ -81,6 +72,27 @@ fn main() -> anyhow::Result<()> {
 ```
 
 ## API Reference
+
+### SQL admission and host stack
+
+SQL execution and SQL fingerprinting share the same admission path. The host
+thread must provide at least a 2 MiB stack. Before constructing an AST, the
+frontend rejects input larger than 1 MiB, more than 4096 non-whitespace tokens,
+or more than 64 structural tokens. Structural tokens are keywords and
+punctuation other than commas and semicolons; non-keyword identifiers and scalar
+string/number literals consume width without adding structural cost. Quoted
+literal and comment contents are interpreted by the SQL lexer, not counted as
+SQL operators. The parser additionally enforces 16 recursive entries.
+
+These are independent safety ceilings, not a promise that every expression
+within the token count is supported. Long flat operator chains need the
+structural bound even without parentheses, because formatting and destruction
+also traverse the AST. A wide simple projection has a different shape. Exceeding
+a ceiling returns an explicit error before execution, without applying a prefix
+of a statement. Both source and prepared packages use these same bounds, without
+native stack switching or an extra thread per request.
+
+### Database operations
 
 ```rust
 use coordinode_embed::{Database, DatabaseError};

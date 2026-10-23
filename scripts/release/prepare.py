@@ -16,6 +16,8 @@ import tomllib
 
 import tomlkit
 
+from dependency_policy import check_native_stack_helpers
+
 
 def command(*args, root):
     return subprocess.check_output(args, cwd=root, text=True)
@@ -91,6 +93,7 @@ def main():
     subprocess.run(["cargo", "hakari", "remove-deps", "--yes"], cwd=root, check=True)
     metadata = json.loads(command("cargo", "metadata", "--all-features", "--format-version=1", root=root))
     internal, external = library_closure(metadata, config["entrypoint"])
+    check_native_stack_helpers(external)
     if internal != names:
         raise ValueError(f"release closure mismatch: missing={internal - names}, extra={names - internal}")
     git_dependencies = [p["name"] for p in external if (p.get("source") or "").startswith("git+")]
