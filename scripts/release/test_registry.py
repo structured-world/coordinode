@@ -1,11 +1,12 @@
-"""A partial publication is resumable only with identical artifacts and bindings."""
+"""A partial publication is resumable only with identical artifacts."""
 import unittest
 import pathlib
 import subprocess
 import tempfile
+import sys
 
 import registry
-from registry import check_versions, configure_publishers
+from registry import check_versions
 
 
 class PublicationRevisionTest(unittest.TestCase):
@@ -73,24 +74,12 @@ class RegistryTest(unittest.TestCase):
             check_versions(self.report, lambda _: {"version": {"checksum": "first", "yanked": True}},
                            allow_missing=True)
 
-    def test_uncertain_publisher_creation_is_reconciled_before_retry(self):
-        # Persist the POST, lose its response, then retry the complete operation.
-        configs = []
-        posts = []
-
-        def call(method, path, body=None):
-            if method == 'GET':
-                return {'github_configs': configs}
-            posts.append(body)
-            configs.append(body['github_config'])
-            raise RuntimeError('lost response')
-
-        with self.assertRaisesRegex(RuntimeError, 'lost response'):
-            configure_publishers(['coordinode-core'], call)
-        configure_publishers(['coordinode-core'], call)
-        self.assertEqual(len(posts), 1)
-        self.assertEqual(configs[0]['environment'], 'crates-io')
-        self.assertEqual(configs[0]['workflow_filename'], 'coordinode-release.yml')
+    def test_publisher_provisioning_is_not_a_release_operation(self):
+        # CI consumes an existing publisher and cannot register one.
+        result = subprocess.run([sys.executable, '-B', registry.__file__, 'trust',
+                                 '--checkout', '.'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice: 'trust'", result.stderr)
 
 
 if __name__ == '__main__':

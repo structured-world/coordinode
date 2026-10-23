@@ -46,17 +46,22 @@ separate gates; stripping source-only tests from an archive does not replace the
 
 ## Publication credentials and recovery
 
-For the first publication, provision the `crates-io` GitHub environment for main
-and the temporary `CRATES_IO_BOOTSTRAP_TOKEN` secret. Restrict the token to the
-listed package names, initial publication and Trusted Publisher registration.
-The workflow publishes through release-plz, registers each crate's publisher for
-`structured-world/coordinode`, `coordinode-release.yml`, environment `crates-io`,
-and reads the binding back. Remove the bootstrap secret and revoke the token
-after successful initial publication and publisher verification.
+The workflow uses only release-plz's native OIDC flow with `id-token: write`.
+Provision the `crates-io` GitHub environment for main before publishing. Register
+each crate's Trusted Publisher in crates.io for `structured-world/coordinode`,
+workflow `coordinode-release.yml`, environment `crates-io`. CI consumes these
+bindings; it never creates or changes them and has no bootstrap token path.
 
-Later publications use release-plz's native OIDC flow with `id-token: write`.
+A previously unpublished crate requires an initial manual upload with a temporary
+crate-scoped credential before its publisher can be registered. Use the exact
+qualified version and prepared archive from the failed publication, verify the
+registry checksum, register its publisher in the browser, then retry the failed
+publication job. Revoke the temporary credential after setup. Do not rerun the
+source suite solely to retry registry authentication.
+
 GitHub App authentication is separate: the standalone CLI reads `GIT_TOKEN`.
-Do not create tags, registry versions or GitHub releases manually.
+Git tags, GitHub releases and subsequent registry versions are created only by
+release-plz.
 
 An interrupted publication can be retried only with the same qualified archives.
 `registry.py preflight` rejects an existing tag belonging to another revision,

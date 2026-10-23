@@ -64,19 +64,6 @@ jobs:
       - name: Reconcile any earlier partial publication
         if: steps.eligible.outputs.publish == 'true'
         run: python3 -B scripts/release/registry.py preflight --checkout "$GITHUB_WORKSPACE"
-      - name: Select bootstrap or OIDC authentication
-        if: steps.eligible.outputs.publish == 'true'
-        id: auth
-        env:
-          BOOTSTRAP_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
-        run: |
-          if [ -n "$BOOTSTRAP_TOKEN" ]; then
-            echo 'bootstrap=true' >> "$GITHUB_OUTPUT"
-            echo 'Using the explicitly provisioned initial-publication credential'
-          else
-            echo 'bootstrap=false' >> "$GITHUB_OUTPUT"
-            echo 'Using crates.io Trusted Publishing (OIDC)'
-          fi
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         if: steps.eligible.outputs.publish == 'true'
         with:
@@ -89,16 +76,8 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: read
-      - name: First publication through release-plz
-        if: steps.eligible.outputs.publish == 'true' && steps.auth.outputs.bootstrap == 'true'
-        env:
-          GIT_TOKEN: ${{ steps.app.outputs.token }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
-        run: |
-          release-plz release --forge github --config .release-plz.toml --allow-dirty --no-verify
-          python3 -B scripts/release/registry.py trust --checkout "$GITHUB_WORKSPACE"
       - name: Publish through OIDC
-        if: steps.eligible.outputs.publish == 'true' && steps.auth.outputs.bootstrap == 'false'
+        if: steps.eligible.outputs.publish == 'true'
         env:
           GIT_TOKEN: ${{ steps.app.outputs.token }}
         run: release-plz release --forge github --config .release-plz.toml --allow-dirty --no-verify
@@ -119,6 +98,7 @@ jobs:
             target/registry-preparation.json
             target/prepared-consumer-metadata.json
             target/crates-io-consumer-metadata.json
+            target/package/*.crate
           if-no-files-found: ignore
       - name: Clean build outputs
         if: always() && steps.eligible.outputs.publish == 'true'

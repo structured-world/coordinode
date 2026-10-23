@@ -1,4 +1,4 @@
-"""Reconcile an immutable coordinated release and its crates.io publisher bindings."""
+"""Reconcile an immutable coordinated release against crates.io."""
 import argparse
 import json
 import os
@@ -6,18 +6,15 @@ import pathlib
 import subprocess
 import tomllib
 import urllib.error
-import urllib.parse
 import urllib.request
 
 
-def request(method, path, body=None, token=None):
-    """Call the public registry; never print credentials or response bodies."""
+def request(method, path):
+    """Read public registry metadata without publication credentials."""
     headers = {"Content-Type": "application/json",
                "User-Agent": "coordinode-release (github.com/structured-world/coordinode)"}
-    if token:
-        headers["Authorization"] = token
     req = urllib.request.Request("https://crates.io/api/v1/" + path, method=method,
-                                 headers=headers, data=None if body is None else json.dumps(body).encode())
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             return json.load(response)
@@ -40,27 +37,6 @@ def check_versions(report, read, *, allow_missing):
         version = data["version"]
         if version["checksum"] != package["archive"]["sha256"] or version["yanked"]:
             raise ValueError(f"{name}: registry version does not match the qualified archive")
-
-
-def configure_publishers(names, call):
-    """Reconcile each binding before any POST and verify its persisted identity."""
-    for name in names:
-        expected = {"crate": name, "repository_owner": "structured-world",
-                    "repository_name": "coordinode", "workflow_filename": "coordinode-release.yml",
-                    "environment": "crates-io"}
-        path = "trusted_publishing/github_configs"
-        query = "?" + urllib.parse.urlencode({"crate": name})
-
-        def exists():
-            return any(all(c.get(k) == v for k, v in expected.items())
-                       for c in call("GET", path + query)["github_configs"])
-
-        if not exists():
-            # Unknown POST outcomes stop this run. A retry reads the binding
-            # first, so it cannot create another publisher blindly.
-            call("POST", path, {"github_config": expected})
-        if not exists():
-            raise ValueError(f"{name}: Trusted Publisher was not verified")
 
 
 def publication_revision(root, source, release_head):
@@ -93,7 +69,7 @@ def publication_revision(root, source, release_head):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("eligible", "preflight", "verify", "trust"))
+    parser.add_argument("mode", choices=("eligible", "preflight", "verify"))
     parser.add_argument("--checkout", type=pathlib.Path, required=True)
     args = parser.parse_args()
     root = args.checkout.resolve()
@@ -138,11 +114,6 @@ def main():
         check_versions(report, lambda p: request("GET", p), allow_missing=False)
         report["registry_checksums_verified"] = True
         report_path.write_text(json.dumps(report, indent=2) + "\n")
-    else:
-        token = os.environ["CARGO_REGISTRY_TOKEN"]
-        if not token:
-            raise ValueError("missing initial-publication token")
-        configure_publishers(names, lambda method, path, body=None: request(method, path, body, token))
     print(f"{args.mode}: verified {len(names)} coordinated packages")
 
 
