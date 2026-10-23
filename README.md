@@ -30,7 +30,7 @@ curl http://localhost:7084/health
 
 Or install a package from the [latest release](https://github.com/structured-world/coordinode/releases/latest): RPMs for Fedora 42 to 44, DEBs for Debian and Ubuntu, and static binaries for linux-amd64 and linux-arm64.
 
-From source (Rust 1.90+; the toolchain is pinned in `rust-toolchain.toml`):
+From source (use the Rust toolchain pinned in `rust-toolchain.toml`):
 
 ```bash
 git clone https://github.com/structured-world/coordinode.git
