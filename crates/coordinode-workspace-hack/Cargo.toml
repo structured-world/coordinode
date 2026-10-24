@@ -28,9 +28,7 @@ anstyle-parse = { version = "1" }
 anstyle-query = { version = "1", default-features = false }
 arc-swap = { version = "1", default-features = false }
 atomic-waker = { version = "1", default-features = false }
-base16ct = { version = "1", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22" }
-base64ct = { version = "1", default-features = false, features = ["alloc"] }
 bigdecimal = { version = "0.4", default-features = false, features = ["serde"] }
 bit-set = { version = "0.11" }
 bit-vec = { version = "0.10" }
@@ -45,8 +43,7 @@ byteview = { version = "0.10" }
 cast = { version = "0.3", default-features = false }
 census = { version = "0.4", default-features = false }
 cfg-if = { version = "1", default-features = false }
-chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha"] }
-chacha20poly1305 = { version = "0.11", default-features = false }
+chacha20 = { version = "0.10", default-features = false, features = ["rng"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ciborium = { version = "0.2" }
 ciborium-io = { version = "0.2", default-features = false, features = ["std"] }
@@ -69,23 +66,15 @@ crossbeam-deque = { version = "0.8" }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
 crunchy = { version = "0.2" }
-crypto-bigint = { version = "0.7", default-features = false, features = ["alloc", "hybrid-array", "rand_core", "subtle", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom"] }
-crypto-primes = { version = "0.7", default-features = false }
 ctr = { version = "0.10", default-features = false }
-ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
-curve25519-dalek = { version = "5", default-features = false, features = ["alloc", "digest", "zeroize"] }
+ctutils = { version = "0.4", default-features = false }
 dashmap = { version = "6", default-features = false }
 datasketches = { version = "0.2", default-features = false }
-der = { version = "0.8", default-features = false, features = ["oid", "pem"] }
 deranged = { version = "0.5", features = ["serde"] }
 digest = { version = "0.11", features = ["alloc", "mac", "oid"] }
 downcast-rs = { version = "2" }
-ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "alloc", "pem"] }
-ed25519 = { version = "3", default-features = false, features = ["alloc", "pkcs8"] }
-ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "pkcs8", "zeroize"] }
 either = { version = "1", default-features = false, features = ["use_std"] }
-elliptic-curve = { version = "0.14", default-features = false, features = ["ecdh", "pem"] }
 endian-type = { version = "0.1", default-features = false }
 env_filter = { version = "2", default-features = false, features = ["std"] }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
@@ -93,7 +82,6 @@ equivalent = { version = "1", default-features = false }
 erased-serde = { version = "0.4", default-features = false, features = ["alloc"] }
 fastdivide = { version = "0.4", default-features = false }
 fastrand = { version = "2" }
-ff = { version = "0.14", default-features = false, features = ["alloc"] }
 flume = { version = "0.12", default-features = false }
 fnv = { version = "1" }
 foldhash-6f8ce4dd05d13bba = { package = "foldhash", version = "0.2", default-features = false }
@@ -104,19 +92,16 @@ futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3" }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 ghash = { version = "0.6", default-features = false }
-group = { version = "0.14", default-features = false, features = ["alloc"] }
 half = { version = "2", default-features = false }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
-hkdf = { version = "0.13", default-features = false }
 hmac = { version = "0.13", default-features = false }
 htmlescape = { version = "0.3", default-features = false }
-hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "subtle", "zeroize"] }
+hybrid-array = { version = "0.4", default-features = false }
 indexmap = { version = "2", default-features = false, features = ["std"] }
 inout = { version = "0.2", default-features = false }
 inventory = { version = "0.3", default-features = false }
@@ -153,25 +138,17 @@ oneshot = { version = "0.1" }
 oorandom = { version = "11", default-features = false }
 ordered-float = { version = "5" }
 ownedbytes = { version = "0.9", default-features = false }
-p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "pem"] }
-p384 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "pem"] }
 page_size = { version = "0.6", default-features = false }
 parking_lot = { version = "0.12" }
 parking_lot_core = { version = "0.9", default-features = false }
-pem-rfc7468 = { version = "1", default-features = false, features = ["alloc"] }
 pest = { version = "2" }
 pin-project-lite = { version = "0.2", default-features = false }
-pkcs1 = { version = "0.8.0-rc.5", default-features = false, features = ["pem"] }
-pkcs8 = { version = "0.11", default-features = false, features = ["pem"] }
 plotters = { version = "0.3", default-features = false, features = ["area_series", "line_series", "svg_backend"] }
 plotters-backend = { version = "0.3", default-features = false }
 plotters-svg = { version = "0.3", default-features = false }
-poly1305 = { version = "0.9", default-features = false }
 polyval = { version = "0.7", default-features = false, features = ["hazmat"] }
 powerfmt = { version = "0.2", default-features = false }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
-primefield = { version = "0.14", default-features = false }
-primeorder = { version = "0.14", default-features = false }
 proptest = { version = "1" }
 quanta = { version = "0.12", default-features = false }
 quick-error = { version = "1", default-features = false }
@@ -189,41 +166,32 @@ rayon-core = { version = "1", default-features = false }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-rfc6979 = { version = "0.6", default-features = false }
-ring = { version = "0.17" }
 rmp = { version = "0.8" }
 rmp-serde = { version = "1", default-features = false }
 rmpv = { version = "1", default-features = false, features = ["with-serde"] }
-rsa = { version = "0.10.0-rc.19", default-features = false, features = ["encoding", "sha2"] }
 rust-stemmers = { version = "1", default-features = false }
 rustc-hash = { version = "2" }
-rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 rusty-fork = { version = "0.3", default-features = false, features = ["timeout"] }
 s2 = { version = "0.2" }
 same-file = { version = "1", default-features = false }
 scopeguard = { version = "1", default-features = false }
-sec1 = { version = "0.8", features = ["ctutils", "pem", "subtle"] }
 serde = { version = "1", features = ["alloc", "derive"] }
 serde_bytes = { version = "0.11" }
 serde_core = { version = "1", default-features = false, features = ["alloc", "result", "std"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = { version = "0.11" }
 sharded-slab = { version = "0.1", default-features = false }
-signature = { version = "3", default-features = false, features = ["alloc", "digest", "rand_core"] }
 sketches-ddsketch-468e82937335b1c9 = { package = "sketches-ddsketch", version = "0.3", default-features = false }
 sketches-ddsketch-9fbad63c4bcf4a8f = { package = "sketches-ddsketch", version = "0.4", default-features = false, features = ["use_serde"] }
 slab = { version = "0.4", default-features = false, features = ["std"] }
 smallvec = { version = "1", default-features = false, features = ["serde", "union"] }
 spin = { version = "0.9" }
-spki = { version = "0.8", default-features = false, features = ["pem"] }
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 stable_deref_trait = { version = "1" }
 stats_alloc = { version = "0.1" }
 streamvbyte64 = { version = "0.2", default-features = false }
 structured-stemmers = { version = "1", default-features = false }
-subtle = { version = "2", default-features = false, features = ["const-generics", "i128"] }
 tantivy = { version = "0.26", default-features = false, features = ["lz4-compression", "mmap", "stemmer", "stopwords"] }
 tantivy-bitpacker = { version = "0.10", default-features = false }
 tantivy-columnar = { version = "0.7", default-features = false }
@@ -254,15 +222,12 @@ ucd-trie = { version = "0.1", default-features = false, features = ["std"] }
 unarray = { version = "0.1", default-features = false }
 unicode-normalization = { version = "0.1" }
 universal-hash = { version = "0.6", default-features = false }
-untrusted = { version = "0.9", default-features = false }
 utf8-ranges = { version = "1", default-features = false }
 utf8parse = { version = "0.2" }
 uuid = { version = "1", features = ["serde", "v4"] }
 wait-timeout = { version = "0.2", default-features = false }
 walkdir = { version = "2", default-features = false }
 whatlang = { version = "0.18", default-features = false }
-wnaf = { version = "0.14", default-features = false }
-x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zeroize = { version = "1" }
@@ -283,9 +248,7 @@ arc-swap = { version = "1", default-features = false }
 async-trait = { version = "0.1", default-features = false }
 atomic-waker = { version = "1", default-features = false }
 autocfg = { version = "1", default-features = false }
-base16ct = { version = "1", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22" }
-base64ct = { version = "1", default-features = false, features = ["alloc"] }
 bigdecimal = { version = "0.4", default-features = false, features = ["serde"] }
 bit-set = { version = "0.11" }
 bit-vec = { version = "0.10" }
@@ -299,11 +262,9 @@ byteorder-lite = { version = "0.1" }
 bytes = { version = "1" }
 byteview = { version = "0.10" }
 cast = { version = "0.3", default-features = false }
-cc = { version = "1", default-features = false }
 census = { version = "0.4", default-features = false }
 cfg-if = { version = "1", default-features = false }
-chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha"] }
-chacha20poly1305 = { version = "0.11", default-features = false }
+chacha20 = { version = "0.10", default-features = false, features = ["rng"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ciborium = { version = "0.2" }
 ciborium-io = { version = "0.2", default-features = false, features = ["std"] }
@@ -326,26 +287,18 @@ crossbeam-deque = { version = "0.8" }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
 crunchy = { version = "0.2" }
-crypto-bigint = { version = "0.7", default-features = false, features = ["alloc", "hybrid-array", "rand_core", "subtle", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom"] }
-crypto-primes = { version = "0.7", default-features = false }
 ctr = { version = "0.10", default-features = false }
-ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
-curve25519-dalek = { version = "5", default-features = false, features = ["alloc", "digest", "zeroize"] }
+ctutils = { version = "0.4", default-features = false }
 darling = { version = "0.24" }
 darling_core = { version = "0.24", default-features = false, features = ["suggestions"] }
 darling_macro = { version = "0.24", default-features = false }
 dashmap = { version = "6", default-features = false }
 datasketches = { version = "0.2", default-features = false }
-der = { version = "0.8", default-features = false, features = ["oid", "pem"] }
 deranged = { version = "0.5", features = ["serde"] }
 digest = { version = "0.11", features = ["alloc", "mac", "oid"] }
 downcast-rs = { version = "2" }
-ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "alloc", "pem"] }
-ed25519 = { version = "3", default-features = false, features = ["alloc", "pkcs8"] }
-ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "pkcs8", "zeroize"] }
 either = { version = "1", default-features = false, features = ["use_std"] }
-elliptic-curve = { version = "0.14", default-features = false, features = ["ecdh", "pem"] }
 endian-type = { version = "0.1", default-features = false }
 env_filter = { version = "2", default-features = false, features = ["std"] }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
@@ -353,8 +306,6 @@ equivalent = { version = "1", default-features = false }
 erased-serde = { version = "0.4", default-features = false, features = ["alloc"] }
 fastdivide = { version = "0.4", default-features = false }
 fastrand = { version = "2" }
-ff = { version = "0.14", default-features = false, features = ["alloc"] }
-find-msvc-tools = { version = "0.1", default-features = false }
 flume = { version = "0.12", default-features = false }
 fnv = { version = "1" }
 foldhash-6f8ce4dd05d13bba = { package = "foldhash", version = "0.2", default-features = false }
@@ -366,19 +317,16 @@ futures-macro = { version = "0.3", default-features = false }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3" }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 ghash = { version = "0.6", default-features = false }
-group = { version = "0.14", default-features = false, features = ["alloc"] }
 half = { version = "2", default-features = false }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
-hkdf = { version = "0.13", default-features = false }
 hmac = { version = "0.13", default-features = false }
 htmlescape = { version = "0.3", default-features = false }
-hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "subtle", "zeroize"] }
+hybrid-array = { version = "0.4", default-features = false }
 ident_case = { version = "1", default-features = false }
 indexmap = { version = "2", default-features = false, features = ["std"] }
 inout = { version = "0.2", default-features = false }
@@ -416,29 +364,21 @@ oneshot = { version = "0.1" }
 oorandom = { version = "11", default-features = false }
 ordered-float = { version = "5" }
 ownedbytes = { version = "0.9", default-features = false }
-p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "pem"] }
-p384 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "pem"] }
 page_size = { version = "0.6", default-features = false }
 parking_lot = { version = "0.12" }
 parking_lot_core = { version = "0.9", default-features = false }
-pem-rfc7468 = { version = "1", default-features = false, features = ["alloc"] }
 pest = { version = "2" }
 pest_derive = { version = "2" }
 pest_generator = { version = "2", default-features = false, features = ["std"] }
 pest_meta = { version = "2" }
 pin-project-lite = { version = "0.2", default-features = false }
-pkcs1 = { version = "0.8.0-rc.5", default-features = false, features = ["pem"] }
-pkcs8 = { version = "0.11", default-features = false, features = ["pem"] }
 plotters = { version = "0.3", default-features = false, features = ["area_series", "line_series", "svg_backend"] }
 plotters-backend = { version = "0.3", default-features = false }
 plotters-svg = { version = "0.3", default-features = false }
-poly1305 = { version = "0.9", default-features = false }
 polyval = { version = "0.7", default-features = false, features = ["hazmat"] }
 powerfmt = { version = "0.2", default-features = false }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 prettyplease = { version = "0.3", default-features = false }
-primefield = { version = "0.14", default-features = false }
-primeorder = { version = "0.14", default-features = false }
 proc-macro2 = { version = "1" }
 proptest = { version = "1" }
 quanta = { version = "0.12", default-features = false }
@@ -458,24 +398,18 @@ rayon-core = { version = "1", default-features = false }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-rfc6979 = { version = "0.6", default-features = false }
-ring = { version = "0.17" }
 rmp = { version = "0.8" }
 rmp-serde = { version = "1", default-features = false }
 rmpv = { version = "1", default-features = false, features = ["with-serde"] }
-rsa = { version = "0.10.0-rc.19", default-features = false, features = ["encoding", "sha2"] }
 rust-stemmers = { version = "1", default-features = false }
 rustc-hash = { version = "2" }
 rustc_version = { version = "0.4", default-features = false }
-rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 rustversion = { version = "1", default-features = false }
 rusty-fork = { version = "0.3", default-features = false, features = ["timeout"] }
 s2 = { version = "0.2" }
 same-file = { version = "1", default-features = false }
 scopeguard = { version = "1", default-features = false }
-sec1 = { version = "0.8", features = ["ctutils", "pem", "subtle"] }
 semver = { version = "1" }
 serde = { version = "1", features = ["alloc", "derive"] }
 serde_bytes = { version = "0.11" }
@@ -484,21 +418,17 @@ serde_derive = { version = "1" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = { version = "0.11" }
 sharded-slab = { version = "0.1", default-features = false }
-shlex = { version = "2" }
-signature = { version = "3", default-features = false, features = ["alloc", "digest", "rand_core"] }
 sketches-ddsketch-468e82937335b1c9 = { package = "sketches-ddsketch", version = "0.3", default-features = false }
 sketches-ddsketch-9fbad63c4bcf4a8f = { package = "sketches-ddsketch", version = "0.4", default-features = false, features = ["use_serde"] }
 slab = { version = "0.4", default-features = false, features = ["std"] }
 smallvec = { version = "1", default-features = false, features = ["serde", "union"] }
 spin = { version = "0.9" }
-spki = { version = "0.8", default-features = false, features = ["pem"] }
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 stable_deref_trait = { version = "1" }
 stats_alloc = { version = "0.1" }
 streamvbyte64 = { version = "0.2", default-features = false }
 strsim = { version = "0.11", default-features = false }
 structured-stemmers = { version = "1", default-features = false }
-subtle = { version = "2", default-features = false, features = ["const-generics", "i128"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit-mut"] }
 tantivy = { version = "0.26", default-features = false, features = ["lz4-compression", "mmap", "stemmer", "stopwords"] }
@@ -537,15 +467,12 @@ unarray = { version = "0.1", default-features = false }
 unicode-ident = { version = "1", default-features = false }
 unicode-normalization = { version = "0.1" }
 universal-hash = { version = "0.6", default-features = false }
-untrusted = { version = "0.9", default-features = false }
 utf8-ranges = { version = "1", default-features = false }
 utf8parse = { version = "0.2" }
 uuid = { version = "1", features = ["serde", "v4"] }
 wait-timeout = { version = "0.2", default-features = false }
 walkdir = { version = "2", default-features = false }
 whatlang = { version = "0.18", default-features = false }
-wnaf = { version = "0.14", default-features = false }
-x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zerocopy-derive = { version = "0.8", default-features = false }
@@ -564,12 +491,14 @@ rustix = { version = "1", features = ["fs"] }
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
-curve25519-dalek-derive = { version = "0.1", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 raw-cpuid = { version = "11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 alloca = { version = "0.4", default-features = false }
@@ -582,10 +511,13 @@ rustix = { version = "1", features = ["fs"] }
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.x86_64-unknown-linux-musl.dependencies]
 alloca = { version = "0.4", default-features = false }
@@ -599,12 +531,14 @@ rustix = { version = "1", features = ["fs"] }
 [target.x86_64-unknown-linux-musl.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
-curve25519-dalek-derive = { version = "0.1", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 raw-cpuid = { version = "11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.aarch64-unknown-linux-musl.dependencies]
 alloca = { version = "0.4", default-features = false }
@@ -617,10 +551,13 @@ rustix = { version = "1", features = ["fs"] }
 [target.aarch64-unknown-linux-musl.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.aarch64-apple-darwin.dependencies]
 alloca = { version = "0.4", default-features = false }
@@ -633,10 +570,13 @@ rustix = { version = "1", features = ["fs"] }
 [target.aarch64-apple-darwin.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
 errno = { version = "0.3", default-features = false, features = ["std"] }
+find-msvc-tools = { version = "0.1", default-features = false }
 libc = { version = "0.2" }
 rustix = { version = "1", features = ["fs"] }
+shlex = { version = "2" }
 
 [target.x86_64-pc-windows-msvc.dependencies]
 alloca = { version = "0.4", default-features = false }
@@ -655,10 +595,12 @@ windows_x86_64_msvc = { version = "0.52", default-features = false }
 [target.x86_64-pc-windows-msvc.build-dependencies]
 alloca = { version = "0.4", default-features = false }
 anstyle-wincon = { version = "3", default-features = false }
+cc = { version = "1", default-features = false }
 cpufeatures = { version = "0.3", default-features = false }
-curve25519-dalek-derive = { version = "0.1", default-features = false }
+find-msvc-tools = { version = "0.1", default-features = false }
 once_cell_polyfill = { version = "1" }
 raw-cpuid = { version = "11", default-features = false }
+shlex = { version = "2" }
 winapi = { version = "0.3", default-features = false, features = ["profileapi", "sysinfoapi"] }
 winapi-util = { version = "0.1", default-features = false }
 windows-link = { version = "0.2", default-features = false }

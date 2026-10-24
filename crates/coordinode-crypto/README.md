@@ -11,7 +11,7 @@ primitives to rustls and retains the upstream MIT OR Apache-2.0 licensing.
 
 ```rust
 let provider = std::sync::Arc::new(coordinode_crypto::provider());
-let builder = rustls::ClientConfig::builder_with_provider(provider)
+let _builder = rustls::ClientConfig::builder_with_provider(provider)
     .with_safe_default_protocol_versions()?;
 # Ok::<(), rustls::Error>(())
 ```
@@ -47,5 +47,6 @@ RUSTFLAGS='--cfg getrandom_backend="custom"' cargo check -p coordinode-crypto \
 This checks compilation, not the availability or security of a target's entropy
 implementation. Production entropy errors propagate as failures.
 
-The package has an independent version and is shared by CoordiNode and
-structured-proxy. See `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICES` for licensing.
+The package follows the CoordiNode release version. Other consumers can reuse
+the provider directly or use the provider installed by their host process.
+See `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICES` for licensing.

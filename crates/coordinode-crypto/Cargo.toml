@@ -1,11 +1,11 @@
 [package]
 name = "coordinode-crypto"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 description = "Pure-Rust RustCrypto provider for rustls"
-repository = "https://github.com/structured-world/structured-proxy"
+repository.workspace = true
 readme = "README.md"
 publish = true
 

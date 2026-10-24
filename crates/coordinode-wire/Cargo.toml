@@ -19,7 +19,7 @@ bytes = { workspace = true }
 structured-zstd = "0.2"
 # Shared pure-Rust TLS provider and local identity policy.
 rustls = { version = "0.23", default-features = false }
-coordinode-crypto = { version = "0.1", path = "../coordinode-crypto" }
+coordinode-crypto = { version = "0.8", path = "../coordinode-crypto" }
 # Fallible process-wide provider initialization must not cache an initialization error.
 once_cell = "1"
 # PEM parsing lives in rustls-pki-types now (rustls-pemfile is unmaintained).

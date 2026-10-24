@@ -23,5 +23,8 @@ impl TryCryptoRng for FailedEntropy {}
 // Entropy failure must return a TLS error before an exchange is constructed.
 #[test]
 fn entropy_failure_does_not_panic_or_create_an_exchange() {
-    assert!(matches!(super::X25519::start_with_rng(&mut FailedEntropy), Err(rustls::Error::General(_))));
+    assert!(matches!(
+        super::X25519::start_with_rng(&mut FailedEntropy),
+        Err(rustls::Error::General(_))
+    ));
 }

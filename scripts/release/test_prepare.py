@@ -49,6 +49,7 @@ name="source-only"
         self.assertEqual(result["dependencies"], original["dependencies"])
         self.assertIn("build-dependencies", original)
         self.assertIn("/bindings/**", result["package"]["include"])
+        self.assertIn("/LICENSE-*", result["package"]["include"])
 
     def test_workspace_hack_cannot_silently_ship(self):
         # Failing preparation is safer than publishing the feature-unification

@@ -47,6 +47,13 @@ jobs:
             sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
           fi
       - uses: Swatinem/rust-cache@v2
+      - name: Keep REST transcoding independent of JWT authentication
+        run: |
+          tree=$(cargo tree -p coordinode-server -e normal --target all --prefix none)
+          if printf '%s\n' "$tree" | grep -E '^(jsonwebtoken|rustls-rustcrypto) v'; then
+            echo "::error::the database REST transcoder must not enable proxy JWT or a separate TLS provider"
+            exit 1
+          fi
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -394,6 +401,24 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  crypto-alloc:
+    name: TLS provider allocation-only and MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: thumbv7em-none-eabihf
+      - name: Check the provider MSRV
+        run: cargo check -p coordinode-crypto
+      - name: Check allocation-only on a bare-metal target
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="custom" -D warnings'
+        run: cargo check -p coordinode-crypto --no-default-features --features alloc --target thumbv7em-none-eabihf
+      - name: Clean the build output
+        if: always()
+        run: cargo clean
 
   deny:
     name: License Check

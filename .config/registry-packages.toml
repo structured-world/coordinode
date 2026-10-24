@@ -3,6 +3,7 @@
 # are deliberately not part of this library distribution.
 entrypoint = "coordinode-embed"
 packages = [
+  "coordinode-crypto",
   "coordinode-core", "coordinode-storage", "coordinode-vector",
   "coordinode-modality", "coordinode-search", "coordinode-cluster",
   "coordinode-query", "coordinode-swarm", "coordinode-wire",

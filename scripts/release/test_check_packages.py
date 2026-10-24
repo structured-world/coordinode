@@ -41,6 +41,16 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(result['files'], 6)
         self.assertEqual(len(result['sha256']), 64)
 
+    def test_dual_licensed_provider_must_ship_both_license_texts(self):
+        # Package preparation must not replace the provider's upstream license
+        # grant with the engine's license or omit either original text.
+        with self.assertRaisesRegex(ValueError, 'LICENSE-APACHE'):
+            self.inspect('license="MIT OR Apache-2.0"\n',
+                         extra={'LICENSE-MIT': b'MIT license fixture'})
+        self.inspect('license="MIT OR Apache-2.0"\n',
+                     extra={'LICENSE-MIT': b'MIT license fixture',
+                            'LICENSE-APACHE': b'Apache license fixture'})
+
     def test_path_edge_cannot_masquerade_as_a_registry_package(self):
         with self.assertRaisesRegex(ValueError, 'source dependency'):
             self.inspect('[dependencies.coordinode-core]\nversion="=1.0.0"\npath="../core"\n')

@@ -187,6 +187,16 @@ Running the stock build, leave the table out.
 
 ### TLS trust and self-signed certificates
 
+Local TLS private keys must be ECDSA P-256/P-384 or Ed25519. RSA private
+identities, including RSA inside PKCS#8, are rejected before activation.
+RSA certificate issuers and peer signatures remain supported for verification;
+an ECDSA server certificate signed by an RSA CA is supported. Rejected identity
+rotation retains the last valid identity and reports the failure.
+
+The REST proxy only transcodes requests and forwards credentials to the database.
+It does not install a JWT verifier or independently authorize requests. Its TLS
+connections use the same provider selected by the embedding host.
+
 There is no "skip verification" switch: a client certificate is always verified
 against `--tls-ca`, which is the trust root. For a single self-signed server
 certificate, clients point their trust at the certificate itself: a self-signed

@@ -48,7 +48,7 @@ def prepare_manifest(document, version, names, codegen):
     """Describe only delivered library targets, preserving runtime features."""
     document = tomlkit.parse(tomlkit.dumps(document))
     package = document["package"]
-    package["include"] = ["/src/**", "/build.rs", "/bindings/**", "/LICENSE",
+    package["include"] = ["/src/**", "/build.rs", "/bindings/**", "/LICENSE", "/LICENSE-*",
                           "/NOTICES", "/COPYRIGHT", "/README.md", "/Cargo.toml"]
     for switch in ("autobins", "autoexamples", "autotests", "autobenches"):
         package[switch] = False
@@ -137,7 +137,8 @@ def main():
             (binding_dir / "files.txt").write_text("\n".join(files) + "\n")
             shutil.copyfile(root / "scripts/release/prepared-build.rs", folder / "build.rs")
         for filename in ("LICENSE", "NOTICES", "COPYRIGHT"):
-            shutil.copyfile(root / filename, folder / filename)
+            if not (folder / filename).exists():
+                shutil.copyfile(root / filename, folder / filename)
         doc = prepare_manifest(tomlkit.parse(manifest.read_text()), version, names, name in config["bindings"])
         manifest.write_text(tomlkit.dumps(doc))
         report["packages"][name] = {"manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}

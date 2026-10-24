@@ -71,10 +71,7 @@ fn install(provider: Arc<CryptoProvider>) -> Result<InstalledProvider, TlsError>
     effective
         .install_default()
         .map_err(|_| TlsError::ProviderConflict)?;
-    let effective = Arc::clone(
-        CryptoProvider::get_default()
-            .expect("successful rustls provider installation establishes the process default"),
-    );
+    let effective = Arc::clone(CryptoProvider::get_default().ok_or(TlsError::ProviderConflict)?);
     Ok(InstalledProvider {
         requested: provider,
         effective,

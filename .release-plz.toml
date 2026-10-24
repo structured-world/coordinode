@@ -112,6 +112,7 @@ changelog_include = [
     "coordinode-bench",
     "coordinode-cluster",
     "coordinode-core",
+    "coordinode-crypto",
     "coordinode-embed",
     "coordinode-modality",
     "coordinode-query",
@@ -174,6 +175,15 @@ version_group = "coordinode"
 publish = true
 git_only = false
 semver_check = true
+
+[[package]]
+name = "coordinode-crypto"
+version_group = "coordinode"
+publish = true
+git_only = false
+semver_check = true
+# This provider did not exist at the previous shared release tag.
+git_tag_name = "coordinode-crypto-v{{ version }}"
 
 [[package]]
 name = "coordinode-embed"

@@ -41,6 +41,10 @@ def inspect_archive(archive, name, version, names, bindings):
         manifest = tomllib.loads(package.extractfile(files["Cargo.toml"]).read().decode())
         if manifest["package"]["name"] != name or manifest["package"]["version"] != version:
             raise ValueError(f"{name}: archive identity mismatch")
+        if manifest["package"].get("license") == "MIT OR Apache-2.0":
+            for license_file in ("LICENSE-MIT", "LICENSE-APACHE"):
+                if license_file not in files:
+                    raise ValueError(f"{name}: missing {license_file}")
         scopes = [manifest, *manifest.get("target", {}).values()]
         for scope in scopes:
             if scope.get("dev-dependencies"):
