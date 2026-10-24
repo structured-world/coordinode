@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.8.1 - 2026-10-24
+
+### Added
+
+- *(storage)* wire the remaining lsm-tree 6.0 controls
+- *(storage)* one I/O budget for compaction and scrub
+- *(routing)* read a routed answer as its rows are asked for
+- *(embed)* run a host's commands through any member
+- *(embed)* one error contract for local and routed calls
+- *(session)* run transactions on the session in arrival order
+- *(transactions)* client-drawn UUID transaction IDs
+- *(cluster)* route operation calls to the leader between members
+- *(cluster)* serve clients through any member
+- *(txn)* hold interactive transactions on their owner
+- *(server)* serve PublishSchema and AwaitSchema
+- *(schema)* prove label definitions in the background
+- *(operation)* apply each client write once
+- *(storage)* store index generations under local installations
+- *(migrate)* add the node sizes report module
+- *(migrate)* catalog record migrations, check and journal stats
+- *(migrate)* offline tool to bring a data directory current
+
+### Fixed
+
+- *(embed)* bound what routed commands hold on the executing member
+- *(routing)* send a routed answer as it is produced
+- *(embed)* every member reaps idle transactions
+- *(storage)* answer a blob write only once it is durable
+- *(embed)* carry a constraint kind as typed bounded fields
+- *(server)* take no periodic checkpoints by default
+- *(storage)* refuse a group member's store an own journal
+- *(embed)* release the store before a member's shutdown returns
+- *(embed)* constrain pure-Rust parser closure
+- *(storage)* never copy a checkpoint over a file it holds
+- *(migrate)* find every marked store, Raft snapshot captures too
+
+### Performance
+
+- *(index)* check every generation in one sorted pass
+- *(session)* open a transaction with its first statement
+- *(query)* bound property delta chains with whole writes
+
+### Testing
+
+- *(server)* keep the label replication test's leader on a busy host
+- *(server)* serve command routing in the follower write test
+- *(session)* a commit in flight survives its stream going away
+
+### Bench
+
+- *(embed)* measure schema packages against single calls
+
 ## v0.8.0 - 2026-10-23
 
 ### Added

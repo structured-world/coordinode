@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.8.1 - 2026-10-24
+
+### Fixed
+
+- *(embed)* constrain pure-Rust parser closure
+
 ## v0.8.0 - 2026-10-23
 
 ### Added

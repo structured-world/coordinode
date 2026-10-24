@@ -2,6 +2,22 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.8.1 - 2026-10-24
+
+### Added
+
+- *(session)* run transactions on the session in arrival order
+- *(transactions)* client-drawn UUID transaction IDs
+- *(txn)* hold interactive transactions on their owner
+
+### Performance
+
+- *(session)* open a transaction with its first statement
+
+### Testing
+
+- *(session)* a commit in flight survives its stream going away
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
