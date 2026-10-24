@@ -23,6 +23,7 @@ jobs:
           name: registry-qualification
           path: |
             target/registry-preparation.json
+            target/fresh-dependency-metadata.json
             target/prepared-consumer-metadata.json
           if-no-files-found: ignore
       - name: Clean the build output

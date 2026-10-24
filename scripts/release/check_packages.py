@@ -61,6 +61,48 @@ def inspect_archive(archive, name, version, names, bindings):
     return {"sha256": hashlib.sha256(archive.read_bytes()).hexdigest(), "files": len(files)}
 
 
+def consumer_manifest(version):
+    return (
+        '[package]\nname="coordinode-registry-consumer"\nversion="0.0.0"\nedition="2024"\n'
+        '[features]\nreplication=["coordinode-embed/replication"]\n'
+        '[dependencies]\n'
+        f'coordinode-embed="={version}"\ncoordinode-core="={version}"\n')
+
+
+def mirror_fresh_dependencies(root, names, version, registry, toolchains):
+    """Discover allowed external versions, then mirror them for archive tests.
+
+    Path patches expose only the unpublished archives to dependency resolution.
+    They are never used to build or qualify the consumer.
+    """
+    with tempfile.TemporaryDirectory(prefix="coordinode-dependency-discovery-") as temporary:
+        discovery = pathlib.Path(temporary)
+        packages = discovery / "packages"
+        packages.mkdir()
+        for name in names:
+            archive = root / f"target/package/{name}-{version}.crate"
+            with tarfile.open(archive) as package:
+                package.extractall(packages, filter="data")
+        patches = '[patch.crates-io]\n' + ''.join(
+            f'{name}={{path={json.dumps(str(packages / f"{name}-{version}"))}}}\n'
+            for name in names)
+        env = dict(os.environ, CARGO_HOME=str(discovery / "cargo-home"),
+                   CARGO_TARGET_DIR=str(discovery / "target"))
+        for index, toolchain in enumerate(toolchains):
+            consumer = discovery / str(index)
+            (consumer / "src").mkdir(parents=True)
+            (consumer / "src/main.rs").write_text('fn main() {}\n')
+            (consumer / "Cargo.toml").write_text(consumer_manifest(version) + patches)
+            prefix = ["rustup", "run", toolchain] if toolchain else []
+            graph = subprocess.check_output(
+                [*prefix, "cargo", "metadata", "--all-features", "--format-version=1"],
+                cwd=consumer, env=env, text=True)
+            (root / "target/fresh-dependency-metadata.json").write_text(graph)
+            check_native_stack_helpers(json.loads(graph)['packages'])
+            subprocess.run(["cargo-local-registry", "--sync", str(consumer / "Cargo.lock"),
+                            "--no-delete", str(registry)], cwd=consumer, env=env, check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkout", type=pathlib.Path, required=True)
@@ -75,6 +117,7 @@ def main():
     report = json.loads(report_path.read_text())
     names = inventory["packages"]
     version = report["version"]
+    toolchains = args.consumer_toolchain or [None]
     if args.source == "prepared":
         package_args = ["cargo", "package", "--allow-dirty", "--no-verify"]
         for name in names:
@@ -93,16 +136,13 @@ def main():
                         "--no-delete", str(registry)], cwd=root, check=True)
         if (root / "Cargo.lock").read_bytes() != packaged_lock:
             raise RuntimeError("registry mirroring changed Cargo.lock; regenerate and requalify archives")
+        mirror_fresh_dependencies(root, names, version, registry, toolchains)
     with tempfile.TemporaryDirectory(prefix="coordinode-package-consumer-") as temporary:
         consumer = pathlib.Path(temporary)
         (consumer / "src").mkdir()
         (consumer / ".cargo").mkdir()
         (consumer / "src/main.rs").write_text((root / "scripts/release/consumer.rs").read_text())
-        (consumer / "Cargo.toml").write_text(
-            '[package]\nname="coordinode-registry-consumer"\nversion="0.0.0"\nedition="2024"\n'
-            '[features]\nreplication=["coordinode-embed/replication"]\n'
-            '[dependencies]\n'
-            f'coordinode-embed="={version}"\ncoordinode-core="={version}"\n')
+        (consumer / "Cargo.toml").write_text(consumer_manifest(version))
         if args.source == "prepared":
             (consumer / ".cargo/config.toml").write_text(
                 '[source.crates-io]\nreplace-with="prepared"\n[source.prepared]\n'
@@ -115,8 +155,16 @@ def main():
             env["CARGO_HOME"] = str(consumer / "cargo-home")
         network = ["--offline"] if args.source == "prepared" else []
         qualified = []
-        for index, toolchain in enumerate(args.consumer_toolchain or [None]):
+        for index, toolchain in enumerate(toolchains):
             prefix = ["rustup", "run", toolchain] if toolchain else []
+            # Each toolchain resolves its own fresh consumer graph. Never let
+            # the minimum-toolchain lock hide a newer allowed resolution.
+            (consumer / "Cargo.lock").unlink(missing_ok=True)
+            graph = subprocess.check_output(
+                [*prefix, "cargo", "metadata", *network, "--all-features", "--format-version=1"],
+                cwd=consumer, env=env, text=True)
+            (root / f"target/{args.source}-consumer-metadata.json").write_text(graph)
+            check_native_stack_helpers(json.loads(graph)['packages'])
             for feature in (None, "replication"):
                 data = consumer / f"run-{index}-{feature or 'standalone'}"
                 data.mkdir()
@@ -126,11 +174,6 @@ def main():
                 subprocess.run([*command, "--", str(data)], cwd=consumer, env=env, check=True)
             qualified.append({"toolchain": toolchain or "current",
                               "standalone": "passed", "replication_build": "passed"})
-        graph = subprocess.check_output(
-            [*prefix, "cargo", "metadata", *network, "--all-features", "--format-version=1"],
-            cwd=consumer, env=env, text=True)
-        check_native_stack_helpers(json.loads(graph)['packages'])
-        (root / f"target/{args.source}-consumer-metadata.json").write_text(graph)
     report[f"{args.source}_consumer"] = qualified
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"{args.source} external consumer passed; consumer build/data cleaned")

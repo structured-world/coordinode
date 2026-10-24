@@ -37,6 +37,14 @@ uniqueness, CAS, rollback, reopen and reconciliation after a process exits witho
 closing the database. The replication-enabled fixture is not a multi-member
 failure qualification, and process exit is not a power-loss simulation.
 
+Before compiling a consumer, the checker resolves fresh allowed dependencies
+for each toolchain. Unpacked archives are path-patched only for this discovery,
+so unpublished versions can participate in registry resolution. Their external
+dependencies are mirrored into the local registry; the actual consumer still
+builds exclusively from registry archives without patches. The source lockfile
+does not constrain this check, and native stack helpers stop qualification
+before compilation. The source suite separately qualifies its locked graph.
+
 The release job runs the same qualification before upload. It selects the commit
 release-plz will actually publish: an ancestor release-PR head is eligible only
 when its complete Git tree matches the source-CI commit. A different tree stops

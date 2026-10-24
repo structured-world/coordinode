@@ -122,6 +122,7 @@ jobs:
           name: registry-publication
           path: |
             target/registry-preparation.json
+            target/fresh-dependency-metadata.json
             target/prepared-consumer-metadata.json
             target/crates-io-consumer-metadata.json
             target/package/*.crate
