@@ -181,11 +181,16 @@ mod tls;
 #[test]
 fn cipher_suites_preserve_aead_key_usage_limits() {
     use rustls::{CipherSuite, SupportedCipherSuite};
-    for suite in super::provider().cipher_suites {
+    let suites = super::provider().cipher_suites;
+    assert_eq!(suites.len(), if cfg!(feature = "tls12") { 9 } else { 3 });
+    for suite in suites {
         let common = match suite {
             SupportedCipherSuite::Tls13(suite) => &suite.common,
             #[cfg(feature = "tls12")]
             SupportedCipherSuite::Tls12(suite) => &suite.common,
+            // Dev dependencies can enable rustls TLS 1.2 independently of our profile.
+            #[cfg(not(feature = "tls12"))]
+            _ => panic!("a TLS 1.3-only provider advertised another protocol"),
         };
         let expected = match common.suite {
             CipherSuite::TLS13_AES_128_GCM_SHA256
