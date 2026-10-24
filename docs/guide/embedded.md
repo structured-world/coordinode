@@ -10,17 +10,27 @@ requirements; optional replication also adds inter-node networking.
 
 ## Rust package availability
 
-The Rust engine is available in the public source workspace. A `coordinode-embed`
-package has not yet been published to crates.io; server release binaries and the
-separate Python package do not supply a Rust library package. In particular,
-`coordinode-embed = "0.3"` is not an available registry installation.
+Install the [Rust library from crates.io](https://crates.io/crates/coordinode-embed):
+
+```toml
+[dependencies]
+coordinode-embed = "0.8"
+```
+
+The default build omits consensus, inter-node transport and the async runtime.
+Enable `features = ["replication"]` when the host needs membership in a
+replicated group; the host then supplies a multi-threaded Tokio runtime. This
+is still an in-process library. A server binary or Python package is not needed.
+Examples that directly import `coordinode_core` types also require an explicit
+`coordinode-core = "0.8"` dependency.
 
 For source integration, select and pin an exact reviewed revision of the
 [public repository](https://github.com/structured-world/coordinode) rather than
 following `main`. Keep your application's lockfile and qualify its resolved
 dependencies and selected features. A source pin is not a qualified registry
-release. The workspace pins Rust 1.99.0; the declared lower MSRV needs its own
-external consumer check. Source builds with `replication` also use the pinned
+release. The workspace pins Rust 1.99.0. Registry consumer checks use Rust
+1.92.0 and 1.99.0 on Linux, including compilation with `replication` enabled.
+Source builds with `replication` also use the pinned
 proto submodule and generation tooling. Prepared registry packages include the
 generated bindings and omit the workspace's development feature-unification
 helper; source and packaged dependency graphs are qualified separately.
@@ -40,9 +50,6 @@ The CE license is AGPL-3.0-only. See the repository's `LICENSE`, `COPYRIGHT` and
 `NOTICES`; dependency licenses remain their own. A source lockfile is not a
 feature/target-specific license report or a promise of production qualification.
 
-The examples below describe library APIs. They do not imply that an unpublished
-registry version can be installed.
-
 ### Analyzer upgrades
 
 This source line pins `structured-stemmers` 1.2.0, generated from Snowball main
@@ -57,10 +64,10 @@ the database. Package installation does not perform this data migration.
 ## Minimal Example
 
 ```rust
-use coordinode_embed::Database;
+use coordinode_embed::{Database, DatabaseError};
 
-fn main() -> anyhow::Result<()> {
-    let mut db = Database::open("/tmp/my-graph")?;
+fn main() -> Result<(), DatabaseError> {
+    let mut db = Database::open("my-graph")?;
 
     // Execute Cypher directly — no gRPC
     db.execute_cypher("CREATE (n:Person {name: 'Alice'}) RETURN n")?;

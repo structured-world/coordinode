@@ -105,8 +105,10 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # Parser
-pest = "2"
-pest_derive = "2"
+# Preserve the supported pure-Rust parser and proc-macro dependency family.
+# https://github.com/pest-parser/pest/issues/1233
+pest = "=2.9.2"
+pest_derive = "=2.9.2"
 # SQL parser for the SQL QueryFrontend, pure Rust, Apache-2.0.
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 

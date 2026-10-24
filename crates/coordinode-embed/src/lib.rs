@@ -2,10 +2,26 @@
 //!
 //! Use CoordiNode as an in-process library without a separate database server.
 //!
+//! ## Installation
+//!
+//! ```toml
+//! [dependencies]
+//! coordinode-embed = "0.8"
+//! ```
+//!
+//! The registry package includes generated protocol bindings, so consumers do
+//! not need a proto submodule or protobuf generation tools. Enable `replication`
+//! when the host needs to participate in a replicated group (see below).
+//!
+//! ## Example
+//!
 //! ```rust,no_run
-//! use coordinode_embed::Database;
-//! let mut db = Database::open("/tmp/coordinode-data").unwrap();
-//! let results = db.execute_cypher("MATCH (n:User) RETURN n.name").unwrap();
+//! use coordinode_embed::{Database, DatabaseError};
+//! # fn main() -> Result<(), DatabaseError> {
+//! let mut db = Database::open("coordinode-data")?;
+//! let results = db.execute_cypher("MATCH (n:User) RETURN n.name")?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Features
