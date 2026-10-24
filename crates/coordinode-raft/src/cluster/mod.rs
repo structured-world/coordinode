@@ -241,10 +241,7 @@ async fn found_deployment(
         Some(id) => id,
         None => {
             let mut id = [0u8; 16];
-            coordinode_wire::tls::selected_provider()
-                .map_err(|e| RaftNodeError::Init(format!("TLS crypto provider: {e}")))?
-                .secure_random
-                .fill(&mut id)
+            getrandom::fill(&mut id)
                 .map_err(|e| RaftNodeError::Init(format!("a random deployment identity: {e:?}")))?;
             DeploymentId(id)
         }

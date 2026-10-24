@@ -110,7 +110,7 @@ impl Fixture {
         let (chain, key) = self.pki.credentials(&self.pki.spiffe_id(id), not_after);
         Arc::new(
             SecurityContext::new(
-                coordinode_wire::tls::selected_provider().expect("a compatible crypto provider"),
+                self.pki.crypto_provider(),
                 chain,
                 key,
                 self.profile_with(others),

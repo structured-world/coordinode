@@ -1061,6 +1061,7 @@ dependencies = [
  "coordinode-wire",
  "coordinode-workspace-hack",
  "futures-util",
+ "getrandom 0.4.3",
  "metrics",
  "openraft",
  "parking_lot",

@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 //! Local consensus does not choose a process-wide TLS backend for its host.
 
 use std::sync::Arc;

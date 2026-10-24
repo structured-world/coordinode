@@ -24,6 +24,7 @@ pub type Credentials = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
 
 /// A test CA issuing node identities in one trust domain.
 pub struct TestPki {
+    provider: Arc<coordinode_wire::tls::CryptoProvider>,
     trust_domain: String,
     anchor: CertificateDer<'static>,
     anchor_pem: String,
@@ -56,11 +57,18 @@ impl TestPki {
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         let ca = params.self_signed(&key).expect("CA");
         Self {
+            provider: coordinode_wire::tls::rustcrypto_provider(),
             trust_domain: trust_domain.to_owned(),
             anchor: ca.der().clone(),
             anchor_pem: ca.pem(),
             issuer: Issuer::new(params, key),
         }
+    }
+
+    /// The backend explicitly owned by this test host and its security contexts.
+    #[must_use]
+    pub fn crypto_provider(&self) -> Arc<coordinode_wire::tls::CryptoProvider> {
+        Arc::clone(&self.provider)
     }
 
     /// Write the CA certificate as a PEM trust bundle into `dir`; returns
@@ -226,7 +234,7 @@ impl TestPki {
         let (chain, key) = self.credentials(uri, None);
         Arc::new(
             SecurityContext::new(
-                coordinode_wire::tls::selected_provider().expect("a compatible crypto provider"),
+                self.crypto_provider(),
                 chain,
                 key,
                 self.profile(),
@@ -309,7 +317,7 @@ impl TestPki {
     ) -> Arc<PeerConnections> {
         let (chain, key) = self.node_credentials(node_id);
         let context = SecurityContext::new(
-            coordinode_wire::tls::selected_provider().expect("a compatible crypto provider"),
+            self.crypto_provider(),
             chain,
             key,
             self.host_profile(Arc::clone(adapter)),
