@@ -1,0 +1,11 @@
+This package includes an adapted rustls-rustcrypto implementation from
+https://github.com/RustCrypto/rustls-rustcrypto at revision
+70f76c039e587192688af18a80d5d6435dedaf22.
+
+The upstream implementation is distributed under MIT OR Apache-2.0. Its
+original license texts and copyright notice are retained in LICENSE-MIT
+and LICENSE-APACHE. Adaptations include current dependency constraints,
+explicit macro identifiers, identity admission, bounded public RSA decoding,
+X25519 contributory checks, fallible entropy handling and AEAD corrections.
+
+Independent TLS/certificate backends are used only by development tests.

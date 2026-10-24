@@ -101,7 +101,7 @@ pub(crate) async fn serve(
             .crypto_provider
             .clone()
             .unwrap_or_else(coordinode_wire::tls::rustcrypto_provider),
-    );
+    )?;
 
     // Resolve the operational mode from the merged string value, so a
     // mode set in the config file is validated exactly like a CLI flag.

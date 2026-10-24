@@ -1,13 +1,16 @@
 //! TLS crypto provider selection and PEM loading.
 //!
 //! The crypto provider is chosen once at startup: the stock server picks
-//! the pure-Rust [`rustls_rustcrypto`] one (no C FFI), and a downstream
+//! the pure-Rust [`coordinode_crypto`] one (no C FFI), and a downstream
 //! distribution may select another, `aws-lc-rs` being the reason the seam
 //! exists. [`install_crypto_provider`] also makes the selection rustls'
 //! process default, so a dependency that builds its own TLS configuration
 //! (tonic's client-facing TLS) agrees with the inter-node wire.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+
+use coordinode_crypto::identity::IdentityKeyProvider;
+use once_cell::sync::OnceCell;
 
 use rustls::pki_types::pem::{Error as PemError, PemObject};
 
@@ -32,6 +35,12 @@ pub enum TlsError {
     /// No private key found in the supplied PEM.
     #[error("no private key in PEM")]
     NoKey,
+    /// A different provider was already installed or selected for this process.
+    #[error("a different TLS crypto provider is already selected for this process")]
+    ProviderConflict,
+    /// The private key does not satisfy the local identity policy.
+    #[error("unsupported local TLS identity: {0}")]
+    Identity(rustls::Error),
 }
 
 /// The pure-Rust crypto provider: RustCrypto algorithms, zero C FFI.
@@ -40,33 +49,63 @@ pub enum TlsError {
 /// selected.
 #[must_use]
 pub fn rustcrypto_provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls_rustcrypto::provider())
+    Arc::new(coordinode_crypto::provider())
 }
 
 /// The provider selected for this process.
-static SELECTED: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
+static SELECTED: OnceCell<InstalledProvider> = OnceCell::new();
+static IDENTITY_POLICY: OnceCell<IdentityKeyProvider> = OnceCell::new();
+
+struct InstalledProvider {
+    requested: Arc<CryptoProvider>,
+    effective: Arc<CryptoProvider>,
+}
+
+fn install(provider: Arc<CryptoProvider>) -> Result<InstalledProvider, TlsError> {
+    if CryptoProvider::get_default().is_some() {
+        return Err(TlsError::ProviderConflict);
+    }
+    let mut effective = provider.as_ref().clone();
+    effective.key_provider =
+        IDENTITY_POLICY.get_or_init(|| IdentityKeyProvider::new(provider.key_provider));
+    effective
+        .install_default()
+        .map_err(|_| TlsError::ProviderConflict)?;
+    let effective = Arc::clone(
+        CryptoProvider::get_default()
+            .expect("successful rustls provider installation establishes the process default"),
+    );
+    Ok(InstalledProvider {
+        requested: provider,
+        effective,
+    })
+}
 
 /// Select the crypto provider for this process and install it as rustls'
 /// default, so dependencies that build their own configs agree with the wire.
 ///
-/// Call once at startup, before any TLS config is built. First call wins: a
-/// later one is ignored and returns `false`, because changing the provider once
-/// connections exist would leave two halves of the process disagreeing about
-/// what was negotiated.
-pub fn install_crypto_provider(provider: Arc<CryptoProvider>) -> bool {
-    if SELECTED.set(Arc::clone(&provider)).is_err() {
-        return false;
+/// Call before any TLS config is built. Reusing the same selection is idempotent;
+/// selecting a different provider or finding an independently installed default
+/// is an error. The effective provider enforces the local identity key policy.
+///
+/// # Errors
+/// Returns [`TlsError::ProviderConflict`] for incompatible process initialization.
+pub fn install_crypto_provider(provider: Arc<CryptoProvider>) -> Result<(), TlsError> {
+    let selected = SELECTED.get_or_try_init(|| install(Arc::clone(&provider)))?;
+    if !Arc::ptr_eq(&selected.requested, &provider) {
+        return Err(TlsError::ProviderConflict);
     }
-    let _ = provider.as_ref().clone().install_default();
-    true
+    Ok(())
 }
 
 /// The selected provider, falling back to the pure-Rust one when startup
 /// selected nothing (an embedding host or a test building a context
 /// directly, say).
-#[must_use]
-pub fn selected_provider() -> Arc<CryptoProvider> {
-    SELECTED.get_or_init(rustcrypto_provider).clone()
+/// # Errors
+/// Returns [`TlsError::ProviderConflict`] if another component installed a default first.
+pub fn selected_provider() -> Result<Arc<CryptoProvider>, TlsError> {
+    let selected = SELECTED.get_or_try_init(|| install(rustcrypto_provider()))?;
+    Ok(Arc::clone(&selected.effective))
 }
 
 /// Parse one or more PEM certificates into DER.
@@ -82,18 +121,20 @@ pub fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> 
         })
 }
 
-/// Parse a single PEM private key (PKCS#8 / PKCS#1 / SEC1) into DER.
+/// Parse an allowed ECDSA or Ed25519 PEM private key into DER.
 ///
 /// # Errors
 /// [`TlsError::Pem`] on a decode error, [`TlsError::NoKey`] if none is present.
 pub fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> {
-    PrivateKeyDer::from_pem_slice(pem).map_err(|source| match source {
+    let key = PrivateKeyDer::from_pem_slice(pem).map_err(|source| match source {
         PemError::NoItemsFound => TlsError::NoKey,
         source => TlsError::Pem {
             what: "private key",
             source,
         },
-    })
+    })?;
+    coordinode_crypto::identity::check_identity_key(&key).map_err(TlsError::Identity)?;
+    Ok(key)
 }
 
 /// A verifier of ordinary client certificates issued by `roots`, on the
@@ -113,7 +154,7 @@ pub fn client_verifier(
     }
     let builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(store),
-        selected_provider(),
+        selected_provider().map_err(|e| e.to_string())?,
     );
     let builder = if mandatory {
         builder

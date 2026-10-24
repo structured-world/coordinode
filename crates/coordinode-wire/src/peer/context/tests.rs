@@ -236,6 +236,85 @@ async fn credential_updates_are_validated_whole_before_they_count() {
     assert_eq!(third, renewed_chain[0]);
 }
 
+/// Explicit backends cannot bypass identity admission on construction or rotation.
+#[tokio::test]
+async fn external_key_backend_obeys_identity_policy() {
+    use rustls::crypto::KeyProvider;
+    use rustls::pki_types::{PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
+
+    #[derive(Debug)]
+    struct Resolver {
+        signing: Arc<dyn rustls::sign::SigningKey>,
+        calls: AtomicUsize,
+    }
+    impl KeyProvider for Resolver {
+        fn load_private_key(
+            &self,
+            _: PrivateKeyDer<'static>,
+        ) -> Result<Arc<dyn rustls::sign::SigningKey>, rustls::Error> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::clone(&self.signing))
+        }
+    }
+    fn refused_keys() -> [PrivateKeyDer<'static>; 2] {
+        // The PKCS#8 header identifies RSA; admission must refuse it before any backend sees its body.
+        let rsa_pkcs8 = vec![
+            0x30, 0x14, 0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7,
+            0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x04, 0x00,
+        ];
+        [
+            PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(Vec::new())),
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(rsa_pkcs8)),
+        ]
+    }
+    let ca = ca();
+    let (chain, key) = leaf(&ca, &["spiffe://td.test/a"]);
+    let base = provider();
+    let resolver = Box::leak(Box::new(Resolver {
+        signing: base.key_provider.load_private_key(key.clone_key()).unwrap(),
+        calls: AtomicUsize::new(0),
+    }));
+    let external = Arc::new(CryptoProvider {
+        key_provider: resolver,
+        ..base.as_ref().clone()
+    });
+    for refused in refused_keys() {
+        assert!(
+            SecurityContext::new(
+                Arc::clone(&external),
+                chain.clone(),
+                refused,
+                crate::peer::test_pki::spiffe("td.test", &ca)
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+    let context = Arc::new(
+        SecurityContext::new(
+            external,
+            chain.clone(),
+            key,
+            crate::peer::test_pki::spiffe("td.test", &ca),
+        )
+        .unwrap(),
+    );
+    let before = context.state.load_full();
+    for refused in refused_keys() {
+        assert!(context.update_credentials(chain.clone(), refused).is_err());
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    assert!(Arc::ptr_eq(&before, &context.state.load_full()));
+    let peer = node(&ca, "spiffe://td.test/b");
+    let presented = handshake(
+        context.server_config(InboundAuth::NodeOnly).unwrap(),
+        peer.client_config(sid("spiffe://td.test/a")).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(presented, chain[0]);
+}
+
 /// Withdrawn trust takes effect for the next handshake; a trust update
 /// under which the node itself would not be valid is refused.
 #[tokio::test]

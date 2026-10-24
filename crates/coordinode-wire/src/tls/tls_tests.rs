@@ -39,3 +39,38 @@ fn load_private_key_missing_is_error() {
         Err(TlsError::NoKey)
     ));
 }
+
+// An already installed process provider must not be hidden by a separate wire selection.
+#[test]
+fn conflicting_process_provider_is_an_error() {
+    rustcrypto_provider()
+        .as_ref()
+        .clone()
+        .install_default()
+        .unwrap();
+    assert!(matches!(
+        install_crypto_provider(rustcrypto_provider()),
+        Err(TlsError::ProviderConflict)
+    ));
+    assert!(matches!(
+        selected_provider(),
+        Err(TlsError::ProviderConflict)
+    ));
+}
+
+// Reusing one explicit selection is idempotent and every transport sees rustls' actual default.
+#[test]
+fn selected_and_process_providers_are_identical() {
+    let provider = rustcrypto_provider();
+    install_crypto_provider(Arc::clone(&provider)).unwrap();
+    install_crypto_provider(provider).unwrap();
+    let selected = selected_provider().unwrap();
+    assert!(Arc::ptr_eq(
+        &selected,
+        CryptoProvider::get_default().unwrap()
+    ));
+    assert!(matches!(
+        install_crypto_provider(rustcrypto_provider()),
+        Err(TlsError::ProviderConflict)
+    ));
+}

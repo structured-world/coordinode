@@ -2134,7 +2134,7 @@ fn host_context(
     let (chain, key) = PKI.node_credentials(id);
     Arc::new(
         coordinode_embed::replication::SecurityContext::new(
-            coordinode_wire::tls::selected_provider(),
+            coordinode_wire::tls::selected_provider().expect("a compatible crypto provider"),
             chain,
             key,
             PKI.host_profile(Arc::clone(adapter)),

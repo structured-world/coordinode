@@ -23,7 +23,7 @@ pub fn tls_client_channel(
     authority: &str,
     identity: Option<Credentials>,
 ) -> tonic::transport::Channel {
-    let provider = coordinode_wire::tls::selected_provider();
+    let provider = coordinode_wire::tls::selected_provider().expect("a compatible crypto provider");
     let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
         .expect("protocol versions")

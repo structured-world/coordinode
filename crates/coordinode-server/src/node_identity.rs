@@ -29,7 +29,8 @@ impl NodeIdentity {
     /// node identity under the trust bundles.
     pub(crate) fn load(settings: NodeIdentitySettings) -> Result<Self, String> {
         let (chain, key) = credentials(&settings)?;
-        let context = SecurityContext::new(selected_provider(), chain, key, profile(&settings)?)
+        let provider = selected_provider().map_err(|e| e.to_string())?;
+        let context = SecurityContext::new(provider, chain, key, profile(&settings)?)
             .map_err(|e| e.to_string())?;
         Ok(Self {
             settings,

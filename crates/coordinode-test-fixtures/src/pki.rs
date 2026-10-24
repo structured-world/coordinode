@@ -226,7 +226,7 @@ impl TestPki {
         let (chain, key) = self.credentials(uri, None);
         Arc::new(
             SecurityContext::new(
-                coordinode_wire::tls::selected_provider(),
+                coordinode_wire::tls::selected_provider().expect("a compatible crypto provider"),
                 chain,
                 key,
                 self.profile(),
@@ -309,7 +309,7 @@ impl TestPki {
     ) -> Arc<PeerConnections> {
         let (chain, key) = self.node_credentials(node_id);
         let context = SecurityContext::new(
-            coordinode_wire::tls::selected_provider(),
+            coordinode_wire::tls::selected_provider().expect("a compatible crypto provider"),
             chain,
             key,
             self.host_profile(Arc::clone(adapter)),

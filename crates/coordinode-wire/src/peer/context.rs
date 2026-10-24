@@ -331,9 +331,8 @@ fn certify(
     if chain.is_empty() {
         return Err(ContextError::Credentials("no certificate".to_owned()));
     }
-    let signing = provider
-        .key_provider
-        .load_private_key(key)
+    let policy = coordinode_crypto::identity::IdentityKeyProvider::new(provider.key_provider);
+    let signing = rustls::crypto::KeyProvider::load_private_key(&policy, key)
         .map_err(|e| ContextError::Credentials(e.to_string()))?;
     let credentials = Arc::new(CertifiedKey::new(chain, signing));
     prove_possession(provider, &credentials)?;

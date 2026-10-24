@@ -17,10 +17,11 @@ bytes = { workspace = true }
 # Pure-Rust zstd (no C FFI) for transport compression. 0.2 is the floor: its
 # streaming decoder is built infallibly, as the code here calls it.
 structured-zstd = "0.2"
-# Inter-node TLS/mTLS. CE crypto provider is pure-Rust rustls-rustcrypto (no C
-# FFI); EE swaps the process-default CryptoProvider to aws-lc-rs.
+# Shared pure-Rust TLS provider and local identity policy.
 rustls = { version = "0.23", default-features = false }
-rustls-rustcrypto = "0.0.2-alpha"
+coordinode-crypto = { version = "0.1", path = "../coordinode-crypto" }
+# Fallible process-wide provider initialization must not cache an initialization error.
+once_cell = "1"
 # PEM parsing lives in rustls-pki-types now (rustls-pemfile is unmaintained).
 rustls-pki-types = { version = "1", features = ["std"] }
 # Chain validation for peer identities, the verifier rustls itself uses.
