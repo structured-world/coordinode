@@ -158,6 +158,46 @@ fn an_indexed_node_is_found_after_replay_behind_a_create() {
 
 // ── Close/Reopen persistence ────────────────────────────────────────
 
+/// A directory a live database holds is not opened a second time: the second
+/// open is refused and the first handle keeps working. Once the database is
+/// dropped, the directory opens again with the committed data, and a
+/// transaction left open at the drop is gone.
+#[test]
+fn a_held_directory_is_refused_and_reopens_once_released() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("CREATE (:Held {k: 1})").expect("write");
+    let open_txn = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(open_txn, "CREATE (:Held {k: 2})", None)
+        .expect("write in the open transaction");
+
+    let refused = Database::open(dir.path())
+        .err()
+        .expect("a directory a live handle holds was opened twice");
+    assert!(
+        matches!(refused, coordinode_embed::DatabaseError::Storage(_))
+            && refused.to_string().contains("Locked"),
+        "the second open names the held store: {refused:?}"
+    );
+    assert_eq!(
+        db.execute_cypher("MATCH (n:Held) RETURN n.k AS k")
+            .expect("the first handle still reads")
+            .len(),
+        1
+    );
+
+    drop(db);
+    let mut db = Database::open(dir.path()).expect("reopen once released");
+    let rows = db
+        .execute_cypher("MATCH (n:Held) RETURN n.k AS k")
+        .expect("read after reopen");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the committed write is there, the open transaction is not"
+    );
+}
+
 #[test]
 fn nodes_persist_across_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");

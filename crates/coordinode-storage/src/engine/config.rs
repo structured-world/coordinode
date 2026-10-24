@@ -132,16 +132,26 @@ pub struct EndpointConfig {
     /// omitting it leaves the endpoint untracked.
     #[serde(default)]
     pub capacity_bytes: u64,
-    /// Hard-limit in bytes — placement engine NEVER writes past this point
-    /// (`used ≤ hard_limit` always). `0` means "no hard limit" (placement engine still observes
-    /// filesystem capacity if known). When both `capacity_bytes` and
-    /// `hard_limit_bytes` are non-zero, `hard_limit_bytes` MUST be
-    /// `<= capacity_bytes` — validated in [`StorageConfig::with_endpoints`].
-    /// Cascade eviction triggers at 95% of `hard_limit_bytes` when non-zero.
-    /// Behaviour implemented by the hard-limit enforcement layer. Optional in
-    /// config: omitting it means no hard limit.
+    /// Total owned-footprint ceiling in bytes: the space the file system
+    /// allocates to every file the database keeps under this endpoint
+    /// (journal, tables, value files, indexes, metadata, captures, scratch)
+    /// never passes it. Growth is charged before it is written; a client
+    /// write that does not fit beside what is held and owed is refused with
+    /// `CapacityExhausted`. Other processes' files on the same file system
+    /// are not counted: the free-space reserve
+    /// ([`StorageConfig::min_free_bytes`]) guards the volume. `0` means no
+    /// limit. When both `capacity_bytes` and `hard_limit_bytes` are non-zero,
+    /// `hard_limit_bytes` MUST be `<= capacity_bytes`, validated in
+    /// [`StorageConfig::with_endpoints`]. Cascade eviction triggers at 95% of
+    /// it when non-zero.
     #[serde(default)]
     pub hard_limit_bytes: u64,
+    /// The part of [`hard_limit_bytes`](Self::hard_limit_bytes) client writes
+    /// leave free for flushes, space-reclaiming compactions and the store's
+    /// recovery records. Inside the limit, not added to it. `None` takes
+    /// [`DEFAULT_RECOVERY_RESERVE_DIVISOR`]: a sixteenth of the limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_reserve_bytes: Option<u64>,
     /// Per-block Reed-Solomon ECC policy for SST blocks on this endpoint.
     ///
     /// `Auto` (the default) derives the effective policy from the
@@ -234,6 +244,10 @@ impl PageEccPolicy {
     }
 }
 
+/// The recovery reserve an endpoint without a configured one keeps: this
+/// fraction of its hard limit.
+pub const DEFAULT_RECOVERY_RESERVE_DIVISOR: u64 = 16;
+
 /// Per-endpoint strategy when a write would push `used_bytes` past the
 /// configured `hard_limit_bytes`.
 ///
@@ -280,6 +294,7 @@ impl EndpointConfig {
             tier,
             capacity_bytes: 0,
             hard_limit_bytes: 0,
+            recovery_reserve_bytes: None,
             page_ecc: PageEccPolicy::default(),
             hard_limit_strategy: HardLimitStrategy::default(),
             tags: std::collections::BTreeMap::new(),
@@ -310,6 +325,23 @@ impl EndpointConfig {
     pub fn with_hard_limit_bytes(mut self, hard_limit_bytes: u64) -> Self {
         self.hard_limit_bytes = hard_limit_bytes;
         self
+    }
+
+    /// Set the recovery reserve inside the hard limit.
+    #[must_use]
+    pub fn with_recovery_reserve_bytes(mut self, bytes: u64) -> Self {
+        self.recovery_reserve_bytes = Some(bytes);
+        self
+    }
+
+    /// The recovery reserve in effect: the configured one, or a
+    /// [`DEFAULT_RECOVERY_RESERVE_DIVISOR`]th of the hard limit; never more
+    /// than the limit.
+    #[must_use]
+    pub fn recovery_reserve(&self) -> u64 {
+        self.recovery_reserve_bytes
+            .unwrap_or(self.hard_limit_bytes / DEFAULT_RECOVERY_RESERVE_DIVISOR)
+            .min(self.hard_limit_bytes)
     }
 
     /// Insert a tag.
@@ -897,6 +929,9 @@ impl StorageConfig {
     ///   directory tree exclusively.
     /// - [`EndpointConfigError::HardLimitAboveCapacity`]: when both are
     ///   set, `hard_limit_bytes <= capacity_bytes` must hold.
+    /// - [`EndpointConfigError::ReserveOutsideLimit`]: a recovery reserve
+    ///   is part of a hard limit, so `recovery_reserve_bytes` needs one at
+    ///   least as large.
     /// - [`EndpointConfigError::NoOplogEndpoint`]: the oplog is the Raft
     ///   log, WAL and CDC source, so it must survive a process restart; at
     ///   least one endpoint must be `Durable` or `Degraded`.
@@ -985,6 +1020,15 @@ impl StorageConfig {
                     hard_limit: ep.hard_limit_bytes,
                     capacity: ep.capacity_bytes,
                 });
+            }
+            if let Some(reserve) = ep.recovery_reserve_bytes {
+                if ep.hard_limit_bytes == 0 || reserve > ep.hard_limit_bytes {
+                    return Err(EndpointConfigError::ReserveOutsideLimit {
+                        id: ep.id.clone(),
+                        reserve,
+                        hard_limit: ep.hard_limit_bytes,
+                    });
+                }
             }
         }
         Ok(())
@@ -1172,6 +1216,20 @@ pub enum EndpointConfigError {
         hard_limit: u64,
         /// Its `capacity_bytes`.
         capacity: u64,
+    },
+    /// An endpoint's recovery reserve lies outside its hard limit: the
+    /// reserve is a part of the limit, so it needs one at least as large.
+    #[error(
+        "EndpointConfig.recovery_reserve_bytes ({reserve}) on {id:?} must lie inside \
+         hard_limit_bytes ({hard_limit}, 0 = no limit)"
+    )]
+    ReserveOutsideLimit {
+        /// Id of the endpoint.
+        id: String,
+        /// Its `recovery_reserve_bytes`.
+        reserve: u64,
+        /// Its `hard_limit_bytes`.
+        hard_limit: u64,
     },
     /// Every endpoint is `Volatile`, so none can hold the oplog.
     #[error(

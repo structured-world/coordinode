@@ -44,6 +44,7 @@ mod integration {
     mod operation_identity;
     mod oplog_placement;
     mod oplog_segments;
+    mod owned_footprint;
     mod page_checksum;
     mod per_level_routing;
     mod procedures;

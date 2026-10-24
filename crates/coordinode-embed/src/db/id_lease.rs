@@ -43,6 +43,15 @@ fn lease_refusal(e: ProposalError) -> IdLeaseError {
         ProposalError::LeadershipLost { .. } | ProposalError::ShuttingDown => {
             IdLeaseError::NotLeader { leader_id: None }
         }
+        ProposalError::CapacityExhausted {
+            endpoint_id,
+            used_bytes,
+            hard_limit_bytes,
+        } => IdLeaseError::CapacityExhausted {
+            endpoint_id,
+            used_bytes,
+            hard_limit_bytes,
+        },
         other => IdLeaseError::NotGranted(other.to_string()),
     }
 }

@@ -192,8 +192,28 @@ const RUN_END: u32 = u32::MAX;
 /// flag u8][vf i64?]` per entry, then `[RUN_END][count u64][xxh3 u64]` over
 /// every entry byte, so a run cut short or damaged fails to read instead of
 /// reading as a shorter one.
-fn spill(run: &Run, dir: &Path) -> Result<(std::fs::File, u64), VerifyError> {
+///
+/// The run is charged to the owned footprint of `dir`'s endpoint before it
+/// is written; the charge goes with the file, which has no name.
+fn spill(
+    run: &Run,
+    dir: &Path,
+    footprints: &coordinode_storage::engine::footprint::Footprints,
+) -> Result<(std::fs::File, u64, Option<Charge>), VerifyError> {
     std::fs::create_dir_all(dir)?;
+    let charge = footprints.unnamed(dir);
+    if let Some(charge) = &charge {
+        // Each entry's fixed fields and key, then the trailer.
+        let size: u64 = run
+            .items
+            .iter()
+            .map(|item| 4 + u64::from(item.len) + 8 + if item.valid_from.is_some() { 9 } else { 1 })
+            .sum::<u64>()
+            + 4
+            + 8
+            + 8;
+        charge.grow_to(size)?;
+    }
     let file = tempfile::tempfile_in(dir)?;
     let mut out = BufWriter::new(file);
     let mut hash = Xxh3::new();
@@ -228,22 +248,28 @@ fn spill(run: &Run, dir: &Path) -> Result<(std::fs::File, u64), VerifyError> {
     let mut file = out.into_inner().map_err(|e| e.into_error())?;
     use std::io::Seek as _;
     file.seek(std::io::SeekFrom::Start(0))?;
-    Ok((file, written))
+    Ok((file, written, charge))
 }
+
+/// What a scratch run is charged on its endpoint's footprint.
+type Charge = std::sync::Arc<coordinode_storage::engine::footprint::FileCharge>;
 
 /// A spilled run read back in order, checked against its trailer.
 struct Spilled {
     reader: BufReader<std::fs::File>,
     hash: Xxh3,
     read: u64,
+    /// Given back with the file, when the run is dropped.
+    _charge: Option<Charge>,
 }
 
 impl Spilled {
-    fn new(file: std::fs::File) -> Self {
+    fn new(file: std::fs::File, charge: Option<Charge>) -> Self {
         Self {
             reader: BufReader::new(file),
             hash: Xxh3::new(),
             read: 0,
+            _charge: charge,
         }
     }
 
@@ -535,9 +561,9 @@ pub(super) fn verify(
             // The largest run goes first: it frees the most.
             if let Some(slot) = slots.iter_mut().max_by_key(|s| s.memory.held()) {
                 slot.memory.sort();
-                let (file, written) = spill(&slot.memory, dir)?;
+                let (file, written, charge) = spill(&slot.memory, dir, engine.footprints())?;
                 slot.memory.clear();
-                slot.spilled.push(Spilled::new(file));
+                slot.spilled.push(Spilled::new(file, charge));
                 stats.spilled_runs += 1;
                 stats.spilled_bytes += written;
             }

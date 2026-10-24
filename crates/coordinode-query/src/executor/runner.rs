@@ -416,6 +416,19 @@ impl From<coordinode_core::graph::node::IdLeaseError> for ExecutionError {
             coordinode_core::graph::node::IdLeaseError::NotLeader { leader_id } => {
                 ExecutionError::NotLeader { leader_id }
             }
+            // One refusal for a write past an endpoint's hard limit, whether
+            // the commit or the identifier it needed met it first.
+            coordinode_core::graph::node::IdLeaseError::CapacityExhausted {
+                endpoint_id,
+                used_bytes,
+                hard_limit_bytes,
+            } => ExecutionError::Storage(
+                coordinode_storage::error::StorageError::CapacityExhausted {
+                    endpoint_id,
+                    used_bytes,
+                    hard_limit_bytes,
+                },
+            ),
             other => ExecutionError::NodeIdLease(other),
         }
     }

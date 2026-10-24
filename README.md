@@ -150,7 +150,7 @@ ORDER BY similarity LIMIT 25
 | Inter-node compression | **Stable** | zstd on the replication transport, level configurable |
 | Consistency test suite | **Stable** | In-process fault injection: partition matrix, crash and clock skew, linearizability checking over a live workload |
 | Scrub and repair | **Stable** | Background checksum verification, damaged segments rebuilt from a healthy replica |
-| Embedded engine | **Source integration** | Rust `coordinode-embed` runs the engine in-process; no crates.io package is published yet. See [Rust package availability](docs/guide/embedded.md#rust-package-availability). The Python `coordinode-embedded` package is a separate artifact. |
+| Embedded engine | **Stable** | Rust [`coordinode-embed`](https://crates.io/crates/coordinode-embed) on crates.io runs the engine in-process; see [Embedded (Rust)](docs/guide/embedded.md) and the runnable [quickstart example](examples/embedded-quickstart). The Python `coordinode-embedded` package is a separate artifact. |
 
 | Planned | Notes |
 |---------|-------|

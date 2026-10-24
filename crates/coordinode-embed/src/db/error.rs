@@ -373,8 +373,10 @@ pub enum DatabaseError {
     )]
     WriteBackpressure,
 
-    /// A storage endpoint is at its hard capacity limit and refuses writes.
-    /// Nothing was applied.
+    /// The write does not fit a storage endpoint's total owned footprint, its
+    /// `hard_limit_bytes`: journal, tables, indexes and metadata together,
+    /// with what admitted writes are promised. Nothing was applied; the write
+    /// may be retried once room is made.
     #[error(
         "endpoint {endpoint_id:?} capacity exhausted (used={used_bytes}, \
          hard_limit={hard_limit_bytes}); writes rejected until usage falls below the limit"
@@ -382,7 +384,7 @@ pub enum DatabaseError {
     CapacityExhausted {
         /// The endpoint.
         endpoint_id: String,
-        /// Bytes it holds.
+        /// Bytes it holds and has promised.
         used_bytes: u64,
         /// Its hard limit.
         hard_limit_bytes: u64,

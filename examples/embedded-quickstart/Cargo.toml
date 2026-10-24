@@ -1,0 +1,16 @@
+[package]
+name = "coordinode-embedded-quickstart"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+publish = false
+description = "An application embedding CoordiNode: an on-disk database, parameters, commit, rollback, a typed refusal and a reopen."
+
+# A project of its own, not a member of the engine's workspace: it builds
+# from the registry packages exactly as an application does.
+[workspace]
+
+[dependencies]
+coordinode-embed = "0.9"
+coordinode-core = "0.9"

@@ -48,6 +48,7 @@ fn start(
             tier: Arc::new(AtomicU8::new(0)),
         },
         None,
+        crate::engine::footprint::Footprints::default(),
     )
     .expect("start FlushManager");
     (mgr, wake)
@@ -101,6 +102,7 @@ fn unflushed_memtable_bytes_past_the_stop_level_stop_writes_until_flushed() {
             tier: Arc::clone(&tier),
         },
         None,
+        crate::engine::footprint::Footprints::default(),
     )
     .expect("start FlushManager");
 

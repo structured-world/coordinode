@@ -3033,8 +3033,8 @@ async fn grpc_write_concern_cache_accepted() {
 
 /// End-to-end capacity propagation through the gRPC handler:
 ///
-/// Fill an endpoint past its `hard_limit_bytes`, refresh the
-/// capacity tracker, then issue a CREATE query through
+/// Fill an endpoint until its owned footprint refuses a write,
+/// then issue a CREATE query through
 /// `CypherServiceImpl::execute_cypher`. The handler returns a
 /// `tonic::Status` exactly as a gRPC client would observe over
 /// the wire (the transport is transparent for `Status`
@@ -3066,38 +3066,46 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
 
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // Step 1: open the engine standalone with a tiny hard_limit so
-    // a modest write blows past the threshold. The capacity gate
-    // engages once `refresh_capacity` observes Full.
+    // Step 1: open the engine standalone with a small hard limit and
+    // fill it until the footprint refuses a write.
     //
     // Layered like `Database::open_with_oracle` would: build the
     // engine first, then plant data, then wrap it as a Database
     // via `from_engine`. Going through `Database::open` directly
     // would lock us to `hard_limit_bytes = 0` (its default
     // single-endpoint config).
+    const LIMIT: u64 = 2 * 1024 * 1024;
     let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
     let storage_config = StorageConfig::with_endpoints(vec![
         EndpointConfig::new("ep", dir.path(), Media::Hdd, Dur::Durable, Tier::Warm)
-            .with_hard_limit_bytes(40_000),
+            .with_hard_limit_bytes(LIMIT),
     ]);
     let engine = std::sync::Arc::new(
         StorageEngine::open_with_oracle(&storage_config, std::sync::Arc::clone(&oracle))
             .expect("open engine with custom hard_limit"),
     );
 
-    // Bulk-write to push past 40 KB on disk.
-    for i in 0..5000u32 {
-        let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+    // Filled until even the room a refusal frees by itself (flushing the
+    // memtables, retiring the journal they cover) takes no more rows.
+    let mut next = 0u32;
+    loop {
+        let from = next;
+        loop {
+            let key = format!("node:0:{next:010}");
+            match engine.put(Partition::Node, key.as_bytes(), &[next as u8; 64]) {
+                Ok(()) => next += 1,
+                Err(coordinode_storage::error::StorageError::CapacityExhausted { .. }) => break,
+                Err(other) => panic!("unexpected refusal: {other:?}"),
+            }
+            assert!(next < 1_000_000, "the endpoint never filled");
+        }
+        if next == from {
+            break;
+        }
+        engine
+            .persist()
+            .expect("a filled store flushes into its reserve");
     }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    let usage = engine.capacity().get("ep").expect("tracked");
-    assert!(
-        !usage.is_writable(),
-        "endpoint must be Full after bulk write (used={})",
-        usage.used(),
-    );
 
     // Step 2: wrap the saturated engine in a Database and stand
     // up the gRPC service. No tonic transport — calling the
@@ -3160,7 +3168,7 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .expect("hard-limit-bytes parses as u64");
-    assert_eq!(hard_limit, 40_000);
+    assert_eq!(hard_limit, LIMIT);
 }
 
 /// A multi-vector must survive the wire as a multi-vector.

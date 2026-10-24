@@ -763,9 +763,10 @@ Each endpoint has these keys:
 | `durability` | yes | `durable` `degraded` `volatile` | `durable` = hardware-redundant (RAID); `degraded` = single drive; `volatile` = lost on restart. Drives the per-block ECC `auto` rule and cluster redundancy invariants. |
 | `tier` | yes | `memory` `hot_cache` `hot` `warm` `cold` | Placement preference (fastest first). Hot LSM levels prefer hotter tiers. |
 | `capacity_bytes` | no | integer | Physical capacity. `0` or omitted = untracked. |
-| `hard_limit_bytes` | no | integer | The placement engine never writes past this. `0` or omitted = no limit. Must be `<= capacity_bytes` when both are set. |
+| `hard_limit_bytes` | no | integer | Ceiling on the space every file of the database under `path` takes on disk, as the file system allocates it (see [Hard limit](#hard-limit-total-database-footprint)). `0` or omitted = no limit. Must be `<= capacity_bytes` when both are set. |
+| `recovery_reserve_bytes` | no | integer | The part of `hard_limit_bytes` client writes leave for flushes, space-reclaiming compactions and the store's own records; inside the limit, not added to it. Omitted = a sixteenth of the limit. Needs `hard_limit_bytes`, and must not exceed it. |
 | `page_ecc` | no | `auto` `force_on` `force_off` | Per-block Reed-Solomon ECC policy. `auto` (default) turns ECC **on** for `degraded` endpoints and **off** for `durable` / `volatile`. See the note below. |
-| `hard_limit_strategy` | no | `reject` `cascade_evict` | What to do when a write would exceed `hard_limit_bytes`. `reject` (default) fails the write; `cascade_evict` demotes data to a cooler endpoint and retries. |
+| `hard_limit_strategy` | no | `reject` `cascade_evict` | What to do when client writes reach `hard_limit_bytes`. `reject` (default) refuses them; `cascade_evict` also has the capacity refresh demote data to a cooler endpoint, after which refused writes are admitted again. |
 
 Example: NVMe hot tier plus an HDD cold tier on a single drive (so ECC is forced
 on to catch media read errors):
@@ -793,6 +794,93 @@ placement (`data_dir` still anchors the consensus log and CDC). Passing `--data`
 on the command line wins over the file — it names a single directory, so it
 collapses any file topology back to one endpoint at that path. A typo in an
 endpoint key is a startup error, like any other unknown config key.
+
+### Hard limit: total database footprint
+
+`hard_limit_bytes` bounds what the database owns under an endpoint, whoever
+wrote it: the journal, tables and indexes, full-text index segments, the store's
+metadata, memtables waiting to be flushed, temporary files of flushes,
+compactions and repairs, local checkpoints, and a cache layer placed under the
+path. The space counted is what the file system allocates (whole blocks, and
+what it allocates past a file's length while the file grows), not file
+lengths: what `du` reports for the directory, never more than the limit.
+
+Room is reserved before anything grows, under one account per endpoint:
+
+- **Client writes are admitted before they land.** Each write reserves what it
+  will add (its journal record and the table it will be flushed into) against
+  the limit less `recovery_reserve_bytes`, together with every write already
+  admitted and what the memtables will write when they are flushed. A write that
+  does not fit is refused before it reaches the journal, with
+  `CapacityExhausted` naming the endpoint, the bytes in use and the limit
+  (gRPC `RESOURCE_EXHAUSTED`, embedded `DatabaseError::CapacityExhausted`).
+  Concurrent writers cannot overcommit: admission is one atomic reservation.
+- **Reads are never refused.** A full database answers every query.
+- **A refusal first reclaims.** Before refusing, the engine flushes the memtables
+  and removes the journal segments every table already covers, then admits the
+  write if that made room. Covered segments go even inside the journal's
+  retention window; segments a rebuild from the newest local checkpoint needs are
+  kept. Any refusal also asks the background flusher to flush every memtable
+  holding data, so the room they were promised comes back without waiting for
+  their size or age. On an endpoint with a limit, journal segments (the
+  consensus log's too) are at most a sixteenth of the limit (at least 1 MiB), so
+  space comes back a segment at a time.
+- **The store's own work uses the reserve.** Flushes and the store's recovery
+  records (schema, consensus vote, commit and log bounds) may use the whole
+  limit; client writes stop at the limit less the reserve, so they always find
+  room. Compactions take only the room admitted writes and the memtables'
+  flushes leave: a compaction that would need more stops, keeps its inputs and
+  runs again later.
+- **Replicated groups.** The consensus log is counted like the journal. A leader
+  admits a write before it proposes it; a follower reserves the room of the
+  entries it receives until it has applied them, and refuses entries that do not
+  fit as unavailable, so the leader sends them again later. Entries the group has
+  already committed may use a follower's reserve: they are acknowledged history,
+  and refusing them would only leave the member behind. The consensus state
+  (vote, commit point, log bounds) is never refused by the limit, which would
+  stop the group; its journal growth still counts.
+- **Sharing.** A file with several names (a hard link) is counted once. A copy,
+  and a clone (a checkpoint on a file system with copy-on-write clones), is
+  counted whole: it shares its blocks only until either side changes.
+- **Cache layers.** A tiered-cache layer whose file lies under a limited
+  endpoint reserves twice its `max_bytes` at open (it compacts into a fresh file
+  beside the old one). If that does not fit, the node starts without the cache.
+
+A limit lowered below what the database already holds deletes nothing. The
+database opens (or keeps running), serves reads and refuses client writes until
+reclamation, compaction or the operator brings it under the limit; meanwhile its
+own work may grow at most the reserve (or 1 MiB, when the reserve of a small
+limit is less) past what it holds and has promised (memtables waiting to be
+flushed, writes already admitted), so those flushes still land and hand back
+their journal. Opening a database also writes a little (the
+first journal segment of an empty store, replay): that work may grow up to 1 MiB
+past what the endpoint holds, whatever the limit, so a database that does not
+fit its limit still opens to be read.
+
+The limit is read at startup. An embedded host changes it on a live database
+with `Database::set_hard_limit(endpoint_id, limit_bytes, reserve_bytes)`: a
+raised limit admits writes at once, a lowered one takes effect as above. A
+compaction the full store held back may take part of the new room first, for
+as long as it runs. In a replicated group each member's limit is set on that
+member. An
+endpoint opened without a limit gets one only through its configuration and a
+restart, since its files were not counted.
+
+`hard_limit_bytes` is not the free-space reserve. `min_free_bytes` /
+`resume_free_bytes` look at the free space of the whole file system (other
+programs' files included) and stop writes before the disk itself fills; the hard
+limit counts only the database's own files and holds them under a size you
+choose, whatever else is on the disk. Use both when the database shares a disk.
+
+What the limit does not cover: files outside the endpoint's path (a backup
+written to another directory, logs), and the store a member of a replicated
+group receives from its leader, which is written beside its own store and
+counted once opened.
+
+`coordinode_footprint_charged_bytes`, `coordinode_footprint_admitted_bytes`,
+`coordinode_footprint_flush_debt_bytes`, `coordinode_footprint_reserve_bytes` and
+`coordinode_footprint_limit_bytes` report the account per endpoint;
+`coordinode_footprint_refusals_total` counts refused writes.
 
 **Page ECC is a build-time feature.** The Reed-Solomon page-ECC codec is compiled
 in only when the binary is built with `--features page_ecc` (off by default). On a

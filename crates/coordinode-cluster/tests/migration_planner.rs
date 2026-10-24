@@ -55,14 +55,14 @@ fn planner_picks_remote_endpoint_when_source_fills_up() {
     // topology mirrors them by name so the planner can reason about
     // ep-a / ep-b / ep-c without caring that they are local-process
     // engines vs full network nodes; the planner does pure topology
-    // + cost arithmetic.
-    let limit = 200_000_u64;
+    // + cost arithmetic. The limit is the total the store's files may
+    // take, which the data below fits under.
+    let limit = 64 * 1024 * 1024_u64;
     let ep_a = open_endpoint("ep-a", limit);
     let _ep_b = open_endpoint("ep-b", limit);
     let _ep_c = open_endpoint("ep-c", limit);
 
-    // Load enough data on ep-a to push the capacity tracker above
-    // the soft threshold. The exact byte count does not matter for
+    // Load data on ep-a. The exact byte count does not matter for
     // the planner test; we just need the engine to report a real
     // non-zero used value that we can ship as the migration payload
     // estimate.
@@ -165,7 +165,7 @@ fn online_during_rebuild_policy_flows_through_planner() {
     // precedence ladder: enum default, planner default override,
     // per-context override. The cost numbers are not relevant to
     // policy resolution, so we keep them simple.
-    let limit = 200_000_u64;
+    let limit = 64 * 1024 * 1024_u64;
     let _ep_a = open_endpoint("ep-a", limit);
     let _ep_b = open_endpoint("ep-b", limit);
     let _ep_c = open_endpoint("ep-c", limit);

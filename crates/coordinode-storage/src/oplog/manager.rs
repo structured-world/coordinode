@@ -253,6 +253,8 @@ pub struct OplogManager {
     sync: SyncMethod,
     /// Where the segments start, for readers outside the manager.
     floor: RetainedFloor,
+    /// The owned footprints the segments are charged to.
+    footprints: crate::engine::footprint::Footprints,
 }
 
 impl OplogManager {
@@ -369,7 +371,39 @@ impl OplogManager {
             floor: RetainedFloor::new(paths.first().map(|&(first, _)| first)),
             sealed: paths,
             sync: SyncMethod::default(),
+            footprints: crate::engine::footprint::Footprints::default(),
         })
+    }
+
+    /// Charge the segments to `footprints` from here on. The segments open
+    /// found are charged as the file system holds them after its recovery,
+    /// which may have cut some short.
+    ///
+    /// # Errors
+    ///
+    /// A segment cannot be measured.
+    pub fn with_footprints(
+        mut self,
+        footprints: crate::engine::footprint::Footprints,
+    ) -> StorageResult<Self> {
+        for (_, path) in &self.sealed {
+            if let Some(charge) = footprints.file(path) {
+                let meta = std::fs::metadata(path)
+                    .map_err(|e| StorageError::Io(format!("measure segment {path:?}: {e}")))?;
+                charge.settle(crate::engine::footprint::allocated_bytes(&meta));
+            }
+        }
+        self.footprints = footprints;
+        Ok(self)
+    }
+
+    /// Remove the segment file at `path` and give back what it was charged.
+    fn remove_segment(&self, path: &Path) -> std::io::Result<()> {
+        let removed = std::fs::remove_file(path);
+        if removed.is_ok() {
+            self.footprints.removed(path);
+        }
+        removed
     }
 
     /// Where this manager's segments start, kept current as they change.
@@ -422,12 +456,27 @@ impl OplogManager {
                     )));
                 }
             }
-            let writer = SegmentWriter::create_or_replace_empty(
+            // The header is charged before the file is made.
+            let charge = self.footprints.file(&path);
+            if let Some(charge) = &charge {
+                charge.charge_to(crate::oplog::segment::HEADER_SIZE)?;
+            }
+            let created = SegmentWriter::create_or_replace_empty(
                 &path,
                 self.shard_id,
                 entry.index,
                 self.sync,
-            )?;
+            );
+            let writer = match (created, charge) {
+                (Ok(writer), Some(charge)) => writer.with_charge(charge),
+                (Ok(writer), None) => writer,
+                (Err(e), _) => {
+                    if !path.exists() {
+                        self.footprints.removed(&path);
+                    }
+                    return Err(e);
+                }
+            };
             // `open` registers every file it finds as sealed, including a
             // header-only leftover from a crash. That file has just been
             // replaced by the active writer, so drop the stale registration or
@@ -661,7 +710,7 @@ impl OplogManager {
                 && reader.entries().iter().any(|e| !is_durable(e));
             if within_window || needed_by_consumer || holds_non_durable {
                 remaining.push((first_idx, path));
-            } else if let Err(e) = std::fs::remove_file(&path) {
+            } else if let Err(e) = self.remove_segment(&path) {
                 failed = Some(StorageError::Io(format!(
                     "remove expired segment {:?}: {e}",
                     path
@@ -772,7 +821,7 @@ impl OplogManager {
 
         for removed in 0..purgeable {
             let path = &self.sealed[removed].1;
-            if let Err(e) = std::fs::remove_file(path) {
+            if let Err(e) = self.remove_segment(path) {
                 let message = format!("remove purged segment {:?}: {e}", path);
                 // Forget only what is gone, so the list still matches the disk.
                 self.sealed.drain(..removed);
@@ -799,7 +848,7 @@ impl OplogManager {
         }
         for removed in 0..self.sealed.len() {
             let path = &self.sealed[removed].1;
-            if let Err(e) = std::fs::remove_file(path) {
+            if let Err(e) = self.remove_segment(path) {
                 let message = format!("remove segment during truncate_all {:?}: {e}", path);
                 // Forget only what is gone, so the list still matches the disk.
                 self.sealed.drain(..removed);
@@ -840,7 +889,7 @@ impl OplogManager {
             if *first < from {
                 break;
             }
-            std::fs::remove_file(path)
+            self.remove_segment(path)
                 .map_err(|e| StorageError::Io(format!("remove truncated segment {path:?}: {e}")))?;
             note_dir(path);
             self.sealed.pop();
@@ -864,6 +913,10 @@ impl OplogManager {
                     total_bytes: end - crate::oplog::segment::HEADER_SIZE,
                 };
                 SegmentWriter::seal_at(path, end, &footer)?;
+                // Cut short: it holds less than it was charged.
+                if let Some(charge) = self.footprints.file(path) {
+                    charge.truncate_to(end + crate::oplog::segment::FOOTER_SIZE);
+                }
                 note_dir(path);
             }
         }

@@ -577,17 +577,27 @@ impl LogStore {
             }
             LostCommitted::CatchUp => None,
         };
+        // The log's segments are charged to the hard limit of the endpoint
+        // they land on, and held to a size that limit can reclaim a segment
+        // at a time, as the member-local journal is.
+        let footprints = engine.footprints().clone();
+        let limit = footprints.for_path(&active_dir).map_or(0, |f| f.limit());
         let oplog = OplogManager::open_multi(
             &active_dir,
             &recovery_dirs,
             shard_id,
-            settings.max_segment_bytes,
+            coordinode_storage::engine::footprint::journal_segment_bytes(
+                limit,
+                settings.max_segment_bytes,
+            ),
             settings.max_segment_entries,
             settings.retention_secs,
             must_hold,
         )
         .map_err(|e| io::Error::other(e.to_string()))?
-        .with_sync_method(settings.sync_method);
+        .with_sync_method(settings.sync_method)
+        .with_footprints(footprints)
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
         let last_purged = Self::load_log_id_from_partition(&engine, KEY_PURGED)?;
         // The last entry in the segments; its recovery reads the last segment
@@ -693,15 +703,12 @@ impl LogStore {
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
-    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), io::Error> {
+    /// Record consensus state the next sync covers, as the vote and the
+    /// purge point are recorded: a refusal here would stop the group, and
+    /// each record is a few bytes tied to entries already admitted.
+    fn put_consensus(&self, write: LocalWrite) -> Result<(), io::Error> {
         self.engine
-            .put(Partition::Raft, key, value)
-            .map_err(|e| io::Error::other(e.to_string()))
-    }
-
-    fn delete(&self, key: &[u8]) -> Result<(), io::Error> {
-        self.engine
-            .delete(Partition::Raft, key)
+            .commit_local(vec![write], LocalSync::Deferred)
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
@@ -1002,9 +1009,16 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             Some(log_id) => {
                 let bytes =
                     rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?;
-                self.put(KEY_COMMITTED, &bytes)
+                self.put_consensus(LocalWrite::Put {
+                    partition: Partition::Raft,
+                    key: KEY_COMMITTED.to_vec(),
+                    value: bytes,
+                })
             }
-            None => self.delete(KEY_COMMITTED),
+            None => self.put_consensus(LocalWrite::Delete {
+                partition: Partition::Raft,
+                key: KEY_COMMITTED.to_vec(),
+            }),
         }
     }
 
@@ -2075,6 +2089,10 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                 self.folded = next;
             }
 
+            // What the entry owes is in the memtables now; the room held for
+            // it since this member took it goes back.
+            self.engine.footprints().applied(index);
+
             // Broadcast applied watermark (ignore send error — receivers may be dropped)
             let _ = self.applied_tx.send(entry.log_id.index);
 
@@ -2219,6 +2237,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         // must not have to wait for a later entry that an idle cluster never
         // sends.
         if let Some(log_id) = meta.last_log_id {
+            self.engine.footprints().applied(log_id.index);
             self.applied_tx.send_if_modified(|applied| {
                 let raised = log_id.index > *applied;
                 if raised {

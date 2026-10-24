@@ -385,7 +385,11 @@ impl StorageEngine {
             })?;
         // The capture is opened as an engine directory, which names its
         // format like any other.
-        crate::format::write_marker(target, coordinode_core::version::engine_format_version())
+        crate::format::write_marker(
+            target,
+            coordinode_core::version::engine_format_version(),
+            &self.footprints,
+        )
     }
 
     /// The replicated rows of `partition` in this engine: every key but the

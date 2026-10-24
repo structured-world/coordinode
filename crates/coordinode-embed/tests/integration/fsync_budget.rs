@@ -114,6 +114,10 @@ fn an_answer_that_an_object_exists_is_durable() {
         let dir = tempdir().unwrap();
         let mut db = open_flusher_held(dir.path());
         db.execute_cypher("CREATE (:User {email: 'a@x'})").unwrap();
+        // The spare NodeId lease the CREATE asks for lands durably in the
+        // background; landing after the statement below it would sync that
+        // statement too, which the setup check would take for the statement's.
+        settle(&db);
         db.set_write_concern(WriteConcern::cache());
         db.execute_cypher(create).unwrap();
         let now = db.engine().current_seqno();

@@ -189,8 +189,10 @@ impl FlushManager {
         journal: Option<Arc<Mutex<EmbeddedOplog>>>,
         pressure: MemtablePressure,
         tables: Option<TableSource>,
+        footprints: crate::engine::footprint::Footprints,
     ) -> StorageResult<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
+        footprints.set_flush_wake(Arc::clone(&wake));
 
         // Bounded channel: capacity = workers × 4 so burst flushes don't stall the monitor.
         let capacity = (num_workers * 4).max(8);
@@ -233,6 +235,7 @@ impl FlushManager {
                         wake: wake_m,
                         pressure,
                         tables,
+                        footprints,
                     },
                 );
             })
@@ -282,6 +285,9 @@ struct FlushMonitorConfig {
     wake: Arc<Wake>,
     pressure: MemtablePressure,
     tables: Option<TableSource>,
+    /// The endpoints' hard limits, whose refusals ask every memtable holding
+    /// data to be flushed ([`Footprints::squeeze`]).
+    footprints: crate::engine::footprint::Footprints,
 }
 
 /// What the monitor keeps per tree between passes.
@@ -310,6 +316,7 @@ fn consider_tree(
     source: impl FnOnce() -> (FlushSource, u64),
     now: Instant,
     cfg: &FlushMonitorConfig,
+    squeezed: bool,
     next_due: &mut Option<Duration>,
 ) {
     let max_age = Duration::from_secs(cfg.max_memtable_age_secs);
@@ -319,7 +326,8 @@ fn consider_tree(
 
     let rotate = active_bytes > cfg.flush_threshold_bytes
         || tree.sealed_memtable_count() > cfg.max_sealed
-        || age_triggered;
+        || age_triggered
+        || (squeezed && active_bytes > 0);
 
     if rotate {
         // Rotate: atomically seal the active memtable → it joins the sealed list.
@@ -384,6 +392,8 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
         // triggers becomes due by age. None while every memtable is empty: an
         // idle engine sleeps until a write wakes it.
         let mut next_due: Option<Duration> = None;
+        // A hard limit refused a write: every memtable holding data goes.
+        let squeezed = cfg.footprints.take_squeeze();
 
         for ((partition, tree), state) in trees.iter().zip(&mut states) {
             let source = || {
@@ -392,7 +402,7 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                     cfg.gc_watermarks.for_partition(*partition),
                 )
             };
-            consider_tree(tree, state, source, now, &cfg, &mut next_due);
+            consider_tree(tree, state, source, now, &cfg, squeezed, &mut next_due);
         }
         if let Some(tables) = &cfg.tables {
             let listed = tables();
@@ -409,7 +419,7 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                         cfg.gc_watermarks.for_partition(Partition::Node),
                     )
                 };
-                consider_tree(&tree, state, source, now, &cfg, &mut next_due);
+                consider_tree(&tree, state, source, now, &cfg, squeezed, &mut next_due);
             }
         }
 

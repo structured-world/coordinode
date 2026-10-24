@@ -75,10 +75,14 @@ pub enum FormatOpen {
 }
 
 /// Record the format a migration reached, once the open that ran it has
-/// succeeded. Nothing to do for any other outcome.
-pub fn settle(opened: &FormatOpen) -> StorageResult<()> {
+/// succeeded, charging the marker to `footprints`. Nothing to do for any
+/// other outcome.
+pub fn settle(
+    opened: &FormatOpen,
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<()> {
     match opened {
-        FormatOpen::Migrated { dir, to, .. } => write_marker(dir, *to),
+        FormatOpen::Migrated { dir, to, .. } => write_marker(dir, *to, footprints),
         _ => Ok(()),
     }
 }
@@ -107,7 +111,9 @@ pub fn prepare_dir(dir: &Path, runs: u32, steps: &[MigrationStep]) -> StorageRes
         Some(found) => found,
         None if is_empty(dir)? => {
             std::fs::create_dir_all(dir).map_err(|e| io_at("create", dir, e))?;
-            write_marker(dir, runs)?;
+            // Before the footprints are measured: open charges the marker
+            // with the rest of the directory.
+            write_marker(dir, runs, &crate::engine::footprint::Footprints::default())?;
             return Ok(FormatOpen::Created);
         }
         None => 0,
@@ -152,17 +158,30 @@ pub fn read_marker(dir: &Path) -> StorageResult<Option<u32>> {
 
 /// Record `format` as the directory's format: written aside, made durable,
 /// then renamed over the marker, so a crash leaves the old marker or the new
-/// one and never a torn one.
-pub fn write_marker(dir: &Path, format: u32) -> StorageResult<()> {
+/// one and never a torn one. The marker is charged to `footprints` before it
+/// is written.
+pub fn write_marker(
+    dir: &Path,
+    format: u32,
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<()> {
     use std::io::Write;
     let path = dir.join(MARKER_FILE);
     let staged: PathBuf = dir.join(format!("{MARKER_FILE}.tmp"));
+    let text = format!("{format}\n");
+    if let Some(charge) = footprints.file(&staged) {
+        charge.charge_to(text.len() as u64)?;
+    }
     let mut file = std::fs::File::create(&staged).map_err(|e| io_at("create", &staged, e))?;
-    file.write_all(format!("{format}\n").as_bytes())
+    file.write_all(text.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(|e| io_at("write", &staged, e))?;
     drop(file);
     std::fs::rename(&staged, &path).map_err(|e| io_at("rename", &path, e))?;
+    // Within one directory: one endpoint, nothing to refuse.
+    footprints
+        .renamed(&staged, &path)
+        .map_err(|e| io_at("charge", &path, e))?;
     sync_dir(dir)
 }
 

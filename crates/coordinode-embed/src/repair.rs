@@ -91,7 +91,9 @@ pub fn create_checkpoint(engine: &StorageEngine, root: &Path) -> StorageResult<P
 
 /// Delete all but the newest `keep` checkpoints under `root`. `keep == 0` is
 /// treated as `1` (never prune the only base). Returns the number removed.
-pub fn prune_checkpoints(root: &Path, keep: usize) -> StorageResult<usize> {
+/// What a removed checkpoint alone held is given back to `engine`'s owned
+/// footprint; files it shared with the live store by hard link stay charged.
+pub fn prune_checkpoints(engine: &StorageEngine, root: &Path, keep: usize) -> StorageResult<usize> {
     let keep = keep.max(1);
     let all = list_checkpoints(root)?;
     if all.len() <= keep {
@@ -100,8 +102,9 @@ pub fn prune_checkpoints(root: &Path, keep: usize) -> StorageResult<usize> {
     let remove_count = all.len() - keep;
     let mut removed = 0;
     for (_, path) in all.into_iter().take(remove_count) {
-        std::fs::remove_dir_all(&path)
-            .map_err(|e| StorageError::Io(format!("prune checkpoint {path:?}: {e}")))?;
+        let pruned = std::fs::remove_dir_all(&path);
+        engine.footprints().removed_tree(&path);
+        pruned.map_err(|e| StorageError::Io(format!("prune checkpoint {path:?}: {e}")))?;
         removed += 1;
     }
     Ok(removed)
@@ -290,7 +293,7 @@ impl CheckpointScheduler {
                         if let Err(e) = create_checkpoint(&engine, &root) {
                             tracing::error!(error = %e, "scheduled checkpoint failed");
                         }
-                        if let Err(e) = prune_checkpoints(&root, cfg.keep) {
+                        if let Err(e) = prune_checkpoints(&engine, &root, cfg.keep) {
                             tracing::warn!(error = %e, "checkpoint prune failed");
                         }
                         let now = SystemTime::now()

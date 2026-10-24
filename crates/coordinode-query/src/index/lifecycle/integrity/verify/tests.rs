@@ -394,7 +394,7 @@ fn scratch_file(bytes: &[u8]) -> std::fs::File {
 
 /// Every entry of `file`, or the error reading it ends with.
 fn read_run(file: std::fs::File) -> Result<Vec<Owned>, VerifyError> {
-    let mut run = Spilled::new(file);
+    let mut run = Spilled::new(file, None);
     let mut out = Vec::new();
     while let Some(entry) = run.next()? {
         out.push(entry);
@@ -410,7 +410,7 @@ fn read_run(file: std::fs::File) -> Result<Vec<Owned>, VerifyError> {
 fn a_damaged_scratch_run_fails_to_read() {
     let dir = tempfile::tempdir().expect("dir");
     let run = three_entries();
-    let (mut file, written) = spill(&run, dir.path()).expect("spill");
+    let (mut file, written, _) = spill(&run, dir.path(), &Default::default()).expect("spill");
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes).expect("read back");
     assert_eq!(bytes.len() as u64, written);

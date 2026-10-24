@@ -228,7 +228,7 @@ fn checkpoint_create_latest_and_prune() {
     assert_eq!(latest_checkpoint(&root), Some(c2.clone()));
 
     // Keep newest 2 → c0 pruned, c1 + c2 remain.
-    let removed = prune_checkpoints(&root, 2).expect("prune");
+    let removed = prune_checkpoints(&engine, &root, 2).expect("prune");
     assert_eq!(removed, 1);
     assert!(!c0.exists());
     assert!(c1.exists());

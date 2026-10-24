@@ -73,6 +73,33 @@ impl GroupReplica {
             .map_err(|e| Status::unavailable(e.to_string()))
     }
 
+    /// Reserve the room the entries of `req` take under the hard limits, or
+    /// refuse them as unavailable: the leader admitted them against its own
+    /// limit, and this member's log append must not meet its limit inside
+    /// the write either. Once they are in the log the room is held until
+    /// they are applied ([`Self::hold_until_applied`]).
+    fn reserve_entries(
+        &self,
+        req: &openraft::raft::AppendEntriesRequest<TypeConfig>,
+    ) -> Result<coordinode_storage::engine::footprint::Admitted, Status> {
+        let (bytes, class) = entries_footprint(req);
+        self.space
+            .reserve(bytes, class)
+            .map_err(|e| Status::unavailable(e.to_string()))
+    }
+
+    /// Keep `room`, reserved for entries now in the log through `last`,
+    /// until the state machine applied them.
+    fn hold_until_applied(
+        &self,
+        last: Option<u64>,
+        room: coordinode_storage::engine::footprint::Admitted,
+    ) {
+        if let Some(last) = last {
+            self.space.footprints().hold_until_applied(last, room);
+        }
+    }
+
     /// Admit a call: its caller must be a member that `op` is open to, its
     /// version record must speak for that member, and its version must
     /// match. Returns the member the caller is. A record naming another
@@ -131,6 +158,36 @@ impl GroupReplica {
             group: self.group().raw(),
         }
     }
+}
+
+/// The room the entries of `req` take under a hard limit, and whose growth
+/// it is: the client's, unless every proposal is the group's own work (as
+/// the leader admitted it) or every entry is committed already. Those may
+/// use the recovery reserve: a committed entry is acknowledged history the
+/// group holds, and refusing it would only leave this member behind.
+fn entries_footprint(
+    req: &openraft::raft::AppendEntriesRequest<TypeConfig>,
+) -> (u64, coordinode_storage::engine::footprint::Admit) {
+    use coordinode_storage::engine::footprint::{Admit, write_footprint};
+    let entries = &req.entries;
+    let committed = req.leader_commit.as_ref().map(|id| id.index);
+    let mut bytes = 0u64;
+    let all_committed = entries
+        .last()
+        .is_some_and(|last| committed.is_some_and(|c| last.log_id.index <= c));
+    let mut class = Admit::Recovery;
+    for entry in entries {
+        if let openraft::entry::EntryPayload::Normal(request) = &entry.payload {
+            for proposal in &request.proposals {
+                // Bounded by the size of a message received.
+                bytes += write_footprint(&proposal.mutations);
+                if !proposal.bypass_rate_limiter && !all_committed {
+                    class = Admit::Client;
+                }
+            }
+        }
+    }
+    (bytes, class)
 }
 
 /// Why a replica could not be added to a server.
@@ -389,10 +446,15 @@ impl RaftService for RaftGrpcHandler {
         let req: openraft::raft::AppendEntriesRequest<TypeConfig> = de(&data)?;
         Admission::same_member(caller, req.vote.leader_id().node_id)?;
         // A heartbeat writes nothing and keeps this member following its
-        // leader; only entries wait for space.
-        if !req.entries.is_empty() {
+        // leader; only entries wait for space, holding theirs until they are
+        // applied.
+        let last = req.entries.last().map(|entry| entry.log_id.index);
+        let room = if req.entries.is_empty() {
+            None
+        } else {
             replica.admit_write()?;
-        }
+            Some(replica.reserve_entries(&req)?)
+        };
         replica.catch_up.note(&req);
 
         let resp = replica
@@ -400,6 +462,9 @@ impl RaftService for RaftGrpcHandler {
             .append_entries(req)
             .await
             .map_err(|e| Status::internal(format!("append_entries: {e}")))?;
+        if let Some(room) = room {
+            replica.hold_until_applied(last, room);
+        }
 
         Ok(replica.answer(replica.payload(ser(&resp)?)))
     }
@@ -476,16 +541,41 @@ impl RaftService for RaftGrpcHandler {
             .filter_map(|status| async move { status.map(Err) });
 
         // Heartbeats pass while the disk is below its reserve; the first
-        // request carrying entries then ends the stream, and the reply stream
-        // ends with UNAVAILABLE so the leader backs off and sends again later.
+        // request carrying entries that do not fit then ends the stream, and
+        // the reply stream ends with UNAVAILABLE so the leader backs off and
+        // sends again later. A request's room is held by the stream until its
+        // reply (the consensus answers the requests in order, each once its
+        // entries are in the log), then until its entries are applied.
         let space = Arc::clone(&replica.space);
         let cut = Arc::new(core::sync::atomic::AtomicBool::new(false));
         let cut_in = Arc::clone(&cut);
+        let held: Arc<
+            parking_lot::Mutex<
+                std::collections::VecDeque<(
+                    Option<u64>,
+                    coordinode_storage::engine::footprint::Admitted,
+                )>,
+            >,
+        > = Arc::default();
+        let held_in = Arc::clone(&held);
         let input_stream = input_stream.take_while(move |req| {
-            let pass = req.entries.is_empty() || !space.is_paused();
-            if !pass {
-                cut_in.store(true, core::sync::atomic::Ordering::Release);
-            }
+            let room = if req.entries.is_empty() {
+                Ok(coordinode_storage::engine::footprint::Admitted::default())
+            } else {
+                let (bytes, class) = entries_footprint(req);
+                space.reserve(bytes, class)
+            };
+            let pass = match room {
+                Ok(room) => {
+                    let last = req.entries.last().map(|entry| entry.log_id.index);
+                    held_in.lock().push_back((last, room));
+                    true
+                }
+                Err(_) => {
+                    cut_in.store(true, core::sync::atomic::Ordering::Release);
+                    false
+                }
+            };
             futures_util::future::ready(pass)
         });
         let catch_up = replica.catch_up.clone();
@@ -516,8 +606,13 @@ impl RaftService for RaftGrpcHandler {
         let output = replica.raft.stream_append(input_stream);
 
         // Serialize output stream: StreamAppendResult → RaftPayload
+        let footprints = replica.space.footprints().clone();
         let output_stream = output.map(move |result| match result {
             Ok(stream_result) => {
+                // The oldest request's entries are in the log now.
+                if let Some((Some(last), room)) = held.lock().pop_front() {
+                    footprints.hold_until_applied(last, room);
+                }
                 let data = rmp_serde::to_vec(&stream_result)
                     .map_err(|e| Status::internal(format!("serialize: {e}")))?;
                 Ok(RaftPayload {

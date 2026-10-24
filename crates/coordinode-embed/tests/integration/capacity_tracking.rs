@@ -2,15 +2,16 @@
 //! (`used ≤ hard_limit` at all times).
 //!
 //! Covers:
-//! - per-endpoint usage scan populates `used_bytes` from on-disk SSTs,
-//! - severity transitions (Normal → Warning → Critical → Emergency → Full),
-//! - `is_writable` flips off at 100% and back on after recovery,
-//! - pre-write gate rejects writes with `CapacityExhausted` when the
-//!   target partition's L0 endpoint is non-writable,
+//! - the capacity report follows the owned footprint, which open measures
+//!   from the files already on the endpoint,
+//! - severity transitions (Normal → Warning → Critical → Emergency → Full)
+//!   against the part of the limit client writes may take,
+//! - every write path (put, delete, merge, `WriteBatch`, Cypher) is refused
+//!   with `CapacityExhausted` once it does not fit, before it lands,
 //! - `CascadeEvict` strategy auto-fires at Emergency severity,
 //! - `Reject` strategy does NOT auto-fire,
-//! - Schema and Raft partitions bypass the gate (engine-internal
-//!   metadata must remain reachable when user-data endpoints are full).
+//! - the store's own metadata (Schema) writes into the recovery reserve
+//!   client writes leave, never past the limit.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -23,6 +24,9 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::StorageError;
 use tempfile::TempDir;
+
+/// Room for a filled store above what an empty one takes at open.
+const ROOMY: u64 = 2 * 1024 * 1024;
 
 /// Tables in the tables folder `dir`, 0 when it does not exist. Empty files
 /// are the engine's reserve of files for tables yet to be written, not
@@ -60,22 +64,96 @@ fn incompressible(i: u32) -> [u8; 64] {
     out
 }
 
+/// One endpoint at `dir` with a hard limit of `limit`.
+fn capped(id: &str, dir: &std::path::Path, limit: u64) -> EndpointConfig {
+    EndpointConfig::new(id, dir, Media::Hdd, Durability::Durable, Tier::Warm)
+        .with_hard_limit_bytes(limit)
+}
+
+/// Put incompressible rows into `part`, numbered from `from`, until the
+/// footprint refuses one; returns how many were accepted. Any other error
+/// fails the test.
+fn fill_from(engine: &StorageEngine, part: Partition, prefix: &str, from: u32) -> u32 {
+    for i in from..from + 1_000_000 {
+        let key = format!("{prefix}{i:010}");
+        match engine.put(part, key.as_bytes(), &incompressible(i)) {
+            Ok(()) => {}
+            Err(StorageError::CapacityExhausted { .. }) => return i - from,
+            Err(other) => panic!("unexpected refusal: {other:?}"),
+        }
+    }
+    panic!("the footprint never refused a write");
+}
+
+/// [`fill_from`] from the first row.
+fn fill(engine: &StorageEngine, part: Partition, prefix: &str) -> u32 {
+    fill_from(engine, part, prefix, 0)
+}
+
+/// Fill `part` until even the room the store frees by itself (a refusal
+/// flushes the memtables and removes the journal they cover; a flush can
+/// start a compaction) takes no more rows: the next write of the same size
+/// is refused. Returns how many rows were accepted in all.
+fn saturate(engine: &StorageEngine, part: Partition, prefix: &str) -> u32 {
+    let mut total = 0;
+    loop {
+        let accepted = fill_from(engine, part, prefix, total);
+        total += accepted;
+        if accepted == 0 {
+            return total;
+        }
+        engine
+            .persist()
+            .expect("a filled store flushes into its reserve");
+    }
+}
+
+/// What the file system allocated to the files under `root`, each file once
+/// however many names it has.
+fn allocated_under(root: &std::path::Path) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if seen.insert((meta.dev(), meta.ino())) {
+                    total += meta.blocks() * 512;
+                }
+            }
+            // No inode to tell links apart: each name counts, by its length
+            // in whole 4 KiB blocks.
+            #[cfg(not(unix))]
+            if seen.insert(entry.path()) {
+                total += meta.len().div_ceil(4096) * 4096;
+            }
+        }
+    }
+    total
+}
+
 /// Writing data + persisting + refreshing the capacity tracker MUST
 /// produce a non-zero `used_bytes` reading for the target endpoint.
-/// Smoke check on the scan path.
+/// Smoke check on the report path.
 #[test]
 fn refresh_picks_up_on_disk_sst_bytes() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "only",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(10_000_000),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("only", dir.path(), 10_000_000)]);
     let engine = StorageEngine::open(&config).expect("open");
 
     for i in 0..500u32 {
@@ -90,54 +168,25 @@ fn refresh_picks_up_on_disk_sst_bytes() {
     let usage = engine.capacity().get("only").expect("endpoint tracked");
     assert!(
         usage.used() > 0,
-        "scan must populate used_bytes from on-disk SSTs, got 0",
-    );
-    assert!(
-        usage.is_writable(),
-        "small write well under 10 MB limit must stay writable",
+        "the report must carry the footprint, got 0"
     );
     assert_eq!(usage.severity(), CapacitySeverity::Normal);
 }
 
-/// Filling an endpoint past 100% MUST flip `is_writable` off and the
-/// pre-put gate MUST reject the next write with
-/// [`StorageError::CapacityExhausted`].
+/// Filling an endpoint MUST end in a write refused with
+/// [`StorageError::CapacityExhausted`] naming the endpoint and its limit,
+/// before the files under the endpoint pass the limit.
 #[test]
 fn full_endpoint_rejects_subsequent_writes() {
     let dir = TempDir::new().expect("tempdir");
-    // Very small limit so a modest write blows past 100%.
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "small",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Write enough to exceed 4 KB on disk.
-    for i in 0..500u32 {
-        let key = format!("node:0:{i:010}");
-        engine
-            .put(Partition::Node, key.as_bytes(), b"payload-bytes")
-            .expect("put");
-    }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
+    let accepted = saturate(&engine, Partition::Node, "node:0:");
+    assert!(accepted > 0, "an empty store refused its first write");
+    assert!(allocated_under(dir.path()) <= ROOMY);
 
-    let usage = engine.capacity().get("small").expect("tracked");
-    assert!(usage.used() > 4096, "wrote more than hard_limit");
-    assert_eq!(usage.severity(), CapacitySeverity::Full);
-    assert!(
-        !usage.is_writable(),
-        "Full severity must flip is_writable off",
-    );
-
-    // Next put on the user-data partition rejects.
-    let result = engine.put(Partition::Node, b"node:0:after-full", b"extra");
+    let result = engine.put(Partition::Node, b"node:0:after-full", &incompressible(0));
     match result {
         Err(StorageError::CapacityExhausted {
             endpoint_id,
@@ -145,120 +194,75 @@ fn full_endpoint_rejects_subsequent_writes() {
             ..
         }) => {
             assert_eq!(endpoint_id, "small");
-            assert_eq!(hard_limit_bytes, 4096);
+            assert_eq!(hard_limit_bytes, ROOMY);
         }
         other => panic!("expected CapacityExhausted after endpoint filled, got: {other:?}"),
     }
+    engine
+        .persist()
+        .expect("a full store still flushes into its reserve");
+    assert!(allocated_under(dir.path()) <= ROOMY);
 }
 
-/// Schema and Raft partitions MUST bypass the capacity gate — engine
-/// metadata must remain reachable even when user-data endpoints are
-/// full (otherwise the operator could not read the metrics that
-/// prove the endpoint is full).
+/// The store's own metadata MUST stay writable once client writes are
+/// refused: a Schema write uses the recovery reserve the client writes
+/// leave. Client writes stay refused.
 #[test]
-fn schema_and_raft_partitions_bypass_capacity_gate() {
+fn schema_writes_use_the_recovery_reserve_client_writes_leave() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "small",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Fill the endpoint.
-    for i in 0..500u32 {
-        let key = format!("node:0:{i:010}");
-        engine
-            .put(Partition::Node, key.as_bytes(), b"payload")
-            .expect("put");
-    }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    let usage = engine.capacity().get("small").expect("tracked");
-    assert!(!usage.is_writable(), "endpoint must be full");
+    saturate(&engine, Partition::Node, "node:0:");
 
-    // Schema put still succeeds — engine metadata path.
     engine
         .put(Partition::Schema, b"schema:label:Test", b"{}")
-        .expect("Schema must remain writable when user endpoint full");
+        .expect("Schema must remain writable when client writes are refused");
 
-    // User-data partition still rejects (sanity check that the gate
-    // is actually active, not unconditionally bypassed).
     let denied = engine.put(Partition::Node, b"node:0:denied", b"x");
     assert!(
         matches!(denied, Err(StorageError::CapacityExhausted { .. })),
-        "user partition must still be gated",
+        "user partition must still be refused",
     );
+    assert!(allocated_under(dir.path()) <= ROOMY);
 }
 
-/// Capacity recovery: deleting on-disk SSTs and re-scanning MUST flip
-/// `is_writable` back to true so the engine can accept new writes
-/// after cascade eviction or operator cleanup brings usage down.
-///
-/// Uses a generous hard_limit (~200 KB) so the fixed engine-internal
-/// overhead (Schema partition manifest etc.) is well under threshold
-/// at baseline, while a bulk-write puts the endpoint over the line
-/// and SST-deletion brings it back.
+/// Files removed behind the engine's back are not seen while it runs: their
+/// charge stays, so the account never falls below what the engine itself
+/// holds. The next open measures the files as they are.
 #[test]
-fn capacity_recovery_re_enables_writes() {
+fn files_removed_behind_the_engine_are_released_at_the_next_open() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "rec",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(200_000),
-    ]);
-    let engine = StorageEngine::open(&config).expect("open");
-
-    // Push past 200 KB with bulk writes (the scan now sees the full
-    // endpoint footprint — partition tables + manifest + WAL + …).
-    for i in 0..5000u32 {
-        let key = format!("node:0:{i:010}");
+    let config = StorageConfig::with_endpoints(vec![capped("rec", dir.path(), ROOMY)]);
+    let foreign = dir.path().join("operator-copy.bin");
+    {
+        // A first open lays the store out; a file an operator leaves on the
+        // endpoint is measured by the next one.
+        drop(StorageEngine::open(&config).expect("first open"));
+    }
+    std::fs::write(&foreign, vec![7u8; 256 * 1024]).expect("write foreign file");
+    {
+        let engine = StorageEngine::open(&config).expect("open");
+        let footprint = engine.footprints().get("rec").expect("capped");
+        let charge = footprint.file(&foreign);
+        assert!(charge.bytes() >= 256 * 1024, "open measured the file");
+        std::fs::remove_file(&foreign).expect("remove behind the engine");
+        assert!(
+            charge.bytes() >= 256 * 1024,
+            "the running engine still counts the removed file"
+        );
+    }
+    let engine = StorageEngine::open(&config).expect("reopen");
+    assert_eq!(
         engine
-            .put(Partition::Node, key.as_bytes(), &incompressible(i))
-            .expect("put");
-    }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    let usage = engine.capacity().get("rec").unwrap();
-    assert!(
-        !usage.is_writable(),
-        "endpoint must be full after bulk write, got used={}",
-        usage.used(),
+            .footprints()
+            .get("rec")
+            .expect("capped")
+            .file(&foreign)
+            .bytes(),
+        0,
+        "the reopened store measured the files as they are"
     );
-
-    // Simulate cascade-eviction / cleanup by deleting the Node
-    // partition's SSTs. The remaining engine-internal bytes
-    // (Schema manifest etc.) must be small enough that the
-    // post-deletion total is well under the 200 KB limit.
-    let tables = dir.path().join(Partition::Node.name()).join("tables");
-    for entry in std::fs::read_dir(&tables).expect("tables dir") {
-        let p = entry.expect("entry").path();
-        if p.is_file() {
-            std::fs::remove_file(p).expect("remove SST");
-        }
-    }
-
-    engine.refresh_capacity();
-    assert!(
-        usage.is_writable(),
-        "recovery to under-limit usage must re-enable writes (used={})",
-        usage.used(),
-    );
-
-    // Confirm the gate now accepts a write.
-    engine
-        .put(Partition::Node, b"node:0:after-recovery", b"v")
-        .expect("write after recovery must succeed");
 }
 
 /// `HardLimitStrategy::CascadeEvict` MUST fire a cascade-eviction
@@ -278,8 +282,7 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
             Durability::Durable,
             Tier::Hot,
         )
-        // 64 KB limit — easy to push to 95% with a modest write.
-        .with_hard_limit_bytes(64 * 1024)
+        .with_hard_limit_bytes(16 * ROOMY)
         .with_hard_limit_strategy(HardLimitStrategy::CascadeEvict),
         EndpointConfig::new(
             "ep-cold",
@@ -292,37 +295,67 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
     ]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Push enough into Node partition to land at Emergency severity
-    // (95-99% of 64 KB ≈ 61-63 KB on disk after SST overhead). A few
-    // hundred entries × ~80 B each should be in range; we err on the
-    // side of definitely-crossing the threshold.
-    for i in 0..800u32 {
+    for i in 0..3000u32 {
         let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+        engine
+            .put(Partition::Node, key.as_bytes(), &incompressible(i))
+            .expect("put under a roomy limit");
     }
     engine.persist().expect("persist");
 
-    // Record cold endpoint SST count before the refresh+cascade pass.
+    // The limit lowered at runtime so that the client share is half of what
+    // the hot endpoint holds puts it at Full at once, without racing the
+    // compactions that route the bottom level to cold by themselves, and
+    // whatever the allowances held for files being written settle to. The
+    // reserve left above the client share is the room the cascade's own
+    // work uses.
     let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
-    let cold_before = tables_in(&cold_tables);
+    let hot_before = engine.footprints().get("ep-hot").expect("capped").charged();
+    let reserve = coordinode_storage::engine::footprint::OVER_LIMIT_ALLOWANCE;
+    engine
+        .set_hard_limit("ep-hot", hot_before / 2 + reserve, Some(reserve))
+        .expect("lower the hot limit");
 
-    // First refresh triggers cascade-evict if severity crossed.
+    // The refresh sees the endpoint at Emergency or Full and cascades.
     engine.refresh_capacity();
-
-    // Second persist + refresh to settle: cascade fires major
-    // compaction asynchronously inside cascade_evict_endpoint;
-    // bottom-level SSTs should now live on cold endpoint.
-    let cold_tables_exists = cold_tables.exists();
-    let cold_after = tables_in(&cold_tables);
+    let usage = engine.capacity().get("ep-hot").expect("tracked");
     assert!(
-        cold_tables_exists,
-        "cold endpoint tables dir must exist after cascade — major \
-         compaction routes bottom levels to cold",
+        matches!(
+            usage.severity(),
+            CapacitySeverity::Emergency | CapacitySeverity::Full
+        ),
+        "a filled endpoint must be at Emergency or Full, got {:?} (used={})",
+        usage.severity(),
+        usage.used()
+    );
+
+    // The cascade is a major compaction routing the bottom level to cold: the
+    // tables there are merged, so their number says nothing; what moves is
+    // the data, which stays readable, and the hot endpoint's footprint.
+    assert!(
+        tables_in(&cold_tables) > 0,
+        "the cascade routes the bottom level to the cold endpoint"
+    );
+    // The tables the cascade replaced leave hot once no read still holds
+    // them, which a loaded machine delays.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let hot_after = loop {
+        let now = engine.footprints().get("ep-hot").expect("capped").charged();
+        if now < hot_before || std::time::Instant::now() >= deadline {
+            break now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(
+        hot_after < hot_before,
+        "the cascade frees the hot endpoint (before {hot_before}, after {hot_after})"
     );
     assert!(
-        cold_after >= cold_before,
-        "cold endpoint SST count must be ≥ pre-cascade count \
-         (cold_before={cold_before}, cold_after={cold_after})",
+        engine
+            .get(Partition::Node, b"node:0:0000000000")
+            .expect("read")
+            .is_some(),
+        "the cascaded rows stay readable"
     );
 }
 
@@ -345,7 +378,7 @@ fn reject_strategy_preserved_no_auto_cascade() {
             Durability::Durable,
             Tier::Hot,
         )
-        .with_hard_limit_bytes(4096), // tiny — definitely crosses thresholds
+        .with_hard_limit_bytes(4096), // below what an empty store takes
         // strategy defaults to Reject
         EndpointConfig::new(
             "ep-cold",
@@ -372,42 +405,22 @@ fn reject_strategy_preserved_no_auto_cascade() {
         HardLimitStrategy::Reject,
         "strategy field must persist as Reject — not swapped to CascadeEvict",
     );
-    // The refresh_capacity path inspects the strategy field and only
-    // fires cascade for CascadeEvict; with Reject, no eviction.
-    // Endpoint should be in Full severity given the tiny limit.
     assert_eq!(
         usage.severity(),
         CapacitySeverity::Full,
-        "tiny limit + bulk write must push to Full severity",
+        "a store past a tiny limit reports Full",
     );
-    assert!(!usage.is_writable());
 }
 
-/// `refresh_capacity` MUST persist the latest `used_bytes` snapshot to
-/// Schema so a subsequent engine open warm-loads it. Lets the
-/// pre-write gate work against plausible values immediately on
-/// reopen, before the first scan completes.
+/// A reopened store's footprint starts from the files: it covers the space
+/// the file system allocated to every file under the endpoint, each once,
+/// and the report carries it before any refresh.
 #[test]
-fn used_bytes_warm_load_on_reopen() {
+fn reopen_measures_the_footprint_from_the_files() {
     let dir = TempDir::new().expect("tempdir");
-    let make_config = || {
-        StorageConfig::with_endpoints(vec![
-            EndpointConfig::new(
-                "ep",
-                dir.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )
-            .with_hard_limit_bytes(10_000_000),
-        ])
-    };
-
-    // First lifecycle: write + persist + refresh → snapshot lands in
-    // Schema via the refresh path.
-    let used_after_first_run: u64;
+    let config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), 10_000_000)]);
     {
-        let engine = StorageEngine::open(&make_config()).expect("first open");
+        let engine = StorageEngine::open(&config).expect("first open");
         for i in 0..500u32 {
             let key = format!("node:0:{i:010}");
             engine
@@ -415,76 +428,56 @@ fn used_bytes_warm_load_on_reopen() {
                 .expect("put");
         }
         engine.persist().expect("persist");
-        engine.refresh_capacity();
-        // Persist again so the Schema write reaches SST.
-        engine.persist().expect("final persist");
-        let usage = engine.capacity().get("ep").unwrap();
-        used_after_first_run = usage.used();
-        assert!(used_after_first_run > 0);
     }
-
-    // Reopen — warm-load must populate `used_bytes` BEFORE any
-    // refresh call. Observable by inspecting the tracker immediately
-    // after open.
-    let engine = StorageEngine::open(&make_config()).expect("reopen");
-    let usage = engine.capacity().get("ep").unwrap();
-    assert_eq!(
-        usage.used(),
-        used_after_first_run,
-        "warm-load must restore last-known used_bytes without scan",
+    let engine = StorageEngine::open(&config).expect("reopen");
+    assert!(engine.capacity().get("ep").unwrap().used() > 0);
+    // Open may itself remove and write files: compare with the files as they
+    // are once it returned.
+    let on_disk = allocated_under(dir.path());
+    let charged = engine.footprints().get("ep").expect("capped").charged();
+    assert!(
+        charged >= on_disk,
+        "the reopened footprint ({charged}) must cover what the files take ({on_disk})",
     );
 }
 
 /// Prometheus counter `endpoint_threshold_alerts_total` MUST
 /// increment on every severity UP-crossing. Drives the endpoint into
-/// `Warning` severity through a local metrics recorder and inspects
-/// the captured counter value.
+/// `Full` severity and inspects the captured counter value.
+///
+/// The crossing is recorded by whichever refresh sees it first: this
+/// thread's, or the engine's background capacity scanner on its own thread
+/// once its interval passes (a loaded machine takes that long). The
+/// recorder is therefore the process's, installed before the engine opens;
+/// the test runs in a process of its own.
 #[test]
 fn threshold_alert_counter_increments_on_severity_crossing() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
-    let dir = TempDir::new().expect("tempdir");
-    // 4 KB limit so a modest write crosses Warning then Full.
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "alert-ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096),
-    ]);
-    let engine = StorageEngine::open(&config).expect("open");
-
-    // Drive enough writes to push severity past Normal → Warning →
-    // Full. Persist + refresh INSIDE the recorder scope so the alert
-    // emissions are captured.
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    metrics::with_local_recorder(&recorder, || {
-        for i in 0..500u32 {
-            let key = format!("node:0:{i:010}");
-            // Note: writes start succeeding (endpoint not yet full
-            // until the first refresh fires the gate). Ignore the
-            // CapacityExhausted that surfaces partway through —
-            // we only care about the counter side-effect.
-            let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
-        }
-        engine.persist().expect("persist");
-        engine.refresh_capacity();
-    });
+    recorder.install().expect("the process's metrics recorder");
+
+    let dir = TempDir::new().expect("tempdir");
+    // 4 KB limit, below what an empty store takes: the first refresh
+    // crosses straight to Full.
+    let config = StorageConfig::with_endpoints(vec![capped("alert-ep", dir.path(), 4096)]);
+    let engine = StorageEngine::open(&config).expect("open");
+    for i in 0..500u32 {
+        let key = format!("node:0:{i:010}");
+        // Refused: we only care about the counter side-effect.
+        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
 
     // Walk the snapshot and find the threshold-alert counter for our
     // endpoint. Any UP-crossing (Normal→Warning, Warning→Full, etc.)
-    // contributes one increment. We assert at least ONE — the exact
-    // count depends on whether refresh observed an intermediate
-    // severity or jumped straight to Full.
+    // contributes one increment.
     let snapshot = snapshotter.snapshot();
     let mut alert_count = 0u64;
     for (key, _unit, _desc, value) in snapshot.into_vec() {
         if key.key().name() == "endpoint_threshold_alerts_total" {
-            // Confirm the labels carry our endpoint id.
             let has_endpoint = key
                 .key()
                 .labels()
@@ -503,7 +496,7 @@ fn threshold_alert_counter_increments_on_severity_crossing() {
 }
 
 /// Prometheus counter `endpoint_cascade_events_total` MUST increment
-/// each time auto-cascade fires. Triggers Emergency severity on a
+/// each time auto-cascade fires. Triggers Full severity on a
 /// CascadeEvict-strategy endpoint and inspects the counter.
 #[test]
 fn cascade_events_counter_increments_on_auto_cascade() {
@@ -511,9 +504,8 @@ fn cascade_events_counter_increments_on_auto_cascade() {
 
     let hot = TempDir::new().expect("hot tempdir");
     let cold = TempDir::new().expect("cold tempdir");
-    // 4 KB hard limit so a modest write reliably lands in
-    // Emergency-or-Full severity — guarantees auto-cascade fires
-    // independently of LSM compression / SST overhead variance.
+    // 4 KB hard limit, below what an empty store takes: Full from the
+    // first refresh, so auto-cascade fires whatever the tables weigh.
     let config = StorageConfig::with_endpoints(vec![
         EndpointConfig::new(
             "ep-hot",
@@ -566,24 +558,16 @@ fn cascade_events_counter_increments_on_auto_cascade() {
     );
 }
 
-/// Gauges `endpoint_used_bytes` and `endpoint_hard_limit_bytes` MUST
-/// be set on every refresh — observable via the same debugging
-/// recorder. Pins the gauge contract.
+/// Gauges `endpoint_used_bytes`, `endpoint_hard_limit_bytes` and the
+/// footprint's own (`coordinode_footprint_*`) MUST be set on every refresh
+/// of a capped endpoint, observable via the same debugging recorder.
+/// Pins the gauge contract.
 #[test]
 fn capacity_gauges_emitted_on_refresh() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "gauge-ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(1_000_000),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("gauge-ep", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
 
     let recorder = DebuggingRecorder::new();
@@ -600,88 +584,60 @@ fn capacity_gauges_emitted_on_refresh() {
     });
 
     let snapshot = snapshotter.snapshot();
-    let mut saw_used_gauge = false;
-    let mut saw_limit_gauge = false;
+    let mut seen = std::collections::HashMap::new();
     for (key, _unit, _desc, value) in snapshot.into_vec() {
-        let name = key.key().name();
         let endpoint_ok = key
             .key()
             .labels()
             .any(|l| l.key() == "endpoint_id" && l.value() == "gauge-ep");
-        if !endpoint_ok {
-            continue;
-        }
-        if let DebugValue::Gauge(g) = value {
-            let g = g.into_inner();
-            if name == "endpoint_used_bytes" {
-                saw_used_gauge = true;
-                assert!(g > 0.0, "used_bytes gauge must be positive after writes");
-            } else if name == "endpoint_hard_limit_bytes" {
-                saw_limit_gauge = true;
-                assert_eq!(g, 1_000_000.0, "hard_limit_bytes gauge mirrors config");
-            }
+        if let (true, DebugValue::Gauge(g)) = (endpoint_ok, value) {
+            seen.insert(key.key().name().to_string(), g.into_inner());
         }
     }
-    assert!(
-        saw_used_gauge,
-        "endpoint_used_bytes gauge must be emitted on refresh"
+    assert!(seen["endpoint_used_bytes"] > 0.0, "used gauge after writes");
+    assert_eq!(seen["endpoint_hard_limit_bytes"], ROOMY as f64);
+    assert!(seen["coordinode_footprint_charged_bytes"] > 0.0);
+    assert_eq!(seen["coordinode_footprint_limit_bytes"], ROOMY as f64);
+    assert_eq!(
+        seen["coordinode_footprint_reserve_bytes"],
+        (ROOMY / 16) as f64,
+        "the default reserve is a sixteenth of the limit"
     );
-    assert!(
-        saw_limit_gauge,
-        "endpoint_hard_limit_bytes gauge must be emitted on refresh"
-    );
+    assert!(seen.contains_key("coordinode_footprint_admitted_bytes"));
+    assert!(seen.contains_key("coordinode_footprint_flush_debt_bytes"));
 }
 
 /// Concurrent put + refresh: writers and the capacity scanner must
 /// not race in ways that produce torn reads or panics. Spawns N
 /// writer threads doing bulk puts while a parallel thread loops on
 /// `refresh_capacity()`. Final state must be consistent: every key
-/// written before the test stopped is readable, the tracker's
-/// `used_bytes` is monotonically non-decreasing across observations,
-/// and `is_writable` semantics hold.
+/// written before the test stopped is readable.
 #[test]
 fn concurrent_put_and_refresh_no_torn_reads() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let dir = TempDir::new().expect("tempdir");
-    // Generous limit so writers don't get gated mid-test.
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(1_000_000_000),
-    ]);
+    // Generous limit so writers are not refused mid-test.
+    let config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), 1_000_000_000)]);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
 
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Refresher thread — bangs on refresh_capacity() while writers
-    // push data through. Any race in the AtomicU64 / AtomicBool /
-    // Mutex<CapacitySeverity> code path would surface as a panic
-    // (poison) or a tracker.used() reading that goes backwards.
+    // Refresher thread: bangs on refresh_capacity() while writers push
+    // data through. A race in the AtomicU64 / Mutex<CapacitySeverity>
+    // code path would surface as a panic (poison).
     let refresher_handle = {
         let engine = Arc::clone(&engine);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            let mut last_used: u64 = 0;
             while !stop.load(Ordering::Acquire) {
                 engine.refresh_capacity();
                 let usage = engine.capacity().get("ep").expect("tracked");
-                let cur = usage.used();
-                // No torn-read sanity: u64 atomics never expose
-                // half-written values, so any observed `cur` must be
-                // a complete snapshot. Across observations the value
-                // may both grow (new flushes) AND shrink (compaction
-                // merging SSTs reclaims overhead; WAL rotation
-                // truncates the old log). The atomic-correctness
-                // assertion is implicit in the lack of panics.
-                let _ = (last_used, cur);
-                last_used = cur;
+                // u64 atomics never expose half-written values; the
+                // footprint grows with flushes and shrinks with
+                // compactions, so no ordering across reads is asserted.
+                let _ = usage.used();
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         })
@@ -703,13 +659,10 @@ fn concurrent_put_and_refresh_no_torn_reads() {
     for h in writer_handles {
         h.join().expect("writer join");
     }
-    // Force a final flush so SSTs are on disk for the last refresh.
     engine.persist().expect("persist");
     stop.store(true, Ordering::Release);
     refresher_handle.join().expect("refresher join");
 
-    // Final state check: every key readable, tracker reports a
-    // plausible used_bytes (> 0, < limit).
     for w in 0..4 {
         for i in 0..250u32 {
             let key = format!("node:0:w{w}:{i:010}");
@@ -720,75 +673,63 @@ fn concurrent_put_and_refresh_no_torn_reads() {
             assert_eq!(&v[..], b"payload-bytes");
         }
     }
+    engine.refresh_capacity();
     let usage = engine.capacity().get("ep").expect("tracked");
     assert!(usage.used() > 0);
-    assert!(usage.is_writable(), "well under the 1 GB limit");
+    assert_eq!(
+        usage.severity(),
+        CapacitySeverity::Normal,
+        "well under 1 GB"
+    );
 }
 
-/// Warm-load preserves a `Full` severity state: opening an engine
-/// whose previous run persisted `used_bytes >= hard_limit_bytes` MUST
-/// initialise the tracker with `is_writable = false` BEFORE the first
-/// scan tick runs. Otherwise the operator would observe a transient
-/// "writable" window on reopen that the next scan would immediately
-/// close, defeating the purpose of warm-load.
+/// A limit lowered below what the store holds deletes nothing: the store
+/// reopened under it keeps every row readable and refuses client writes at
+/// once, its report at Full before any scan.
 #[test]
-fn warm_load_preserves_full_severity_state() {
+fn a_store_reopened_under_a_lower_limit_refuses_writes_and_keeps_its_data() {
     let dir = TempDir::new().expect("tempdir");
-    let make_config = || {
-        StorageConfig::with_endpoints(vec![
-            EndpointConfig::new(
-                "ep",
-                dir.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )
-            .with_hard_limit_bytes(4096),
-        ])
+    let accepted = {
+        let engine = StorageEngine::open(&StorageConfig::with_endpoints(vec![capped(
+            "ep",
+            dir.path(),
+            ROOMY,
+        )]))
+        .expect("first open");
+        let accepted = fill(&engine, Partition::Node, "node:0:");
+        engine.persist().expect("persist");
+        accepted
     };
 
-    // Step 1: fill past 100% + persist the snapshot.
-    {
-        let engine = StorageEngine::open(&make_config()).expect("first open");
-        for i in 0..500u32 {
-            let key = format!("node:0:{i:010}");
-            engine
-                .put(Partition::Node, key.as_bytes(), b"payload-bytes")
-                .expect("put");
-        }
-        engine.persist().expect("persist");
-        engine.refresh_capacity();
-        // Persist the schema partition again so the meta:capacity:*
-        // snapshot reaches SST before drop.
-        engine.persist().expect("final persist");
-        let usage = engine.capacity().get("ep").unwrap();
-        assert!(!usage.is_writable(), "endpoint full at end of step 1");
-    }
-
-    // Step 2: reopen. The very first inspection — BEFORE any scan
-    // tick — must already report is_writable=false because warm-load
-    // resolved severity against the persisted used_bytes.
-    let engine = StorageEngine::open(&make_config()).expect("reopen");
+    let engine = StorageEngine::open(&StorageConfig::with_endpoints(vec![capped(
+        "ep",
+        dir.path(),
+        ROOMY / 2,
+    )]))
+    .expect("reopen under a lower limit");
     let usage = engine.capacity().get("ep").unwrap();
-    assert!(
-        !usage.is_writable(),
-        "warm-load must preserve Full severity → is_writable=false; \
-         no transient writable window on reopen",
-    );
-
-    // The pre-write gate must also reject — proves the warm-loaded
-    // is_writable flag is consulted by `check_partition_capacity`.
+    assert_eq!(usage.severity(), CapacitySeverity::Full, "before any scan");
     let denied = engine.put(Partition::Node, b"node:0:after-reopen", b"x");
     assert!(
         matches!(denied, Err(StorageError::CapacityExhausted { .. })),
-        "warm-loaded Full endpoint must reject writes on reopen, got: {denied:?}",
+        "a store past its limit refuses writes on reopen, got: {denied:?}",
     );
+    for i in 0..accepted {
+        let key = format!("node:0:{i:010}");
+        assert!(
+            engine
+                .get(Partition::Node, key.as_bytes())
+                .unwrap()
+                .is_some(),
+            "row {i} was deleted to fit the lower limit"
+        );
+    }
 }
 
 /// Endpoints without a `hard_limit_bytes` configuration (default `0`)
-/// MUST never enter alert severity or flip `is_writable`. The tracker
-/// still records `used_bytes` for diagnostics but the limit is
-/// "unlimited" semantically.
+/// MUST never enter alert severity or refuse writes. The tracker still
+/// records `used_bytes` for diagnostics but the limit is "unlimited"
+/// semantically.
 #[test]
 fn endpoint_without_hard_limit_never_alerts() {
     let dir = TempDir::new().expect("tempdir");
@@ -817,19 +758,16 @@ fn endpoint_without_hard_limit_never_alerts() {
         CapacitySeverity::Normal,
         "unlimited endpoint must stay Normal regardless of usage",
     );
-    assert!(usage.is_writable());
     // Subsequent writes continue to succeed.
     engine
         .put(Partition::Node, b"node:0:no-limit", b"v")
         .expect("unlimited endpoint accepts writes indefinitely");
 }
 
-/// Multi-endpoint capacity tracking: each endpoint's `used_bytes` is
-/// computed independently from its own `tables/` directories, and
-/// severity / `is_writable` transitions on one endpoint do NOT affect
-/// any other endpoint's state. Production CE+EE tier deployments
-/// rely on this — the scanner must report per-endpoint state, never
-/// aggregate.
+/// Multi-endpoint capacity tracking: each endpoint's `used_bytes` is its
+/// own footprint, and severity on one endpoint does NOT affect any other
+/// endpoint's report. Production CE+EE tier deployments rely on this: the
+/// scanner must report per-endpoint state, never aggregate.
 #[test]
 fn multi_endpoint_tracking_is_independent_per_endpoint() {
     let hot = TempDir::new().expect("hot tempdir");
@@ -910,22 +848,18 @@ fn multi_endpoint_tracking_is_independent_per_endpoint() {
     assert_eq!(hot_usage.severity(), CapacitySeverity::Normal);
     assert_eq!(warm_usage.severity(), CapacitySeverity::Normal);
     assert_eq!(cold_usage.severity(), CapacitySeverity::Normal);
-    assert!(hot_usage.is_writable());
-    assert!(warm_usage.is_writable());
-    assert!(cold_usage.is_writable());
 }
 
-/// Multi-endpoint scenario: filling ONE endpoint past 100% MUST NOT
-/// flip `is_writable` on any other endpoint, and MUST NOT trigger
-/// auto-cascade for an endpoint that is itself not in Emergency.
-/// Pins per-endpoint isolation of state transitions.
+/// Multi-endpoint scenario: one endpoint past its limit MUST NOT report
+/// another as full, and MUST NOT trigger auto-cascade for an endpoint that
+/// is itself not in Emergency. Pins per-endpoint isolation of the report.
 #[test]
 fn multi_endpoint_full_state_does_not_leak_across_endpoints() {
     let hot = TempDir::new().expect("hot tempdir");
     let cold = TempDir::new().expect("cold tempdir");
 
     let config = StorageConfig::with_endpoints(vec![
-        // Tiny Hot limit so it fills.
+        // Tiny Hot limit, below what an empty store takes there.
         EndpointConfig::new(
             "ep-hot",
             hot.path(),
@@ -955,87 +889,65 @@ fn multi_endpoint_full_state_does_not_leak_across_endpoints() {
 
     let hot_usage = engine.capacity().get("ep-hot").expect("tracked");
     let cold_usage = engine.capacity().get("ep-cold").expect("tracked");
-
-    // Hot is Full (writes exceeded 4 KB easily).
     assert_eq!(hot_usage.severity(), CapacitySeverity::Full);
-    assert!(!hot_usage.is_writable());
-    // Cold is well under its 10 GB limit — Normal, writable.
-    assert_eq!(cold_usage.severity(), CapacitySeverity::Normal);
-    assert!(
-        cold_usage.is_writable(),
-        "cold endpoint must NOT inherit Hot's Full state — \
-         per-endpoint state tracking",
+    assert_eq!(
+        cold_usage.severity(),
+        CapacitySeverity::Normal,
+        "cold endpoint must NOT inherit Hot's Full state",
     );
+    assert!(allocated_under(cold.path()) < 10_000_000_000);
 }
 
-/// DOWN-crossing severity (Full → Normal after recovery) MUST NOT
-/// increment `endpoint_threshold_alerts_total`. The counter measures
-/// "alerts went off", not "severity changed in either direction".
-/// Pins the asymmetric semantics of the alert counter.
+/// DOWN-crossing severity (Full → Normal after the limit is raised at
+/// runtime) MUST NOT increment `endpoint_threshold_alerts_total`. The
+/// counter measures "alerts went off", not "severity changed in either
+/// direction". Pins the asymmetric semantics of the alert counter, and a
+/// raised limit admitting writes again without a restart.
 #[test]
 fn down_crossing_severity_does_not_increment_alert_counter() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     let dir = TempDir::new().expect("tempdir");
-    // Generous limit so engine-internal overhead (Schema manifest
-    // etc., now counted by the broader scan) is well under threshold
-    // at baseline. Bulk Node writes push over, SST-deletion recovers.
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(200_000),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Step 1: write to Full (UP-crossing increments counter).
-    for i in 0..5000u32 {
-        let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), &incompressible(i));
-    }
+    // Step 1: write until refused (UP-crossing increments counter).
+    fill(&engine, Partition::Node, "node:0:");
     engine.persist().expect("persist");
     engine.refresh_capacity();
     let usage = engine.capacity().get("ep").expect("tracked");
-    assert_eq!(usage.severity(), CapacitySeverity::Full);
+    assert!(
+        matches!(
+            usage.severity(),
+            CapacitySeverity::Emergency | CapacitySeverity::Full
+        ),
+        "a filled endpoint is at Emergency or Full, got {:?}",
+        usage.severity()
+    );
 
-    // Step 2: install a fresh recorder, then delete SSTs +
-    // refresh — the DOWN-crossing back to Normal must NOT increment
-    // the alert counter.
+    // Step 2: raise the limit inside a fresh recorder: the DOWN-crossing
+    // back to Normal must NOT increment the alert counter.
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, || {
-        let tables = dir.path().join(Partition::Node.name()).join("tables");
-        for entry in std::fs::read_dir(&tables).expect("tables") {
-            let p = entry.expect("entry").path();
-            if p.is_file() {
-                std::fs::remove_file(p).expect("remove SST");
-            }
-        }
+        engine
+            .footprints()
+            .get("ep")
+            .expect("capped")
+            .set_limit(64 * ROOMY, 0);
         engine.refresh_capacity();
     });
 
-    // Severity must now be Normal (the DOWN-crossing happened
-    // inside the recorder scope).
     let usage = engine.capacity().get("ep").expect("tracked");
     assert_eq!(
         usage.severity(),
         CapacitySeverity::Normal,
-        "deletion + refresh must drop severity back to Normal",
+        "a raised limit drops severity back to Normal",
     );
-    assert!(
-        usage.is_writable(),
-        "DOWN-crossing also flips is_writable back on"
-    );
+    engine
+        .put(Partition::Node, b"node:0:after-raise", b"v")
+        .expect("a raised limit admits writes without a restart");
 
-    // No alert counter increments captured during the DOWN-crossing
-    // refresh. The recorder only saw events from the second refresh
-    // call (where severity moved DOWN), so any
-    // `endpoint_threshold_alerts_total` increments here would be a
-    // bug.
     let snapshot = snapshotter.snapshot();
     for (key, _unit, _desc, value) in snapshot.into_vec() {
         if key.key().name() == "endpoint_threshold_alerts_total" {
@@ -1050,241 +962,171 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
     }
 }
 
-// ── Regression tests for hard-limit gate completeness ─────────────────
+// ── Every write path is admitted before it lands ──────────────────────
 //
-// The initial pre-write gate was wired only to `engine.put`. All three
-// remaining write paths (`engine.delete`, `engine.merge`,
-// `WriteBatch::commit`) were left ungated — writes through them would
-// succeed even on a Full endpoint, silently exceeding the hard limit. Each
-// test below MUST fail against the pre-fix code and pass after the
-// gate is propagated to every write path.
+// A write path left out of admission would succeed on a full endpoint and
+// pass the limit. Each test below fills the endpoint, then drives one path.
 
-/// `engine.delete` on a Full endpoint MUST reject with
-/// `CapacityExhausted`. A delete tombstone still consumes memtable
-/// bytes that will eventually flush to an SST, so a Full endpoint
-/// can't accept it.
+/// `engine.delete` on a full endpoint MUST reject with `CapacityExhausted`.
+/// A delete tombstone still consumes memtable bytes that will eventually
+/// flush to an SST, so a full endpoint can't accept it.
 #[test]
 fn delete_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "small",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
-
-    for i in 0..500u32 {
-        let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
-    }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    let usage = engine.capacity().get("small").expect("tracked");
-    assert!(!usage.is_writable(), "endpoint must be full");
+    saturate(&engine, Partition::Node, "node:0:");
 
     let result = engine.delete(Partition::Node, b"node:0:any-key");
     assert!(
         matches!(result, Err(StorageError::CapacityExhausted { .. })),
-        "delete on Full endpoint must reject with CapacityExhausted, got: {result:?}",
+        "delete on a full endpoint must reject with CapacityExhausted, got: {result:?}",
     );
 }
 
-/// `engine.merge` on a Full endpoint MUST reject with
-/// `CapacityExhausted`. Merge operands accumulate in the memtable
-/// until compaction folds them — they are additive in storage cost.
+/// `engine.merge` on a full endpoint MUST reject with `CapacityExhausted`.
+/// Merge operands accumulate in the memtable until compaction folds them:
+/// they are additive in storage cost.
 #[test]
 fn merge_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "small",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
-
     // Fill via the Adj partition (Adj is the canonical merge target —
     // posting-list deltas via `engine.merge`).
-    for i in 0..500u32 {
-        let key = format!("adj:T:out:{i:010}");
-        let _ = engine.put(Partition::Adj, key.as_bytes(), b"payload-bytes");
-    }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    let usage = engine.capacity().get("small").expect("tracked");
-    assert!(!usage.is_writable(), "endpoint must be full");
+    saturate(&engine, Partition::Adj, "adj:T:out:");
 
     let result = engine.merge(Partition::Adj, b"adj:T:out:42", &[0u8; 8]);
     assert!(
         matches!(result, Err(StorageError::CapacityExhausted { .. })),
-        "merge on Full endpoint must reject with CapacityExhausted, got: {result:?}",
+        "merge on a full endpoint must reject with CapacityExhausted, got: {result:?}",
     );
 }
 
-/// `WriteBatch::commit` on a Full endpoint MUST reject — this is the
-/// primary write path used by Raft proposal apply, query runner, and
-/// most internal subsystems. The pre-write gate must fire here too,
-/// or the entire mechanism is bypassable by every actual writer.
+/// `WriteBatch::commit` on a full endpoint MUST reject, and nothing of the
+/// batch lands.
 #[test]
 fn write_batch_commit_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "small",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
-
-    for i in 0..500u32 {
-        let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
-    }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    let usage = engine.capacity().get("small").expect("tracked");
-    assert!(!usage.is_writable(), "endpoint must be full");
+    saturate(&engine, Partition::Node, "node:0:");
 
     let mut batch = WriteBatch::new(&engine);
-    batch.put(Partition::Node, b"node:0:batched", b"v");
+    batch.put(Partition::Node, b"node:0:batched", &incompressible(7)[..]);
     let result = batch.commit();
     assert!(
         matches!(result, Err(StorageError::CapacityExhausted { .. })),
-        "WriteBatch::commit on Full endpoint must reject, got: {result:?}",
+        "WriteBatch::commit on a full endpoint must reject, got: {result:?}",
+    );
+    assert!(
+        engine
+            .get(Partition::Node, b"node:0:batched")
+            .unwrap()
+            .is_none()
     );
 }
 
-/// `WriteBatch` with mixed partitions: if ANY partition's L0 endpoint
-/// is Full, the entire commit MUST reject (atomicity — partial
-/// commits across partitions are not a thing in our model). Even if
-/// some partitions in the batch target a non-Full endpoint, the
-/// presence of a single Full-targeted mutation aborts the whole.
+/// A `WriteBatch` mixing the store's metadata with client data is a client
+/// write: the whole commit MUST reject on a full endpoint, its Schema part
+/// included (atomicity: partial commits across partitions are not a thing
+/// in our model).
 #[test]
 fn write_batch_commit_rejects_when_any_partition_endpoint_full() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "small",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
-
-    for i in 0..500u32 {
-        let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
-    }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    assert!(!engine.capacity().get("small").unwrap().is_writable());
+    saturate(&engine, Partition::Node, "node:0:");
 
     let mut batch = WriteBatch::new(&engine);
-    // Schema is bypassed by the gate, so this mutation alone would
-    // succeed. Mixing it with a Node-targeted mutation must still
-    // abort because Node's L0 endpoint is Full.
     batch.put(Partition::Schema, b"schema:label:Test", b"{}");
     batch.put(Partition::Node, b"node:0:mixed", b"v");
     let result = batch.commit();
     assert!(
         matches!(result, Err(StorageError::CapacityExhausted { .. })),
-        "mixed-partition batch with one Full-targeted mutation must reject, got: {result:?}",
+        "a mixed batch on a full endpoint must reject, got: {result:?}",
+    );
+    assert!(
+        engine
+            .get(Partition::Schema, b"schema:label:Test")
+            .unwrap()
+            .is_none(),
+        "no part of a refused batch lands"
     );
 }
 
-/// Read paths MUST remain functional on a Full endpoint —
+/// Read paths MUST remain functional on a full endpoint:
 /// `engine.get`, `prefix_scan` and friends MUST NOT consult the
-/// capacity gate. Operators need to be able to inspect data on a
-/// full endpoint to decide what to evict.
+/// footprint. Operators need to be able to inspect data on a full
+/// endpoint to decide what to evict.
 #[test]
 fn reads_remain_functional_on_full_endpoint() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "small",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
+    let accepted = fill(&engine, Partition::Node, "node:0:");
+    assert!(accepted > 42);
 
-    for i in 0..500u32 {
-        let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
-    }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    assert!(!engine.capacity().get("small").unwrap().is_writable());
-
-    // Point reads succeed.
     let v = engine
         .get(Partition::Node, b"node:0:0000000042")
-        .expect("get must work on Full endpoint");
+        .expect("get must work on a full endpoint");
     assert!(v.is_some(), "key must still be readable");
 
-    // Prefix scans succeed.
-    let iter = engine
+    let count = engine
         .prefix_scan(Partition::Node, b"node:0:")
-        .expect("prefix_scan must work on Full endpoint");
-    let count = iter.count();
-    assert!(
-        count > 0,
-        "prefix scan must return existing keys on Full endpoint",
-    );
+        .expect("prefix_scan must work on a full endpoint")
+        .count();
+    assert_eq!(count as u32, accepted, "every accepted row scans back");
 }
 
-/// Triggers fire bodies through the same `mvcc_write_buffer` as the
-/// originating mutation. When the targeted endpoint is Full, the
-/// trigger's body write MUST fail fast with `CapacityExhausted` —
-/// no implicit retry, no infinite loop. The whole transaction
-/// aborts via the standard error-propagation path, exactly like
-/// a non-trigger write would.
-///
-/// The protection is structural: the trigger executor calls
-/// `execute_op` which lands in the same `engine.put` /
-/// `WriteBatch::commit` gate. There is no retry layer in
-/// `fire_before_commit_triggers` (verified by source inspection
-/// and asserted here by measuring wall time of the failing call).
+/// The first node a full database creates needs a NodeId lease, whose record
+/// is itself a write: refused by the limit, it reaches the caller as the
+/// typed `CapacityExhausted` naming the endpoint, like any write past the
+/// limit, never as an internal failure.
+#[test]
+fn a_node_id_lease_refused_by_the_limit_is_capacity_exhausted() {
+    use coordinode_embed::{Database, DatabaseError};
+
+    let dir = TempDir::new().expect("tempdir");
+    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let storage_config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), ROOMY)]);
+    let engine = std::sync::Arc::new(
+        StorageEngine::open_with_oracle(&storage_config, std::sync::Arc::clone(&oracle))
+            .expect("open engine"),
+    );
+    // Filled before any node exists, so no lease was granted yet.
+    saturate(&engine, Partition::Node, "node:0:");
+    let pipeline: std::sync::Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+        std::sync::Arc::new(
+            coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
+        );
+    let mut db =
+        Database::from_engine(dir.path(), engine, oracle, pipeline).expect("a full store opens");
+    match db.execute_cypher("CREATE (:First)") {
+        Err(DatabaseError::CapacityExhausted {
+            endpoint_id,
+            hard_limit_bytes,
+            ..
+        }) => {
+            assert_eq!(endpoint_id, "ep");
+            assert_eq!(hard_limit_bytes, ROOMY);
+        }
+        other => panic!("expected CapacityExhausted, got {other:?}"),
+    }
+}
+
+/// Triggers fire bodies through the same write path as the originating
+/// mutation. When the endpoint is full, the whole transaction (the user
+/// CREATE and the trigger's CREATE) MUST fail fast with
+/// `CapacityExhausted`: no implicit retry, no infinite loop.
 #[test]
 fn trigger_fail_fast_on_capacity_exhausted() {
     use coordinode_embed::Database;
     use std::time::Instant;
 
     let dir = TempDir::new().expect("tempdir");
-    // Smallish limit; trigger DDL itself writes to Schema (bypasses
-    // the gate) so DDL succeeds even after the limit is hit; we
-    // need to populate the trigger BEFORE filling so the user-data
-    // partitions are below the limit at DDL time.
     let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let storage_config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(40_000),
-    ]);
+    let storage_config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), ROOMY)]);
     let engine = std::sync::Arc::new(
         coordinode_storage::engine::core::StorageEngine::open_with_oracle(
             &storage_config,
@@ -1300,39 +1142,17 @@ fn trigger_fail_fast_on_capacity_exhausted() {
         Database::from_engine(dir.path(), std::sync::Arc::clone(&engine), oracle, pipeline)
             .expect("from_engine");
 
-    // Setup: trigger on User CREATE creates an Audit node — the
-    // simplest possible cascade. With a Full endpoint both nodes
-    // are denied at the same gate; without a retry loop the call
-    // returns fast.
+    // Setup: trigger on User CREATE creates an Audit node, before the
+    // endpoint fills.
     db.execute_cypher(
         "CREATE TRIGGER audit_user ON :User CREATE BEFORE COMMIT \
          EXECUTE CREATE (a:Audit)",
     )
     .expect("create trigger");
 
-    // Fill the endpoint through direct engine writes (bypasses the
-    // Cypher path so we can fill without firing the trigger
-    // ourselves).
-    for i in 0..5000u32 {
-        let key = format!("node:0:{i:010}");
-        let _ = engine.put(
-            coordinode_storage::engine::partition::Partition::Node,
-            key.as_bytes(),
-            b"payload-bytes",
-        );
-    }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    assert!(
-        !engine.capacity().get("ep").unwrap().is_writable(),
-        "endpoint must be Full before firing the trigger-source mutation",
-    );
+    // Fill through direct engine writes, so the trigger is not fired.
+    saturate(&engine, Partition::Node, "node:0:");
 
-    // Fire the trigger via a CREATE that the trigger watches. The
-    // ENTIRE transaction (user CREATE + trigger CREATE) must abort
-    // immediately. We measure wall time — a retry loop would push
-    // this well past 1 s. Fail-fast keeps it < 200 ms even on
-    // contended CI machines.
     let started = Instant::now();
     let result = db.execute_cypher("CREATE (u:User {name: 'alice'})");
     let elapsed = started.elapsed();
@@ -1344,138 +1164,86 @@ fn trigger_fail_fast_on_capacity_exhausted() {
             rows.len(),
         ),
     };
-    // The DatabaseError carries the typed CapacityExhausted —
-    // either as Storage(...) (rare for Cypher writes) or as
-    // Execution(Storage(...)) via the proposal pipeline path
-    // we already lift.
     let msg = format!("{err}");
     assert!(
         msg.contains("capacity exhausted") || msg.contains("CapacityExhausted"),
         "expected capacity-exhausted error from trigger path, got: {msg}",
     );
+    assert!(
+        db.execute_cypher("MATCH (a:Audit) RETURN a")
+            .unwrap()
+            .is_empty(),
+        "the trigger's effect is refused with the statement"
+    );
 
     // Wall-time guard: a retry loop with exponential backoff takes
-    // seconds, fail-fast single-digit milliseconds. The ceiling sits
-    // between the two, clear of a debug build on a fully loaded CI
-    // runner (measured at 221 ms there), so it catches the loop and
-    // nothing else.
+    // seconds; a refusal plus one reclamation takes milliseconds. The
+    // ceiling sits between the two, clear of a debug build on a fully
+    // loaded CI runner.
     assert!(
-        elapsed < std::time::Duration::from_secs(1),
-        "trigger fail-fast must complete in < 1 s (got {elapsed:?}): \
+        elapsed < std::time::Duration::from_secs(5),
+        "trigger fail-fast must complete in < 5 s (got {elapsed:?}): \
          a longer wall time suggests a hidden retry loop",
     );
 }
 
-/// Compaction-driven recovery: write past the limit, fire
-/// `major_compact` (the real production path that reclaims space
-/// from stale MVCC versions, tombstones, and pre-compaction
-/// L0/L1 overlap), refresh, and assert writes RESUME automatically
-/// because `used_bytes` dropped back below `hard_limit_bytes`.
+/// Compaction-driven recovery: fill with rewrites of the same keys until
+/// refused, fire `major_compact` (the production path that reclaims space
+/// from stale MVCC versions), and assert writes RESUME without a restart
+/// because the files compaction removed gave their space back.
 ///
-/// This is the canonical "I deleted a bunch of data and the engine
-/// keeps refusing my writes — why?" question. The answer: deletes
-/// produce tombstones which still occupy space; only compaction
-/// physically reclaims it. The capacity gate has to follow the
-/// post-compaction reality, not a synchronous accounting that
-/// confuses logical deletes with physical reclamation.
+/// Deletes produce tombstones which still occupy space; only compaction
+/// physically reclaims it, and the footprint follows the files.
 #[test]
 fn writes_resume_after_compaction_frees_space() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(200_000),
-    ]);
+    let config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Step 1: bulk-write the SAME 100 keys over 150 rounds. Each
-    // rewrite creates a new MVCC version of the same key; the engine
-    // keeps the versions in SSTs until compaction folds them. This is
-    // the easy way to manufacture compaction-reclaimable space
-    // without depending on tombstones. The padding and round count
-    // push the endpoint past the 200K hard limit.
-    let padding = "x".repeat(64);
-    for round in 0..150u32 {
+    // Rewrite the SAME 100 keys round after round until refused: every
+    // rewrite is a new MVCC version compaction can fold away.
+    let mut refused = false;
+    'fill: for round in 0..100_000u32 {
         for i in 0..100u32 {
             let key = format!("node:0:{i:010}");
-            let value = format!("round-{round}-{padding}");
-            // Once the endpoint fills, the gate rejects the rest of the
-            // barrage; that rejection is the state this test starts from.
-            let _ = engine.put(Partition::Node, key.as_bytes(), value.as_bytes());
+            match engine.put(Partition::Node, key.as_bytes(), &incompressible(round)) {
+                Ok(()) => {}
+                Err(StorageError::CapacityExhausted { .. }) => {
+                    refused = true;
+                    break 'fill;
+                }
+                Err(other) => panic!("unexpected refusal: {other:?}"),
+            }
         }
     }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    let usage = engine.capacity().get("ep").expect("tracked");
-    assert!(
-        !usage.is_writable(),
-        "endpoint must be full after rewrite barrage (used={})",
-        usage.used(),
-    );
+    assert!(refused, "the rewrite barrage never filled the endpoint");
+    assert!(allocated_under(dir.path()) <= ROOMY);
 
-    // Subsequent put rejects.
-    let denied = engine.put(Partition::Node, b"node:0:while-full", b"x");
-    assert!(
-        matches!(denied, Err(StorageError::CapacityExhausted { .. })),
-        "writes must be gated while endpoint is Full",
-    );
-
-    // Step 2: fire major compaction. It will fold every key down to
-    // its latest version, reclaiming the redundancy from step 1.
-    // After refresh, used_bytes drops back below the
-    // threshold and is_writable flips on.
     engine
         .major_compact(Partition::Node)
         .expect("major compact");
 
-    // Poll rather than read once. Capacity is measured by walking the files
-    // under the endpoint, and compaction returning does not mean the segments
-    // it superseded are already unlinked: they are held on the version free
-    // list until the last reference drops, and until then the walk still
-    // counts them. On an unloaded machine that window is invisible; on a busy
-    // CI runner it is not, which is why reading once made this test fail on
-    // main roughly two runs in five. The assertion below is unchanged: the
-    // endpoint must become writable, this only allows the reclaim a moment to
-    // reach the filesystem.
+    // The tables compaction replaced are removed once no read still holds
+    // them, which a loaded machine delays: poll for the room they leave.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        engine.refresh_capacity();
-        if engine.capacity().get("ep").expect("tracked").is_writable()
-            || std::time::Instant::now() >= deadline
-        {
-            break;
+        match engine.put(Partition::Node, b"node:0:after-compact", b"v") {
+            Ok(()) => break,
+            Err(StorageError::CapacityExhausted { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(other) => panic!("writes must resume after compaction reclaims space: {other:?}"),
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-
-    let usage = engine.capacity().get("ep").expect("tracked");
-    assert!(
-        usage.is_writable(),
-        "writes must resume after compaction reclaims space \
-         (used={} <= hard_limit=200000)",
-        usage.used(),
-    );
-
-    // Step 3: confirm the gate now accepts new writes.
-    engine
-        .put(Partition::Node, b"node:0:after-compact", b"v")
-        .expect("write must succeed after compaction recovery");
+    assert!(allocated_under(dir.path()) <= ROOMY);
 }
 
-/// Cascade-eviction-driven recovery on a multi-tier config: the
-/// Hot endpoint fills past its limit, `cascade_evict_endpoint`
-/// fires (via the `CascadeEvict` strategy + emergency severity)
-/// to push bottom-level SSTs to the Cold endpoint, the Hot
-/// endpoint's `used_bytes` drops back below the threshold, and
-/// writes resume on partitions routed to Hot.
-///
-/// This is the canonical CE+EE flow for "Hot tier capacity event
-/// auto-recovers without operator intervention".
+/// Cascade-eviction-driven recovery on a multi-tier config: a capped Hot
+/// endpoint under the `CascadeEvict` strategy takes three times its limit
+/// of rows. Each write it refuses goes through once the cascade (fired by
+/// the capacity refresh at Emergency or Full) has moved bottom-level tables
+/// to the Cold endpoint; Hot never passes its limit and every row reads
+/// back.
 #[test]
 fn writes_resume_after_cascade_eviction_frees_hot_endpoint() {
     let hot = TempDir::new().expect("hot tempdir");
@@ -1489,7 +1257,7 @@ fn writes_resume_after_cascade_eviction_frees_hot_endpoint() {
             Durability::Durable,
             Tier::Hot,
         )
-        .with_hard_limit_bytes(200_000)
+        .with_hard_limit_bytes(ROOMY)
         .with_hard_limit_strategy(HardLimitStrategy::CascadeEvict),
         EndpointConfig::new(
             "ep-cold",
@@ -1501,176 +1269,158 @@ fn writes_resume_after_cascade_eviction_frees_hot_endpoint() {
     ]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Bulk write — same key set, many rewrites, plus diverse keys
-    // to give compaction enough material to push to bottom level.
-    // Padding keeps each value chunky so the cumulative footprint
-    // crosses the 200K hard limit under v5's tighter SST encoding.
-    let padding = "x".repeat(64);
-    for round in 0..60u32 {
-        for i in 0..200u32 {
-            let key = format!("node:0:{i:010}");
-            let value = format!("round-{round}-{padding}");
-            let _ = engine.put(Partition::Node, key.as_bytes(), value.as_bytes());
+    // A row of 64 incompressible bytes takes more than that on disk: rows
+    // for three limits' worth of their values push well past Hot's limit.
+    let rows = (3 * ROOMY / 64) as u32;
+    for i in 0..rows {
+        let key = format!("node:0:{i:010}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match engine.put(Partition::Node, key.as_bytes(), &incompressible(i)) {
+                Ok(()) => break,
+                Err(StorageError::CapacityExhausted { .. })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    // The refresh fires the cascade; the tables it replaces
+                    // leave Hot once no compaction still reads them.
+                    engine.refresh_capacity();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(other) => panic!(
+                    "row {i}: Hot must recover after cascade eviction: {other:?} \
+                     (hot_used={}, cold_used={})",
+                    engine.capacity().get("ep-hot").unwrap().used(),
+                    engine.capacity().get("ep-cold").unwrap().used(),
+                ),
+            }
+        }
+        if i % 1024 == 0 {
+            assert!(
+                allocated_under(hot.path()) <= ROOMY,
+                "row {i}: Hot past its limit"
+            );
         }
     }
-    engine.persist().expect("persist");
-    engine.refresh_capacity();
-    let usage = engine.capacity().get("ep-hot").expect("hot tracked");
+    assert!(allocated_under(hot.path()) <= ROOMY);
     assert!(
-        !usage.is_writable(),
-        "Hot endpoint must reach Full after bulk write \
-         (used={})",
-        usage.used(),
+        allocated_under(cold.path()) > ROOMY,
+        "more than Hot's limit moved to Cold"
     );
-
-    // `refresh_capacity` itself already fires the auto-cascade for
-    // `CascadeEvict` strategy at Emergency-or-Full severity — see
-    // run_capacity_refresh. The cascade calls major_compact, which
-    // pushes the bottom-level SSTs to the Cold endpoint via the
-    // per-LSM-level routing's L4+ → Cold mapping.
-
-    // Refresh again, as the background scanner does on each pass: the
-    // post-cascade SSTs move to Cold, and the tables they replace leave Hot
-    // once no compaction still running reads them, which a busy machine
-    // delays. Recovery is promised without an operator, not within one pass.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        engine.refresh_capacity();
-        let writable = engine.capacity().get("ep-hot").expect("hot").is_writable();
-        if writable || std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    for i in (0..rows).step_by(997) {
+        let key = format!("node:0:{i:010}");
+        assert!(
+            engine
+                .get(Partition::Node, key.as_bytes())
+                .expect("read")
+                .is_some(),
+            "row {i} reads back"
+        );
     }
-    let hot_usage = engine.capacity().get("ep-hot").expect("hot");
-    let cold_usage = engine.capacity().get("ep-cold").expect("cold");
-
-    // Hot endpoint MUST have dropped below its limit (cascade
-    // physically moved bytes off).
-    assert!(
-        hot_usage.is_writable(),
-        "Hot endpoint must auto-recover after cascade eviction \
-         (hot_used={}, cold_used={})",
-        hot_usage.used(),
-        cold_usage.used(),
-    );
-
-    // Subsequent put on Node (routed to Hot at L0) succeeds.
-    engine
-        .put(Partition::Node, b"node:0:after-cascade", b"v")
-        .expect("write must succeed after cascade-driven recovery");
 }
 
-/// Capacity scanner MUST count every on-disk file under the endpoint
-/// root, not just `<part>/tables/`. Engine-managed artefacts that
-/// live in sibling directories (WAL, oplog segments, tantivy FTS
-/// index files, manifest data) all consume disk and must contribute
-/// to `used_bytes`. A narrower per-partition scan would silently
-/// under-count and let the disk fill while the gate reports
-/// comfortable headroom.
-///
-/// This test plants arbitrary files in non-partition subdirectories
-/// of the endpoint root and asserts the scanner sees them.
+/// A cache layer placed under a capped endpoint writes its file directly, so
+/// open reserves the room it may reach (twice its size, for its compaction)
+/// on the footprint; one that does not fit leaves the cache off and nothing
+/// reserved, the store opening as before.
 #[test]
-fn refresh_counts_all_endpoint_files_not_only_partition_tables() {
+fn a_cache_layer_under_a_capped_endpoint_is_reserved_or_left_off() {
+    use coordinode_storage::cache::config::{CacheLayerConfig, TieredCacheConfig};
+    let open = |dir: &std::path::Path, layer_bytes: u64| {
+        let mut config = StorageConfig::with_endpoints(vec![capped("ep", dir, ROOMY)]);
+        config.cache = TieredCacheConfig {
+            layers: vec![CacheLayerConfig::new(dir.join("block.cache"), layer_bytes)],
+            ..TieredCacheConfig::default()
+        };
+        StorageEngine::open(&config).expect("open")
+    };
+
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(10_000_000),
-    ]);
-    let engine = StorageEngine::open(&config).expect("open");
+    let engine = open(dir.path(), 64 * 1024);
+    assert!(engine.tiered_cache().is_some(), "a layer that fits is on");
+    let reserved = engine
+        .footprints()
+        .get("ep")
+        .expect("capped")
+        .file(&dir.path().join("block.cache"))
+        .bytes();
+    assert!(
+        reserved >= 2 * 64 * 1024,
+        "the layer is reserved twice over"
+    );
+    drop(engine);
 
-    // Plant a few non-partition files that the OLD scanner would
-    // have missed:
-    //   - WAL-like file
-    //   - oplog-like segment
-    //   - tantivy-like index directory
-    //   - misc operator file (random log)
-    let wal_dir = dir.path().join("wal");
-    std::fs::create_dir_all(&wal_dir).expect("mkdir wal");
-    std::fs::write(wal_dir.join("standalone.wal"), vec![0u8; 100_000]).expect("write wal file");
+    let dir = TempDir::new().expect("tempdir");
+    let engine = open(dir.path(), ROOMY);
+    assert!(
+        engine.tiered_cache().is_none(),
+        "a layer past the limit leaves the cache off"
+    );
+    assert!(
+        engine
+            .footprints()
+            .get("ep")
+            .expect("capped")
+            .file(&dir.path().join("block.cache"))
+            .bytes()
+            < ROOMY,
+        "nothing stays reserved for a layer left off"
+    );
+    engine
+        .put(Partition::Node, b"node:0:with-cache-off", b"v")
+        .expect("the store opens and writes as before");
+}
 
+/// The footprint open measures covers every file under the endpoint root,
+/// not just `<part>/tables/`: journal segments, text-index files and
+/// anything else a previous run left there take room on the endpoint.
+#[test]
+fn open_counts_all_endpoint_files_not_only_partition_tables() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), 10_000_000)]);
+    drop(StorageEngine::open(&config).expect("lay the store out"));
+    let before = allocated_under(dir.path());
+    // Files of every kind, planted before the store opens again.
     let oplog_dir = dir.path().join("oplog").join("0");
     std::fs::create_dir_all(&oplog_dir).expect("mkdir oplog");
-    std::fs::write(
-        oplog_dir.join("segment-00000000000000000001.bin"),
-        vec![0u8; 50_000],
-    )
-    .expect("write oplog seg");
-
+    std::fs::write(oplog_dir.join("leftover.bin"), vec![0u8; 50_000]).expect("write oplog file");
     let text_dir = dir.path().join("text_indexes").join("text_idx_x_body");
     std::fs::create_dir_all(&text_dir).expect("mkdir text idx");
     std::fs::write(text_dir.join("meta.json"), vec![0u8; 30_000]).expect("write tantivy meta");
     std::fs::write(text_dir.join("segment.idx"), vec![0u8; 200_000])
         .expect("write tantivy segment");
+    std::fs::write(dir.path().join("operator.log"), vec![0u8; 100_000]).expect("write misc");
 
-    // Run capacity refresh and assert every planted file counts.
-    engine.refresh_capacity();
-    let usage = engine.capacity().get("ep").expect("tracked");
-    let observed = usage.used();
-
-    // Total planted bytes = 100k + 50k + 30k + 200k = 380k. Plus
-    // engine-internal files (schema partition manifests etc.) that
-    // exist after open. Assert at least the planted total.
+    let engine = StorageEngine::open(&config).expect("open");
+    let observed = engine.capacity().get("ep").expect("tracked").used();
     let planted = 100_000 + 50_000 + 30_000 + 200_000;
     assert!(
-        observed >= planted,
-        "scanner must see at least the planted {planted} bytes in non-partition dirs, got {observed}",
+        observed >= before + planted,
+        "the footprint must cover the store ({before}) and the planted {planted} bytes, \
+         got {observed}",
     );
 }
 
-/// Tantivy-style FTS index that pushes an endpoint past 100% MUST
-/// flip `is_writable` off — even though the bytes did not arrive
-/// through `engine.put`. Tantivy writes are not gated themselves
-/// (they happen inside the query layer's index update path), but
-/// they MUST show up in capacity accounting so the next put through
-/// the gate observes the Full state and rejects.
+/// Text-index bytes left on an endpoint count against its limit like any
+/// other file: a store whose files already pass the limit refuses client
+/// writes, whatever subsystem wrote them.
 #[test]
-fn tantivy_index_bytes_can_push_endpoint_to_full() {
+fn text_index_bytes_can_push_endpoint_to_full() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![
-        EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096),
-    ]);
-    let engine = StorageEngine::open(&config).expect("open");
-
-    // Simulate a fat tantivy index without going through the query
-    // layer: drop a large file into the canonical text-index path.
+    let config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), ROOMY)]);
+    drop(StorageEngine::open(&config).expect("lay the store out"));
     let text_dir = dir.path().join("text_indexes").join("text_idx_X_body");
     std::fs::create_dir_all(&text_dir).expect("mkdir");
-    std::fs::write(text_dir.join("fat.idx"), vec![0u8; 8192]).expect("write fat idx");
+    std::fs::write(text_dir.join("fat.idx"), vec![0u8; 3 * ROOMY as usize]).expect("write fat idx");
 
+    let engine = StorageEngine::open(&config).expect("a store past its limit opens");
     engine.refresh_capacity();
     let usage = engine.capacity().get("ep").expect("tracked");
+    assert_eq!(usage.severity(), CapacitySeverity::Full);
 
-    assert_eq!(
-        usage.severity(),
-        CapacitySeverity::Full,
-        "8 KB tantivy file > 4 KB hard_limit must register as Full",
-    );
-    assert!(
-        !usage.is_writable(),
-        "Full state from non-partition bytes still flips the gate",
-    );
-
-    // Subsequent put on user data must reject — proves the gate
-    // honours the non-partition byte count.
     let result = engine.put(Partition::Node, b"node:0:after-fat-idx", b"x");
     assert!(
         matches!(result, Err(StorageError::CapacityExhausted { .. })),
-        "Full from FTS bytes must still gate writes, got: {result:?}",
+        "a store past its limit by text-index bytes refuses writes, got: {result:?}",
     );
 }
 

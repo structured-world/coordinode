@@ -1,42 +1,20 @@
-//! Per-endpoint capacity tracking + hard-limit enforcement.
+//! Per-endpoint capacity reporting: how full each endpoint is against its
+//! hard limit, the alerts its thresholds raise, and the cascade eviction an
+//! endpoint configured for it starts.
 //!
-//! Enforces `used ≤ hard_limit` at all times. For each [`crate::engine::config::EndpointConfig`]
-//! with a non-zero `hard_limit_bytes`, this module:
+//! The limit itself is enforced by the owned footprint
+//! ([`crate::engine::footprint`]), which charges every byte before it is
+//! written; this module reads that account, it does not gate anything. For
+//! each endpoint, on the scanner's cadence:
 //!
-//! 1. Periodically scans the endpoint's per-partition `tables/`
-//!    directories and recomputes total bytes-on-disk (`used_bytes`).
-//! 2. Tracks alert-threshold crossings (80% / 90% / 95% / 100%) and
-//!    emits Prometheus metrics + structured tracing events.
-//! 3. At the 95% emergency threshold with [`HardLimitStrategy::CascadeEvict`],
-//!    fires a cascade eviction through the per-LSM-level routing
-//!    (using the bottom-level compaction mechanism from the routing
-//!    module).
-//! 4. At 100%, flips the endpoint's `is_writable` flag to `false`.
-//!    Writes targeting that endpoint surface as
-//!    `StorageError::CapacityExhausted` so the coordinator can retry
-//!    on a different endpoint.
-//!
-//! ## Polling vs flush-callback tracking
-//!
-//! The storage-stack design implies "synchronous tracking on every
-//! SST flush / compact / delete". `coordinode-lsm-tree` does not yet
-//! expose flush/compact callbacks at the consumer boundary, so this
-//! implementation uses **periodic disk scanning** instead.
-//! Implications:
-//!
-//! - Threshold detection lag = up to one scan interval (default 5 s).
-//! - Operator-facing alerts (80% / 90%) are observed within the
-//!   interval and are operationally useful at any reasonable cadence.
-//! - The 100% rejection gate has the same lag — a burst of writes
-//!   within one interval *can* push `used_bytes` over `hard_limit`
-//!   transiently. The 95% emergency threshold + 5% safety margin
-//!   keeps this within the configured limit in practice. Operators
-//!   who require synchronous enforcement should size `hard_limit_bytes`
-//!   conservatively (≥ 5% headroom below physical capacity).
-//!
-//! A future upstream addition of flush/compact callbacks to
-//! `coordinode-lsm-tree` would let this module switch to incremental
-//! tracking with no API change above this layer.
+//! 1. `used_bytes` is the endpoint's charged footprint (what its files take
+//!    on disk); an endpoint without a hard limit has no footprint and is
+//!    measured by walking its folder, for the gauges only.
+//! 2. Alert-threshold crossings (80% / 90% / 95% / 100%) emit Prometheus
+//!    metrics and structured tracing events.
+//! 3. At the 95% emergency threshold with
+//!    [`HardLimitStrategy::CascadeEvict`], a cascade eviction is fired
+//!    through the per-LSM-level routing.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -62,9 +40,8 @@ pub enum CapacitySeverity {
     /// 95% to 100% — emergency. Cascade eviction fires here if
     /// `HardLimitStrategy::CascadeEvict`.
     Emergency,
-    /// At or above 100% — endpoint is_writable flag flipped off,
-    /// writes targeting this endpoint reject until cascade or
-    /// operator intervention drops usage back below threshold.
+    /// At or above 100%: the footprint refuses growth until reclamation,
+    /// cascade or the operator brings it back under the limit.
     Full,
 }
 
@@ -106,25 +83,24 @@ pub struct EndpointUsage {
     /// Endpoint id this state belongs to. Used as the Prometheus
     /// `endpoint_id` label and the cascade-eviction target.
     pub id: String,
-    /// Most-recent scanned bytes-on-disk total across every
-    /// `<endpoint>/<partition>/tables/` directory served by this
-    /// endpoint.
+    /// The endpoint's footprint at the last refresh: what its files take on
+    /// disk, what admitted writes hold and what the memtables owe, as the
+    /// owned footprint counts them.
     pub used_bytes: AtomicU64,
     /// `hard_limit_bytes` snapshot from the endpoint config at engine
     /// open time. `0` means "no limit configured" — tracker still
     /// counts usage for diagnostics but never triggers thresholds.
     pub hard_limit_bytes: u64,
+    /// The part of the limit client writes may take (the limit less the
+    /// recovery reserve), which the severities are fractions of: `Full` is
+    /// where client writes are refused. Follows a limit changed at runtime.
+    pub ceiling_bytes: AtomicU64,
     /// `capacity_bytes` snapshot from the endpoint config — physical
     /// size of the underlying media (informational only).
     pub capacity_bytes: u64,
     /// Configured strategy for handling
     /// `used_bytes + write_size > hard_limit_bytes`.
     pub strategy: HardLimitStrategy,
-    /// `true` when writes targeting this endpoint are accepted. Flips
-    /// to `false` on a `Full` (≥ 100%) severity crossing; flips back
-    /// to `true` once a refresh observes usage back under the limit
-    /// (cascade eviction or operator-driven cleanup).
-    pub is_writable: AtomicBool,
     /// Last observed severity — used to detect transitions so alert
     /// metrics increment exactly once per crossing (not on every
     /// scan).
@@ -140,9 +116,9 @@ impl EndpointUsage {
             id: endpoint.id.clone(),
             used_bytes: AtomicU64::new(0),
             hard_limit_bytes: endpoint.hard_limit_bytes,
+            ceiling_bytes: AtomicU64::new(endpoint.hard_limit_bytes - endpoint.recovery_reserve()),
             capacity_bytes: endpoint.capacity_bytes,
             strategy: endpoint.hard_limit_strategy,
-            is_writable: AtomicBool::new(true),
             last_severity: std::sync::Mutex::new(CapacitySeverity::Normal),
         }
     }
@@ -152,16 +128,25 @@ impl EndpointUsage {
         self.used_bytes.load(Ordering::Acquire)
     }
 
-    /// `true` iff writes targeting this endpoint may proceed. Flips
-    /// to `false` when a scan observes the endpoint at or above its
-    /// `hard_limit_bytes`.
-    pub fn is_writable(&self) -> bool {
-        self.is_writable.load(Ordering::Acquire)
-    }
-
-    /// Severity for the current `used` snapshot.
+    /// Severity for the current `used` snapshot, against the part of the
+    /// limit client writes may take.
     pub fn severity(&self) -> CapacitySeverity {
-        CapacitySeverity::for_usage(self.used(), self.hard_limit_bytes)
+        severity_of(
+            self.used(),
+            self.hard_limit_bytes,
+            self.ceiling_bytes.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// The severity of `used` bytes under a hard limit `limit` (`0`: none) of
+/// which client writes may take `ceiling`: a reserve as large as the limit
+/// leaves client writes nothing, which is full.
+fn severity_of(used: u64, limit: u64, ceiling: u64) -> CapacitySeverity {
+    match (limit, ceiling) {
+        (0, _) => CapacitySeverity::Normal,
+        (_, 0) => CapacitySeverity::Full,
+        (_, ceiling) => CapacitySeverity::for_usage(used, ceiling),
     }
 }
 
@@ -203,50 +188,33 @@ impl CapacityTracker {
         self.endpoints.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    /// Refresh `used_bytes` for every endpoint by scanning its
-    /// per-partition `tables/` directories on disk.
-    ///
-    /// `partition_names` is the list of partition directory names to
-    /// scan under each endpoint's root (e.g. `["node", "adj",
-    /// "edgeprop", ...]`). Provided by the caller to avoid coupling
-    /// this module to [`crate::engine::partition::Partition`].
+    /// Refresh `used_bytes` for every endpoint: its charged footprint, or,
+    /// for an endpoint without a hard limit, the bytes its folder holds.
     ///
     /// Side effects on each [`EndpointUsage`]:
     /// - Updates `used_bytes` atomically (Release ordering).
     /// - Re-evaluates severity. On transition to a higher severity:
     ///   increments the per-severity Prometheus counter (caller is
     ///   expected to read these counters) and emits `tracing::warn!`.
-    /// - Flips `is_writable` to `false` if severity is `Full`; flips
-    ///   back to `true` if severity drops below `Full` (cascade or
-    ///   operator cleanup brought usage back under limit).
     pub fn refresh(
         &self,
         endpoint_paths: &BTreeMap<String, std::path::PathBuf>,
-        _partition_names: &[&str],
+        footprints: &crate::engine::footprint::Footprints,
     ) {
         for (id, usage) in &self.endpoints {
-            let Some(root) = endpoint_paths.get(id) else {
-                continue;
+            let total = match footprints.get(id) {
+                Some(footprint) => {
+                    publish_footprint(id, footprint);
+                    usage
+                        .ceiling_bytes
+                        .store(footprint.client_ceiling(), Ordering::Release);
+                    footprint.committed()
+                }
+                None => match endpoint_paths.get(id) {
+                    Some(root) => dir_size(root),
+                    None => continue,
+                },
             };
-            // Recursively sum every file under the endpoint root.
-            // This captures every on-disk artefact the engine writes
-            // through this mount point, not just partition SSTs:
-            //   - `<part>/tables/`     — LSM SST files
-            //   - `<part>/manifest/`   — lsm-tree manifest + segment metadata
-            //   - `wal/standalone.wal` — standalone WAL file
-            //   - `oplog/<shard>/`     — Raft oplog segments
-            //   - `text_indexes/`      — tantivy FTS index segments
-            //   - any future engine-managed subdirectory
-            //
-            // Matches `du -sh <endpoint>` — the operational definition
-            // of "how full is this disk from coordinode's view". A
-            // narrower per-partition scan misses anything outside
-            // `tables/` and silently under-counts capacity.
-            //
-            // The `partition_names` argument is preserved for
-            // backward-compatible API but no longer used — the walk
-            // is exhaustive.
-            let total = dir_size(root);
             usage.used_bytes.store(total, Ordering::Release);
 
             // Prometheus gauges — read by the metrics-exporter-prometheus
@@ -258,7 +226,7 @@ impl CapacityTracker {
             metrics::gauge!("endpoint_hard_limit_bytes", "endpoint_id" => id.clone())
                 .set(usage.hard_limit_bytes as f64);
 
-            let new_sev = CapacitySeverity::for_usage(total, usage.hard_limit_bytes);
+            let new_sev = usage.severity();
             // Severity-transition handling.
             #[allow(clippy::expect_used)]
             let mut last = usage
@@ -294,17 +262,30 @@ impl CapacityTracker {
                 }
                 *last = new_sev;
             }
-            // is_writable flag — Full means hard reject.
-            let writable = !matches!(new_sev, CapacitySeverity::Full);
-            usage.is_writable.store(writable, Ordering::Release);
         }
     }
 }
 
-/// Recursive directory size — sum of file lengths under `root`.
-/// Tolerates missing entries silently (returns 0); a directory that
-/// disappeared between `read_dir` and the per-entry `metadata` call
-/// just stops contributing rather than aborting the scan.
+/// Publish what endpoint `id`'s footprint holds, has admitted and owes, and
+/// the reserve it keeps.
+fn publish_footprint(id: &str, footprint: &crate::engine::footprint::Footprint) {
+    let id = id.to_owned();
+    for (name, value) in [
+        ("coordinode_footprint_charged_bytes", footprint.charged()),
+        ("coordinode_footprint_admitted_bytes", footprint.admitted()),
+        ("coordinode_footprint_flush_debt_bytes", footprint.debt()),
+        ("coordinode_footprint_reserve_bytes", footprint.reserve()),
+        ("coordinode_footprint_limit_bytes", footprint.limit()),
+    ] {
+        metrics::gauge!(name, "endpoint_id" => id.clone()).set(value as f64);
+    }
+}
+
+/// Recursive directory size, the sum of file lengths under `root`, for the
+/// gauges of an endpoint without a footprint. Tolerates missing entries
+/// silently (returns 0); a directory that disappeared between `read_dir`
+/// and the per-entry `metadata` call just stops contributing rather than
+/// aborting the scan.
 fn dir_size(root: &Path) -> u64 {
     let mut total = 0u64;
     let entries = match std::fs::read_dir(root) {

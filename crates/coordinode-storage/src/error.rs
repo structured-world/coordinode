@@ -45,15 +45,15 @@ pub enum StorageError {
         context: String,
     },
 
-    /// Endpoint capacity exhausted (hard-limit gate). The named
-    /// endpoint's `used_bytes` is at or above its `hard_limit_bytes`
-    /// and its `is_writable` flag is currently `false`. Coordinator
-    /// may retry on a different endpoint or surface the error to the
-    /// client.
+    /// The write does not fit the named endpoint's owned footprint: what its
+    /// files hold, what admitted writes and unflushed memtables have been
+    /// promised, and the write itself would pass `hard_limit_bytes`. Refused
+    /// before anything of it was written; retryable once reclamation, a
+    /// cascade or the operator makes room.
     #[error(
         "endpoint {endpoint_id:?} capacity exhausted (used={used_bytes}, \
-         hard_limit={hard_limit_bytes}) — writes rejected until cascade \
-         eviction or operator cleanup brings usage below the limit"
+         hard_limit={hard_limit_bytes}); writes are refused until reclamation, \
+         cascade eviction or operator cleanup makes room"
     )]
     CapacityExhausted {
         endpoint_id: String,

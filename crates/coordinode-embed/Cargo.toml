@@ -80,6 +80,9 @@ stats_alloc = "0.1"
 # The routing bench's floor: an echo over the members' own mutual TLS.
 tokio-rustls = { version = "0.26", default-features = false }
 rustls-pki-types = { version = "1", features = ["std"] }
+# The footprint tests count a file reached under several names once, on
+# Windows too (by volume and file index).
+same-file = "1"
 
 # A replicated group through the entry point a host opens.
 [[test]]

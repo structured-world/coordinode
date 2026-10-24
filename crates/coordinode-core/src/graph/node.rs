@@ -221,6 +221,21 @@ pub enum IdLeaseError {
         /// The member the group last named leader; `None` during an election.
         leader_id: Option<u64>,
     },
+    /// The lease record did not fit the endpoint's hard limit: the statement
+    /// that needed it is refused as any write past the limit is. Nothing was
+    /// granted.
+    #[error(
+        "no NodeId lease was granted: endpoint {endpoint_id:?} capacity exhausted \
+         (used={used_bytes}, hard_limit={hard_limit_bytes})"
+    )]
+    CapacityExhausted {
+        /// The endpoint whose limit refused the record.
+        endpoint_id: String,
+        /// What the endpoint held or had promised.
+        used_bytes: u64,
+        /// Its hard limit.
+        hard_limit_bytes: u64,
+    },
     /// The log did not grant a lease for another reason.
     #[error("no NodeId lease was granted: {0}")]
     NotGranted(String),

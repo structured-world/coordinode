@@ -370,6 +370,8 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
 /// channel, which is what ends the loop. A compaction that did work wakes the
 /// monitor, because the result can make another level due.
 fn compaction_worker_loop(receiver: flume::Receiver<CompactionRequest>, compacted: &Wake) {
+    // The thread runs compactions only.
+    let _maintenance = crate::engine::footprint::MaintenanceScope::enter();
     while let Ok(CompactionRequest {
         tree,
         source,

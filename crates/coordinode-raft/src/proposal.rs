@@ -239,17 +239,37 @@ impl RaftProposalPipeline {
     }
 
     /// The refusals a write meets before it reaches the log: a member that
-    /// does not run its group's version, a disk below its reserve.
-    fn check_admission(&self) -> Result<(), ProposalError> {
+    /// does not run its group's version, a disk below its reserve, an
+    /// endpoint's hard limit without room for it. The returned admission
+    /// holds the write's room until it drops, which the caller keeps until
+    /// the entry is in this leader's log: an append that met the limit inside
+    /// its write would stop consensus here. Control records (membership,
+    /// commit decisions) are the group's own work and may use the reserve.
+    fn check_admission(
+        &self,
+        proposal: &RaftProposal,
+    ) -> Result<coordinode_storage::engine::footprint::Admitted, ProposalError> {
         use crate::cluster::version::MemberState;
+        use coordinode_storage::engine::footprint::{Admit, Admitted, write_footprint};
         if let Some(MemberState::Mismatched(m)) = self.version.as_ref().map(|g| g.state()) {
             metrics::counter!("coordinode_version_refused_writes_total").increment(1);
             return Err(ProposalError::Mismatched(m));
         }
-        if let Some(space) = &self.space {
-            space.admit().map_err(storage_to_proposal_err)?;
+        let class = if proposal.bypass_rate_limiter {
+            Admit::Recovery
+        } else {
+            Admit::Client
+        };
+        match (&self.closure, &self.space) {
+            // The engine reclaims room before it refuses.
+            (Some(engine), _) => engine
+                .admit_proposal(&proposal.mutations, class)
+                .map_err(storage_to_proposal_err),
+            (None, Some(space)) => space
+                .reserve(write_footprint(&proposal.mutations), class)
+                .map_err(storage_to_proposal_err),
+            (None, None) => Ok(Admitted::default()),
         }
-        Ok(())
     }
 
     /// Create a pipeline that can wait for `w:1` / `w:N` through the log
@@ -314,7 +334,7 @@ impl RaftProposalPipeline {
         proposal: &RaftProposal,
     ) -> Result<ProposalOutcome, ProposalError> {
         check_proposal(proposal)?;
-        self.check_admission()?;
+        let room = self.check_admission(proposal)?;
         {
             use openraft::rt::watch::WatchReceiver;
             let rx = self.raft.metrics();
@@ -333,6 +353,7 @@ impl RaftProposalPipeline {
             let written = raft.client_write(request).await;
             // Handed to the log (or refused) by now.
             drop(hold);
+            drop(room);
             if let Err(e) = written {
                 tracing::warn!(proposal_id = %id, error = %e, "w:0 write did not commit");
             }
@@ -360,7 +381,7 @@ impl RaftProposalPipeline {
         use openraft::rt::watch::WatchReceiver;
 
         check_proposal(proposal)?;
-        self.check_admission()?;
+        let room = self.check_admission(proposal)?;
         let mut metrics_rx = self.raft.metrics();
         let (members, majority, term) = {
             let m = metrics_rx.borrow_watched();
@@ -388,6 +409,7 @@ impl RaftProposalPipeline {
             let written = raft.client_write(request).await;
             // Handed to the log (or refused) by now.
             drop(hold);
+            drop(room);
             written
         });
 
@@ -484,7 +506,8 @@ impl RaftProposalPipeline {
         proposal: &RaftProposal,
     ) -> Result<ProposalOutcome, ProposalError> {
         check_proposal(proposal)?;
-        self.check_admission()?;
+        // Held across every attempt: each may put the entry in the log.
+        let _room = self.check_admission(proposal)?;
         let start = std::time::Instant::now();
 
         for attempt in 0..MAX_RETRIES {

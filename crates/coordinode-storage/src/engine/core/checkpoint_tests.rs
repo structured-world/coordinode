@@ -419,9 +419,10 @@ fn a_second_journal_capture_into_the_same_directory_leaves_the_segment_intact() 
     let target = dir.path().join("ckpt");
     claim_checkpoint_dir(&target).expect("claim");
     let dst = target.join("oplog");
-    capture_journal(&src, &dst).expect("first capture");
+    let footprints = Default::default();
+    capture_journal(&src, &dst, &footprints).expect("first capture");
     assert!(
-        capture_journal(&src, &dst).is_err(),
+        capture_journal(&src, &dst, &footprints).is_err(),
         "a capture over an existing one was accepted"
     );
     assert_eq!(
@@ -448,7 +449,7 @@ fn concurrent_checkpoints_into_one_directory_claim_it_once() {
                     s.spawn(|| {
                         barrier.wait();
                         claim_checkpoint_dir(&target)?;
-                        capture_journal(&src, &target.join("oplog"))
+                        capture_journal(&src, &target.join("oplog"), &Default::default())
                     })
                 })
                 .collect();

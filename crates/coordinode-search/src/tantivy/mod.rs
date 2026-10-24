@@ -305,22 +305,26 @@ impl TextIndex {
 
     /// Create an empty index at `dir`, replacing whatever the directory
     /// held, whose files are written without syncing them (see
-    /// [`scratch_dir::ScratchDirectory`]). Only for an index the caller
-    /// rebuilds from its source every time it creates it.
+    /// [`scratch_dir::ScratchDirectory`]) and charged to `footprints`. Only
+    /// for an index the caller rebuilds from its source every time it
+    /// creates it.
     pub fn create_scratch(
         dir: &Path,
         heap_size_bytes: usize,
         language: Option<&str>,
+        footprints: coordinode_storage::engine::footprint::Footprints,
     ) -> Result<Self, TextSearchError> {
         let layout = Layout::new(language);
         if dir.exists() {
-            std::fs::remove_dir_all(dir).map_err(|e| {
+            let cleared = std::fs::remove_dir_all(dir);
+            footprints.removed_tree(dir);
+            cleared.map_err(|e| {
                 TextSearchError::IndexCorrupted(format!("clear {}: {e}", dir.display()))
             })?;
         }
         std::fs::create_dir_all(dir)
             .map_err(|e| TextSearchError::IndexCorrupted(format!("cannot create dir: {e}")))?;
-        let directory = scratch_dir::ScratchDirectory::open(dir)
+        let directory = scratch_dir::ScratchDirectory::open(dir, footprints)
             .map_err(|e| TextSearchError::IndexCorrupted(format!("open {}: {e}", dir.display())))?;
         let index = Index::create(
             directory,

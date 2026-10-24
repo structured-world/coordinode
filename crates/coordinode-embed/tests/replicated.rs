@@ -37,13 +37,16 @@ static PKI: std::sync::LazyLock<coordinode_test_fixtures::TestPki> =
 const TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn storage(dir: &Path) -> StorageConfig {
-    StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir,
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )])
+    storage_limited(dir, 0)
+}
+
+/// [`storage`] with every file of the member under `dir` held to
+/// `hard_limit` bytes; `0` for no limit.
+fn storage_limited(dir: &Path, hard_limit: u64) -> StorageConfig {
+    StorageConfig::with_endpoints(vec![
+        EndpointConfig::new("default", dir, Media::Hdd, Durability::Durable, Tier::Warm)
+            .with_hard_limit_bytes(hard_limit),
+    ])
 }
 
 fn addr(port: u16) -> String {
@@ -70,6 +73,19 @@ async fn open_under(
     preference: ElectionPreference,
     security: Arc<coordinode_embed::replication::SecurityContext>,
 ) -> Result<ReplicatedDatabase, ReplicationError> {
+    open_over(&storage(dir), id, port, founding, preference, security).await
+}
+
+/// Open member `id` over the store `storage` describes, serving its peers on
+/// `port`.
+async fn open_over(
+    storage: &StorageConfig,
+    id: u64,
+    port: u16,
+    founding: Founding,
+    preference: ElectionPreference,
+    security: Arc<coordinode_embed::replication::SecurityContext>,
+) -> Result<ReplicatedDatabase, ReplicationError> {
     let mut options = MemberOptions::new(id);
     options.preference = preference;
     options.peering = Some(Peering {
@@ -78,7 +94,7 @@ async fn open_under(
         founding,
         timeouts: PeerTimeouts::default(),
     });
-    ReplicatedDatabase::open(&storage(dir), options, Some(addr(port).parse().unwrap())).await
+    ReplicatedDatabase::open(storage, options, Some(addr(port).parse().unwrap())).await
 }
 
 async fn wait_until(what: &str, cond: impl Fn() -> bool) {
@@ -104,6 +120,16 @@ async fn group(
     dirs: &[tempfile::TempDir],
     last: Option<u64>,
 ) -> (Vec<ReplicatedDatabase>, Vec<u16>) {
+    group_limited(dirs, last, 0).await
+}
+
+/// [`group`] with every member's files held to `hard_limit` bytes; `0` for
+/// no limit.
+async fn group_limited(
+    dirs: &[tempfile::TempDir],
+    last: Option<u64>,
+    hard_limit: u64,
+) -> (Vec<ReplicatedDatabase>, Vec<u16>) {
     let ports: Vec<u16> = dirs.iter().map(|_| alloc_port()).collect();
     let preference = |id: u64| {
         if last == Some(id) {
@@ -112,12 +138,13 @@ async fn group(
             ElectionPreference::Ordinary
         }
     };
-    let founder = open(
+    let founder = open_over(
+        &storage_limited(dirs[0].path(), hard_limit),
         1,
-        dirs[0].path(),
         ports[0],
         Founding::Form { deployment: None },
         preference(1),
+        PKI.context(1),
     )
     .await
     .unwrap();
@@ -126,12 +153,13 @@ async fn group(
     for (i, dir) in dirs.iter().enumerate().skip(1) {
         let id = i as u64 + 1;
         members.push(
-            open(
+            open_over(
+                &storage_limited(dir.path(), hard_limit),
                 id,
-                dir.path(),
                 ports[i],
                 Founding::Join(enrollment.clone()),
                 preference(id),
+                PKI.context(id),
             )
             .await
             .unwrap(),
@@ -143,6 +171,141 @@ async fn group(
         members[0].promote(id).await.unwrap();
     }
     (members, ports)
+}
+
+/// Text of `len` bytes no codec shrinks, distinct per `seed`.
+fn incompressible_text(seed: u64, len: usize) -> String {
+    use std::fmt::Write;
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut out = String::with_capacity(len + 8);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        write!(&mut out, "{:08x}", state as u32).unwrap();
+    }
+    out
+}
+
+/// A group whose members' files are held to a hard limit refuses writes
+/// once the limit is reached, typed, with its consensus running; under a
+/// limit lowered below what the members hold, every write is refused
+/// through the leader and through a follower alike, nothing is deleted, and
+/// every member keeps answering reads: from the leader, from a follower's
+/// own copy, and at read concern majority. A raised limit admits writes at
+/// once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_group_refuses_writes_and_keeps_serving_reads() {
+    use coordinode_core::txn::read_concern::ReadConcernLevel;
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group_limited(&dirs, None, LIMIT).await;
+        followers_reach_the_leader(&members).await;
+
+        let mut accepted = 0i64;
+        let mut refused = None;
+        for key in 0..1024u64 {
+            let statement = format!(
+                "CREATE (:Full {{key: {key}, payload: '{}'}})",
+                incompressible_text(key, 32 * 1024)
+            );
+            match members[0].execute(Statement::new(&statement)).await {
+                Ok(_) => accepted += 1,
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+        }
+        let refused = refused.expect("the group never refused a write past its limit");
+        assert!(
+            matches!(refused, DatabaseError::CapacityExhausted { .. }),
+            "the refusal is typed, the leader's consensus untouched: {refused:?}"
+        );
+        assert!(accepted > 0, "the group took writes before it filled");
+
+        // Room comes back as the group reclaims its log, so a limit lowered
+        // below what every member holds is what keeps the group full: it
+        // deletes nothing and refuses every write, through the leader and
+        // through a follower alike.
+        for member in &members {
+            member
+                .database()
+                .read()
+                .set_hard_limit("default", LIMIT / 2, None)
+                .expect("lower the limit");
+        }
+        for (member, path) in [(&members[0], "the leader"), (&members[1], "a follower")] {
+            let refused = member
+                .execute(Statement::new("CREATE (:Full {key: -1})"))
+                .await;
+            assert!(
+                matches!(refused, Err(DatabaseError::CapacityExhausted { .. })),
+                "a write through {path} is refused, typed: {refused:?}"
+            );
+        }
+
+        let rows = |answer: Routed<RoutedAnswer>| match answer.value.rows.as_slice() {
+            [row] => match row.as_slice() {
+                [Value::Int(n)] => *n,
+                other => panic!("count row {other:?}"),
+            },
+            other => panic!("count rows {other:?}"),
+        };
+        let count_query = "MATCH (n:Full) RETURN count(n) AS n";
+        let from_leader = members[0]
+            .execute(Statement::new(count_query))
+            .await
+            .expect("the leader answers a read when full");
+        assert_eq!(rows(from_leader), accepted);
+        for (member, concern) in [
+            (&members[1], None),
+            (&members[2], Some(ReadConcernLevel::Majority)),
+        ] {
+            wait_until("the follower applied every accepted write", || {
+                label_count(member, "Full") == accepted as u64
+            })
+            .await;
+            let answer = member
+                .execute(Statement {
+                    requested: Requested {
+                        read_concern: concern,
+                        read_preference: Some(ReadPreference::Nearest),
+                        ..Requested::default()
+                    },
+                    ..Statement::new(count_query)
+                })
+                .await
+                .expect("a full follower answers a read from its own copy");
+            assert_eq!(answer.forwarded_to, None, "served by the follower");
+            assert_eq!(rows(answer), accepted);
+        }
+
+        // A raised limit admits writes again, at once, with nothing lost.
+        for member in &members {
+            member
+                .database()
+                .read()
+                .set_hard_limit("default", 2 * LIMIT, None)
+                .expect("raise the limit");
+        }
+        members[0]
+            .execute(Statement::new("CREATE (:Full {key: 2000000})"))
+            .await
+            .expect("a raised limit admits writes");
+        let after = members[0]
+            .execute(Statement::new(count_query))
+            .await
+            .expect("read after the limit was raised");
+        assert_eq!(rows(after), accepted + 1);
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
 }
 
 /// A store written by the embedded library without replication opens as the

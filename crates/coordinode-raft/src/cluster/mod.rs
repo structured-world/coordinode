@@ -3273,7 +3273,9 @@ fn spawn_snapshot_trigger(
             };
             // A snapshot is a full copy of the store written to disk; with the
             // disk below its reserve it waits, and the next probe asks again.
-            if engine.space().is_paused() {
+            // A hard limit does not stop it: the snapshot is what lets the
+            // log be compacted, the room a full member gets back.
+            if engine.space().is_paused_by_free_space() {
                 tracing::debug!(reason, "snapshot trigger: waiting for disk space");
                 continue;
             }

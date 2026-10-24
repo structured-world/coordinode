@@ -176,6 +176,7 @@ impl EmbeddedOplog {
         shard: ShardId,
         cfg: &OplogJournalConfig,
         durable_ceiling: Arc<AtomicU64>,
+        footprints: crate::engine::footprint::Footprints,
     ) -> StorageResult<Self> {
         let manager = OplogManager::open(
             dir,
@@ -184,7 +185,8 @@ impl EmbeddedOplog {
             cfg.max_segment_entries,
             cfg.retention_secs,
         )?
-        .with_sync_method(cfg.sync_method);
+        .with_sync_method(cfg.sync_method)
+        .with_footprints(footprints)?;
         let next_index = manager
             .recover_last_entry()?
             .map(|e| e.index + 1)
@@ -273,7 +275,6 @@ impl EmbeddedOplog {
             )));
         }
         let index = self.next_index;
-        self.next_index += 1;
         let entry = OplogEntry {
             ts: commit_ts,
             term: 0,
@@ -283,7 +284,17 @@ impl EmbeddedOplog {
             is_migration: false,
             pre_images: None,
         };
-        self.manager.append(&entry)?;
+        match self.manager.append(&entry) {
+            Ok(()) => self.next_index += 1,
+            // Refused before a byte was written: the index stays free for the
+            // next entry, and the journal holds no gap.
+            Err(refused @ StorageError::CapacityExhausted { .. }) => return Err(refused),
+            Err(e) => {
+                // Part of the entry may be in the file; its index is spent.
+                self.next_index += 1;
+                return Err(e);
+            }
+        }
         if level != Journal::Journal {
             // Recorded before the entry is applied: a view chosen once its
             // effects are visible already stops below it.

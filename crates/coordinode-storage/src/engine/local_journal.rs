@@ -64,9 +64,11 @@ impl LocalJournal {
         cfg: &OplogJournalConfig,
         trees: &HashMap<Partition, AnyTree>,
         installations: &Installations,
+        footprints: crate::engine::footprint::Footprints,
     ) -> StorageResult<Self> {
         // Its own ceiling, never read: local records do not bound a read view.
-        let mut log = EmbeddedOplog::open(dir, 0, cfg, Arc::new(AtomicU64::new(u64::MAX)))?;
+        let mut log =
+            EmbeddedOplog::open(dir, 0, cfg, Arc::new(AtomicU64::new(u64::MAX)), footprints)?;
         let entries = log.read_all()?;
         let mut covered: HashMap<Partition, TreeCoverage> = HashMap::with_capacity(trees.len());
         for (&part, tree) in trees {

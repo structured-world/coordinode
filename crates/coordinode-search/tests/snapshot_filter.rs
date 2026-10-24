@@ -235,9 +235,13 @@ fn a_current_state_index_refuses_a_read_at_a_timestamp() {
     use std::collections::HashMap;
 
     let dir = TempDir::new().unwrap();
-    let mut idx =
-        MultiLanguageTextIndex::create_scratch(dir.path(), 15_000_000, MultiLangConfig::default())
-            .unwrap();
+    let mut idx = MultiLanguageTextIndex::create_scratch(
+        dir.path(),
+        15_000_000,
+        MultiLangConfig::default(),
+        Default::default(),
+    )
+    .unwrap();
     idx.add_node(
         1,
         &HashMap::from([("body".to_string(), "graph engine".to_string())]),

@@ -199,12 +199,6 @@ pub struct StorageEngine {
     /// before `trees` (declared earlier in the struct) so the thread
     /// stops accessing tree handles before they are released.
     capacity_scanner: Option<crate::engine::capacity::CapacityScanner>,
-    /// Per-partition resolved L0 endpoint id (the endpoint that
-    /// receives newly flushed SSTs for this partition). Cached at
-    /// engine open so the pre-write capacity gate is a single
-    /// HashMap lookup on the hot path. Schema partition is mapped to
-    /// the primary endpoint id (single-tier bootstrap).
-    partition_l0_endpoint: HashMap<Partition, String>,
     /// Optional embedded oplog journal (oracle-backed, no-Raft mode).
     ///
     /// `Some` when opened via [`StorageEngine::open_with_oracle`] against a
@@ -290,6 +284,17 @@ pub struct StorageEngine {
     /// its free-space reserve; shared with the consensus layer, which checks
     /// it before anything reaches its log.
     space: Arc<crate::engine::space::SpaceGuard>,
+    /// The owned footprint of every endpoint with a hard limit: every byte
+    /// the store's files take there is charged before it is written, and a
+    /// client write is admitted against it before it is journaled.
+    footprints: crate::engine::footprint::Footprints,
+    /// One reclamation of the footprint at a time: refusals arriving while
+    /// one runs wait for its outcome rather than start another.
+    footprint_reclaim: parking_lot::Mutex<()>,
+    /// The lowest journal index a rebuild from the latest local checkpoint
+    /// replays from; reclamation keeps it. `u64::MAX` when no checkpoint
+    /// needs any.
+    journal_keep_from: AtomicU64,
 }
 
 /// History entries a replacement import writes between two admissions
@@ -699,6 +704,31 @@ impl StorageEngine {
             config
         };
 
+        // Every file the trees grow under an endpoint with a hard limit is
+        // charged to its footprint before it is written; the footprints start
+        // with what the endpoints already hold.
+        let footprints = crate::engine::footprint::Footprints::open(&config.endpoints)
+            .map_err(|e| StorageError::Io(format!("measure the endpoints' footprint: {e}")))?;
+        // A store that does not fit its limit still opens; what it grows
+        // while opening is bounded by the phase, held until this returns.
+        let _opening = footprints.open_phase();
+        let _metered;
+        let config = if footprints.is_empty() {
+            config
+        } else {
+            let inner = config
+                .fs
+                .clone()
+                .unwrap_or_else(|| Arc::new(lsm_tree::fs::StdFs));
+            _metered = config
+                .clone()
+                .with_fs(Arc::new(crate::engine::metered_fs::MeteredFs::new(
+                    inner,
+                    footprints.clone(),
+                )) as Arc<dyn lsm_tree::fs::Fs>);
+            &_metered
+        };
+
         // Shared block cache across all partition trees.
         let cache = Arc::new(lsm_tree::Cache::with_capacity_bytes(
             config.block_cache_bytes,
@@ -731,6 +761,14 @@ impl StorageEngine {
         // One write buffer for every partition tree: the memtable axis of the
         // write-pressure verdict bounds their unflushed bytes together.
         let write_buffer = Arc::new(lsm_tree::WriteBufferBudget::default());
+        // What the memtables will write when they are flushed is owed to the
+        // footprint from the moment it is in them.
+        if !footprints.is_empty() {
+            let unflushed = Arc::clone(&write_buffer);
+            footprints.set_debt(move || {
+                crate::engine::footprint::flush_debt(unflushed.unflushed_bytes())
+            });
+        }
         // One maintenance budget for every tree's compaction and the scrub:
         // the trees share the disks the foreground needs.
         let maintenance = new_maintenance_budget(
@@ -785,11 +823,7 @@ impl StorageEngine {
         }
 
         // Pass 2: load/initialise routing for each non-Schema partition,
-        // then open it with `level_routes` wired. Also cache each
-        // partition's L0 endpoint id for the pre-write capacity gate.
-        let primary_endpoint_id = config.endpoints[0].id.clone();
-        let mut partition_l0_endpoint: HashMap<Partition, String> = HashMap::new();
-        partition_l0_endpoint.insert(Partition::Schema, primary_endpoint_id.clone());
+        // then open it with `level_routes` wired.
         for &part in Partition::all() {
             if part == Partition::Schema {
                 continue;
@@ -801,12 +835,6 @@ impl StorageEngine {
                 part,
                 config.relocated,
             )?;
-            let l0_endpoint = routing
-                .levels
-                .get(&0)
-                .cloned()
-                .unwrap_or_else(|| primary_endpoint_id.clone());
-            partition_l0_endpoint.insert(part, l0_endpoint);
             let tree_config = config
                 .to_tree_config_with_routing(part, Arc::clone(&seqno), Some(&routing))
                 .use_cache(Arc::clone(&cache))
@@ -858,8 +886,12 @@ impl StorageEngine {
         #[cfg(feature = "columnar")]
         let mut columnar_replay: Vec<ColumnarReplay> = Vec::new();
         let oplog = match journal_config {
-            Some(jcfg) => match config.select_oplog_endpoint(0) {
+            Some(mut jcfg) => match config.select_oplog_endpoint(0) {
                 Ok(endpoint) => {
+                    jcfg.max_segment_bytes = crate::engine::footprint::journal_segment_bytes(
+                        endpoint.hard_limit_bytes,
+                        jcfg.max_segment_bytes,
+                    );
                     // A store whose history is a group's log is refused
                     // before its log is opened as a journal: an entry written
                     // here would never reach the group.
@@ -875,6 +907,7 @@ impl StorageEngine {
                         0,
                         &jcfg,
                         pending_commits.durable_ceiling_cell(),
+                        footprints.clone(),
                     )?;
                     let entries = journal.read_all()?;
                     let mut covered: HashMap<Partition, TreeCoverage> =
@@ -1027,6 +1060,7 @@ impl StorageEngine {
                         &OplogJournalConfig::from(config),
                         &trees,
                         &installations,
+                        footprints.clone(),
                     )?)
                 } else {
                     None
@@ -1113,14 +1147,23 @@ impl StorageEngine {
             .clone()
             .or_else(|| local_journal.as_ref().map(|local| Arc::clone(local.log())));
 
-        // Open tiered cache if configured.
+        // Open tiered cache if configured. A layer under a capped endpoint is
+        // reserved first; one that does not fit leaves the cache off, which
+        // costs reads their cache and loses nothing.
         let tiered_cache = if config.cache.is_enabled() {
-            match TieredCache::open(&config.cache) {
-                Ok(cache) => Some(cache),
+            match reserve_cache_layers(&config.cache, &footprints) {
                 Err(e) => {
-                    tracing::warn!(error = %e, "tiered cache failed to open, continuing without");
+                    tracing::warn!(error = %e, "tiered cache does not fit a hard limit, continuing without");
                     None
                 }
+                Ok(()) => match TieredCache::open(&config.cache) {
+                    Ok(cache) => Some(cache),
+                    Err(e) => {
+                        release_cache_layers(&config.cache, &footprints);
+                        tracing::warn!(error = %e, "tiered cache failed to open, continuing without");
+                        None
+                    }
+                },
             }
         } else {
             None
@@ -1198,6 +1241,7 @@ impl StorageEngine {
                 tier: Arc::clone(&memtable_pressure),
             },
             flushed_tables,
+            footprints.clone(),
         )?;
 
         // Feed the backpressure thresholds to every partition tree so the
@@ -1243,41 +1287,33 @@ impl StorageEngine {
             "storage engine opened"
         );
 
-        // Build the capacity tracker + warm-load persisted snapshots
-        // BEFORE spawning the scanner so the first scan tick sees the
-        // hydrated state.
+        // The capacity tracker reports the footprints, which were measured
+        // from the endpoints at open: it starts from them, before the first
+        // scan tick.
         let capacity_arc = {
             let tracker = crate::engine::capacity::CapacityTracker::new(&config.endpoints);
-            for ep in &config.endpoints {
-                let persisted = load_persisted_capacity(&schema_tree, &seqno, &ep.id);
-                if persisted > 0 {
-                    if let Some(usage) = tracker.get(&ep.id) {
-                        usage
-                            .used_bytes
-                            .store(persisted, std::sync::atomic::Ordering::Release);
-                        use crate::engine::capacity::CapacitySeverity;
-                        let sev = CapacitySeverity::for_usage(persisted, usage.hard_limit_bytes);
-                        let writable = !matches!(sev, CapacitySeverity::Full);
-                        usage
-                            .is_writable
-                            .store(writable, std::sync::atomic::Ordering::Release);
-                    }
+            for footprint in footprints.iter() {
+                if let Some(usage) = tracker.get(footprint.id()) {
+                    usage
+                        .used_bytes
+                        .store(footprint.charged(), std::sync::atomic::Ordering::Release);
                 }
             }
             Arc::new(tracker)
         };
 
         // Spawn the background scanner. It samples every partition's
-        // footprint on every deployment; the capacity scan, its persisted
-        // usage and cascade eviction run only where an endpoint has a
-        // `hard_limit_bytes` to enforce. The closure captures cheap snapshots
-        // (AnyTree is internally Arc'd) so no circular reference with `Self`.
+        // footprint on every deployment; the capacity report and cascade
+        // eviction run only where an endpoint has a `hard_limit_bytes`. The
+        // closure captures cheap snapshots (AnyTree is internally Arc'd) so
+        // no circular reference with `Self`.
         let capacity_scanner = {
             let tracked = config.endpoints.iter().any(|ep| ep.hard_limit_bytes > 0);
             let tracker_c = Arc::clone(&capacity_arc);
             let endpoints_c = config.endpoints.clone();
             let trees_c = trees.clone();
             let seqno_c = Arc::clone(&seqno);
+            let footprints_c = footprints.clone();
             let gc_controller_c = Arc::clone(&gc_controller);
             let interval = std::time::Duration::from_secs(5);
             Some(
@@ -1289,7 +1325,7 @@ impl StorageEngine {
                         publish_footprint(&trees_c);
                         return;
                     }
-                    run_capacity_refresh(&tracker_c, &endpoints_c, &trees_c, &seqno_c, |id| {
+                    run_capacity_refresh(&tracker_c, &endpoints_c, &trees_c, &footprints_c, |id| {
                         run_cascade_evict(
                             &endpoints_c,
                             &trees_c,
@@ -1390,7 +1426,7 @@ impl StorageEngine {
         // The open succeeded: a migrated directory now records its format.
         // An open refused above leaves the old marker, so the store it
         // refused stays as its writer left it.
-        crate::format::settle(&format)?;
+        crate::format::settle(&format, &footprints)?;
         let mut engine = Self {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
@@ -1419,7 +1455,6 @@ impl StorageEngine {
             endpoints: config.endpoints.clone(),
             capacity: capacity_arc,
             capacity_scanner,
-            partition_l0_endpoint,
             oplog,
             journal_flusher,
             local_journal,
@@ -1441,7 +1476,12 @@ impl StorageEngine {
             applied_feed: Arc::new(crate::engine::applied::AppliedFeed::default()),
             index_feed_capacity: config.index_feed_capacity.max(1),
             open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
-            space: Arc::new(crate::engine::space::SpaceGuard::new(config)),
+            space: Arc::new(
+                crate::engine::space::SpaceGuard::new(config).with_footprints(footprints.clone()),
+            ),
+            footprints,
+            footprint_reclaim: parking_lot::Mutex::new(()),
+            journal_keep_from: AtomicU64::new(u64::MAX),
         };
         engine.drain_local_journal()?;
         // A repair that lost nothing owes only the tail the journal or the
@@ -1502,6 +1542,146 @@ impl StorageEngine {
     /// first.
     pub fn space(&self) -> &Arc<crate::engine::space::SpaceGuard> {
         &self.space
+    }
+
+    /// The owned footprint of every endpoint with a hard limit.
+    pub fn footprints(&self) -> &crate::engine::footprint::Footprints {
+        &self.footprints
+    }
+
+    /// Change the hard limit of endpoint `endpoint_id` without a restart, and
+    /// its recovery reserve (`None`: a sixteenth of the limit). A raised
+    /// limit admits writes at once. A limit below what the endpoint holds
+    /// deletes nothing: it is pending, client writes are refused and the
+    /// store's own growth is held to what it holds plus the reserve until
+    /// reclamation brings it under the limit.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for an unknown endpoint, a limit of
+    /// `0`, or an endpoint opened without a hard limit: the files it writes
+    /// are not charged, so a limit there takes a restart with it configured.
+    pub fn set_hard_limit(
+        &self,
+        endpoint_id: &str,
+        limit: u64,
+        reserve: Option<u64>,
+    ) -> StorageResult<()> {
+        if limit == 0 {
+            return Err(StorageError::InvalidConfig(
+                "a hard limit of 0 removes the limit, which takes a restart".into(),
+            ));
+        }
+        let footprint = self.footprints.get(endpoint_id).ok_or_else(|| {
+            StorageError::InvalidConfig(format!(
+                "endpoint {endpoint_id:?} has no hard limit to change: one is set in its \
+                 configuration and takes effect at the next open"
+            ))
+        })?;
+        let reserve =
+            reserve.unwrap_or(limit / crate::engine::config::DEFAULT_RECOVERY_RESERVE_DIVISOR);
+        footprint.set_limit(limit, reserve);
+        tracing::info!(
+            endpoint = endpoint_id,
+            hard_limit_bytes = limit,
+            recovery_reserve_bytes = footprint.reserve(),
+            pending = footprint.pending_limit().is_some(),
+            "endpoint hard limit changed"
+        );
+        Ok(())
+    }
+
+    /// Admit a client write of `mutations` before anything of it is written:
+    /// the free-space reserve of the volumes, then the owned footprint of
+    /// every endpoint with a hard limit, which must hold its journal entry and
+    /// its share of the flush that follows. A refusal on the footprint starts
+    /// the reclamation that can make room: a flush of the memtables and the
+    /// removal of journal segments the trees then cover.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::OutOfSpace`] below the free-space reserve,
+    /// [`StorageError::CapacityExhausted`] when the write does not fit the
+    /// footprint.
+    pub fn admit_write(
+        &self,
+        mutations: &[Mutation],
+    ) -> StorageResult<crate::engine::footprint::Admitted> {
+        self.admit_proposal(mutations, crate::engine::footprint::Admit::Client)
+    }
+
+    /// Admit `mutations` as a write of `class` before it is proposed to the
+    /// group's log: the free-space reserve, then the owned footprint of every
+    /// endpoint with a hard limit, reclaiming once before a refusal. The
+    /// returned admission holds the room until it drops, which the leader
+    /// keeps until the entry is in its log: a log append that met a limit
+    /// inside its write would stop consensus on this member.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::OutOfSpace`] below the free-space reserve,
+    /// [`StorageError::CapacityExhausted`] when the write does not fit the
+    /// footprint.
+    pub fn admit_proposal(
+        &self,
+        mutations: &[Mutation],
+        class: crate::engine::footprint::Admit,
+    ) -> StorageResult<crate::engine::footprint::Admitted> {
+        match class {
+            crate::engine::footprint::Admit::Client => self.space.admit_free_space()?,
+            crate::engine::footprint::Admit::Recovery => {
+                self.space.admit_free_space_recovery()?;
+            }
+        }
+        if self.footprints.is_empty() {
+            return Ok(crate::engine::footprint::Admitted::default());
+        }
+        let bytes = crate::engine::footprint::write_footprint(mutations);
+        self.admit_footprint(bytes, class)
+    }
+
+    /// Admit, on the owned footprint, a write of the partitions `parts` that
+    /// adds about `bytes`: the store's own metadata (Schema, Raft) as a
+    /// recovery record, which may use the reserve, anything else as a client
+    /// write.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::CapacityExhausted`] when the write does not fit.
+    pub(crate) fn admit_partition_write(
+        &self,
+        parts: impl IntoIterator<Item = Partition>,
+        bytes: u64,
+    ) -> StorageResult<crate::engine::footprint::Admitted> {
+        use crate::engine::footprint::Admit;
+        if self.footprints.is_empty() {
+            return Ok(crate::engine::footprint::Admitted::default());
+        }
+        let class = if parts
+            .into_iter()
+            .all(|part| matches!(part, Partition::Schema | Partition::Raft))
+        {
+            Admit::Recovery
+        } else {
+            Admit::Client
+        };
+        self.admit_footprint(bytes, class)
+    }
+
+    /// Admit `bytes` on every capped endpoint as `class`, reclaiming once
+    /// when they do not fit.
+    fn admit_footprint(
+        &self,
+        bytes: u64,
+        class: crate::engine::footprint::Admit,
+    ) -> StorageResult<crate::engine::footprint::Admitted> {
+        if let Ok(admitted) = self.footprints.admit(bytes, class) {
+            return Ok(admitted);
+        }
+        self.reclaim_footprint();
+        // What the reclamation freed admits the write at once; what it could
+        // not leaves the refusal standing, with the footprint as it is now.
+        self.footprints.admit(bytes, class)
     }
 
     /// The cached write-pressure verdict (two relaxed atomic loads): the
@@ -2047,8 +2227,14 @@ impl StorageEngine {
     /// Admit a write that prepares a replacement copy of an index generation,
     /// as a client write to the index partition is admitted.
     fn admit_replacement_write(&self) -> StorageResult<()> {
-        self.space.admit()?;
-        self.check_partition_capacity(Partition::Idx)
+        self.space.admit_free_space()?;
+        // A stride of entries must fit; once written they are owed by the
+        // memtable, so the admission need not outlive the check.
+        self.admit_partition_write(
+            [Partition::Idx],
+            crate::engine::footprint::footprint_of(0, IMPORT_ADMISSION_STRIDE),
+        )
+        .map(drop)
     }
 
     /// Record that `generation`'s replacement holds its complete imported
@@ -2331,14 +2517,17 @@ impl StorageEngine {
     pub fn create_checkpoint(&self, target: &Path) -> StorageResult<CheckpointSummary> {
         claim_checkpoint_dir(target)?;
         let mut summary = CheckpointSummary::default();
+        // No reclamation removes journal segments while the checkpoint is
+        // taken: the floor its rebuild replays from is kept once it exists.
+        let _no_reclaim = self.footprint_reclaim.lock();
 
         // Fold the applied prefix into every tree first, so the checkpoint's
         // bases, and the journal a rebuild from it needs, are as recent as
         // they can be.
-        if let Some(coverage) = &self.coverage {
+        let replay_floor = self.coverage.as_ref().map(|coverage| {
             let mut folded = coverage.lock_folded();
-            self.fold_coverage(coverage, &mut folded, coverage::FoldScope::All);
-        }
+            self.fold_coverage(coverage, &mut folded, coverage::FoldScope::All)
+        });
 
         // The journal is copied before the trees. A segment the purge drops
         // meanwhile held only entries already persisted in the live trees,
@@ -2348,11 +2537,18 @@ impl StorageEngine {
         if let Ok(endpoint) = self.select_oplog_endpoint(0) {
             let src_oplog = endpoint.path.join("oplog");
             if src_oplog.exists() {
-                summary.oplog_bytes = capture_journal(&src_oplog, &target.join("oplog"))?;
+                summary.oplog_bytes =
+                    capture_journal(&src_oplog, &target.join("oplog"), &self.footprints)?;
             }
         }
 
         self.checkpoint_trees(target, &mut summary)?;
+        // The newest checkpoint is the one a rebuild starts from: its trees
+        // hold every entry below the folded base, and the journal keeps the
+        // rest for it.
+        if let Some(floor) = replay_floor {
+            self.set_journal_keep_from(floor);
+        }
         Ok(summary)
     }
 
@@ -2417,7 +2613,11 @@ impl StorageEngine {
             })?;
         }
         // The copy is a directory of this engine's format, opened as one.
-        crate::format::write_marker(target, coordinode_core::version::engine_format_version())
+        crate::format::write_marker(
+            target,
+            coordinode_core::version::engine_format_version(),
+            &self.footprints,
+        )
     }
 
     /// Open a checkpoint written by [`Self::create_checkpoint`] as a plain
@@ -2848,6 +3048,58 @@ impl StorageEngine {
             }
             _ => Ok(0),
         }
+    }
+
+    /// Keep the journal from `index` on for a rebuild from the latest local
+    /// checkpoint ([`Self::checkpoint_replay_floor`]); `u64::MAX` when none
+    /// needs it. Reclamation under a footprint limit never removes it.
+    pub fn set_journal_keep_from(&self, index: u64) {
+        self.journal_keep_from
+            .store(index, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Make room in the owned footprint: flush the memtables, which turns
+    /// what they owe into tables, then remove the journal segments every tree
+    /// then covers durably. What a rebuild from the latest checkpoint replays
+    /// is kept, and so is every entry whose writes are not yet in a table.
+    /// Covered segments go even inside the journal's retention window: the
+    /// trees hold their effects, and the window is a time bound on history,
+    /// not an obligation the limit may be broken for.
+    ///
+    /// One runs at a time; a call arriving while one runs waits for it and
+    /// returns, its outcome being the room there is.
+    pub fn reclaim_footprint(&self) {
+        let Some(_one) = self.footprint_reclaim.try_lock() else {
+            drop(self.footprint_reclaim.lock());
+            return;
+        };
+        metrics::counter!("coordinode_footprint_reclamations_total").increment(1);
+        if let Err(e) = self.reclaim_journal() {
+            tracing::warn!(error = %e, "footprint reclamation failed");
+        }
+    }
+
+    fn reclaim_journal(&self) -> StorageResult<()> {
+        let Some(oplog) = &self.oplog else {
+            return self.persist();
+        };
+        // Every entry below `covered` is in a table of every tree.
+        let covered = self.persist_coverage_base()?;
+        let below = covered.min(
+            self.journal_keep_from
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        let mut log = oplog
+            .lock()
+            .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+        // A segment is removed only once sealed: the active one is sealed when
+        // all it holds is covered, and the next entry starts a new one.
+        if log.next_index() <= below {
+            log.rotate()?;
+        }
+        let removed = log.purge_before(below)?;
+        tracing::debug!(removed, below, "footprint reclamation purged the journal");
+        Ok(())
     }
 
     /// Record, durably, that this store's log is a consensus log: from here
@@ -3292,14 +3544,14 @@ impl StorageEngine {
     /// Write a key-value pair to the given partition.
     /// Invalidates any cached entry for this key.
     ///
-    /// Pre-write capacity gate: if the partition's resolved L0
-    /// endpoint is currently non-writable (its `used_bytes` is at or
-    /// above `hard_limit_bytes` per the latest capacity scan), the
-    /// call returns [`StorageError::CapacityExhausted`] without
-    /// inserting. The coordinator may retry on a different endpoint
-    /// or surface the error to the client.
+    /// Admitted on the owned footprint first: a write that does not fit
+    /// beside what the endpoints hold and owe returns
+    /// [`StorageError::CapacityExhausted`] without inserting.
     pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
-        self.check_partition_capacity(part)?;
+        let _admitted = self.admit_partition_write(
+            [part],
+            crate::engine::footprint::footprint_of((key.len() + value.len()) as u64, 1),
+        )?;
         let mut addressing = self.addressing(part)?;
         let seqno = self
             .coordinator
@@ -3314,36 +3566,6 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Pre-write capacity gate for a partition. Looks up the
-    /// partition's L0 endpoint in the cached routing and consults the
-    /// capacity tracker's `is_writable` flag. Returns
-    /// [`StorageError::CapacityExhausted`] when the endpoint has
-    /// crossed the 100% threshold; `Ok(())` otherwise.
-    ///
-    /// `Schema` and `Raft` partitions are always permitted — these
-    /// hold engine-internal metadata that must remain accessible even
-    /// when user-data endpoints are full (otherwise the operator
-    /// could not read the metrics that prove the endpoint is full).
-    pub fn check_partition_capacity(&self, part: Partition) -> StorageResult<()> {
-        if matches!(part, Partition::Schema | Partition::Raft) {
-            return Ok(());
-        }
-        let Some(endpoint_id) = self.partition_l0_endpoint.get(&part) else {
-            return Ok(());
-        };
-        let Some(usage) = self.capacity.get(endpoint_id) else {
-            return Ok(());
-        };
-        if !usage.is_writable() {
-            return Err(StorageError::CapacityExhausted {
-                endpoint_id: usage.id.clone(),
-                used_bytes: usage.used(),
-                hard_limit_bytes: usage.hard_limit_bytes,
-            });
-        }
-        Ok(())
-    }
-
     /// Capacity tracker handle — exposed so background scanners,
     /// Prometheus exporters, and admin RPCs can read per-endpoint
     /// usage state without going through `put`/`get` paths.
@@ -3351,12 +3573,11 @@ impl StorageEngine {
         &self.capacity
     }
 
-    /// Refresh the capacity tracker by scanning every configured
-    /// endpoint's per-partition `tables/` directory and recomputing
-    /// `used_bytes`. Side effects: severity-transition logs,
-    /// `is_writable` flag flips at the 100% threshold, and (when the
-    /// endpoint strategy is `CascadeEvict`) a cascade-eviction fire
-    /// at the 95% emergency threshold.
+    /// Refresh the capacity report from the owned footprints (an endpoint
+    /// without a hard limit by walking its folder). Side effects:
+    /// severity-transition logs and gauges, and (when the endpoint strategy
+    /// is `CascadeEvict`) a cascade-eviction fire at the 95% emergency
+    /// threshold. Enforcement is the footprint's, not this report's.
     ///
     /// Synchronous — caller decides cadence. A background polling
     /// loop wrapper lives in the engine's open path.
@@ -3365,20 +3586,20 @@ impl StorageEngine {
             &self.capacity,
             &self.endpoints,
             self.coordinator.trees(),
-            self.coordinator.seqno_generator(),
+            &self.footprints,
             |id| self.cascade_evict_endpoint(id),
         );
     }
 
     /// Delete a key from the given partition.
     ///
-    /// Pre-write capacity gate applies: a delete writes a tombstone
-    /// that still consumes memtable bytes (and eventually SST bytes
-    /// after flush), so the hard-limit gate must fire here too;
-    /// operators evict via cascade or by reducing `hard_limit_bytes`,
-    /// not by stuffing more tombstones onto a Full endpoint.
+    /// Admitted on the owned footprint like a put: a tombstone takes memtable
+    /// bytes, then table bytes, until a compaction drops what it covers.
     pub fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {
-        self.check_partition_capacity(part)?;
+        let _admitted = self.admit_partition_write(
+            [part],
+            crate::engine::footprint::footprint_of(key.len() as u64, 1),
+        )?;
         let mut buf = Vec::new();
         // A generation with no installation here holds nothing to delete.
         if let Some(stored) = self.stored_key(part, key, &mut buf) {
@@ -3436,7 +3657,10 @@ impl StorageEngine {
     ///
     /// Invalidates any cached entry for this key (stale after merge).
     pub fn merge(&self, part: Partition, key: &[u8], operand: &[u8]) -> StorageResult<()> {
-        self.check_partition_capacity(part)?;
+        let _admitted = self.admit_partition_write(
+            [part],
+            crate::engine::footprint::footprint_of((key.len() + operand.len()) as u64, 1),
+        )?;
         let mut addressing = self.addressing(part)?;
         let seqno =
             self.coordinator
@@ -3669,8 +3893,9 @@ impl StorageEngine {
         level: Journal,
     ) -> StorageResult<()> {
         // Refused before the journal append, which is the write a full disk
-        // would fail in.
-        self.space.admit()?;
+        // would fail in; the admission is held until the write is in the
+        // journal and the memtables.
+        let _admitted = self.admit_write(mutations)?;
         if let Some((command, rest)) = crate::engine::operations::unit_command(mutations)? {
             // The decision, the journal append and the apply hold the
             // issuer's lock together: the journal records each decision's
@@ -3738,7 +3963,32 @@ impl StorageEngine {
         }
         // Past the admission of client writes, but not past the part of the
         // reserve that retiring these records needs.
-        self.space.admit_recovery()?;
+        self.space.admit_free_space_recovery()?;
+        // Inside the footprint's recovery reserve, never past its limit. The
+        // consensus state (vote, commit and purge points) is not admitted:
+        // a refusal would stop the group, and the records are a few bytes
+        // each, kept for entries already admitted; the journal growth they
+        // cause is still held to the limit.
+        let consensus = writes.iter().all(|write| match write {
+            LocalWrite::Put { partition, .. } | LocalWrite::Delete { partition, .. } => {
+                *partition == Partition::Raft
+            }
+        });
+        let _admitted = if self.footprints.is_empty() || consensus {
+            crate::engine::footprint::Admitted::default()
+        } else {
+            let data = writes
+                .iter()
+                .map(|write| match write {
+                    LocalWrite::Put { key, value, .. } => (key.len() + value.len()) as u64,
+                    LocalWrite::Delete { key, .. } => key.len() as u64,
+                })
+                .sum();
+            self.admit_footprint(
+                crate::engine::footprint::footprint_of(data, writes.len()),
+                crate::engine::footprint::Admit::Recovery,
+            )?
+        };
         if self.oplog.is_none() {
             return self.commit_member_local(writes, sync);
         }
@@ -4173,6 +4423,12 @@ impl StorageEngine {
     /// and end-to-end tests; not used on the steady-state write path.
     pub fn major_compact(&self, part: Partition) -> StorageResult<()> {
         let tree = self.tree(part)?;
+        // Under a hard limit the compaction's output takes only the room
+        // left beside what is held and promised: the journal the tables
+        // already cover goes first, so a full store can still compact.
+        if !self.footprints.is_empty() {
+            self.reclaim_footprint();
+        }
         // Target table size of 64 MiB is the lsm-tree default — picked
         // here explicitly so the major compaction's output SST size is
         // independent of any per-partition tuning we may layer on later.
@@ -4190,6 +4446,7 @@ impl StorageEngine {
         // owes anyone a time-travel contract; see
         // `GcWatermarkController::maintenance_compaction_threshold`.
         let threshold = self.coordinator.maintenance_compaction_threshold_for(part);
+        let _maintenance = crate::engine::footprint::MaintenanceScope::enter();
         tree.major_compact(64 * 1024 * 1024, threshold)
             .map_err(|e| StorageError::Io(format!("major compact {}: {e}", part.name())))?;
         Ok(())
@@ -4468,7 +4725,10 @@ impl StorageEngine {
             self.coordinator.advance_gc_watermark();
         }
         let watermark = self.coordinator.gc_watermark_value_for(part);
-        tree.major_compact(u64::MAX, watermark)?;
+        {
+            let _maintenance = crate::engine::footprint::MaintenanceScope::enter();
+            tree.major_compact(u64::MAX, watermark)?;
+        }
         // Operand fold for commutative partitions is time-travel safe: it
         // rewrites each key's merged value with `put`, adding a new version on
         // top while leaving the older operands intact for reads at older
@@ -5317,6 +5577,7 @@ fn run_cascade_evict(
         // eviction moves data between endpoints and must not collect history
         // the retention policy still holds. See `StorageEngine::major_compact`
         // for what the threshold means.
+        let _maintenance = crate::engine::footprint::MaintenanceScope::enter();
         tree.major_compact(64 * 1024 * 1024, gc_watermark(part))
             .map_err(|e| StorageError::Io(format!("major compact {}: {e}", part.name())))?;
         compacted_partitions += 1;
@@ -5448,7 +5709,7 @@ fn run_capacity_refresh<F>(
     capacity: &crate::engine::capacity::CapacityTracker,
     endpoints: &[crate::engine::config::EndpointConfig],
     trees: &HashMap<Partition, lsm_tree::AnyTree>,
-    seqno: &lsm_tree::SharedSequenceNumberGenerator,
+    footprints: &crate::engine::footprint::Footprints,
     mut cascade_fn: F,
 ) where
     F: FnMut(&str) -> StorageResult<CascadeReport>,
@@ -5457,32 +5718,8 @@ fn run_capacity_refresh<F>(
         .iter()
         .map(|ep| (ep.id.clone(), ep.path.clone()))
         .collect();
-    let partition_names: Vec<&str> = Partition::all()
-        .iter()
-        .filter(|p| **p != Partition::Raft)
-        .map(|p| p.name())
-        .collect();
-    capacity.refresh(&endpoint_paths, &partition_names);
+    capacity.refresh(&endpoint_paths, footprints);
     publish_footprint(trees);
-
-    // Persist used_bytes snapshots to Schema for warm-load on the
-    // next engine open, only when the value moved: an unchanged
-    // snapshot rewritten every scan keeps the Schema memtable from
-    // ever emptying, which on an idle engine means a flush, a table and
-    // a compaction per memtable age for nothing.
-    if let Some(schema_tree) = trees.get(&Partition::Schema) {
-        use lsm_tree::AbstractTree;
-        for (_id, usage) in capacity.iter() {
-            let key = capacity_key_for(&usage.id);
-            let Ok(encoded) = rmp_serde::to_vec(&usage.used()) else {
-                continue;
-            };
-            let stored = schema_tree.get(&key, lsm_tree::SeqNo::MAX).ok().flatten();
-            if stored.as_deref() != Some(encoded.as_slice()) {
-                schema_tree.insert(&key, &encoded, seqno.next());
-            }
-        }
-    }
 
     // Auto-cascade pass: any endpoint at Emergency severity with
     // `CascadeEvict` strategy triggers a cascade eviction. The
@@ -5518,36 +5755,6 @@ fn run_capacity_refresh<F>(
                 );
             }
         }
-    }
-}
-
-/// Encode a capacity-snapshot key for the Schema partition.
-///
-/// Key format: `meta:capacity:<endpoint_id>` — colon-prefixed to live
-/// in the engine-metadata namespace alongside `meta:routing:*`. Value
-/// is a MessagePack-encoded `u64` for the most-recent `used_bytes`
-/// observation. Lets a fresh engine open warm the capacity tracker
-/// to last-known values rather than running every gate against
-/// zero-used until the first scan completes.
-fn capacity_key_for(endpoint_id: &str) -> Vec<u8> {
-    format!("meta:capacity:{endpoint_id}").into_bytes()
-}
-
-/// Load the last-known `used_bytes` for an endpoint from Schema. Used
-/// at engine open to seed the capacity tracker before the first scan
-/// runs. Returns `0` (== "treat as fresh") when no snapshot exists —
-/// not an error: a partition with no prior persisted snapshot is the
-/// fresh-engine case.
-fn load_persisted_capacity(
-    schema_tree: &lsm_tree::AnyTree,
-    seqno: &lsm_tree::SharedSequenceNumberGenerator,
-    endpoint_id: &str,
-) -> u64 {
-    use lsm_tree::AbstractTree;
-    let key = capacity_key_for(endpoint_id);
-    match schema_tree.get(&key, seqno.get()) {
-        Ok(Some(bytes)) => rmp_serde::from_slice(&bytes).unwrap_or(0),
-        _ => 0,
     }
 }
 
@@ -5716,8 +5923,14 @@ pub struct CheckpointSummary {
 /// hard link to a live segment, and a copy onto it would truncate the
 /// journal itself. A file that disappears between the listing and its
 /// capture is skipped: the journal purge removed it, and it held only
-/// entries already in the trees.
-fn capture_journal(src: &Path, dst: &Path) -> StorageResult<u64> {
+/// entries already in the trees. A link is the segment's bytes under a
+/// second name, charged once; a copy is charged to `footprints` before it is
+/// written.
+fn capture_journal(
+    src: &Path,
+    dst: &Path,
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<u64> {
     create_dir_new(dst)?;
     let mut bytes = 0u64;
     let entries =
@@ -5729,12 +5942,17 @@ fn capture_journal(src: &Path, dst: &Path) -> StorageResult<u64> {
             .map_err(|e| StorageError::Io(format!("file type {:?}: {e}", entry.path())))?;
         let to = dst.join(entry.file_name());
         if file_type.is_dir() {
-            bytes += capture_journal(&entry.path(), &to)?;
+            bytes += capture_journal(&entry.path(), &to, footprints)?;
         } else {
             let from = entry.path();
             match crate::oplog::segment::is_sealed(&from) {
                 Ok(true) => match std::fs::hard_link(&from, &to) {
-                    Ok(()) => continue,
+                    Ok(()) => {
+                        footprints
+                            .linked(&from, &to)
+                            .map_err(|e| StorageError::Io(format!("link {to:?}: {e}")))?;
+                        continue;
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         return Err(StorageError::TargetExists {
                             path: to.display().to_string(),
@@ -5747,7 +5965,7 @@ fn capture_journal(src: &Path, dst: &Path) -> StorageResult<u64> {
                 Err(_) if !from.exists() => continue,
                 Err(e) => return Err(e),
             }
-            match copy_new(&from, &to) {
+            match copy_new(&from, &to, footprints) {
                 Ok(copied) => bytes += copied,
                 Err(StorageError::Io(_)) if !from.exists() => {}
                 Err(e) => return Err(e),
@@ -5759,11 +5977,37 @@ fn capture_journal(src: &Path, dst: &Path) -> StorageResult<u64> {
 
 /// Copy `from` into a new file `to`, refusing an existing one, unlike
 /// `std::fs::copy`, which truncates whatever `to` names (the source itself,
-/// when `to` is a hard link to it).
-fn copy_new(from: &Path, to: &Path) -> StorageResult<u64> {
+/// when `to` is a hard link to it). The copy is charged to `footprints`
+/// before it is made.
+fn copy_new(
+    from: &Path,
+    to: &Path,
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<u64> {
     // The source first: one the purge removed leaves no empty copy behind.
     let mut source =
         std::fs::File::open(from).map_err(|e| StorageError::Io(format!("open {from:?}: {e}")))?;
+    if let Some(charge) = footprints.file(to) {
+        let len = source
+            .metadata()
+            .map_err(|e| StorageError::Io(format!("measure {from:?}: {e}")))?
+            .len();
+        // An active segment may grow while it is copied; the copy is held to
+        // what was charged for it.
+        charge.charge_to(len)?;
+        let mut target = std::fs::File::create_new(to).map_err(|e| {
+            footprints.removed(to);
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                StorageError::TargetExists {
+                    path: to.display().to_string(),
+                }
+            } else {
+                StorageError::Io(format!("create {to:?}: {e}"))
+            }
+        })?;
+        return std::io::copy(&mut std::io::Read::take(&mut source, len), &mut target)
+            .map_err(|e| StorageError::Io(format!("copy {from:?} to {to:?}: {e}")));
+    }
     let mut target = std::fs::File::create_new(to).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             StorageError::TargetExists {
@@ -5895,6 +6139,54 @@ fn group_history_evidence(
         }
     }
     Ok(None)
+}
+
+/// Reserve, on the footprint of a capped endpoint holding it, the room each
+/// cache layer's file may reach: its `max_bytes`, twice over, since the
+/// layer compacts into a fresh file beside the old one. The cache writes its
+/// files directly, so the reservation is its whole charge. On a refusal
+/// nothing stays reserved.
+///
+/// # Errors
+///
+/// [`StorageError::CapacityExhausted`] for a layer that does not fit;
+/// [`StorageError::InvalidConfig`] for a size past what a file can hold.
+fn reserve_cache_layers(
+    cache: &crate::cache::config::TieredCacheConfig,
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<()> {
+    for layer in &cache.layers {
+        let Some(charge) = footprints.file(&layer.path) else {
+            continue;
+        };
+        let reserved = layer
+            .max_bytes
+            .checked_mul(2)
+            .ok_or_else(|| {
+                StorageError::InvalidConfig(format!(
+                    "cache layer {:?}: max_bytes {} past what a file can hold",
+                    layer.path, layer.max_bytes
+                ))
+            })
+            .and_then(|bytes| charge.charge_to(bytes));
+        if let Err(e) = reserved {
+            release_cache_layers(cache, footprints);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Bring each cache layer's charge back to what its file holds.
+fn release_cache_layers(
+    cache: &crate::cache::config::TieredCacheConfig,
+    footprints: &crate::engine::footprint::Footprints,
+) {
+    for layer in &cache.layers {
+        if let Some(charge) = footprints.file(&layer.path) {
+            charge.settle(crate::engine::footprint::allocated_at(&layer.path).unwrap_or(0));
+        }
+    }
 }
 
 /// Record, durably, that `partition` of the store at `data_dir` holds an

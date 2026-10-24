@@ -79,12 +79,11 @@ fn severity_labels_match_prometheus_convention() {
 }
 
 #[test]
-fn tracker_starts_writable_with_zero_usage() {
+fn tracker_starts_with_zero_usage() {
     let usages = vec![ep("a", 1000), ep("b", 0)];
     let tracker = CapacityTracker::new(&usages);
     let a = tracker.get("a").expect("a tracked");
     assert_eq!(a.used(), 0);
-    assert!(a.is_writable(), "fresh endpoint is writable");
     assert_eq!(a.severity(), CapacitySeverity::Normal);
     let b = tracker.get("b").expect("b tracked");
     assert_eq!(b.hard_limit_bytes, 0, "no-limit endpoint preserved");
@@ -120,95 +119,53 @@ fn dir_size_missing_root_returns_zero() {
     assert_eq!(dir_size(Path::new("/nonexistent/abs/path")), 0);
 }
 
+/// An endpoint with a hard limit reports what its footprint charges, and the
+/// severity that charge reaches; one that shrinks reports the recovery.
 #[test]
-fn refresh_updates_used_and_severity() {
+fn refresh_reports_the_charged_footprint() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let ep_root = tmp.path().to_path_buf();
-    let part_dir = ep_root.join("node").join("tables");
-    std::fs::create_dir_all(&part_dir).unwrap();
-    // Plant 800 B of fake SST data — should be 80% of a 1000 B limit.
-    std::fs::write(part_dir.join("000.sst"), vec![0u8; 800]).unwrap();
+    let mut config = ep("only", 1 << 20);
+    config.path = tmp.path().to_path_buf();
+    let footprints = crate::engine::footprint::Footprints::open(&[config.clone()]).unwrap();
+    let footprint = footprints.get("only").unwrap();
+    let tracker = CapacityTracker::new(&[config]);
+    let paths = BTreeMap::from([("only".to_string(), tmp.path().to_path_buf())]);
 
-    let mut ep_config = ep("only", 1000);
-    ep_config.path = ep_root.clone();
-    let tracker = CapacityTracker::new(&[ep_config]);
-
-    let mut paths = BTreeMap::new();
-    paths.insert("only".to_string(), ep_root);
-    tracker.refresh(&paths, &["node"]);
-
+    let file = footprint.file(&tmp.path().join("table"));
+    file.grow_to(850 * 1024).unwrap();
+    tracker.refresh(&paths, &footprints);
     let usage = tracker.get("only").unwrap();
-    assert_eq!(usage.used(), 800);
+    assert_eq!(usage.used(), footprint.charged());
     assert_eq!(usage.severity(), CapacitySeverity::Warning);
-    assert!(
-        usage.is_writable(),
-        "Warning severity still writable — only Full flips the flag",
-    );
+
+    file.truncate_to(0);
+    tracker.refresh(&paths, &footprints);
+    assert_eq!(usage.used(), 0);
+    assert_eq!(usage.severity(), CapacitySeverity::Normal);
 }
 
+/// An endpoint without a hard limit has no footprint: its folder is walked
+/// for the gauges.
 #[test]
-fn refresh_full_severity_flips_is_writable_off() {
+fn refresh_walks_the_folder_of_an_endpoint_without_a_limit() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let ep_root = tmp.path().to_path_buf();
-    let part_dir = ep_root.join("node").join("tables");
-    std::fs::create_dir_all(&part_dir).unwrap();
-    // 1100 B > 1000 B hard_limit → Full severity.
-    std::fs::write(part_dir.join("000.sst"), vec![0u8; 1100]).unwrap();
-
-    let mut ep_config = ep("only", 1000);
-    ep_config.path = ep_root.clone();
-    let tracker = CapacityTracker::new(&[ep_config]);
-
-    let mut paths = BTreeMap::new();
-    paths.insert("only".to_string(), ep_root);
-    tracker.refresh(&paths, &["node"]);
-
-    let usage = tracker.get("only").unwrap();
-    assert_eq!(usage.severity(), CapacitySeverity::Full);
-    assert!(
-        !usage.is_writable(),
-        "Full severity must flip is_writable off — writes targeting this endpoint reject",
-    );
-}
-
-#[test]
-fn refresh_recovery_flips_is_writable_back_on() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let ep_root = tmp.path().to_path_buf();
-    let part_dir = ep_root.join("node").join("tables");
-    std::fs::create_dir_all(&part_dir).unwrap();
-
-    let mut ep_config = ep("only", 1000);
-    ep_config.path = ep_root.clone();
-    let tracker = CapacityTracker::new(&[ep_config]);
-    let mut paths = BTreeMap::new();
-    paths.insert("only".to_string(), ep_root.clone());
-
-    // Step 1: full.
-    let big_path = part_dir.join("big.sst");
-    std::fs::write(&big_path, vec![0u8; 1500]).unwrap();
-    tracker.refresh(&paths, &["node"]);
-    let usage = tracker.get("only").unwrap();
-    assert!(!usage.is_writable());
-
-    // Step 2: cascade-eviction analog — operator deletes the big
-    // SST. Next refresh observes a lower usage and must flip the
-    // writable flag back on.
-    std::fs::remove_file(&big_path).unwrap();
-    tracker.refresh(&paths, &["node"]);
-    assert!(
-        usage.is_writable(),
-        "recovery below threshold must re-enable writes",
-    );
+    std::fs::write(tmp.path().join("000.sst"), vec![0u8; 800]).unwrap();
+    let mut config = ep("free", 0);
+    config.path = tmp.path().to_path_buf();
+    let tracker = CapacityTracker::new(&[config]);
+    let paths = BTreeMap::from([("free".to_string(), tmp.path().to_path_buf())]);
+    tracker.refresh(&paths, &Default::default());
+    let usage = tracker.get("free").unwrap();
+    assert_eq!(usage.used(), 800);
     assert_eq!(usage.severity(), CapacitySeverity::Normal);
 }
 
 #[test]
 fn refresh_missing_endpoint_path_skipped_not_errored() {
     let tracker = CapacityTracker::new(&[ep("missing", 1000)]);
-    // No path entry for "missing" → refresh skips, no panic, no
-    // mutation of state.
-    tracker.refresh(&BTreeMap::new(), &["node"]);
+    // Neither a footprint nor a path for "missing": refresh skips it, no
+    // panic, no mutation of state.
+    tracker.refresh(&BTreeMap::new(), &Default::default());
     assert_eq!(tracker.get("missing").unwrap().used(), 0);
 }
 
@@ -264,25 +221,9 @@ fn scanner_shutdown_is_idempotent() {
     drop(scanner);
 }
 
-/// Regression test for the warm-load race: the scanner's first tick
-/// MUST be deferred by `interval`, not fire immediately on spawn.
-///
-/// Why: at engine open, `load_persisted_capacity` warm-hydrates the
-/// tracker from Schema. The user thread then starts writes + calls
-/// `engine.refresh_capacity()` to publish a fresh measurement to
-/// Schema. If the scanner also fires its first tick concurrently,
-/// its slow disk scan can finish AFTER the user's manual refresh,
-/// grab a higher seqno, and write a stale (or empty) measurement
-/// that wins LSM merge on the next reopen — clobbering the value
-/// the user just committed.
-///
-/// Repro on the unwanted-immediate-tick code:
-/// - spawn scanner with `interval = 1s`, counter `Arc<AtomicU32>`
-/// - sleep 200 ms (well under interval)
-/// - assert counter == 0 (no tick yet)
-///
-/// Before the fix this assertion FAILS (counter == 1 because the
-/// loop body calls refresh_fn() immediately).
+/// The scanner's first tick is deferred by `interval`, not fired on spawn:
+/// the engine open, which measured the footprints itself, completes
+/// without a scan competing with the caller's first writes.
 #[test]
 fn first_tick_is_deferred_by_interval() {
     use std::sync::atomic::AtomicU32;

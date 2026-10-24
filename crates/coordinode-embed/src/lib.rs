@@ -6,12 +6,15 @@
 //!
 //! ```toml
 //! [dependencies]
-//! coordinode-embed = "0.8"
+//! coordinode-embed = "0.9"
+//! # Query parameters and result values are coordinode_core types.
+//! coordinode-core = "0.9"
 //! ```
 //!
 //! The registry package includes generated protocol bindings, so consumers do
-//! not need a proto submodule or protobuf generation tools. Enable `replication`
-//! when the host needs to participate in a replicated group (see below).
+//! not need a proto submodule or protobuf generation tools. Rust 1.92 or newer.
+//! `Database::open_with_config` takes a `coordinode_storage` configuration:
+//! add `coordinode-storage = "0.9"` to set endpoints, limits or retention.
 //!
 //! ## Example
 //!
@@ -19,10 +22,20 @@
 //! use coordinode_embed::{Database, DatabaseError};
 //! # fn main() -> Result<(), DatabaseError> {
 //! let mut db = Database::open("coordinode-data")?;
+//! let tx = db.begin_transaction()?;
+//! db.execute_in_transaction(tx, "CREATE (:User {name: 'ada'})", None)?;
+//! db.commit_transaction(tx)?;
 //! let results = db.execute_cypher("MATCH (n:User) RETURN n.name")?;
+//! // Dropping the database closes it and releases the directory.
+//! drop(db);
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! A complete application (parameters, commit, rollback, a typed refusal,
+//! reopen) is the repository's `examples/embedded-quickstart`; the guide is
+//! *Embedded (Rust)* in the documentation. [`Database`] covers opening,
+//! closing and durability; [`DatabaseError`] the typed refusals.
 //!
 //! ## Features
 //!
@@ -53,3 +66,11 @@ pub use db::{
     TransactionOptions, TriggerDispatchConfig,
 };
 pub use repair::RepairReport;
+
+/// Every Rust snippet of the embedded guide, compiled as a doctest against
+/// this crate so the guide cannot advertise code that does not build. The
+/// replicated snippets need the feature; the documentation suite runs with
+/// all features.
+#[cfg(all(doctest, feature = "replication"))]
+#[doc = include_str!("../../../docs/guide/embedded.md")]
+pub struct EmbeddedGuide;

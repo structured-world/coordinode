@@ -823,7 +823,7 @@ impl Database {
     pub fn checkpoint(&self, keep: usize) -> Result<std::path::PathBuf, DatabaseError> {
         let root = crate::repair::checkpoint_root(self.engine.data_dir());
         let path = crate::repair::create_checkpoint(&self.engine, &root)?;
-        crate::repair::prune_checkpoints(&root, keep)?;
+        crate::repair::prune_checkpoints(&self.engine, &root, keep)?;
         Ok(path)
     }
 
@@ -862,6 +862,10 @@ impl Database {
         // updates HNSW inline on the write path and applies no Raft entries.
         follow_raft_applies: bool,
     ) -> Result<Self, DatabaseError> {
+        // What opening the database writes (repair, registries, schema) is
+        // the store's own work: bounded, and allowed past a limit the
+        // database no longer fits, so it opens to be read.
+        let _opening = engine.footprints().open_phase();
         // Auto-repair on open. For an embedded engine with a retained
         // oplog journal, if a checkpoint exists, scrub and rebuild any corrupt
         // partition from that checkpoint + oplog replay BEFORE any state is read
@@ -871,6 +875,15 @@ impl Database {
         // `verify_and_repair()` to inspect.
         if engine.has_journal() {
             let root = crate::repair::checkpoint_root(engine.data_dir());
+            // The journal keeps what a rebuild from the newest checkpoint
+            // replays; a floor that cannot be read keeps the whole journal.
+            if let Some(latest) = crate::repair::latest_checkpoint(&root) {
+                let floor = StorageEngine::checkpoint_replay_floor(&latest).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "checkpoint replay floor unreadable; keeping the journal");
+                    0
+                });
+                engine.set_journal_keep_from(floor);
+            }
             // An interrupted rebuild is repaired, or reported, even when its
             // checkpoint has gone since.
             if crate::repair::latest_checkpoint(&root).is_some()
@@ -1392,7 +1405,8 @@ impl Database {
     ) -> Result<coordinode_query::index::TextIndexRegistry, DatabaseError> {
         use coordinode_query::index::IndexType;
 
-        let registry = coordinode_query::index::TextIndexRegistry::new(base_dir);
+        let registry = coordinode_query::index::TextIndexRegistry::new(base_dir)
+            .with_footprints(engine.footprints().clone());
 
         // A definition the listing cannot read refuses the open: the
         // database is not served without one of its indexes.
@@ -1935,6 +1949,28 @@ impl Database {
     /// (default five minutes).
     pub fn set_retention_window(&self, window: Duration) {
         self.engine.set_retention_window(window);
+    }
+
+    /// Change the total owned-footprint ceiling of endpoint `endpoint_id`
+    /// (its `hard_limit_bytes`) without a restart, and the recovery reserve
+    /// inside it (`None`: a sixteenth of the limit). A raised limit admits
+    /// writes at once; a limit below what the endpoint holds deletes nothing
+    /// and refuses client writes, reads going on, until the database fits it.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Storage`] for an unknown endpoint, a limit of `0`, or
+    /// an endpoint opened without a hard limit (that takes a restart with one
+    /// configured).
+    pub fn set_hard_limit(
+        &self,
+        endpoint_id: &str,
+        limit_bytes: u64,
+        reserve_bytes: Option<u64>,
+    ) -> Result<(), DatabaseError> {
+        Ok(self
+            .engine
+            .set_hard_limit(endpoint_id, limit_bytes, reserve_bytes)?)
     }
 
     /// The configured MVCC time-travel retention window.

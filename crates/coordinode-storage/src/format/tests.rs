@@ -1,4 +1,10 @@
 use super::*;
+use crate::engine::footprint::Footprints;
+
+/// The marker written outside any engine: nothing to charge.
+fn mark(dir: &Path, format: u32) -> StorageResult<()> {
+    write_marker(dir, format, &Footprints::default())
+}
 
 fn touch(dir: &Path, name: &str) {
     std::fs::create_dir_all(dir).expect("dir");
@@ -55,7 +61,7 @@ fn an_unmarked_directory_with_data_is_format_zero() {
         opened,
         FormatOpen::Migrated { from: 0, to: 1, .. }
     ));
-    settle(&opened).expect("settle");
+    settle(&opened, &Footprints::default()).expect("settle");
     assert_eq!(read_marker(root.path()).expect("read"), Some(1));
 
     let older = tempfile::tempdir().expect("tempdir");
@@ -80,7 +86,7 @@ fn an_unmarked_directory_with_data_is_format_zero() {
 fn the_previous_format_migrates_through_its_step() {
     let root = tempfile::tempdir().expect("tempdir");
     touch(root.path(), "schema");
-    write_marker(root.path(), 4).expect("mark");
+    mark(root.path(), 4).expect("mark");
     let opened = prepare_dir(root.path(), 5, STEPS).expect("migrate");
     assert!(matches!(
         opened,
@@ -92,7 +98,7 @@ fn the_previous_format_migrates_through_its_step() {
         Some(4),
         "the marker waits for the open to succeed"
     );
-    settle(&opened).expect("settle");
+    settle(&opened, &Footprints::default()).expect("settle");
     assert_eq!(read_marker(root.path()).expect("read"), Some(5));
 }
 
@@ -117,7 +123,7 @@ fn the_engine_refuses_a_directory_of_an_earlier_format() {
         drop(StorageEngine::open(&config).expect("open"));
         match earlier {
             None => std::fs::remove_file(root.path().join(MARKER_FILE)).expect("unmark"),
-            Some(format) => write_marker(root.path(), format).expect("mark earlier"),
+            Some(format) => mark(root.path(), format).expect("mark earlier"),
         }
         let err = StorageEngine::open(&config).err().expect("refused");
         assert!(
@@ -139,7 +145,7 @@ fn other_formats_are_refused_untouched() {
     for found in [3, 6] {
         let root = tempfile::tempdir().expect("tempdir");
         touch(root.path(), "schema");
-        write_marker(root.path(), found).expect("mark");
+        mark(root.path(), found).expect("mark");
         let err = prepare_dir(root.path(), 5, STEPS).expect_err("refused");
         let text = err.to_string();
         assert!(
@@ -161,7 +167,7 @@ fn a_failed_step_leaves_the_old_marker() {
     }];
     let root = tempfile::tempdir().expect("tempdir");
     touch(root.path(), "schema");
-    write_marker(root.path(), 4).expect("mark");
+    mark(root.path(), 4).expect("mark");
     prepare_dir(root.path(), 5, FAILING).expect_err("step fails");
     assert_eq!(read_marker(root.path()).expect("read"), Some(4));
 }
@@ -190,7 +196,7 @@ fn the_engine_refuses_a_directory_of_a_newer_format() {
     drop(StorageEngine::open(&config).expect("open"));
     let runs = coordinode_core::version::engine_format_version();
     assert_eq!(read_marker(root.path()).expect("read"), Some(runs));
-    write_marker(root.path(), runs + 1).expect("mark newer");
+    mark(root.path(), runs + 1).expect("mark newer");
     let err = StorageEngine::open(&config).err().expect("refused");
     assert!(
         matches!(err, StorageError::UnsupportedFormat { .. }),

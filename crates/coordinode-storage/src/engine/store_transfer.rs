@@ -569,7 +569,13 @@ pub fn receive_store(reader: &mut impl Read, dir: &Path) -> StorageResult<Receiv
         }
         restore_tree(dir, tree)?;
     }
-    crate::format::write_marker(dir, coordinode_core::version::engine_format_version())?;
+    // A received store is measured by the engine that opens it; the transfer
+    // writes beside the member's store unheld by its footprint.
+    crate::format::write_marker(
+        dir,
+        coordinode_core::version::engine_format_version(),
+        &crate::engine::footprint::Footprints::default(),
+    )?;
     Ok(received)
 }
 

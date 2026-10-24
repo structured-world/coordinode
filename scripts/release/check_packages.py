@@ -65,6 +65,50 @@ def inspect_archive(archive, name, version, names, bindings):
     return {"sha256": hashlib.sha256(archive.read_bytes()).hexdigest(), "files": len(files)}
 
 
+QUICKSTART = "examples/embedded-quickstart"
+
+
+def admits(requirement, version):
+    """Whether a plain Cargo requirement (`0.9`, `1.2.3`: caret) admits `version`."""
+    wanted = [int(part) for part in requirement.split(".")]
+    have = [int(part) for part in version.split("-")[0].split(".")]
+    # Caret: the leftmost non-zero component of the requirement is fixed.
+    fixed = next((i for i, part in enumerate(wanted) if part != 0), len(wanted) - 1) + 1
+    return have[:fixed] == wanted[:fixed] and have[:len(wanted)] >= wanted
+
+
+def check_quickstart_requirements(root, names, version):
+    """The published example must build against the version being qualified."""
+    manifest = tomllib.loads((root / QUICKSTART / "Cargo.toml").read_text())
+    for name, requirement in manifest["dependencies"].items():
+        if name not in names:
+            continue
+        if not isinstance(requirement, str) or not admits(requirement, version):
+            raise ValueError(
+                f"{QUICKSTART}/Cargo.toml requires {name} {requirement!r}, which does not "
+                f"admit {version}: update the example's requirement with the release")
+
+
+def run_quickstart(root, network, prefix, env, workdir):
+    """Build the example project as published and run it twice on one directory.
+
+    The second run checks the documented repeat-run behaviour: it adds its own
+    rows to the database the first run left and verifies them.
+    """
+    project = workdir / "embedded-quickstart"
+    (project / "src").mkdir(parents=True)
+    for relative in ("Cargo.toml", "src/main.rs"):
+        (project / relative).write_text((root / QUICKSTART / relative).read_text())
+    if (workdir / ".cargo").exists():
+        (project / ".cargo").mkdir()
+        (project / ".cargo/config.toml").write_text(
+            (workdir / ".cargo/config.toml").read_text())
+    data = workdir / "quickstart-data"
+    for _ in range(2):
+        subprocess.run([*prefix, "cargo", "run", *network, "--", str(data)],
+                       cwd=project, env=env, check=True)
+
+
 def consumer_manifest(version):
     return (
         '[package]\nname="coordinode-registry-consumer"\nversion="0.0.0"\nedition="2024"\n'
@@ -121,6 +165,7 @@ def main():
     report = json.loads(report_path.read_text())
     names = inventory["packages"]
     version = report["version"]
+    check_quickstart_requirements(root, set(names), version)
     toolchains = args.consumer_toolchain or [None]
     if args.source == "prepared":
         package_args = ["cargo", "package", "--allow-dirty", "--no-verify"]
@@ -176,8 +221,16 @@ def main():
                 if feature:
                     command.extend(["--features", feature])
                 subprocess.run([*command, "--", str(data)], cwd=consumer, env=env, check=True)
+            quickstart = consumer / f"quickstart-{index}"
+            quickstart.mkdir()
+            if args.source == "prepared":
+                (quickstart / ".cargo").mkdir()
+                (quickstart / ".cargo/config.toml").write_text(
+                    (consumer / ".cargo/config.toml").read_text())
+            run_quickstart(root, network, prefix, env, quickstart)
             qualified.append({"toolchain": toolchain or "current",
-                              "standalone": "passed", "replication_build": "passed"})
+                              "standalone": "passed", "replication_build": "passed",
+                              "quickstart_example": "passed"})
     report[f"{args.source}_consumer"] = qualified
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"{args.source} external consumer passed; consumer build/data cleaned")

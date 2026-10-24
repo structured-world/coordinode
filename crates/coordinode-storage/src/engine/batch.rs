@@ -89,6 +89,16 @@ impl Mutation {
             | Self::RemoveRange { partition, .. } => *partition,
         }
     }
+
+    /// The key and value bytes this mutation writes.
+    fn data_bytes(&self) -> u64 {
+        match self {
+            Self::Put { key, value, .. } => (key.len() + value.len()) as u64,
+            Self::Delete { key, .. } => key.len() as u64,
+            Self::Merge { key, operand, .. } => (key.len() + operand.len()) as u64,
+            Self::RemoveRange { start, end, .. } => (start.len() + end.len()) as u64,
+        }
+    }
 }
 
 /// An atomic write batch with crash safety guarantees.
@@ -194,10 +204,15 @@ impl<'a> WriteBatch<'a> {
             return Ok(());
         }
         let engine = self.engine;
-        // Capacity is gated inside `commit_at` BEFORE the seqno is consumed
-        // only if we allocate after the gate; allocate here and let the gate
-        // reject before any mutation lands (a consumed seqno with no writes
-        // is harmless: seqnos only need to be monotonic, not dense).
+        // Admitted whole on the owned footprint before any mutation lands:
+        // a batch that does not fit writes nothing.
+        let _admitted = engine.admit_partition_write(
+            self.mutations.iter().map(Mutation::partition),
+            crate::engine::footprint::footprint_of(
+                self.mutations.iter().map(Mutation::data_bytes).sum(),
+                self.mutations.len(),
+            ),
+        )?;
         let seqno = engine.next_seqno();
         self.commit_at(seqno)?;
         if engine.flush_policy() == FlushPolicy::SyncPerBatch {
@@ -251,19 +266,6 @@ impl<'a> WriteBatch<'a> {
         }
 
         let WriteBatch { engine, mutations } = self;
-
-        // Pre-write capacity gate: atomicity contract, no mutation lands if any
-        // partition in the batch targets a full L0 endpoint. `Schema` and
-        // `Raft` bypass the gate (engine-internal metadata). O(distinct
-        // partitions), not O(mutations).
-        let mut checked: std::collections::HashSet<Partition> =
-            std::collections::HashSet::with_capacity(Partition::all().len());
-        for m in mutations {
-            let part = m.partition();
-            if checked.insert(part) {
-                engine.check_partition_capacity(part)?;
-            }
-        }
 
         // Group by partition, preserving staging order within each group so
         // repeated merge operands on one key resolve in the order they were

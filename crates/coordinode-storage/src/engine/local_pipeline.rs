@@ -65,9 +65,9 @@ impl<'a> LocalProposalPipeline<'a> {
 
 impl ProposalPipeline for LocalProposalPipeline<'_> {
     fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
-        self.engine
-            .space()
-            .admit()
+        let _admitted = self
+            .engine
+            .admit_write(&proposal.mutations)
             .map_err(storage_to_proposal_err)?;
         // The whole proposal lands at one seqno, its commit_ts, so a
         // snapshot at commit_ts sees all of it and one tick earlier none.
@@ -140,10 +140,10 @@ impl OwnedLocalProposalPipeline {
                 .map_err(storage_to_proposal_err)?;
         } else {
             // Refused before the apply and the flush that would hit a full
-            // disk.
-            self.engine
-                .space()
-                .admit()
+            // disk, or pass a footprint limit.
+            let _admitted = self
+                .engine
+                .admit_write(&proposal.mutations)
                 .map_err(storage_to_proposal_err)?;
             // The whole proposal lands at one seqno, its commit_ts.
             self.engine

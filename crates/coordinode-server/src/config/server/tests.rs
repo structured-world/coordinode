@@ -682,6 +682,65 @@ fn explicit_multi_endpoint_topology_parses_from_yaml() {
     assert_eq!(eps[1].id, "hdd-cold");
     assert_eq!(eps[1].durability, Durability::Degraded);
     assert_eq!(eps[1].capacity_bytes, 16_000_000_000_000);
+    assert_eq!(eps[1].recovery_reserve_bytes, None);
+}
+
+/// The total owned-footprint ceiling and the recovery reserve inside it are
+/// read from the endpoint block; a reserve set without a limit to hold it,
+/// or larger than the limit, refuses the configuration by name.
+#[test]
+fn hard_limit_and_recovery_reserve_parse_and_validate() {
+    let dir = tempfile::tempdir().unwrap();
+    let load = |endpoint: &str| {
+        let path = dir.path().join("c.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "data_dir: /var/lib/coordinode/data\n\
+                 storage:\n\
+                 \x20 endpoints:\n\
+                 \x20   - id: capped\n\
+                 \x20     path: /mnt/capped\n\
+                 \x20     media: ssd\n\
+                 \x20     durability: durable\n\
+                 \x20     tier: warm\n\
+                 {endpoint}"
+            ),
+        )
+        .unwrap();
+        ServerConfig::load(Some(path.to_str().unwrap()))
+            .unwrap()
+            .resolve_storage_config()
+    };
+
+    let storage = load(
+        "\x20     hard_limit_bytes: 1073741824\n\
+         \x20     recovery_reserve_bytes: 134217728\n",
+    )
+    .expect("a reserve inside the limit");
+    assert_eq!(storage.endpoints[0].hard_limit_bytes, 1 << 30);
+    assert_eq!(storage.endpoints[0].recovery_reserve(), 128 << 20);
+
+    let storage = load("\x20     hard_limit_bytes: 1073741824\n").expect("a limit alone");
+    assert_eq!(
+        storage.endpoints[0].recovery_reserve(),
+        (1 << 30) / 16,
+        "the default reserve is a sixteenth of the limit"
+    );
+
+    for endpoint in [
+        "\x20     recovery_reserve_bytes: 1024\n",
+        "\x20     hard_limit_bytes: 4096\n\
+         \x20     recovery_reserve_bytes: 8192\n",
+    ] {
+        assert!(
+            matches!(
+                load(endpoint),
+                Err(EndpointConfigError::ReserveOutsideLimit { .. })
+            ),
+            "{endpoint}"
+        );
+    }
 }
 
 #[test]

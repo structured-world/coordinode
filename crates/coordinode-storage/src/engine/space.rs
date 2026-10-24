@@ -13,12 +13,19 @@
 //! on it, the database's own files and anything else. It is read again when
 //! the last reading is older than [`RECHECK`], so the hot path costs an
 //! atomic load almost always and a syscall at most a few times a second.
+//!
+//! The guard also answers for the endpoints' hard limits
+//! ([`Footprints`]): a write that finds no room under one is refused with
+//! [`StorageError::CapacityExhausted`], at the same points and with the same
+//! consequences as one below the free-space reserve. That is what keeps a
+//! consensus log append from meeting a limit inside its write.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::engine::config::{Durability, StorageConfig};
+use crate::engine::footprint::{Admit, Admitted, Footprints};
 use crate::error::{StorageError, StorageResult};
 
 /// How old a free-space reading may be before a write reads it again.
@@ -45,6 +52,8 @@ pub struct SpaceGuard {
     /// before the first.
     read_at: AtomicU64,
     epoch: Instant,
+    /// The endpoints' hard limits, answered for with the free space.
+    footprints: Footprints,
 }
 
 impl SpaceGuard {
@@ -65,17 +74,43 @@ impl SpaceGuard {
             paused: AtomicBool::new(false),
             read_at: AtomicU64::new(0),
             epoch: Instant::now(),
+            footprints: Footprints::default(),
         };
         guard.refresh();
         guard
     }
 
-    /// Admit a write, or refuse it while free space is below the reserve.
+    /// Answer for the hard limits of `footprints` as well.
+    #[must_use]
+    pub fn with_footprints(mut self, footprints: Footprints) -> Self {
+        self.footprints = footprints;
+        self
+    }
+
+    /// The endpoints' hard limits the guard answers for.
+    pub fn footprints(&self) -> &Footprints {
+        &self.footprints
+    }
+
+    /// Admit a write, or refuse it while free space is below the reserve or
+    /// an endpoint's hard limit leaves client writes no room.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::OutOfSpace`] while writes are paused;
+    /// [`StorageError::CapacityExhausted`] for an endpoint without room.
+    pub fn admit(&self) -> StorageResult<()> {
+        self.admit_free_space()?;
+        self.has_room(Admit::Client)
+    }
+
+    /// [`Self::admit`] by free space alone, for a write the engine then
+    /// admits on the footprint itself (reclaiming before it refuses).
     ///
     /// # Errors
     ///
     /// [`StorageError::OutOfSpace`] while writes are paused.
-    pub fn admit(&self) -> StorageResult<()> {
+    pub(crate) fn admit_free_space(&self) -> StorageResult<()> {
         if self.is_stale() {
             self.refresh();
         }
@@ -84,6 +119,32 @@ impl SpaceGuard {
             return Err(self.refusal());
         }
         Ok(())
+    }
+
+    /// [`Self::admit`], then reserve `bytes` of `class` on every endpoint
+    /// with a hard limit, held until the returned admission drops: a write
+    /// that cannot be checked by size later (a consensus log append) holds
+    /// its room from before it is proposed until it is in the log.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit`], and [`StorageError::CapacityExhausted`] when the
+    /// write does not fit.
+    pub fn reserve(&self, bytes: u64, class: Admit) -> StorageResult<Admitted> {
+        match class {
+            Admit::Client => self.admit()?,
+            Admit::Recovery => self.admit_recovery()?,
+        }
+        self.footprints.admit(bytes, class)
+    }
+
+    /// Refuse a write of `class` that no endpoint's hard limit has room for.
+    fn has_room(&self, class: Admit) -> StorageResult<()> {
+        let room = self.footprints.has_room(class);
+        if room.is_err() {
+            metrics::counter!("coordinode_footprint_refusals_total").increment(1);
+        }
+        room
     }
 
     /// Admit a write of the store's own recovery records (index use guards,
@@ -96,8 +157,21 @@ impl SpaceGuard {
     /// # Errors
     ///
     /// [`StorageError::OutOfSpace`] while free space is below half the
-    /// reserve.
+    /// reserve; [`StorageError::CapacityExhausted`] for an endpoint whose
+    /// hard limit leaves even the store's own work no room.
     pub fn admit_recovery(&self) -> StorageResult<()> {
+        self.admit_free_space_recovery()?;
+        self.has_room(Admit::Recovery)
+    }
+
+    /// [`Self::admit_recovery`] by free space alone, for a write the engine
+    /// then admits on the footprint itself.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::OutOfSpace`] while free space is below half the
+    /// reserve.
+    pub(crate) fn admit_free_space_recovery(&self) -> StorageResult<()> {
         if self.is_stale() {
             self.refresh();
         }
@@ -108,9 +182,21 @@ impl SpaceGuard {
         Ok(())
     }
 
-    /// Whether writes are paused, reading free space again if the last
-    /// reading is stale.
+    /// Whether client writes are paused: free space below the reserve
+    /// (reading it again if the last reading is stale), or an endpoint whose
+    /// hard limit leaves them no room.
     pub fn is_paused(&self) -> bool {
+        if self.is_stale() {
+            self.refresh();
+        }
+        self.paused.load(Ordering::Acquire) || self.has_room(Admit::Client).is_err()
+    }
+
+    /// Whether free space alone pauses writes, whatever the hard limits say:
+    /// for the store's own work that frees room under a limit (a snapshot
+    /// that lets the consensus log be compacted) yet must not run on a disk
+    /// below its reserve.
+    pub fn is_paused_by_free_space(&self) -> bool {
         if self.is_stale() {
             self.refresh();
         }

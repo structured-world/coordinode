@@ -505,7 +505,9 @@ fn scores(
 
 fn fresh(dir: &std::path::Path, docs: &[(u64, &str)]) -> MultiLanguageTextIndex {
     let config = MultiLangConfig::with_default_language("english");
-    let mut idx = MultiLanguageTextIndex::create_scratch(dir, 15_000_000, config).unwrap();
+    let mut idx =
+        MultiLanguageTextIndex::create_scratch(dir, 15_000_000, config, Default::default())
+            .unwrap();
     let docs: Vec<_> = docs
         .iter()
         .map(|(id, body)| (*id, props(&[("body", body)])))
@@ -960,6 +962,7 @@ fn a_failed_write_leaves_no_trace_in_the_statistics() {
         &path,
         15_000_000,
         MultiLangConfig::with_default_language("english"),
+        Default::default(),
     )
     .unwrap();
     idx.add_node(1, &props(&[("body", "graph engine")]))
@@ -986,9 +989,13 @@ fn a_failed_write_leaves_no_trace_in_the_statistics() {
 fn writes_to_a_lost_directory_keep_failing_without_a_panic() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("idx");
-    let mut idx =
-        MultiLanguageTextIndex::create_scratch(&path, 15_000_000, MultiLangConfig::default())
-            .unwrap();
+    let mut idx = MultiLanguageTextIndex::create_scratch(
+        &path,
+        15_000_000,
+        MultiLangConfig::default(),
+        Default::default(),
+    )
+    .unwrap();
     idx.add_node(1, &props(&[("body", "graph engine")]))
         .unwrap();
     std::fs::remove_dir_all(&path).unwrap();

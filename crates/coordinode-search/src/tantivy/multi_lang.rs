@@ -197,15 +197,17 @@ impl MultiLanguageTextIndex {
 
     /// Create an empty index at `dir`, replacing whatever it held, with files
     /// written unsynced (see [`TextIndex::create_scratch`]): for an index the
-    /// caller rebuilds from its source every time it creates it.
+    /// caller rebuilds from its source every time it creates it. Its files are
+    /// charged to `footprints`.
     pub fn create_scratch(
         dir: &Path,
         heap_size_bytes: usize,
         config: MultiLangConfig,
+        footprints: coordinode_storage::engine::footprint::Footprints,
     ) -> Result<Self, TextSearchError> {
         // Tokenization happens per document via PreTokenizedString, as in
         // `open_or_create`.
-        let mut inner = TextIndex::create_scratch(dir, heap_size_bytes, Some("none"))?;
+        let mut inner = TextIndex::create_scratch(dir, heap_size_bytes, Some("none"), footprints)?;
         inner.corpus = Some(Corpus::default());
         Ok(Self::over(inner, config))
     }

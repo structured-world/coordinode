@@ -67,6 +67,8 @@ pub struct TextIndexRegistry {
     /// The writes the indexes have not folded, when a worker maintains them
     /// from the applied entries; a registry without one serves what it holds.
     coverage: RwLock<Option<Arc<IndexCoverage>>>,
+    /// The owned footprints the index files are charged to.
+    footprints: coordinode_storage::engine::footprint::Footprints,
 }
 
 /// The stored rows of one node, as a text index reads them.
@@ -289,7 +291,19 @@ impl TextIndexRegistry {
             definitions: RwLock::new(HashMap::new()),
             base_dir: base_dir.into(),
             coverage: RwLock::new(None),
+            footprints: Default::default(),
         }
+    }
+
+    /// Charge the index files to `footprints`: the store's owned footprint,
+    /// whose limit an index build cannot pass.
+    #[must_use]
+    pub fn with_footprints(
+        mut self,
+        footprints: coordinode_storage::engine::footprint::Footprints,
+    ) -> Self {
+        self.footprints = footprints;
+        self
     }
 
     /// Learn from `coverage` which writes the indexes have not folded, so a
@@ -566,6 +580,7 @@ impl TextIndexRegistry {
                 &idx_dir,
                 15_000_000,
                 per_field_config.clone(),
+                self.footprints.clone(),
             ) {
                 Ok(index) => index,
                 // An index replaced in this process may still have its files
@@ -578,10 +593,13 @@ impl TextIndexRegistry {
                         .map(|d| d.as_nanos())
                         .unwrap_or_default();
                     let fresh = idx_dir.with_extension(nanos.to_string());
-                    MultiLanguageTextIndex::create_scratch(&fresh, 15_000_000, per_field_config)
-                        .map_err(|e| {
-                            format!("failed to create text index for {prop}: {first}; {e}")
-                        })?
+                    MultiLanguageTextIndex::create_scratch(
+                        &fresh,
+                        15_000_000,
+                        per_field_config,
+                        self.footprints.clone(),
+                    )
+                    .map_err(|e| format!("failed to create text index for {prop}: {first}; {e}"))?
                 }
             };
 

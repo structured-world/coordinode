@@ -77,6 +77,30 @@ class ArchiveTest(unittest.TestCase):
             self.inspect(extra={'../outside': b'not allowed'})
 
 
+class QuickstartRequirementTest(unittest.TestCase):
+    def test_caret_requirements_admit_only_compatible_releases(self):
+        self.assertTrue(check_packages.admits('0.9', '0.9.0'))
+        self.assertTrue(check_packages.admits('0.9', '0.9.4'))
+        self.assertFalse(check_packages.admits('0.9', '0.10.0'))
+        self.assertFalse(check_packages.admits('0.9.2', '0.9.1'))
+        self.assertTrue(check_packages.admits('1', '1.4.0'))
+        self.assertFalse(check_packages.admits('1.2', '2.0.0'))
+
+    def test_an_example_left_behind_the_release_is_refused(self):
+        # The published example is the documented consumer entry point: a
+        # release its requirement does not admit would publish an example
+        # that builds against the previous release, or not at all.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            (root / check_packages.QUICKSTART).mkdir(parents=True)
+            (root / check_packages.QUICKSTART / 'Cargo.toml').write_text(
+                '[package]\nname="quickstart"\n[dependencies]\n'
+                'coordinode-embed="0.9"\ntempfile="3"\n')
+            check_packages.check_quickstart_requirements(root, {'coordinode-embed'}, '0.9.3')
+            with self.assertRaisesRegex(ValueError, 'does not admit 0.10.0'):
+                check_packages.check_quickstart_requirements(root, {'coordinode-embed'}, '0.10.0')
+
+
 class CheckerStartupTest(unittest.TestCase):
     def test_registry_checker_does_not_require_the_preparation_environment(self):
         # Upload verification runs after the disposable preparation environment
@@ -104,6 +128,10 @@ class FreshResolutionTest(unittest.TestCase):
             (root / 'Cargo.lock').write_text('# Qualified source lock\n')
             (root / 'scripts/release').mkdir(parents=True)
             (root / 'scripts/release/consumer.rs').write_text('fn main() {}\n')
+            (root / check_packages.QUICKSTART / 'src').mkdir(parents=True)
+            (root / check_packages.QUICKSTART / 'Cargo.toml').write_text(
+                '[package]\nname="quickstart"\n[dependencies]\ncoordinode-embed="1.0"\n')
+            (root / check_packages.QUICKSTART / 'src/main.rs').write_text('fn main() {}\n')
             archive = root / 'target/package/coordinode-embed-1.0.0.crate'
             files = {name: b'fixture' for name in
                      ('src/lib.rs', 'LICENSE', 'NOTICES', 'COPYRIGHT', 'README.md')}

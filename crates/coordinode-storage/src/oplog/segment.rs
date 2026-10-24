@@ -522,6 +522,10 @@ pub struct SegmentWriter {
     /// Handed out by [`Self::flush_to_os`]; the file is duplicated once per
     /// segment, not once per batch.
     sync_handle: Option<SyncHandle>,
+    /// What the segment is charged on its endpoint's owned footprint, when
+    /// the endpoint has a hard limit: each frame, and the footer the seal
+    /// writes, is charged before it is written.
+    charge: Option<std::sync::Arc<crate::engine::footprint::FileCharge>>,
 }
 
 /// Create `path`, which must not exist, for writing under `sync`.
@@ -643,7 +647,17 @@ impl SegmentWriter {
             reader: None,
             sync,
             sync_handle: None,
+            charge: None,
         })
+    }
+
+    /// Charge this segment's growth to `charge` from here on.
+    pub(crate) fn with_charge(
+        mut self,
+        charge: std::sync::Arc<crate::engine::footprint::FileCharge>,
+    ) -> Self {
+        self.charge = Some(charge);
+        self
     }
 
     /// Create the segment at `path`, replacing a leftover from an interrupted
@@ -870,13 +884,19 @@ impl SegmentWriter {
         let mut varint_buf = Vec::with_capacity(10);
         encode_varint(payload.len() as u64, &mut varint_buf);
 
+        let frame_bytes = (varint_buf.len() + payload.len() + 4) as u64;
+        if let Some(charge) = &self.charge {
+            // The frame and the footer the seal adds after it, before either
+            // is written: a refused append leaves the segment as it was, and
+            // a seal never needs room it was not given.
+            charge.charge_appending(HEADER_SIZE + self.total_bytes + frame_bytes + FOOTER_SIZE)?;
+        }
         self.file.write_all(&varint_buf).map_err(io_err)?;
         self.file.write_all(&payload).map_err(io_err)?;
         self.file
             .write_all(&checksum.to_le_bytes())
             .map_err(io_err)?;
 
-        let frame_bytes = (varint_buf.len() + payload.len() + 4) as u64;
         self.frames
             .push((entry.index, HEADER_SIZE + self.total_bytes));
         self.total_bytes += frame_bytes;
@@ -990,7 +1010,19 @@ impl SegmentWriter {
         // Step 2: make the written bytes durable under the configured method.
         sync_file(self.file.get_ref(), self.sync)
             .map_err(|e| StorageError::Io(format!("sync segment: {e}")))?;
+        self.settle_charge();
         Ok(())
+    }
+
+    /// Bring the segment's charge to what the file system allocated to it:
+    /// the allowance charged ahead of the appends is given back, an
+    /// allocation past it kept.
+    fn settle_charge(&self) {
+        if let Some(charge) = &self.charge {
+            if let Some(allocated) = crate::engine::footprint::allocated_at(&self.path) {
+                charge.settle(allocated);
+            }
+        }
     }
 
     /// Hand everything appended so far to the kernel and return the handle
@@ -1004,6 +1036,12 @@ impl SegmentWriter {
         self.file
             .flush()
             .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
+        // What the kernel allocated past the allowance is counted at once.
+        if let Some(charge) = &self.charge {
+            if let Some(allocated) = crate::engine::footprint::allocated_at(&self.path) {
+                charge.observe(allocated);
+            }
+        }
         if let Some(handle) = &self.sync_handle {
             return Ok(handle.clone());
         }
@@ -1038,6 +1076,7 @@ impl SegmentWriter {
         // the active-writer reference and add the path to sealed[].
         sync_file(self.file.get_ref(), self.sync)
             .map_err(|e| StorageError::Io(format!("sync on seal: {e}")))?;
+        self.settle_charge();
         Ok(self.path)
     }
 }

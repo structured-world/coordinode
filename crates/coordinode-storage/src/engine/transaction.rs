@@ -2260,6 +2260,7 @@ impl<'a> Transaction<'a> {
                     ctx.write_concern.journal,
                 )?;
             } else {
+                let _admitted = self.engine.admit_write(&mutations)?;
                 self.engine
                     .apply_proposal_at(&mutations, commit_ts.as_raw())?;
             }
