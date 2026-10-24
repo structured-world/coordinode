@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import tomllib
 import urllib.error
@@ -39,6 +40,17 @@ def check_versions(report, read, *, allow_missing):
             raise ValueError(f"{name}: registry version does not match the qualified archive")
 
 
+def merged_release_revision(pull):
+    """Resolve a retry from the forge's approved merge, never a moving PR head."""
+    if (pull['merged_at'] is None or pull['base']['ref'] != 'main'
+            or not pull['head']['ref'].startswith('release-plz-')):
+        raise ValueError('retry requires a merged release PR targeting main')
+    revision = pull['merge_commit_sha']
+    if not isinstance(revision, str) or re.fullmatch(r'[0-9a-f]{40}', revision) is None:
+        raise ValueError('release PR has no valid merge commit identifier')
+    return revision
+
+
 def publication_revision(root, source, release_head):
     """Match release-plz's commit selection before creating qualified archives.
 
@@ -69,15 +81,29 @@ def publication_revision(root, source, release_head):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("eligible", "preflight", "verify"))
+    parser.add_argument("mode", choices=("source", "eligible", "preflight", "verify"))
     parser.add_argument("--checkout", type=pathlib.Path, required=True)
+    parser.add_argument("--release-pr", type=int, help="merged release PR to retry")
     args = parser.parse_args()
+    if args.release_pr is not None and (args.mode != 'source' or args.release_pr <= 0):
+        parser.error('--release-pr requires source mode and a positive PR number')
     root = args.checkout.resolve()
     if os.environ.get("GITHUB_REPOSITORY") != "structured-world/coordinode":
         raise ValueError("release requires the authoritative repository")
     if os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("release requires the main branch")
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    if args.mode == 'source':
+        if args.release_pr is not None:
+            pull = json.loads(subprocess.check_output([
+                'gh', 'api', f'repos/structured-world/coordinode/pulls/{args.release_pr}'], text=True))
+            source = merged_release_revision(pull)
+        subprocess.run(['git', 'merge-base', '--is-ancestor', source, 'origin/main'],
+                       cwd=root, check=True)
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+            output.write(f'commit={source}\n')
+        print(f'Selected source commit: {source}')
+        return
     if args.mode == "eligible":
         # This is release-plz's documented release_always=false contract. Check
         # it before expensive preparation or checking an old server-only tag.

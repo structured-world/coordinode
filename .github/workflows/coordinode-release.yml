@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_pr:
+        description: Merged release PR to retry (empty selects the current main commit)
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -23,6 +28,24 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Select the approved release source
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PR: ${{ inputs.release_pr }}
+        run: |
+          release_args=(source --checkout "$GITHUB_WORKSPACE")
+          if [[ -n "$RELEASE_PR" ]]; then
+            release_args+=(--release-pr "$RELEASE_PR")
+          fi
+          python3 -B scripts/release/registry.py "${release_args[@]}"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        if: steps.source.outputs.commit != github.sha
+        with:
+          ref: ${{ steps.source.outputs.commit }}
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
@@ -73,10 +96,16 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: read
+      # Authenticate even when reconciliation finds every version already uploaded.
+      - name: Obtain the publication credential through OIDC
+        if: steps.eligible.outputs.publish == 'true'
+        id: crates
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
       - name: Publish through OIDC
         if: steps.eligible.outputs.publish == 'true'
         env:
           GIT_TOKEN: ${{ steps.app.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates.outputs.token }}
         run: release-plz release --forge github --config .release-plz.toml --allow-dirty --no-verify
       - name: Verify every published checksum and a real registry consumer
         if: steps.eligible.outputs.publish == 'true'

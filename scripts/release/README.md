@@ -7,7 +7,9 @@ version. The remaining workspace packages are not registry libraries.
 The `Embedded registry packages` workflow tests the actual archives before a PR
 lands. `Release PLZ` runs on a push to main and publishes only a merged release
 PR after successful source CI on that exact commit. A manual retry on main
-requires the same source-CI evidence. Release-PR preparation runs separately on
+can select the merged release PR; the workflow resolves its immutable merge
+commit, verifies that it belongs to main, and requires the same source-CI
+evidence. Release-PR preparation runs separately on
 clean main. Publication does not use `workflow_run`, which crates.io rejects for
 Trusted Publishing.
 
@@ -48,18 +50,35 @@ separate gates; stripping source-only tests from an archive does not replace the
 
 ## Publication credentials and recovery
 
-The workflow uses only release-plz's native OIDC flow with `id-token: write`.
+The workflow obtains a temporary credential through the official
+`rust-lang/crates-io-auth-action` with `id-token: write` and passes it to
+release-plz. The action revokes it when the job finishes, including on failure.
+Authentication runs even when all versions were already uploaded by an earlier
+attempt; reconciliation cannot silently skip checking the OIDC binding.
 Provision the `crates-io` GitHub environment for main before publishing. Register
 each crate's Trusted Publisher in crates.io for `structured-world/coordinode`,
 workflow `coordinode-release.yml`, environment `crates-io`. CI consumes these
 bindings; it never creates or changes them and has no bootstrap token path.
 
-A previously unpublished crate requires an initial manual upload with a temporary
-crate-scoped credential before its publisher can be registered. Use the exact
-qualified version and prepared archive from the failed publication, verify the
-registry checksum, register its publisher in the browser, then retry the failed
-publication job. Revoke the temporary credential after setup. Do not rerun the
-source suite solely to retry registry authentication.
+A previously unpublished crate requires an initial owner upload before its
+publisher can be registered. Use an existing managed Cargo credential or a
+short-lived crate-scoped token, outside CI. Use the exact qualified version and
+prepared archive from the failed publication, verify the registry checksum,
+and register its publisher in the browser. Revoke any temporary credential
+created for setup. Observe crates.io's publishing limits and `Retry-After`.
+
+To retry publication after main has advanced, dispatch `coordinode-release.yml`
+on main with `release_pr` set to the original merged release PR number. This
+uses the current publishing workflow with that approved source revision:
+
+```sh
+gh workflow run coordinode-release.yml --repo structured-world/coordinode \
+  --ref main -f release_pr=PR_NUMBER
+```
+
+The workflow derives the commit from GitHub rather than accepting a branch or
+an arbitrary SHA. It checks the existing source-suite result; do not rerun that
+suite solely to retry registry authentication.
 
 GitHub App authentication is separate: the standalone CLI reads `GIT_TOKEN`.
 Git tags, GitHub releases and subsequent registry versions are created only by

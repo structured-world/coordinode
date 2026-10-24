@@ -9,6 +9,36 @@ import registry
 from registry import check_versions
 
 
+class ReleaseRetryTest(unittest.TestCase):
+    def setUp(self):
+        self.pull = {
+            'merged_at': '2026-01-01T00:00:00Z',
+            'base': {'ref': 'main'},
+            'head': {'ref': 'release-plz-test'},
+            'merge_commit_sha': 'a1' * 20,
+        }
+
+    def test_retry_selects_the_recorded_merge_commit(self):
+        # A retry must retain the approved release instead of moving with main.
+        self.assertEqual(registry.merged_release_revision(self.pull),
+                         self.pull['merge_commit_sha'])
+
+    def test_retry_refuses_unmerged_or_unrelated_pull_requests(self):
+        # Dispatch cannot turn an ordinary or unapproved PR into a release.
+        variants = [dict(self.pull, merged_at=None),
+                    dict(self.pull, base={'ref': 'development'}),
+                    dict(self.pull, head={'ref': 'feature/test'})]
+        for pull in variants:
+            with self.subTest(pull=pull), self.assertRaisesRegex(ValueError, 'merged release PR'):
+                registry.merged_release_revision(pull)
+
+    def test_retry_refuses_a_moving_ref_in_place_of_the_merge_commit(self):
+        # Only the forge's immutable commit identifier can reach checkout.
+        self.pull['merge_commit_sha'] = 'refs/heads/main'
+        with self.assertRaisesRegex(ValueError, 'commit identifier'):
+            registry.merged_release_revision(self.pull)
+
+
 class PublicationRevisionTest(unittest.TestCase):
     """Qualify the commit release-plz packages, not an ancestor with another tree."""
 
