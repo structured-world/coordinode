@@ -2,6 +2,17 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.9.0 - 2026-10-24
+
+### Fixed
+
+- *(raft)* separate entropy from tls selection
+- *(tls)* [**breaking**] require explicit host selection
+
+### Refactored
+
+- *(crypto)* [**breaking**] share RustCrypto provider
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
