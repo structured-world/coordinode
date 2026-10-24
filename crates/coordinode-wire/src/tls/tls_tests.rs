@@ -60,7 +60,10 @@ fn load_private_key_missing_is_error() {
 #[test]
 fn reading_an_unselected_provider_does_not_install_one() {
     assert!(CryptoProvider::get_default().is_none());
-    assert!(selected_provider().is_err());
+    assert!(matches!(
+        selected_provider(),
+        Err(TlsError::ProviderNotSelected)
+    ));
     assert!(CryptoProvider::get_default().is_none());
     install_crypto_provider(rustcrypto_provider()).expect("explicit selection");
     selected_provider().expect("selected provider");
@@ -73,7 +76,10 @@ fn an_unselected_client_verifier_does_not_install_a_provider() {
     let (cert_pem, _) = issue(&ca, "localhost");
     let roots = load_certs(cert_pem.as_bytes()).expect("trust anchor");
     assert!(CryptoProvider::get_default().is_none());
-    assert!(client_verifier(roots.clone(), true).is_err());
+    assert!(matches!(
+        client_verifier(roots.clone(), true),
+        Err(TlsError::ProviderNotSelected)
+    ));
     assert!(CryptoProvider::get_default().is_none());
     install_crypto_provider(rustcrypto_provider()).expect("explicit selection");
     client_verifier(roots, true).expect("configured verifier");

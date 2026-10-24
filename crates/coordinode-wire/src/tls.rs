@@ -41,6 +41,15 @@ pub enum TlsError {
     /// A different provider was already installed or selected for this process.
     #[error("a different TLS crypto provider is already selected for this process")]
     ProviderConflict,
+    /// The host has not explicitly selected a TLS backend.
+    #[error("the host must select a TLS crypto provider before building TLS configuration")]
+    ProviderNotSelected,
+    /// A configured client trust anchor is invalid.
+    #[error("invalid client trust anchor: {0}")]
+    TrustAnchor(#[source] rustls::Error),
+    /// The configured client certificate verifier cannot be built.
+    #[error("invalid client certificate verifier: {0}")]
+    Verifier(#[source] rustls::server::VerifierBuilderError),
     /// The private key does not satisfy the local identity policy.
     #[error("unsupported local TLS identity: {0}")]
     Identity(rustls::Error),
@@ -48,8 +57,8 @@ pub enum TlsError {
 
 /// The pure-Rust crypto provider: RustCrypto algorithms, zero C FFI.
 ///
-/// What the stock server selects, and the fallback whenever nothing was
-/// selected.
+/// The stock server selects this explicitly during startup. Constructing it
+/// does not install a process default.
 #[must_use]
 pub fn rustcrypto_provider() -> Arc<CryptoProvider> {
     Arc::new(coordinode_crypto::provider())
@@ -98,13 +107,18 @@ pub fn install_crypto_provider(provider: Arc<CryptoProvider>) -> Result<(), TlsE
     Ok(())
 }
 
-/// The selected provider, falling back to the pure-Rust one when startup
-/// selected nothing (an embedding host or a test building a context
-/// directly, say).
+/// Read the host's explicit selection without choosing or installing a backend.
+///
 /// # Errors
-/// Returns [`TlsError::ProviderConflict`] if another component installed a default first.
+/// Returns [`TlsError::ProviderNotSelected`] before host selection, or
+/// [`TlsError::ProviderConflict`] if an independent component installed a default.
 pub fn selected_provider() -> Result<Arc<CryptoProvider>, TlsError> {
-    let selected = SELECTED.get_or_try_init(|| install(rustcrypto_provider()))?;
+    let Some(selected) = SELECTED.get() else {
+        if CryptoProvider::get_default().is_some() {
+            return Err(TlsError::ProviderConflict);
+        }
+        return Err(TlsError::ProviderNotSelected);
+    };
     Ok(Arc::clone(&selected.effective))
 }
 
@@ -143,25 +157,27 @@ pub fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> 
 ///
 /// # Errors
 ///
-/// A root is not a usable trust anchor, or none is given.
+/// The host has not selected a provider, a trust anchor is invalid, or the
+/// configured verifier cannot be built.
 pub fn client_verifier(
     roots: Vec<CertificateDer<'static>>,
     mandatory: bool,
-) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, String> {
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, TlsError> {
+    let provider = selected_provider()?;
     let mut store = rustls::RootCertStore::empty();
     for root in roots {
-        store.add(root).map_err(|e| e.to_string())?;
+        store.add(root).map_err(TlsError::TrustAnchor)?;
     }
     let builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(store),
-        selected_provider().map_err(|e| e.to_string())?,
+        provider,
     );
     let builder = if mandatory {
         builder
     } else {
         builder.allow_unauthenticated()
     };
-    builder.build().map_err(|e| e.to_string())
+    builder.build().map_err(TlsError::Verifier)
 }
 
 #[cfg(test)]

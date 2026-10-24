@@ -133,6 +133,7 @@ async fn plain_text_is_a_client_where_allowed_and_refused_elsewhere() {
 /// identity, so no inter-node service admits it.
 #[tokio::test]
 async fn an_ordinary_client_certificate_is_never_a_node() {
+    crate::tls::install_crypto_provider(provider()).expect("test host provider");
     let ca = ca();
     let a = node(&ca, "spiffe://td.test/a");
     let clients = crate::tls::client_verifier(vec![ca.der.clone()], true).expect("verifier");
@@ -201,6 +202,7 @@ async fn shared_port_takes(
 /// A port shared with clients that trusts `client_ca` for client
 /// certificates, held by node `spiffe://td.test/a`.
 async fn shared_port_trusting(node_ca: &Ca, client_ca: &Ca) -> (Incoming, String) {
+    crate::tls::install_crypto_provider(provider()).expect("test host provider");
     let a = node(node_ca, "spiffe://td.test/a");
     let clients = crate::tls::client_verifier(vec![client_ca.der.clone()], true).expect("verifier");
     let (listener, addr) = bind().await;
