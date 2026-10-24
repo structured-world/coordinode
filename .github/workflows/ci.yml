@@ -407,6 +407,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TARGET_DIR: target/crypto-provider
+      RUSTUP_TOOLCHAIN: 1.92.0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92.0
