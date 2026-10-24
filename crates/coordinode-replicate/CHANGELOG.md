@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.9.0 - 2026-10-24
+
+### Testing
+
+- *(replicate)* sync a watch test on delivered notices
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
