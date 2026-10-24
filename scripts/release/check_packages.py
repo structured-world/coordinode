@@ -15,6 +15,13 @@ import tempfile
 import tomllib
 
 from dependency_policy import check_native_stack_helpers
+from supply_chain import write_evidence
+
+
+def host_triple(prefix, cwd, env):
+    """The target triple the toolchain builds for by default."""
+    info = subprocess.check_output([*prefix, "rustc", "-vV"], cwd=cwd, env=env, text=True)
+    return next(line.split(": ", 1)[1] for line in info.splitlines() if line.startswith("host: "))
 
 
 def inspect_archive(archive, name, version, names, bindings):
@@ -114,7 +121,8 @@ def consumer_manifest(version):
         '[package]\nname="coordinode-registry-consumer"\nversion="0.0.0"\nedition="2024"\n'
         '[features]\nreplication=["coordinode-embed/replication"]\n'
         '[dependencies]\n'
-        f'coordinode-embed="={version}"\ncoordinode-core="={version}"\n')
+        f'coordinode-embed="={version}"\ncoordinode-core="={version}"\n'
+        f'coordinode-storage="={version}"\n')
 
 
 def mirror_fresh_dependencies(root, names, version, registry, toolchains):
@@ -214,12 +222,26 @@ def main():
                 cwd=consumer, env=env, text=True)
             (root / f"target/{args.source}-consumer-metadata.json").write_text(graph)
             check_native_stack_helpers(json.loads(graph)['packages'])
+            host = host_triple(prefix, consumer, env)
+            evidence = {}
             for feature in (None, "replication"):
-                data = consumer / f"run-{index}-{feature or 'standalone'}"
+                features = ["--features", feature] if feature else []
+                name = feature or "standalone"
+                # The graph this feature set builds for this target, with the
+                # lock it resolved: the license and SBOM evidence describe it.
+                graph = json.loads(subprocess.check_output(
+                    [*prefix, "cargo", "metadata", *network, *features,
+                     "--filter-platform", host, "--format-version=1"],
+                    cwd=consumer, env=env, text=True))
+                stem = f"{args.source}-{toolchain or 'current'}-{name}"
+                written = write_evidence(
+                    root / "target", stem, graph, (consumer / "Cargo.lock").read_text(),
+                    {"source": args.source, "version": version,
+                     "toolchain": toolchain or "current", "features": name, "target": host})
+                evidence[name] = len(written["packages"])
+                data = consumer / f"run-{index}-{name}"
                 data.mkdir()
-                command = [*prefix, "cargo", "run", *network]
-                if feature:
-                    command.extend(["--features", feature])
+                command = [*prefix, "cargo", "run", *network, *features]
                 subprocess.run([*command, "--", str(data)], cwd=consumer, env=env, check=True)
             quickstart = consumer / f"quickstart-{index}"
             quickstart.mkdir()
@@ -228,9 +250,10 @@ def main():
                 (quickstart / ".cargo/config.toml").write_text(
                     (consumer / ".cargo/config.toml").read_text())
             run_quickstart(root, network, prefix, env, quickstart)
-            qualified.append({"toolchain": toolchain or "current",
+            qualified.append({"toolchain": toolchain or "current", "target": host,
                               "standalone": "passed", "replication_build": "passed",
-                              "quickstart_example": "passed"})
+                              "quickstart_example": "passed",
+                              "license_inventory_packages": evidence})
     report[f"{args.source}_consumer"] = qualified
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"{args.source} external consumer passed; consumer build/data cleaned")

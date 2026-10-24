@@ -115,6 +115,16 @@ jobs:
           python3 -B scripts/release/registry.py verify --checkout "$GITHUB_WORKSPACE"
           python3 -B scripts/release/check_packages.py --checkout "$GITHUB_WORKSPACE" \
             --source crates-io --consumer-toolchain 1.92.0 --consumer-toolchain 1.99.0
+      # The SBOM and license inventory of the graph a consumer installs from
+      # crates.io, per toolchain, feature set and target, ship with the release.
+      - name: Attach dependency and license evidence to the release
+        if: steps.eligible.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          version="$(python3 -c 'import json; print(json.load(open("target/registry-preparation.json"))["version"])')"
+          gh release upload "v${version}" --repo structured-world/coordinode --clobber \
+            target/crates-io-*-licenses.json target/crates-io-*-sbom.cdx.json
       - name: Keep publication evidence
         if: always() && steps.eligible.outputs.publish == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -125,6 +135,8 @@ jobs:
             target/fresh-dependency-metadata.json
             target/prepared-consumer-metadata.json
             target/crates-io-consumer-metadata.json
+            target/*-licenses.json
+            target/*-sbom.cdx.json
             target/package/*.crate
           if-no-files-found: ignore
       - name: Clean build outputs

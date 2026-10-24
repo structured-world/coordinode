@@ -33,11 +33,15 @@ coordinode-storage = "0.9"
   [Build features](#build-features)). `replication` adds membership in a
   replicated group; `io-uring` adds the io_uring storage backend on Linux.
 - **What the registry checks run.** A registry release passes when the
-  [quickstart example](#quickstart) and a broader consumer (crash recovery,
-  operation identity) build from the published packages and run standalone,
-  and the same consumer compiles with `replication`. Compiling with a feature
-  is not the same as running it: run your own scenario with the features you
-  enable on the build you ship.
+  [quickstart example](#quickstart) and a broader consumer build from the
+  published packages and run standalone, and the same consumer compiles with
+  `replication`. The broader consumer covers unique identity under concurrent
+  writers, revision and lease-epoch fencing, an atomic audit and outbox,
+  rollback and reopen, an increment retried after a process exit and across a
+  checkpoint and repair, a logical restore into a new domain, and the hard
+  limit. A process exit is not a power loss. Compiling with a feature is not
+  the same as running it: run your own scenario with the features you enable
+  on the build you ship.
 
 Other artifacts are separate: the Python package `coordinode-embedded`
 (`pip install coordinode-embedded`) embeds the same engine for Python, and
@@ -54,7 +58,9 @@ your dependency graph actually selects: another dependency can unify features
 the engine itself does not request.
 
 The CE license is AGPL-3.0-only. See the repository's `LICENSE`, `COPYRIGHT`
-and `NOTICES`; dependency licenses remain their own.
+and `NOTICES`; dependency licenses remain their own. Releases after 0.9.0
+attach to their GitHub release a license inventory and a CycloneDX SBOM of
+the graph the registry check installed, per toolchain, feature set and target.
 
 ## Quickstart
 

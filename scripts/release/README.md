@@ -33,9 +33,23 @@ disk-backed Rust consumer. Cargo's local registry contains the unpublished
 archives and their registry dependencies; there are no path patches. Both the
 minimum toolchain and the source toolchain exercise the default and replication
 feature configurations. The fixture checks transactions, schema publication,
-uniqueness, CAS, rollback, reopen and reconciliation after a process exits without
-closing the database. The replication-enabled fixture is not a multi-member
-failure qualification, and process exit is not a power-loss simulation.
+uniqueness under concurrent writers, CAS and lease-epoch fencing, rollback,
+reopen, a non-idempotent increment retried after a process exits without closing
+the database and again across a checkpoint and repair, a logical backup restored
+into a new domain (which refuses earlier operation descriptors), and the
+owned-footprint limit (typed refusal, reads, a raised limit, reopen). The
+replication-enabled fixture is not a multi-member failure qualification, and
+process exit is not a power-loss simulation.
+
+For each toolchain and feature set the checker records the graph Cargo resolved
+for the host target and its lock: `target/<source>-<toolchain>-<features>-licenses.json`
+lists every package the consumer builds (normal and build edges, never dev) with
+its license expression, registry checksum and the license or notice files it
+ships, and refuses a package without a license declaration;
+`…-sbom.cdx.json` is the same graph as a CycloneDX 1.5 SBOM. The release job
+attaches the crates.io evidence to the GitHub release of that version. A package
+that ships no license file is listed with none: its attribution comes from its
+declared license.
 
 Before compiling a consumer, the checker resolves fresh allowed dependencies
 for each toolchain. Unpacked archives are path-patched only for this discovery,

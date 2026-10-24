@@ -25,6 +25,8 @@ jobs:
             target/registry-preparation.json
             target/fresh-dependency-metadata.json
             target/prepared-consumer-metadata.json
+            target/*-licenses.json
+            target/*-sbom.cdx.json
           if-no-files-found: ignore
       - name: Clean the build output
         if: always()
