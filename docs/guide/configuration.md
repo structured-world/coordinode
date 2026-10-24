@@ -763,7 +763,7 @@ Each endpoint has these keys:
 | `durability` | yes | `durable` `degraded` `volatile` | `durable` = hardware-redundant (RAID); `degraded` = single drive; `volatile` = lost on restart. Drives the per-block ECC `auto` rule and cluster redundancy invariants. |
 | `tier` | yes | `memory` `hot_cache` `hot` `warm` `cold` | Placement preference (fastest first). Hot LSM levels prefer hotter tiers. |
 | `capacity_bytes` | no | integer | Physical capacity. `0` or omitted = untracked. |
-| `hard_limit_bytes` | no | integer | Ceiling on the space every file of the database under `path` takes on disk, as the file system allocates it (see [Hard limit](#hard-limit-total-database-footprint)). `0` or omitted = no limit. Must be `<= capacity_bytes` when both are set. |
+| `hard_limit_bytes` | no | integer | Ceiling on the space every file of the database under `path` takes on disk, as the file system allocates it (see [Hard limit](#hard-limit-total-database-footprint)). `0` or omitted = no limit; otherwise at least 8 MiB (8388608). Must be `<= capacity_bytes` when both are set. |
 | `recovery_reserve_bytes` | no | integer | The part of `hard_limit_bytes` client writes leave for flushes, space-reclaiming compactions and the store's own records; inside the limit, not added to it. Omitted = a sixteenth of the limit. Needs `hard_limit_bytes`, and must not exceed it. |
 | `page_ecc` | no | `auto` `force_on` `force_off` | Per-block Reed-Solomon ECC policy. `auto` (default) turns ECC **on** for `degraded` endpoints and **off** for `durable` / `volatile`. See the note below. |
 | `hard_limit_strategy` | no | `reject` `cascade_evict` | What to do when client writes reach `hard_limit_bytes`. `reject` (default) refuses them; `cascade_evict` also has the capacity refresh demote data to a cooler endpoint, after which refused writes are admitted again. |
@@ -804,6 +804,19 @@ compactions and repairs, local checkpoints, and a cache layer placed under the
 path. The space counted is what the file system allocates (whole blocks, and
 what it allocates past a file's length while the file grows), not file
 lengths: what `du` reports for the directory, never more than the limit.
+A file growing is charged its allocation ahead of the writer (as much as it
+holds, at least 64 KiB and at most 4 MiB) until it is synced or closed, then
+what the file system actually allocated.
+
+The smallest limit accepted is 8 MiB; a smaller one fails the start
+(`HardLimitBelowMinimum`) and `Database::set_hard_limit` refuses it. An empty
+store takes about 160 KiB, but the engine's own bounded structures need the
+rest at their worst: the journal segment being written (at least 1 MiB,
+charged twice that while it grows), the sealed segment kept until its tables
+are flushed, the flush of the memtable it covers, the room a store may grow
+while it opens (1 MiB) and the recovery reserve. Size a production limit from
+the data you keep plus that baseline and room for its transactions and
+compactions, not from the minimum.
 
 Room is reserved before anything grows, under one account per endpoint:
 

@@ -194,9 +194,33 @@ fn empty_endpoint_id_rejected() {
 #[should_panic(expected = "hard_limit_bytes")]
 fn hard_limit_above_capacity_rejected() {
     let ep = EndpointConfig::new("ep-x", "/a", Media::Hdd, Durability::Durable, Tier::Warm)
-        .with_capacity_bytes(1_000)
-        .with_hard_limit_bytes(2_000);
+        .with_capacity_bytes(MIN_HARD_LIMIT_BYTES)
+        .with_hard_limit_bytes(2 * MIN_HARD_LIMIT_BYTES);
     let _ = StorageConfig::with_endpoints(vec![ep]);
+}
+
+/// A hard limit too small for the engine's own bounded structures (an empty
+/// store, the journal segment being written and the one awaiting removal, a
+/// flush, the recovery reserve) is refused by name at configuration rather
+/// than accepted and then refusing every write. The minimum itself is valid.
+#[test]
+fn a_hard_limit_below_the_minimum_is_refused() {
+    let endpoint = |limit| {
+        EndpointConfig::new("ep-x", "/a", Media::Hdd, Durability::Durable, Tier::Warm)
+            .with_hard_limit_bytes(limit)
+    };
+    let refused = StorageConfig::try_with_endpoints(vec![endpoint(MIN_HARD_LIMIT_BYTES - 1)]);
+    assert!(
+        matches!(
+            &refused,
+            Err(EndpointConfigError::HardLimitBelowMinimum { id, hard_limit, minimum })
+                if id == "ep-x"
+                    && *hard_limit == MIN_HARD_LIMIT_BYTES - 1
+                    && *minimum == MIN_HARD_LIMIT_BYTES
+        ),
+        "expected the minimum to be enforced, got {refused:?}"
+    );
+    assert!(StorageConfig::try_with_endpoints(vec![endpoint(MIN_HARD_LIMIT_BYTES)]).is_ok());
 }
 
 #[test]
@@ -211,7 +235,7 @@ fn hard_limit_only_capacity_zero_accepted() {
     // capacity untracked + explicit hard_limit = valid (operator hasn't
     // declared physical capacity but wants a soft cap).
     let ep = EndpointConfig::new("ep-x", "/a", Media::Hdd, Durability::Durable, Tier::Warm)
-        .with_hard_limit_bytes(500);
+        .with_hard_limit_bytes(MIN_HARD_LIMIT_BYTES);
     let _ = StorageConfig::with_endpoints(vec![ep]);
 }
 

@@ -1559,8 +1559,9 @@ impl StorageEngine {
     /// # Errors
     ///
     /// [`StorageError::InvalidConfig`] for an unknown endpoint, a limit of
-    /// `0`, or an endpoint opened without a hard limit: the files it writes
-    /// are not charged, so a limit there takes a restart with it configured.
+    /// `0` or below [`crate::engine::config::MIN_HARD_LIMIT_BYTES`], or an
+    /// endpoint opened without a hard limit: the files it writes are not
+    /// charged, so a limit there takes a restart with it configured.
     pub fn set_hard_limit(
         &self,
         endpoint_id: &str,
@@ -1571,6 +1572,12 @@ impl StorageEngine {
             return Err(StorageError::InvalidConfig(
                 "a hard limit of 0 removes the limit, which takes a restart".into(),
             ));
+        }
+        if limit < crate::engine::config::MIN_HARD_LIMIT_BYTES {
+            return Err(StorageError::InvalidConfig(format!(
+                "a hard limit of {limit} bytes is below the supported minimum of {} bytes",
+                crate::engine::config::MIN_HARD_LIMIT_BYTES
+            )));
         }
         let footprint = self.footprints.get(endpoint_id).ok_or_else(|| {
             StorageError::InvalidConfig(format!(

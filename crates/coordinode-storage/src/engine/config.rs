@@ -248,6 +248,18 @@ impl PageEccPolicy {
 /// fraction of its hard limit.
 pub const DEFAULT_RECOVERY_RESERVE_DIVISOR: u64 = 16;
 
+/// The smallest hard limit an endpoint is configured with: 8 MiB. Below it
+/// the engine's own bounded structures do not fit beside any data at their
+/// worst: the journal segment being written (at least 1 MiB, charged twice
+/// that while the file system may allocate ahead of it), the sealed one
+/// awaiting removal until its tables are flushed (1 MiB), the flush of the
+/// memtable it covers (its data, an eighth more and 128 KiB, charged ahead
+/// the same way), the room a store may grow while it opens (1 MiB) and the
+/// recovery reserve (a sixteenth of the limit). An empty store takes about
+/// 160 KiB. A limit the operator lowers below what the store already holds
+/// stays valid down to this minimum and is pending, not refused.
+pub const MIN_HARD_LIMIT_BYTES: u64 = 8 << 20;
+
 /// Per-endpoint strategy when a write would push `used_bytes` past the
 /// configured `hard_limit_bytes`.
 ///
@@ -1021,6 +1033,13 @@ impl StorageConfig {
                     capacity: ep.capacity_bytes,
                 });
             }
+            if ep.hard_limit_bytes > 0 && ep.hard_limit_bytes < MIN_HARD_LIMIT_BYTES {
+                return Err(EndpointConfigError::HardLimitBelowMinimum {
+                    id: ep.id.clone(),
+                    hard_limit: ep.hard_limit_bytes,
+                    minimum: MIN_HARD_LIMIT_BYTES,
+                });
+            }
             if let Some(reserve) = ep.recovery_reserve_bytes {
                 if ep.hard_limit_bytes == 0 || reserve > ep.hard_limit_bytes {
                     return Err(EndpointConfigError::ReserveOutsideLimit {
@@ -1216,6 +1235,21 @@ pub enum EndpointConfigError {
         hard_limit: u64,
         /// Its `capacity_bytes`.
         capacity: u64,
+    },
+    /// An endpoint's hard limit is below [`MIN_HARD_LIMIT_BYTES`]: too small
+    /// for what the engine itself holds at its worst, so the store would
+    /// refuse writes it could never make room for.
+    #[error(
+        "EndpointConfig.hard_limit_bytes ({hard_limit}) on {id:?} is below the supported \
+         minimum of {minimum} bytes"
+    )]
+    HardLimitBelowMinimum {
+        /// Id of the endpoint.
+        id: String,
+        /// Its `hard_limit_bytes`.
+        hard_limit: u64,
+        /// The supported minimum.
+        minimum: u64,
     },
     /// An endpoint's recovery reserve lies outside its hard limit: the
     /// reserve is a part of the limit, so it needs one at least as large.

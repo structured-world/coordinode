@@ -730,8 +730,8 @@ fn hard_limit_and_recovery_reserve_parse_and_validate() {
 
     for endpoint in [
         "\x20     recovery_reserve_bytes: 1024\n",
-        "\x20     hard_limit_bytes: 4096\n\
-         \x20     recovery_reserve_bytes: 8192\n",
+        "\x20     hard_limit_bytes: 8388608\n\
+         \x20     recovery_reserve_bytes: 16777216\n",
     ] {
         assert!(
             matches!(
@@ -741,6 +741,13 @@ fn hard_limit_and_recovery_reserve_parse_and_validate() {
             "{endpoint}"
         );
     }
+
+    // A limit too small for the engine's own structures is refused by name.
+    assert!(matches!(
+        load("\x20     hard_limit_bytes: 4096\n"),
+        Err(EndpointConfigError::HardLimitBelowMinimum { minimum, .. })
+            if minimum == coordinode_storage::engine::config::MIN_HARD_LIMIT_BYTES
+    ));
 }
 
 #[test]

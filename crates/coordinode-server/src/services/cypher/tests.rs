@@ -3074,7 +3074,7 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
     // via `from_engine`. Going through `Database::open` directly
     // would lock us to `hard_limit_bytes = 0` (its default
     // single-endpoint config).
-    const LIMIT: u64 = 2 * 1024 * 1024;
+    const LIMIT: u64 = coordinode_storage::engine::config::MIN_HARD_LIMIT_BYTES;
     let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
     let storage_config = StorageConfig::with_endpoints(vec![
         EndpointConfig::new("ep", dir.path(), Media::Hdd, Dur::Durable, Tier::Warm)
@@ -3092,7 +3092,17 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
         let from = next;
         loop {
             let key = format!("node:0:{next:010}");
-            match engine.put(Partition::Node, key.as_bytes(), &[next as u8; 64]) {
+            // Distinct bytes per row, so no codec shrinks the fill.
+            let mut state = u64::from(next).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let value: Vec<u8> = (0..32)
+                .flat_map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()
+                })
+                .collect();
+            match engine.put(Partition::Node, key.as_bytes(), &value) {
                 Ok(()) => next += 1,
                 Err(coordinode_storage::error::StorageError::CapacityExhausted { .. }) => break,
                 Err(other) => panic!("unexpected refusal: {other:?}"),

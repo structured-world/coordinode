@@ -224,10 +224,15 @@ in `tokio::task::spawn_blocking`, not on a runtime worker.
 - **Open transactions.** A transaction that was not committed when its
   database was dropped is gone: nothing it wrote was durable, so nothing is
   undone.
-- **Acknowledged writes.** Under the default write concern, a write is
-  acknowledged once its journal entry is fsynced: it survives a process crash
-  and a power failure. Weaker journal settings trade that for latency; see
-  [Durability](./transactions#durability).
+- **Acknowledged writes.** The default write concern of `Database::open` is
+  `journal: journal`: a write, or a transaction's commit, is answered only
+  after its journal entry was synced to the medium (`F_FULLFSYNC` on macOS,
+  `fdatasync` on Linux, `FlushFileBuffers` on Windows), and only then applied
+  to the memtables. The directory of a new journal segment is synced before
+  the first entry in it is (not on Windows, which has no directory sync). A
+  transaction's effects are one journal entry, so they land together or not
+  at all. It survives a process crash and a power failure. Weaker journal
+  settings trade that for latency; see [Durability](./transactions#durability).
 - **Crash recovery.** After a kill or power loss the next open recovers by
   itself: every acknowledged entry is replayed, a write cut off before it was
   acknowledged is dropped, and the database opens. Nothing is deleted by hand.
@@ -246,7 +251,7 @@ different questions:
 | Control | Set with | Measures | What it guarantees |
 |---------|----------|----------|--------------------|
 | Free-space reserve | `StorageConfig::min_free_bytes` / `resume_free_bytes`; live with `db.engine().space().set_reserve(min, resume)` | Free space of the whole file system, other programs' files included | Writes stop before the disk itself fills, so the store keeps room to recover |
-| Hard limit | `EndpointConfig::with_hard_limit_bytes` (and `with_recovery_reserve_bytes`) per endpoint; live with `Database::set_hard_limit` | Space every file of the database under the endpoint's directory takes, as the file system allocates it | The database's own files never take more than the limit, whatever else is on the disk |
+| Hard limit | `EndpointConfig::with_hard_limit_bytes` (and `with_recovery_reserve_bytes`) per endpoint, at least 8 MiB; live with `Database::set_hard_limit` | Space every file of the database under the endpoint's directory takes, as the file system allocates it | The database's own files never take more than the limit, whatever else is on the disk |
 
 Under either control a write that does not fit is refused before it reaches
 the journal (`CapacityExhausted` for the hard limit, a "no space" storage

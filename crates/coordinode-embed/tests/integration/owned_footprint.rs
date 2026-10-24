@@ -10,7 +10,8 @@ use std::path::Path;
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 
-const LIMIT: u64 = 8 * 1024 * 1024;
+/// The smallest supported limit: the tests hold the engine to it.
+const LIMIT: u64 = coordinode_storage::engine::config::MIN_HARD_LIMIT_BYTES;
 
 /// Bytes the file system allocated to every file under `root`, and their
 /// lengths: `(allocated, logical)`, each file once however many names it
@@ -549,24 +550,43 @@ fn a_limit_changed_at_runtime_takes_effect_without_a_restart() {
     let mut db = Database::open_with_config(capped(dir.path())).unwrap();
     let accepted = fill(&mut db, dir.path(), 0);
 
-    db.set_hard_limit("owned", 2 * LIMIT, None).unwrap();
+    db.set_hard_limit("owned", 3 * LIMIT, None).unwrap();
     admitted_once_room_settles(&mut db, &create(accepted));
+    // Grow past the original limit, so lowering back to it is below what
+    // the database holds.
+    let mut written = accepted + 1;
+    let held =
+        |db: &Database| -> u64 { db.engine().footprints().iter().map(|f| f.charged()).sum() };
+    while held(&db) < LIMIT + LIMIT / 2 {
+        admitted_once_room_settles(&mut db, &create(written));
+        written += 1;
+    }
 
-    db.set_hard_limit("owned", LIMIT / 4, None).unwrap();
+    db.set_hard_limit("owned", LIMIT, None).unwrap();
     assert!(matches!(
-        db.execute_cypher(&create(accepted + 1)),
+        db.execute_cypher(&create(written)),
         Err(DatabaseError::CapacityExhausted { .. })
     ));
     assert_eq!(
         count(&mut db),
-        accepted as i64 + 1,
+        written as i64,
         "a lowered limit deletes nothing and reads go on"
     );
 
-    db.set_hard_limit("owned", 2 * LIMIT, None).unwrap();
-    admitted_once_room_settles(&mut db, &create(accepted + 1));
+    db.set_hard_limit("owned", 3 * LIMIT, None).unwrap();
+    admitted_once_room_settles(&mut db, &create(written));
     assert!(
         db.set_hard_limit("missing", LIMIT, None).is_err(),
         "an endpoint without a limit is named in an error"
+    );
+    // A limit too small for the engine's own structures is refused, live as
+    // at configuration.
+    assert!(
+        db.set_hard_limit(
+            "owned",
+            coordinode_storage::engine::config::MIN_HARD_LIMIT_BYTES - 1,
+            None
+        )
+        .is_err()
     );
 }

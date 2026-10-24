@@ -18,15 +18,16 @@
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::capacity::CapacitySeverity;
 use coordinode_storage::engine::config::{
-    Durability, EndpointConfig, HardLimitStrategy, Media, StorageConfig, Tier,
+    Durability, EndpointConfig, HardLimitStrategy, MIN_HARD_LIMIT_BYTES, Media, StorageConfig, Tier,
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::StorageError;
 use tempfile::TempDir;
 
-/// Room for a filled store above what an empty one takes at open.
-const ROOMY: u64 = 2 * 1024 * 1024;
+/// The smallest supported limit: room for a filled store above what an
+/// empty one takes at open, with the engine's own bounded structures.
+const ROOMY: u64 = MIN_HARD_LIMIT_BYTES;
 
 /// Tables in the tables folder `dir`, 0 when it does not exist. Empty files
 /// are the engine's reserve of files for tables yet to be written, not
@@ -295,11 +296,19 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
     ]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    for i in 0..3000u32 {
+    // Enough on hot that half of it is still a supported limit.
+    let hot_charged = || engine.footprints().get("ep-hot").expect("capped").charged();
+    let mut i = 0u32;
+    while hot_charged() < 2 * MIN_HARD_LIMIT_BYTES + 2 * (1 << 20) {
         let key = format!("node:0:{i:010}");
+        let value: Vec<u8> = (0..16u32)
+            .flat_map(|k| incompressible(i * 16 + k))
+            .collect();
         engine
-            .put(Partition::Node, key.as_bytes(), &incompressible(i))
+            .put(Partition::Node, key.as_bytes(), &value)
             .expect("put under a roomy limit");
+        i += 1;
+        assert!(i < 200_000, "the hot endpoint never held enough");
     }
     engine.persist().expect("persist");
 
@@ -361,10 +370,10 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
 
 /// `HardLimitStrategy::Reject` (default) MUST NOT auto-fire cascade
 /// eviction even at Emergency severity. The endpoint just sits there
-/// near-full until operator intervention. Verified by configuring a
-/// tiny limit and `Reject` strategy, then observing that the strategy
-/// field on the tracker is preserved as `Reject` after the refresh
-/// pass (the auto-cascade branch is gated on `CascadeEvict`).
+/// near-full until operator intervention. Verified by filling an endpoint
+/// under the `Reject` strategy, then observing that the strategy field on
+/// the tracker is preserved as `Reject` after the refresh pass (the
+/// auto-cascade branch is gated on `CascadeEvict`).
 #[test]
 fn reject_strategy_preserved_no_auto_cascade() {
     let hot = TempDir::new().expect("hot tempdir");
@@ -378,7 +387,7 @@ fn reject_strategy_preserved_no_auto_cascade() {
             Durability::Durable,
             Tier::Hot,
         )
-        .with_hard_limit_bytes(4096), // below what an empty store takes
+        .with_hard_limit_bytes(ROOMY),
         // strategy defaults to Reject
         EndpointConfig::new(
             "ep-cold",
@@ -390,11 +399,9 @@ fn reject_strategy_preserved_no_auto_cascade() {
     ]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    for i in 0..500u32 {
-        let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
-    }
-    engine.persist().expect("persist");
+    // Node tables move down to the cold tier as they compact; the schema
+    // partition stays on the first endpoint, so it is what fills hot.
+    fill(&engine, Partition::Schema, "schema:fill:");
     engine.refresh_capacity();
 
     let usage = engine.capacity().get("ep-hot").expect("tracked");
@@ -408,7 +415,7 @@ fn reject_strategy_preserved_no_auto_cascade() {
     assert_eq!(
         usage.severity(),
         CapacitySeverity::Full,
-        "a store past a tiny limit reports Full",
+        "a store that refuses writes reports Full",
     );
 }
 
@@ -459,16 +466,10 @@ fn threshold_alert_counter_increments_on_severity_crossing() {
     recorder.install().expect("the process's metrics recorder");
 
     let dir = TempDir::new().expect("tempdir");
-    // 4 KB limit, below what an empty store takes: the first refresh
-    // crosses straight to Full.
-    let config = StorageConfig::with_endpoints(vec![capped("alert-ep", dir.path(), 4096)]);
+    // Filled until refused: the severity climbs from Normal to Full.
+    let config = StorageConfig::with_endpoints(vec![capped("alert-ep", dir.path(), ROOMY)]);
     let engine = StorageEngine::open(&config).expect("open");
-    for i in 0..500u32 {
-        let key = format!("node:0:{i:010}");
-        // Refused: we only care about the counter side-effect.
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
-    }
-    engine.persist().expect("persist");
+    fill(&engine, Partition::Node, "node:0:");
     engine.refresh_capacity();
 
     // Walk the snapshot and find the threshold-alert counter for our
@@ -504,8 +505,10 @@ fn cascade_events_counter_increments_on_auto_cascade() {
 
     let hot = TempDir::new().expect("hot tempdir");
     let cold = TempDir::new().expect("cold tempdir");
-    // 4 KB hard limit, below what an empty store takes: Full from the
-    // first refresh, so auto-cascade fires whatever the tables weigh.
+    // Filled until it refuses a write: its refresh then sees Full, so
+    // auto-cascade fires. Node tables move down to the cold tier as they
+    // compact; the schema partition stays on the first endpoint, so it is
+    // what fills hot.
     let config = StorageConfig::with_endpoints(vec![
         EndpointConfig::new(
             "ep-hot",
@@ -514,7 +517,7 @@ fn cascade_events_counter_increments_on_auto_cascade() {
             Durability::Durable,
             Tier::Hot,
         )
-        .with_hard_limit_bytes(4096)
+        .with_hard_limit_bytes(ROOMY)
         .with_hard_limit_strategy(HardLimitStrategy::CascadeEvict),
         EndpointConfig::new(
             "ep-cold",
@@ -528,12 +531,8 @@ fn cascade_events_counter_increments_on_auto_cascade() {
 
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
+    fill(&engine, Partition::Schema, "schema:fill:");
     metrics::with_local_recorder(&recorder, || {
-        for i in 0..500u32 {
-            let key = format!("node:0:{i:010}");
-            let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
-        }
-        engine.persist().expect("persist");
         engine.refresh_capacity();
     });
 
@@ -693,7 +692,7 @@ fn a_store_reopened_under_a_lower_limit_refuses_writes_and_keeps_its_data() {
         let engine = StorageEngine::open(&StorageConfig::with_endpoints(vec![capped(
             "ep",
             dir.path(),
-            ROOMY,
+            2 * ROOMY,
         )]))
         .expect("first open");
         let accepted = fill(&engine, Partition::Node, "node:0:");
@@ -704,7 +703,7 @@ fn a_store_reopened_under_a_lower_limit_refuses_writes_and_keeps_its_data() {
     let engine = StorageEngine::open(&StorageConfig::with_endpoints(vec![capped(
         "ep",
         dir.path(),
-        ROOMY / 2,
+        ROOMY,
     )]))
     .expect("reopen under a lower limit");
     let usage = engine.capacity().get("ep").unwrap();
@@ -859,7 +858,7 @@ fn multi_endpoint_full_state_does_not_leak_across_endpoints() {
     let cold = TempDir::new().expect("cold tempdir");
 
     let config = StorageConfig::with_endpoints(vec![
-        // Tiny Hot limit, below what an empty store takes there.
+        // The smallest Hot limit, filled below.
         EndpointConfig::new(
             "ep-hot",
             hot.path(),
@@ -867,7 +866,7 @@ fn multi_endpoint_full_state_does_not_leak_across_endpoints() {
             Durability::Durable,
             Tier::Hot,
         )
-        .with_hard_limit_bytes(4096),
+        .with_hard_limit_bytes(ROOMY),
         // Huge Cold limit so it stays Normal.
         EndpointConfig::new(
             "ep-cold",
@@ -880,11 +879,9 @@ fn multi_endpoint_full_state_does_not_leak_across_endpoints() {
     ]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    for i in 0..500u32 {
-        let key = format!("node:0:{i:010}");
-        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
-    }
-    engine.persist().expect("persist");
+    // Node tables move down to the cold tier as they compact; the schema
+    // partition stays on the first endpoint, so it is what fills hot.
+    fill(&engine, Partition::Schema, "schema:fill:");
     engine.refresh_capacity();
 
     let hot_usage = engine.capacity().get("ep-hot").expect("tracked");
