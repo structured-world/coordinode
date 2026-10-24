@@ -62,7 +62,7 @@ impl crypto::ActiveKeyExchange for X25519KeyExchange {
 }
 
 macro_rules! impl_kx {
-    ($name:ident, $exchange:ident, $kx_name:expr, $secret:ty, $public_key:ty) => {
+    ($name:ident, $exchange:ident, $kx_name:expr, $secret:ty, $public_key:ty, $wire_len:expr) => {
         #[derive(Debug)]
         pub struct $name;
 
@@ -89,6 +89,11 @@ macro_rules! impl_kx {
 
         impl crypto::ActiveKeyExchange for $exchange {
             fn complete(self: Box<$exchange>, peer: &[u8]) -> Result<SharedSecret, rustls::Error> {
+                // RFC 8446 section 4.2.8.2 and RFC 8422 section 5.4.1 require
+                // fixed-width uncompressed NIST points, unlike general SEC1.
+                if peer.len() != $wire_len || peer[0] != 4 {
+                    return Err(rustls::PeerMisbehaved::InvalidKeyShare.into());
+                }
                 let their_pub = <$public_key>::from_sec1_bytes(peer)
                     .map_err(|_| rustls::Error::from(rustls::PeerMisbehaved::InvalidKeyShare))?;
                 Ok(self
@@ -110,8 +115,8 @@ macro_rules! impl_kx {
     };
 }
 
-impl_kx! {SecP256R1, SecP256R1KeyExchange, rustls::NamedGroup::secp256r1, p256::ecdh::EphemeralSecret, p256::PublicKey}
-impl_kx! {SecP384R1, SecP384R1KeyExchange, rustls::NamedGroup::secp384r1, p384::ecdh::EphemeralSecret, p384::PublicKey}
+impl_kx! {SecP256R1, SecP256R1KeyExchange, rustls::NamedGroup::secp256r1, p256::ecdh::EphemeralSecret, p256::PublicKey, 65}
+impl_kx! {SecP384R1, SecP384R1KeyExchange, rustls::NamedGroup::secp384r1, p384::ecdh::EphemeralSecret, p384::PublicKey, 97}
 
 pub const ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[&X25519, &SecP256R1, &SecP384R1];
 
