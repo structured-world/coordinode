@@ -29,6 +29,8 @@ fn settings(pki: &TestPki, dir: &Path, n: u64) -> NodeIdentitySettings {
 #[test]
 fn a_reload_publishes_renewed_files_and_refuses_broken_ones() {
     let pki = TestPki::new();
+    coordinode_wire::tls::install_crypto_provider(pki.crypto_provider())
+        .expect("test host provider");
     let dir = tempfile::tempdir().expect("tempdir");
     let identity = NodeIdentity::load(settings(&pki, dir.path(), 1)).expect("load");
     assert_eq!(identity.context().identity(), pki.identity(1));
@@ -58,6 +60,8 @@ fn a_reload_publishes_renewed_files_and_refuses_broken_ones() {
 #[test]
 fn a_join_needs_the_deployment_and_a_member_to_enroll_from() {
     let pki = TestPki::new();
+    coordinode_wire::tls::install_crypto_provider(pki.crypto_provider())
+        .expect("test host provider");
     let dir = tempfile::tempdir().expect("tempdir");
     let mut joiner = settings(&pki, dir.path(), 2);
     let load = |s: &NodeIdentitySettings| NodeIdentity::load(s.clone()).expect("load");
@@ -93,6 +97,8 @@ fn a_join_needs_the_deployment_and_a_member_to_enroll_from() {
 #[test]
 fn credentials_outside_the_bundles_are_refused() {
     let pki = TestPki::new();
+    coordinode_wire::tls::install_crypto_provider(pki.crypto_provider())
+        .expect("test host provider");
     let stranger = TestPki::with_trust_domain("elsewhere.test");
     let dir = tempfile::tempdir().expect("tempdir");
     let mut foreign = settings(&pki, dir.path(), 1);
@@ -104,4 +110,21 @@ fn credentials_outside_the_bundles_are_refused() {
     let mut unbundled = settings(&pki, dir.path(), 1);
     unbundled.trust_bundles.clear();
     assert!(NodeIdentity::load(unbundled).is_err());
+}
+
+/// Identity loading never chooses a backend, and succeeds after host selection.
+#[test]
+fn identity_loading_requires_explicit_host_selection() {
+    let pki = TestPki::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let configured = settings(&pki, dir.path(), 1);
+    let error = NodeIdentity::load(configured.clone())
+        .err()
+        .expect("host selection required");
+    assert!(error.contains("host must select"), "{error}");
+    assert!(coordinode_wire::tls::CryptoProvider::get_default().is_none());
+    coordinode_wire::tls::install_crypto_provider(pki.crypto_provider())
+        .expect("test host provider");
+    let identity = NodeIdentity::load(configured).expect("explicitly configured host");
+    assert_eq!(identity.context().identity(), pki.identity(1));
 }
