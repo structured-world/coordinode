@@ -74,6 +74,7 @@ Thumbs.db
 
 # Test artifacts
 /tmp/
+/tests/fixtures/crypto-provider/Cargo.lock
 *.profraw
 *.profdata
 data/

@@ -1,7 +1,7 @@
 //! TLS crypto provider selection and PEM loading.
 //!
 //! The crypto provider is chosen once at startup: the stock server picks
-//! the pure-Rust [`coordinode_crypto`] one (no C FFI), and a downstream
+//! the pure-Rust [`sid_crypto::tls::rustcrypto`] one (no C FFI), and a downstream
 //! distribution may select another, `aws-lc-rs` being the reason the seam
 //! exists. [`install_crypto_provider`] also makes the selection rustls'
 //! process default, so a dependency that builds its own TLS configuration
@@ -61,7 +61,7 @@ pub enum TlsError {
 /// does not install a process default.
 #[must_use]
 pub fn rustcrypto_provider() -> Arc<CryptoProvider> {
-    Arc::new(coordinode_crypto::provider())
+    Arc::new(sid_crypto::tls::rustcrypto::provider())
 }
 
 /// The provider selected for this process.
@@ -168,10 +168,8 @@ pub fn client_verifier(
     for root in roots {
         store.add(root).map_err(TlsError::TrustAnchor)?;
     }
-    let builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(store),
-        provider,
-    );
+    let builder =
+        rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(store), provider);
     let builder = if mandatory {
         builder
     } else {

@@ -854,34 +854,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "coordinode-crypto"
-version = "0.8.0"
-dependencies = [
- "aead",
- "aes-gcm",
- "chacha20poly1305",
- "crypto-bigint",
- "crypto-common 0.2.2",
- "der",
- "digest 0.11.3",
- "ed25519-dalek",
- "getrandom 0.4.3",
- "hmac",
- "p256",
- "p384",
- "pkcs8",
- "rcgen",
- "rsa",
- "rustls",
- "rustls-pki-types",
- "sec1",
- "sha2 0.11.1",
- "signature",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "coordinode-embed"
 version = "0.8.0"
 dependencies = [
@@ -1327,7 +1299,6 @@ version = "0.8.0"
 dependencies = [
  "arc-swap",
  "bytes",
- "coordinode-crypto",
  "coordinode-workspace-hack",
  "der",
  "futures-util",
@@ -1342,6 +1313,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-webpki",
  "sec1",
+ "sid-crypto",
  "structured-zstd",
  "thiserror 2.0.21",
  "tokio",
@@ -5367,6 +5339,36 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "sid-crypto"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bc57a26c3b8de38cd2766990cb8e01257c17fc829e8c860efde65c0d5a91396"
+dependencies = [
+ "aead",
+ "aes-gcm",
+ "chacha20poly1305",
+ "crypto-bigint",
+ "crypto-common 0.2.2",
+ "der",
+ "digest 0.11.3",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "hmac",
+ "p256",
+ "p384",
+ "pkcs8",
+ "rsa",
+ "rustls",
+ "rustls-pki-types",
+ "sec1",
+ "sha2 0.11.1",
+ "signature",
+ "thiserror 2.0.21",
+ "x25519-dalek",
+ "zeroize",
+]
 
 [[package]]
 name = "signal-hook-registry"

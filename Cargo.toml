@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/coordinode-core",
-    "crates/coordinode-crypto",
     "crates/coordinode-query",
     "crates/coordinode-vector",
     "crates/coordinode-search",

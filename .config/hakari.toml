@@ -70,7 +70,6 @@ workspace-members = ["coordinode-core"]
 # `replication` feature: unified here, a library build without it would
 # compile them all the same.
 workspace-members = [
-    "coordinode-crypto",
     "coordinode-raft",
     "coordinode-wire",
     "coordinode-migrate",

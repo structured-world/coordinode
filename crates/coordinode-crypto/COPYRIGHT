@@ -1,7 +1,0 @@
-Upstream rustls-rustcrypto implementation:
-Copyright (c) 2023 Steve Fan, ctz.
-
-Modifications:
-Copyright (c) 2026 Dmitry Prudnikov.
-
-Licensed under MIT OR Apache-2.0; see LICENSE-MIT and LICENSE-APACHE.

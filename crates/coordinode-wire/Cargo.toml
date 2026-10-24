@@ -19,7 +19,7 @@ bytes = { workspace = true }
 structured-zstd = "0.2"
 # Shared pure-Rust TLS provider.
 rustls = { version = "0.23", default-features = false }
-coordinode-crypto = { version = "0.8", path = "../coordinode-crypto" }
+sid-crypto = { version = "0.1", default-features = false, features = ["std", "tls-rustcrypto", "tls12"] }
 # Local identity admission retains product policy outside the shared TLS adapter.
 der = { version = "0.8", default-features = false }
 pkcs8 = { version = "0.11", default-features = false }

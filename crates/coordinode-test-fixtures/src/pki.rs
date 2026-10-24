@@ -233,13 +233,8 @@ impl TestPki {
     pub fn context_of(&self, uri: &str) -> Arc<SecurityContext> {
         let (chain, key) = self.credentials(uri, None);
         Arc::new(
-            SecurityContext::new(
-                self.crypto_provider(),
-                chain,
-                key,
-                self.profile(),
-            )
-            .expect("a node security context"),
+            SecurityContext::new(self.crypto_provider(), chain, key, self.profile())
+                .expect("a node security context"),
         )
     }
 

@@ -1,0 +1,15 @@
+[package]
+name = "tls-provider-consumer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+[workspace]
+
+[features]
+std = ["sid-crypto/std"]
+tls12 = ["sid-crypto/tls12"]
+
+[dependencies]
+sid-crypto = { version = "0.1", default-features = false, features = ["alloc", "tls-rustcrypto"] }

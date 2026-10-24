@@ -21,7 +21,9 @@ async fn local_consensus_does_not_select_a_tls_provider() {
         Tier::Warm,
     )]);
     let engine = Arc::new(StorageEngine::open(&config).expect("storage engine"));
-    let node = RaftNode::single_node(engine).await.expect("local consensus");
+    let node = RaftNode::single_node(engine)
+        .await
+        .expect("local consensus");
     let deployment = node.deployment();
     node.shutdown().await.expect("shutdown");
     assert!(deployment.is_some(), "the deployment identity was recorded");
