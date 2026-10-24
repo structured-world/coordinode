@@ -17,9 +17,13 @@ bytes = { workspace = true }
 # Pure-Rust zstd (no C FFI) for transport compression. 0.2 is the floor: its
 # streaming decoder is built infallibly, as the code here calls it.
 structured-zstd = "0.2"
-# Shared pure-Rust TLS provider and local identity policy.
+# Shared pure-Rust TLS provider.
 rustls = { version = "0.23", default-features = false }
 coordinode-crypto = { version = "0.8", path = "../coordinode-crypto" }
+# Local identity admission retains product policy outside the shared TLS adapter.
+der = { version = "0.8", default-features = false }
+pkcs8 = { version = "0.11", default-features = false }
+sec1 = { version = "0.8", default-features = false }
 # Fallible process-wide provider initialization must not cache an initialization error.
 once_cell = "1"
 # PEM parsing lives in rustls-pki-types now (rustls-pemfile is unmaintained).

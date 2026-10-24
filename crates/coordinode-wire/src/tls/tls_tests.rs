@@ -29,6 +29,22 @@ fn load_certs_and_key_round_trip() {
     load_private_key(key_pem.as_bytes()).expect("key");
 }
 
+// Admission must preserve every supported identity algorithm before backend key loading.
+#[test]
+fn local_identity_admission_accepts_supported_algorithms() {
+    let provider = rustcrypto_provider();
+    let policy = IdentityKeyProvider::new(provider.key_provider);
+    for algorithm in [
+        &rcgen::PKCS_ECDSA_P256_SHA256,
+        &rcgen::PKCS_ECDSA_P384_SHA384,
+        &rcgen::PKCS_ED25519,
+    ] {
+        let key = KeyPair::generate_for(algorithm).expect("identity key");
+        let key = load_private_key(key.serialize_pem().as_bytes()).expect("admitted identity");
+        rustls::crypto::KeyProvider::load_private_key(&policy, key).expect("backend signing key");
+    }
+}
+
 #[test]
 fn load_private_key_missing_is_error() {
     // A PEM with only a certificate, no key.

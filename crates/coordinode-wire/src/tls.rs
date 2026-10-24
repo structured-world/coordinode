@@ -9,10 +9,13 @@
 
 use std::sync::Arc;
 
-use coordinode_crypto::identity::IdentityKeyProvider;
 use once_cell::sync::OnceCell;
 
 use rustls::pki_types::pem::{Error as PemError, PemObject};
+
+pub(crate) mod identity;
+
+use identity::IdentityKeyProvider;
 
 /// Re-exported so a caller naming a provider is guaranteed to be naming this
 /// crate's rustls, not a second copy resolved elsewhere in the tree.
@@ -130,7 +133,7 @@ pub fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> 
             source,
         },
     })?;
-    coordinode_crypto::identity::check_identity_key(&key).map_err(TlsError::Identity)?;
+    identity::check_identity_key(&key).map_err(TlsError::Identity)?;
     Ok(key)
 }
 
