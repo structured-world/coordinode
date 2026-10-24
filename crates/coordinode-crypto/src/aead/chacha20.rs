@@ -194,6 +194,9 @@ impl MessageDecrypter for Tls12Cipher {
             .decrypt_in_place(&nonce, &aad, &mut DecryptBufferAdapter(payload))
             .map_err(|_| rustls::Error::DecryptError)?;
 
+        if payload.len() > super::TLS12_MAX_PLAINTEXT {
+            return Err(rustls::Error::PeerSentOversizedRecord);
+        }
         Ok(m.into_plain_message())
     }
 }

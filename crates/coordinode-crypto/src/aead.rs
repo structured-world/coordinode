@@ -4,6 +4,10 @@ use rustls::crypto::cipher::{BorrowedPayload, PrefixedPayload};
 pub mod chacha20;
 pub mod gcm;
 
+// RFC 5246 section 6.2.1 bounds authenticated TLS 1.2 plaintext.
+#[cfg(feature = "tls12")]
+const TLS12_MAX_PLAINTEXT: usize = 1 << 14;
+
 pub(crate) struct EncryptBufferAdapter<'a>(&'a mut PrefixedPayload);
 
 impl AsRef<[u8]> for EncryptBufferAdapter<'_> {

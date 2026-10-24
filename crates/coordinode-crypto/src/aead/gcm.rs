@@ -244,6 +244,10 @@ macro_rules! impl_gcm_tls12 {
                     tag_pos
                 };
 
+                if tag_pos > super::TLS12_MAX_PLAINTEXT {
+                    return Err(rustls::Error::PeerSentOversizedRecord);
+                }
+
                 // We defer the truncation to here, because we may inadvertently shifted the
                 // original data if the decryption failed. Another way to avoid this is
                 // to clone the payload slice starting after the explicit nonce,
