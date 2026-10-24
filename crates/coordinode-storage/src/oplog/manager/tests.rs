@@ -351,6 +351,27 @@ fn rotation_creates_new_segment_files() {
     assert_eq!(mgr.sealed.len(), 2);
 }
 
+/// A segment's directory entry is made durable when the segment is created,
+/// before any entry in it can be acknowledged: syncing the file alone does
+/// not persist the name of a new file (POSIX fsync), so a power cut could
+/// otherwise take a segment of synced entries with it.
+#[test]
+fn creating_a_segment_syncs_its_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = test_manager(dir.path());
+    assert_eq!(mgr.dir_syncs, 0);
+    mgr.append(&make_entry(0, 4000)).expect("append");
+    assert_eq!(mgr.dir_syncs, 1, "the first segment's creation");
+    mgr.append(&make_entry(1, 4001)).expect("append");
+    assert_eq!(
+        mgr.dir_syncs, 1,
+        "an append to an existing segment syncs no directory"
+    );
+    mgr.rotate().expect("rotate");
+    mgr.append(&make_entry(2, 4002)).expect("append");
+    assert_eq!(mgr.dir_syncs, 2, "the next segment's creation");
+}
+
 #[test]
 fn auto_rotation_on_entry_limit() {
     let dir = tempfile::tempdir().expect("tempdir");

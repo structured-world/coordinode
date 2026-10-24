@@ -255,6 +255,10 @@ pub struct OplogManager {
     floor: RetainedFloor,
     /// The owned footprints the segments are charged to.
     footprints: crate::engine::footprint::Footprints,
+    /// Directory syncs made for created segments, for the tests that check
+    /// a new segment's name is durable before its entries are.
+    #[cfg(test)]
+    dir_syncs: u64,
 }
 
 impl OplogManager {
@@ -372,6 +376,8 @@ impl OplogManager {
             sealed: paths,
             sync: SyncMethod::default(),
             footprints: crate::engine::footprint::Footprints::default(),
+            #[cfg(test)]
+            dir_syncs: 0,
         })
     }
 
@@ -477,6 +483,15 @@ impl OplogManager {
                     return Err(e);
                 }
             };
+            // Syncing a new file does not make its name durable (POSIX
+            // fsync(2)): without its directory synced, a power cut could
+            // take the segment and every entry already acknowledged from
+            // it. Once per segment, before any of its entries is synced.
+            sync_dir(&self.dir)?;
+            #[cfg(test)]
+            {
+                self.dir_syncs += 1;
+            }
             // `open` registers every file it finds as sealed, including a
             // header-only leftover from a crash. That file has just been
             // replaced by the active writer, so drop the stale registration or
