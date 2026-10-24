@@ -2,6 +2,22 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.9.0 - 2026-10-24
+
+### Fixed
+
+- *(tls)* [**breaking**] require explicit host selection
+- *(crypto)* qualify isolated transport providers
+
+### Refactored
+
+- *(tls)* keep identity policy in wire
+- *(crypto)* [**breaking**] share RustCrypto provider
+
+### Testing
+
+- *(tls)* expose implicit provider selection
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
