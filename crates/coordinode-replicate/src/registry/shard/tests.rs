@@ -951,7 +951,8 @@ async fn the_background_sweep_ends_a_silent_bounded_consumer() {
 }
 
 /// A reader watching its registration hears of writes to its own record as
-/// they apply (here, its cancellation) and not of writes to others'.
+/// they apply (here, its cancellation) and not of writes to others', once
+/// the notices of the writes made before it watched have been delivered.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watch_hears_of_its_own_record_only() {
     let f = fixture(Arc::new(ManualClock::new(1_000))).await;
@@ -968,10 +969,25 @@ async fn a_watch_hears_of_its_own_record_only() {
         .register(registration("other", 10, ConsumerRetentionPolicy::Strict))
         .expect("register other");
     let mut watch = f.reg.watch(&mine);
-    assert!(watch.changed(), "the first call");
+    let mut later = f.reg.watch(&other);
+    assert!(watch.changed() && later.changed(), "the first calls");
 
+    // The relay delivers notices after their writes applied, in apply order,
+    // so the notice of the registration of `mine` can still be on its way
+    // and reach the watch after its first call. A write to `other` made after
+    // both registrations is heard only once every earlier notice has been
+    // delivered: from then on, a change of `mine` is a write made after it.
     f.reg.checkpoint(&other, 20).expect("acknowledge other");
-    // The other record's write applies and is relayed before this one.
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut relayed = false;
+    while !relayed && tokio::time::Instant::now() < until {
+        relayed = later.changed();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(relayed, "the acknowledgement was relayed");
+    // Whatever the registration's notice told it, taken in now.
+    watch.changed();
+
     f.reg.unregister(mine).expect("cancel mine");
     let until = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut heard = false;

@@ -25,6 +25,37 @@ fn a_watch_reports_writes_to_its_own_record() {
     assert!(!watch.changed(), "reported once");
 }
 
+/// The relay delivers a write's notice some time after the write applied, in
+/// apply order. A watch made right after its record was written can hear of
+/// that write only after its first call: a change reported then may be that
+/// earlier write, and the next write to the record is a change of its own.
+/// Once the notice of a later write to another record is heard, every
+/// earlier notice has arrived.
+#[test]
+fn a_notice_of_a_write_before_the_watch_can_arrive_after_its_first_call() {
+    let watches = relayed();
+    let (mine, other) = (b"consumer:mine".to_vec(), b"consumer:other".to_vec());
+    // Both records were written; their notices are still on the way.
+    let mut watch = watches.watch(mine.clone());
+    let mut later = watches.watch(other.clone());
+    assert!(watch.changed() && later.changed(), "the first calls");
+
+    // The relay delivers the notice of the registration of `mine` now.
+    watches.applied(std::slice::from_ref(&mine));
+    // Taken for the next write to `mine`, this change would be the wrong one.
+    assert!(watch.changed(), "the earlier write, heard late");
+    // The next write to `mine` is reported again, on its own.
+    watches.applied(std::slice::from_ref(&mine));
+    assert!(watch.changed(), "the next write, heard after it");
+    assert!(!watch.changed(), "nothing more applied to it");
+
+    // A write to `other`, written after both registrations: once its notice
+    // is heard, no notice of an earlier write is still on the way.
+    watches.applied(std::slice::from_ref(&other));
+    assert!(later.changed());
+    assert!(!watch.changed());
+}
+
 /// Writes whose keys are not known may have changed any record.
 #[test]
 fn unknown_writes_reach_every_watch() {
