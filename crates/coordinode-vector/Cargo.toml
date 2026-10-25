@@ -73,6 +73,10 @@ harness = false
 name = "distance_kernel_variants"
 harness = false
 
+[[bench]]
+name = "vector_numerics"
+harness = false
+
 # Cannot use workspace lints because SIMD intrinsics require unsafe.
 # This is the ONLY crate with unsafe_code = "allow".
 # All SIMD functions have scalar fallbacks and use runtime feature detection.
