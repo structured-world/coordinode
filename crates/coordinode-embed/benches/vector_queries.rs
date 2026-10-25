@@ -6,16 +6,24 @@
 //!
 //! The statements use only the public Cypher surface, so the same file runs
 //! against the code before the change. Each prints its row count beside its
-//! latencies: an equal-cost wrong answer shows up as a changed count.
+//! latencies (an equal-cost wrong answer shows up as a changed count), and
+//! the heap allocations and bytes allocated per statement, the parameter
+//! map it is handed included. Under concurrent writes the counts include
+//! the writer's.
 
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
+use std::alloc::System;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+
+#[global_allocator]
+static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 /// The populations measured: dimension and vectors per label.
 const SHAPES: [(usize, usize); 2] = [(128, 20_000), (768, 4_000)];
@@ -84,8 +92,15 @@ fn measure(db: &Database, label: &str, query: &str, queries: &[Vec<f32>], runs: 
         )])
     };
     let (rows, _) = run(db, query, &p(0)); // Bind the plan before measurement.
+    let region = Region::new(GLOBAL);
     let samples = (0..runs).map(|i| run(db, query, &p(i)).1).collect();
+    let change = region.change();
     report(label, rows, samples);
+    println!(
+        "{label}: allocations/statement={} bytes allocated/statement={}",
+        change.allocations / runs,
+        change.bytes_allocated / runs,
+    );
 }
 
 fn load(db: &Database, label: &str, dim: usize, n: usize, seed: u64) {
