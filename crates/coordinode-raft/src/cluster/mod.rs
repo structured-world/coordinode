@@ -2279,6 +2279,26 @@ impl RaftNode {
             .and_then(admission::member_target)
     }
 
+    /// Wait until [`Self::member_target`] knows member `node_id`, at most
+    /// `timeout`: woken by the membership this node applies, not by polling.
+    /// Whether it does.
+    pub async fn wait_for_member_target(&self, node_id: u64, timeout: std::time::Duration) -> bool {
+        self.raft
+            .wait(Some(timeout))
+            .metrics(
+                |m| {
+                    m.membership_config
+                        .membership()
+                        .get_node(&node_id)
+                        .and_then(admission::member_target)
+                        .is_some()
+                },
+                "the member's address is known",
+            )
+            .await
+            .is_ok()
+    }
+
     /// Every other member as a peer to dial.
     pub fn peer_targets(&self) -> Vec<PeerTarget> {
         use openraft::async_runtime::watch::WatchReceiver;

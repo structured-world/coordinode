@@ -220,10 +220,11 @@ impl Ingress {
     }
 
     /// Run `call` at `leader`. A call proven not sent there
-    /// ([`DatabaseError::PeerUnreachable`], such as a leader whose address
-    /// this member has not learned yet) goes again to the leader known then,
-    /// a bounded number of times within `deadline`; a call that may have run
-    /// is never sent again. Returns the answer and the member that gave it.
+    /// ([`DatabaseError::PeerUnreachable`]) goes again to the leader known
+    /// then, a bounded number of times within `deadline`: once this member
+    /// learns the address of a leader it knew only by id, else after a
+    /// pause. A call that may have run is never sent again. Returns the
+    /// answer and the member that gave it.
     async fn at_leader<T, Fut>(
         &self,
         mut leader: u64,
@@ -234,6 +235,7 @@ impl Ingress {
         Fut: std::future::Future<Output = Result<T, DatabaseError>>,
     {
         let mut pauses = REROUTE_PAUSES.iter();
+        let mut waited_for_address = false;
         loop {
             let sent = match self.admitter.router(leader) {
                 Ok(router) => call(router).await,
@@ -243,6 +245,21 @@ impl Ingress {
                 Err(e @ DatabaseError::PeerUnreachable { .. }) => e,
                 other => return other.map(|answer| (answer, leader)),
             };
+            // A leader this member knows by id but not yet by address (it has
+            // just joined, the membership naming the address still on its
+            // way): wait for that membership to apply, within the caller's
+            // time, rather than guess at it with pauses.
+            // Once per call, so the series stays bounded.
+            if !waited_for_address && !self.admitter.knows_member(leader) {
+                waited_for_address = true;
+                let wait = deadline.map_or(LEADER_ADDRESS_WAIT, |d| {
+                    d.saturating_duration_since(Instant::now())
+                        .min(LEADER_ADDRESS_WAIT)
+                });
+                if self.admitter.learn_member(leader, wait).await {
+                    continue;
+                }
+            }
             let Some(pause) = pauses.next() else {
                 return Err(unsent);
             };
@@ -442,6 +459,11 @@ impl Ingress {
 /// Pauses before sending a command again that was proven not sent: a
 /// member that just joined learns its leader's address within the first of
 /// them, and the whole series stays well inside a statement's time.
+/// The longest a command waits for this member to learn where the leader it
+/// knows by id is, when the caller sets no earlier deadline: a membership
+/// entry applies in milliseconds, this covers a loaded host.
+const LEADER_ADDRESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const REROUTE_PAUSES: [std::time::Duration; 3] = [
     std::time::Duration::from_millis(25),
     std::time::Duration::from_millis(50),

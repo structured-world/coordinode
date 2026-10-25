@@ -414,6 +414,23 @@ impl Admitter {
         Ok(router)
     }
 
+    /// Whether this member knows where `member` is.
+    pub fn knows_member(&self, member: u64) -> bool {
+        self.node
+            .as_ref()
+            .is_some_and(|node| node.member_target(member).is_some())
+    }
+
+    /// Wait until this member knows where `member` is, at most `timeout`:
+    /// woken as the membership it applies names the address. Whether it
+    /// does; `false` at once standalone.
+    pub async fn learn_member(&self, member: u64, timeout: Duration) -> bool {
+        match self.node.as_ref() {
+            Some(node) => node.wait_for_member_target(member, timeout).await,
+            None => false,
+        }
+    }
+
     /// The member every command of a transaction runs at, the leader: `None`
     /// when it is this one, standalone or leading.
     ///
