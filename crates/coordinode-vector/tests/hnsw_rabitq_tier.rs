@@ -82,7 +82,7 @@ fn rabitq_inserts_persist_originals_through_tier() {
     index.set_vector_tier(Some(tier_handle));
 
     for id in 0..N {
-        index.insert(id, synth_vec(id));
+        index.insert(id, synth_vec(id)).unwrap();
     }
 
     // RaBitQ side: codec must be active and calibrated.

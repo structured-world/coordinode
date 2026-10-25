@@ -18,6 +18,8 @@
 //! Each iteration starts from a fresh index so the bench measures
 //! end-to-end build time, not steady-state insert throughput.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use coordinode_core::graph::types::VectorMetric;
@@ -65,7 +67,7 @@ fn bench_serial_vs_batch(c: &mut Criterion) {
                 || (items.clone(), HnswIndex::new(make_config(n as u32))),
                 |(items, mut index)| {
                     for (id, v) in items {
-                        index.insert(id, v);
+                        index.insert(id, v).unwrap();
                     }
                     std::hint::black_box(index);
                 },
@@ -77,7 +79,7 @@ fn bench_serial_vs_batch(c: &mut Criterion) {
             b.iter_batched(
                 || (items.clone(), HnswIndex::new(make_config(n as u32))),
                 |(items, mut index)| {
-                    index.insert_batch(items);
+                    index.insert_batch(items).unwrap();
                     std::hint::black_box(index);
                 },
                 criterion::BatchSize::LargeInput,
@@ -92,7 +94,7 @@ fn bench_serial_vs_batch(c: &mut Criterion) {
             b.iter_batched(
                 || (items.clone(), HnswIndex::new(make_config(n as u32))),
                 |(items, mut index)| {
-                    index.bulk_build(items);
+                    index.bulk_build(items).unwrap();
                     std::hint::black_box(index);
                 },
                 criterion::BatchSize::LargeInput,

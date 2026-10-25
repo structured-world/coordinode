@@ -3,6 +3,8 @@
 //! Measures search QPS at different index sizes.
 //! Baseline for tracking the visited-pool and prefetch optimizations.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use coordinode_core::graph::types::VectorMetric;
@@ -33,7 +35,7 @@ fn build_index(vectors: &[Vec<f32>]) -> HnswIndex {
         ..Default::default()
     });
     for (i, v) in vectors.iter().enumerate() {
-        index.insert(i as u64, v.clone());
+        index.insert(i as u64, v.clone()).unwrap();
     }
     index
 }
@@ -49,7 +51,7 @@ fn bench_search(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("top10", n), &n, |b, _| {
             b.iter(|| {
-                let results = index.search(query, 10);
+                let results = index.search(query, 10).unwrap();
                 std::hint::black_box(results);
             });
         });
@@ -68,7 +70,7 @@ fn bench_sequential_searches(c: &mut Criterion) {
         b.iter(|| {
             for i in 0..100 {
                 let query = &vectors[i % n];
-                let results = index.search(query, 10);
+                let results = index.search(query, 10).unwrap();
                 std::hint::black_box(results);
             }
         });

@@ -1,4 +1,5 @@
 use super::*;
+use crate::hnsw::VectorDomainError;
 use coordinode_core::graph::types::VectorMetric;
 
 fn test_config() -> HnswConfig {
@@ -18,7 +19,7 @@ fn empty_edge_index() {
     let index = EdgeHnswIndex::new("KNOWS", "embedding", test_config());
     assert!(index.is_empty());
     assert_eq!(index.len(), 0);
-    assert!(index.search(&[1.0, 0.0], 5).is_empty());
+    assert!(index.search(&[1.0, 0.0], 5).unwrap().is_empty());
 }
 
 #[test]
@@ -26,16 +27,16 @@ fn insert_and_search_edges() {
     let mut index = EdgeHnswIndex::new("KNOWS", "relationship_embedding", test_config());
 
     // Alice→Bob: technical collaboration
-    index.insert(1, 2, vec![0.9, 0.1, 0.0]);
+    index.insert(1, 2, vec![0.9, 0.1, 0.0]).unwrap();
     // Alice→Charlie: personal friendship
-    index.insert(1, 3, vec![0.1, 0.9, 0.0]);
+    index.insert(1, 3, vec![0.1, 0.9, 0.0]).unwrap();
     // Bob→Charlie: professional mentor
-    index.insert(2, 3, vec![0.7, 0.3, 0.0]);
+    index.insert(2, 3, vec![0.7, 0.3, 0.0]).unwrap();
 
     assert_eq!(index.len(), 3);
 
     // Search for "technical collaboration" pattern
-    let results = index.search(&[1.0, 0.0, 0.0], 2);
+    let results = index.search(&[1.0, 0.0, 0.0], 2).unwrap();
     assert_eq!(results.len(), 2);
 
     // Most similar to (1,0,0) should be Alice→Bob (0.9, 0.1, 0)
@@ -47,13 +48,15 @@ fn insert_and_search_edges() {
 fn edge_search_returns_source_target() {
     let mut index = EdgeHnswIndex::new("FOLLOWS", "vec", test_config());
 
-    index.insert(10, 20, vec![1.0, 0.0]);
-    index.insert(30, 40, vec![0.0, 1.0]);
+    index.insert(10, 20, vec![1.0, 0.0]).unwrap();
+    index.insert(30, 40, vec![0.0, 1.0]).unwrap();
 
-    let results = index.search(&[1.0, 0.0], 1);
+    let results = index.search(&[1.0, 0.0], 1).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].source, 10);
     assert_eq!(results[0].target, 20);
+    // The exact cosine distance of the identical direction.
+    assert_eq!(results[0].score, 0.0);
 }
 
 #[test]
@@ -61,11 +64,11 @@ fn multiple_edges_from_same_source() {
     let mut index = EdgeHnswIndex::new("RATED", "sentiment_vec", test_config());
 
     // User 1 rates multiple movies with different sentiment vectors
-    index.insert(1, 100, vec![0.9, 0.1]); // Positive review
-    index.insert(1, 101, vec![0.1, 0.9]); // Negative review
-    index.insert(1, 102, vec![0.5, 0.5]); // Mixed review
+    index.insert(1, 100, vec![0.9, 0.1]).unwrap(); // Positive review
+    index.insert(1, 101, vec![0.1, 0.9]).unwrap(); // Negative review
+    index.insert(1, 102, vec![0.5, 0.5]).unwrap(); // Mixed review
 
-    let results = index.search(&[0.8, 0.2], 3);
+    let results = index.search(&[0.8, 0.2], 3).unwrap();
     assert_eq!(results.len(), 3);
     // All from source 1
     assert!(results.iter().all(|r| r.source == 1));
@@ -99,12 +102,29 @@ fn high_dimensional_edge_vectors() {
         let vec: Vec<f32> = (0..384)
             .map(|d| ((i * d + 1) as f32 * 0.01).sin())
             .collect();
-        index.insert(i, i + 100, vec);
+        index.insert(i, i + 100, vec).unwrap();
     }
 
     assert_eq!(index.len(), 10);
 
     let query: Vec<f32> = (0..384).map(|d| (d as f32 * 0.01).sin()).collect();
-    let results = index.search(&query, 3);
+    let results = index.search(&query, 3).unwrap();
     assert_eq!(results.len(), 3);
+}
+
+/// An edge vector the metric cannot evaluate is refused and not mapped: a
+/// later search never sees a half-registered edge.
+#[test]
+fn a_refused_edge_vector_is_not_registered() {
+    let mut index = EdgeHnswIndex::new("KNOWS", "embedding", test_config());
+    let refused = index.insert(1, 2, vec![0.0, 0.0]).unwrap_err();
+    assert_eq!(refused.error, VectorDomainError::ZeroVectorCosine);
+    assert!(index.is_empty());
+    assert!(index.id_map.is_empty());
+    assert_eq!(
+        index.search(&[0.0, 0.0], 1),
+        Err(VectorSearchError::Domain(
+            VectorDomainError::ZeroVectorCosine
+        ))
+    );
 }

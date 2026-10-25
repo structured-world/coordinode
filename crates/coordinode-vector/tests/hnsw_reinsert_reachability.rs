@@ -52,8 +52,13 @@ fn unreachable(
     ids: std::ops::Range<u64>,
     vector: impl Fn(u64) -> Vec<f32>,
 ) -> Vec<u64> {
-    ids.filter(|&id| !idx.search(&vector(id), 10).iter().any(|r| r.id == id))
-        .collect()
+    ids.filter(|&id| {
+        !idx.search(&vector(id), 10)
+            .unwrap()
+            .iter()
+            .any(|r| r.id == id)
+    })
+    .collect()
 }
 
 /// Build 6000 nodes, then insert 2000 more while each one is inserted again
@@ -62,16 +67,16 @@ fn unreachable(
 fn build_with_late_reinserts(second: impl Fn(u64) -> Vec<f32>) -> HnswIndex {
     let mut idx = HnswIndex::new(config());
     for id in 0..6000 {
-        idx.insert(id, v(id));
+        idx.insert(id, v(id)).unwrap();
     }
     for id in 6000..8000 {
-        idx.insert(id, v(id));
+        idx.insert(id, v(id)).unwrap();
         if id >= 6256 {
-            idx.insert(id - 256, second(id - 256));
+            idx.insert(id - 256, second(id - 256)).unwrap();
         }
     }
     for id in 7744..8000 {
-        idx.insert(id, second(id));
+        idx.insert(id, second(id)).unwrap();
     }
     idx
 }

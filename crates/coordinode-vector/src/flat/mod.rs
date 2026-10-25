@@ -1,28 +1,27 @@
 //! Flat (brute-force) vector index: exact nearest neighbor search.
 //!
-//! For small datasets (<100K vectors). Computes distance to every vector
-//! and returns exact top-K results. No approximation, 100% recall.
-//!
-//! Automatically selected by the query planner when the dataset is small
-//! enough that brute-force is faster than HNSW index overhead.
+//! For small datasets (<100K vectors). Scores every vector exactly (binary64,
+//! canonical reduction; see [`crate::metrics::exact`]) and returns the top-K.
+//! No approximation, 100% recall.
 
 use coordinode_core::graph::types::VectorMetric;
 
-use crate::metrics;
+use crate::metrics::exact::{self, ExactQuery, VectorDomainError};
 
-/// Flat vector index: stores all vectors and computes exact distances.
+/// Flat vector index: stores all vectors and scores each query exactly.
 pub struct FlatIndex {
     /// Distance metric.
     metric: VectorMetric,
-    /// Stored vectors: (id, vector).
+    /// Stored vectors: (id, vector), all of one dimension.
     vectors: Vec<(u64, Vec<f32>)>,
 }
 
-/// Search result with node ID and distance/similarity score.
+/// Search result: the node and its exact ranking distance under the index's
+/// metric (see [`ExactQuery`]): lower ranks first, ties by id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlatSearchResult {
     pub id: u64,
-    pub score: f32,
+    pub score: f64,
 }
 
 impl FlatIndex {
@@ -44,16 +43,32 @@ impl FlatIndex {
         self.vectors.is_empty()
     }
 
+    /// The dimension every stored vector has, once one is stored.
+    fn dimension(&self) -> Option<usize> {
+        self.vectors.first().map(|(_, v)| v.len())
+    }
+
     /// Insert a vector. Duplicates (same ID) are ignored.
-    pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
-        if self
-            .vectors
-            .iter()
-            .any(|(existing_id, _)| *existing_id == id)
-        {
-            return;
+    ///
+    /// # Errors
+    ///
+    /// The vector is empty, has a non-finite component, has another
+    /// dimension than the stored ones, or is zero under cosine; nothing is
+    /// stored.
+    pub fn insert(&mut self, id: u64, vector: Vec<f32>) -> Result<(), VectorDomainError> {
+        exact::admit(&vector, self.metric)?;
+        if let Some(dim) = self.dimension() {
+            if dim != vector.len() {
+                return Err(VectorDomainError::DimensionMismatch {
+                    left: vector.len(),
+                    right: dim,
+                });
+            }
         }
-        self.vectors.push((id, vector));
+        if !self.vectors.iter().any(|(existing, _)| *existing == id) {
+            self.vectors.push((id, vector));
+        }
+        Ok(())
     }
 
     /// Remove a vector by ID.
@@ -63,41 +78,35 @@ impl FlatIndex {
         self.vectors.len() < before
     }
 
-    /// Search for K exact nearest neighbors.
+    /// Search for K exact nearest neighbors, nearest first, equal distances by
+    /// id.
     ///
-    /// Returns results sorted by distance (nearest first for L2/L1,
-    /// highest similarity first for Cosine/DotProduct).
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<FlatSearchResult> {
+    /// # Errors
+    ///
+    /// The query is empty, non-finite, of another dimension than the stored
+    /// vectors, or zero under cosine.
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<FlatSearchResult>, VectorDomainError> {
+        let exact = ExactQuery::new(query, self.metric)?;
         if self.is_empty() || k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-
-        let mut scored: Vec<FlatSearchResult> = self
+        let mut scored = self
             .vectors
             .iter()
             .map(|(id, vec)| {
-                let score = self.compute_distance(query, vec);
-                FlatSearchResult { id: *id, score }
+                Ok(FlatSearchResult {
+                    id: *id,
+                    score: exact.distance(vec)?,
+                })
             })
-            .collect();
-
-        // Nearest first (cosine and dot are turned into distances above),
-        // equal distances by id.
-        scored.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
-
+            .collect::<Result<Vec<_>, VectorDomainError>>()?;
+        scored.sort_by(|a, b| exact::ranked_order(a.score, a.id, b.score, b.id));
         scored.truncate(k);
-        scored
-    }
-
-    /// Compute distance using the configured metric.
-    /// Returns a value where lower = more similar (consistent with HNSW).
-    fn compute_distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        match self.metric {
-            VectorMetric::Cosine => 1.0 - metrics::cosine_similarity(a, b),
-            VectorMetric::L2 => metrics::euclidean_distance_squared(a, b),
-            VectorMetric::DotProduct => -metrics::dot_product(a, b),
-            VectorMetric::L1 => metrics::manhattan_distance(a, b),
-        }
+        Ok(scored)
     }
 
     /// Check if brute-force is recommended for this dataset size.

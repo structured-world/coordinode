@@ -16,7 +16,7 @@ fn build_index(n: usize, dim: usize) -> HnswIndex {
                 (bits as f32 / 16_777_216.0) - 0.5
             })
             .collect();
-        index.insert(i as u64, v);
+        index.insert(i as u64, v).unwrap();
     }
     index
 }
@@ -98,13 +98,25 @@ fn reorder_preserves_search_results() {
     let k = 10;
     let before: Vec<Vec<u64>> = queries
         .iter()
-        .map(|q| index.search(q, k).into_iter().map(|r| r.id).collect())
+        .map(|q| {
+            index
+                .search(q, k)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        })
         .collect();
 
     index.reorder_for_cache_locality();
 
     for (q, want) in queries.iter().zip(&before) {
-        let got: Vec<u64> = index.search(q, k).into_iter().map(|r| r.id).collect();
+        let got: Vec<u64> = index
+            .search(q, k)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
         assert_eq!(&got, want, "top-{k} ids must be identical after reorder");
     }
 }
@@ -162,12 +174,12 @@ fn bulk_build_cache_optimized_yields_working_graph() {
         max_dimensions: 65_536,
         ..Default::default()
     });
-    index.bulk_build_cache_optimized(items.clone());
+    index.bulk_build_cache_optimized(items.clone()).unwrap();
 
     let mut hits = 0;
     let probes = 50;
     for (id, v) in items.iter().step_by(n / probes).take(probes) {
-        let top = index.search(v, 1);
+        let top = index.search(v, 1).unwrap();
         if top.first().is_some_and(|r| r.id == *id) {
             hits += 1;
         }

@@ -10,7 +10,7 @@
 //! Same as node HNSW: each CE replica builds its own in-memory index
 //! from replicated edge property data in CoordiNode storage.
 
-use crate::hnsw::{HnswConfig, HnswIndex};
+use crate::hnsw::{AdmissionError, HnswConfig, HnswIndex, VectorSearchError};
 
 /// An edge identified by (source_id, target_id).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,8 +50,9 @@ pub struct EdgeSearchResult {
     pub source: u64,
     /// Target node ID of the edge.
     pub target: u64,
-    /// Similarity/distance score.
-    pub score: f32,
+    /// Exact ranking distance under the index's metric (see
+    /// [`crate::hnsw::SearchResult`]).
+    pub score: f64,
 }
 
 impl EdgeHnswIndex {
@@ -80,18 +81,37 @@ impl EdgeHnswIndex {
     }
 
     /// Insert an edge vector into the index.
-    pub fn insert(&mut self, source: u64, target: u64, vector: Vec<f32>) {
+    ///
+    /// # Errors
+    ///
+    /// [`AdmissionError`] when the vector cannot be indexed; nothing changes.
+    pub fn insert(
+        &mut self,
+        source: u64,
+        target: u64,
+        vector: Vec<f32>,
+    ) -> Result<(), AdmissionError> {
         let edge_id = EdgeId { source, target };
         let hnsw_id = edge_id.to_hnsw_id();
 
+        self.hnsw.insert(hnsw_id, vector)?;
         self.id_map.insert(hnsw_id, edge_id);
-        self.hnsw.insert(hnsw_id, vector);
+        Ok(())
     }
 
     /// Search for K nearest edge vectors to the query.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<EdgeSearchResult> {
-        self.hnsw
-            .search(query, k)
+    ///
+    /// # Errors
+    ///
+    /// As [`HnswIndex::search`].
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<EdgeSearchResult>, VectorSearchError> {
+        Ok(self
+            .hnsw
+            .search(query, k)?
             .into_iter()
             .filter_map(|r| {
                 self.id_map.get(&r.id).map(|edge_id| EdgeSearchResult {
@@ -100,7 +120,7 @@ impl EdgeHnswIndex {
                     score: r.score,
                 })
             })
-            .collect()
+            .collect())
     }
 }
 

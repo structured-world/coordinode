@@ -14,6 +14,8 @@
 //! workload size is intentionally small enough to run on CI hardware in
 //! seconds while still saturating memory bandwidth across cores.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -52,7 +54,7 @@ fn build_index(vectors: &[Vec<f32>]) -> HnswIndex {
         ..Default::default()
     });
     for (i, v) in vectors.iter().enumerate() {
-        index.insert(i as u64, v.clone());
+        index.insert(i as u64, v.clone()).unwrap();
     }
     index
 }
@@ -90,7 +92,7 @@ fn bench_parallel_search(c: &mut Criterion) {
                                     if idx >= queries {
                                         break;
                                     }
-                                    let results = index.search(&query_set[idx], 10);
+                                    let results = index.search(&query_set[idx], 10).unwrap();
                                     std::hint::black_box(results);
                                 }
                             });
@@ -145,7 +147,7 @@ fn bench_scaling_report(c: &mut Criterion) {
                                         break;
                                     }
                                     let q = &query_set[idx % query_set.len()];
-                                    let results = index.search(q, 10);
+                                    let results = index.search(q, 10).unwrap();
                                     std::hint::black_box(results);
                                 }
                             });

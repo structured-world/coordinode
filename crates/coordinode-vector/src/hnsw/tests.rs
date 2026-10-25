@@ -2,6 +2,102 @@ use std::collections::HashSet;
 
 use super::*;
 
+/// The index under test, its admission and search errors turned into test
+/// failures: these tests build valid indexes and exercise graph behaviour,
+/// so any refusal is a defect. Named like the index so it shadows the glob
+/// import; everything else reaches the index through `Deref`. Tests of the
+/// refusals themselves call [`super::HnswIndex`] directly.
+struct HnswIndex(super::HnswIndex);
+
+impl core::ops::Deref for HnswIndex {
+    type Target = super::HnswIndex;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for HnswIndex {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[allow(clippy::type_complexity)]
+impl HnswIndex {
+    fn new(config: HnswConfig) -> Self {
+        Self(super::HnswIndex::new(config))
+    }
+
+    fn insert(&mut self, id: u64, vector: Vec<f32>) {
+        self.0.insert(id, vector).expect("admitted");
+    }
+
+    fn insert_shared(&self, id: u64, vector: &[f32]) -> bool {
+        self.0.insert_shared(id, vector).expect("admitted")
+    }
+
+    fn insert_batch(&mut self, items: Vec<(u64, Vec<f32>)>) {
+        self.0.insert_batch(items).expect("admitted");
+    }
+
+    fn bulk_build(&mut self, items: Vec<(u64, Vec<f32>)>) {
+        self.0.bulk_build(items).expect("admitted");
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        self.0.search(query, k).expect("searchable")
+    }
+
+    fn search_with_mode(&self, query: &[f32], k: usize, mode: SearchMode) -> Vec<SearchResult> {
+        self.0.search_with_mode(query, k, mode).expect("searchable")
+    }
+
+    fn search_with_visibility<F: Fn(u64) -> bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        overfetch_factor: f64,
+        max_expansion_rounds: usize,
+        is_visible: F,
+    ) -> (
+        Vec<SearchResult>,
+        coordinode_core::graph::types::VectorMvccStats,
+    ) {
+        self.0
+            .search_with_visibility(query, k, overfetch_factor, max_expansion_rounds, is_visible)
+            .expect("searchable")
+    }
+
+    fn search_with_loader(
+        &self,
+        query: &[f32],
+        k: usize,
+        loader: &dyn VectorLoader,
+    ) -> Vec<SearchResult> {
+        self.0
+            .search_with_loader(query, k, loader)
+            .expect("searchable")
+    }
+
+    /// The meter's stop, or the results; a search failure is a defect.
+    #[allow(clippy::panic, reason = "a refused search fails the test")]
+    fn search_metered<M: Meter>(
+        &self,
+        query: &[f32],
+        k: usize,
+        meter: &mut M,
+    ) -> Result<Vec<SearchResult>, M::Stop>
+    where
+        M::Stop: core::fmt::Debug,
+    {
+        match self.0.search_metered(query, k, meter) {
+            Ok(found) => Ok(found),
+            Err(SearchError::Stopped(stop)) => Err(stop),
+            Err(SearchError::Failed(error)) => panic!("searchable: {error}"),
+        }
+    }
+}
+
 fn make_config(metric: VectorMetric) -> HnswConfig {
     HnswConfig {
         m: 4,
@@ -463,9 +559,10 @@ fn larger_dataset() {
 fn high_dimensional() {
     let mut index = HnswIndex::new(make_config(VectorMetric::Cosine));
 
-    // 128-dimensional vectors
+    // 128-dimensional vectors, none all zeros (cosine has no direction for
+    // one).
     for i in 0..20u64 {
-        let vec: Vec<f32> = (0..128).map(|d| ((i * d) as f32).sin()).collect();
+        let vec: Vec<f32> = (0..128).map(|d| ((i * d + 1) as f32).sin()).collect();
         index.insert(i, vec);
     }
 
@@ -891,24 +988,14 @@ fn sq8_reranking_improves_accuracy() {
     let results = index.search(query, 5);
     assert_eq!(results.len(), 5);
 
-    // First result should be the query vector itself (distance ~0)
+    // First result should be the query vector itself, at distance 0.
     assert_eq!(results[0].id, 0);
-    assert!(
-        results[0].score < 0.01,
-        "self-distance should be near zero, got {}",
-        results[0].score
-    );
+    assert_eq!(results[0].score, 0.0);
 
-    // Scores should be from f32 reranking (exact), not dequantized
-    // Verify by computing exact distance for second result
-    let expected_dist =
-        metrics::euclidean_distance_squared(query, &vectors[results[1].id as usize]);
-    let score_diff = (results[1].score - expected_dist).abs();
-    assert!(
-        score_diff < 1e-5,
-        "reranked score should match exact f32 distance: got {}, expected {expected_dist}",
-        results[1].score
-    );
+    // Scores are the exact evaluation of the retained f32 vectors, not of
+    // their SQ8 codes: bit for bit the canonical L2.
+    let expected = metrics::exact::l2(query, &vectors[results[1].id as usize]).unwrap();
+    assert_eq!(results[1].score, expected);
 }
 
 #[test]
@@ -1517,8 +1604,9 @@ fn sq8_disabled_by_default() {
     assert!(!config.quantization.is_active());
 
     let mut index = HnswIndex::new(config);
+    // The default metric is cosine: no vector is all zeros.
     for i in 0..200u64 {
-        index.insert(i, vec![i as f32, 0.0]);
+        index.insert(i, vec![i as f32, 1.0]);
     }
     assert!(!index.is_quantized());
 }
@@ -1781,17 +1869,15 @@ fn offload_search_with_loader_returns_correct_results() {
         );
     }
 
-    // Verify scores are exact f32 distances (not approximate SQ8)
+    // Scores are the exact evaluation of the loaded f32 vectors (not of the
+    // in-memory SQ8 codes): bit for bit the canonical L2.
     for result in &results {
         let v = loader.vectors.get(&result.id).unwrap();
-        let expected = metrics::euclidean_distance_squared(&query, v);
-        let diff = (result.score - expected).abs();
-        assert!(
-            diff < 1e-5,
-            "score for node {} should be exact f32 distance: got {}, expected {}",
-            result.id,
+        assert_eq!(
             result.score,
-            expected
+            metrics::exact::l2(&query, v).unwrap(),
+            "node {}",
+            result.id
         );
     }
 }
@@ -2024,49 +2110,20 @@ fn search_exact_returns_recall_1_top_k() {
     // ambiguity to assert against).
     let query: Vec<f32> = (0..8).map(|d| 0.31 + d as f32 * 0.07).collect();
 
-    let mut reference: Vec<(u64, f32)> = all
+    // The brute-force reference under the same evaluation: canonical L2,
+    // ties by id.
+    let mut reference: Vec<(u64, f64)> = all
         .iter()
-        .map(|(id, v)| {
-            let d2: f32 = query
-                .iter()
-                .zip(v.iter())
-                .map(|(a, b)| (a - b) * (a - b))
-                .sum();
-            (*id, d2)
-        })
+        .map(|(id, v)| (*id, metrics::exact::l2(&query, v).unwrap()))
         .collect();
-    reference.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    reference.sort_by(|a, b| metrics::exact::ranked_order(a.1, a.0, b.1, b.0));
     reference.truncate(10);
-    let reference_ids: Vec<u64> = reference.iter().map(|(id, _)| *id).collect();
 
     let got = idx.search_with_mode(&query, 10, SearchMode::Exact);
-    assert_eq!(got.len(), 10);
-    // Set equality on ids: brute-force and exact must agree on the
-    // top-k membership. Order within tied scores is implementation
-    // defined and not part of the contract — the synthetic spread
-    // happens to produce a few collisions across ids.
-    let got_set: std::collections::HashSet<u64> = got.iter().map(|r| r.id).collect();
-    let ref_set: std::collections::HashSet<u64> = reference_ids.iter().copied().collect();
-    assert_eq!(
-        got_set, ref_set,
-        "exact search must return the full brute-force top-k"
-    );
-    // Returned scores must be non-decreasing (sorted ascending).
-    for w in got.windows(2) {
-        assert!(
-            w[0].score <= w[1].score + 1e-5,
-            "exact result not sorted: {} then {}",
-            w[0].score,
-            w[1].score
-        );
-    }
-    // Top-1 score equals the brute-force minimum.
-    assert!(
-        (got[0].score - reference[0].1).abs() < 1e-4,
-        "top-1 distance {} differs from brute-force {}",
-        got[0].score,
-        reference[0].1
-    );
+    // Exhaustive search is the reference itself: same ids, same order, same
+    // score bits, ties included.
+    let got: Vec<(u64, f64)> = got.iter().map(|r| (r.id, r.score)).collect();
+    assert_eq!(got, reference);
 
     // Hnsw mode keeps working untouched.
     let hnsw_got = idx.search_with_mode(&query, 5, SearchMode::Hnsw);
@@ -3246,44 +3303,120 @@ fn inserted_nodes_are_live_and_reorder_keeps_them_live() {
     );
 }
 
-/// A vector whose dimension is zero or differs from the index's is rejected
-/// on every insert path and leaves the index as it was; the distance kernels
-/// assume equal lengths, so it must never reach planning or the store.
+/// A vector whose dimension is zero or differs from the index's is refused,
+/// with the node and the reason, on every insert path, and leaves the index
+/// as it was: a batch holding one is refused whole, before any item is
+/// applied. The distance kernels assume equal lengths, so it must never reach
+/// planning or the store.
 #[test]
 fn inserts_with_the_wrong_dimension_are_rejected() {
-    let mut index = HnswIndex::new(make_config(VectorMetric::L2));
-    index.insert(1, vec![]);
+    let mut index = super::HnswIndex::new(make_config(VectorMetric::L2));
+    assert_eq!(
+        index.insert(1, vec![]),
+        Err(AdmissionError {
+            id: 1,
+            error: VectorDomainError::Empty
+        })
+    );
     assert!(index.is_empty(), "a zero-length vector sized the index");
     for i in 0..10u64 {
-        index.insert(i, vec![i as f32, 1.0, 2.0]);
+        index.insert(i, vec![i as f32, 1.0, 2.0]).unwrap();
     }
-    index.insert(100, vec![1.0, 2.0]);
-    index.insert(3, vec![1.0, 2.0, 3.0, 4.0]);
+    let mismatch = |id, left| AdmissionError {
+        id,
+        error: VectorDomainError::DimensionMismatch { left, right: 3 },
+    };
+    assert_eq!(index.insert(100, vec![1.0, 2.0]), Err(mismatch(100, 2)));
+    assert_eq!(
+        index.insert(3, vec![1.0, 2.0, 3.0, 4.0]),
+        Err(mismatch(3, 4))
+    );
     let batch: Vec<(u64, Vec<f32>)> = (200..300u64)
         .map(|i| {
             let dim = if i % 3 == 0 { 5 } else { 3 };
             (i, vec![i as f32; dim])
         })
         .collect();
-    index.insert_batch(batch);
+    // 201 is the first multiple of three in the batch: its first wrong item.
+    assert_eq!(index.insert_batch(batch.clone()), Err(mismatch(201, 5)));
+    assert_eq!(index.bulk_build(batch), Err(mismatch(201, 5)));
     assert!(!index.contains(100));
     assert_eq!(
         index.get_vector(index.idx_for_id_for_test(3).expect("kept")),
         Some([3.0, 1.0, 2.0].as_slice()),
         "a wrong-dimension update replaced node 3"
     );
-    assert!(
-        (200..300u64)
-            .filter(|i| i % 3 == 0)
-            .all(|i| !index.contains(i))
+    assert!((200..300u64).all(|i| !index.contains(i)));
+    assert_eq!(index.len(), 10);
+}
+
+/// A vector the metric cannot evaluate is refused on every insert path, and a
+/// query it cannot evaluate is refused on every search path, with the reason:
+/// non-finite components for every metric, a zero vector under cosine. A zero
+/// vector is an ordinary vector for the other metrics.
+#[test]
+fn vectors_the_metric_cannot_evaluate_are_refused() {
+    let mut cosine = super::HnswIndex::new(make_config(VectorMetric::Cosine));
+    let zero = AdmissionError {
+        id: 7,
+        error: VectorDomainError::ZeroVectorCosine,
+    };
+    assert_eq!(cosine.insert(7, vec![0.0, -0.0]), Err(zero));
+    assert_eq!(cosine.insert_shared(7, &[0.0, 0.0]), Err(zero));
+    assert_eq!(
+        cosine.insert_batch(vec![(1, vec![1.0, 0.0]), (7, vec![0.0, 0.0])]),
+        Err(zero)
     );
-    assert!(
-        (200..300u64)
-            .filter(|i| i % 3 != 0)
-            .all(|i| index.contains(i))
+    assert!(cosine.is_empty(), "a refused batch applied an item");
+    cosine.insert(1, vec![1.0, 0.0]).unwrap();
+    // A tiny nonzero vector has a direction.
+    cosine.insert(2, vec![1e-40, 0.0]).unwrap();
+    let domain = |e| VectorSearchError::Domain(e);
+    assert_eq!(
+        cosine.search(&[0.0, 0.0], 1),
+        Err(domain(VectorDomainError::ZeroVectorCosine))
     );
-    let accepted = (200..300u64).filter(|i| i % 3 != 0).count();
-    assert_eq!(index.len(), 10 + accepted);
+    assert_eq!(
+        cosine.search_with_mode(&[0.0, 0.0], 1, SearchMode::Exact),
+        Err(domain(VectorDomainError::ZeroVectorCosine))
+    );
+    assert_eq!(
+        cosine
+            .search_with_visibility(&[0.0, 0.0], 1, 1.2, 3, |_| true)
+            .map(|(found, _)| found),
+        Err(domain(VectorDomainError::ZeroVectorCosine))
+    );
+    assert_eq!(
+        cosine.search(&[1.0, f32::NAN], 1),
+        Err(domain(VectorDomainError::NonFinite { index: 1 }))
+    );
+    assert_eq!(
+        cosine.search(&[1.0, 0.0, 0.0], 1),
+        Err(domain(VectorDomainError::DimensionMismatch {
+            left: 3,
+            right: 2
+        }))
+    );
+    let ids: Vec<u64> = cosine
+        .search(&[1.0, 0.0], 2)
+        .unwrap()
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids, [1, 2]);
+
+    for metric in [VectorMetric::L2, VectorMetric::DotProduct, VectorMetric::L1] {
+        let mut index = super::HnswIndex::new(make_config(metric));
+        assert_eq!(
+            index.insert(1, vec![f32::INFINITY, 0.0]),
+            Err(AdmissionError {
+                id: 1,
+                error: VectorDomainError::NonFinite { index: 0 }
+            })
+        );
+        index.insert(1, vec![0.0, 0.0]).unwrap();
+        assert_eq!(index.search(&[0.0, 0.0], 1).unwrap()[0].id, 1);
+    }
 }
 
 /// Updating a node's vector refreshes the norms the cosine kernels read: a

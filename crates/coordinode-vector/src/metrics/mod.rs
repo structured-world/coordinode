@@ -9,6 +9,7 @@
 use coordinode_core::graph::types::VectorMetric;
 use tracing::info;
 
+pub mod exact;
 pub mod maxsim;
 pub use maxsim::{maxsim, maxsim_per_query_token};
 

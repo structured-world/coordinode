@@ -34,7 +34,7 @@ fn bulk_build_below_threshold_routes_to_insert_batch() {
     let mut idx = make_index(4);
     let items = synth_items(BULK_BUILD_THRESHOLD - 1, 4);
     let expected = items.len();
-    idx.bulk_build(items);
+    idx.bulk_build(items).unwrap();
     assert_eq!(idx.len(), expected);
 }
 
@@ -114,7 +114,20 @@ fn bulk_build_at_threshold_matches_insert_batch_membership() {
     let mut idx_bulk = make_index(4);
     let mut idx_batch = make_index(4);
     let items = synth_items(BULK_BUILD_THRESHOLD, 4);
-    idx_bulk.bulk_build(items.clone());
-    idx_batch.insert_batch(items);
+    idx_bulk.bulk_build(items.clone()).unwrap();
+    idx_batch.insert_batch(items).unwrap();
     assert_eq!(idx_bulk.len(), idx_batch.len());
+}
+
+/// Above the threshold too, a batch holding a vector the index cannot take is
+/// refused before anything is inserted: no leader is seeded from it.
+#[test]
+fn bulk_build_refuses_the_whole_batch_before_seeding() {
+    let mut idx = make_index(4);
+    let mut items = synth_items(BULK_BUILD_THRESHOLD * 2, 4);
+    let last = items.len() - 1;
+    items[last].1[2] = f32::NAN;
+    let refused = idx.bulk_build(items).unwrap_err();
+    assert_eq!(refused.id, last as u64);
+    assert!(idx.is_empty());
 }

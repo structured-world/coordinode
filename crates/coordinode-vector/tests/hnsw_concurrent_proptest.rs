@@ -86,7 +86,7 @@ proptest! {
         let _ = (dim, batch_size, m); // shape is fixed inside; vary by config.
         let cfg = make_config(m, 16, 1_000);
         let mut idx = HnswIndex::new(cfg);
-        idx.insert_batch(batch.clone());
+        idx.insert_batch(batch.clone()).unwrap();
 
         // Property 1 — membership: every unique id in the input must be
         // present in the index.
@@ -111,7 +111,7 @@ proptest! {
         }
         let mut hits = 0usize;
         for (id, v) in &winning {
-            let top = idx.search(v, 1);
+            let top = idx.search(v, 1).unwrap();
             if !top.is_empty() && top[0].id == *id {
                 hits += 1;
             }
@@ -143,14 +143,14 @@ proptest! {
 
         // Path A: two batches.
         let mut a = HnswIndex::new(cfg_a);
-        a.insert_batch(first.clone());
-        a.insert_batch(second.clone());
+        a.insert_batch(first.clone()).unwrap();
+        a.insert_batch(second.clone()).unwrap();
 
         // Path B: one combined batch.
         let mut b = HnswIndex::new(cfg_b);
         let mut combined = first.clone();
         combined.extend(second.clone());
-        b.insert_batch(combined);
+        b.insert_batch(combined).unwrap();
 
         // Both paths must have the same set of node ids — independent
         // of dedupe semantics within each batch (we resolve to "any id
@@ -174,7 +174,7 @@ proptest! {
     ) {
         let cfg = make_config(8, 16, 1_000);
         let mut idx = HnswIndex::new(cfg);
-        idx.insert_batch(batch);
+        idx.insert_batch(batch).unwrap();
 
         if idx.is_empty() {
             return Ok(());
@@ -187,7 +187,7 @@ proptest! {
 
         // Reference result from a single-threaded search.
         let baseline: Vec<u64> =
-            idx.search(&query, 5).into_iter().map(|r| r.id).collect();
+            idx.search(&query, 5).unwrap().into_iter().map(|r| r.id).collect();
 
         // Run 8 concurrent searches; every result set must equal the
         // baseline (deterministic search — same query, same graph).
@@ -201,7 +201,8 @@ proptest! {
             let baseline = baseline_arc.clone();
             let q = query.clone();
             handles.push(thread::spawn(move || {
-                let got: Vec<u64> = idx.search(&q, 5).into_iter().map(|r| r.id).collect();
+                let got: Vec<u64> =
+                    idx.search(&q, 5).unwrap().into_iter().map(|r| r.id).collect();
                 got == *baseline
             }));
         }

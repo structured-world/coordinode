@@ -9,6 +9,8 @@
 //! that load, the insert rate and the recall once it is done. Run with
 //! `cargo bench -p coordinode-vector --bench hnsw_publication`.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::types::VectorMetric;
@@ -71,15 +73,17 @@ fn main() {
     let build = Instant::now();
     if sequential {
         for (i, v) in data.into_iter().enumerate() {
-            index.insert(i as u64, v);
+            index.insert(i as u64, v).unwrap();
         }
     } else {
-        index.insert_batch(
-            data.into_iter()
-                .enumerate()
-                .map(|(i, v)| (i as u64, v))
-                .collect(),
-        );
+        index
+            .insert_batch(
+                data.into_iter()
+                    .enumerate()
+                    .map(|(i, v)| (i as u64, v))
+                    .collect(),
+            )
+            .unwrap();
     }
     println!(
         "build ({}): {N} x {DIM} in {:.2?}",
@@ -94,7 +98,7 @@ fn main() {
         let start = Instant::now();
         for q in &queries {
             let t = Instant::now();
-            std::hint::black_box(index.search(q, K));
+            std::hint::black_box(index.search(q, K).unwrap());
             times.push(t.elapsed());
         }
         let total = start.elapsed();
@@ -129,7 +133,7 @@ fn control_recall(queries: &[Vec<f32>]) {
         .enumerate()
         .map(|(i, v)| (i as u64, v))
         .collect();
-    index.insert_batch(all);
+    index.insert_batch(all).unwrap();
     println!(
         "recall@{K} of a batch-built control ({} vectors): {:.4}",
         index.len(),
@@ -140,8 +144,8 @@ fn control_recall(queries: &[Vec<f32>]) {
 fn recall(index: &HnswIndex, queries: &[Vec<f32>]) -> f64 {
     let mut hits = 0usize;
     for q in queries {
-        let exact = index.search_with_mode(q, K, SearchMode::Exact);
-        let approx = index.search(q, K);
+        let exact = index.search_with_mode(q, K, SearchMode::Exact).unwrap();
+        let approx = index.search(q, K).unwrap();
         hits += approx
             .iter()
             .filter(|a| exact.iter().any(|e| e.id == a.id))
@@ -165,7 +169,7 @@ fn live_phase(index: &HnswIndex, queries: &[Vec<f32>]) {
                 let (fresh, inserting) = (&fresh, &inserting);
                 s.spawn(move || {
                     for (i, v) in fresh.iter().enumerate().skip(t * per).take(per) {
-                        index.insert_shared((N + i) as u64, v);
+                        index.insert_shared((N + i) as u64, v).unwrap();
                     }
                     inserting.fetch_sub(1, std::sync::atomic::Ordering::Release);
                 })
@@ -174,7 +178,7 @@ fn live_phase(index: &HnswIndex, queries: &[Vec<f32>]) {
         let mut q = 0usize;
         while inserting.load(std::sync::atomic::Ordering::Acquire) > 0 {
             let t = Instant::now();
-            std::hint::black_box(index.search(&queries[q % queries.len()], K));
+            std::hint::black_box(index.search(&queries[q % queries.len()], K).unwrap());
             times.push(t.elapsed());
             q += 1;
         }

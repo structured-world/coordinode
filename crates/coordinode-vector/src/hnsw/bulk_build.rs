@@ -22,7 +22,7 @@
 use coordinode_core::graph::types::VectorMetric;
 use rayon::prelude::*;
 
-use super::HnswIndex;
+use super::{AdmissionError, HnswIndex};
 use crate::metrics;
 
 /// Minimum item count at which the cluster-and-stitch path is
@@ -52,10 +52,16 @@ pub(crate) const BULK_BUILD_THRESHOLD: usize = 256;
 /// stitch (Step 4). The seeded path here is a strict superset of
 /// `insert_batch` and must produce a graph with the same membership;
 /// recall comes from later steps.
-pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>, cache_reorder: bool) {
+///
+/// The caller admitted every item already.
+pub(crate) fn bulk_build(
+    index: &mut HnswIndex,
+    items: Vec<(u64, Vec<f32>)>,
+    cache_reorder: bool,
+) -> Result<(), AdmissionError> {
     let n = items.len();
     if n == 0 {
-        return;
+        return Ok(());
     }
 
     let leader_count = leader_count_for(n);
@@ -81,7 +87,7 @@ pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>, cac
     // sees every prior leader; this builds a clean upper-graph
     // skeleton across the leader sample.
     for (id, vec) in leaders {
-        index.insert(id, vec);
+        index.insert(id, vec)?;
     }
 
     // Followers ride the parallel insert_batch path against the
@@ -90,7 +96,7 @@ pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>, cac
     if !followers.is_empty() {
         let leader_vecs: Vec<Vec<f32>> = leaders_for_assignment;
         let reordered = cluster_order_followers(followers, &leader_vecs, index.config().metric);
-        index.insert_batch(reordered);
+        index.insert_batch(reordered)?;
     }
 
     // Opt-in O6 cache-locality pass: renumber nodes into BFS visit order so the
@@ -99,6 +105,7 @@ pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>, cac
     if cache_reorder {
         index.reorder_for_cache_locality();
     }
+    Ok(())
 }
 
 /// Brute-force assign every follower to the index of its nearest

@@ -105,6 +105,7 @@ fn prefetch_read_data(ptr: *const u8) {
 use std::collections::HashMap;
 
 use crate::metrics;
+pub use crate::metrics::exact::{ExactQuery, VectorDomainError};
 use crate::quantize::Sq8Params;
 use crate::quantize::rabitq::{RaBitQCode, RaBitQExtCode, RaBitQParams, RaBitQQuery};
 
@@ -472,11 +473,72 @@ pub(crate) struct LayerPlan {
     pub max_conn: usize,
 }
 
-/// A search result with node ID and distance/similarity.
+/// A search result: the node and its exact ranking distance under the
+/// index's metric (see [`ExactQuery`]): lower ranks first, ties by id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
     pub id: u64,
-    pub score: f32,
+    pub score: f64,
+}
+
+/// Why a search produced no results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum VectorSearchError {
+    /// The query, or a candidate's retained or decoded values, cannot be
+    /// evaluated under the index's metric.
+    #[error(transparent)]
+    Domain(#[from] VectorDomainError),
+    /// A candidate has no values to score here: its f32 vector is offloaded
+    /// and the search was given no loader for it, and it has no SQ8 code.
+    #[error("node {id} has no retained values to score: its vectors are offloaded")]
+    NoRetainedValues {
+        /// The candidate's id.
+        id: u64,
+    },
+}
+
+/// Why a metered search produced no results: the meter stopped it, or it
+/// failed as an unmetered search does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SearchError<S> {
+    /// The meter stopped the search.
+    #[error("the search was stopped")]
+    Stopped(S),
+    /// The search failed.
+    #[error(transparent)]
+    Failed(VectorSearchError),
+}
+
+impl<S> From<VectorSearchError> for SearchError<S> {
+    fn from(error: VectorSearchError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl<S> From<VectorDomainError> for SearchError<S> {
+    fn from(error: VectorDomainError) -> Self {
+        Self::Failed(VectorSearchError::Domain(error))
+    }
+}
+
+/// An unmetered search's result: the meter cannot stop it.
+fn unmetered<T>(
+    found: Result<T, SearchError<core::convert::Infallible>>,
+) -> Result<T, VectorSearchError> {
+    found.map_err(|error| match error {
+        SearchError::Stopped(never) => match never {},
+        SearchError::Failed(error) => error,
+    })
+}
+
+/// Why an index refused a vector; nothing of the insert or batch was applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the vector of node {id} cannot be indexed: {error}")]
+pub struct AdmissionError {
+    /// The node whose vector was refused.
+    pub id: u64,
+    /// What is wrong with it.
+    pub error: VectorDomainError,
 }
 
 /// Search strategy. Callers can opt into recall=1.0 brute-force kNN
@@ -675,12 +737,13 @@ impl Ord for FarCandidate {
     }
 }
 
-/// A result kept by an exact top-k selection: its distance and the node's
-/// id, ordered as the ranking is, by [`metrics::ranked_order`]. The heap holds
-/// the worst kept result at its top.
+/// A result kept by an exact top-k selection: its exact ranking distance and
+/// the node's id, ordered as the ranking is, by
+/// [`metrics::exact::ranked_order`]. The heap holds the worst kept result at
+/// its top.
 #[derive(Clone, Copy)]
 struct RankedResult {
-    distance: f32,
+    distance: f64,
     id: u64,
 }
 
@@ -699,7 +762,7 @@ impl PartialOrd for RankedResult {
 
 impl Ord for RankedResult {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        metrics::ranked_order(self.distance, self.id, other.distance, other.id)
+        metrics::exact::ranked_order(self.distance, self.id, other.distance, other.id)
     }
 }
 
@@ -1041,10 +1104,61 @@ impl HnswIndex {
     /// both CREATE and SET.
     ///
     /// Through [`Self::insert_shared`], then the calibration it reports due.
-    pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
-        if self.insert_shared(id, &vector) {
+    ///
+    /// # Errors
+    ///
+    /// [`AdmissionError`] when the vector cannot be indexed (see
+    /// [`Self::check`]); the index is unchanged.
+    pub fn insert(&mut self, id: u64, vector: Vec<f32>) -> Result<(), AdmissionError> {
+        if self.insert_shared(id, &vector)? {
             self.calibrate_if_due();
         }
+        Ok(())
+    }
+
+    /// Check that node `id`'s `vector` can be indexed: finite and nonempty,
+    /// of the index's dimension once it has one, and nonzero under cosine.
+    ///
+    /// # Errors
+    ///
+    /// [`AdmissionError`] naming `id` and the reason.
+    pub fn check(&self, id: u64, vector: &[f32]) -> Result<(), AdmissionError> {
+        let reference = self
+            .data_level0
+            .get()
+            .map(data_level0::DataLevel0Block::dim);
+        self.check_against(id, vector, reference)
+    }
+
+    fn check_against(
+        &self,
+        id: u64,
+        vector: &[f32],
+        reference: Option<usize>,
+    ) -> Result<(), AdmissionError> {
+        let refuse = |error| AdmissionError { id, error };
+        metrics::exact::admit(vector, self.config.metric).map_err(refuse)?;
+        match reference {
+            Some(dim) if dim != vector.len() => Err(refuse(VectorDomainError::DimensionMismatch {
+                left: vector.len(),
+                right: dim,
+            })),
+            _ => Ok(()),
+        }
+    }
+
+    /// Check every vector of a batch before any is applied: each as
+    /// [`Self::check`] does, and all of one dimension, the index's or, in an
+    /// empty index, the first item's.
+    fn check_batch(&self, items: &[(u64, Vec<f32>)]) -> Result<(), AdmissionError> {
+        let reference = self
+            .data_level0
+            .get()
+            .map(data_level0::DataLevel0Block::dim)
+            .or_else(|| items.first().map(|(_, v)| v.len()));
+        items
+            .iter()
+            .try_for_each(|(id, vector)| self.check_against(*id, vector, reference))
     }
 
     /// Batched insert: the items go in concurrently across the rayon pool,
@@ -1058,17 +1172,30 @@ impl HnswIndex {
     ///
     /// Through [`Self::insert_batch_shared`], then the calibration it reports
     /// due.
-    pub fn insert_batch(&mut self, items: Vec<(u64, Vec<f32>)>) {
-        if self.insert_batch_shared(items) {
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::insert_batch_shared`].
+    pub fn insert_batch(&mut self, items: Vec<(u64, Vec<f32>)>) -> Result<(), AdmissionError> {
+        if self.insert_batch_shared(items)? {
             self.calibrate_if_due();
         }
+        Ok(())
     }
 
     /// [`Self::insert_batch`] through a shared borrow, concurrently with
     /// searches and other inserts. Returns whether a calibration is now due;
     /// the caller runs [`Self::calibrate_if_due`] once it holds the index
     /// exclusively.
-    pub fn insert_batch_shared(&self, mut items: Vec<(u64, Vec<f32>)>) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// [`AdmissionError`] for the first item that cannot be indexed, checked
+    /// before any item is applied, so a refused batch leaves the index as it
+    /// was. A concurrent first insert of another dimension can still take the
+    /// index's dimension meanwhile; the items of the other dimension are then
+    /// refused as they come.
+    pub fn insert_batch_shared(&self, items: Vec<(u64, Vec<f32>)>) -> Result<bool, AdmissionError> {
         use rayon::prelude::*;
         const SEED_DENSITY: usize = 64;
         // Largest share of the graph a wave of concurrent inserts may add.
@@ -1079,7 +1206,7 @@ impl HnswIndex {
         // Bound on repair passes; each finds fewer unreached nodes.
         const CONNECT_PASSES: usize = 8;
 
-        self.screen_dims(&mut items);
+        self.check_batch(&items)?;
         // Concurrent inserts of one id finish in any order; keeping only the
         // last occurrence keeps the batch's own order meaningful.
         let mut last: rustc_hash::FxHashMap<u64, usize> = rustc_hash::FxHashMap::default();
@@ -1098,7 +1225,7 @@ impl HnswIndex {
         let seed = items.len().min(SEED_DENSITY.saturating_sub(self.len()));
         let rest = items.split_off(seed);
         for (id, vector) in items {
-            self.insert_shared(id, &vector);
+            self.insert_shared(id, &vector)?;
         }
         // The rest goes in waves of at most a `WAVE_SHARE`th of the graph
         // as it stands: an insert links to what is published, and the
@@ -1117,9 +1244,8 @@ impl HnswIndex {
                 remaining = later;
                 continue;
             }
-            now.par_iter().for_each(|(id, vector)| {
-                self.insert_shared(*id, vector);
-            });
+            now.par_iter()
+                .try_for_each(|(id, vector)| self.insert_shared(*id, vector).map(drop))?;
             remaining = later;
         }
         // A batch this large is a build: one pass over the graph per node it
@@ -1133,7 +1259,7 @@ impl HnswIndex {
                 }
             }
         }
-        self.calibration_due()
+        Ok(self.calibration_due())
     }
 
     /// Bulk-build path for static corpora where every vector is known
@@ -1166,13 +1292,17 @@ impl HnswIndex {
     /// ParlayANN topology); that work requires threading an
     /// allowed-node bitmap through the search-internals and is
     /// deliberately not part of this entry point.
-    pub fn bulk_build(&mut self, mut items: Vec<(u64, Vec<f32>)>) {
-        self.screen_dims(&mut items);
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::insert_batch_shared`]: the batch is checked before any
+    /// item is applied.
+    pub fn bulk_build(&mut self, items: Vec<(u64, Vec<f32>)>) -> Result<(), AdmissionError> {
+        self.check_batch(&items)?;
         if items.len() < bulk_build::BULK_BUILD_THRESHOLD {
-            self.insert_batch(items);
-            return;
+            return self.insert_batch(items);
         }
-        bulk_build::bulk_build(self, items, false);
+        bulk_build::bulk_build(self, items, false)
     }
 
     /// Bulk-build then run a BFS cache-locality reorder.
@@ -1180,14 +1310,21 @@ impl HnswIndex {
     /// one-off post-build pass for better search cache locality. Prefer this for
     /// read-heavy indexes built once and queried many times; use
     /// [`bulk_build`](Self::bulk_build) when the index keeps mutating.
-    pub fn bulk_build_cache_optimized(&mut self, mut items: Vec<(u64, Vec<f32>)>) {
-        self.screen_dims(&mut items);
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bulk_build`].
+    pub fn bulk_build_cache_optimized(
+        &mut self,
+        items: Vec<(u64, Vec<f32>)>,
+    ) -> Result<(), AdmissionError> {
+        self.check_batch(&items)?;
         if items.len() < bulk_build::BULK_BUILD_THRESHOLD {
-            self.insert_batch(items);
+            self.insert_batch(items)?;
             self.reorder_for_cache_locality();
-            return;
+            return Ok(());
         }
-        bulk_build::bulk_build(self, items, true);
+        bulk_build::bulk_build(self, items, true)
     }
 
     /// Choose the neighbours of a node at `vector` on every layer from
@@ -1292,30 +1429,6 @@ impl HnswIndex {
             // exclusivity are the caller's.
             unsafe { block.set_vector(idx, vector) };
         }
-    }
-
-    /// Drop, with a warning, the batch items whose dimension is zero or
-    /// differs from the index's (or, before the first insert, from the first
-    /// non-empty item's). Batch planning and cluster assignment compare items
-    /// with each other, and the distance kernels assume equal lengths.
-    fn screen_dims(&self, items: &mut Vec<(u64, Vec<f32>)>) {
-        let reference = self
-            .data_level0
-            .get()
-            .map(data_level0::DataLevel0Block::dim)
-            .or_else(|| items.iter().map(|(_, v)| v.len()).find(|&d| d > 0));
-        items.retain(|(id, vec)| {
-            let accepted = !vec.is_empty() && Some(vec.len()) == reference;
-            if !accepted {
-                warn!(
-                    node_id = *id,
-                    dim = vec.len(),
-                    index_dim = reference,
-                    "HNSW insert rejected: vector dimension is zero or differs from the index"
-                );
-            }
-            accepted
-        });
     }
 
     /// Allocate the RaBitQ code block on the first insert of a RaBitQ index,
@@ -1516,18 +1629,7 @@ impl HnswIndex {
     /// the caller links it. `None` when the vector's dimension is zero or
     /// differs from the index's; then no slot is taken.
     fn allocate_node(&self, id: u64, new_level: usize, vector: &[f32]) -> Option<usize> {
-        let Some(block) = self.store_for(vector.len()) else {
-            warn!(
-                node_id = id,
-                dim = vector.len(),
-                index_dim = self
-                    .data_level0
-                    .get()
-                    .map(data_level0::DataLevel0Block::dim),
-                "HNSW insert rejected: vector dimension is zero or differs from the index"
-            );
-            return None;
-        };
+        let block = self.store_for(vector.len())?;
         // The slot is this insert's alone: no link or entry point names it
         // until the caller links the node. A reused slot is reachable from
         // nothing either: it became free only after every operation that
@@ -1604,21 +1706,39 @@ impl HnswIndex {
     /// calibration run yet. Calibration rewrites every node's code and takes
     /// the index exclusively, so the caller runs it with
     /// [`Self::calibrate_if_due`].
-    pub fn insert_shared(&self, id: u64, vector: &[f32]) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// [`AdmissionError`] when the vector cannot be indexed (see
+    /// [`Self::check`]), including a concurrent first insert having given the
+    /// index another dimension; the index is unchanged.
+    pub fn insert_shared(&self, id: u64, vector: &[f32]) -> Result<bool, AdmissionError> {
+        self.check(id, vector)?;
         self.admit();
         let op = self.begin_operation();
         if let Some(current) = self.id_to_idx.get(id) {
             if self.read_node_f32(current) == Some(vector) {
-                return false;
+                return Ok(false);
             }
         }
         let new_level = self.random_level();
         let Some(idx) = self.allocate_node(id, new_level, vector) else {
-            return false;
+            // Admitted against no dimension yet, and another first insert
+            // created the store with its own meanwhile.
+            return Err(AdmissionError {
+                id,
+                error: VectorDomainError::DimensionMismatch {
+                    left: vector.len(),
+                    right: self
+                        .data_level0
+                        .get()
+                        .map_or(0, data_level0::DataLevel0Block::dim),
+                },
+            });
         };
         self.link_node(idx, id, new_level, vector);
         self.finish_insert(idx, id, new_level, &op);
-        self.calibration_due()
+        Ok(self.calibration_due())
     }
 
     /// Make the linked node `idx` a result: live, mapped from `id` (retiring
@@ -2154,14 +2274,77 @@ impl HnswIndex {
         // follow-up.
     }
 
-    /// Search for K nearest neighbors.
+    /// Search for the K nearest neighbours.
     ///
-    /// When SQ8 quantization is active, HNSW traversal uses approximate
-    /// (dequantized) distances for candidate generation. The final top-K
-    /// results are reranked using exact f32 distances.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
-        let Ok(found) = self.search_metered(query, k, &mut Unmetered);
-        found
+    /// Traversal ranks candidates by the approximate f32 (or quantized)
+    /// estimator; the `ef` candidates it returns are then scored exactly
+    /// ([`ExactQuery`], binary64, canonical reduction) and the best K by that
+    /// score, ties by id, are the result.
+    ///
+    /// # Errors
+    ///
+    /// [`VectorSearchError::Domain`] for a query the metric cannot evaluate
+    /// (empty, non-finite, another dimension than the index's, zero under
+    /// cosine) or a candidate whose values cannot be scored.
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>, VectorSearchError> {
+        unmetered(self.search_metered(query, k, &mut Unmetered))
+    }
+
+    /// The query checked for this index: its metric, and its dimension when
+    /// the index holds vectors.
+    fn exact_query<'q>(&self, query: &'q [f32]) -> Result<ExactQuery<'q>, VectorDomainError> {
+        let exact = ExactQuery::new(query, self.config.metric)?;
+        if let Some(dim) = self
+            .data_level0
+            .get()
+            .map(data_level0::DataLevel0Block::dim)
+        {
+            if dim != query.len() {
+                return Err(VectorDomainError::DimensionMismatch {
+                    left: query.len(),
+                    right: dim,
+                });
+            }
+        }
+        Ok(exact)
+    }
+
+    /// The exact ranking distance of node `idx`, from its retained f32
+    /// vector, or from the values its SQ8 code decodes to when the f32 vector
+    /// was offloaded.
+    fn exact_node_distance(
+        &self,
+        exact: &ExactQuery<'_>,
+        idx: usize,
+    ) -> Result<f64, VectorSearchError> {
+        if let Some(vector) = self.read_node_f32(idx) {
+            return Ok(exact.distance(vector)?);
+        }
+        if let (Some(params), Some(code)) = (self.sq8_params.as_ref(), self.node_sq8(idx)) {
+            return Ok(exact.distance(&params.dequantize(code))?);
+        }
+        Err(VectorSearchError::NoRetainedValues {
+            id: self.node_id(idx),
+        })
+    }
+
+    /// The traversal's candidates scored exactly and in the ranking's order.
+    fn rank_exactly(
+        &self,
+        exact: &ExactQuery<'_>,
+        candidates: Vec<Candidate>,
+    ) -> Result<Vec<SearchResult>, VectorSearchError> {
+        let mut ranked = candidates
+            .into_iter()
+            .map(|c| {
+                Ok(SearchResult {
+                    id: self.node_id(c.idx as usize),
+                    score: self.exact_node_distance(exact, c.idx as usize)?,
+                })
+            })
+            .collect::<Result<Vec<_>, VectorSearchError>>()?;
+        ranked.sort_by(|a, b| metrics::exact::ranked_order(a.score, a.id, b.score, b.id));
+        Ok(ranked)
     }
 
     /// [`Self::search`] reporting its progress to `meter`, which can stop
@@ -2169,13 +2352,14 @@ impl HnswIndex {
     ///
     /// # Errors
     ///
-    /// The stop `meter` returned.
+    /// The stop `meter` returned, or what [`Self::search`] fails with.
     pub fn search_metered<M: Meter>(
         &self,
         query: &[f32],
         k: usize,
         meter: &mut M,
-    ) -> Result<Vec<SearchResult>, M::Stop> {
+    ) -> Result<Vec<SearchResult>, SearchError<M::Stop>> {
+        let exact = self.exact_query(query)?;
         let _op = self.begin_operation();
         // Cache query-side state once per search — for Cosine the query norm
         // would otherwise be recomputed on every distance call (hundreds of
@@ -2200,7 +2384,9 @@ impl HnswIndex {
 
         // Traverse from top to layer 1 (greedy)
         for level in (1..=top_level).rev() {
-            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level, meter)?;
+            current_ep = self
+                .search_layer_greedy_ctx(&qctx, current_ep, level, meter)
+                .map_err(SearchError::Stopped)?;
         }
 
         // Effective layer-0 beam must be at least `k`. Without this floor
@@ -2214,47 +2400,36 @@ impl HnswIndex {
         }
 
         // Search at layer 0 with ef candidates
-        let candidates = self.results_only(self.search_layer_ctx(&qctx, current_ep, ef, 0, meter)?);
-
-        if self.is_quantized() {
-            // Rerank candidates using exact f32 distance
-            meter.work(candidates.len() as u64)?;
-            let mut reranked: Vec<SearchResult> = candidates
-                .into_iter()
-                .map(|c| {
-                    let exact_dist = self.compute_exact_distance(&qctx, c.idx as usize);
-                    SearchResult {
-                        id: self.node_id(c.idx as usize),
-                        score: exact_dist,
-                    }
-                })
-                .collect();
-            reranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
-            reranked.truncate(k);
-            Ok(reranked)
-        } else {
-            // No quantization: the candidates in the ranking's order, equal
-            // distances by id rather than by slot.
-            let mut ranked: Vec<SearchResult> = candidates
-                .into_iter()
-                .map(|c| SearchResult {
-                    id: self.node_id(c.idx as usize),
-                    score: c.distance,
-                })
-                .collect();
-            ranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
-            ranked.truncate(k);
-            Ok(ranked)
-        }
+        let candidates = self.results_only(
+            self.search_layer_ctx(&qctx, current_ep, ef, 0, meter)
+                .map_err(SearchError::Stopped)?,
+        );
+        // Every candidate the traversal returned is scored exactly: the
+        // estimator's order is not the result's.
+        meter
+            .work(candidates.len() as u64)
+            .map_err(SearchError::Stopped)?;
+        let mut ranked = self.rank_exactly(&exact, candidates)?;
+        ranked.truncate(k);
+        Ok(ranked)
     }
 
     /// Search with explicit mode selection. `SearchMode::Hnsw` matches
     /// `search()`; `SearchMode::Exact` performs a brute-force linear scan
     /// over every indexed vector and returns recall=1.0 top-k. Both modes
-    /// share the same stored vectors (no auxiliary index) and the same
-    /// distance kernels, so callers can mix exact and approximate queries
-    /// against one collection without reloading the data.
-    pub fn search_with_mode(&self, query: &[f32], k: usize, mode: SearchMode) -> Vec<SearchResult> {
+    /// share the same stored vectors (no auxiliary index) and score their
+    /// results the same way, so callers can mix exact and approximate
+    /// queries against one collection without reloading the data.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::search`].
+    pub fn search_with_mode(
+        &self,
+        query: &[f32],
+        k: usize,
+        mode: SearchMode,
+    ) -> Result<Vec<SearchResult>, VectorSearchError> {
         match mode {
             SearchMode::Hnsw => self.search(query, k),
             SearchMode::Exact => self.search_exact(query, k),
@@ -2263,24 +2438,23 @@ impl HnswIndex {
 
     /// Brute-force exact k-NN over every indexed vector.
     ///
-    /// Iterates `0..nodes.len()`, computes the exact f32 distance for each,
-    /// and heap-selects the top-k. No graph traversal, no `ef_search`. The
-    /// cost is linear in the index size and independent of `M`, so it is
-    /// the right choice when the per-label collection is small enough that
-    /// HNSW overhead exceeds a straight scan, or when recall=1.0 is a hard
-    /// requirement (regulatory queries, ground-truth validation).
-    fn search_exact(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+    /// Iterates `0..nodes.len()`, scores each exactly, and heap-selects the
+    /// top-k. No graph traversal, no `ef_search`. The cost is linear in the
+    /// index size and independent of `M`, so it is the right choice when the
+    /// per-label collection is small enough that HNSW overhead exceeds a
+    /// straight scan, or when recall=1.0 is a hard requirement (regulatory
+    /// queries, ground-truth validation).
+    fn search_exact(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SearchResult>, VectorSearchError> {
+        let exact = self.exact_query(query)?;
         let _op = self.begin_operation();
         let n = self.node_len();
         if n == 0 || k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let qctx = QueryCtx::new(
-            query,
-            self.config.metric,
-            self.rabitq_params.as_ref(),
-            &self.config.quantization,
-        );
         // Max-heap in the ranking's own order, distance then id: its top is
         // the worst result kept, replaced by any candidate ranked before it.
         // Keyed by id, not slot, so equal distances select the same results
@@ -2294,7 +2468,7 @@ impl HnswIndex {
                 continue;
             }
             let cand = RankedResult {
-                distance: self.compute_exact_distance(&qctx, idx),
+                distance: self.exact_node_distance(&exact, idx)?,
                 id: self.node_id(idx),
             };
             if heap.len() < k {
@@ -2306,13 +2480,14 @@ impl HnswIndex {
                 }
             }
         }
-        heap.into_sorted_vec()
+        Ok(heap
+            .into_sorted_vec()
             .into_iter()
             .map(|r| SearchResult {
                 id: r.id,
                 score: r.distance,
             })
-            .collect()
+            .collect())
     }
 
     /// Search with MVCC snapshot visibility checking.
@@ -2330,6 +2505,11 @@ impl HnswIndex {
     ///
     /// # Returns
     /// `(results, stats)` — filtered results and statistics for EXPLAIN output.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::search`].
+    #[allow(clippy::type_complexity)]
     pub fn search_with_visibility<F>(
         &self,
         query: &[f32],
@@ -2337,22 +2517,24 @@ impl HnswIndex {
         overfetch_factor: f64,
         max_expansion_rounds: usize,
         is_visible: F,
-    ) -> (
-        Vec<SearchResult>,
-        coordinode_core::graph::types::VectorMvccStats,
-    )
+    ) -> Result<
+        (
+            Vec<SearchResult>,
+            coordinode_core::graph::types::VectorMvccStats,
+        ),
+        VectorSearchError,
+    >
     where
         F: Fn(u64) -> bool,
     {
-        let Ok(found) = self.search_with_visibility_metered(
+        unmetered(self.search_with_visibility_metered(
             query,
             k,
             overfetch_factor,
             max_expansion_rounds,
             is_visible,
             &mut Unmetered,
-        );
-        found
+        ))
     }
 
     /// [`Self::search_with_visibility`] reporting its progress to `meter`,
@@ -2360,7 +2542,7 @@ impl HnswIndex {
     ///
     /// # Errors
     ///
-    /// The stop `meter` returned.
+    /// The stop `meter` returned, or what [`Self::search`] fails with.
     #[allow(clippy::type_complexity)]
     pub fn search_with_visibility_metered<F, M: Meter>(
         &self,
@@ -2375,11 +2557,12 @@ impl HnswIndex {
             Vec<SearchResult>,
             coordinode_core::graph::types::VectorMvccStats,
         ),
-        M::Stop,
+        SearchError<M::Stop>,
     >
     where
         F: Fn(u64) -> bool,
     {
+        let exact = self.exact_query(query)?;
         let _op = self.begin_operation();
         let mut stats = coordinode_core::graph::types::VectorMvccStats {
             overfetch_factor,
@@ -2403,7 +2586,9 @@ impl HnswIndex {
 
         // Traverse from top to layer 1 (greedy)
         for level in (1..=top_level).rev() {
-            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level, meter)?;
+            current_ep = self
+                .search_layer_greedy_ctx(&qctx, current_ep, level, meter)
+                .map_err(SearchError::Stopped)?;
         }
 
         let mut visible_results: Vec<SearchResult> = Vec::new();
@@ -2418,45 +2603,30 @@ impl HnswIndex {
         for round in 0..=max_expansion_rounds {
             stats.expansion_rounds = round;
 
-            let candidates =
-                self.results_only(self.search_layer_ctx(&qctx, current_ep, current_ef, 0, meter)?);
-            // Each candidate is reranked or checked for visibility.
-            meter.work(candidates.len() as u64)?;
+            let candidates = self.results_only(
+                self.search_layer_ctx(&qctx, current_ep, current_ef, 0, meter)
+                    .map_err(SearchError::Stopped)?,
+            );
+            // Each candidate is checked for visibility and the visible ones
+            // scored.
+            meter
+                .work(candidates.len() as u64)
+                .map_err(SearchError::Stopped)?;
+            stats.candidates_fetched += candidates.len();
 
-            // Convert to SearchResult with exact distances (rerank if quantized)
-            let results: Vec<SearchResult> = if self.is_quantized() {
-                let mut reranked: Vec<SearchResult> = candidates
-                    .into_iter()
-                    .map(|c| SearchResult {
-                        id: self.node_id(c.idx as usize),
-                        score: self.compute_exact_distance(&qctx, c.idx as usize),
-                    })
-                    .collect();
-                reranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
-                reranked
-            } else {
-                let mut ranked: Vec<SearchResult> = candidates
-                    .into_iter()
-                    .map(|c| SearchResult {
-                        id: self.node_id(c.idx as usize),
-                        score: c.distance,
-                    })
-                    .collect();
-                ranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
-                ranked
-            };
-
-            stats.candidates_fetched += results.len();
-
-            // Post-filter: keep only visible candidates
-            visible_results.clear();
-            for result in &results {
-                if is_visible(result.id) {
-                    visible_results.push(result.clone());
-                } else {
-                    stats.candidates_filtered += 1;
-                }
-            }
+            // Only a visible candidate can be a result, so only those are
+            // scored.
+            let visible: Vec<Candidate> = candidates
+                .into_iter()
+                .filter(|c| {
+                    let shown = is_visible(self.node_id(c.idx as usize));
+                    if !shown {
+                        stats.candidates_filtered += 1;
+                    }
+                    shown
+                })
+                .collect();
+            visible_results = self.rank_exactly(&exact, visible)?;
             stats.candidates_visible = visible_results.len();
 
             if visible_results.len() >= k || round == max_expansion_rounds {
@@ -2476,14 +2646,17 @@ impl HnswIndex {
     /// Used when `offload_vectors` is enabled: HNSW traversal uses SQ8 in-memory,
     /// then batch-loads f32 from the `loader` for exact reranking of top candidates.
     /// When vectors are NOT offloaded, falls back to the regular `search()` path.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::search`].
     pub fn search_with_loader(
         &self,
         query: &[f32],
         k: usize,
         loader: &dyn VectorLoader,
-    ) -> Vec<SearchResult> {
-        let Ok(found) = self.search_with_loader_metered(query, k, loader, &mut Unmetered);
-        found
+    ) -> Result<Vec<SearchResult>, VectorSearchError> {
+        unmetered(self.search_with_loader_metered(query, k, loader, &mut Unmetered))
     }
 
     /// [`Self::search_with_loader`] reporting its progress to `meter`, which
@@ -2491,17 +2664,18 @@ impl HnswIndex {
     ///
     /// # Errors
     ///
-    /// The stop `meter` returned.
+    /// The stop `meter` returned, or what [`Self::search`] fails with.
     pub fn search_with_loader_metered<M: Meter>(
         &self,
         query: &[f32],
         k: usize,
         loader: &dyn VectorLoader,
         meter: &mut M,
-    ) -> Result<Vec<SearchResult>, M::Stop> {
+    ) -> Result<Vec<SearchResult>, SearchError<M::Stop>> {
         if !self.is_offloaded() {
             return self.search_metered(query, k, meter);
         }
+        let exact = self.exact_query(query)?;
         let _op = self.begin_operation();
 
         let qctx = QueryCtx::new(
@@ -2519,7 +2693,9 @@ impl HnswIndex {
         let mut current_ep = start_idx;
 
         for level in (1..=top_level).rev() {
-            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level, meter)?;
+            current_ep = self
+                .search_layer_greedy_ctx(&qctx, current_ep, level, meter)
+                .map_err(SearchError::Stopped)?;
         }
 
         // See `search()` for why the beam floor at `k` is mandatory.
@@ -2528,151 +2704,45 @@ impl HnswIndex {
             .ef_search
             .max(self.config.rerank_candidates)
             .max(k);
-        let candidates = self.results_only(self.search_layer_ctx(&qctx, current_ep, ef, 0, meter)?);
+        let candidates = self.results_only(
+            self.search_layer_ctx(&qctx, current_ep, ef, 0, meter)
+                .map_err(SearchError::Stopped)?,
+        );
 
         // Batch-load f32 vectors from storage for reranking: one id and one
         // full-width vector per candidate.
-        meter.work(candidates.len() as u64)?;
-        meter.scratch(
-            (candidates.len()
-                * (core::mem::size_of::<u64>()
-                    + core::mem::size_of::<Vec<f32>>()
-                    + core::mem::size_of_val(query))) as u64,
-        )?;
+        meter
+            .work(candidates.len() as u64)
+            .map_err(SearchError::Stopped)?;
+        meter
+            .scratch(
+                (candidates.len()
+                    * (core::mem::size_of::<u64>()
+                        + core::mem::size_of::<Vec<f32>>()
+                        + core::mem::size_of_val(query))) as u64,
+            )
+            .map_err(SearchError::Stopped)?;
         let candidate_ids: Vec<u64> = candidates
             .iter()
             .map(|c| self.node_id(c.idx as usize))
             .collect();
         let loaded = loader.load_vectors(&candidate_ids, &self.config.property_name);
 
-        let mut reranked: Vec<SearchResult> = candidates
-            .into_iter()
-            .filter_map(|c| {
-                let node_id = self.node_id(c.idx as usize);
-                let f32_vec = loaded.get(&node_id)?;
-                let exact_dist = self.distance_for_metric(&qctx, f32_vec);
-                Some(SearchResult {
-                    id: node_id,
-                    score: exact_dist,
-                })
-            })
-            .collect();
-        reranked.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
+        let mut reranked = Vec::with_capacity(candidates.len());
+        for c in candidates {
+            let id = self.node_id(c.idx as usize);
+            // The loader returns the vectors the store still holds: a node it
+            // has none for was removed since the index saw it, not a result.
+            if let Some(vector) = loaded.get(&id) {
+                reranked.push(SearchResult {
+                    id,
+                    score: exact.distance(vector)?,
+                });
+            }
+        }
+        reranked.sort_by(|a, b| metrics::exact::ranked_order(a.score, a.id, b.score, b.id));
         reranked.truncate(k);
         Ok(reranked)
-    }
-
-    /// Search with MVCC visibility + external f32 loading (reserved for future use).
-    ///
-    /// Currently the executor handles MVCC post-filtering after search_with_loader,
-    /// so this method is not called from production code. Retained for direct
-    /// HnswIndex API users who want combined visibility + loader in one call.
-    #[allow(dead_code)]
-    pub fn search_with_visibility_and_loader<F>(
-        &self,
-        query: &[f32],
-        k: usize,
-        overfetch_factor: f64,
-        max_expansion_rounds: usize,
-        is_visible: F,
-        loader: Option<&dyn VectorLoader>,
-    ) -> (
-        Vec<SearchResult>,
-        coordinode_core::graph::types::VectorMvccStats,
-    )
-    where
-        F: Fn(u64) -> bool,
-    {
-        // When not offloaded or no loader, delegate to existing method
-        let loader = match loader {
-            Some(l) if self.is_offloaded() => l,
-            _ => {
-                return self.search_with_visibility(
-                    query,
-                    k,
-                    overfetch_factor,
-                    max_expansion_rounds,
-                    is_visible,
-                );
-            }
-        };
-        let _op = self.begin_operation();
-
-        let mut stats = coordinode_core::graph::types::VectorMvccStats {
-            overfetch_factor,
-            ..Default::default()
-        };
-
-        let qctx = QueryCtx::new(
-            query,
-            self.config.metric,
-            self.rabitq_params.as_ref(),
-            &self.config.quantization,
-        );
-
-        // Single-load entry-point snapshot doubles as the empty-index
-        // guard — see `search` above for the consistency rationale.
-        let Some((start_idx, top_level)) = self.entry_point.for_search() else {
-            return (Vec::new(), stats);
-        };
-        let mut current_ep = start_idx;
-
-        for level in (1..=top_level).rev() {
-            let Ok(next) = self.search_layer_greedy_ctx(&qctx, current_ep, level, &mut Unmetered);
-            current_ep = next;
-        }
-
-        let mut visible_results: Vec<SearchResult> = Vec::new();
-        let base_ef = self.config.ef_search.max(self.config.rerank_candidates);
-        let mut current_ef = ((k as f64 * overfetch_factor).ceil() as usize).max(base_ef);
-
-        for round in 0..=max_expansion_rounds {
-            stats.expansion_rounds = round;
-            let Ok(found) = self.search_layer_ctx(&qctx, current_ep, current_ef, 0, &mut Unmetered);
-            let candidates = self.results_only(found);
-
-            // Batch-load f32 for reranking
-            let candidate_ids: Vec<u64> = candidates
-                .iter()
-                .map(|c| self.node_id(c.idx as usize))
-                .collect();
-            let loaded = loader.load_vectors(&candidate_ids, &self.config.property_name);
-
-            let mut results: Vec<SearchResult> = candidates
-                .into_iter()
-                .filter_map(|c| {
-                    let node_id = self.node_id(c.idx as usize);
-                    let f32_vec = loaded.get(&node_id)?;
-                    let exact_dist = self.distance_for_metric(&qctx, f32_vec);
-                    Some(SearchResult {
-                        id: node_id,
-                        score: exact_dist,
-                    })
-                })
-                .collect();
-            results.sort_by(|a, b| metrics::ranked_order(a.score, a.id, b.score, b.id));
-
-            stats.candidates_fetched += results.len();
-
-            visible_results.clear();
-            for result in &results {
-                if is_visible(result.id) {
-                    visible_results.push(result.clone());
-                } else {
-                    stats.candidates_filtered += 1;
-                }
-            }
-            stats.candidates_visible = visible_results.len();
-
-            if visible_results.len() >= k || round == max_expansion_rounds {
-                break;
-            }
-
-            current_ef *= 2;
-        }
-
-        visible_results.truncate(k);
-        (visible_results, stats)
     }
 
     /// Generate a random level for a new element.

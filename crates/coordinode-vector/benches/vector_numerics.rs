@@ -51,28 +51,37 @@ const SCAN_FLOATS: usize = 4 << 20;
 /// arithmetic before and after a change.
 mod api {
     use super::*;
+    use coordinode_vector::metrics::exact;
 
     pub fn score(a: &[f32], b: &[f32], metric: VectorMetric) -> f64 {
-        f64::from(coordinode_vector::metrics::distance(a, b, metric))
+        match metric {
+            VectorMetric::Cosine => exact::cosine_similarity(a, b),
+            VectorMetric::L2 => exact::l2(a, b),
+            VectorMetric::DotProduct => exact::dot(a, b),
+            VectorMetric::L1 => exact::l1(a, b),
+        }
+        .unwrap()
     }
 
     pub fn fill(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>) {
-        index.insert_batch(items);
+        index.insert_batch(items).unwrap();
     }
 
     pub fn exact_top10(index: &HnswIndex, query: &[f32]) -> f64 {
         index
             .search_with_mode(query, 10, SearchMode::Exact)
+            .unwrap()
             .iter()
-            .map(|r| f64::from(r.score))
+            .map(|r| r.score)
             .sum()
     }
 
     pub fn hnsw_top10(index: &HnswIndex, query: &[f32]) -> f64 {
         index
             .search(query, 10)
+            .unwrap()
             .iter()
-            .map(|r| f64::from(r.score))
+            .map(|r| r.score)
             .sum()
     }
 }
