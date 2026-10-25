@@ -59,5 +59,9 @@ serde_json = { workspace = true }
 name = "edge_vector_strategy"
 harness = false
 
+[[bench]]
+name = "vector_merge"
+harness = false
+
 [lints]
 workspace = true
