@@ -419,6 +419,9 @@ pub struct HnswIndex {
     /// Proper RNG gives correct exponential layer distribution.
     /// AtomicU64 so concurrent inserts can draw levels.
     rng_state: std::sync::atomic::AtomicU64,
+    /// Tests: batch waves run blind, every insert planned before any links.
+    #[cfg(test)]
+    blind_waves: std::sync::atomic::AtomicBool,
     /// Optional persistent vector tier backing (truth tier
     /// f32 + quantized rerank tier). `None` for in-memory-only indexes
     /// (tests, ad-hoc analytics); `Some` when the caller has wired up
@@ -743,6 +746,8 @@ impl HnswIndex {
             search_scratch_pool: SearchScratchPool::new(),
             // Seed from address of self (varies per instance). Non-deterministic but fast.
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
+            #[cfg(test)]
+            blind_waves: std::sync::atomic::AtomicBool::new(false),
             vector_tier: None,
             rabitq_block: std::sync::OnceLock::new(),
             data_level0: std::sync::OnceLock::new(),
@@ -1106,6 +1111,12 @@ impl HnswIndex {
         while !remaining.is_empty() {
             let wave = (self.len() / WAVE_SHARE).clamp(1, remaining.len());
             let (now, later) = remaining.split_at(wave);
+            #[cfg(test)]
+            if self.blind_waves.load(core::sync::atomic::Ordering::Relaxed) {
+                self.insert_wave_blind(now);
+                remaining = later;
+                continue;
+            }
             now.par_iter().for_each(|(id, vector)| {
                 self.insert_shared(*id, vector);
             });
@@ -1606,6 +1617,13 @@ impl HnswIndex {
             return false;
         };
         self.link_node(idx, id, new_level, vector);
+        self.finish_insert(idx, id, new_level, &op);
+        self.calibration_due()
+    }
+
+    /// Make the linked node `idx` a result: live, mapped from `id` (retiring
+    /// the node it replaces), and the entry point if it tops the graph.
+    fn finish_insert(&self, idx: usize, id: u64, new_level: usize, op: &Operation<'_>) {
         self.nodes().set_state(idx, data_level0::NodeState::Live);
         match self.id_to_idx.insert(id, idx) {
             Some(old) => {
@@ -1623,7 +1641,29 @@ impl HnswIndex {
         // Linked, so it may now head the descent if it reached a new top
         // layer.
         let _ = self.entry_point.try_promote(new_level as u8, idx as u64);
-        self.calibration_due()
+    }
+
+    /// Insert one wave the way the widest pool can at worst: every node of
+    /// it planned before any is linked, so none sees another. The bound a
+    /// build's quality is tested against.
+    #[cfg(test)]
+    fn insert_wave_blind(&self, wave: &[(u64, Vec<f32>)]) {
+        let op = self.begin_operation();
+        let planned: Vec<_> = wave
+            .iter()
+            .filter_map(|(id, vector)| {
+                let level = self.random_level();
+                let idx = self.allocate_node(*id, level, vector)?;
+                Some((idx, *id, level, vector, self.plan_links(vector, level)))
+            })
+            .collect();
+        for (idx, id, level, vector, plan) in planned {
+            match plan {
+                Some(plan) => self.publish_links(idx, id, plan),
+                None => self.link_node(idx, id, level, vector),
+            }
+            self.finish_insert(idx, id, level, &op);
+        }
     }
 
     /// Remove `id` through a shared borrow, concurrently with searches and
@@ -1769,6 +1809,12 @@ impl HnswIndex {
                 return;
             }
         };
+        self.publish_links(idx, id, per_layer);
+    }
+
+    /// Publish the lists `per_layer` planned for node `idx`, then the
+    /// back-edges that make it reachable.
+    fn publish_links(&self, idx: usize, id: u64, per_layer: Vec<LayerPlan>) {
         let store = self.nodes();
         let per_layer: Vec<(usize, Vec<u64>, usize)> = per_layer
             .into_iter()
@@ -3369,39 +3415,22 @@ impl HnswIndex {
             }
         }
 
-        // Prune back-edges with the SAME diversity heuristic used for new-node
-        // selection (RobustPrune / hnswlib `getNeighborsByHeuristic2`), not a
-        // naive closest-`max_conn` truncation. Truncation drops the long-range /
-        // diverse edges that keep the graph navigable, which measurably lowers
-        // recall-per-ef; the heuristic keeps them. Construction-time only, so the
-        // extra pairwise-distance cost is off the search hot path.
-        let mut kept: Vec<u64> = self
-            .select_neighbours_robust_prune(&candidates, max_conn)
+        // A list that fits keeps every candidate: only an overflow prunes, as
+        // in hnswlib, so pruning never drops an edge it has room for.
+        if candidates.len() <= max_conn {
+            return candidates.iter().map(|c| u64::from(c.idx)).collect();
+        }
+        // An overflow keeps what the diversity heuristic keeps (RobustPrune /
+        // hnswlib `getNeighborsByHeuristic2`), and only that. Topping the list
+        // up with the closest of the rest makes every list a near-kNN list:
+        // the next prune then sees those close nodes first and drops the far
+        // ones they shadow, until nodes away from the dense regions keep no
+        // incoming edge and no search can return them (on 600 random 20-dim
+        // points, up to 131 unreachable).
+        self.select_neighbours_robust_prune(&candidates, max_conn)
             .into_iter()
             .map(|idx| idx as u64)
-            .collect();
-        // hnswlib `keepPrunedConnections`: if the diversity heuristic kept fewer
-        // than `max_conn`, backfill with the closest not-yet-kept candidates so
-        // the back-edge list stays dense. A sparse list (heuristic alone) loses
-        // recall, especially on low-dim / small graphs; this keeps the diverse
-        // long-range edges first, then fills the remaining slots by distance.
-        if kept.len() < max_conn {
-            let kept_set: std::collections::HashSet<u64> = kept.iter().copied().collect();
-            let mut rest: Vec<&Candidate> = candidates
-                .iter()
-                .filter(|c| !kept_set.contains(&u64::from(c.idx)))
-                .collect();
-            rest.sort_by(|a, b| {
-                metrics::distance_order(a.distance, b.distance).then(a.idx.cmp(&b.idx))
-            });
-            for c in rest {
-                if kept.len() >= max_conn {
-                    break;
-                }
-                kept.push(u64::from(c.idx));
-            }
-        }
-        kept
+            .collect()
     }
 
     // ── Atomic neighbour write helpers ─────────────────────────────────────
@@ -3608,35 +3637,20 @@ impl HnswIndex {
             // Otherwise the append already landed in the sole neighbour store
             // for this layer; there is nothing else to mirror.
         } else {
-            // List at the inline cap (`M_MAX0`). When `max_conn == M_MAX0`
-            // (default config: `m_max0 = 2 * m = 64` matches the compile-
-            // time cap on layer 0) the previous "force-prune + retry" path
-            // was a no-op — prune of N elements down to `max_conn == N`
-            // keeps everything, then `cas_append` still finds no slot and
-            // the new edge is silently dropped. That's the connectivity-
-            // collapse bug that drove SIFT1M recall to ~1.5%.
-            //
-            // Fix: do the prune in-memory with the new id included, so it
-            // competes fairly against existing neighbours. The kept set
-            // has ≤ `max_conn` elements (`≤ M_MAX0`) so the published list
-            // fits without truncation. Recomputed against the winning list
-            // if another writer replaced it meanwhile.
+            // The list is full (on layer 0 the append stops at `m_max0`, so
+            // every overflow there lands here): the new edge competes with
+            // the existing ones under the same diversity rule as any prune,
+            // in one publish, recomputed against the winning list if another
+            // writer replaced it meanwhile. Keeping the closest `max_conn`
+            // instead turns layer 0 into a near-kNN graph whose lists stop
+            // naming the nodes between dense regions: 10% of 20k clustered
+            // points ended with no incoming edge.
             self.layer_update(neighbour_idx, level, |current| {
                 if current.contains(&id) {
                     return None;
                 }
-                // Stored u64s ARE neighbour indices: direct cast, no map hop.
-                let mut scored: Vec<(f32, u64)> = Vec::with_capacity(current.len() + 1);
-                for &nidx_u64 in current.iter().chain(core::iter::once(&id)) {
-                    let nidx = nidx_u64 as usize;
-                    if nidx < self.node_len() {
-                        let dist = self.distance_between_nodes(neighbour_idx, nidx);
-                        scored.push((dist, nidx_u64));
-                    }
-                }
-                scored.sort_by(|a, b| metrics::distance_order(a.0, b.0).then(a.1.cmp(&b.1)));
-                scored.truncate(max_conn);
-                Some(scored.into_iter().map(|(_, nid)| nid).collect())
+                let kept = self.prune_selection(neighbour_idx, current, max_conn, &[id]);
+                (kept != current).then_some(kept)
             });
         }
     }

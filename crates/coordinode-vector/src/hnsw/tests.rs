@@ -2473,18 +2473,10 @@ fn unreachable_live_nodes(index: &HnswIndex) -> usize {
         .count()
 }
 
-/// A build batch on a wide thread pool leaves no node unreachable, and its
-/// self-recall stays near that of inserting one by one. Pruning a full
-/// list can drop a node's last incoming edge, and inserts in flight together
-/// never see each other, so before the reachability repair a 128-thread
-/// build of 600 points left nodes no search could return: self-recall fell
-/// to 505/600 against 576 serial. Many builds, since the loss depends on
-/// how the inserts interleave.
-#[test]
-fn a_build_batch_on_a_wide_pool_leaves_no_node_unreachable() {
-    let n = 600usize;
-    let dim = 20usize;
-    let items: Vec<(u64, Vec<f32>)> = (0..n)
+/// `n` points of `dim` components spread uniformly over `[-0.5, 0.5)`,
+/// deterministic per index.
+fn uniform_points(n: usize, dim: usize) -> Vec<(u64, Vec<f32>)> {
+    (0..n)
         .map(|i| {
             let v = (0..dim)
                 .map(|d| {
@@ -2495,27 +2487,107 @@ fn a_build_batch_on_a_wide_pool_leaves_no_node_unreachable() {
                 .collect();
             (i as u64, v)
         })
-        .collect();
+        .collect()
+}
+
+/// How many of `items` a search for their own vector returns first.
+fn self_recall(index: &HnswIndex, items: &[(u64, Vec<f32>)]) -> usize {
+    items
+        .iter()
+        .filter(|(id, v)| index.search(v, 1).first().is_some_and(|r| r.id == *id))
+        .count()
+}
+
+/// An L2 index over the build tests' points, its level draws seeded by
+/// `seed`.
+fn seeded_l2_index(seed: u64) -> HnswIndex {
+    let index = HnswIndex::new(HnswConfig {
+        ef_search: 64,
+        metric: VectorMetric::L2,
+        max_dimensions: 65_536,
+        ..Default::default()
+    });
+    index.rng_state.store(
+        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    index
+}
+
+/// Inserting one by one leaves every node findable, whatever levels the
+/// draws give. A full layer-0 list used to keep its closest `m_max0` by
+/// plain truncation, so nodes between dense regions lost their last
+/// incoming edge: with these seeds 116, 131 and 123 of the 600 points were
+/// unreachable and no search returned them.
+#[test]
+fn serial_inserts_leave_every_node_findable() {
+    let items = uniform_points(600, 20);
+    for seed in [7u64, 35, 38] {
+        let mut index = seeded_l2_index(seed);
+        for (id, v) in items.clone() {
+            index.insert(id, v);
+        }
+        assert_eq!(unreachable_live_nodes(&index), 0, "seed {seed}");
+        assert_eq!(self_recall(&index, &items), items.len(), "seed {seed}");
+    }
+}
+
+/// A batch links as well as inserting one by one even at the worst a wide
+/// pool can interleave: every insert of each wave planned before any of
+/// them links, so none sees another. The bound a concurrent build of the
+/// same points cannot fall below.
+#[test]
+fn a_blind_wave_build_leaves_every_node_findable() {
+    let items = uniform_points(600, 20);
+    for seed in [7u64, 35, 38] {
+        for bulk in [false, true] {
+            let mut index = seeded_l2_index(seed);
+            index
+                .blind_waves
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if bulk {
+                index.bulk_build(items.clone());
+            } else {
+                index.insert_batch(items.clone());
+            }
+            assert_eq!(
+                unreachable_live_nodes(&index),
+                0,
+                "seed {seed} (bulk: {bulk})"
+            );
+            assert_eq!(
+                self_recall(&index, &items),
+                items.len(),
+                "seed {seed} (bulk: {bulk})"
+            );
+        }
+    }
+}
+
+/// A build batch on a wide thread pool leaves no node unreachable, and its
+/// self-recall stays near that of inserting one by one. Pruning a full
+/// list can drop a node's last incoming edge, and inserts in flight together
+/// never see each other, so before the reachability repair a 128-thread
+/// build of 600 points left nodes no search could return. Many builds,
+/// since the graph depends on how the inserts interleave.
+#[test]
+fn a_build_batch_on_a_wide_pool_leaves_no_node_unreachable() {
+    let n = 600usize;
+    let items = uniform_points(n, 20);
     let cfg = || HnswConfig {
         ef_search: 64,
         metric: VectorMetric::L2,
         max_dimensions: 65_536,
         ..Default::default()
     };
-    let self_recall = |index: &HnswIndex| {
-        items
-            .iter()
-            .filter(|(id, v)| index.search(v, 1).first().is_some_and(|r| r.id == *id))
-            .count()
-    };
+    let self_recall = |index: &HnswIndex| self_recall(index, &items);
     let mut serial = HnswIndex::new(cfg());
     for (id, v) in items.clone() {
         serial.insert(id, v);
     }
     // Reachability is exact; recall is approximate, and a concurrent build
-    // is a different graph from the serial one, so its self-recall varies
-    // around it (547-600 here). A graph that lost reachability fell far
-    // below this floor.
+    // is a different graph from the serial one. A graph that lost
+    // reachability fell far below this floor.
     let floor = self_recall(&serial) * 9 / 10;
 
     let pool = rayon::ThreadPoolBuilder::new()
