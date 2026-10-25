@@ -12,5 +12,5 @@ description = "An application embedding CoordiNode: an on-disk database, paramet
 [workspace]
 
 [dependencies]
-coordinode-embed = "0.9"
-coordinode-core = "0.9"
+coordinode-embed = "0.10"
+coordinode-core = "0.10"
