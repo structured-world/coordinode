@@ -2,6 +2,17 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-10-25
+
+### Added
+
+- *(storage)* hold the database to a strict total footprint limit
+
+### Fixed
+
+- *(storage)* refuse a hard limit below the supported minimum
+- *(storage)* sync a new journal segment's directory
+
 ## v0.8.0 - 2026-10-23
 
 ### Added

@@ -32,7 +32,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.92"
 license = "AGPL-3.0-only"
@@ -156,26 +156,26 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # Published libraries share one version, including public types and storage
 # contracts. Cargo packages the complete closure together before publication;
 # release-plz updates these exact requirements with the coordinated version.
-coordinode-core = { path = "crates/coordinode-core", version = "=0.9.0" }
-coordinode-query = { path = "crates/coordinode-query", version = "=0.9.0" }
+coordinode-core = { path = "crates/coordinode-core", version = "=0.10.0" }
+coordinode-query = { path = "crates/coordinode-query", version = "=0.10.0" }
 coordinode-session = { path = "crates/coordinode-session" }
-coordinode-vector = { path = "crates/coordinode-vector", version = "=0.9.0" }
-coordinode-search = { path = "crates/coordinode-search", version = "=0.9.0" }
-coordinode-storage = { path = "crates/coordinode-storage", version = "=0.9.0" }
-coordinode-modality = { path = "crates/coordinode-modality", version = "=0.9.0" }
+coordinode-vector = { path = "crates/coordinode-vector", version = "=0.10.0" }
+coordinode-search = { path = "crates/coordinode-search", version = "=0.10.0" }
+coordinode-storage = { path = "crates/coordinode-storage", version = "=0.10.0" }
+coordinode-modality = { path = "crates/coordinode-modality", version = "=0.10.0" }
 coordinode-timeseries = { path = "crates/coordinode-timeseries" }
-coordinode-cluster = { path = "crates/coordinode-cluster", version = "=0.9.0" }
-coordinode-raft = { path = "crates/coordinode-raft", version = "=0.9.0" }
+coordinode-cluster = { path = "crates/coordinode-cluster", version = "=0.10.0" }
+coordinode-raft = { path = "crates/coordinode-raft", version = "=0.10.0" }
 coordinode-auth = { path = "crates/coordinode-auth" }
 coordinode-server = { path = "crates/coordinode-server" }
 coordinode-s3 = { path = "crates/coordinode-s3" }
-coordinode-embed = { path = "crates/coordinode-embed", version = "=0.9.0" }
-coordinode-swarm = { path = "crates/coordinode-swarm", version = "=0.9.0" }
-coordinode-replicate = { path = "crates/coordinode-replicate", version = "=0.9.0" }
+coordinode-embed = { path = "crates/coordinode-embed", version = "=0.10.0" }
+coordinode-swarm = { path = "crates/coordinode-swarm", version = "=0.10.0" }
+coordinode-replicate = { path = "crates/coordinode-replicate", version = "=0.10.0" }
 coordinode-client = { path = "crates/coordinode-client" }
 coordinode-test-fixtures = { path = "crates/coordinode-test-fixtures" }
 coordinode-bench = { path = "crates/coordinode-bench" }
-coordinode-wire = { path = "crates/coordinode-wire", version = "=0.9.0" }
+coordinode-wire = { path = "crates/coordinode-wire", version = "=0.10.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

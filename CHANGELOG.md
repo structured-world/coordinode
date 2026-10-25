@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.10.0 - 2026-10-25
+
+### Added
+
+- *(storage)* hold the database to a strict total footprint limit
+- *(operation)* apply each client write once
+- *(storage)* store index generations under local installations
+- *(migrate)* add the node sizes report module
+- *(migrate)* catalog record migrations, check and journal stats
+- *(migrate)* offline tool to bring a data directory current
+
+### Fixed
+
+- *(storage)* refuse a hard limit below the supported minimum
+- *(storage)* sync a new journal segment's directory
+- *(storage)* never copy a checkpoint over a file it holds
+- *(migrate)* find every marked store, Raft snapshot captures too
+
+### Performance
+
+- *(query)* bound property delta chains with whole writes
+
+### Testing
+
+- *(embed)* lower a full group to the supported minimum
+- *(embed)* lower the limit below the data, not the transient charge
+
 ## v0.9.0 - 2026-10-24
 
 ### Added

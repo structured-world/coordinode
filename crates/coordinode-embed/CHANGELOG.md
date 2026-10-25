@@ -2,6 +2,21 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-10-25
+
+### Added
+
+- *(storage)* hold the database to a strict total footprint limit
+
+### Fixed
+
+- *(storage)* refuse a hard limit below the supported minimum
+
+### Testing
+
+- *(embed)* lower a full group to the supported minimum
+- *(embed)* lower the limit below the data, not the transient charge
+
 ## v0.9.0 - 2026-10-24
 
 ### Fixed
