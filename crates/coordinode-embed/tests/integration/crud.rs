@@ -3646,6 +3646,76 @@ fn a_correlated_case_key_is_evaluated_per_row() {
     }
 }
 
+/// An undirected pattern binds every edge at the node, incoming and
+/// outgoing, so deleting what it binds leaves the node with none and the
+/// node can then be deleted in the same transaction. Deleting only the edges
+/// of one direction left the node "still connected".
+#[test]
+fn deleting_undirected_matches_removes_edges_of_both_directions() {
+    use coordinode_core::graph::types::Value;
+    for in_transaction in [false, true] {
+        let mut db = open_db();
+        db.execute_cypher(
+            "CREATE (a:A {k: 1})-[:From {w: 7}]->(r:R {k: 1})-[:To]->(b:B {k: 1}), (r)-[:Self]->(r)",
+        )
+        .unwrap();
+        // An incoming edge reached undirected is read, and written, under its
+        // own orientation.
+        let read_w = |db: &mut Database| {
+            db.execute_cypher("MATCH (r:R {k: 1})-[e:From]-(a:A) RETURN e.w AS w")
+                .unwrap()
+                .first()
+                .and_then(|row| row.get("w").cloned())
+        };
+        assert_eq!(read_w(&mut db), Some(Value::Int(7)));
+        db.execute_cypher("MATCH (r:R {k: 1})-[e:From]-(a:A) SET e.w = 8")
+            .unwrap();
+        assert_eq!(read_w(&mut db), Some(Value::Int(8)));
+        let directed = db
+            .execute_cypher("MATCH (a:A)-[e:From]->(r:R) RETURN e.w AS w")
+            .unwrap();
+        assert_eq!(directed[0].get("w"), Some(&Value::Int(8)));
+        let count_edges = |db: &mut Database| match db
+            .execute_cypher("MATCH (r:R {k: 1})-[e]-() RETURN count(e) AS n")
+            .unwrap()
+            .first()
+            .and_then(|row| row.get("n").cloned())
+        {
+            Some(Value::Int(n)) => n,
+            other => panic!("count {other:?}"),
+        };
+        // The self loop is matched once per direction, so twice.
+        assert_eq!(count_edges(&mut db), 4);
+        if in_transaction {
+            db.execute_cypher(
+                "MATCH (r:R {k: 1})-[e]-() DELETE e WITH DISTINCT r MATCH (x:R {k: 1}) DELETE x",
+            )
+            .unwrap();
+        } else {
+            db.execute_cypher("MATCH (r:R {k: 1})-[e]-() DELETE e")
+                .unwrap();
+            assert_eq!(count_edges(&mut db), 0);
+            db.execute_cypher("MATCH (r:R {k: 1}) DELETE r").unwrap();
+        }
+        let left = db
+            .execute_cypher("MATCH (r:R) RETURN count(r) AS n")
+            .unwrap();
+        assert_eq!(
+            left[0].get("n"),
+            Some(&Value::Int(0)),
+            "in transaction {in_transaction}"
+        );
+        let ends = db
+            .execute_cypher("MATCH (a:A), (b:B) RETURN count(*) AS n")
+            .unwrap();
+        assert_eq!(
+            ends[0].get("n"),
+            Some(&Value::Int(1)),
+            "the other ends stay"
+        );
+    }
+}
+
 #[test]
 fn with_distinct_passthrough() {
     use coordinode_core::graph::types::Value;

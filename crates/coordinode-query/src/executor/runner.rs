@@ -7511,11 +7511,34 @@ fn execute_traverse(
     }
 }
 
+/// One edge a hop crossed: the node at its far end, the index of its type in
+/// the traversal's edge types, and whether it points into the node expanded
+/// (`target → source`) rather than out of it. An undirected hop finds edges
+/// of both orientations, so the orientation travels with each one: an edge
+/// is stored, read and deleted under its own source and target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Hop {
+    pub(crate) target: u64,
+    pub(crate) edge_type: usize,
+    pub(crate) incoming: bool,
+}
+
+impl Hop {
+    /// The edge's stored `(source, target)` for a hop from `from`.
+    pub(crate) fn endpoints(self, from: u64) -> (u64, u64) {
+        if self.incoming {
+            (self.target, from)
+        } else {
+            (from, self.target)
+        }
+    }
+}
+
 /// Expand one hop from `src_id` in the given direction and edge types.
 ///
-/// Returns ALL `(target_uid, edge_type_index)` pairs — no truncation.
-/// The caller decides whether to process them sequentially or in parallel
-/// based on `AdaptiveConfig::parallel_threshold`.
+/// Returns ALL hops, no truncation. The caller decides whether to process
+/// them sequentially or in parallel based on
+/// `AdaptiveConfig::parallel_threshold`.
 ///
 /// Each neighbour counts one unit of the statement's work, and `held` grows
 /// by the list's memory (and the posting list it is read from) before the
@@ -7526,9 +7549,10 @@ fn expand_one_hop(
     direction: Direction,
     ctx: &mut ExecutionContext<'_>,
     held: &mut coordinode_core::budget::MemoryCharge<'_>,
-) -> Result<Vec<(u64, usize)>, ExecutionError> {
+) -> Result<Vec<Hop>, ExecutionError> {
     // A neighbour's slot in the list and its id in the decoded posting list.
-    let per_neighbor = (core::mem::size_of::<(u64, usize)>() + core::mem::size_of::<u64>()) as u64;
+    let per_neighbor = (core::mem::size_of::<Hop>() + core::mem::size_of::<u64>()) as u64;
+    let incoming_first = direction == Direction::Incoming;
     let mut neighbors = Vec::new();
     // Single buffer reused for all key constructions in this call.
     // Avoids N_edge_types × N_directions heap allocations per traversal step.
@@ -7569,7 +7593,11 @@ fn expand_one_hop(
             }
 
             for tgt_uid in posting_list.iter() {
-                neighbors.push((tgt_uid, et_idx));
+                neighbors.push(Hop {
+                    target: tgt_uid,
+                    edge_type: et_idx,
+                    incoming: incoming_first,
+                });
             }
         }
 
@@ -7580,7 +7608,11 @@ fn expand_one_hop(
                 held.grow(posting_list.len() as u64 * per_neighbor)?;
                 neighbors.reserve(posting_list.len());
                 for tgt_uid in posting_list.iter() {
-                    neighbors.push((tgt_uid, et_idx));
+                    neighbors.push(Hop {
+                        target: tgt_uid,
+                        edge_type: et_idx,
+                        incoming: true,
+                    });
                 }
             }
         }
@@ -7593,6 +7625,8 @@ fn expand_one_hop(
 struct TargetRowParams<'a> {
     input_row: &'a Row,
     target_uid: u64,
+    /// Whether the edge points from the target into the source.
+    incoming: bool,
     edge_type: Option<&'a str>,
     /// Whether the edge type is declared TEMPORAL. When true, the row builder
     /// emits one row per `(src, tgt)` edgeprop version; when false it emits at
@@ -7717,9 +7751,12 @@ fn build_target_rows(
             }
         });
         if let Some(src_raw) = source_id_raw {
-            let (ep_src, ep_tgt) = match params.direction {
-                Direction::Outgoing | Direction::Both => (NodeId::from_raw(src_raw), target_id),
-                Direction::Incoming => (target_id, NodeId::from_raw(src_raw)),
+            // The edge under its own orientation, which an undirected hop
+            // finds either way round.
+            let (ep_src, ep_tgt) = if trp.incoming {
+                (target_id, NodeId::from_raw(src_raw))
+            } else {
+                (NodeId::from_raw(src_raw), target_id)
             };
 
             if trp.edge_is_temporal {
@@ -7892,17 +7929,16 @@ struct ParallelCtx<'a> {
 /// dropped: it may be a temporal node the pattern does not label, whose
 /// versions only the sequential path reads.
 fn process_targets_parallel(
-    neighbors: &[(u64, u64, usize)],
+    neighbors: &[(u64, Hop)],
     input_row: &Row,
     params: &TraverseParams<'_>,
     pctx: &ParallelCtx<'_>,
-    unresolved: &Mutex<Vec<(u64, u64, usize)>>,
+    unresolved: &Mutex<Vec<(u64, Hop)>>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let target_variable = params.target_variable;
     let target_labels = params.target_labels;
     let target_filters = params.target_filters;
     let edge_variable = params.edge_variable;
-    let direction = params.direction;
     let source = params.source;
 
     neighbors
@@ -7911,7 +7947,8 @@ fn process_targets_parallel(
             let mut schemas = HashMap::<String, Option<LabelSchema>>::new();
             let rows: Vec<_> = chunk
                 .iter()
-                .filter_map(|(src_uid, tgt_uid, et_idx)| {
+                .filter_map(|&(src, hop)| {
+                    let (src_uid, tgt_uid, et_idx) = (&src, &hop.target, &hop.edge_type);
                     let target_id = NodeId::from_raw(*tgt_uid);
 
                     // Stateless snapshot read through the Layer-4 store: the
@@ -7929,7 +7966,7 @@ fn process_targets_parallel(
                         .ok()?;
                     let Some(mut target_record) = target_record else {
                         if let Ok(mut guard) = unresolved.lock() {
-                            guard.push((*src_uid, *tgt_uid, *et_idx));
+                            guard.push((src, hop));
                         }
                         return None;
                     };
@@ -8004,12 +8041,9 @@ fn process_targets_parallel(
                             out_row.insert(ev.to_string(), Value::String(et.to_string()));
 
                             {
-                                let (ep_src, ep_tgt) = match direction {
-                                    Direction::Outgoing | Direction::Both => {
-                                        (NodeId::from_raw(*src_uid), target_id)
-                                    }
-                                    Direction::Incoming => (target_id, NodeId::from_raw(*src_uid)),
-                                };
+                                let (ep_src, ep_tgt) = hop.endpoints(src);
+                                let (ep_src, ep_tgt) =
+                                    (NodeId::from_raw(ep_src), NodeId::from_raw(ep_tgt));
                                 // Hidden metadata for downstream SET / DELETE on r.
                                 out_row.insert(
                                     format!("{ev}.__src__"),
@@ -8183,10 +8217,7 @@ fn execute_single_hop_traverse(
                 occ_read_keys: None,
             };
             let src_raw = source_id.as_raw();
-            let with_src: Vec<(u64, u64, usize)> = neighbors
-                .iter()
-                .map(|&(tgt, et_idx)| (src_raw, tgt, et_idx))
-                .collect();
+            let with_src: Vec<(u64, Hop)> = neighbors.iter().map(|&hop| (src_raw, hop)).collect();
             let unresolved = Mutex::new(Vec::new());
             let parallel_rows =
                 process_targets_parallel(&with_src, row, params, &pctx, &unresolved)?;
@@ -8209,36 +8240,49 @@ fn execute_single_hop_traverse(
             // Targets with no plain record (temporal nodes the pattern does
             // not label, or dangling edges) take the sequential path, which
             // reads their versions.
-            for (_, target_uid, et_idx) in unresolved.into_inner().unwrap_or_default() {
+            for (_, hop) in unresolved.into_inner().unwrap_or_default() {
                 let trp = TargetRowParams {
                     input_row: row,
-                    target_uid,
-                    edge_type: params.edge_types.get(et_idx).map(|s| s.as_str()),
-                    edge_is_temporal: params.edge_temporal.get(et_idx).copied().unwrap_or(false),
+                    target_uid: hop.target,
+                    incoming: hop.incoming,
+                    edge_type: params.edge_types.get(hop.edge_type).map(|s| s.as_str()),
+                    edge_is_temporal: params
+                        .edge_temporal
+                        .get(hop.edge_type)
+                        .copied()
+                        .unwrap_or(false),
                 };
                 let target_rows = build_target_rows(&trp, params, ctx)?;
                 keep_rows(&mut kept, target_rows, &mut results)?;
             }
         } else {
             // Sequential path for normal fan-out
-            for (target_uid, et_idx) in neighbors {
-                let edge_type = params.edge_types.get(et_idx).map(|s| s.as_str());
-                let edge_is_temporal = params.edge_temporal.get(et_idx).copied().unwrap_or(false);
+            for hop in neighbors {
+                let target_uid = hop.target;
+                let edge_type = params.edge_types.get(hop.edge_type).map(|s| s.as_str());
+                let edge_is_temporal = params
+                    .edge_temporal
+                    .get(hop.edge_type)
+                    .copied()
+                    .unwrap_or(false);
                 let trp = TargetRowParams {
                     input_row: row,
                     target_uid,
+                    incoming: hop.incoming,
                     edge_type,
                     edge_is_temporal,
                 };
                 let mut target_rows = build_target_rows(&trp, params, ctx)?;
                 if let Some(pv) = params.path_variable {
-                    // One-hop named path: source -> target via this edge.
+                    // One-hop named path: source -> target, over the edge as
+                    // it is stored.
+                    let (rel_source, rel_target) = hop.endpoints(source_id.as_raw());
                     let path = Value::Path(coordinode_core::graph::types::PathValue {
                         nodes: vec![source_id.as_raw(), target_uid],
                         rels: vec![coordinode_core::graph::types::PathRel {
                             edge_type: edge_type.unwrap_or_default().to_string(),
-                            source: source_id.as_raw(),
-                            target: target_uid,
+                            source: rel_source,
+                            target: rel_target,
                         }],
                     });
                     for r in &mut target_rows {
@@ -8271,21 +8315,23 @@ fn keep_rows(
 }
 
 /// Reconstruct the route from `source` to `target` as a path value, using the
-/// BFS predecessor map (`pred[n] = Some((prev, edge_type_idx))`; the source's
-/// entry is `None`). The route is the shortest one the level-synchronous BFS
-/// discovered to `target`. Returns a zero-length path when `source == target`.
+/// BFS predecessor map (`pred[n] = Some((prev, hop))`, the hop that reached
+/// `n` from `prev`; the source's entry is `None`). The route is the shortest
+/// one the level-synchronous BFS discovered to `target`, each relationship
+/// with its stored source and target. Returns a zero-length path when
+/// `source == target`.
 fn reconstruct_bfs_path(
     source: u64,
     target: u64,
-    pred: &rustc_hash::FxHashMap<u64, Option<(u64, usize)>>,
+    pred: &rustc_hash::FxHashMap<u64, Option<(u64, Hop)>>,
     edge_types: &[String],
 ) -> Value {
-    let mut back: Vec<(u64, usize)> = Vec::new();
+    let mut back: Vec<Hop> = Vec::new();
     let mut cur = target;
     while cur != source {
         match pred.get(&cur).copied().flatten() {
-            Some((prev, et_idx)) => {
-                back.push((cur, et_idx));
+            Some((prev, hop)) => {
+                back.push(hop);
                 cur = prev;
             }
             // Target unreachable from source in `pred` (should not happen for a
@@ -8299,15 +8345,16 @@ fn reconstruct_bfs_path(
     let mut rels = Vec::with_capacity(back.len());
     nodes.push(source);
     let mut prev = source;
-    for (node, et_idx) in back {
-        let edge_type = edge_types.get(et_idx).cloned().unwrap_or_default();
+    for hop in back {
+        let edge_type = edge_types.get(hop.edge_type).cloned().unwrap_or_default();
+        let (rel_source, rel_target) = hop.endpoints(prev);
         rels.push(coordinode_core::graph::types::PathRel {
             edge_type,
-            source: prev,
-            target: node,
+            source: rel_source,
+            target: rel_target,
         });
-        nodes.push(node);
-        prev = node;
+        nodes.push(hop.target);
+        prev = hop.target;
     }
     Value::Path(coordinode_core::graph::types::PathValue { nodes, rels })
 }
@@ -8326,7 +8373,7 @@ fn expand_frontier(
     params: &TraverseParams<'_>,
     ctx: &mut ExecutionContext<'_>,
     held: &mut coordinode_core::budget::MemoryCharge<'_>,
-) -> Result<Vec<(u64, u64, usize)>, ExecutionError> {
+) -> Result<Vec<(u64, Hop)>, ExecutionError> {
     let mut out = Vec::new();
     for &src_uid in to_expand {
         let src_nid = NodeId::from_raw(src_uid);
@@ -8334,10 +8381,10 @@ fn expand_frontier(
         let mut one = held.empty_like();
         let neighbors =
             expand_one_hop(src_nid, params.edge_types, params.direction, ctx, &mut one)?;
-        held.grow((neighbors.len() * core::mem::size_of::<(u64, u64, usize)>()) as u64)?;
+        held.grow((neighbors.len() * core::mem::size_of::<(u64, Hop)>()) as u64)?;
         out.reserve(neighbors.len());
-        for (tgt_uid, et_idx) in neighbors {
-            out.push((src_uid, tgt_uid, et_idx));
+        for hop in neighbors {
+            out.push((src_uid, hop));
         }
     }
     Ok(out)
@@ -8404,8 +8451,9 @@ fn execute_varlen_traverse(
         let mut frontier_bytes = 0u64;
         let mut sets_bytes = 0u64;
 
-        // Edge-level cycle detection: (source_uid, target_uid, edge_type_idx).
-        // Prevents traversing the same relationship twice per BFS invocation.
+        // Edge-level cycle detection: the edge's stored (source, target,
+        // edge_type_idx), whichever end it was walked from. Prevents
+        // traversing the same relationship twice per BFS invocation.
         // Keys are internal ids (not attacker-controlled), so a fast non-DoS
         // hasher is the right choice on this hot loop.
         let mut visited_edges: rustc_hash::FxHashSet<(u64, u64, usize)> =
@@ -8427,7 +8475,7 @@ fn execute_varlen_traverse(
         // variable is requested. `pred[n] = Some((prev, edge_type_idx))`, the
         // source's entry is `None`. Records the first (shortest) route to each
         // reached node.
-        let mut pred: rustc_hash::FxHashMap<u64, Option<(u64, usize)>> =
+        let mut pred: rustc_hash::FxHashMap<u64, Option<(u64, Hop)>> =
             rustc_hash::FxHashMap::default();
         if params.path_variable.is_some() {
             pred.insert(source_id.as_raw(), None);
@@ -8454,7 +8502,7 @@ fn execute_varlen_traverse(
             let depth_start_edges = edges_processed;
 
             // Collect all unique neighbors across the frontier for this depth
-            let mut depth_neighbors: Vec<(u64, u64, usize)> = Vec::new(); // (src, tgt, et_idx)
+            let mut depth_neighbors: Vec<(u64, Hop)> = Vec::new(); // (src, hop)
 
             // Expand the whole depth frontier in one step. Each node expands at
             // most once across the traversal, so filter to the not-yet-expanded
@@ -8483,19 +8531,21 @@ fn execute_varlen_traverse(
                     0
                 }
                 + if dedup_targets { set_entry } else { 0 }
-                + core::mem::size_of::<(u64, u64, usize)>() as u64;
+                + core::mem::size_of::<(u64, Hop)>() as u64;
             level.grow(expansions.len() as u64 * per_expansion)?;
-            for (src_uid, tgt_uid, et_idx) in expansions {
-                if !visited_edges.insert((src_uid, tgt_uid, et_idx)) {
+            for (src_uid, hop) in expansions {
+                let tgt_uid = hop.target;
+                let (stored_src, stored_tgt) = hop.endpoints(src_uid);
+                if !visited_edges.insert((stored_src, stored_tgt, hop.edge_type)) {
                     continue;
                 }
                 edges_processed += 1;
                 next_frontier.push(tgt_uid);
                 if params.path_variable.is_some() {
-                    pred.entry(tgt_uid).or_insert(Some((src_uid, et_idx)));
+                    pred.entry(tgt_uid).or_insert(Some((src_uid, hop)));
                 }
                 if depth >= min_hops && (!dedup_targets || emitted_targets.insert(tgt_uid)) {
-                    depth_neighbors.push((src_uid, tgt_uid, et_idx));
+                    depth_neighbors.push((src_uid, hop));
                 }
             }
             // The sets and the map outlive this depth: their part of the
@@ -8565,11 +8615,11 @@ fn execute_varlen_traverse(
             if minimal_emit {
                 // Bare target binding only: count(DISTINCT target) reads nothing
                 // else. depth_neighbors is already deduped to distinct targets.
-                for &(_src_uid, tgt_uid, _et_idx) in &depth_neighbors {
+                for &(_src_uid, hop) in &depth_neighbors {
                     let mut out = row.clone();
                     out.insert(
                         params.target_variable.to_string(),
-                        Value::Int(tgt_uid as i64),
+                        Value::Int(hop.target as i64),
                     );
                     keep_rows(&mut kept, vec![out], &mut results)?;
                 }
@@ -8611,16 +8661,17 @@ fn execute_varlen_traverse(
                 // As at the single-hop site: targets with no plain record are
                 // read sequentially, versions included. The parallel path runs
                 // only without a path variable, so no route is bound here.
-                for (src_uid, tgt_uid, et_idx) in unresolved.into_inner().unwrap_or_default() {
+                for (src_uid, hop) in unresolved.into_inner().unwrap_or_default() {
                     let mut hop_row = row.clone();
                     hop_row.insert(params.source.to_string(), Value::Int(src_uid as i64));
                     let trp = TargetRowParams {
                         input_row: &hop_row,
-                        target_uid: tgt_uid,
-                        edge_type: params.edge_types.get(et_idx).map(|s| s.as_str()),
+                        target_uid: hop.target,
+                        incoming: hop.incoming,
+                        edge_type: params.edge_types.get(hop.edge_type).map(|s| s.as_str()),
                         edge_is_temporal: params
                             .edge_temporal
-                            .get(et_idx)
+                            .get(hop.edge_type)
                             .copied()
                             .unwrap_or(false),
                     };
@@ -8628,7 +8679,8 @@ fn execute_varlen_traverse(
                     keep_rows(&mut kept, target_rows, &mut results)?;
                 }
             } else {
-                for &(src_uid, tgt_uid, et_idx) in &depth_neighbors {
+                for &(src_uid, hop) in &depth_neighbors {
+                    let (tgt_uid, et_idx) = (hop.target, hop.edge_type);
                     // For depth > 1 the source becomes an intermediate node, so
                     // edge property lookups must rebind it to that node. At depth
                     // 1 (and any hop whose source is still the original) the row
@@ -8650,6 +8702,7 @@ fn execute_varlen_traverse(
                     let trp = TargetRowParams {
                         input_row,
                         target_uid: tgt_uid,
+                        incoming: hop.incoming,
                         edge_type,
                         edge_is_temporal,
                     };
@@ -9921,7 +9974,10 @@ fn execute_doc_score(
         let mut scored_count: usize = 0;
         let mut matching: usize = 0;
 
-        for (chunk_uid, _et_idx) in &neighbours {
+        for Hop {
+            target: chunk_uid, ..
+        } in &neighbours
+        {
             // A chunk read and scored.
             ctx.budget.work(1)?;
             let chunk = match ctx.mvcc_get_node(ctx.shard_id, NodeId::from_raw(*chunk_uid))? {
@@ -10976,9 +11032,9 @@ fn execute_shortest_path(
         // BFS from src_uid to tgt_uid, recording each node's predecessor so the
         // actual path can be reconstructed. Keys are internal ids, so a fast
         // non-DoS hasher fits this hot loop. `pred[n]` is None for the source
-        // and Some((predecessor, edge_type_idx)) otherwise.
+        // and Some((predecessor, hop that reached it)) otherwise.
         let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
-        let mut pred: rustc_hash::FxHashMap<u64, Option<(u64, usize)>> =
+        let mut pred: rustc_hash::FxHashMap<u64, Option<(u64, Hop)>> =
             rustc_hash::FxHashMap::default();
         // The search's queue and predecessor map, held for this pair.
         let budget = Arc::clone(&ctx.budget);
@@ -11001,16 +11057,16 @@ fn execute_shortest_path(
             let mut one = searched.empty_like();
             let neighbors = expand_one_hop(nid, edge_types, sp.direction, ctx, &mut one)?;
 
-            for (neighbor_uid, et_idx) in neighbors {
-                if let std::collections::hash_map::Entry::Vacant(e) = pred.entry(neighbor_uid) {
+            for hop in neighbors {
+                if let std::collections::hash_map::Entry::Vacant(e) = pred.entry(hop.target) {
                     // The map and the queue both grow by the new node.
                     searched.grow(
-                        (core::mem::size_of::<(u64, Option<(u64, usize)>)>()
+                        (core::mem::size_of::<(u64, Option<(u64, Hop)>)>()
                             + 1
                             + core::mem::size_of::<(u64, usize)>()) as u64,
                     )?;
-                    e.insert(Some((uid, et_idx)));
-                    queue.push_back((neighbor_uid, depth + 1));
+                    e.insert(Some((uid, hop)));
+                    queue.push_back((hop.target, depth + 1));
                 }
             }
         }
@@ -11020,10 +11076,10 @@ fn execute_shortest_path(
             // Walk predecessors back from tgt to src, then reverse into a
             // forward node/relationship sequence. A zero-length path (src ==
             // tgt) yields a single node and no relationships.
-            let mut back: Vec<(u64, usize)> = Vec::new();
+            let mut back: Vec<Hop> = Vec::new();
             let mut cur = tgt_uid;
-            while let Some(Some((p, et))) = pred.get(&cur).copied() {
-                back.push((cur, et));
+            while let Some(Some((p, hop))) = pred.get(&cur).copied() {
+                back.push(hop);
                 cur = p;
             }
             back.reverse();
@@ -11032,15 +11088,17 @@ fn execute_shortest_path(
             let mut rels = Vec::with_capacity(back.len());
             nodes.push(src_uid);
             let mut prev = src_uid;
-            for (node, et_idx) in back {
-                let edge_type = edge_types.get(et_idx).cloned().unwrap_or_default();
+            for hop in back {
+                let edge_type = edge_types.get(hop.edge_type).cloned().unwrap_or_default();
+                // Each relationship under its stored source and target.
+                let (rel_source, rel_target) = hop.endpoints(prev);
                 rels.push(coordinode_core::graph::types::PathRel {
                     edge_type,
-                    source: prev,
-                    target: node,
+                    source: rel_source,
+                    target: rel_target,
                 });
-                nodes.push(node);
-                prev = node;
+                nodes.push(hop.target);
+                prev = hop.target;
             }
             out.insert(
                 sp.path_variable.to_string(),
@@ -11784,9 +11842,15 @@ fn execute_merge_relationship_check(
             ctx,
             &mut held,
         )?;
-        if !neighbors.iter().any(|(tgt, _)| *tgt == target_raw) {
+        // The edge found, under its own orientation: an undirected MERGE
+        // matches one either way round.
+        let Some(found) = neighbors.iter().find(|hop| hop.target == target_raw) else {
             continue;
-        }
+        };
+        let (ep_src, ep_tgt) = {
+            let (s, t) = found.endpoints(source_id.as_raw());
+            (NodeId::from_raw(s), NodeId::from_raw(t))
+        };
 
         // Edge (src → tgt) exists in adjacency list.
         // If edge_filters are specified, also verify that the stored edge properties
@@ -11795,10 +11859,6 @@ fn execute_merge_relationship_check(
         // one EdgeProp record per (type, src, tgt), a mismatch means the edge's current
         // properties don't satisfy this MERGE pattern).
         if !edge_filters.is_empty() {
-            let (ep_src, ep_tgt) = match direction {
-                Direction::Outgoing | Direction::Both => (source_id, target_id),
-                Direction::Incoming => (target_id, source_id),
-            };
             // Load stored edge properties into a flat name→value map.
             let mut stored: std::collections::HashMap<String, Value> =
                 std::collections::HashMap::new();
@@ -11829,10 +11889,6 @@ fn execute_merge_relationship_check(
         // Edge found and all property filters match.
         let mut row = correlated.clone();
         if let Some(ev) = edge_variable {
-            let (ep_src, ep_tgt) = match direction {
-                Direction::Outgoing | Direction::Both => (source_id, target_id),
-                Direction::Incoming => (target_id, source_id),
-            };
             row.insert(format!("{ev}.__type__"), Value::String(et.clone()));
             row.insert(ev.clone(), Value::String(et.clone()));
             // The endpoints a later SET needs to find the edgeprop key. Without
