@@ -233,6 +233,58 @@ pub fn try_extract_vector(val: &Value) -> Option<Vec<f32>> {
 }
 
 impl Value {
+    /// Feeds `state` so that values equal under `==` feed it the same bytes:
+    /// the hash an exact deduplication buckets by before comparing. Zero
+    /// floats of either sign feed one value; geo values, documents and paths
+    /// feed only their kind and are told apart by the comparison.
+    pub fn hash_equal<H: core::hash::Hasher>(&self, state: &mut H) {
+        use core::hash::Hash as _;
+        // `0.0 == -0.0`; every other equal pair of floats has equal bits.
+        fn f64_bits(x: f64) -> u64 {
+            if x == 0.0 { 0 } else { x.to_bits() }
+        }
+        fn f32_bits(x: f32) -> u32 {
+            if x == 0.0 { 0 } else { x.to_bits() }
+        }
+        core::mem::discriminant(self).hash(state);
+        match self {
+            Self::Null | Self::Geo(_) | Self::Document(_) | Self::Path(_) => {}
+            Self::Bool(b) => state.write_u8(u8::from(*b)),
+            Self::Int(i) | Self::Timestamp(i) => state.write_i64(*i),
+            Self::Float(f) => state.write_u64(f64_bits(*f)),
+            Self::String(s) => s.hash(state),
+            Self::Vector(v) => {
+                state.write_usize(v.len());
+                for x in v {
+                    state.write_u32(f32_bits(*x));
+                }
+            }
+            Self::Blob(b) | Self::Binary(b) => b.hash(state),
+            Self::Array(items) => {
+                state.write_usize(items.len());
+                for item in items {
+                    item.hash_equal(state);
+                }
+            }
+            Self::Map(entries) => {
+                state.write_usize(entries.len());
+                for (key, value) in entries {
+                    key.hash(state);
+                    value.hash_equal(state);
+                }
+            }
+            Self::MultiVector(rows) => {
+                state.write_usize(rows.len());
+                for row in rows {
+                    state.write_usize(row.len());
+                    for x in row {
+                        state.write_u32(f32_bits(*x));
+                    }
+                }
+            }
+        }
+    }
+
     /// Memory this value holds: its own size plus the capacity it allocated,
     /// counted through nested lists, maps and documents. What a query budget
     /// charges for keeping it. A map's entries count their key and value

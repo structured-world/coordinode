@@ -2257,6 +2257,72 @@ fn distinct_removes_non_consecutive_duplicate_rows() {
     );
 }
 
+/// DISTINCT, count(DISTINCT) and grouping bucket values by hash and then
+/// compare them: equal values that hash apart (signed zeros, lists and maps
+/// holding them) would survive as duplicates, and a hash collision must not
+/// merge different values. First-seen order is kept, NULL is a value for
+/// DISTINCT and is not counted by count(DISTINCT).
+#[test]
+fn distinct_and_grouping_keep_exact_equality() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let rows = run_cypher(
+        "UNWIND [0.0, -0.0, [1, -0.0], [1, 0.0], {k: -0.0}, {k: 0.0}, null, null, 'a', 1, 1.0, 'a'] \
+         AS v RETURN DISTINCT v AS v",
+        engine,
+        &mut interner,
+    );
+    let values: Vec<Value> = rows
+        .iter()
+        .map(|r| r.get("v").cloned().unwrap_or(Value::Null))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            Value::Float(0.0),
+            Value::Array(vec![Value::Int(1), Value::Float(-0.0)]),
+            Value::Map([("k".to_string(), Value::Float(-0.0))].into()),
+            Value::Null,
+            Value::String("a".into()),
+            Value::Int(1),
+            Value::Float(1.0),
+        ],
+        "first-seen distinct values, signed zeros merged, 1 and 1.0 kept apart"
+    );
+
+    let counted = run_cypher(
+        "UNWIND [0.0, -0.0, null, 'a', 'a', 2] AS v RETURN count(DISTINCT v) AS n",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(counted[0].get("n"), Some(&Value::Int(3)));
+
+    // Enough rows and distinct keys that a quadratic dedup is visible, with
+    // every count checked: 20000 rows, 5000 groups of 4.
+    let distinct = run_cypher(
+        "UNWIND range(0, 19999) AS i RETURN count(DISTINCT i % 5000) AS n",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(distinct[0].get("n"), Some(&Value::Int(5000)));
+    let groups = run_cypher(
+        "UNWIND range(0, 19999) AS i WITH i % 5000 AS g, count(*) AS c \
+         WHERE c <> 4 RETURN count(*) AS wrong",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(groups[0].get("wrong"), Some(&Value::Int(0)));
+    let projected = run_cypher(
+        "UNWIND range(0, 19999) AS i WITH DISTINCT i % 5000 AS g RETURN count(*) AS n, min(g) AS lo, max(g) AS hi",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(projected[0].get("n"), Some(&Value::Int(5000)));
+    assert_eq!(projected[0].get("lo"), Some(&Value::Int(0)));
+    assert_eq!(projected[0].get("hi"), Some(&Value::Int(4999)));
+}
+
 #[test]
 fn distinct_with_float_values() {
     let (_fx, mut interner) = setup_social_graph();

@@ -1,5 +1,52 @@
 use super::*;
 
+fn equal_hash(value: &Value) -> u64 {
+    use core::hash::Hasher as _;
+    let mut state = rustc_hash::FxHasher::default();
+    value.hash_equal(&mut state);
+    state.finish()
+}
+
+/// Exact deduplication buckets by `hash_equal` and then compares: equal
+/// values hashing apart would keep both copies of one value. Signed zeros
+/// are equal, so they must hash alike, inside lists, maps and vectors too.
+#[test]
+fn equal_values_hash_equal() {
+    let pairs = [
+        (Value::Float(0.0), Value::Float(-0.0)),
+        (
+            Value::Vector(vec![0.0, 1.5]),
+            Value::Vector(vec![-0.0, 1.5]),
+        ),
+        (
+            Value::Array(vec![Value::Float(-0.0), Value::String("a".into())]),
+            Value::Array(vec![Value::Float(0.0), Value::String("a".into())]),
+        ),
+        (
+            Value::Map([("k".to_string(), Value::Float(-0.0))].into()),
+            Value::Map([("k".to_string(), Value::Float(0.0))].into()),
+        ),
+        (
+            Value::MultiVector(vec![vec![-0.0]]),
+            Value::MultiVector(vec![vec![0.0]]),
+        ),
+        (
+            Value::Geo(GeoValue::Point { lat: 1.0, lon: 2.0 }),
+            Value::Geo(GeoValue::Point { lat: 1.0, lon: 2.0 }),
+        ),
+    ];
+    for (a, b) in &pairs {
+        assert_eq!(a, b);
+        assert_eq!(equal_hash(a), equal_hash(b), "{a:?} and {b:?}");
+    }
+    // Kinds hash apart even where the payload bits coincide.
+    assert_ne!(equal_hash(&Value::Int(5)), equal_hash(&Value::Timestamp(5)));
+    assert_ne!(
+        equal_hash(&Value::String("a".into())),
+        equal_hash(&Value::String("b".into()))
+    );
+}
+
 /// What a value holds grows with what it allocated, through nesting: a
 /// budget charging a scalar's size for a long string or a deep document
 /// would let a query keep far more than its limit.

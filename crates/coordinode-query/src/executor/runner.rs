@@ -4683,30 +4683,25 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             }
 
             if *distinct {
-                // Full dedup — not just consecutive. O(n²) but correct for
-                // all Value types including Float (which lacks Hash). The
-                // copies kept to compare against are charged before they are
-                // made.
-                let mut seen: Vec<Row> = Vec::new();
-                let mut refused = None;
-                result.retain(|row| {
-                    if refused.is_some() || seen.iter().any(|s| s == row) {
-                        return false;
+                // Full dedup, not just consecutive, in first-seen order: a row
+                // is compared only with the kept rows sharing its hash. The
+                // kept rows are the projected ones, moved, never copied; the
+                // index over them is charged while it exists.
+                use crate::executor::row::{DistinctIndex, row_hash};
+                let mut index = DistinctIndex::default();
+                let mut index_charge = ctx.budget.empty_charge();
+                let mut kept: Vec<Row> = Vec::with_capacity(result.len());
+                for row in result {
+                    let hash = row_hash(&row);
+                    let (found, asked) = index.find(hash, |at| kept[at] == row);
+                    ctx.budget.work(1 + asked)?;
+                    if found.is_none() {
+                        index_charge.grow(DistinctIndex::ENTRY_BYTES)?;
+                        index.keep(hash);
+                        kept.push(row);
                     }
-                    if let Err(stop) = ctx.budget.work(seen.len() as u64).and_then(|()| {
-                        ctx.budget
-                            .reserve(crate::executor::row::row_held_bytes(row))
-                            .map(coordinode_core::budget::MemoryCharge::keep_until_query_ends)
-                    }) {
-                        refused = Some(stop);
-                        return false;
-                    }
-                    seen.push(row.clone());
-                    true
-                });
-                if let Some(stop) = refused {
-                    return Err(stop.into());
                 }
+                return Ok(kept);
             }
 
             Ok(result)
@@ -4883,13 +4878,24 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 // Each left row's right side holds its rows only until they
                 // are joined; the joined rows are the statement's.
                 let mut joined = Ok(());
-                for lr in &left_rows {
-                    ctx.correlated_row = Some(lr.clone());
+                for lr in left_rows {
+                    // The left row is lent to the right side and taken back:
+                    // only a right side yielding several rows copies it.
+                    ctx.correlated_row = Some(lr);
                     joined = ctx.in_budget_part(
                         |ctx| execute_op(right, ctx),
                         |ctx, rr| {
-                            for r in rr {
-                                let mut merged = lr.clone();
+                            // Every operator that replaces the correlated row
+                            // restores it, so the right side hands back this one.
+                            let mut lr = ctx.correlated_row.take();
+                            debug_assert!(lr.is_some(), "the correlated row was not restored");
+                            let last = rr.len().checked_sub(1);
+                            for (i, r) in rr.into_iter().enumerate() {
+                                let mut merged = if Some(i) == last {
+                                    lr.take().unwrap_or_default()
+                                } else {
+                                    lr.clone().unwrap_or_default()
+                                };
                                 merged.extend(r);
                                 keep_joined(ctx, merged, &mut result)?;
                             }
@@ -4933,6 +4939,9 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // The branches' rows were charged as they were made; they move
             // here, and the de-duplication counts its comparisons.
             let mut result: Vec<Row> = Vec::new();
+            let mut index = crate::executor::row::DistinctIndex::default();
+            let budget = Arc::clone(&ctx.budget);
+            let mut index_charge = budget.empty_charge();
             for branch in inputs {
                 let rows = execute_op(branch, ctx)?;
                 ctx.hold((rows.len() * core::mem::size_of::<Row>()) as u64)?;
@@ -4940,8 +4949,12 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     result.extend(rows);
                 } else {
                     for row in rows {
-                        ctx.budget.work(1 + result.len() as u64)?;
-                        if !result.contains(&row) {
+                        let hash = crate::executor::row::row_hash(&row);
+                        let (found, asked) = index.find(hash, |at| result[at] == row);
+                        ctx.budget.work(1 + asked)?;
+                        if found.is_none() {
+                            index_charge.grow(crate::executor::row::DistinctIndex::ENTRY_BYTES)?;
+                            index.keep(hash);
                             result.push(row);
                         }
                     }
@@ -6945,9 +6958,10 @@ fn execute_btree_index_scan(
     value_expr: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let temporal = ctx
-        .load_current_label_schema(label)?
-        .is_some_and(|s| s.temporal);
+    // A correlated probe runs once per outer row: the label's schema is read
+    // once per statement (the cache drops it on any schema change).
+    cache_label_schema(label, ctx)?;
+    let temporal = matches!(ctx.label_schema_cache.get(label), Some(Some(s)) if s.temporal);
 
     // Evaluate the lookup value. A correlated key (e.g. `WHERE a.pid = e.s`
     // driven per outer row) resolves against `correlated_row`; a literal /
@@ -11077,23 +11091,29 @@ fn execute_aggregate(
         let all: Vec<&Row> = rows.iter().collect();
         groups.push((Vec::new(), all));
     } else {
+        // Groups in first-seen order; a key is compared only with the group
+        // keys sharing its hash.
+        use crate::executor::row::{DistinctIndex, values_hash};
+        let mut index = DistinctIndex::default();
         for row in rows {
             let key: Vec<Value> = group_by
                 .iter()
                 .map(|e| eval_neutral(e, row))
                 .collect::<Result<_, _>>()?;
-            // The search compares the key with every group so far.
-            budget.work(1 + groups.len() as u64)?;
-            let found = groups.iter_mut().find(|(k, _)| k == &key);
-            if let Some((_, group_rows)) = found {
+            let hash = values_hash(&key);
+            let (found, asked) = index.find(hash, |at| groups[at].0 == key);
+            budget.work(1 + asked)?;
+            if let Some(at) = found {
                 held.grow(reference)?;
-                group_rows.push(row);
+                groups[at].1.push(row);
             } else {
                 held.grow(
                     core::mem::size_of::<(Vec<Value>, Vec<&Row>)>() as u64
                         + reference
+                        + DistinctIndex::ENTRY_BYTES
                         + key.iter().map(Value::held_bytes).sum::<u64>(),
                 )?;
+                index.keep(hash);
                 groups.push((key, vec![row]));
             }
         }
@@ -11143,10 +11163,15 @@ fn eval_aggregate_values(agg: &AggregateItem, rows: &[&Row]) -> Result<Vec<Value
     }
 
     if agg.distinct {
-        // Deduplicate using linear scan (Value doesn't impl Hash).
-        let mut unique = Vec::with_capacity(values.len());
+        // First-seen order; a value is compared only with the kept values
+        // sharing its hash.
+        use crate::executor::row::{DistinctIndex, values_hash};
+        let mut index = DistinctIndex::default();
+        let mut unique: Vec<Value> = Vec::with_capacity(values.len());
         for v in values {
-            if !unique.contains(&v) {
+            let hash = values_hash([&v]);
+            if index.find(hash, |at| unique[at] == v).0.is_none() {
+                index.keep(hash);
                 unique.push(v);
             }
         }
