@@ -468,10 +468,21 @@ impl Tree {
     /// Add the sum of the next complete block.
     #[inline(always)]
     pub(crate) fn push(&mut self, block_sum: f64) {
-        let mut value = block_sum;
-        // Each trailing one bit of the count is a subtree of the same size
-        // as the one being completed: merge it.
-        let mut count = self.blocks;
+        self.push_subtree(block_sum, 0);
+    }
+
+    /// Add the sum of the next `2^level` complete blocks, a complete subtree:
+    /// the blocks pushed so far are a multiple of `2^level`.
+    #[inline(always)]
+    pub(crate) fn push_subtree(&mut self, subtree_sum: f64, level: u32) {
+        debug_assert!(
+            self.blocks.trailing_zeros() >= level,
+            "a subtree of 2^level blocks starts at a multiple of 2^level"
+        );
+        let mut value = subtree_sum;
+        // Each trailing one bit of the count at this level is a subtree of
+        // the same size as the one being completed: merge it.
+        let mut count = self.blocks >> level;
         while count & 1 == 1 {
             self.len -= 1;
             // SAFETY: `len` stayed inside the initialized prefix: each one bit
@@ -483,7 +494,7 @@ impl Tree {
         }
         self.stack[self.len] = core::mem::MaybeUninit::new(value);
         self.len += 1;
-        self.blocks += 1;
+        self.blocks += 1 << level;
     }
 
     /// The canonical sum of every pushed block and then `tail`, the reduced
@@ -611,22 +622,94 @@ mod avx2 {
         unsafe { _mm256_cvtps_pd(_mm_loadu_ps(p)) }
     }
 
+    /// Lane `j` of output `i` is lane `i` of input `j`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn transpose(r: [__m256d; 4]) -> [__m256d; 4] {
+        // [r0.0, r1.0, r0.2, r1.2], [r0.1, r1.1, r0.3, r1.3], and so for r2, r3.
+        let t0 = _mm256_unpacklo_pd(r[0], r[1]);
+        let t1 = _mm256_unpackhi_pd(r[0], r[1]);
+        let t2 = _mm256_unpacklo_pd(r[2], r[3]);
+        let t3 = _mm256_unpackhi_pd(r[2], r[3]);
+        [
+            _mm256_permute2f128_pd::<0x20>(t0, t2),
+            _mm256_permute2f128_pd::<0x20>(t1, t3),
+            _mm256_permute2f128_pd::<0x31>(t0, t2),
+            _mm256_permute2f128_pd::<0x31>(t1, t3),
+        ]
+    }
+
+    /// The canonical sum of four consecutive blocks, `p[block][quad]` holding
+    /// each block's terms four by four. Lane `j` carries block `j` through the
+    /// pairs [`block`] makes, without the horizontal steps, and the four block
+    /// sums are then paired as the tree pairs them.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn four_blocks(p: [[__m256d; 4]; 4]) -> f64 {
+        let quad = |q: usize| {
+            // SAFETY: AVX2 is enabled for this function.
+            let [x0, x1, x2, x3] = unsafe { transpose([p[0][q], p[1][q], p[2][q], p[3][q]]) };
+            _mm256_add_pd(_mm256_add_pd(x0, x1), _mm256_add_pd(x2, x3))
+        };
+        let sums = _mm256_add_pd(
+            _mm256_add_pd(quad(0), quad(1)),
+            _mm256_add_pd(quad(2), quad(3)),
+        );
+        let pairs = _mm_hadd_pd(
+            _mm256_castpd256_pd128(sums),
+            _mm256_extractf128_pd::<1>(sums),
+        );
+        _mm_cvtsd_f64(pairs) + _mm_cvtsd_f64(_mm_unpackhi_pd(pairs, pairs))
+    }
+
+    /// The canonical reduction of `$n` terms: `$quad(o)` yields terms `o` to
+    /// `o + 3`, `$term(i)` term `i` of the tail. Four blocks go at a time
+    /// while they last, a complete subtree each, then single blocks, then the
+    /// tail. A macro, not a function: `#[inline(always)]` cannot be combined
+    /// with `#[target_feature]`, and each kernel needs its own copy compiled
+    /// with AVX2.
+    macro_rules! reduce {
+        ($n:expr, $quad:expr, $term:expr) => {{
+            let n: usize = $n;
+            let quad = $quad;
+            let blocks = n / BLOCK;
+            let block_of = |s: usize| [quad(s), quad(s + 4), quad(s + 8), quad(s + 12)];
+            let mut tree = Tree::new();
+            let mut b = 0;
+            while b + 4 <= blocks {
+                let s = b * BLOCK;
+                let p = [
+                    block_of(s),
+                    block_of(s + BLOCK),
+                    block_of(s + 2 * BLOCK),
+                    block_of(s + 3 * BLOCK),
+                ];
+                // SAFETY: AVX2 is enabled in every kernel expanding this.
+                tree.push_subtree(unsafe { four_blocks(p) }, 2);
+                b += 4;
+            }
+            while b < blocks {
+                let [p0, p1, p2, p3] = block_of(b * BLOCK);
+                // SAFETY: as above.
+                tree.push(unsafe { block(p0, p1, p2, p3) });
+                b += 1;
+            }
+            tree.finish(tail(n, $term))
+        }};
+    }
+
     /// # Safety
     ///
     /// AVX2 is available; `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn dot(a: &[f32], b: &[f32]) -> f64 {
-        let n = a.len();
-        let mut tree = Tree::new();
-        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
-            // SAFETY: base + 16 <= n for every whole block.
-            unsafe {
-                let (pa, pb) = (a.as_ptr().add(base), b.as_ptr().add(base));
-                let p = |o: usize| _mm256_mul_pd(load(pa.add(o)), load(pb.add(o)));
-                tree.push(block(p(0), p(4), p(8), p(12)));
-            }
-        }
-        tree.finish(tail(n, |i| f64::from(a[i]) * f64::from(b[i])))
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        reduce!(
+            a.len(),
+            // SAFETY: the driver asks only for whole quads inside both slices.
+            |o: usize| unsafe { _mm256_mul_pd(load(pa.add(o)), load(pb.add(o))) },
+            |i: usize| f64::from(a[i]) * f64::from(b[i])
+        )
     }
 
     /// # Safety
@@ -634,23 +717,19 @@ mod avx2 {
     /// AVX2 is available; `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn squared_l2(a: &[f32], b: &[f32]) -> f64 {
-        let n = a.len();
-        let mut tree = Tree::new();
-        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
-            // SAFETY: base + 16 <= n for every whole block.
-            unsafe {
-                let (pa, pb) = (a.as_ptr().add(base), b.as_ptr().add(base));
-                let p = |o: usize| {
-                    let d = _mm256_sub_pd(load(pa.add(o)), load(pb.add(o)));
-                    _mm256_mul_pd(d, d)
-                };
-                tree.push(block(p(0), p(4), p(8), p(12)));
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        reduce!(
+            a.len(),
+            // SAFETY: as in `dot`.
+            |o: usize| unsafe {
+                let d = _mm256_sub_pd(load(pa.add(o)), load(pb.add(o)));
+                _mm256_mul_pd(d, d)
+            },
+            |i: usize| {
+                let d = f64::from(a[i]) - f64::from(b[i]);
+                d * d
             }
-        }
-        tree.finish(tail(n, |i| {
-            let d = f64::from(a[i]) - f64::from(b[i]);
-            d * d
-        }))
+        )
     }
 
     /// # Safety
@@ -658,20 +737,16 @@ mod avx2 {
     /// AVX2 is available; `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn l1(a: &[f32], b: &[f32]) -> f64 {
-        let n = a.len();
-        let mut tree = Tree::new();
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
         let sign = _mm256_set1_pd(-0.0);
-        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
-            // SAFETY: base + 16 <= n for every whole block.
-            unsafe {
-                let (pa, pb) = (a.as_ptr().add(base), b.as_ptr().add(base));
-                let p = |o: usize| {
-                    _mm256_andnot_pd(sign, _mm256_sub_pd(load(pa.add(o)), load(pb.add(o))))
-                };
-                tree.push(block(p(0), p(4), p(8), p(12)));
-            }
-        }
-        tree.finish(tail(n, |i| (f64::from(a[i]) - f64::from(b[i])).abs()))
+        reduce!(
+            a.len(),
+            // SAFETY: as in `dot`.
+            |o: usize| unsafe {
+                _mm256_andnot_pd(sign, _mm256_sub_pd(load(pa.add(o)), load(pb.add(o))))
+            },
+            |i: usize| (f64::from(a[i]) - f64::from(b[i])).abs()
+        )
     }
 
     /// # Safety
@@ -679,53 +754,33 @@ mod avx2 {
     /// AVX2 is available.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn sum_of_squares(a: &[f32]) -> f64 {
-        let n = a.len();
-        let mut tree = Tree::new();
-        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
-            // SAFETY: base + 16 <= n for every whole block.
-            unsafe {
-                let pa = a.as_ptr().add(base);
-                let p = |o: usize| {
-                    let x = load(pa.add(o));
-                    _mm256_mul_pd(x, x)
-                };
-                tree.push(block(p(0), p(4), p(8), p(12)));
+        let pa = a.as_ptr();
+        reduce!(
+            a.len(),
+            // SAFETY: the driver asks only for whole quads inside the slice.
+            |o: usize| unsafe {
+                let x = load(pa.add(o));
+                _mm256_mul_pd(x, x)
+            },
+            |i: usize| {
+                let x = f64::from(a[i]);
+                x * x
             }
-        }
-        tree.finish(tail(n, |i| {
-            let x = f64::from(a[i]);
-            x * x
-        }))
+        )
     }
 
-    /// The dot product and both sums of squares in one pass over the inputs.
+    /// The dot product and both sums of squares. Three passes: each keeps the
+    /// vertical reduction's registers to itself, and the inputs are in cache
+    /// after the first.
     ///
     /// # Safety
     ///
     /// AVX2 is available; `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn cosine_parts(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
-        let n = a.len();
-        let (mut dot, mut ssa, mut ssb) = (Tree::new(), Tree::new(), Tree::new());
-        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
-            // SAFETY: base + 16 <= n for every whole block.
-            unsafe {
-                let (pa, pb) = (a.as_ptr().add(base), b.as_ptr().add(base));
-                let va = [load(pa), load(pa.add(4)), load(pa.add(8)), load(pa.add(12))];
-                let vb = [load(pb), load(pb.add(4)), load(pb.add(8)), load(pb.add(12))];
-                let ab = |i: usize| _mm256_mul_pd(va[i], vb[i]);
-                let aa = |i: usize| _mm256_mul_pd(va[i], va[i]);
-                let bb = |i: usize| _mm256_mul_pd(vb[i], vb[i]);
-                dot.push(block(ab(0), ab(1), ab(2), ab(3)));
-                ssa.push(block(aa(0), aa(1), aa(2), aa(3)));
-                ssb.push(block(bb(0), bb(1), bb(2), bb(3)));
-            }
-        }
-        (
-            dot.finish(tail(n, |i| f64::from(a[i]) * f64::from(b[i]))),
-            ssa.finish(tail(n, |i| f64::from(a[i]) * f64::from(a[i]))),
-            ssb.finish(tail(n, |i| f64::from(b[i]) * f64::from(b[i]))),
-        )
+        // SAFETY: AVX2 is available and the lengths match, as the caller
+        // guarantees.
+        unsafe { (dot(a, b), sum_of_squares(a), sum_of_squares(b)) }
     }
 }
 
