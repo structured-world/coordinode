@@ -7176,9 +7176,15 @@ fn execute_hnsw_scan(
         // node the delta names is answered from the store, so some hits do
         // not count. Ask for more until k of them do or the index runs out,
         // instead of answering LIMIT k with fewer rows than exist.
-        let mut want = k.checked_add(superseded).ok_or_else(|| {
-            ExecutionError::Unsupported(format!("HnswScan({index_name}): k={k} is too large"))
-        })?;
+        // One hit past the k-th shows whether a hit as near as the k-th was
+        // left out; asking for k alone would never settle on the first
+        // search and always search twice.
+        let mut want = k
+            .checked_add(superseded)
+            .and_then(|want| want.checked_add(1))
+            .ok_or_else(|| {
+                ExecutionError::Unsupported(format!("HnswScan({index_name}): k={k} is too large"))
+            })?;
         // The search runs against the statement's budget, and the records
         // of its hits are held while the rows are built.
         let budget = Arc::clone(&ctx.budget);
@@ -12146,12 +12152,31 @@ fn exists_subplan_matches(
     row: &Row,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Value, ExecutionError> {
-    let rows = execute_op(&subplan.root, ctx)?;
+    let rows = run_correlated(subplan, row, ctx)?;
     ctx.budget.work(rows.len() as u64)?;
     let any = rows
         .iter()
         .any(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)));
     Ok(Value::Bool(any))
+}
+
+/// The rows of `subplan` run for the outer `row`: its filters and index
+/// lookups see the outer bindings (a key the outer row computed, such as a
+/// WITH alias), and the outer correlation comes back afterwards, whether
+/// the run finished or was refused.
+fn run_correlated(
+    subplan: &crate::planner::logical::LogicalPlan,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    // An enclosing correlation (a subquery inside a correlated join) stays
+    // visible under this row's own bindings.
+    let mut outer = ctx.correlated_row.clone().unwrap_or_default();
+    outer.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let previous = ctx.correlated_row.replace(outer);
+    let rows = execute_op(&subplan.root, ctx);
+    ctx.correlated_row = previous;
+    rows
 }
 
 /// Execute an embedded subplan correlated with the outer `row`: keep only rows
@@ -12162,7 +12187,7 @@ fn correlated_subplan_rows(
     row: &Row,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let rows = execute_op(&subplan.root, ctx)?;
+    let rows = run_correlated(subplan, row, ctx)?;
     let mut merged_rows = Vec::new();
     for rr in rows {
         if rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)) {

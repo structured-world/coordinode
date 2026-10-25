@@ -3716,6 +3716,51 @@ fn deleting_undirected_matches_removes_edges_of_both_directions() {
     }
 }
 
+/// An EXISTS subquery keyed by a value the outer row computed finds the
+/// node that key names, with and without an index on the key and with
+/// string range conditions beside it. A false here dropped outer rows whose
+/// subquery matched.
+#[test]
+fn an_exists_subquery_keyed_by_an_outer_value_finds_its_node() {
+    use coordinode_core::graph::types::Value;
+    for indexed in [false, true] {
+        let mut db = open_db();
+        if indexed {
+            db.execute_cypher("CREATE UNIQUE INDEX range_key ON :RangeRow(key)")
+                .unwrap();
+        }
+        db.execute_cypher(
+            "CREATE (:RangeRow {key: 'asset/one', parent: 'assets', asset: 'one', incarnation: 'life'}), \
+             (:RangeRow {key: 'network/one/life', parent: 'networks', address_space: 'space/life', ip_order: '4/c000020a'})",
+        )
+        .unwrap();
+        let conditions = [
+            "ns.key = scope_key",
+            "ns.key = scope_key AND ns.address_space = 'space/life'",
+            "ns.key = scope_key AND ns.ip_order >= '4/c0000200'",
+            "ns.key = scope_key AND ns.address_space = 'space/life' \
+             AND ns.ip_order >= '4/c0000200' AND ns.ip_order <= '4/c00002ff'",
+        ];
+        for condition in conditions {
+            let query = format!(
+                "MATCH (a:RangeRow {{parent: 'assets'}}) \
+                 WITH a, 'network/' + a.asset + '/' + a.incarnation AS scope_key \
+                 WHERE EXISTS {{ MATCH (ns:RangeRow) WHERE {condition} }} RETURN a.key AS key"
+            );
+            let rows = db.execute_cypher(&query).unwrap();
+            let keys: Vec<Value> = rows
+                .iter()
+                .map(|r| r.get("key").cloned().unwrap_or(Value::Null))
+                .collect();
+            assert_eq!(
+                keys,
+                vec![Value::String("asset/one".into())],
+                "indexed {indexed}: {condition}"
+            );
+        }
+    }
+}
+
 #[test]
 fn with_distinct_passthrough() {
     use coordinode_core::graph::types::Value;
