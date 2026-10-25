@@ -3879,6 +3879,84 @@ fn the_fast_estimator_domain_is_bounded_by_the_largest_component() {
     assert!(!in_fast_domain(&[1e20, 0.0], VectorMetric::Cosine, &rabitq));
 }
 
+/// The estimator's error band drops only candidates that cannot be among the
+/// k best by exact score: over the whole population as candidates, ranking
+/// what the band keeps returns the same results, scores and order as ranking
+/// every candidate. The data pushes the bound: near-duplicate vectors one
+/// ulp apart, exact duplicates (ties broken by id), several magnitudes
+/// inside the fast domain and dimensions from 3 to 515.
+#[test]
+fn the_error_band_keeps_every_possible_exact_result() {
+    let mut pruned_somewhere = false;
+    for metric in [
+        VectorMetric::L2,
+        VectorMetric::L1,
+        VectorMetric::DotProduct,
+        VectorMetric::Cosine,
+    ] {
+        for (dim, scale) in [
+            (3usize, 1.0f32),
+            (17, 2f32.powi(-30)),
+            (128, 1.0),
+            (515, 2f32.powi(30)),
+        ] {
+            let base = uniform_points(60, dim);
+            let mut items: Vec<(u64, Vec<f32>)> = Vec::new();
+            for (id, v) in &base {
+                let v: Vec<f32> = v.iter().map(|x| (x + 0.5) * scale).collect();
+                // One ulp away in a single component, and an exact duplicate.
+                let mut near = v.clone();
+                near[0] = f32::from_bits(near[0].to_bits() + 1);
+                items.push((id * 3, v.clone()));
+                items.push((id * 3 + 1, near));
+                items.push((id * 3 + 2, v));
+            }
+            let mut index = HnswIndex::new(HnswConfig {
+                metric,
+                max_dimensions: 65_536,
+                max_elements: items.len() as u32,
+                ..Default::default()
+            });
+            index.insert_batch(items);
+            for (q, query) in uniform_points(8, dim).into_iter().enumerate() {
+                let query: Vec<f32> = query.1.iter().map(|x| (x + 0.25) * scale).collect();
+                let exact = index.exact_query(&query).unwrap();
+                let qctx = QueryCtx::new(
+                    &query,
+                    metric,
+                    index.rabitq_params.as_ref(),
+                    &index.config.quantization,
+                    index.wide_for(&query),
+                );
+                let all: Vec<Candidate> = (0..index.node_len())
+                    .map(|idx| Candidate {
+                        distance: index.compute_distance(&qctx, idx),
+                        idx: idx as u32,
+                    })
+                    .collect();
+                for k in [1usize, 10, 50] {
+                    let mut full = index.rank_exactly(&exact, all.clone()).unwrap();
+                    full.truncate(k);
+                    let mut kept = all.clone();
+                    index.exact_band(&qctx, &mut kept, k);
+                    pruned_somewhere |= kept.len() < all.len();
+                    let mut banded = index.rank_exactly(&exact, kept).unwrap();
+                    banded.truncate(k);
+                    let bits = |r: &[SearchResult]| -> Vec<(u64, u64)> {
+                        r.iter().map(|s| (s.id, s.score.to_bits())).collect()
+                    };
+                    assert_eq!(
+                        bits(&banded),
+                        bits(&full),
+                        "{metric:?} d{dim} scale {scale} query {q} k {k}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(pruned_somewhere, "the band never dropped a candidate");
+}
+
 /// The first vector outside the fast domain switches the index to the
 /// range-safe estimator for good, and the index then serves both scales; a
 /// query outside the domain is evaluated range-safely on an index that is

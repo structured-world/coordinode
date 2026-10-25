@@ -2495,6 +2495,89 @@ impl HnswIndex {
         })
     }
 
+    /// Drops the traversal candidates that cannot be among the `k` best by
+    /// exact score, so only the rest are evaluated exactly.
+    ///
+    /// The estimate of an unquantized index searched in its fast domain is
+    /// the metric evaluated in binary32, whose error is bounded whatever the
+    /// kernel's summation order: n terms sum within `γ(n-1)·Σ|x_i|`, with
+    /// `γ(m) = m·u/(1 - m·u)` and `u = 2^-24` (Higham, Accuracy and Stability
+    /// of Numerical Algorithms, 2nd ed., §2.2 and §4.2), plus an absolute
+    /// term for subnormal products. Each candidate thereby has an interval
+    /// holding its exact score; one whose lowest score exceeds the k-th
+    /// smallest highest score ranks after k others, ties included. A
+    /// quantized, range-safe or non-finite estimate keeps every candidate.
+    fn exact_band(&self, qctx: &QueryCtx<'_>, candidates: &mut Vec<Candidate>, k: usize) {
+        if k == 0
+            || candidates.len() <= k
+            || qctx.wide
+            || self.is_quantized()
+            || self.rabitq_params.is_some()
+            || candidates.iter().any(|c| !c.distance.is_finite())
+        {
+            return;
+        }
+        let n = qctx.vec.len() as f64;
+        let u = f64::from(f32::EPSILON) / 2.0;
+        let gamma = |m: f64| m * u / (1.0 - m * u);
+        // Subnormal products and squares err absolutely, half an ulp of the
+        // smallest subnormal each; four times that per term covers them.
+        let tiny = 4.0 * n * 2f64.powi(-149);
+        // The exact scores are binary64 evaluations: far within this margin.
+        let rel64 = 1e-9;
+        let metric = self.config.metric;
+        let query_norm = match metric {
+            VectorMetric::DotProduct => metrics::exact::sum_of_squares(qctx.vec).sqrt(),
+            _ => 0.0,
+        };
+        let block = self.data_level0.get();
+        let mut bounds: Vec<(f64, f64)> = Vec::with_capacity(candidates.len());
+        for c in candidates.iter() {
+            let est = f64::from(c.distance);
+            let bound = match metric {
+                VectorMetric::L2 => {
+                    let g = gamma(n + 2.0);
+                    let lo = ((est - tiny) / (1.0 + g)).max(0.0).sqrt();
+                    let hi = ((est + tiny) / (1.0 - g)).sqrt();
+                    (lo * (1.0 - rel64), hi * (1.0 + rel64))
+                }
+                VectorMetric::L1 => {
+                    let g = gamma(n + 1.0);
+                    let lo = ((est - tiny) / (1.0 + g)).max(0.0);
+                    let hi = (est + tiny) / (1.0 - g);
+                    (lo * (1.0 - rel64), hi * (1.0 + rel64))
+                }
+                VectorMetric::DotProduct => {
+                    // Error relative to |q|·|b|; a node without its stored
+                    // sum of squares gives no bound.
+                    let Some(ss) = block.and_then(|b| b.sum_of_squares(c.idx as usize)) else {
+                        return;
+                    };
+                    let scale = query_norm * ss.sqrt();
+                    let b = (gamma(n + 1.0) + rel64) * scale + tiny;
+                    (est - b, est + b)
+                }
+                VectorMetric::Cosine => {
+                    // Both norms are at least 1e-12 on the binary32 path
+                    // (smaller ones take the binary64 cosine), so the
+                    // subnormal term relative to their product is below
+                    // `tiny · 1e24`.
+                    let b = 4.0 * gamma(n + 4.0) + tiny * 1e24 + rel64;
+                    (est - b, est + b)
+                }
+            };
+            bounds.push(bound);
+        }
+        let mut highs: Vec<f64> = bounds.iter().map(|&(_, hi)| hi).collect();
+        let (_, &mut kth, _) = highs.select_nth_unstable_by(k - 1, f64::total_cmp);
+        let mut at = 0;
+        candidates.retain(|_| {
+            let keep = bounds[at].0 <= kth;
+            at += 1;
+            keep
+        });
+    }
+
     /// The traversal's candidates scored exactly and in the ranking's order.
     fn rank_exactly(
         &self,
@@ -2568,12 +2651,13 @@ impl HnswIndex {
         }
 
         // Search at layer 0 with ef candidates
-        let candidates = self.results_only(
+        let mut candidates = self.results_only(
             self.search_layer_ctx(&qctx, current_ep, ef, 0, meter)
                 .map_err(SearchError::Stopped)?,
         );
-        // Every candidate the traversal returned is scored exactly: the
-        // estimator's order is not the result's.
+        // Every candidate that can be among the k best is scored exactly:
+        // the estimator's order is not the result's.
+        self.exact_band(&qctx, &mut candidates, k);
         meter
             .work(candidates.len() as u64)
             .map_err(SearchError::Stopped)?;
