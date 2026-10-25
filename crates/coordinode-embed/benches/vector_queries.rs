@@ -26,6 +26,10 @@ const SCANS: usize = 100;
 /// Vectors created per statement while loading.
 const BATCH: usize = 500;
 
+/// Top-10 of the indexed label.
+const TOP_K_V: &str =
+    "MATCH (n:V) RETURN n.i AS i, vector_distance(n.e, $q) AS d ORDER BY d LIMIT 10";
+
 /// Components in `[-1, 1)`, deterministic per seed.
 fn synth(seed: u64, dim: usize) -> Vec<f32> {
     let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -110,7 +114,9 @@ fn load(db: &Database, label: &str, dim: usize, n: usize, seed: u64) {
 
 fn main() {
     for (dim, n) in SHAPES {
-        let dir = tempfile::tempdir().expect("tempdir");
+        // Beside the build, not in the system temporary directory: hosts keep
+        // a small root disk and the store grows under the concurrent writes.
+        let dir = tempfile::tempdir_in(".").expect("tempdir");
         let db = Database::open(dir.path()).expect("open");
         // The index exists before the vectors arrive: they enter it on write,
         // with no background build to wait for.
@@ -129,17 +135,19 @@ fn main() {
         let queries: Vec<Vec<f32>> = (0..64).map(|q| synth(1_000_000 + q, dim)).collect();
         let shape = format!("d{dim} n{n}");
 
+        // The distance projected under an alias: the shape the planner serves
+        // from the index.
         measure(
             &db,
             &format!("{shape} index top-10"),
-            "MATCH (n:V) RETURN n.i AS i ORDER BY vector_distance(n.e, $q) LIMIT 10",
+            TOP_K_V,
             &queries,
             HOT,
         );
         measure(
             &db,
             &format!("{shape} exhaustive top-10"),
-            "MATCH (n:W) RETURN n.i AS i ORDER BY vector_distance(n.e, $q) LIMIT 10",
+            "MATCH (n:W) RETURN n.i AS i, vector_distance(n.e, $q) AS d ORDER BY d LIMIT 10",
             &queries,
             SCANS,
         );
@@ -186,7 +194,7 @@ fn main() {
             measure(
                 &db,
                 &format!("{shape} index top-10 under writes"),
-                "MATCH (n:V) RETURN n.i AS i ORDER BY vector_distance(n.e, $q) LIMIT 10",
+                TOP_K_V,
                 &queries,
                 HOT,
             );
