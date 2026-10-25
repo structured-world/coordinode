@@ -3591,6 +3591,61 @@ fn with_passthrough_followed_by_where() {
 
 /// `WITH DISTINCT a` — dedup must operate on the merged row (including
 /// `a.*` columns). Two rows of the same node collapse to one.
+/// A lookup key computed per outer row by a CASE (or any other expression
+/// over the outer binding) is evaluated for each row, with an index on the
+/// key and without one. Treating CASE as not referring to the outer row ran
+/// the lookup once with the binding unbound, and matched nothing.
+#[test]
+fn a_correlated_case_key_is_evaluated_per_row() {
+    use coordinode_core::graph::types::Value;
+    for indexed in [false, true] {
+        let mut db = open_db();
+        if indexed {
+            db.execute_cypher("CREATE UNIQUE INDEX g_key ON :G(key)")
+                .unwrap();
+        }
+        db.execute_cypher("CREATE (:G {key: 'g/one'}), (:G {key: 'g/two'})")
+            .unwrap();
+        let queries = [
+            "UNWIND [1, 2, 3] AS e MATCH (g:G) \
+             WHERE g.key = CASE WHEN e = 1 THEN 'g/one' WHEN e = 2 THEN 'g/two' ELSE 'g/none' END \
+             RETURN e, g.key AS key ORDER BY e",
+            "UNWIND [1, 2, 3] AS e MATCH (g:G {key: CASE e WHEN 1 THEN 'g/one' WHEN 2 THEN 'g/two' END}) \
+             RETURN e, g.key AS key ORDER BY e",
+            "UNWIND [['g', 'one'], ['g', 'two'], ['x', 'y']] AS e MATCH (g:G) \
+             WHERE g.key = e[0] + '/' + e[1] RETURN e[1] AS e, g.key AS key ORDER BY key",
+        ];
+        // The simple CASE form evaluates per row on its own.
+        let keys = db
+            .execute_cypher(
+                "UNWIND [1, 2, 3] AS e RETURN CASE e WHEN 1 THEN 'g/one' WHEN 2 THEN 'g/two' END AS key",
+            )
+            .unwrap();
+        assert_eq!(
+            keys.iter()
+                .map(|r| r.get("key").cloned())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Value::String("g/one".into())),
+                Some(Value::String("g/two".into())),
+                Some(Value::Null)
+            ]
+        );
+        for query in queries {
+            let rows = db.execute_cypher(query).unwrap();
+            let keys: Vec<Value> = rows
+                .iter()
+                .map(|r| r.get("key").cloned().unwrap_or(Value::Null))
+                .collect();
+            assert_eq!(
+                keys,
+                vec![Value::String("g/one".into()), Value::String("g/two".into())],
+                "indexed {indexed}: {query}"
+            );
+        }
+    }
+}
+
 #[test]
 fn with_distinct_passthrough() {
     use coordinode_core::graph::types::Value;

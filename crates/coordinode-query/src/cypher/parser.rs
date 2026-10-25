@@ -3613,13 +3613,13 @@ fn build_case_expr(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
     let mut operand = None;
     let mut when_clauses = Vec::new();
     let mut else_clause = None;
-    let mut first_expr = true;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
-            Rule::expression if first_expr => {
+            // The expression between CASE and the first WHEN is the operand
+            // of the simple form; the CASE keyword itself comes first.
+            Rule::expression if when_clauses.is_empty() => {
                 operand = Some(Box::new(build_expression(inner)?));
-                first_expr = false;
             }
             Rule::when_clause => {
                 let wc_children = inner.into_inner();
@@ -3639,7 +3639,6 @@ fn build_case_expr(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
                         })?)?;
                     when_clauses.push((when, then));
                 }
-                first_expr = false;
             }
             Rule::else_clause => {
                 for ec in inner.into_inner() {
@@ -3648,9 +3647,8 @@ fn build_case_expr(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
                     }
                 }
             }
-            _ => {
-                first_expr = false;
-            }
+            // Keywords.
+            _ => {}
         }
     }
 

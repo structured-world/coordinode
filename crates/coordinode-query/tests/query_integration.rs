@@ -2257,6 +2257,53 @@ fn distinct_removes_non_consecutive_duplicate_rows() {
     );
 }
 
+/// AND and OR follow three-valued logic (openCypher 9, 2.7 Boolean
+/// operators): a false operand makes AND false and a true one makes OR true
+/// whatever the other is, and only an undecided pair is NULL. Answering NULL
+/// for `null OR true` dropped matching rows from a disjunction of nullable
+/// conditions, and `NOT (null AND false)` was NULL instead of true.
+#[test]
+fn and_or_follow_three_valued_logic() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+    let rows = run_cypher(
+        "RETURN null OR true AS a, true OR null AS b, null OR false AS c, \
+         null AND false AS d, false AND null AS e, null AND true AS f, \
+         NOT (null AND false) AS g, NOT (null OR true) AS h, \
+         true AND false AS i, false OR true AS j, true AND true AS k, false OR false AS l",
+        engine,
+        &mut interner,
+    );
+    let get = |k: &str| rows[0].get(k).cloned();
+    assert_eq!(get("a"), Some(Value::Bool(true)));
+    assert_eq!(get("b"), Some(Value::Bool(true)));
+    assert_eq!(get("c"), Some(Value::Null));
+    assert_eq!(get("d"), Some(Value::Bool(false)));
+    assert_eq!(get("e"), Some(Value::Bool(false)));
+    assert_eq!(get("f"), Some(Value::Null));
+    assert_eq!(get("g"), Some(Value::Bool(true)));
+    assert_eq!(get("h"), Some(Value::Bool(false)));
+    assert_eq!(get("i"), Some(Value::Bool(false)));
+    assert_eq!(get("j"), Some(Value::Bool(true)));
+    assert_eq!(get("k"), Some(Value::Bool(true)));
+    assert_eq!(get("l"), Some(Value::Bool(false)));
+
+    // A disjunction over a property some nodes lack keeps every node one of
+    // its branches matches.
+    let found = run_cypher(
+        "MATCH (n:Person) WHERE n.missing = 1 OR n.age >= 30 RETURN count(n) AS n",
+        engine,
+        &mut interner,
+    );
+    let all = run_cypher(
+        "MATCH (n:Person) WHERE n.age >= 30 RETURN count(n) AS n",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(found[0].get("n"), all[0].get("n"));
+    assert_ne!(all[0].get("n"), Some(&Value::Int(0)));
+}
+
 /// DISTINCT, count(DISTINCT) and grouping bucket values by hash and then
 /// compare them: equal values that hash apart (signed zeros, lists and maps
 /// holding them) would survive as duplicates, and a hash collision must not

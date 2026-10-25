@@ -308,13 +308,19 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<V
             }
         },
 
-        // Logical
+        // Logical, three-valued (openCypher 9, 2.7): a false operand decides
+        // AND and a true one decides OR whatever the other is; an undecided
+        // pair with NULL is NULL.
         BinOp::And => match (left, right) {
-            (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
+            (Value::Bool(false), Value::Bool(_) | Value::Null)
+            | (Value::Bool(_) | Value::Null, Value::Bool(false)) => Value::Bool(false),
+            (Value::Bool(true), Value::Bool(true)) => Value::Bool(true),
             _ => Value::Null,
         },
         BinOp::Or => match (left, right) {
-            (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
+            (Value::Bool(true), Value::Bool(_) | Value::Null)
+            | (Value::Bool(_) | Value::Null, Value::Bool(true)) => Value::Bool(true),
+            (Value::Bool(false), Value::Bool(false)) => Value::Bool(false),
             _ => Value::Null,
         },
         BinOp::Xor => match (left, right) {

@@ -11682,19 +11682,11 @@ fn expr_references_outside(
     expr: &crate::plan::expr::Expr,
     bound: &std::collections::HashSet<String>,
 ) -> bool {
-    use crate::plan::expr::Expr as PExpr;
-    match expr {
-        PExpr::Variable(name) => !bound.contains(name),
-        PExpr::Property { base, .. } => expr_references_outside(base, bound),
-        PExpr::Unary { operand, .. } => expr_references_outside(operand, bound),
-        PExpr::Binary { left, right, .. } => {
-            expr_references_outside(left, bound) || expr_references_outside(right, bound)
-        }
-        PExpr::Call { args, .. } | PExpr::List(args) => {
-            args.iter().any(|e| expr_references_outside(e, bound))
-        }
-        _ => false,
-    }
+    // Every expression form the evaluator reads a variable through (CASE,
+    // IN, subscripts, comprehensions...), with locally bound names excluded.
+    let mut vars = Vec::new();
+    collect_expr_vars(expr, &mut vars);
+    vars.iter().any(|name| !bound.contains(name))
 }
 
 /// Returns a reference to the innermost `Traverse` op if `op` is Traverse or a chain of
@@ -12076,10 +12068,12 @@ fn eval_neutral_with_storage(
         }
         PExpr::Binary { left, op, right } => {
             let lv = eval_neutral_with_storage(left, row, ctx)?;
-            // Short-circuit AND/OR before evaluating the right side.
-            match op {
-                BinOp::And if !is_truthy(&lv) => return Ok(Value::Bool(false)),
-                BinOp::Or if is_truthy(&lv) => return Ok(Value::Bool(true)),
+            // Short-circuit AND/OR before evaluating the right side, only on
+            // an operand that decides it: a NULL left side leaves the answer
+            // to the right one (three-valued logic).
+            match (op, &lv) {
+                (BinOp::And, Value::Bool(false)) => return Ok(Value::Bool(false)),
+                (BinOp::Or, Value::Bool(true)) => return Ok(Value::Bool(true)),
                 _ => {}
             }
             let rv = eval_neutral_with_storage(right, row, ctx)?;
