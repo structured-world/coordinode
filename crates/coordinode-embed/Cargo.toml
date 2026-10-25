@@ -114,6 +114,10 @@ name = "label_scan"
 harness = false
 
 [[bench]]
+name = "vector_queries"
+harness = false
+
+[[bench]]
 name = "borrowed_point"
 harness = false
 
