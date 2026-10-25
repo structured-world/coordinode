@@ -275,7 +275,7 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
     let hot = TempDir::new().expect("hot tempdir");
     let cold = TempDir::new().expect("cold tempdir");
 
-    let config = StorageConfig::with_endpoints(vec![
+    let mut config = StorageConfig::with_endpoints(vec![
         EndpointConfig::new(
             "ep-hot",
             hot.path(),
@@ -294,12 +294,19 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
         )
         .with_hard_limit_bytes(0), // unlimited
     ]);
+    // The cascade is what must move the data. A background compaction routes
+    // the tables to cold by itself, before the limit is lowered on a fast
+    // host, and leaves the hot endpoint holding nothing to judge.
+    config.compaction_workers = 0;
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Enough on hot that half of it is still a supported limit.
-    let hot_charged = || engine.footprints().get("ep-hot").expect("capped").charged();
+    // Rows of 1 KiB no codec shrinks, counted by what was written rather than
+    // by the charge, which also holds what files still being written are
+    // allowed.
+    const ROW: u64 = 16 * 64;
+    let written = 2 * MIN_HARD_LIMIT_BYTES + 2 * (1 << 20);
     let mut i = 0u32;
-    while hot_charged() < 2 * MIN_HARD_LIMIT_BYTES + 2 * (1 << 20) {
+    while u64::from(i) * ROW < written {
         let key = format!("node:0:{i:010}");
         let value: Vec<u8> = (0..16u32)
             .flat_map(|k| incompressible(i * 16 + k))
@@ -308,21 +315,18 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
             .put(Partition::Node, key.as_bytes(), &value)
             .expect("put under a roomy limit");
         i += 1;
-        assert!(i < 200_000, "the hot endpoint never held enough");
     }
     engine.persist().expect("persist");
 
-    // The limit lowered at runtime so that the client share is half of what
-    // the hot endpoint holds puts it at Full at once, without racing the
-    // compactions that route the bottom level to cold by themselves, and
-    // whatever the allowances held for files being written settle to. The
-    // reserve left above the client share is the room the cascade's own
-    // work uses.
+    // The limit lowered at runtime so that the client share is the supported
+    // minimum, under half of the data the hot endpoint holds, puts it at
+    // Full at once. The reserve left above the client share is the room the
+    // cascade's own work uses.
     let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
     let hot_before = engine.footprints().get("ep-hot").expect("capped").charged();
     let reserve = coordinode_storage::engine::footprint::OVER_LIMIT_ALLOWANCE;
     engine
-        .set_hard_limit("ep-hot", hot_before / 2 + reserve, Some(reserve))
+        .set_hard_limit("ep-hot", MIN_HARD_LIMIT_BYTES + reserve, Some(reserve))
         .expect("lower the hot limit");
 
     // The refresh sees the endpoint at Emergency or Full and cascades.
