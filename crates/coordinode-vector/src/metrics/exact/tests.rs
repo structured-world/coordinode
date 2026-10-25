@@ -450,3 +450,37 @@ fn maxsim_refuses_what_it_cannot_score() {
         Err(VectorDomainError::NonFinite { index: 1 })
     );
 }
+
+/// A distance from a cached sum of squares has the bits of the distance that
+/// reduces it, under every metric and kernel width: the cache is the same
+/// canonical value, not an approximation of it.
+#[test]
+fn a_cached_sum_of_squares_gives_the_same_distance() {
+    for n in [1usize, 15, 16, 17, 100, 769] {
+        let q: Vec<f32> = values(n as u64 * 3 + 1, n)
+            .into_iter()
+            .map(|x| if x.is_finite() { x } else { 0.25 })
+            .collect();
+        let c: Vec<f32> = values(n as u64 * 5 + 2, n)
+            .into_iter()
+            .map(|x| if x.is_finite() { x } else { -0.75 })
+            .collect();
+        for metric in [
+            VectorMetric::Cosine,
+            VectorMetric::L2,
+            VectorMetric::DotProduct,
+            VectorMetric::L1,
+        ] {
+            let Ok(query) = ExactQuery::new(&q, metric) else {
+                continue;
+            };
+            let direct = query.distance(&c);
+            let cached = query.distance_with_sum_of_squares(&c, sum_of_squares(&c));
+            assert_eq!(
+                direct.map(f64::to_bits),
+                cached.map(f64::to_bits),
+                "{metric:?} n {n}"
+            );
+        }
+    }
+}

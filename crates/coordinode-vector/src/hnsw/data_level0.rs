@@ -115,6 +115,10 @@ struct Segment {
     /// per-visit cosine multiplies by it instead of dividing. Kept apart from
     /// `meta` so a visit reads 4 bytes per node from a dense array.
     inv_norms: Box<[AtomicU32]>,
+    /// The exact binary64 sum of squares of each node's vector, as f64
+    /// bits, written with the vector it belongs to: an exact cosine against
+    /// the node reduces only the dot product.
+    sums_of_squares: Box<[AtomicU64]>,
     /// Per-node lists above layer 0; their count is the node's top layer.
     /// Written once with the node's scalars, before the node is reachable.
     upper: Box<[UnsafeCell<UpperLists>]>,
@@ -137,6 +141,7 @@ impl Segment {
             lists: (0..cap).map(|_| AtomicNeighbourList::new()).collect(),
             meta: (0..cap).map(|_| NodeMeta::new()).collect(),
             inv_norms: (0..cap).map(|_| AtomicU32::new(0)).collect(),
+            sums_of_squares: (0..cap).map(|_| AtomicU64::new(0)).collect(),
             upper: (0..cap).map(|_| UnsafeCell::new(Box::default())).collect(),
             sq8: (0..cap).map(|_| UnsafeCell::new(None)).collect(),
             rabitq: (0..cap).map(|_| UnsafeCell::new(None)).collect(),
@@ -444,15 +449,23 @@ impl DataLevel0Block {
         true
     }
 
-    /// Initialize node `idx`: its external id, its norms and `upper_layers`
-    /// empty lists above layer 0.
+    /// Initialize node `idx`: its external id, its norms (the f32 norm of
+    /// the traversal estimator and the exact `sum_of_squares` of the vector
+    /// it is given) and `upper_layers` empty lists above layer 0.
     ///
     /// # Safety
     ///
     /// `idx < self.capacity()`, and the caller is the only writer of node
     /// `idx` and writes before the node is reachable by any reader (no link
     /// or entry point names it yet), or holds the store exclusively.
-    pub(super) unsafe fn init_node(&self, idx: usize, id: u64, norm: f32, upper_layers: usize) {
+    pub(super) unsafe fn init_node(
+        &self,
+        idx: usize,
+        id: u64,
+        norm: f32,
+        sum_of_squares: f64,
+        upper_layers: usize,
+    ) {
         // SAFETY: caller bounds and exclusivity.
         unsafe {
             let (segment, off) = self.locate(idx);
@@ -462,6 +475,10 @@ impl DataLevel0Block {
                 .id
                 .store(id, Ordering::Relaxed);
             store_norms(segment, off, norm);
+            segment
+                .sums_of_squares
+                .get_unchecked(off)
+                .store(sum_of_squares.to_bits(), Ordering::Relaxed);
             *segment.upper.get_unchecked(off).get() = (0..upper_layers)
                 .map(|_| AtomicNeighbourList::new())
                 .collect();
@@ -521,6 +538,16 @@ impl DataLevel0Block {
             .norm
             .load(Ordering::Relaxed);
         Some(f32::from_bits(bits))
+    }
+
+    /// The exact sum of squares of node `idx`'s vector, `None` when `idx`
+    /// has no slot.
+    #[inline]
+    pub(super) fn sum_of_squares(&self, idx: usize) -> Option<f64> {
+        let (segment, off) = self.try_locate(idx)?;
+        // SAFETY: off lies inside the segment per try_locate.
+        let bits = unsafe { segment.sums_of_squares.get_unchecked(off) }.load(Ordering::Relaxed);
+        Some(f64::from_bits(bits))
     }
 
     /// `1 / norm` of node `idx`'s vector (0.0 when not invertible), `None`

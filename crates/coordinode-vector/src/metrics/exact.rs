@@ -306,6 +306,32 @@ impl<'a> ExactQuery<'a> {
         };
         Ok(canonical(d))
     }
+
+    /// [`Self::distance`] of a candidate whose [`sum_of_squares`] is known:
+    /// a cosine reduces only the dot product. The same bits as
+    /// [`Self::distance`] when `sum_of_squares` is the candidate's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::distance`].
+    pub fn distance_with_sum_of_squares(
+        &self,
+        candidate: &[f32],
+        sum_of_squares: f64,
+    ) -> Result<f64, VectorDomainError> {
+        if !matches!(self.metric, VectorMetric::Cosine) {
+            return self.distance(candidate);
+        }
+        same_dims(self.vector, candidate)?;
+        let dot = finite(
+            kernels().dot(self.vector, candidate),
+            self.vector,
+            candidate,
+        )?;
+        Ok(canonical(
+            1.0 - cosine_from_parts(dot, self.sum_of_squares, sum_of_squares)?,
+        ))
+    }
 }
 
 /// Check `vector` for admission to an index of `metric`: finite, nonempty,
@@ -693,6 +719,172 @@ mod avx2 {
     }
 }
 
+// --- SSE2 kernels (x86_64 baseline: every x86_64 CPU has SSE2) ---
+
+#[cfg(target_arch = "x86_64")]
+mod sse2 {
+    use super::{BLOCK, Tree, tail};
+    use std::arch::x86_64::*;
+
+    /// `[x0 + x1, y0 + y1]`: the adjacent pairs of two registers.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn pairs(x: __m128d, y: __m128d) -> __m128d {
+        _mm_add_pd(_mm_unpacklo_pd(x, y), _mm_unpackhi_pd(x, y))
+    }
+
+    /// The canonical reduction of the 16 terms in `p` (two per register, in
+    /// term order).
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn block(p: [__m128d; 8]) -> f64 {
+        // SAFETY: SSE2 is enabled on this function.
+        unsafe {
+            let q0 = pairs(p[0], p[1]);
+            let q1 = pairs(p[2], p[3]);
+            let q2 = pairs(p[4], p[5]);
+            let q3 = pairs(p[6], p[7]);
+            let r = pairs(pairs(q0, q1), pairs(q2, q3));
+            _mm_cvtsd_f64(r) + _mm_cvtsd_f64(_mm_unpackhi_pd(r, r))
+        }
+    }
+
+    /// Sixteen f32 from `p`, widened, in term order.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn load16(p: *const f32) -> [__m128d; 8] {
+        // SAFETY: the caller keeps `p..p+16` inside its slice.
+        unsafe {
+            let v = [
+                _mm_loadu_ps(p),
+                _mm_loadu_ps(p.add(4)),
+                _mm_loadu_ps(p.add(8)),
+                _mm_loadu_ps(p.add(12)),
+            ];
+            let hi = |x: __m128| _mm_cvtps_pd(_mm_movehl_ps(x, x));
+            [
+                _mm_cvtps_pd(v[0]),
+                hi(v[0]),
+                _mm_cvtps_pd(v[1]),
+                hi(v[1]),
+                _mm_cvtps_pd(v[2]),
+                hi(v[2]),
+                _mm_cvtps_pd(v[3]),
+                hi(v[3]),
+            ]
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `a.len() == b.len()`.
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn dot(a: &[f32], b: &[f32]) -> f64 {
+        let n = a.len();
+        let mut tree = Tree::new();
+        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
+            // SAFETY: base + 16 <= n for every whole block.
+            unsafe {
+                let va = load16(a.as_ptr().add(base));
+                let vb = load16(b.as_ptr().add(base));
+                tree.push(block(core::array::from_fn(|i| _mm_mul_pd(va[i], vb[i]))));
+            }
+        }
+        tree.finish(tail(n, |i| f64::from(a[i]) * f64::from(b[i])))
+    }
+
+    /// # Safety
+    ///
+    /// `a.len() == b.len()`.
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn squared_l2(a: &[f32], b: &[f32]) -> f64 {
+        let n = a.len();
+        let mut tree = Tree::new();
+        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
+            // SAFETY: base + 16 <= n for every whole block.
+            unsafe {
+                let va = load16(a.as_ptr().add(base));
+                let vb = load16(b.as_ptr().add(base));
+                tree.push(block(core::array::from_fn(|i| {
+                    let d = _mm_sub_pd(va[i], vb[i]);
+                    _mm_mul_pd(d, d)
+                })));
+            }
+        }
+        tree.finish(tail(n, |i| {
+            let d = f64::from(a[i]) - f64::from(b[i]);
+            d * d
+        }))
+    }
+
+    /// # Safety
+    ///
+    /// `a.len() == b.len()`.
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn l1(a: &[f32], b: &[f32]) -> f64 {
+        let n = a.len();
+        let mut tree = Tree::new();
+        let sign = _mm_set1_pd(-0.0);
+        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
+            // SAFETY: base + 16 <= n for every whole block.
+            unsafe {
+                let va = load16(a.as_ptr().add(base));
+                let vb = load16(b.as_ptr().add(base));
+                tree.push(block(core::array::from_fn(|i| {
+                    _mm_andnot_pd(sign, _mm_sub_pd(va[i], vb[i]))
+                })));
+            }
+        }
+        tree.finish(tail(n, |i| (f64::from(a[i]) - f64::from(b[i])).abs()))
+    }
+
+    /// # Safety
+    ///
+    /// None beyond the caller running on x86_64.
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn sum_of_squares(a: &[f32]) -> f64 {
+        let n = a.len();
+        let mut tree = Tree::new();
+        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
+            // SAFETY: base + 16 <= n for every whole block.
+            unsafe {
+                let va = load16(a.as_ptr().add(base));
+                tree.push(block(core::array::from_fn(|i| _mm_mul_pd(va[i], va[i]))));
+            }
+        }
+        tree.finish(tail(n, |i| {
+            let x = f64::from(a[i]);
+            x * x
+        }))
+    }
+
+    /// The dot product and both sums of squares in one pass over the inputs.
+    ///
+    /// # Safety
+    ///
+    /// `a.len() == b.len()`.
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn cosine_parts(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+        let n = a.len();
+        let (mut dot, mut ssa, mut ssb) = (Tree::new(), Tree::new(), Tree::new());
+        for base in (0..n / BLOCK).map(|i| i * BLOCK) {
+            // SAFETY: base + 16 <= n for every whole block.
+            unsafe {
+                let va = load16(a.as_ptr().add(base));
+                let vb = load16(b.as_ptr().add(base));
+                dot.push(block(core::array::from_fn(|i| _mm_mul_pd(va[i], vb[i]))));
+                ssa.push(block(core::array::from_fn(|i| _mm_mul_pd(va[i], va[i]))));
+                ssb.push(block(core::array::from_fn(|i| _mm_mul_pd(vb[i], vb[i]))));
+            }
+        }
+        (
+            dot.finish(tail(n, |i| f64::from(a[i]) * f64::from(b[i]))),
+            ssa.finish(tail(n, |i| f64::from(a[i]) * f64::from(a[i]))),
+            ssb.finish(tail(n, |i| f64::from(b[i]) * f64::from(b[i]))),
+        )
+    }
+}
+
 // --- NEON kernels (aarch64) ---
 
 #[cfg(target_arch = "aarch64")]
@@ -857,6 +1049,9 @@ mod neon {
 pub(crate) enum Kernels {
     /// The portable reference.
     Scalar,
+    /// x86_64 SSE2, part of every x86_64 CPU.
+    #[cfg(target_arch = "x86_64")]
+    Sse2,
     /// x86_64 AVX2.
     #[cfg(target_arch = "x86_64")]
     Avx2,
@@ -869,6 +1064,10 @@ impl Kernels {
     /// The kernel sets this CPU can run, the reference first.
     pub(crate) fn available() -> Vec<Self> {
         let mut sets = vec![Self::Scalar];
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("sse2") {
+            sets.push(Self::Sse2);
+        }
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") {
             sets.push(Self::Avx2);
@@ -885,8 +1084,10 @@ impl Kernels {
         debug_assert_eq!(a.len(), b.len());
         match self {
             Self::Scalar => dot_scalar(a, b),
-            // SAFETY: `Avx2` is chosen only when the CPU has AVX2; the caller
-            // checked the dimensions.
+            // SAFETY: `Sse2` and `Avx2` are chosen only when the CPU has the
+            // feature; the caller checked the dimensions.
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse2 => unsafe { sse2::dot(a, b) },
             #[cfg(target_arch = "x86_64")]
             Self::Avx2 => unsafe { avx2::dot(a, b) },
             // SAFETY: `Neon` is chosen only when the CPU has NEON.
@@ -900,6 +1101,9 @@ impl Kernels {
         debug_assert_eq!(a.len(), b.len());
         match self {
             Self::Scalar => squared_l2_scalar(a, b),
+            // SAFETY: as in `dot`.
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse2 => unsafe { sse2::squared_l2(a, b) },
             // SAFETY: as in `dot`.
             #[cfg(target_arch = "x86_64")]
             Self::Avx2 => unsafe { avx2::squared_l2(a, b) },
@@ -916,6 +1120,9 @@ impl Kernels {
             Self::Scalar => l1_scalar(a, b),
             // SAFETY: as in `dot`.
             #[cfg(target_arch = "x86_64")]
+            Self::Sse2 => unsafe { sse2::l1(a, b) },
+            // SAFETY: as in `dot`.
+            #[cfg(target_arch = "x86_64")]
             Self::Avx2 => unsafe { avx2::l1(a, b) },
             // SAFETY: as in `dot`.
             #[cfg(target_arch = "aarch64")]
@@ -927,7 +1134,10 @@ impl Kernels {
     pub(crate) fn sum_of_squares(self, a: &[f32]) -> f64 {
         match self {
             Self::Scalar => sum_of_squares_scalar(a),
-            // SAFETY: `Avx2` is chosen only when the CPU has AVX2.
+            // SAFETY: `Sse2` and `Avx2` are chosen only when the CPU has the
+            // feature.
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse2 => unsafe { sse2::sum_of_squares(a) },
             #[cfg(target_arch = "x86_64")]
             Self::Avx2 => unsafe { avx2::sum_of_squares(a) },
             // SAFETY: `Neon` is chosen only when the CPU has NEON.
@@ -941,6 +1151,9 @@ impl Kernels {
         debug_assert_eq!(a.len(), b.len());
         match self {
             Self::Scalar => cosine_parts_scalar(a, b),
+            // SAFETY: as in `dot`.
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse2 => unsafe { sse2::cosine_parts(a, b) },
             // SAFETY: as in `dot`.
             #[cfg(target_arch = "x86_64")]
             Self::Avx2 => unsafe { avx2::cosine_parts(a, b) },

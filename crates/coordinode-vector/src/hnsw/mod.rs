@@ -1830,7 +1830,13 @@ impl HnswIndex {
         // unreachable and written by this insert only.
         unsafe {
             self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
-            block.init_node(idx, id, metrics::norm_l2(vector), new_level);
+            block.init_node(
+                idx,
+                id,
+                metrics::norm_l2(vector),
+                metrics::exact::sum_of_squares(vector),
+                new_level,
+            );
             block.set_codes(idx, quantized, rabitq_code);
         }
         Some(idx)
@@ -2468,7 +2474,17 @@ impl HnswIndex {
         idx: usize,
     ) -> Result<f64, VectorSearchError> {
         if let Some(vector) = self.read_node_f32(idx) {
-            return Ok(exact.distance(vector)?);
+            // The retained vector's sum of squares was stored with it.
+            let cached = self
+                .data_level0
+                .get()
+                .and_then(|block| block.sum_of_squares(idx));
+            return Ok(match cached {
+                Some(sum_of_squares) => {
+                    exact.distance_with_sum_of_squares(vector, sum_of_squares)?
+                }
+                None => exact.distance(vector)?,
+            });
         }
         if let (Some(params), Some(code)) = (self.sq8_params.as_ref(), self.node_sq8(idx)) {
             return Ok(exact.distance(&params.dequantize(code))?);

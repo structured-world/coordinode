@@ -143,7 +143,7 @@ impl HnswIndex {
         let mut l0_vecs: Vec<Vec<f32>> = Vec::with_capacity(n);
         let mut l0_nbrs: Vec<Vec<u32>> = Vec::with_capacity(n);
         let mut upper: Vec<Vec<Vec<u64>>> = Vec::with_capacity(n);
-        let mut meta: Vec<(u64, f32)> = Vec::with_capacity(n);
+        let mut meta: Vec<(u64, f32, f64)> = Vec::with_capacity(n);
         let mut nb_buf: Vec<u64> = Vec::new();
         for &old in &old_of_new {
             l0_vecs.push(
@@ -174,6 +174,7 @@ impl HnswIndex {
             meta.push((
                 self.node_id(old),
                 self.nodes().norm(old).unwrap_or_default(),
+                self.nodes().sum_of_squares(old).unwrap_or_default(),
             ));
         }
 
@@ -209,13 +210,13 @@ impl HnswIndex {
                 nb.drop_f32();
             }
             for new in 0..n {
-                let (id, norm) = meta[new];
+                let (id, norm, sum_of_squares) = meta[new];
                 let per_layer = std::mem::take(&mut upper[new]);
                 let (sq8, rabitq) = std::mem::take(&mut codes[new]);
                 // SAFETY: new < n <= cap; `nb` is owned here, so nothing else
                 // reads or writes it.
                 unsafe {
-                    nb.init_node(new, id, norm, per_layer.len());
+                    nb.init_node(new, id, norm, sum_of_squares, per_layer.len());
                     nb.set_codes(new, sq8, rabitq);
                     if has_f32 && !l0_vecs[new].is_empty() {
                         nb.set_vector(new, &l0_vecs[new]);
@@ -258,7 +259,7 @@ impl HnswIndex {
 
         // id -> idx map and entry point follow the new numbering.
         self.id_to_idx.clear();
-        for (new, &(id, _)) in meta.iter().enumerate() {
+        for (new, &(id, _, _)) in meta.iter().enumerate() {
             self.id_to_idx.insert(id, new);
         }
         self.entry_point = super::entry_point::EntryPoint::new();
