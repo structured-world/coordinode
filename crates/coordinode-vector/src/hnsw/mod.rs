@@ -636,13 +636,11 @@ impl<'a> QueryCtx<'a> {
     }
 }
 
-/// `1 / n`, or 0.0 when `n` is too small to invert safely. The zero
-/// sentinel makes `dot * inv_a * inv_b` evaluate to 0.0 for zero
-/// vectors — the same "no direction" answer the division-based cosine
-/// helpers return through their epsilon guard.
+/// `1 / n`, or the 0.0 sentinel that sends the cosine through the f64
+/// path when the f32 one cannot use `n`.
 #[inline]
 fn inv_or_zero(n: f32) -> f32 {
-    if n < f32::EPSILON { 0.0 } else { 1.0 / n }
+    metrics::cosine_inverse_norm(n)
 }
 
 /// Max-heap candidate (for maintaining top-K worst). 8-byte packed —
@@ -3265,18 +3263,20 @@ impl HnswIndex {
                 }
                 // Cached inverse norm available even without RaBitQ — skip
                 // the per-visit `norm_l2(b)` pass AND the divide: the score
-                // is `1 - dot * inv_a * inv_b`. Zero-vector inverses are
-                // stored as 0.0, which collapses the product to 0.0 — the
-                // same answer the division helpers' epsilon guard gives.
+                // is `1 - dot * inv_a * inv_b`. An inverse stored as 0.0
+                // (zero, tiny or huge norm) takes the f64 cosine instead.
                 if let Some(b_inv) = self
                     .data_level0
                     .get()
                     .and_then(|block| block.inv_norm(node_idx))
                 {
-                    if b_inv.is_finite() {
-                        let dot = metrics::dot_product(ctx.vec, node_vec);
-                        return 1.0 - dot * ctx.inv_norm_l2 * b_inv;
-                    }
+                    return 1.0
+                        - metrics::cosine_similarity_with_inverse_norms(
+                            ctx.vec,
+                            node_vec,
+                            ctx.inv_norm_l2,
+                            b_inv,
+                        );
                 }
             }
             return self.distance_for_metric(ctx, node_vec);

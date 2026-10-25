@@ -144,11 +144,83 @@ pub fn distance(a: &[f32], b: &[f32], metric: VectorMetric) -> f32 {
     }
 }
 
+/// The smallest norm the f32 kernels serve cosine for. Above it a component
+/// whose square or product underflows f32 weighs under 1e-14 of the result;
+/// below it, or where a dot, a squared norm or their product leaves the f32
+/// range, cosine is computed in f64, where every square and product of f32
+/// values is a normal number.
+const COSINE_F32_MIN_NORM: f32 = 1e-12;
+
 /// Cosine similarity: dot(a,b) / (||a|| * ||b||).
-/// Returns value in [-1, 1]. Higher = more similar.
+/// Returns value in [-1, 1]. Higher = more similar. Scale-invariant over
+/// every finite vector; 0 when either vector is zero (no direction).
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let norm_a = norm_l2(a);
     cosine_similarity_with_query_norm(a, b, norm_a)
+}
+
+/// Cosine of `a` and `b` accumulated in f64, from the vectors alone: the
+/// path for magnitudes the f32 kernels cannot represent.
+#[cold]
+#[inline(never)]
+fn cosine_similarity_wide(a: &[f32], b: &[f32]) -> f32 {
+    let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(x), f64::from(y));
+        dot += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    if aa == 0.0 || bb == 0.0 {
+        return 0.0; // Zero vectors have no direction
+    }
+    (dot / (aa.sqrt() * bb.sqrt())) as f32
+}
+
+/// `dot / (a_norm * b_norm)` when the f32 terms are exact enough to give
+/// cosine, otherwise the f64 computation from the vectors themselves.
+#[inline(always)]
+fn cosine_from_terms(a: &[f32], b: &[f32], dot: f32, a_norm: f32, b_norm: f32) -> f32 {
+    let denom = a_norm * b_norm;
+    // NaN norms (a NaN component) fail every comparison and go wide too.
+    if dot.is_finite()
+        && denom.is_finite()
+        && a_norm >= COSINE_F32_MIN_NORM
+        && b_norm >= COSINE_F32_MIN_NORM
+    {
+        return dot / denom;
+    }
+    cosine_similarity_wide(a, b)
+}
+
+/// Cosine similarity from inverse norms cached for both vectors: the
+/// division turned into a multiply. An inverse of `0.0` marks a vector whose
+/// norm could not be inverted in f32 (zero, too small or too large), whose
+/// cosine is computed in f64.
+#[inline]
+pub fn cosine_similarity_with_inverse_norms(a: &[f32], b: &[f32], a_inv: f32, b_inv: f32) -> f32 {
+    let dot = dot_product_inner(a, b);
+    if dot.is_finite()
+        && a_inv > 0.0
+        && a_inv <= 1.0 / COSINE_F32_MIN_NORM
+        && b_inv > 0.0
+        && b_inv <= 1.0 / COSINE_F32_MIN_NORM
+    {
+        return dot * a_inv * b_inv;
+    }
+    cosine_similarity_wide(a, b)
+}
+
+/// `1 / norm` for [`cosine_similarity_with_inverse_norms`], `0.0` when the
+/// f32 cosine cannot use it.
+#[inline]
+#[must_use]
+pub fn cosine_inverse_norm(norm: f32) -> f32 {
+    if (COSINE_F32_MIN_NORM..f32::INFINITY).contains(&norm) {
+        1.0 / norm
+    } else {
+        0.0
+    }
 }
 
 /// Cosine similarity where ‖a‖₂ is already known.
@@ -161,11 +233,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn cosine_similarity_with_query_norm(a: &[f32], b: &[f32], a_norm_l2: f32) -> f32 {
     let dot = dot_product_inner(a, b);
-    let denom = a_norm_l2 * norm_l2(b);
-    if denom < f32::EPSILON {
-        return 0.0; // Zero vectors have no direction
-    }
-    dot / denom
+    cosine_from_terms(a, b, dot, a_norm_l2, norm_l2(b))
 }
 
 /// Cosine similarity where BOTH norms are already known.
@@ -185,11 +253,7 @@ pub fn cosine_similarity_with_both_norms(
     b_norm_l2: f32,
 ) -> f32 {
     let dot = dot_product_inner(a, b);
-    let denom = a_norm_l2 * b_norm_l2;
-    if denom < f32::EPSILON {
-        return 0.0;
-    }
-    dot / denom
+    cosine_from_terms(a, b, dot, a_norm_l2, b_norm_l2)
 }
 
 /// Cosine distance: 1 - cosine_similarity. Range [0, 2]. Lower = more similar.
@@ -264,10 +328,25 @@ pub fn manhattan_distance(a: &[f32], b: &[f32]) -> f32 {
     l1_scalar(a, b)
 }
 
-/// L2 norm: sqrt(sum(a_i^2)).
+/// L2 norm: sqrt(sum(a_i^2)), accurate for every finite vector whose norm
+/// fits f32: a sum of squares that overflows or underflows f32 is redone in
+/// f64. `inf` only when the norm itself exceeds `f32::MAX`.
 #[inline]
 pub fn norm_l2(a: &[f32]) -> f32 {
-    dot_product_inner(a, a).sqrt()
+    let sq = dot_product_inner(a, a);
+    // Squares of a norm at COSINE_F32_MIN_NORM: well inside the normal range.
+    if sq.is_finite() && sq >= COSINE_F32_MIN_NORM * COSINE_F32_MIN_NORM {
+        return sq.sqrt();
+    }
+    norm_l2_wide(a)
+}
+
+/// [`norm_l2`] accumulated in f64.
+#[cold]
+#[inline(never)]
+fn norm_l2_wide(a: &[f32]) -> f32 {
+    let sq: f64 = a.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+    sq.sqrt() as f32
 }
 
 // --- Diagnostic distance-call counter (bench-only feature) ---

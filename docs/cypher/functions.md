@@ -37,7 +37,7 @@ CoordiNode extensions. Operate on `Vector` or `Array` of Float/Int values.
 | Function | Signature | Returns | Notes |
 |----------|-----------|---------|-------|
 | `vector_distance` | `vector_distance(a, b)` | Float | Euclidean (L2) distance |
-| `vector_similarity` | `vector_similarity(a, b)` | Float | Cosine similarity. Range [0, 1] |
+| `vector_similarity` | `vector_similarity(a, b)` | Float | Cosine similarity. Range [-1, 1], independent of the vectors' scale for any finite values; `0.0` when either vector is all zeros |
 | `vector_dot` | `vector_dot(a, b)` | Float | Dot product |
 | `vector_manhattan` | `vector_manhattan(a, b)` | Float | Manhattan (L1) distance. Only accepts `Vector` values — not `Array` |
 

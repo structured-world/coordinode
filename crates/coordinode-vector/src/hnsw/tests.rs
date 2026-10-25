@@ -3240,6 +3240,33 @@ fn update_refreshes_the_cosine_norms() {
     );
 }
 
+/// Cosine search over large finite vectors ranks by direction through the
+/// cached inverse norms and the build's both-norms path: the vector along
+/// the query is found at distance 0, and no distance comes back NaN or
+/// below 0 (`1 - inf * 0` would rank a far vector first).
+#[test]
+fn cosine_search_over_large_finite_vectors_ranks_by_direction() {
+    let mut index = HnswIndex::new(make_config(VectorMetric::Cosine));
+    for i in 0..20u64 {
+        let v: Vec<f32> = (0..4)
+            .map(|d| ((i * 5 + d) as f32 * 0.3).sin() * 1e20)
+            .collect();
+        index.insert(i, v);
+    }
+    index.insert(100, vec![1e20, 1e20, 0.0, 0.0]);
+    let results = index.search(&[3e20, 3e20, 0.0, 0.0], 5);
+    assert_eq!(results[0].id, 100);
+    assert!(results[0].score.abs() < 1e-5, "{}", results[0].score);
+    for r in &results {
+        assert!(
+            (0.0..=2.0 + 1e-5).contains(&r.score),
+            "distance {} of {} outside [0, 2]",
+            r.score,
+            r.id
+        );
+    }
+}
+
 /// A prune that races a back-edge append must keep the append: the prune
 /// recomputes against the list that won instead of overwriting it with a
 /// result computed from an older snapshot. `max_conn` here exceeds every

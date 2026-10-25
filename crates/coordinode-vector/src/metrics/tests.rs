@@ -99,6 +99,63 @@ fn cosine_scale_invariant() {
     assert!(approx_eq(cosine_similarity(&a, &b), 1.0));
 }
 
+/// Finite vectors whose dot and squared norms leave the f32 range score as
+/// their direction says: `[1e20, 1e20]` against itself is 1, not the NaN
+/// `inf / inf` gives, through every entry point.
+#[test]
+fn cosine_of_large_finite_vectors_is_their_direction() {
+    let a = [1e20f32, 1e20];
+    let b = [2e20f32, 2e20];
+    let opposite = [-1e20f32, -1e20];
+    let wide: Vec<f32> = vec![1e19; 1500]; // each square fits, the sum does not
+    for (x, y, want) in [
+        (&a[..], &a[..], 1.0),
+        (&a[..], &b[..], 1.0),
+        (&a[..], &opposite[..], -1.0),
+        (&wide[..], &wide[..], 1.0),
+        (
+            &[f32::MAX, f32::MAX][..],
+            &[f32::MAX, 0.0][..],
+            core::f32::consts::FRAC_1_SQRT_2,
+        ),
+    ] {
+        let got = cosine_similarity(x, y);
+        assert!(approx_eq(got, want), "cosine {got}, want {want}");
+        let got = cosine_similarity_with_query_norm(x, y, norm_l2(x));
+        assert!(approx_eq(got, want), "with query norm {got}, want {want}");
+        let got = cosine_similarity_with_both_norms(x, y, norm_l2(x), norm_l2(y));
+        assert!(approx_eq(got, want), "with both norms {got}, want {want}");
+    }
+}
+
+/// Cosine does not depend on scale: vectors far below 1 keep their angle
+/// instead of being taken for zero vectors, down to subnormal components.
+#[test]
+fn cosine_is_scale_invariant_down_to_tiny_vectors() {
+    let a = [1.0f32, 2.0, 3.0];
+    let b = [3.0f32, -1.0, 2.0];
+    let want = cosine_similarity(&a, &b);
+    for scale in [1e-4f32, 1e-10, 1e-20, 1e-30, 1e-40] {
+        let sa: Vec<f32> = a.iter().map(|x| x * scale).collect();
+        let sb: Vec<f32> = b.iter().map(|x| x * scale).collect();
+        let got = cosine_similarity(&sa, &sb);
+        assert!(
+            (got - want).abs() < 1e-3,
+            "scale {scale}: cosine {got}, want {want}"
+        );
+    }
+    // A zero vector still has no direction.
+    assert_eq!(cosine_similarity(&[1e-30, 0.0], &[0.0, 0.0]), 0.0);
+}
+
+/// The norm of a finite vector is finite whenever it fits in f32, however
+/// its squares overflow or underflow.
+#[test]
+fn norm_of_extreme_finite_vectors() {
+    assert!((norm_l2(&[3e20, 4e20]) / 5e20 - 1.0).abs() < 1e-6);
+    assert!((norm_l2(&[3e-25, 4e-25]) / 5e-25 - 1.0).abs() < 1e-6);
+}
+
 #[test]
 fn cosine_distance_range() {
     let a = [1.0, 0.0];

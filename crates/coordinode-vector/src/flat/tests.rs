@@ -56,6 +56,21 @@ fn cosine_metric() {
     assert_eq!(results[0].id, 1);
 }
 
+/// Large finite vectors rank by direction: the one along the query comes
+/// first with distance 0, not after the others with a NaN distance.
+#[test]
+fn cosine_ranks_large_finite_vectors_by_direction() {
+    let mut index = FlatIndex::new(VectorMetric::Cosine);
+    index.insert(1, vec![1.0, 0.0]);
+    index.insert(2, vec![1e20, 1e20]);
+    index.insert(3, vec![-1e20, 1e20]);
+
+    let results = index.search(&[3e20, 3e20], 3);
+    assert_eq!(results[0].id, 2);
+    assert!(results[0].score.abs() < 1e-5, "{}", results[0].score);
+    assert!(results.iter().all(|r| r.score.is_finite()));
+}
+
 #[test]
 fn dot_product_metric() {
     let mut index = FlatIndex::new(VectorMetric::DotProduct);

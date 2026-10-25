@@ -111,7 +111,7 @@ struct Segment {
     lists: Box<[AtomicNeighbourList<M_MAX0, u32>]>,
     /// Per-node scalars.
     meta: Box<[NodeMeta]>,
-    /// `1 / norm` per node (0.0 for a zero vector), as f32 bits; the
+    /// `1 / norm` per node (0.0 when not invertible in f32), as f32 bits; the
     /// per-visit cosine multiplies by it instead of dividing. Kept apart from
     /// `meta` so a visit reads 4 bytes per node from a dense array.
     inv_norms: Box<[AtomicU32]>,
@@ -204,14 +204,14 @@ impl core::fmt::Debug for DataLevel0Block {
 }
 
 /// Store `norm` and its inverse for the node at `off` in `segment`; a norm
-/// below `f32::EPSILON` stores inverse 0.0, which collapses the cosine product
-/// to 0 like the division helpers' epsilon guard.
+/// the f32 cosine cannot invert (zero, tiny or huge) stores inverse 0.0,
+/// which sends that node's cosine through the f64 path.
 ///
 /// # Safety
 ///
 /// `off` lies inside the segment.
 unsafe fn store_norms(segment: &Segment, off: usize, norm: f32) {
-    let inv = if norm < f32::EPSILON { 0.0 } else { 1.0 / norm };
+    let inv = crate::metrics::cosine_inverse_norm(norm);
     // SAFETY: off bound per contract.
     unsafe {
         segment
@@ -523,7 +523,7 @@ impl DataLevel0Block {
         Some(f32::from_bits(bits))
     }
 
-    /// `1 / norm` of node `idx`'s vector (0.0 for a zero vector), `None`
+    /// `1 / norm` of node `idx`'s vector (0.0 when not invertible), `None`
     /// when `idx` has no slot. Read on every cosine visit.
     #[inline(always)]
     pub(super) fn inv_norm(&self, idx: usize) -> Option<f32> {
