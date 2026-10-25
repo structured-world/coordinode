@@ -31,8 +31,39 @@ fn equal_values_hash_equal() {
             Value::MultiVector(vec![vec![0.0]]),
         ),
         (
-            Value::Geo(GeoValue::Point { lat: 1.0, lon: 2.0 }),
-            Value::Geo(GeoValue::Point { lat: 1.0, lon: 2.0 }),
+            Value::Geo(GeoValue::Point {
+                lat: -0.0,
+                lon: 2.0,
+            }),
+            Value::Geo(GeoValue::Point { lat: 0.0, lon: 2.0 }),
+        ),
+        (
+            Value::Document(rmpv::Value::Map(vec![(
+                rmpv::Value::from("k"),
+                rmpv::Value::Array(vec![rmpv::Value::F64(-0.0), rmpv::Value::from(7)]),
+            )])),
+            Value::Document(rmpv::Value::Map(vec![(
+                rmpv::Value::from("k"),
+                rmpv::Value::Array(vec![rmpv::Value::F64(0.0), rmpv::Value::from(7)]),
+            )])),
+        ),
+        (
+            Value::Path(PathValue {
+                nodes: vec![1, 2],
+                rels: vec![PathRel {
+                    edge_type: "R".into(),
+                    source: 1,
+                    target: 2,
+                }],
+            }),
+            Value::Path(PathValue {
+                nodes: vec![1, 2],
+                rels: vec![PathRel {
+                    edge_type: "R".into(),
+                    source: 1,
+                    target: 2,
+                }],
+            }),
         ),
     ];
     for (a, b) in &pairs {
@@ -44,6 +75,26 @@ fn equal_values_hash_equal() {
     assert_ne!(
         equal_hash(&Value::String("a".into())),
         equal_hash(&Value::String("b".into()))
+    );
+    // Content-bearing kinds hash by content, not only by kind: different
+    // documents, points and paths do not all share one bucket.
+    assert_ne!(
+        equal_hash(&Value::Document(rmpv::Value::from(1))),
+        equal_hash(&Value::Document(rmpv::Value::from(2)))
+    );
+    assert_ne!(
+        equal_hash(&Value::Geo(GeoValue::Point { lat: 1.0, lon: 2.0 })),
+        equal_hash(&Value::Geo(GeoValue::Point { lat: 2.0, lon: 1.0 }))
+    );
+    assert_ne!(
+        equal_hash(&Value::Path(PathValue {
+            nodes: vec![1],
+            rels: vec![]
+        })),
+        equal_hash(&Value::Path(PathValue {
+            nodes: vec![2],
+            rels: vec![]
+        }))
     );
 }
 

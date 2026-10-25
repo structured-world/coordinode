@@ -4684,24 +4684,26 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
             if *distinct {
                 // Full dedup, not just consecutive, in first-seen order: a row
-                // is compared only with the kept rows sharing its hash. The
-                // kept rows are the projected ones, moved, never copied; the
-                // index over them is charged while it exists.
+                // is compared only with the kept rows sharing its hash. Kept
+                // rows are compacted to the front of the projected list itself,
+                // so no second list or row copy exists; the index is charged
+                // before it is allocated.
                 use crate::executor::row::{DistinctIndex, row_hash};
                 let mut index = DistinctIndex::default();
                 let mut index_charge = ctx.budget.empty_charge();
-                let mut kept: Vec<Row> = Vec::with_capacity(result.len());
-                for row in result {
-                    let hash = row_hash(&row);
-                    let (found, asked) = index.find(hash, |at| kept[at] == row);
+                index.reserve(result.len(), &mut index_charge)?;
+                let mut kept = 0;
+                for at in 0..result.len() {
+                    let hash = row_hash(&result[at]);
+                    let (found, asked) = index.find(hash, |k| result[k] == result[at]);
                     ctx.budget.work(1 + asked)?;
                     if found.is_none() {
-                        index_charge.grow(DistinctIndex::ENTRY_BYTES)?;
                         index.keep(hash);
-                        kept.push(row);
+                        result.swap(kept, at);
+                        kept += 1;
                     }
                 }
-                return Ok(kept);
+                result.truncate(kept);
             }
 
             Ok(result)
@@ -4938,26 +4940,33 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::Union { inputs, all } => {
             // The branches' rows were charged as they were made; they move
             // here, and the de-duplication counts its comparisons.
-            let mut result: Vec<Row> = Vec::new();
-            let mut index = crate::executor::row::DistinctIndex::default();
+            let mut branches = Vec::with_capacity(inputs.len());
+            for branch in inputs {
+                branches.push(execute_op(branch, ctx)?);
+            }
+            // One list of exactly the combined rows; each row's slot is
+            // charged before it is made.
+            let total = branches.iter().map(Vec::len).sum::<usize>();
+            ctx.hold((total * core::mem::size_of::<Row>()) as u64)?;
+            let mut result: Vec<Row> = Vec::with_capacity(total);
+            if *all {
+                for rows in branches {
+                    result.extend(rows);
+                }
+                return Ok(result);
+            }
+            use crate::executor::row::{DistinctIndex, row_hash};
             let budget = Arc::clone(&ctx.budget);
             let mut index_charge = budget.empty_charge();
-            for branch in inputs {
-                let rows = execute_op(branch, ctx)?;
-                ctx.hold((rows.len() * core::mem::size_of::<Row>()) as u64)?;
-                if *all {
-                    result.extend(rows);
-                } else {
-                    for row in rows {
-                        let hash = crate::executor::row::row_hash(&row);
-                        let (found, asked) = index.find(hash, |at| result[at] == row);
-                        ctx.budget.work(1 + asked)?;
-                        if found.is_none() {
-                            index_charge.grow(crate::executor::row::DistinctIndex::ENTRY_BYTES)?;
-                            index.keep(hash);
-                            result.push(row);
-                        }
-                    }
+            let mut index = DistinctIndex::default();
+            index.reserve(total, &mut index_charge)?;
+            for row in branches.into_iter().flatten() {
+                let hash = row_hash(&row);
+                let (found, asked) = index.find(hash, |at| result[at] == row);
+                budget.work(1 + asked)?;
+                if found.is_none() {
+                    index.keep(hash);
+                    result.push(row);
                 }
             }
             Ok(result)
@@ -11093,8 +11102,11 @@ fn execute_aggregate(
     } else {
         // Groups in first-seen order; a key is compared only with the group
         // keys sharing its hash.
-        use crate::executor::row::{DistinctIndex, values_hash};
+        // The index is sized for the worst case, every row its own group;
+        // the group list and each group's members grow by charged doubling.
+        use crate::executor::row::{DistinctIndex, push_charged, values_hash};
         let mut index = DistinctIndex::default();
+        index.reserve(rows.len(), &mut held)?;
         for row in rows {
             let key: Vec<Value> = group_by
                 .iter()
@@ -11104,17 +11116,13 @@ fn execute_aggregate(
             let (found, asked) = index.find(hash, |at| groups[at].0 == key);
             budget.work(1 + asked)?;
             if let Some(at) = found {
-                held.grow(reference)?;
-                groups[at].1.push(row);
+                push_charged(&mut groups[at].1, row, &mut held)?;
             } else {
-                held.grow(
-                    core::mem::size_of::<(Vec<Value>, Vec<&Row>)>() as u64
-                        + reference
-                        + DistinctIndex::ENTRY_BYTES
-                        + key.iter().map(Value::held_bytes).sum::<u64>(),
-                )?;
+                held.grow(key.iter().map(Value::held_bytes).sum::<u64>())?;
                 index.keep(hash);
-                groups.push((key, vec![row]));
+                let mut members = Vec::new();
+                push_charged(&mut members, row, &mut held)?;
+                push_charged(&mut groups, (key, members), &mut held)?;
             }
         }
     }
@@ -11137,7 +11145,7 @@ fn execute_aggregate(
             budget.work(group_rows.len() as u64)?;
             let _scratch =
                 budget.reserve((group_rows.len() * core::mem::size_of::<Value>()) as u64)?;
-            let val = compute_aggregate(agg, group_rows, params)?;
+            let val = compute_aggregate(agg, group_rows, params, budget)?;
             let col = agg.alias.clone().unwrap_or_else(|| agg.function.clone());
             out.insert(col, val);
         }
@@ -11152,30 +11160,43 @@ fn execute_aggregate(
 }
 
 /// Evaluate aggregate argument for all rows, applying DISTINCT dedup if needed.
-/// Returns non-null values only.
-fn eval_aggregate_values(agg: &AggregateItem, rows: &[&Row]) -> Result<Vec<Value>, EvalError> {
+/// Returns non-null values only. The list's slots are the caller's reserved
+/// scratch; what the values allocate beyond their slots, and the DISTINCT
+/// index, are charged to `held` before they are kept.
+fn eval_aggregate_values(
+    agg: &AggregateItem,
+    rows: &[&Row],
+    budget: &coordinode_core::budget::QueryBudget,
+    held: &mut coordinode_core::budget::MemoryCharge<'_>,
+) -> Result<Vec<Value>, ExecutionError> {
+    let slot = core::mem::size_of::<Value>() as u64;
     let mut values: Vec<Value> = Vec::with_capacity(rows.len());
     for r in rows.iter() {
         let v = eval_neutral(&agg.arg, r)?;
         if !v.is_null() {
+            held.grow(v.held_bytes() - slot)?;
             values.push(v);
         }
     }
 
     if agg.distinct {
         // First-seen order; a value is compared only with the kept values
-        // sharing its hash.
+        // sharing its hash. Kept values are compacted to the front in place.
         use crate::executor::row::{DistinctIndex, values_hash};
         let mut index = DistinctIndex::default();
-        let mut unique: Vec<Value> = Vec::with_capacity(values.len());
-        for v in values {
-            let hash = values_hash([&v]);
-            if index.find(hash, |at| unique[at] == v).0.is_none() {
+        index.reserve(values.len(), held)?;
+        let mut kept = 0;
+        for at in 0..values.len() {
+            let hash = values_hash([&values[at]]);
+            let (found, asked) = index.find(hash, |k| values[k] == values[at]);
+            budget.work(asked)?;
+            if found.is_none() {
                 index.keep(hash);
-                unique.push(v);
+                values.swap(kept, at);
+                kept += 1;
             }
         }
-        values = unique;
+        values.truncate(kept);
     }
 
     Ok(values)
@@ -11186,7 +11207,11 @@ fn compute_aggregate(
     agg: &AggregateItem,
     rows: &[&Row],
     params: &HashMap<String, coordinode_core::graph::types::Value>,
-) -> Result<Value, EvalError> {
+    budget: &coordinode_core::budget::QueryBudget,
+) -> Result<Value, ExecutionError> {
+    // The argument values and their DISTINCT index, held while folding.
+    let mut held = budget.empty_charge();
+    let held = &mut held;
     use crate::function::AggregateFn;
     let function = AggregateFn::resolve(&agg.function)
         .ok_or_else(|| EvalError::UnknownFunction(agg.function.clone()))?;
@@ -11196,12 +11221,12 @@ fn compute_aggregate(
                 // count(*) ignores DISTINCT — counts all rows
                 Value::Int(rows.len() as i64)
             } else {
-                let values = eval_aggregate_values(agg, rows)?;
+                let values = eval_aggregate_values(agg, rows, budget, held)?;
                 Value::Int(values.len() as i64)
             }
         }
         AggregateFn::Sum => {
-            let values = eval_aggregate_values(agg, rows)?;
+            let values = eval_aggregate_values(agg, rows, budget, held)?;
             let mut int_sum: i64 = 0;
             let mut float_sum: f64 = 0.0;
             let mut has_float = false;
@@ -11230,7 +11255,7 @@ fn compute_aggregate(
             }
         }
         AggregateFn::Avg => {
-            let values = eval_aggregate_values(agg, rows)?;
+            let values = eval_aggregate_values(agg, rows, budget, held)?;
             let mut sum = 0.0f64;
             let mut count = 0u64;
             for v in &values {
@@ -11253,7 +11278,7 @@ fn compute_aggregate(
             }
         }
         AggregateFn::Min => {
-            let values = eval_aggregate_values(agg, rows)?;
+            let values = eval_aggregate_values(agg, rows, budget, held)?;
             values
                 .into_iter()
                 .reduce(|a, b| {
@@ -11266,7 +11291,7 @@ fn compute_aggregate(
                 .unwrap_or(Value::Null)
         }
         AggregateFn::Max => {
-            let values = eval_aggregate_values(agg, rows)?;
+            let values = eval_aggregate_values(agg, rows, budget, held)?;
             values
                 .into_iter()
                 .reduce(|a, b| {
@@ -11279,11 +11304,11 @@ fn compute_aggregate(
                 .unwrap_or(Value::Null)
         }
         AggregateFn::Collect => {
-            let values = eval_aggregate_values(agg, rows)?;
+            let values = eval_aggregate_values(agg, rows, budget, held)?;
             Value::Array(values)
         }
         AggregateFn::PercentileCont | AggregateFn::PercentileDisc => {
-            let agg_values = eval_aggregate_values(agg, rows)?;
+            let agg_values = eval_aggregate_values(agg, rows, budget, held)?;
             let mut values: Vec<f64> = agg_values
                 .iter()
                 .filter_map(|v| match v {
@@ -11329,7 +11354,7 @@ fn compute_aggregate(
             }
         }
         AggregateFn::StDev | AggregateFn::StDevP => {
-            let agg_values = eval_aggregate_values(agg, rows)?;
+            let agg_values = eval_aggregate_values(agg, rows, budget, held)?;
             let values: Vec<f64> = agg_values
                 .iter()
                 .filter_map(|v| match v {

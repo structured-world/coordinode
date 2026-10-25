@@ -232,23 +232,77 @@ pub fn try_extract_vector(val: &Value) -> Option<Vec<f32>> {
     }
 }
 
+/// The bits equal floats share: `0.0 == -0.0`, and every other equal pair
+/// already has equal bits.
+fn f64_bits(x: f64) -> u64 {
+    if x == 0.0 { 0 } else { x.to_bits() }
+}
+
+fn f32_bits(x: f32) -> u32 {
+    if x == 0.0 { 0 } else { x.to_bits() }
+}
+
+/// [`Value::hash_equal`] for a nested document: documents equal under `==`
+/// feed the same bytes.
+fn hash_document<H: core::hash::Hasher>(doc: &rmpv::Value, state: &mut H) {
+    use core::hash::Hash as _;
+    core::mem::discriminant(doc).hash(state);
+    match doc {
+        rmpv::Value::Nil => {}
+        rmpv::Value::Boolean(b) => state.write_u8(u8::from(*b)),
+        // Equal integers have equal values, whichever form holds them.
+        rmpv::Value::Integer(i) => match (i.as_u64(), i.as_i64()) {
+            (Some(u), _) => state.write_u64(u),
+            (None, Some(n)) => state.write_i64(n),
+            (None, None) => {}
+        },
+        rmpv::Value::F32(x) => state.write_u32(f32_bits(*x)),
+        rmpv::Value::F64(x) => state.write_u64(f64_bits(*x)),
+        rmpv::Value::String(s) => s.as_bytes().hash(state),
+        rmpv::Value::Binary(b) => b.hash(state),
+        rmpv::Value::Array(items) => {
+            state.write_usize(items.len());
+            for item in items {
+                hash_document(item, state);
+            }
+        }
+        rmpv::Value::Map(entries) => {
+            state.write_usize(entries.len());
+            for (key, value) in entries {
+                hash_document(key, state);
+                hash_document(value, state);
+            }
+        }
+        rmpv::Value::Ext(kind, bytes) => {
+            state.write_i8(*kind);
+            bytes.hash(state);
+        }
+    }
+}
+
 impl Value {
     /// Feeds `state` so that values equal under `==` feed it the same bytes:
     /// the hash an exact deduplication buckets by before comparing. Zero
-    /// floats of either sign feed one value; geo values, documents and paths
-    /// feed only their kind and are told apart by the comparison.
+    /// floats of either sign feed one value.
     pub fn hash_equal<H: core::hash::Hasher>(&self, state: &mut H) {
         use core::hash::Hash as _;
-        // `0.0 == -0.0`; every other equal pair of floats has equal bits.
-        fn f64_bits(x: f64) -> u64 {
-            if x == 0.0 { 0 } else { x.to_bits() }
-        }
-        fn f32_bits(x: f32) -> u32 {
-            if x == 0.0 { 0 } else { x.to_bits() }
-        }
         core::mem::discriminant(self).hash(state);
         match self {
-            Self::Null | Self::Geo(_) | Self::Document(_) | Self::Path(_) => {}
+            Self::Null => {}
+            Self::Geo(GeoValue::Point { lat, lon }) => {
+                state.write_u64(f64_bits(*lat));
+                state.write_u64(f64_bits(*lon));
+            }
+            Self::Document(doc) => hash_document(doc, state),
+            Self::Path(path) => {
+                path.nodes.hash(state);
+                state.write_usize(path.rels.len());
+                for rel in &path.rels {
+                    rel.edge_type.hash(state);
+                    state.write_u64(rel.source);
+                    state.write_u64(rel.target);
+                }
+            }
             Self::Bool(b) => state.write_u8(u8::from(*b)),
             Self::Int(i) | Self::Timestamp(i) => state.write_i64(*i),
             Self::Float(f) => state.write_u64(f64_bits(*f)),
