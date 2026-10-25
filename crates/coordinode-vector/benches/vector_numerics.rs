@@ -2,7 +2,7 @@
 //! and after a change to the metric arithmetic, on pinned hardware.
 //!
 //! - `kernel/<metric>/d<dim>`: one pair, every metric, dimensions 128 to 65536.
-//! - `flat_warm|flat_cold/<metric>/d<dim>`: an exhaustive top-10 scan over a
+//! - `exact_warm|exact_cold/<metric>/d<dim>`: an exhaustive top-10 scan over a
 //!   population of about 16 MiB of retained values; the cold variant evicts the
 //!   caches before each scan.
 //! - `hnsw/<metric>/d<dim>/ef<ef>`: top-10 search with a small and a large
@@ -17,8 +17,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use coordinode_core::graph::types::VectorMetric;
-use coordinode_vector::flat::FlatIndex;
-use coordinode_vector::hnsw::{HnswConfig, HnswIndex};
+use coordinode_vector::hnsw::{HnswConfig, HnswIndex, SearchMode};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 /// Retained values of a vector population, in `[-1, 1)`, deterministic per
@@ -57,9 +56,13 @@ mod api {
         f64::from(coordinode_vector::metrics::distance(a, b, metric))
     }
 
-    pub fn flat_top10(index: &FlatIndex, query: &[f32]) -> f64 {
+    pub fn fill(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>) {
+        index.insert_batch(items);
+    }
+
+    pub fn exact_top10(index: &HnswIndex, query: &[f32]) -> f64 {
         index
-            .search(query, 10)
+            .search_with_mode(query, 10, SearchMode::Exact)
             .iter()
             .map(|r| f64::from(r.score))
             .sum()
@@ -104,31 +107,37 @@ fn evict(buffer: &mut [u64]) {
     black_box(buffer);
 }
 
-fn bench_flat(c: &mut Criterion) {
+fn bench_exhaustive(c: &mut Criterion) {
     let mut checksum = 0.0f64;
     let mut eviction = vec![0u64; 8 << 20];
     for (metric, name) in [METRICS[0], METRICS[1]] {
         for dim in DIMS {
-            let n = (SCAN_FLOATS / dim).max(16);
-            let mut index = FlatIndex::new(metric);
-            for i in 0..n as u64 {
-                index.insert(i, synth(i + 10, dim));
-            }
-            let query = synth(3, dim);
-            checksum += api::flat_top10(&index, &query);
-            c.bench_function(&format!("flat_warm/{name}/d{dim}"), |bch| {
-                bch.iter(|| black_box(api::flat_top10(&index, black_box(&query))))
+            let n = (SCAN_FLOATS / dim).max(16) as u64;
+            let mut index = HnswIndex::new(HnswConfig {
+                metric,
+                max_dimensions: 65_536,
+                max_elements: n as u32,
+                ..Default::default()
             });
-            c.bench_function(&format!("flat_cold/{name}/d{dim}"), |bch| {
+            api::fill(
+                &mut index,
+                (0..n).map(|i| (i, synth(i + 10, dim))).collect(),
+            );
+            let query = synth(3, dim);
+            checksum += api::exact_top10(&index, &query);
+            c.bench_function(&format!("exact_warm/{name}/d{dim}"), |bch| {
+                bch.iter(|| black_box(api::exact_top10(&index, black_box(&query))))
+            });
+            c.bench_function(&format!("exact_cold/{name}/d{dim}"), |bch| {
                 bch.iter_batched(
                     || evict(&mut eviction),
-                    |()| black_box(api::flat_top10(&index, black_box(&query))),
+                    |()| black_box(api::exact_top10(&index, black_box(&query))),
                     BatchSize::PerIteration,
                 )
             });
         }
     }
-    println!("flat checksum {checksum:.17e}");
+    println!("exact checksum {checksum:.17e}");
 }
 
 fn bench_hnsw(c: &mut Criterion) {
@@ -143,7 +152,10 @@ fn bench_hnsw(c: &mut Criterion) {
                     max_elements: n as u32,
                     ..Default::default()
                 });
-                index.insert_batch((0..n).map(|i| (i, synth(i + 10, dim))).collect());
+                api::fill(
+                    &mut index,
+                    (0..n).map(|i| (i, synth(i + 10, dim))).collect(),
+                );
                 let queries: Vec<Vec<f32>> = (0..64).map(|q| synth(q + 1_000_000, dim)).collect();
                 checksum += queries
                     .iter()
@@ -165,6 +177,6 @@ fn bench_hnsw(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = configure();
-    targets = bench_kernels, bench_flat, bench_hnsw
+    targets = bench_kernels, bench_exhaustive, bench_hnsw
 }
 criterion_main!(benches);
