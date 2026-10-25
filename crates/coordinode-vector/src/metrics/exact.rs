@@ -1144,6 +1144,20 @@ impl Kernels {
         sets
     }
 
+    /// The set's name, as the bench-only `kernel-select` feature reads it.
+    #[cfg(feature = "kernel-select")]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse2 => "sse2",
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2 => "avx2",
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => "neon",
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn dot(self, a: &[f32], b: &[f32]) -> f64 {
         debug_assert_eq!(a.len(), b.len());
@@ -1236,10 +1250,14 @@ pub(crate) fn kernels() -> Kernels {
     static CHOSEN: std::sync::OnceLock<Kernels> = std::sync::OnceLock::new();
     // no-std: a caller-provided kernel choice
     *CHOSEN.get_or_init(|| {
-        Kernels::available()
-            .last()
-            .copied()
-            .unwrap_or(Kernels::Scalar)
+        let sets = Kernels::available();
+        #[cfg(feature = "kernel-select")]
+        if let Ok(name) = std::env::var("COORDINODE_VECTOR_EXACT_KERNELS") {
+            if let Some(set) = sets.iter().find(|set| set.name() == name) {
+                return *set;
+            }
+        }
+        sets.last().copied().unwrap_or(Kernels::Scalar)
     })
 }
 

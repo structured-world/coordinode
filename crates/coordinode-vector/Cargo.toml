@@ -30,6 +30,11 @@ coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-h
 # volume against competitors at equal recall. Never enable in
 # production builds.
 dist-counters = []
+# Bench-only: the exact kernels take the set named by the
+# COORDINODE_VECTOR_EXACT_KERNELS environment variable (scalar, sse2,
+# avx2, neon) when the CPU has it, so one host measures each set. Never
+# enable in production builds.
+kernel-select = []
 
 [dev-dependencies]
 criterion = { workspace = true }
