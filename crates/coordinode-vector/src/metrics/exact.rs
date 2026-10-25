@@ -447,7 +447,10 @@ fn tree_small(t: &[f64]) -> f64 {
 /// are folded from the right when the input ends.
 pub(crate) struct Tree {
     /// Pending complete subtrees, largest first; 64 levels cover any count.
-    stack: [f64; 64],
+    /// Exactly `stack[..len]` is initialized: left uninitialized, a short
+    /// reduction pays no 512-byte clear per evaluation.
+    stack: [core::mem::MaybeUninit<f64>; 64],
+    /// The number of one bits of `blocks`, so at most 64.
     len: usize,
     blocks: u64,
 }
@@ -456,7 +459,7 @@ impl Tree {
     #[inline(always)]
     pub(crate) fn new() -> Self {
         Self {
-            stack: [0.0; 64],
+            stack: [core::mem::MaybeUninit::uninit(); 64],
             len: 0,
             blocks: 0,
         }
@@ -471,11 +474,14 @@ impl Tree {
         let mut count = self.blocks;
         while count & 1 == 1 {
             self.len -= 1;
+            // SAFETY: `len` stayed inside the initialized prefix: each one bit
+            // of `blocks` is one pushed, initialized entry.
+            let left = unsafe { self.stack[self.len].assume_init() };
             // IEEE addition is commutative: the operand order changes no bit.
-            value += self.stack[self.len];
+            value += left;
             count >>= 1;
         }
-        self.stack[self.len] = value;
+        self.stack[self.len] = core::mem::MaybeUninit::new(value);
         self.len += 1;
         self.blocks += 1;
     }
@@ -484,15 +490,19 @@ impl Tree {
     /// remaining terms (`None` when the input was a whole number of blocks).
     #[inline(always)]
     pub(crate) fn finish(self, tail: Option<f64>) -> f64 {
-        let mut stack = self.stack[..self.len].iter().rev();
+        // SAFETY: `stack[..len]` is initialized (see the field).
+        let mut stack = self.stack[..self.len]
+            .iter()
+            .rev()
+            .map(|v| unsafe { v.assume_init() });
         let mut acc = match tail {
             Some(t) => t,
             None => match stack.next() {
-                Some(&last) => last,
+                Some(last) => last,
                 None => return 0.0,
             },
         };
-        for &left in stack {
+        for left in stack {
             acc += left;
         }
         acc

@@ -2474,10 +2474,11 @@ impl HnswIndex {
         idx: usize,
     ) -> Result<f64, VectorSearchError> {
         if let Some(vector) = self.read_node_f32(idx) {
-            // The retained vector's sum of squares was stored with it.
-            let cached = self
-                .data_level0
-                .get()
+            // The retained vector's sum of squares was stored with it; only a
+            // cosine reads it.
+            let cached = matches!(self.config.metric, VectorMetric::Cosine)
+                .then(|| self.data_level0.get())
+                .flatten()
                 .and_then(|block| block.sum_of_squares(idx));
             return Ok(match cached {
                 Some(sum_of_squares) => {
