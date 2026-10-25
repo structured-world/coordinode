@@ -197,7 +197,9 @@ fn incompressible_text(seed: u64, len: usize) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_group_refuses_writes_and_keeps_serving_reads() {
     use coordinode_core::txn::read_concern::ReadConcernLevel;
-    const LIMIT: u64 = 8 * 1024 * 1024;
+    // Twice the smallest supported limit, so the members can be lowered to
+    // the minimum below what they hold.
+    const LIMIT: u64 = 2 * coordinode_storage::engine::config::MIN_HARD_LIMIT_BYTES;
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
         let (members, _ports) = group_limited(&dirs, None, LIMIT).await;
@@ -233,7 +235,11 @@ async fn a_full_group_refuses_writes_and_keeps_serving_reads() {
             member
                 .database()
                 .read()
-                .set_hard_limit("default", LIMIT / 2, None)
+                .set_hard_limit(
+                    "default",
+                    coordinode_storage::engine::config::MIN_HARD_LIMIT_BYTES,
+                    None,
+                )
                 .expect("lower the limit");
         }
         for (member, path) in [(&members[0], "the leader"), (&members[1], "a follower")] {
