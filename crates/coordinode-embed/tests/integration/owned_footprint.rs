@@ -553,11 +553,10 @@ fn a_limit_changed_at_runtime_takes_effect_without_a_restart() {
     db.set_hard_limit("owned", 3 * LIMIT, None).unwrap();
     admitted_once_room_settles(&mut db, &create(accepted));
     // Grow past the original limit, so lowering back to it is below what
-    // the database holds.
+    // the database holds. Counted in payload, not in charged bytes: those
+    // include journal and compaction inputs a refusal reclaims first.
     let mut written = accepted + 1;
-    let held =
-        |db: &Database| -> u64 { db.engine().footprints().iter().map(|f| f.charged()).sum() };
-    while held(&db) < LIMIT + LIMIT / 2 {
+    while written * 64 * 1024 < 2 * LIMIT {
         admitted_once_room_settles(&mut db, &create(written));
         written += 1;
     }
