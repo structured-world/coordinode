@@ -21,6 +21,7 @@ use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
 use coordinode_query::planner::PlanError;
 use coordinode_query::procedure::ProcedureError;
 use coordinode_storage::error::StorageError;
+use coordinode_vector::hnsw::{VectorDomainError, VectorSearchError};
 
 use super::SessionSettingRefused;
 use super::interactive::TransactionEnd;
@@ -53,6 +54,29 @@ pub enum DatabaseError {
     /// Arithmetic with no answer, or a call of a function nothing provides.
     #[error("{0}")]
     Arithmetic(EvalError),
+
+    /// Vectors their metric cannot evaluate: in a vector function, a query
+    /// vector or a scored candidate. Empty, non-finite, of different widths,
+    /// or zero under cosine. Nothing was answered.
+    #[error("{0}")]
+    VectorDomain(VectorDomainError),
+
+    /// A write would give the vector index on `:{label}({property})` a vector
+    /// it cannot take. Nothing was written.
+    #[error(
+        "the vector index on :{label}({property}) cannot take the vector of node \
+         {element_id}: {error}"
+    )]
+    VectorRefused {
+        /// The indexed label.
+        label: String,
+        /// The indexed property.
+        property: String,
+        /// The elementId of the node.
+        element_id: String,
+        /// What is wrong with the vector.
+        error: VectorDomainError,
+    },
 
     /// A `CALL` refused before the procedure ran.
     #[error("{0}")]
@@ -704,6 +728,8 @@ impl From<StoreError> for DatabaseError {
         match e {
             StoreError::Storage(storage) => storage.into(),
             StoreError::Budget(stop) => Self::Budget(stop),
+            StoreError::VectorSearch(VectorSearchError::Domain(e)) => Self::VectorDomain(e),
+            StoreError::VectorAdmission(refused) => Self::VectorDomain(refused.error),
             other => Self::Other(other.to_string()),
         }
     }
@@ -725,7 +751,19 @@ impl From<ExecutionError> for DatabaseError {
                 property,
                 operator: operator.to_owned(),
             },
+            E::Arithmetic(EvalError::VectorDomain(e)) | E::VectorDomain(e) => Self::VectorDomain(e),
             E::Arithmetic(eval) => Self::Arithmetic(eval),
+            E::VectorRefused {
+                label,
+                property,
+                element_id,
+                error,
+            } => Self::VectorRefused {
+                label,
+                property,
+                element_id,
+                error,
+            },
             E::OperationSettled {
                 op,
                 outcome,

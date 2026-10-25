@@ -292,6 +292,33 @@ fn retryable_refusals_carry_the_sqlstate_drivers_retry_on() {
     }
 }
 
+/// Vectors their metric cannot evaluate, and a vector an index refuses, are
+/// `22000 data_exception`, as pgvector answers vectors of different
+/// dimensions or with a NaN component; never `XX000`, whatever the path.
+#[test]
+fn vector_domain_errors_are_data_exceptions() {
+    use coordinode_embed::db::DatabaseError;
+    use coordinode_query::executor::eval::EvalError;
+    use coordinode_query::executor::runner::ExecutionError;
+    use coordinode_vector::hnsw::VectorDomainError;
+
+    let cases = [
+        DatabaseError::from(ExecutionError::VectorDomain(VectorDomainError::Empty)),
+        DatabaseError::from(ExecutionError::Arithmetic(EvalError::VectorDomain(
+            VectorDomainError::ZeroVectorCosine,
+        ))),
+        DatabaseError::from(ExecutionError::VectorRefused {
+            label: "Doc".into(),
+            property: "embedding".into(),
+            element_id: "n:1".into(),
+            error: VectorDomainError::NonFinite { index: 0 },
+        }),
+    ];
+    for error in cases {
+        assert_eq!(super::sqlstate(&error), "22000", "{error:?}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn key_errors_carry_their_sqlstate() {
     use tokio_postgres::error::SqlState;

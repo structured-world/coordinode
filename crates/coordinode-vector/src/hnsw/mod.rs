@@ -450,6 +450,11 @@ pub struct HnswIndex {
     reclaim: std::sync::Arc<reclaim::SlotReclaim>,
     /// [`HnswConfig::retired_bytes_budget`], settable while the index serves.
     retired_bytes_budget: core::sync::atomic::AtomicUsize,
+    /// Set, for good, before the first vector outside the fast estimator's
+    /// domain ([`fast_domain`]) joins the index: from then on its traversal
+    /// evaluates with the range-safe estimator. Graph lists hold no
+    /// distances, so the switch leaves nothing stale.
+    wide_estimator: core::sync::atomic::AtomicBool,
 }
 
 /// One search, insert or removal: the epoch pin that keeps every list and
@@ -592,6 +597,99 @@ impl Ord for Candidate {
     }
 }
 
+/// Widest vector the fast estimator's sum bounds below cover.
+const MAX_FAST_DIMS: usize = 1 << 16;
+
+/// The range of a vector's largest component magnitude inside which the fast
+/// estimators of an index of `metric` and `codec` evaluate every pair of such
+/// vectors without overflow or underflow; `None` when they take any finite
+/// vector.
+///
+/// L2 and dot: a term is at most `(2 · 2^40)^2 = 2^82`, a sum of up to
+/// [`MAX_FAST_DIMS`] of them `2^98`, under `f32::MAX` (about `2^128`); vectors
+/// at the floor have squares of `2^-80`, `2^46` above the smallest normal f32,
+/// so gaps far smaller than the vectors stay normal. L1 terms are linear: at
+/// most `2^101`, sums `2^117`, floor `2^-100`. The f32 cosine takes any finite
+/// vector (it widens out of its own range), but RaBitQ codes carry f32 norms
+/// and absolute thresholds, held to the L2 range. SQ8 codes are scale-free.
+fn fast_domain(metric: VectorMetric, codec: &QuantizationCodec) -> Option<(f32, f32)> {
+    let squares = ((-40f32).exp2(), 40f32.exp2());
+    match metric {
+        VectorMetric::Cosine => {
+            matches!(codec, QuantizationCodec::RaBitQ { .. }).then_some(squares)
+        }
+        VectorMetric::L2 | VectorMetric::DotProduct => Some(squares),
+        VectorMetric::L1 => Some(((-100f32).exp2(), 100f32.exp2())),
+    }
+}
+
+/// Whether the fast estimators of an index of `metric` and `codec` evaluate
+/// `v` against any other vector of their domain: an all-zero vector, or one
+/// whose largest component magnitude is inside [`fast_domain`].
+fn in_fast_domain(v: &[f32], metric: VectorMetric, codec: &QuantizationCodec) -> bool {
+    let Some((low, high)) = fast_domain(metric, codec) else {
+        return true;
+    };
+    if v.len() > MAX_FAST_DIMS {
+        return false;
+    }
+    let largest = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    largest == 0.0 || (low..=high).contains(&largest)
+}
+
+/// The range-safe estimator's value for an exact binary64 distance `d`: an
+/// f32 ordered as `d` is, over the whole binary64 range. The numeric order of
+/// non-negative IEEE values is the order of their bit patterns, so the top 32
+/// bits of `|d|` read as f32 bits keep it, with 20 mantissa bits of
+/// resolution; every distance of finite f32 vectors is below `2^1017`, where
+/// the result stays finite.
+#[inline]
+fn ordered_key(d: f64) -> f32 {
+    // The shift leaves the top 32 bits: the cast keeps all of them.
+    let key = f32::from_bits((d.abs().to_bits() >> 32) as u32);
+    if d < 0.0 { -key } else { key }
+}
+
+/// The binary64 distance an [`ordered_key`] stands for, to the key's
+/// resolution.
+#[inline]
+fn key_distance(key: f32) -> f64 {
+    let d = f64::from_bits(u64::from(key.abs().to_bits()) << 32);
+    if key < 0.0 { -d } else { d }
+}
+
+/// The traversal distance of `a` and `b` under `metric` by the range-safe
+/// evaluator: the exact binary64 value of what the fast estimator computes
+/// (squared L2, negated dot, L1, cosine distance), through [`ordered_key`].
+fn wide_distance(metric: VectorMetric, a: &[f32], b: &[f32]) -> f32 {
+    let k = metrics::exact::kernels();
+    ordered_key(match metric {
+        VectorMetric::L2 => k.squared_l2(a, b),
+        VectorMetric::DotProduct => -k.dot(a, b),
+        VectorMetric::L1 => k.l1(a, b),
+        VectorMetric::Cosine => {
+            let (dot, ss_a, ss_b) = k.cosine_parts(a, b);
+            1.0 - (dot / (ss_a.sqrt() * ss_b.sqrt())).clamp(-1.0, 1.0)
+        }
+    })
+}
+
+/// The traversal distance of two vectors outside a search, ordered as a
+/// search's: the fast f32 value, or the range-safe one when `wide` (the f32
+/// cosine is range-safe already: `wide` only takes codes out of a cosine
+/// search).
+fn estimate_pair(metric: VectorMetric, a: &[f32], b: &[f32], wide: bool) -> f32 {
+    if wide && !matches!(metric, VectorMetric::Cosine) {
+        return wide_distance(metric, a, b);
+    }
+    match metric {
+        VectorMetric::Cosine => 1.0 - metrics::cosine_similarity(a, b),
+        VectorMetric::L2 => metrics::euclidean_distance_squared(a, b),
+        VectorMetric::DotProduct => -metrics::dot_product(a, b),
+        VectorMetric::L1 => metrics::manhattan_distance(a, b),
+    }
+}
+
 /// Per-search cached state.
 ///
 /// HNSW search calls the metric distance function thousands of times per query,
@@ -600,6 +698,10 @@ impl Ord for Candidate {
 struct QueryCtx<'a> {
     /// The query vector.
     vec: &'a [f32],
+    /// Whether this search, insert or prune evaluates distances with the
+    /// range-safe estimator ([`wide_distance`]) rather than the fast f32
+    /// kernels: decided once, so every distance it compares is of one kind.
+    wide: bool,
     /// ‖query‖₂ — pre-computed once per search. Used by Cosine metric only;
     /// other metrics ignore this field.
     norm_l2: f32,
@@ -640,6 +742,7 @@ impl<'a> QueryCtx<'a> {
         metric: VectorMetric,
         rabitq: Option<&RaBitQParams>,
         codec: &QuantizationCodec,
+        wide: bool,
     ) -> Self {
         let norm_l2 = if matches!(metric, VectorMetric::Cosine) {
             metrics::norm_l2(vec)
@@ -650,8 +753,10 @@ impl<'a> QueryCtx<'a> {
         // AND the query's dimensionality matches. Mismatched dims fall back
         // to the f32 distance path with no encode cost. 1-bit uses the
         // asymmetric paper kernel (4-bit-plane query against 1-bit data);
-        // 2/3/4-bit Extended uses the symmetric LUT kernel.
-        let rabitq_query = rabitq.and_then(|p| {
+        // 2/3/4-bit Extended uses the symmetric LUT kernel. A range-safe
+        // search does not use the codes: their f32 scalars are the fast
+        // estimator's, with its domain.
+        let rabitq_query = rabitq.filter(|_| !wide).and_then(|p| {
             if vec.len() != p.dims() as usize {
                 return None;
             }
@@ -667,6 +772,7 @@ impl<'a> QueryCtx<'a> {
         });
         Self {
             vec,
+            wide,
             norm_l2,
             inv_norm_l2: inv_or_zero(norm_l2),
             rabitq_query,
@@ -686,7 +792,7 @@ impl<'a> QueryCtx<'a> {
     /// connectivity to the point where no search-time ef budget can
     /// recover the true top-K (recall plateau independent of ef — what
     /// the glove-100-angular bench showed at recall=0.17).
-    fn new_for_build(vec: &'a [f32], metric: VectorMetric) -> Self {
+    fn new_for_build(vec: &'a [f32], metric: VectorMetric, wide: bool) -> Self {
         let norm_l2 = if matches!(metric, VectorMetric::Cosine) {
             metrics::norm_l2(vec)
         } else {
@@ -694,6 +800,7 @@ impl<'a> QueryCtx<'a> {
         };
         Self {
             vec,
+            wide,
             norm_l2,
             inv_norm_l2: inv_or_zero(norm_l2),
             rabitq_query: None,
@@ -814,6 +921,27 @@ impl HnswIndex {
             vector_tier: None,
             rabitq_block: std::sync::OnceLock::new(),
             data_level0: std::sync::OnceLock::new(),
+            wide_estimator: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether a search for `query` evaluates with the range-safe estimator:
+    /// the index holds a vector outside the fast estimator's domain, or the
+    /// query is outside it.
+    fn wide_for(&self, query: &[f32]) -> bool {
+        self.wide_estimator
+            .load(core::sync::atomic::Ordering::Acquire)
+            || !in_fast_domain(query, self.config.metric, &self.config.quantization)
+    }
+
+    /// Switch the index to the range-safe estimator before `vector` joins
+    /// it, when the fast estimator cannot evaluate it. One switch, for good:
+    /// a search that read the flag just before evaluates the newcomer badly
+    /// once, never wrongly ordered against itself.
+    fn note_estimator_domain(&self, vector: &[f32]) {
+        if !in_fast_domain(vector, self.config.metric, &self.config.quantization) {
+            self.wide_estimator
+                .store(true, core::sync::atomic::Ordering::Release);
         }
     }
 
@@ -1116,6 +1244,14 @@ impl HnswIndex {
         Ok(())
     }
 
+    /// The dimension the first indexed vector fixed, or `None` while the
+    /// index has held none.
+    pub fn dimension(&self) -> Option<usize> {
+        self.data_level0
+            .get()
+            .map(data_level0::DataLevel0Block::dim)
+    }
+
     /// Check that node `id`'s `vector` can be indexed: finite and nonempty,
     /// of the index's dimension once it has one, and nonzero under cosine.
     ///
@@ -1123,11 +1259,7 @@ impl HnswIndex {
     ///
     /// [`AdmissionError`] naming `id` and the reason.
     pub fn check(&self, id: u64, vector: &[f32]) -> Result<(), AdmissionError> {
-        let reference = self
-            .data_level0
-            .get()
-            .map(data_level0::DataLevel0Block::dim);
-        self.check_against(id, vector, reference)
+        self.check_against(id, vector, self.dimension())
     }
 
     fn check_against(
@@ -1207,6 +1339,10 @@ impl HnswIndex {
         const CONNECT_PASSES: usize = 8;
 
         self.check_batch(&items)?;
+        // Before the first wave: the batch's inserts all evaluate one way.
+        for (_, vector) in &items {
+            self.note_estimator_domain(vector);
+        }
         // Concurrent inserts of one id finish in any order; keeping only the
         // last occurrence keeps the batch's own order meaningful.
         let mut last: rustc_hash::FxHashMap<u64, usize> = rustc_hash::FxHashMap::default();
@@ -1299,6 +1435,9 @@ impl HnswIndex {
     /// item is applied.
     pub fn bulk_build(&mut self, items: Vec<(u64, Vec<f32>)>) -> Result<(), AdmissionError> {
         self.check_batch(&items)?;
+        for (_, vector) in &items {
+            self.note_estimator_domain(vector);
+        }
         if items.len() < bulk_build::BULK_BUILD_THRESHOLD {
             return self.insert_batch(items);
         }
@@ -1319,6 +1458,9 @@ impl HnswIndex {
         items: Vec<(u64, Vec<f32>)>,
     ) -> Result<(), AdmissionError> {
         self.check_batch(&items)?;
+        for (_, vector) in &items {
+            self.note_estimator_domain(vector);
+        }
         if items.len() < bulk_build::BULK_BUILD_THRESHOLD {
             self.insert_batch(items)?;
             self.reorder_for_cache_locality();
@@ -1336,6 +1478,9 @@ impl HnswIndex {
         // atomic read.
         let (start_idx, top_level) = self.entry_point.for_search()?;
         let mut current_ep = start_idx;
+        // One estimator for the whole plan: its searches and its prune
+        // compare distances of one kind.
+        let wide = self.wide_for(vector);
 
         // Step 1: greedy descent down to new_level + 1.
         //
@@ -1349,7 +1494,7 @@ impl HnswIndex {
         // (no ef_search can find the true top-K). See `QueryCtx::new_
         // for_build` doc comment for the full reasoning.
         for level in (new_level + 1..=top_level).rev() {
-            current_ep = self.search_layer_greedy_query_for_build(vector, current_ep, level);
+            current_ep = self.search_layer_greedy_query_for_build(vector, current_ep, level, wide);
         }
 
         // Step 2: select neighbours at every layer from new_level down to 0.
@@ -1358,7 +1503,7 @@ impl HnswIndex {
         for level in (0..=lowest_planning_layer).rev() {
             let ef = self.config.ef_construction;
             // Same f32-build rationale as step 1 above.
-            let candidates = self.search_layer_query_for_build(vector, current_ep, ef, level);
+            let candidates = self.search_layer_query_for_build(vector, current_ep, ef, level, wide);
 
             let max_conn = if level == 0 {
                 self.config.m_max0
@@ -1368,7 +1513,7 @@ impl HnswIndex {
             // RobustPrune when alpha > 1.0; legacy "take M closest"
             // otherwise. Both feed the same downstream insert plan path.
             let selected: Vec<usize> = if self.config.effective_alpha() > 1.0 {
-                self.select_neighbours_robust_prune(&candidates, max_conn)
+                self.select_neighbours_robust_prune(&candidates, max_conn, wide)
             } else {
                 candidates
                     .into_iter()
@@ -1714,6 +1859,7 @@ impl HnswIndex {
     /// index another dimension; the index is unchanged.
     pub fn insert_shared(&self, id: u64, vector: &[f32]) -> Result<bool, AdmissionError> {
         self.check(id, vector)?;
+        self.note_estimator_domain(vector);
         self.admit();
         let op = self.begin_operation();
         if let Some(current) = self.id_to_idx.get(id) {
@@ -2039,6 +2185,10 @@ impl HnswIndex {
 
         let max_conn = self.config.m_max0;
         let mut unreached = 0;
+        // One estimator for the evictions' distance comparisons.
+        let wide = self
+            .wide_estimator
+            .load(core::sync::atomic::Ordering::Acquire);
         for u in 0..n {
             if reached[u] || !live(u) {
                 continue;
@@ -2075,8 +2225,8 @@ impl HnswIndex {
                             .copied()
                             .filter(|&w| in_degree.get(w as usize).is_some_and(|&d| d > 1))
                             .max_by(|&a, &b| {
-                                self.distance_between_nodes(p, a as usize)
-                                    .total_cmp(&self.distance_between_nodes(p, b as usize))
+                                self.distance_between_nodes(p, a as usize, wide)
+                                    .total_cmp(&self.distance_between_nodes(p, b as usize, wide))
                             })?;
                         evicted = Some(w);
                         next.retain(|&x| x != w);
@@ -2369,6 +2519,7 @@ impl HnswIndex {
             self.config.metric,
             self.rabitq_params.as_ref(),
             &self.config.quantization,
+            self.wide_for(query),
         );
 
         // Single-load entry-point snapshot — `for_search()` returns
@@ -2575,6 +2726,7 @@ impl HnswIndex {
             self.config.metric,
             self.rabitq_params.as_ref(),
             &self.config.quantization,
+            self.wide_for(query),
         );
 
         // Single-load entry-point snapshot doubles as the empty-index
@@ -2683,6 +2835,7 @@ impl HnswIndex {
             self.config.metric,
             self.rabitq_params.as_ref(),
             &self.config.quantization,
+            self.wide_for(query),
         );
 
         // Single-load entry-point snapshot doubles as the empty-index
@@ -2761,9 +2914,16 @@ impl HnswIndex {
 
     /// Build-path variant of the greedy descent that forces exact f32
     /// distance for every comparison. See [`QueryCtx::new_for_build`] for why
-    /// build must not use RaBitQ.
-    fn search_layer_greedy_query_for_build(&self, query: &[f32], ep: usize, level: usize) -> usize {
-        let ctx = QueryCtx::new_for_build(query, self.config.metric);
+    /// build must not use RaBitQ. `wide` picks the estimator, as the plan
+    /// decided it.
+    fn search_layer_greedy_query_for_build(
+        &self,
+        query: &[f32],
+        ep: usize,
+        level: usize,
+        wide: bool,
+    ) -> usize {
+        let ctx = QueryCtx::new_for_build(query, self.config.metric, wide);
         let Ok(found) = self.search_layer_greedy_ctx(&ctx, ep, level, &mut Unmetered);
         found
     }
@@ -2829,8 +2989,9 @@ impl HnswIndex {
         ep: usize,
         ef: usize,
         level: usize,
+        wide: bool,
     ) -> Vec<Candidate> {
-        let ctx = QueryCtx::new_for_build(query, self.config.metric);
+        let ctx = QueryCtx::new_for_build(query, self.config.metric, wide);
         let Ok(found) = self.search_layer_ctx(&ctx, ep, ef, level, &mut Unmetered);
         found
     }
@@ -3364,8 +3525,8 @@ impl HnswIndex {
                 // Nested, not a tuple pattern: a tuple would read the node's
                 // RaBitQ code (random 72B-stride read, a cache miss per
                 // visit) even on unquantized indexes where the params are
-                // None.
-                if let Some(params) = self.rabitq_params.as_ref() {
+                // None. A range-safe search takes no norm from a code.
+                if let Some(params) = self.rabitq_params.as_ref().filter(|_| !ctx.wide) {
                     if let Some(enc) = self.node_rabitq(node_idx) {
                         let b_norm = rabitq_code_norm(enc, params);
                         return 1.0
@@ -3412,6 +3573,11 @@ impl HnswIndex {
     /// ignore it and the field is set to a sentinel by `QueryCtx::new`.
     #[inline(always)]
     fn distance_for_metric(&self, ctx: &QueryCtx<'_>, b: &[f32]) -> f32 {
+        // The f32 cosine widens out of its own range: only the other metrics
+        // need the range-safe evaluator.
+        if ctx.wide && !matches!(self.config.metric, VectorMetric::Cosine) {
+            return wide_distance(self.config.metric, ctx.vec, b);
+        }
         match self.config.metric {
             VectorMetric::Cosine => {
                 1.0 - metrics::cosine_similarity_with_query_norm(ctx.vec, b, ctx.norm_l2)
@@ -3471,13 +3637,17 @@ impl HnswIndex {
         let mut seen: std::collections::HashSet<u64> =
             std::collections::HashSet::with_capacity(neighbours.len() + extras.len());
         let mut candidates: Vec<Candidate> = Vec::with_capacity(neighbours.len() + extras.len());
+        // One estimator for every distance this selection compares.
+        let wide = self
+            .wide_estimator
+            .load(core::sync::atomic::Ordering::Acquire);
         for &neighbor_idx_u64 in neighbours.iter().chain(extras.iter()) {
             if !seen.insert(neighbor_idx_u64) {
                 continue;
             }
             let neighbor_idx = neighbor_idx_u64 as usize;
             if neighbor_idx < self.node_len() {
-                let dist = self.distance_between_nodes(node_idx, neighbor_idx);
+                let dist = self.distance_between_nodes(node_idx, neighbor_idx, wide);
                 candidates.push(Candidate {
                     distance: dist,
                     idx: neighbor_idx_u64 as u32,
@@ -3497,7 +3667,7 @@ impl HnswIndex {
         // ones they shadow, until nodes away from the dense regions keep no
         // incoming edge and no search can return them (on 600 random 20-dim
         // points, up to 131 unreachable).
-        self.select_neighbours_robust_prune(&candidates, max_conn)
+        self.select_neighbours_robust_prune(&candidates, max_conn, wide)
             .into_iter()
             .map(|idx| idx as u64)
             .collect()
@@ -3745,6 +3915,7 @@ impl HnswIndex {
         &self,
         candidates: &[Candidate],
         max_conn: usize,
+        wide: bool,
     ) -> Vec<usize> {
         if max_conn == 0 || candidates.is_empty() {
             return Vec::new();
@@ -3781,8 +3952,15 @@ impl HnswIndex {
                 // d(p, p') — distance from inserted node to p'.
                 let d_p_pprime = pool[j].distance;
                 // d(p*, p') — pairwise distance between two candidates.
-                let d_pstar_pprime = self.distance_between_nodes(p_star, p_prime);
-                if alpha * d_pstar_pprime <= d_p_pprime {
+                let d_pstar_pprime = self.distance_between_nodes(p_star, p_prime, wide);
+                // The range-safe estimator's values are order keys, not
+                // distances: α scales the distance a key stands for.
+                let shadowed = if wide {
+                    f64::from(alpha) * key_distance(d_pstar_pprime) <= key_distance(d_p_pprime)
+                } else {
+                    alpha * d_pstar_pprime <= d_p_pprime
+                };
+                if shadowed {
                     pruned[j] = true;
                 }
             }
@@ -3791,7 +3969,9 @@ impl HnswIndex {
         kept
     }
 
-    fn distance_between_nodes(&self, a_idx: usize, b_idx: usize) -> f32 {
+    /// The traversal distance between two stored nodes, by the estimator
+    /// `wide` names: the one the caller's other distances were computed by.
+    fn distance_between_nodes(&self, a_idx: usize, b_idx: usize, wide: bool) -> f32 {
         // Try exact f32 for both nodes
         if let (Some(va), Some(vb)) = (self.read_node_f32(a_idx), self.read_node_f32(b_idx)) {
             // Cosine fast path: both norms are precomputed per node, so
@@ -3810,24 +3990,16 @@ impl HnswIndex {
                     }
                 }
             }
-            let ctx = QueryCtx::new(
-                va,
-                self.config.metric,
-                self.rabitq_params.as_ref(),
-                &self.config.quantization,
-            );
+            // The build context: a pair distance uses no RaBitQ code, so the
+            // query encoding a search context computes would be wasted.
+            let ctx = QueryCtx::new_for_build(va, self.config.metric, wide);
             return self.distance_for_metric(&ctx, vb);
         }
         // Fall back to SQ8 approximate distance
         if let Some(ref params) = self.sq8_params {
             let va = self.get_node_vector_or_dequantized(a_idx, params);
             let vb = self.get_node_vector_or_dequantized(b_idx, params);
-            let ctx = QueryCtx::new(
-                &va,
-                self.config.metric,
-                self.rabitq_params.as_ref(),
-                &self.config.quantization,
-            );
+            let ctx = QueryCtx::new_for_build(&va, self.config.metric, wide);
             return self.distance_for_metric(&ctx, &vb);
         }
         f32::INFINITY

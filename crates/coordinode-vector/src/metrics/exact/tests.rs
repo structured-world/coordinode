@@ -337,3 +337,116 @@ fn error_against_the_exact_sum_is_bounded() {
         assert!((got - exact).abs() <= bound, "n {n}: {got} vs {exact}");
     }
 }
+
+/// A pairwise score of an input with a NaN or an infinity is refused naming
+/// the component, never returned as a NaN score; an empty pair is refused
+/// rather than scored 0. Guards the lazy check, which scans the inputs only
+/// when the reduction came out non-finite.
+#[test]
+fn pairwise_scores_refuse_non_finite_and_empty_inputs() {
+    let nan = [1.0, f32::NAN, 2.0];
+    let inf = [1.0, 2.0, f32::INFINITY];
+    let ok = [1.0, 1.0, 1.0];
+    assert_eq!(
+        dot(&nan, &ok),
+        Err(VectorDomainError::NonFinite { index: 1 })
+    );
+    assert_eq!(
+        l1(&ok, &inf),
+        Err(VectorDomainError::NonFinite { index: 2 })
+    );
+    assert_eq!(
+        squared_l2(&inf, &ok),
+        Err(VectorDomainError::NonFinite { index: 2 })
+    );
+    assert_eq!(
+        l2(&nan, &ok),
+        Err(VectorDomainError::NonFinite { index: 1 })
+    );
+    // An infinity against a zero component: the product is NaN, still caught.
+    assert_eq!(
+        cosine_similarity(&[f32::INFINITY, 0.0], &[0.0, 1.0]),
+        Err(VectorDomainError::NonFinite { index: 0 })
+    );
+    assert_eq!(dot(&[], &[]), Err(VectorDomainError::Empty));
+    let query = ExactQuery::new(&ok, VectorMetric::L2).unwrap();
+    assert_eq!(
+        query.distance(&nan),
+        Err(VectorDomainError::NonFinite { index: 1 })
+    );
+    let query = ExactQuery::new(&ok, VectorMetric::Cosine).unwrap();
+    assert_eq!(
+        query.distance(&inf),
+        Err(VectorDomainError::NonFinite { index: 2 })
+    );
+}
+
+/// The public sum is the canonical tree over the terms' order.
+#[test]
+fn sum_is_the_canonical_tree() {
+    for n in [1usize, 2, 3, 15, 16, 17, 37, 100] {
+        let terms: Vec<f64> = values(n as u64, n)
+            .into_iter()
+            .map(|x| if x.is_finite() { f64::from(x) } else { 1.0 })
+            .collect();
+        assert_eq!(
+            sum(&terms).to_bits(),
+            (levelwise(terms.clone()) + 0.0).to_bits()
+        );
+    }
+}
+
+/// MaxSim is the canonical sum, over query rows, of each row's largest exact
+/// dot product with a document row: bit-for-bit, not within a tolerance.
+#[test]
+fn maxsim_sums_each_query_rows_best_exact_dot() {
+    let q: Vec<Vec<f32>> = (0..5)
+        .map(|i| (0..8).map(|j| ((i + j) as f32) * 0.1 - 0.3).collect())
+        .collect();
+    let d: Vec<Vec<f32>> = (0..9)
+        .map(|i| (0..8).map(|j| ((i * 2 + j) as f32) * 0.05 - 0.2).collect())
+        .collect();
+    let best: Vec<f64> = q
+        .iter()
+        .map(|q| {
+            d.iter()
+                .map(|d| dot(q, d).unwrap())
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+        .collect();
+    assert_eq!(maxsim(&d, &q).unwrap().to_bits(), levelwise(best).to_bits());
+    // One row each: the dot product itself.
+    let (a, b) = (vec![vec![1.0, 2.0, 3.0]], vec![vec![4.0, 5.0, 6.0]]);
+    assert_eq!(maxsim(&b, &a), Ok(32.0));
+}
+
+/// Products past the f32 range stay exact in binary64: a matrix of 1e20
+/// components scores 2e40 per row, where an f32 kernel overflows to infinity.
+#[test]
+fn maxsim_holds_products_beyond_f32() {
+    let rows = vec![vec![1e20f32, 1e20]];
+    let expected = 2.0 * f64::from(1e20f32) * f64::from(1e20f32);
+    assert_eq!(maxsim(&rows, &rows), Ok(expected));
+}
+
+/// Empty matrices or rows, rows of different widths and non-finite components
+/// are domain errors, not a score of 0.
+#[test]
+fn maxsim_refuses_what_it_cannot_score() {
+    let row = vec![vec![1.0f32, 0.0]];
+    assert_eq!(maxsim(&[], &row), Err(VectorDomainError::Empty));
+    assert_eq!(maxsim(&row, &[]), Err(VectorDomainError::Empty));
+    assert_eq!(maxsim(&[vec![]], &[vec![]]), Err(VectorDomainError::Empty));
+    assert_eq!(
+        maxsim(&[vec![1.0, 0.0, 0.0]], &row),
+        Err(VectorDomainError::DimensionMismatch { left: 3, right: 2 })
+    );
+    assert_eq!(
+        maxsim(&row, &[vec![1.0, 0.0], vec![1.0]]),
+        Err(VectorDomainError::DimensionMismatch { left: 1, right: 2 })
+    );
+    assert_eq!(
+        maxsim(&[vec![1.0, f32::NAN]], &row),
+        Err(VectorDomainError::NonFinite { index: 1 })
+    );
+}

@@ -175,7 +175,7 @@ impl Worker {
                         // The entries are applied and stay in the store;
                         // reading them all again is the one way not to drop
                         // these.
-                        tracing::warn!(error = %e, "vector index worker could not read applied nodes; rebuilding");
+                        tracing::warn!(error = %e, "vector index worker could not fold applied nodes; rebuilding");
                         self.rebuild()
                     }
                 }
@@ -253,8 +253,12 @@ impl Worker {
                     None => {}
                 }
             }
+            // A write is refused before it commits a vector its index cannot
+            // take, so a refusal here is a store the indexes cannot hold: the
+            // rebuild that follows reports it as the index's offline reason.
             self.registry
-                .on_vectors_written(&def.label, property, upserts);
+                .on_vectors_written(&def.label, property, upserts)
+                .map_err(|e| format!("index :{}({property}): {e}", def.label))?;
         }
         Ok(())
     }

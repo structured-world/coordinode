@@ -79,8 +79,27 @@ fn cluster_assignment_picks_nearest_leader_under_l2() {
         (2u64, vec![5.5, 0.0]), // closer to leader 1
         (3u64, vec![4.5, 0.0]), // closer to leader 0
     ];
-    let a = assign_followers_to_leaders(&followers, &leaders, VectorMetric::L2);
+    let a = assign_followers_to_leaders(&followers, &leaders, VectorMetric::L2, false);
     assert_eq!(a, vec![0, 1, 1, 0]);
+}
+
+/// The range-safe estimator assigns as the fast one does inside its domain,
+/// and still tells leaders apart where the fast one overflows: the same
+/// layout scaled by 2^66 squares past the f32 range.
+#[test]
+fn cluster_assignment_holds_past_the_f32_range() {
+    let scale = 2f32.powi(66);
+    let s = |v: &[f32]| v.iter().map(|x| x * scale).collect::<Vec<f32>>();
+    let leaders = vec![s(&[0.0, 0.0]), s(&[10.0, 0.0])];
+    let followers: Vec<(u64, Vec<f32>)> = [[1.0, 0.0], [9.0, 0.0], [5.5, 0.0], [4.5, 0.0]]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as u64, s(v)))
+        .collect();
+    for metric in [VectorMetric::L2, VectorMetric::L1] {
+        let a = assign_followers_to_leaders(&followers, &leaders, metric, true);
+        assert_eq!(a, vec![0, 1, 1, 0], "{metric:?}");
+    }
 }
 
 /// Followers are dealt round-robin over the clusters, each cluster in
@@ -96,7 +115,7 @@ fn cluster_order_deals_followers_round_robin_over_the_clusters() {
         (20u64, vec![9.0, 0.0]), // cluster 1
         (40u64, vec![8.0, 0.0]), // cluster 1
     ];
-    let reordered = cluster_order_followers(followers, &leaders, VectorMetric::L2);
+    let reordered = cluster_order_followers(followers, &leaders, VectorMetric::L2, false);
     let ids: Vec<u64> = reordered.iter().map(|(id, _)| *id).collect();
     // Rank 0 of each cluster, then rank 1, then the longer cluster's
     // tail; each cluster keeps its input order.

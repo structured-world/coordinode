@@ -47,7 +47,9 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use coordinode_bench::BenchReport;
 use coordinode_core::graph::types::VectorMetric;
-use coordinode_vector::hnsw::{HnswConfig, HnswIndex, QuantizationCodec, SearchMode};
+use coordinode_vector::hnsw::{
+    HnswConfig, HnswIndex, QuantizationCodec, SearchMode, VectorSearchError,
+};
 use serde::Serialize;
 use tracing::info;
 
@@ -464,7 +466,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_train = args.subset_size;
         let new_gt_k = args.k.max(10);
         let gt_recompute_start = Instant::now();
-        gt_flat = brute_force_gt(&train_flat, &query_flat, d, new_gt_k, metric);
+        gt_flat = brute_force_gt(&train_flat, &query_flat, d, new_gt_k, metric)?;
         gt_k = new_gt_k;
         info!(
             new_gt_k,
@@ -621,7 +623,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             buf.push((row_idx as u64, train_flat[start..start + d].to_vec()));
             if buf.len() == BUILD_CHUNK {
                 shard_inserted += buf.len();
-                shard.insert_batch(std::mem::take(&mut buf));
+                shard.insert_batch(std::mem::take(&mut buf))?;
                 info!(
                     shard_id,
                     inserted = shard_inserted,
@@ -632,7 +634,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if !buf.is_empty() {
             shard_inserted += buf.len();
-            shard.insert_batch(buf);
+            shard.insert_batch(buf)?;
         }
         info!(
             shard_id,
@@ -847,7 +849,7 @@ fn sweep_one(
                 let q_start = q_idx * dim;
                 let query = &query_flat[q_start..q_start + dim];
                 let t = Instant::now();
-                let results = multi_search(shards, router, query, k, search_mode);
+                let results = multi_search(shards, router, query, k, search_mode)?;
                 let elapsed_us = t.elapsed().as_micros() as f64;
                 latencies_us.push(elapsed_us);
                 let gt_start = q_idx * gt_k;
@@ -897,7 +899,7 @@ fn sweep_one(
                             let q_start = q_idx * dim;
                             let query = &query_flat[q_start..q_start + dim];
                             let t = Instant::now();
-                            let results = multi_search(shards, router, query, k, search_mode);
+                            let results = multi_search(shards, router, query, k, search_mode)?;
                             lat.push(t.elapsed().as_micros() as f64);
                             let gt_start = q_idx * gt_k;
                             let gt: std::collections::HashSet<i64> = gt_flat
@@ -912,15 +914,15 @@ fn sweep_one(
                             }
                             total += k as u64;
                         }
-                        (lat, hits, total)
+                        Ok::<_, VectorSearchError>((lat, hits, total))
                     })
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| (Vec::new(), 0u64, 0u64)))
-                .collect()
-        });
+                .map(|h| h.join().unwrap_or_else(|_| Ok((Vec::new(), 0u64, 0u64))))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
         let cap: usize = workers.iter().map(|(l, _, _)| l.len()).sum();
         let mut latencies_us = Vec::with_capacity(cap);
         let mut hits = 0u64;
@@ -968,15 +970,19 @@ fn sweep_one(
 /// with the legacy sequential loop).
 ///
 /// Lower `score` is "better" across every supported metric (cosine
-/// distance, L2-squared, negated dot product), so the merge sorts
-/// ascending and takes the first `k`.
+/// distance, L2, negated dot product, L1), so the merge sorts ascending,
+/// equal scores by id, and takes the first `k`.
+///
+/// # Errors
+///
+/// A query the shards' metric cannot evaluate.
 fn multi_search(
     shards: &[HnswIndex],
     router: Option<&CentroidRouter>,
     query: &[f32],
     k: usize,
     mode: SearchMode,
-) -> Vec<coordinode_vector::hnsw::SearchResult> {
+) -> Result<Vec<coordinode_vector::hnsw::SearchResult>, VectorSearchError> {
     use rayon::prelude::*;
     if shards.len() == 1 {
         return shards[0].search_with_mode(query, k, mode);
@@ -990,18 +996,22 @@ fn multi_search(
     if routed.len() == 1 {
         return shards[routed[0]].search_with_mode(query, k, mode);
     }
-    let mut merged: Vec<coordinode_vector::hnsw::SearchResult> = routed
+    let answers: Vec<Vec<coordinode_vector::hnsw::SearchResult>> = routed
         .par_iter()
-        .flat_map_iter(|&s| shards[s].search_with_mode(query, k, mode))
-        .collect();
-    merged.sort_by(|a, b| a.score.total_cmp(&b.score));
+        .map(|&s| shards[s].search_with_mode(query, k, mode))
+        .collect::<Result<_, _>>()?;
+    let mut merged: Vec<coordinode_vector::hnsw::SearchResult> =
+        answers.into_iter().flatten().collect();
+    merged.sort_by(|a, b| {
+        coordinode_vector::metrics::exact::ranked_order(a.score, a.id, b.score, b.id)
+    });
     // Closure replication (and overlapping routed shards) can place a vector
     // in several probed shards; keep only its best-scoring occurrence so the
     // top-K is K distinct ids.
     let mut seen = std::collections::HashSet::with_capacity(merged.len());
     merged.retain(|r| seen.insert(r.id));
     merged.truncate(k);
-    merged
+    Ok(merged)
 }
 
 /// Centroid-based shard router: k-means cluster centres plus the

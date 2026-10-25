@@ -91,11 +91,9 @@ pub fn read_fvecs(path: impl AsRef<Path>) -> Result<(usize, Vec<f32>), FvecsErro
         }
         let mut row = vec![0u8; (dim as usize) * 4];
         reader.read_exact(&mut row)?;
-        for chunk in row.chunks_exact(4) {
-            let arr: [u8; 4] = chunk
-                .try_into()
-                .map_err(|_| FvecsError::Io(std::io::Error::other("chunk size mismatch")))?;
-            vectors.push(f32::from_le_bytes(arr));
+        // The row is `dim * 4` bytes: whole chunks, no remainder.
+        for bytes in row.as_chunks::<4>().0 {
+            vectors.push(f32::from_le_bytes(*bytes));
         }
         idx += 1;
     }
@@ -142,11 +140,9 @@ pub fn read_ivecs(path: impl AsRef<Path>) -> Result<(usize, Vec<i32>), FvecsErro
         }
         let mut row = vec![0u8; (dim as usize) * 4];
         reader.read_exact(&mut row)?;
-        for chunk in row.chunks_exact(4) {
-            let arr: [u8; 4] = chunk
-                .try_into()
-                .map_err(|_| FvecsError::Io(std::io::Error::other("chunk size mismatch")))?;
-            vectors.push(i32::from_le_bytes(arr));
+        // The row is `dim * 4` bytes: whole chunks, no remainder.
+        for bytes in row.as_chunks::<4>().0 {
+            vectors.push(i32::from_le_bytes(*bytes));
         }
         idx += 1;
     }

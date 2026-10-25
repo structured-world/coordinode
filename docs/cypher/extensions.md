@@ -53,10 +53,10 @@ DROP VECTOR INDEX product_embedding
 | `m` | 16 | Bi-directional links per HNSW node |
 | `ef_construction` | 200 | Dynamic list size during build |
 | `metric` | `"cosine"` | Distance metric: `cosine`, `euclidean`, `dot` |
-| `dimensions` | — | Vector dimensionality (required) |
+| `dimensions` | — | Vector dimensionality: every vector the index takes has it. Without it, the first vector indexed fixes it |
 | `quantization` | `"none"` | In-RAM codec: `none`, `sq8`, `rabitq`, `rabitq-2bit`, `rabitq-3bit`, `rabitq-4bit` |
 | `ef_search` | 200 | Dynamic candidate-list size during search. Raise for higher recall (especially with low-bit quantization or sparsely connected data) at a latency cost |
-| `rerank_candidates` | 100 | Approximate candidates re-scored with exact f32 distance before returning the top-k |
+| `rerank_candidates` | 100 | Approximate candidates re-scored exactly (binary64 over the stored values) before returning the top-k |
 | `online_during_build` | `"block"` | Reader behaviour while the index backfills (see below) |
 
 #### Online-during-build policy
@@ -97,9 +97,27 @@ which is one session; a unary call has none and names its bound in the hint
 or in its request (see [Session settings](./reference.md#session-settings-set)).
 
 A backfill that aborts (panic, write error) lands the index in the `Failed`
-state and every reader sees an error regardless of policy. A subsequent
-engine reopen rebuilds the HNSW from on-disk vectors and resets the state
-to `Ready` automatically.
+state and every reader sees an error regardless of policy. So does a
+backfill that meets a stored vector the index cannot take (see below): it
+names the node and the reason instead of leaving the node out of an index
+that would then report complete. A subsequent engine reopen rebuilds the
+HNSW from on-disk vectors and resets the state to `Ready` automatically.
+
+#### Vectors an index takes
+
+An index takes a vector its metric can evaluate: nonempty, every component
+finite, of the index's dimensionality, and for `cosine` not all zeros (a
+zero vector has no direction; a tiny nonzero one does). A write that would
+give an index any other vector, whether by `CREATE`, `SET`, `MERGE` or a
+statement of an explicit transaction, is refused before it commits and
+nothing of it lands: over gRPC `INVALID_ARGUMENT` with `ErrorInfo.reason`
+`VECTOR_REFUSED` and the `label`, `property`, `element_id` and `problem`
+metadata, over the PostgreSQL wire SQLSTATE `22000`. A property no vector
+index covers stores any nonempty finite vector, a zero vector included; a
+vector parameter that is empty or has a NaN or infinite component is refused
+as the statement starts (`VECTOR_DOMAIN`). Search results are scored
+exactly, by the same evaluation as the
+[vector functions](./functions.md#vector-functions).
 
 The CREATE response row includes a `state` field (`"building" | "ready" |
 "failed"`) so clients can poll for completion or surface the status in a

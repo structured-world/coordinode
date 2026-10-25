@@ -2445,8 +2445,10 @@ impl Database {
         };
         let mut plan = self.plan_for_execution(plan, &stats);
 
-        // Bind parameters: replace $name references with literal values.
+        // Bind parameters: replace $name references with literal values,
+        // once their vectors are checked.
         if let Some(ref p) = params {
+            coordinode_query::executor::runner::check_parameters(p)?;
             plan.substitute_params(p);
         }
 

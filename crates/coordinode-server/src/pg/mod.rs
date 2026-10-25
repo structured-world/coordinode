@@ -169,8 +169,9 @@ fn command_tag(query: &str) -> Tag {
 /// duplicate_table`, one another catalog object holds `42710
 /// duplicate_object`; a missing table is `42P01 undefined_table`, another
 /// missing object `42704 undefined_object`; a catalog change the catalog's
-/// state refuses is `55000 object_not_in_prerequisite_state`. Everything else
-/// stays `XX000 internal_error`.
+/// state refuses is `55000 object_not_in_prerequisite_state`. Vectors their
+/// metric cannot evaluate, and a vector an index refuses, are `22000
+/// data_exception`. Everything else stays `XX000 internal_error`.
 fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
     use coordinode_core::schema::definition::ConstraintKind;
     use coordinode_embed::db::DatabaseError;
@@ -210,6 +211,9 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         // read_only_sql_transaction: this member takes no writes, the leader
         // does, and a read-only member is read-only for the same reason.
         DatabaseError::NotLeader { .. } | DatabaseError::Mismatched(_) => "25006",
+        // data_exception: vectors their metric cannot evaluate, as pgvector
+        // answers vectors of different dimensions or with a NaN component.
+        DatabaseError::VectorDomain(_) | DatabaseError::VectorRefused { .. } => "22000",
         _ => "XX000",
     }
 }

@@ -181,11 +181,10 @@ impl Fixture {
                 .and_then(|r| r.props.get(&fields.lookup(property)?))
                 .and_then(coordinode_core::graph::types::try_extract_vector);
             match vector {
-                Some(vector) => self.registry.on_vectors_written(
-                    &def.label,
-                    property,
-                    vec![(NodeId::from_raw(id), vector)],
-                ),
+                Some(vector) => self
+                    .registry
+                    .on_vectors_written(&def.label, property, vec![(NodeId::from_raw(id), vector)])
+                    .expect("an admitted vector"),
                 None => self
                     .registry
                     .on_vector_removed(&def.label, property, NodeId::from_raw(id)),
@@ -289,7 +288,11 @@ impl Fixture {
     fn indexed(&self, query: [f32; 3], id: u64) -> bool {
         let hnsw = self.registry.get("Doc", "embedding").expect("hnsw");
         let graph = hnsw.read().expect("hnsw");
-        graph.search(&query, 1).iter().any(|r| r.id == id)
+        graph
+            .search(&query, 1)
+            .expect("an evaluable query")
+            .iter()
+            .any(|r| r.id == id)
     }
 
     fn graph_len(&self) -> usize {
@@ -592,7 +595,8 @@ fn a_build_finishes_under_writes_that_never_pause() {
                 let vector = spread(id);
                 fx.apply_doc_at(id, vector, fx.oracle.next().as_raw());
                 fx.registry
-                    .on_vector_written("Doc", NodeId::from_raw(id), "embedding", &vector);
+                    .on_vector_written("Doc", NodeId::from_raw(id), "embedding", &vector)
+                    .expect("an admitted vector");
                 id += 1;
             }
             id - 1_000_000
@@ -865,6 +869,29 @@ fn one_build_fills_every_index_of_the_shard() {
     let imgs = imgs.read().expect("imgs");
     assert_eq!(docs.len(), 1, "only the Doc node");
     assert_eq!(imgs.len(), 2, "the scanned Img node and the late one");
-    assert!(imgs.search(&[1.0, 0.0, 0.0], 1).iter().any(|r| r.id == 3));
+    assert!(
+        imgs.search(&[1.0, 0.0, 0.0], 1)
+            .expect("an evaluable query")
+            .iter()
+            .any(|r| r.id == 3)
+    );
     assert!(img_health.snapshot().is_ready());
+}
+
+/// A stored vector the index cannot take fails the build with the reason,
+/// instead of leaving the node out of a build that then reports complete: a
+/// zero vector under the cosine metric this fixture's index uses.
+#[test]
+fn a_stored_vector_the_index_cannot_take_fails_the_build() {
+    let fx = fixture();
+    fx.apply_record(0, 1, &record("Doc", fx.field, [1.0, 0.0, 0.0]));
+    fx.apply_record(0, 2, &record("Doc", fx.field, [0.0, 0.0, 0.0]));
+    let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
+    let health = fx.health();
+    let token = fx.registry.new_build_token();
+    let reason = fx
+        .build(&hnsw, &health, &token)
+        .expect_err("the build must fail");
+    assert!(reason.contains("node 2"), "{reason}");
+    assert!(reason.contains("zero"), "{reason}");
 }

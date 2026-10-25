@@ -513,8 +513,9 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
             if axis < DIM {
                 query[axis] = 1.0;
             }
-            let hits =
-                graph.search_with_mode(&query, steady.end, coordinode_vector::SearchMode::Exact);
+            let hits = graph
+                .search_with_mode(&query, steady.end, coordinode_vector::SearchMode::Exact)
+                .expect("an evaluable query");
             assert_eq!(hits.len(), expected.len(), "{member} exact live ID count");
             let mut seen = std::collections::HashSet::new();
             for hit in hits {
@@ -526,7 +527,7 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
                 let vector = expected.get(&hit.id).expect("unexpected indexed ID");
                 assert_eq!(
                     hit.score,
-                    coordinode_vector::metrics::euclidean_distance_squared(&query, vector),
+                    coordinode_vector::metrics::exact::l2(&query, vector).unwrap(),
                     "{member} wrong indexed payload for {}, axis {axis}",
                     hit.id,
                 );

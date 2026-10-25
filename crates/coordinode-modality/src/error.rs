@@ -61,6 +61,15 @@ pub enum StoreError {
     /// cancellation.
     #[error(transparent)]
     Budget(#[from] coordinode_core::budget::BudgetStop),
+
+    /// A vector index refused a vector its metric cannot evaluate; nothing
+    /// was indexed.
+    #[error(transparent)]
+    VectorAdmission(#[from] coordinode_vector::hnsw::AdmissionError),
+
+    /// A vector search could not evaluate its query or a candidate.
+    #[error(transparent)]
+    VectorSearch(#[from] coordinode_vector::hnsw::VectorSearchError),
 }
 
 // Convenience: `iter_guard.into_inner()?` inside store scan loops

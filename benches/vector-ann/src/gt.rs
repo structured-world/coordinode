@@ -7,16 +7,24 @@
 //! can measure recall against the exact data that was loaded.
 
 use coordinode_core::graph::types::VectorMetric;
+use coordinode_vector::hnsw::VectorDomainError;
 
 /// Exact k-NN over the full train set for every query, parallel over
-/// queries. Returns a row-major `n_query x k` matrix of train row ids.
+/// queries: the engine's exact evaluation and order (ranking distance, equal
+/// distances by row id), the reference an exact search answers. Returns a
+/// row-major `n_query x k` matrix of train row ids.
+///
+/// # Errors
+///
+/// A query or train row the metric cannot evaluate.
 pub fn brute_force_gt(
     train: &[f32],
     queries: &[f32],
     d: usize,
     k: usize,
     metric: VectorMetric,
-) -> Vec<i32> {
+) -> Result<Vec<i32>, VectorDomainError> {
+    use coordinode_vector::metrics::exact::{ExactQuery, ranked_order};
     use rayon::prelude::*;
 
     let n_train = train.len() / d;
@@ -33,45 +41,30 @@ pub fn brute_force_gt(
         result
             .par_chunks_mut(k)
             .enumerate()
-            .for_each(|(q_idx, out)| {
-                use coordinode_vector::metrics;
-                let q = &queries[q_idx * d..(q_idx + 1) * d];
-                // SIMD-dispatched kernels from the engine: the scalar
-                // helpers below are kept only for the tiny recall checks.
-                let q_norm = metrics::norm_l2(q);
-                let mut scored: Vec<(f32, i32)> = (0..n_train)
-                    .map(|i| {
-                        let v = &train[i * d..(i + 1) * d];
-                        let score = match metric {
-                            VectorMetric::L2 => metrics::euclidean_distance_squared(q, v),
-                            VectorMetric::L1 => metrics::manhattan_distance(q, v),
-                            // Cosine similarity / dot product both ordered
-                            // descending; negate so smaller-is-closer
-                            // matches the L2 / L1 path.
-                            VectorMetric::Cosine => {
-                                -metrics::cosine_similarity_with_query_norm(q, v, q_norm)
-                            }
-                            VectorMetric::DotProduct => -metrics::dot_product(q, v),
-                        };
-                        (score, i as i32)
-                    })
-                    .collect();
+            .try_for_each(|(q_idx, out)| {
+                let q = ExactQuery::new(&queries[q_idx * d..(q_idx + 1) * d], metric)?;
+                let mut scored: Vec<(f64, i32)> = (0..n_train)
+                    .map(|i| Ok((q.distance(&train[i * d..(i + 1) * d])?, i as i32)))
+                    .collect::<Result<_, VectorDomainError>>()?;
+                let order =
+                    |a: &(f64, i32), b: &(f64, i32)| ranked_order(a.0, a.1 as u64, b.0, b.1 as u64);
                 let take = k.min(scored.len());
                 if take < scored.len() {
-                    scored.select_nth_unstable_by(take, |a, b| a.0.total_cmp(&b.0));
+                    scored.select_nth_unstable_by(take, order);
                 }
-                scored[..take].sort_by(|a, b| a.0.total_cmp(&b.0));
+                scored[..take].sort_by(order);
                 for (i, (_, idx)) in scored[..take].iter().enumerate() {
                     out[i] = *idx;
                 }
-            });
+                Ok(())
+            })
     };
     match pool {
         Some(p) => p.install(&mut compute),
         None => compute(),
-    }
+    }?;
 
-    result
+    Ok(result)
 }
 
 pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {

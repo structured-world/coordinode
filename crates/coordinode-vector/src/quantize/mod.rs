@@ -10,6 +10,9 @@
 //! SQ8 maps each dimension independently using per-dimension min/max:
 //!   quantize:   u8 = round((f32 - min) / (max - min) * 255)
 //!   dequantize: f32 = u8 / 255 * (max - min) + min
+//!
+//! Both run in binary64, so the mapping holds at every scale of finite f32
+//! values: a range of `1e-26` or of `6e38` quantizes as a range of `1` does.
 
 pub mod popcount;
 pub mod rabitq;
@@ -57,14 +60,10 @@ impl Sq8Params {
             }
         }
 
-        // Prevent division by zero: if min == max, expand range slightly
-        for i in 0..dims {
-            if (maxs[i] - mins[i]).abs() < f32::EPSILON {
-                mins[i] -= 0.5;
-                maxs[i] += 0.5;
-            }
-        }
-
+        // A dimension every vector holds the same value in keeps an empty
+        // range, which quantizes to code 0 and dequantizes to that value. A
+        // range is never widened by an absolute amount: that drowns a range
+        // far below it and vanishes beside one far above it.
         Some(Self { mins, maxs })
     }
 
@@ -80,6 +79,13 @@ impl Sq8Params {
         self.mins.len()
     }
 
+    /// The range of dimension `i`, in binary64: the difference of two finite
+    /// f32 values, which overflows f32 for opposite values past `f32::MAX / 2`.
+    #[inline]
+    fn range(&self, i: usize) -> f64 {
+        f64::from(self.maxs[i]) - f64::from(self.mins[i])
+    }
+
     /// Quantize a float32 vector to uint8.
     pub fn quantize(&self, vector: &[f32]) -> Vec<u8> {
         assert_eq!(vector.len(), self.dims(), "dimension mismatch");
@@ -87,8 +93,12 @@ impl Sq8Params {
             .iter()
             .enumerate()
             .map(|(i, &v)| {
-                let range = self.maxs[i] - self.mins[i];
-                let normalized = (v - self.mins[i]) / range;
+                let range = self.range(i);
+                if range == 0.0 {
+                    return 0;
+                }
+                let normalized = (f64::from(v) - f64::from(self.mins[i])) / range;
+                // In [0, 255] after the clamp: the cast cannot truncate.
                 (normalized.clamp(0.0, 1.0) * 255.0).round() as u8
             })
             .collect()
@@ -101,8 +111,9 @@ impl Sq8Params {
             .iter()
             .enumerate()
             .map(|(i, &q)| {
-                let range = self.maxs[i] - self.mins[i];
-                (q as f32 / 255.0) * range + self.mins[i]
+                // Between min and max, both finite f32: the narrowing stays
+                // finite.
+                (f64::from(q) / 255.0 * self.range(i) + f64::from(self.mins[i])) as f32
             })
             .collect()
     }

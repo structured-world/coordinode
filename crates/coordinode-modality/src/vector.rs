@@ -53,6 +53,12 @@ pub trait VectorStore: Send + Sync {
     /// store.insert(2, vec![0.0, 1.0, 0.0])?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::VectorAdmission`] for a vector the index's metric cannot
+    /// evaluate (non-finite, of another dimension, zero under cosine); the
+    /// index is unchanged.
     fn insert(&self, node_id: u64, vector: Vec<f32>) -> StoreResult<()>;
 
     /// Remove a node's vector: it stops being a result at once, the graph
@@ -78,7 +84,12 @@ pub trait VectorStore: Send + Sync {
     fn remove(&self, node_id: u64) -> StoreResult<()>;
 
     /// K-nearest-neighbour search. Returns up to `k` results sorted by
-    /// distance ascending.
+    /// their exact distance ascending, ties by id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::VectorSearch`] for a query the index's metric cannot
+    /// evaluate. The other searches below fail the same way.
     ///
     /// # Examples
     ///
@@ -150,11 +161,16 @@ pub trait VectorStore: Send + Sync {
     /// # use coordinode_modality::{LocalVectorStore, VectorStore};
     /// # use coordinode_vector::hnsw::HnswConfig;
     /// let store = LocalVectorStore::new(HnswConfig::default());
-    /// let mut iter = (0..100u64).map(|i| (i, vec![i as f32, 0.0, 0.0]));
+    /// let mut iter = (0..100u64).map(|i| (i, vec![i as f32, 1.0, 0.0]));
     /// let n = store.bulk_insert(&mut iter)?;
     /// assert_eq!(n, 100);
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::VectorAdmission`] for the first vector the index cannot
+    /// take; every vector is checked before any is indexed.
     fn bulk_insert(&self, vectors: &mut dyn Iterator<Item = (u64, Vec<f32>)>)
     -> StoreResult<usize>;
 
@@ -252,7 +268,7 @@ impl LocalVectorStore {
 impl VectorStore for LocalVectorStore {
     fn insert(&self, node_id: u64, vector: Vec<f32>) -> StoreResult<()> {
         // Shared: concurrent inserts and searches proceed together.
-        let due = self.read()?.insert_shared(node_id, &vector);
+        let due = self.read()?.insert_shared(node_id, &vector)?;
         if due {
             self.calibrate()?;
         }
@@ -266,7 +282,7 @@ impl VectorStore for LocalVectorStore {
     }
 
     fn knn_search(&self, query: &[f32], k: usize) -> StoreResult<Vec<SearchResult>> {
-        Ok(self.read()?.search(query, k))
+        Ok(self.read()?.search(query, k)?)
     }
 
     fn knn_search_with_loader(
@@ -280,7 +296,7 @@ impl VectorStore for LocalVectorStore {
             Some(loader) => guard.search_with_loader(query, k, loader),
             None => guard.search(query, k),
         };
-        Ok(results)
+        Ok(results?)
     }
 
     fn knn_search_with_mode(
@@ -289,22 +305,17 @@ impl VectorStore for LocalVectorStore {
         k: usize,
         mode: SearchMode,
     ) -> StoreResult<Vec<SearchResult>> {
-        Ok(self.read()?.search_with_mode(query, k, mode))
+        Ok(self.read()?.search_with_mode(query, k, mode)?)
     }
 
     fn bulk_insert(
         &self,
         vectors: &mut dyn Iterator<Item = (u64, Vec<f32>)>,
     ) -> StoreResult<usize> {
-        let mut count = 0;
-        let mut due = false;
-        {
-            let guard = self.read()?;
-            for (id, vec) in vectors {
-                due |= guard.insert_shared(id, &vec);
-                count += 1;
-            }
-        }
+        let items: Vec<(u64, Vec<f32>)> = vectors.collect();
+        let count = items.len();
+        // One batch: every vector is checked before any is indexed.
+        let due = self.read()?.insert_batch_shared(items)?;
         if due {
             self.calibrate()?;
         }

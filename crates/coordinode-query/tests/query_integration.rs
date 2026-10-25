@@ -3305,11 +3305,11 @@ fn vector_top_k_empty_input_returns_empty() {
     );
 }
 
-/// Dimension mismatch between query vector and stored embeddings.
-/// Rows whose vector has a different dimension than the query must be skipped
-/// via `if v.len() == query_vec.len()` guard in brute-force fallback.
+/// Dimension mismatch between query vector and stored embeddings: a row
+/// whose vector is of another width than the query's is a domain error of the
+/// statement, never a row left out of the ranking.
 #[test]
-fn vector_top_k_dimension_mismatch_skips_rows() {
+fn vector_top_k_dimension_mismatch_is_a_domain_error() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -3349,43 +3349,27 @@ fn vector_top_k_dimension_mismatch_skips_rows() {
         &mut interner,
     );
 
-    let results = run_cypher(
+    let ast = parse(
         "MATCH (n:Mixed) \
          WITH n.nid AS nid, vector_distance(n.v, [1.0, 0.0, 0.0]) AS d \
          ORDER BY d \
          LIMIT 5 \
          RETURN nid, d",
-        engine,
-        &mut interner,
-    );
+    )
+    .expect("parse");
+    let plan = build_logical_plan(&ast).expect("plan");
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
 
-    // Only 2 rows returned (dim=2 node silently skipped).
-    assert_eq!(
-        results.len(),
-        2,
-        "dim mismatch row must be silently skipped"
-    );
-
-    let top_id = results[0]
-        .get("nid")
-        .and_then(|v| match v {
-            Value::Int(i) => Some(*i),
-            _ => None,
-        })
-        .expect("nid populated");
-    assert_eq!(top_id, 1, "closest to [1,0,0] is n1");
-
-    let second_id = results[1]
-        .get("nid")
-        .and_then(|v| match v {
-            Value::Int(i) => Some(*i),
-            _ => None,
-        })
-        .expect("second nid populated");
-    assert_eq!(
-        second_id, 3,
-        "second is n3 (n2 skipped due to dim mismatch)"
-    );
+    // The dim=2 vector has no distance to the query: the statement fails with
+    // that domain error instead of answering without the node.
+    match execute(&plan, &mut ctx) {
+        Err(coordinode_query::executor::ExecutionError::VectorDomain(e)) => assert_eq!(
+            e,
+            coordinode_vector::hnsw::VectorDomainError::DimensionMismatch { left: 2, right: 3 }
+        ),
+        other => panic!("expected a dimension mismatch, got {other:?}"),
+    }
 }
 
 /// SKIP between ORDER BY and LIMIT → planner does NOT apply optimization
@@ -10216,7 +10200,7 @@ fn setup_rrf_indices(
     if let Some(handle) = vec_reg.get(label, vector_prop) {
         let mut idx = handle.write().unwrap();
         for (id, v, _text) in rows {
-            idx.insert(*id, v.clone());
+            idx.insert(*id, v.clone()).unwrap();
         }
     }
 
@@ -11901,7 +11885,8 @@ fn hnsw_scan_executor_returns_index_top_k() {
         ..Default::default()
     });
     for (i, (x, y)) in coords.iter().enumerate() {
-        hnsw.insert(node_ids[i], vec![*x as f32, *y as f32]);
+        hnsw.insert(node_ids[i], vec![*x as f32, *y as f32])
+            .unwrap();
     }
     let registry = VectorIndexRegistry::new();
     registry.register_with_index(

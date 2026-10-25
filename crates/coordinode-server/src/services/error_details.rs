@@ -54,6 +54,16 @@ pub enum Reason {
     DivideByZero,
     /// An integer operation whose exact result leaves the 64-bit range.
     LongOverflow,
+    /// Vectors their metric cannot evaluate, in a vector function, a query
+    /// vector or a scored candidate. Nothing was answered. Metadata carries
+    /// `problem`: `dimension_mismatch` (with `left` and `right`, the two
+    /// widths), `empty`, `non_finite` (with `index`, the component's
+    /// position) or `zero_vector_cosine`. Terminal.
+    VectorDomain,
+    /// A write would give a vector index a vector it cannot take. Nothing was
+    /// written. Metadata carries `label`, `property`, `element_id` and the
+    /// `problem` keys of `VECTOR_DOMAIN`. Terminal.
+    VectorRefused,
     /// No transaction is held under this ID on the leader: never opened
     /// there (a change of leader ends every open transaction, so the new
     /// leader knows none of the old one's), or already finished, aborted or
@@ -276,6 +286,8 @@ impl Reason {
             Reason::ProcedureCall => "PROCEDURE_CALL",
             Reason::DivideByZero => "DIVIDE_BY_ZERO",
             Reason::LongOverflow => "LONG_OVERFLOW",
+            Reason::VectorDomain => "VECTOR_DOMAIN",
+            Reason::VectorRefused => "VECTOR_REFUSED",
             Reason::UnknownTransaction => "UNKNOWN_TRANSACTION",
             Reason::TransactionIdInUse => "TRANSACTION_ID_IN_USE",
             Reason::TransactionAborted => "TRANSACTION_ABORTED",

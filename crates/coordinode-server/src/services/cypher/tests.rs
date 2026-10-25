@@ -1278,6 +1278,65 @@ fn query_faults_are_invalid_argument_with_a_reason() {
     }
 }
 
+/// A vector its metric cannot evaluate is the caller's fault, INVALID_ARGUMENT
+/// with the reason and the numbers in the metadata: from a vector function, a
+/// query or a candidate (`VECTOR_DOMAIN`) and from a write a vector index
+/// refused (`VECTOR_REFUSED`, naming the index and the node).
+#[test]
+fn vector_domain_errors_are_invalid_argument_with_their_numbers() {
+    use coordinode_query::executor::eval::EvalError;
+    use coordinode_query::executor::runner::ExecutionError;
+    use coordinode_vector::hnsw::VectorDomainError;
+    use tonic_types::StatusExt;
+
+    let info = |err: ExecutionError| {
+        let status = db_error_to_status(DatabaseError::from(err));
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        status
+            .get_error_details()
+            .error_info()
+            .expect("ErrorInfo")
+            .clone()
+    };
+    let meta = |info: &tonic_types::ErrorInfo, key: &str| info.metadata.get(key).cloned();
+
+    let from_function = info(ExecutionError::Arithmetic(EvalError::VectorDomain(
+        VectorDomainError::DimensionMismatch {
+            left: 3,
+            right: 768,
+        },
+    )));
+    assert_eq!(from_function.reason, "VECTOR_DOMAIN");
+    assert_eq!(
+        meta(&from_function, "problem").as_deref(),
+        Some("dimension_mismatch")
+    );
+    assert_eq!(meta(&from_function, "left").as_deref(), Some("3"));
+    assert_eq!(meta(&from_function, "right").as_deref(), Some("768"));
+
+    let from_search = info(ExecutionError::VectorDomain(VectorDomainError::NonFinite {
+        index: 5,
+    }));
+    assert_eq!(from_search.reason, "VECTOR_DOMAIN");
+    assert_eq!(meta(&from_search, "problem").as_deref(), Some("non_finite"));
+    assert_eq!(meta(&from_search, "index").as_deref(), Some("5"));
+
+    let refused = info(ExecutionError::VectorRefused {
+        label: "Doc".into(),
+        property: "embedding".into(),
+        element_id: "n:9".into(),
+        error: VectorDomainError::ZeroVectorCosine,
+    });
+    assert_eq!(refused.reason, "VECTOR_REFUSED");
+    assert_eq!(meta(&refused, "label").as_deref(), Some("Doc"));
+    assert_eq!(meta(&refused, "property").as_deref(), Some("embedding"));
+    assert_eq!(meta(&refused, "element_id").as_deref(), Some("n:9"));
+    assert_eq!(
+        meta(&refused, "problem").as_deref(),
+        Some("zero_vector_cosine")
+    );
+}
+
 /// The offending name travels as data, not as something to be parsed back out
 /// of a sentence.
 #[test]

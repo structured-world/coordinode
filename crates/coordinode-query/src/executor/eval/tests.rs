@@ -712,13 +712,14 @@ fn eval_maxsim_score_rejects_mismatched_dim() {
         args: vec![Expr::Literal(d), Expr::Literal(q)],
         distinct: false,
     };
-    let v = eval_expr(&expr, &empty_row());
-    // coerce ok on each, but kernel returns 0 on dim mismatch.
-    if let Value::Float(s) = v {
-        assert_eq!(s, 0.0);
-    } else {
-        panic!("expected Float, got {v:?}");
-    }
+    // Both sides coerce, but rows of different widths have no MaxSim: a
+    // domain error, never a score of 0 that would rank as an answer.
+    assert_eq!(
+        try_eval_expr(&expr, &empty_row()),
+        Err(EvalError::VectorDomain(
+            VectorDomainError::DimensionMismatch { left: 3, right: 2 }
+        ))
+    );
 }
 
 #[test]
@@ -833,8 +834,76 @@ fn eval_vector_distance_dim_mismatch() {
         ],
         distinct: false,
     };
-    let v = eval_expr(&expr, &empty_row());
-    assert_eq!(v, Value::Null); // Dimension mismatch → null
+    // Vectors of different widths have no distance: a domain error, not a
+    // NULL that reads as a missing property.
+    assert_eq!(
+        try_eval_expr(&expr, &empty_row()),
+        Err(EvalError::VectorDomain(
+            VectorDomainError::DimensionMismatch { left: 2, right: 3 }
+        ))
+    );
+}
+
+/// Every pairwise vector function answers the exact binary64 score, the same
+/// bits the canonical kernels give, for vectors past the f32 range of their
+/// products; cosine of a zero vector and a non-finite component are domain
+/// errors in every function that meets them.
+#[test]
+fn eval_vector_functions_are_exact_and_refuse_their_domain_errors() {
+    use coordinode_vector::metrics::exact;
+    let call = |name: &str, a: Value, b: Value| {
+        try_eval_expr(
+            &Expr::FunctionCall {
+                name: name.into(),
+                args: vec![Expr::Literal(a), Expr::Literal(b)],
+                distinct: false,
+            },
+            &empty_row(),
+        )
+    };
+    let (a, b) = (vec![1e20f32, 1e20], vec![1e20f32, 1e20]);
+    let v = |x: &[f32]| Value::Vector(x.to_vec());
+    assert_eq!(
+        call("vector_similarity", v(&a), v(&b)),
+        Ok(Value::Float(1.0))
+    );
+    assert_eq!(
+        call("vector_dot", v(&a), v(&b)),
+        Ok(Value::Float(exact::dot(&a, &b).unwrap()))
+    );
+    assert_eq!(call("vector_distance", v(&a), v(&b)), Ok(Value::Float(0.0)));
+    // vector_manhattan accepts a list of numbers as the others do.
+    assert_eq!(
+        call(
+            "vector_manhattan",
+            Value::Array(vec![Value::Float(1.0), Value::Int(2)]),
+            v(&[0.0, 0.0])
+        ),
+        Ok(Value::Float(3.0))
+    );
+    assert_eq!(
+        call("vector_similarity", v(&[0.0, 0.0]), v(&[1.0, 0.0])),
+        Err(EvalError::VectorDomain(VectorDomainError::ZeroVectorCosine))
+    );
+    for name in [
+        "vector_distance",
+        "vector_similarity",
+        "vector_dot",
+        "vector_manhattan",
+    ] {
+        assert_eq!(
+            call(name, v(&[1.0, f32::NAN]), v(&[1.0, 1.0])),
+            Err(EvalError::VectorDomain(VectorDomainError::NonFinite {
+                index: 1
+            })),
+            "{name}"
+        );
+        assert_eq!(
+            call(name, Value::Null, v(&[1.0])),
+            Ok(Value::Null),
+            "{name}: a missing vector is NULL"
+        );
+    }
 }
 
 #[test]

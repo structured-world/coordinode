@@ -882,10 +882,15 @@ impl Database {
             self.admit_operation(descriptor, &chain)?;
             txn.bind_operation(descriptor.op, chain);
         }
-        // Constraints judge each node as the whole transaction leaves it,
-        // not as one of its statements did.
+        // Constraints and vector indexes judge each node as the whole
+        // transaction leaves it, not as one of its statements did.
         let fields = self.fields.current()?;
-        coordinode_query::executor::runner::check_post_state(&mut txn, &self.engine, &fields)?;
+        coordinode_query::executor::runner::check_post_state(
+            &mut txn,
+            &self.engine,
+            &fields,
+            Some(&self.vector_index_registry),
+        )?;
         let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
             write_concern: &write_concern,
             pipeline: Some(self.pipeline.as_ref()),

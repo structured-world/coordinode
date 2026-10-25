@@ -22,6 +22,7 @@ use coordinode_query::executor::eval::EvalError;
 use coordinode_query::executor::runner::CatalogObject;
 use coordinode_query::procedure::ProcedureError;
 use coordinode_raft::proto::internode::routing as wire;
+use coordinode_vector::hnsw::VectorDomainError;
 use prost::Message;
 
 use crate::db::{DatabaseError, ReadFenceFailure, StorageFailure, TransactionEnd};
@@ -74,6 +75,8 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::Semantic(_) => "Semantic",
         E::SessionSetting { .. } => "SessionSetting",
         E::Arithmetic(_) => "Arithmetic",
+        E::VectorDomain(_) => "VectorDomain",
+        E::VectorRefused { .. } => "VectorRefused",
         E::Procedure(_) => "Procedure",
         E::Unsupported(_) => "Unsupported",
         E::Budget(_) => "Budget",
@@ -332,6 +335,9 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             setting,
             reason: cut(reason),
         }),
+        E::Arithmetic(EvalError::VectorDomain(e)) | E::VectorDomain(e) => {
+            Kind::VectorDomain(vector_domain_to_wire(e))
+        }
         E::Arithmetic(eval) => Kind::Arithmetic(wire::ArithmeticFailure {
             failure: Some(match eval {
                 EvalError::UnknownFunction(name) => {
@@ -343,7 +349,20 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
                 EvalError::LongOverflow => {
                     wire::arithmetic_failure::Failure::LongOverflow(wire::Empty {})
                 }
+                // Taken by the arm above.
+                EvalError::VectorDomain(e) => return to_wire(E::VectorDomain(e)),
             }),
+        }),
+        E::VectorRefused {
+            label,
+            property,
+            element_id,
+            error,
+        } => Kind::VectorRefused(wire::VectorRefused {
+            label,
+            property,
+            element_id,
+            domain: Some(vector_domain_to_wire(error)),
         }),
         E::Procedure(refusal) => Kind::Procedure(procedure_to_wire(refusal)),
         E::Unsupported(message) => Kind::Unsupported(text(message)),
@@ -636,6 +655,40 @@ fn usize_from(field: &str, n: u64) -> Result<usize, String> {
     usize::try_from(n).map_err(|_| format!("{field}: {n} does not fit this member"))
 }
 
+fn vector_domain_to_wire(e: VectorDomainError) -> wire::VectorDomain {
+    use wire::vector_domain::Failure;
+    // usize is at most 64 bits on every supported target.
+    let width = |n: usize| n as u64;
+    wire::VectorDomain {
+        failure: Some(match e {
+            VectorDomainError::DimensionMismatch { left, right } => {
+                Failure::DimensionMismatch(wire::VectorWidths {
+                    left: width(left),
+                    right: width(right),
+                })
+            }
+            VectorDomainError::Empty => Failure::Empty(wire::Empty {}),
+            VectorDomainError::NonFinite { index } => Failure::NonFiniteIndex(width(index)),
+            VectorDomainError::ZeroVectorCosine => Failure::ZeroVectorCosine(wire::Empty {}),
+        }),
+    }
+}
+
+fn vector_domain_from_wire(d: wire::VectorDomain) -> Result<VectorDomainError, String> {
+    use wire::vector_domain::Failure;
+    Ok(match d.failure.ok_or("a vector domain error of no kind")? {
+        Failure::DimensionMismatch(w) => VectorDomainError::DimensionMismatch {
+            left: usize_from("left", w.left)?,
+            right: usize_from("right", w.right)?,
+        },
+        Failure::Empty(_) => VectorDomainError::Empty,
+        Failure::NonFiniteIndex(index) => VectorDomainError::NonFinite {
+            index: usize_from("non_finite_index", index)?,
+        },
+        Failure::ZeroVectorCosine(_) => VectorDomainError::ZeroVectorCosine,
+    })
+}
+
 fn procedure_from_wire(p: wire::ProcedureRefused) -> Result<ProcedureError, String> {
     use wire::ProcedureRefusal as K;
     let procedure = p.procedure;
@@ -713,6 +766,13 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
                 wire::arithmetic_failure::Failure::LongOverflow(_) => EvalError::LongOverflow,
             })
         }
+        Kind::VectorDomain(d) => E::VectorDomain(vector_domain_from_wire(d)?),
+        Kind::VectorRefused(r) => E::VectorRefused {
+            label: r.label,
+            property: r.property,
+            element_id: r.element_id,
+            error: vector_domain_from_wire(r.domain.ok_or("a vector refusal of no reason")?)?,
+        },
         Kind::Procedure(p) => E::Procedure(procedure_from_wire(p)?),
         Kind::Unsupported(t) => E::Unsupported(t.message),
         Kind::Budget(b) => E::Budget(match b.stop.ok_or("a spent budget of no kind")? {

@@ -84,14 +84,47 @@ fn calibrate_dimension_mismatch_returns_none() {
     assert!(Sq8Params::calibrate(&[&v1, &v2]).is_none());
 }
 
+/// A dimension every vector holds one value in keeps an empty range: it
+/// quantizes to code 0 and dequantizes to that value exactly, whatever its
+/// magnitude (an absolute widening vanishes beside `1e38`).
 #[test]
 fn calibrate_constant_dimension() {
-    let v1 = vec![5.0, 1.0];
-    let v2 = vec![5.0, 2.0];
-    let params = Sq8Params::calibrate(&[&v1, &v2]).expect("calibrate");
-    assert!(params.maxs[0] > params.mins[0]);
-    let q = params.quantize(&v1);
-    assert_eq!(q.len(), 2);
+    for constant in [5.0f32, 1e38, -1e-30] {
+        let v1 = vec![constant, 1.0];
+        let v2 = vec![constant, 2.0];
+        let params = Sq8Params::calibrate(&[&v1, &v2]).expect("calibrate");
+        assert_eq!(params.mins[0], params.maxs[0]);
+        let q = params.quantize(&v1);
+        assert_eq!(q[0], 0);
+        assert_eq!(params.dequantize(&q)[0], constant);
+    }
+}
+
+/// Quantization is scale-free: the same layout scaled to tiny or huge
+/// magnitudes, or spanning opposite values near the f32 limit, restores to
+/// the same relative accuracy as at unit scale.
+#[test]
+fn quantization_holds_at_every_scale() {
+    let base: Vec<Vec<f32>> = (0..50)
+        .map(|i| vec![(i as f32) / 50.0 - 0.5, ((i * 7) % 50) as f32 / 25.0 - 1.0])
+        .collect();
+    for scale in [1.0f32, 1e-30, 1e30, 6e37] {
+        let vectors: Vec<Vec<f32>> = base
+            .iter()
+            .map(|v| v.iter().map(|x| x * scale).collect())
+            .collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let params = Sq8Params::calibrate(&refs).expect("calibrate");
+        for v in &vectors {
+            let restored = params.dequantize(&params.quantize(v));
+            for (i, (&orig, &back)) in v.iter().zip(&restored).enumerate() {
+                assert!(back.is_finite(), "scale {scale}: dim {i}");
+                let range = f64::from(params.maxs[i]) - f64::from(params.mins[i]);
+                let error = (f64::from(orig) - f64::from(back)).abs() / range;
+                assert!(error < 0.01, "scale {scale}: dim {i}: {orig} -> {back}");
+            }
+        }
+    }
 }
 
 #[test]

@@ -23,7 +23,6 @@ use coordinode_core::graph::types::VectorMetric;
 use rayon::prelude::*;
 
 use super::{AdmissionError, HnswIndex};
-use crate::metrics;
 
 /// Minimum item count at which the cluster-and-stitch path is
 /// expected to beat the incremental `insert_batch` path. Below this
@@ -95,7 +94,12 @@ pub(crate) fn bulk_build(
     // two neighbours of one cluster are inserted side by side.
     if !followers.is_empty() {
         let leader_vecs: Vec<Vec<f32>> = leaders_for_assignment;
-        let reordered = cluster_order_followers(followers, &leader_vecs, index.config().metric);
+        // The caller noted every item's domain, so the flag covers them.
+        let wide = index
+            .wide_estimator
+            .load(core::sync::atomic::Ordering::Acquire);
+        let reordered =
+            cluster_order_followers(followers, &leader_vecs, index.config().metric, wide);
         index.insert_batch(reordered)?;
     }
 
@@ -119,32 +123,29 @@ fn assign_followers_to_leaders(
     followers: &[(u64, Vec<f32>)],
     leaders: &[Vec<f32>],
     metric: VectorMetric,
+    wide: bool,
 ) -> Vec<usize> {
     if leaders.is_empty() {
         return vec![0; followers.len()];
     }
     followers
         .par_iter()
-        .map(|(_, v)| nearest_leader_index(v, leaders, metric))
+        .map(|(_, v)| nearest_leader_index(v, leaders, metric, wide))
         .collect()
 }
 
-/// Pick the nearest leader for a single follower vector. Falls
-/// through to `cosine_distance` / `euclidean_distance` /
-/// `manhattan_distance` / `1 - dot` based on the metric. Equal
-/// distances break toward the lower index.
-fn nearest_leader_index(v: &[f32], leaders: &[Vec<f32>], metric: VectorMetric) -> usize {
+/// Pick the nearest leader for a single follower vector, by the traversal
+/// estimator `wide` names. Equal distances break toward the lower index.
+fn nearest_leader_index(
+    v: &[f32],
+    leaders: &[Vec<f32>],
+    metric: VectorMetric,
+    wide: bool,
+) -> usize {
     let mut best_idx = 0;
     let mut best_dist = f32::INFINITY;
     for (i, l) in leaders.iter().enumerate() {
-        let d = match metric {
-            VectorMetric::Cosine => metrics::cosine_distance(v, l),
-            VectorMetric::L2 => metrics::euclidean_distance(v, l),
-            VectorMetric::L1 => metrics::manhattan_distance(v, l),
-            // Higher dot means closer; convert to a lower-is-better
-            // distance to share the comparator with the other metrics.
-            VectorMetric::DotProduct => -metrics::dot_product(v, l),
-        };
+        let d = super::estimate_pair(metric, v, l, wide);
         if d < best_dist {
             best_dist = d;
             best_idx = i;
@@ -166,8 +167,9 @@ fn cluster_order_followers(
     followers: Vec<(u64, Vec<f32>)>,
     leaders: &[Vec<f32>],
     metric: VectorMetric,
+    wide: bool,
 ) -> Vec<(u64, Vec<f32>)> {
-    let assignment = assign_followers_to_leaders(&followers, leaders, metric);
+    let assignment = assign_followers_to_leaders(&followers, leaders, metric, wide);
     // Rank of each follower within its cluster, in input order.
     let mut seen = vec![0usize; leaders.len().max(1)];
     let rank: Vec<usize> = assignment

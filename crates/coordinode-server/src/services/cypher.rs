@@ -173,6 +173,27 @@ fn convert_params(
         .collect()
 }
 
+/// The `ErrorInfo` metadata of a vector domain error: what is wrong, and the
+/// numbers that say where.
+fn vector_problem(
+    domain: &coordinode_vector::hnsw::VectorDomainError,
+) -> Vec<(&'static str, String)> {
+    use coordinode_vector::hnsw::VectorDomainError as D;
+    match domain {
+        D::DimensionMismatch { left, right } => vec![
+            ("problem", "dimension_mismatch".to_owned()),
+            ("left", left.to_string()),
+            ("right", right.to_string()),
+        ],
+        D::Empty => vec![("problem", "empty".to_owned())],
+        D::NonFinite { index } => vec![
+            ("problem", "non_finite".to_owned()),
+            ("index", index.to_string()),
+        ],
+        D::ZeroVectorCosine => vec![("problem", "zero_vector_cosine".to_owned())],
+    }
+}
+
 /// Convert a DatabaseError to a tonic Status.
 ///
 /// Capacity-exhausted errors — whether they arrive as
@@ -224,6 +245,15 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
+        DatabaseError::Arithmetic(EvalError::VectorDomain(domain))
+        | DatabaseError::VectorDomain(domain) => {
+            return status_with_reason(
+                Code::InvalidArgument,
+                rendered,
+                Reason::VectorDomain,
+                vector_problem(domain),
+            );
+        }
         DatabaseError::Arithmetic(eval) => {
             let (reason, metadata) = match eval {
                 EvalError::DivideByZero => (Reason::DivideByZero, Vec::new()),
@@ -236,8 +266,29 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                     // classification exists to undo.
                     vec![("function", name.clone())],
                 ),
+                // Taken by the arm above.
+                EvalError::VectorDomain(domain) => (Reason::VectorDomain, vector_problem(domain)),
             };
             return status_with_reason(Code::InvalidArgument, eval.to_string(), reason, metadata);
+        }
+        DatabaseError::VectorRefused {
+            label,
+            property,
+            element_id,
+            error,
+        } => {
+            let mut metadata = vec![
+                ("label", label.clone()),
+                ("property", property.clone()),
+                ("element_id", element_id.clone()),
+            ];
+            metadata.extend(vector_problem(error));
+            return status_with_reason(
+                Code::InvalidArgument,
+                rendered,
+                Reason::VectorRefused,
+                metadata,
+            );
         }
         // A CALL the catalog refused: a fault in the query, like a syntax
         // error, with the procedure and the argument or column it names.

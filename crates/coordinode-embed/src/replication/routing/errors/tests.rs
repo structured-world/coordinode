@@ -32,6 +32,19 @@ fn every_variant() -> Vec<DatabaseError> {
         E::Arithmetic(EvalError::DivideByZero),
         E::Arithmetic(EvalError::LongOverflow),
         E::Arithmetic(EvalError::UnknownFunction("lenght".into())),
+        E::VectorDomain(VectorDomainError::DimensionMismatch {
+            left: 3,
+            right: 768,
+        }),
+        E::VectorDomain(VectorDomainError::Empty),
+        E::VectorDomain(VectorDomainError::NonFinite { index: 41 }),
+        E::VectorDomain(VectorDomainError::ZeroVectorCosine),
+        E::VectorRefused {
+            label: "Doc".into(),
+            property: "embedding".into(),
+            element_id: "n:7".into(),
+            error: VectorDomainError::NonFinite { index: 2 },
+        },
         E::Procedure(ProcedureError::Unknown {
             procedure: "db.nosuch".into(),
         }),
@@ -380,6 +393,21 @@ fn every_variant_round_trips_with_its_fields() {
         assert_eq!(format!("{back:?}"), sent);
         assert_eq!(back.to_string(), rendered);
     }
+}
+
+/// A vector domain error raised by a function's evaluation crosses as the
+/// vector domain error it is, the one variant a caller branches on for it.
+#[test]
+fn a_vector_function_domain_error_crosses_as_a_vector_domain_error() {
+    let domain = VectorDomainError::ZeroVectorCosine;
+    let back = decode(&encode(DatabaseError::Arithmetic(EvalError::VectorDomain(
+        domain,
+    ))))
+    .expect("decoded");
+    assert!(
+        matches!(back, DatabaseError::VectorDomain(e) if e == domain),
+        "{back:?}"
+    );
 }
 
 /// An unclassified storage failure crosses with its message; its cause stays

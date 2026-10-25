@@ -4,11 +4,11 @@ use coordinode_cluster::{PartitionSet, VectorShardRouter};
 use coordinode_core::graph::types::VectorMetric;
 
 /// A merge across partitions ranks equal scores by id: the merged map's
-/// iteration order is arbitrary, and the result must not follow it. A NaN
-/// (no distance) never takes a place from a number, and the best occurrence
-/// of an id replicated to two partitions wins.
+/// iteration order is arbitrary, and the result must not follow it. The
+/// nearer occurrence of an id replicated to two partitions wins, and a later
+/// farther occurrence does not replace it.
 #[test]
-fn a_merge_ranks_equal_scores_by_id_and_a_nan_last() {
+fn a_merge_ranks_equal_scores_by_id_and_keeps_the_nearer_occurrence() {
     let mut best = HashMap::new();
     let tied: Vec<SearchResult> = (0..50u64)
         .rev()
@@ -18,25 +18,23 @@ fn a_merge_ranks_equal_scores_by_id_and_a_nan_last() {
     VectorIndexRegistry::accumulate_best(
         &mut best,
         vec![
+            SearchResult { id: 7, score: 0.5 },
+            SearchResult { id: 3, score: 2.0 },
             SearchResult {
                 id: 100,
-                score: f32::NAN,
-            },
-            SearchResult { id: 7, score: 0.5 },
-            SearchResult {
-                id: 3,
-                score: f32::NAN,
+                score: 3.0,
             },
         ],
     );
 
-    let merged = VectorIndexRegistry::finalize_merge(best, 52);
+    let merged = VectorIndexRegistry::finalize_merge(best, 51);
     let ids: Vec<u64> = merged.iter().map(|r| r.id).collect();
     let mut expected = vec![7];
     expected.extend((0..50u64).filter(|id| *id != 7));
     expected.push(100);
     assert_eq!(ids, expected);
     assert_eq!(merged[0].score, 0.5, "the nearer occurrence of id 7 wins");
+    assert_eq!(merged[3].score, 1.0, "the farther occurrence of id 3 loses");
 }
 use std::sync::Arc;
 
@@ -92,14 +90,14 @@ fn search(
     query: &[f32],
     k: usize,
 ) -> Option<Vec<SearchResult>> {
-    let Ok(found) = reg.search(
+    reg.search(
         label,
         property,
         query,
         k,
         &mut coordinode_core::budget::Unmetered,
-    );
-    found
+    )
+    .expect("an evaluable query")
 }
 
 /// `reg`'s filtered search with overfetch 2.0 and 4 rounds, under no query
@@ -110,7 +108,7 @@ fn search_visible(
     k: usize,
     is_visible: impl Fn(u64) -> bool,
 ) -> Option<Vec<SearchResult>> {
-    let Ok(found) = reg.search_with_visibility(
+    reg.search_with_visibility(
         "Doc",
         "embedding",
         query,
@@ -119,8 +117,8 @@ fn search_visible(
         4,
         is_visible,
         &mut coordinode_core::budget::Unmetered,
-    );
-    found
+    )
+    .expect("an evaluable query")
 }
 
 /// The vector index `name` as the index numbered `raw`, serving from
@@ -244,9 +242,14 @@ fn insert_and_search() {
     reg.register(def);
 
     // Insert vectors
-    reg.on_vector_written("Movie", NodeId::from_raw(1), "embedding", &[1.0, 0.0, 0.0]);
-    reg.on_vector_written("Movie", NodeId::from_raw(2), "embedding", &[0.0, 1.0, 0.0]);
-    reg.on_vector_written("Movie", NodeId::from_raw(3), "embedding", &[0.9, 0.1, 0.0]);
+    for (id, vector) in [
+        (1, [1.0, 0.0, 0.0]),
+        (2, [0.0, 1.0, 0.0]),
+        (3, [0.9, 0.1, 0.0]),
+    ] {
+        reg.on_vector_written("Movie", NodeId::from_raw(id), "embedding", &vector)
+            .unwrap();
+    }
 
     // Search for vector closest to [1.0, 0.0, 0.0]
     let results = search(&reg, "Movie", "embedding", &[1.0, 0.0, 0.0], 2)
@@ -331,7 +334,9 @@ fn sharded_search_matches_single_index_top1() {
     // Single-index baseline.
     let single = VectorIndexRegistry::new();
     single.register(hnsw(1, "emb", "Doc", "embedding"));
-    single.bulk_insert("Doc", "embedding", vectors.iter().cloned());
+    single
+        .bulk_insert("Doc", "embedding", vectors.iter().cloned())
+        .unwrap();
 
     // Sharded index, 2 partitions split on the first-coord sign.
     let sharded = VectorIndexRegistry::new();
@@ -339,7 +344,9 @@ fn sharded_search_matches_single_index_top1() {
         hnsw(1, "emb", "Doc", "embedding"),
         Arc::new(TwoPartitionRouter),
     );
-    sharded.bulk_insert("Doc", "embedding", vectors.iter().cloned());
+    sharded
+        .bulk_insert("Doc", "embedding", vectors.iter().cloned())
+        .unwrap();
 
     for q in [vec![-1.0, 0.0, 0.0], vec![1.0, 0.0, 0.0]] {
         let base = search(&single, "Doc", "embedding", &q, 1).unwrap();
@@ -365,7 +372,8 @@ fn sharded_dedup_replicated_boundary_id() {
         "Doc",
         "embedding",
         [(4u64, vec![1.0, 0.0, 0.0]), (7, vec![0.0, 1.0, 0.0])].into_iter(),
-    );
+    )
+    .unwrap();
     // The boundary query fans out to both partitions, so id 7 is found in
     // each; the merge must dedup it to a single result.
     let results = search(&reg, "Doc", "embedding", &[0.0, 1.0, 0.0], 10).unwrap();
@@ -402,13 +410,16 @@ fn a_scattered_search_charges_the_merge_of_its_partitions() {
         "Doc",
         "embedding",
         [(4u64, vec![1.0, 0.0, 0.0]), (7, vec![0.0, 1.0, 0.0])].into_iter(),
-    );
+    )
+    .unwrap();
     let mut recorded = Recorded::default();
-    let Ok(found) = reg.search("Doc", "embedding", &[0.0, 1.0, 0.0], 10, &mut recorded);
+    let found = reg
+        .search("Doc", "embedding", &[0.0, 1.0, 0.0], 10, &mut recorded)
+        .unwrap();
     assert_eq!(found.map(|r| r.len()), Some(2));
     // The boundary query reaches the first partition (one answer) and then
     // the second (two answers); each is charged before it is merged.
-    let entry = core::mem::size_of::<(u64, f32)>() as u64;
+    let entry = core::mem::size_of::<(u64, f64)>() as u64;
     assert!(recorded.0.contains(&entry), "{:?}", recorded.0);
     assert_eq!(recorded.0.last(), Some(&(2 * entry)), "{:?}", recorded.0);
 }
@@ -429,7 +440,8 @@ fn sharded_search_with_visibility_filters_hidden_ids() {
             (4, vec![1.0, 0.0, 0.0]),
         ]
         .into_iter(),
-    );
+    )
+    .unwrap();
 
     // The query routes to the negative partition {1, 2}. Hiding id 1 must
     // prune it from the scatter-gathered, merged result.
@@ -450,4 +462,93 @@ fn sharded_search_with_visibility_filters_hidden_ids() {
         unfiltered[0].id, 1,
         "unfiltered sharded top-1 is the exact match"
     );
+}
+
+/// The check a write is refused with before it commits: the declared
+/// dimension holds before the index has any vector, a zero vector is refused
+/// under cosine, and the check changes nothing.
+#[test]
+fn admission_checks_the_declared_dimension_and_the_metric() {
+    use coordinode_vector::hnsw::VectorDomainError;
+    let reg = VectorIndexRegistry::new();
+    reg.register(hnsw(1, "emb", "Doc", "embedding"));
+    let node = NodeId::from_raw(9);
+    let check = |v: &[f32]| {
+        reg.check_admission("Doc", "embedding", node, v)
+            .map_err(|e| e.error)
+    };
+
+    assert_eq!(
+        check(&[1.0, 0.0]),
+        Err(VectorDomainError::DimensionMismatch { left: 2, right: 3 }),
+        "the declared width binds before any vector is indexed"
+    );
+    assert_eq!(
+        check(&[0.0, 0.0, 0.0]),
+        Err(VectorDomainError::ZeroVectorCosine)
+    );
+    assert_eq!(
+        check(&[0.0, f32::NAN, 1.0]),
+        Err(VectorDomainError::NonFinite { index: 1 })
+    );
+    assert_eq!(
+        check(&[0.0, 1e-30, 0.0]),
+        Ok(()),
+        "a tiny nonzero vector has a direction"
+    );
+    assert_eq!(
+        reg.get("Doc", "embedding").unwrap().read().unwrap().len(),
+        0
+    );
+    // No index, nothing to check.
+    assert!(reg.check_admission("Doc", "other", node, &[0.0]).is_ok());
+}
+
+/// A write of an unevaluable vector inserts nothing, through the single and
+/// the partitioned index alike: a partitioned batch is checked whole before
+/// any partition is written.
+#[test]
+fn a_refused_batch_changes_no_partition() {
+    let single = VectorIndexRegistry::new();
+    single.register(hnsw(1, "emb", "Doc", "embedding"));
+    let sharded = VectorIndexRegistry::new();
+    sharded.register_sharded(
+        hnsw(1, "emb", "Doc", "embedding"),
+        Arc::new(TwoPartitionRouter),
+    );
+    let batch = || {
+        vec![
+            (NodeId::from_raw(1), vec![-1.0, 0.0, 0.0]),
+            (NodeId::from_raw(2), vec![1.0, 0.0, 0.0]),
+            (NodeId::from_raw(3), vec![0.0, 0.0, 0.0]),
+        ]
+    };
+    for reg in [&single, &sharded] {
+        let refused = reg
+            .on_vectors_written("Doc", "embedding", batch())
+            .unwrap_err();
+        assert_eq!(refused.id, 3);
+        for q in [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]] {
+            assert!(search(reg, "Doc", "embedding", &q, 5).unwrap().is_empty());
+        }
+    }
+}
+
+/// A search scores its hits exactly: the score of an exact match is exactly
+/// zero cosine distance, and a vector past the f32 range of its dot product
+/// still gets a finite score.
+#[test]
+fn search_scores_are_exact() {
+    let reg = VectorIndexRegistry::new();
+    reg.register(hnsw(1, "emb", "Doc", "embedding"));
+    reg.bulk_insert(
+        "Doc",
+        "embedding",
+        [(1u64, vec![1e20, 1e20, 0.0]), (2, vec![0.0, 1.0, 0.0])].into_iter(),
+    )
+    .unwrap();
+    let hits = search(&reg, "Doc", "embedding", &[1e20, 1e20, 0.0], 2).unwrap();
+    assert_eq!(hits[0].id, 1);
+    assert_eq!(hits[0].score, 0.0);
+    assert!(hits[1].score.is_finite());
 }

@@ -37,11 +37,24 @@ CoordiNode extensions. Operate on `Vector` or `Array` of Float/Int values.
 | Function | Signature | Returns | Notes |
 |----------|-----------|---------|-------|
 | `vector_distance` | `vector_distance(a, b)` | Float | Euclidean (L2) distance |
-| `vector_similarity` | `vector_similarity(a, b)` | Float | Cosine similarity. Range [-1, 1], independent of the vectors' scale for any finite values; `0.0` when either vector is all zeros |
+| `vector_similarity` | `vector_similarity(a, b)` | Float | Cosine similarity, in [-1, 1] and independent of the vectors' scale |
 | `vector_dot` | `vector_dot(a, b)` | Float | Dot product |
-| `vector_manhattan` | `vector_manhattan(a, b)` | Float | Manhattan (L1) distance. Only accepts `Vector` values — not `Array` |
+| `vector_manhattan` | `vector_manhattan(a, b)` | Float | Manhattan (L1) distance |
 
-`vector_distance`, `vector_similarity`, and `vector_dot` accept both `Vector` and `Array` of Float/Int. `vector_manhattan` requires native `Vector` values; passing plain arrays returns `null`. Both arguments must have identical dimensionality.
+Every function accepts both `Vector` and `Array` of Float/Int; an argument that is `null` or not a vector answers `null`.
+
+**Exact evaluation.** Each score is computed exactly in IEEE binary64 over the stored single-precision values: every component is widened before it is multiplied or subtracted, and the terms are summed by one fixed balanced tree over component order. The result does not depend on the CPU (scalar, AVX2 or NEON), on the plan (a scalar call, a `WHERE` threshold, an `ORDER BY`, an index search) or on where the query runs: the same inputs give the same bits everywhere. Products past the single-precision range (components around `1e20`) stay finite. Equal scores rank by node id.
+
+**Domain errors.** Vectors the metric cannot evaluate fail the statement rather than answer a number, `0` or `null`:
+
+| Case | Error |
+|------|-------|
+| Vectors of different widths | `dimension_mismatch` |
+| A vector with no components | `empty` |
+| A NaN or infinite component | `non_finite` |
+| `vector_similarity` with a vector whose components are all zero (it has no direction) | `zero_vector_cosine` |
+
+Over gRPC the status is `INVALID_ARGUMENT` with `ErrorInfo.reason` `VECTOR_DOMAIN` and the case in the `problem` metadata key (`left`/`right` carry the two widths, `index` the non-finite component); over the PostgreSQL wire it is SQLSTATE `22000`. A tiny nonzero vector has a direction: only an all-zero vector is refused under cosine.
 
 ```cypher
 MATCH (p:Product)
@@ -63,9 +76,11 @@ LIMIT 10
 maxsim_score(doc, query) = Sum over q in query_tokens of max over d in doc_tokens of dot(q, d)
 ```
 
-Both arguments accept the native `MultiVector` value type or a plain `Array<Array<Float|Int>>` of the same shape (so that parameter literals from gRPC / JSON paths work without an explicit cast). All rows on both sides must have equal length; any mismatch returns `0.0`, and a missing argument returns `null`. Pre-normalise rows to unit L2 norm if you want cosine semantics; the kernel itself is metric-agnostic and computes raw dot products.
+Both arguments accept the native `MultiVector` value type or a plain `Array<Array<Float|Int>>` of the same shape (so that parameter literals from gRPC / JSON paths work without an explicit cast). A missing argument returns `null`. Pre-normalise rows to unit L2 norm if you want cosine semantics; the kernel itself is metric-agnostic and computes raw dot products.
 
-Typical ColBERT workloads run with `dim = 128`, `|query_tokens| ~ 32-64`, `|doc_tokens| ~ 100-220`. The kernel is `O(|q| * |d| * dim)` per call and dispatches the inner per-pair distance through the AVX-512 / AVX2+FMA / NEON / scalar paths shared with `vector_dot`. A future centroid index (PLAID-style) will prune the `|d|` factor for large corpora; the current path is brute-force over the input rows.
+Each dot product is the exact binary64 `vector_dot`, and the per-row maxima are summed by the same fixed tree, so the score has the same bits on every CPU and plan. An empty matrix or row, rows of different widths and a non-finite component are domain errors (`VECTOR_DOMAIN`, see [Vector Functions](#vector-functions)), never a score of `0.0`.
+
+Typical ColBERT workloads run with `dim = 128`, `|query_tokens| ~ 32-64`, `|doc_tokens| ~ 100-220`. The kernel is `O(|q| * |d| * dim)` per call and dispatches the inner per-pair products through the AVX2 / NEON / scalar paths shared with `vector_dot`. A future centroid index (PLAID-style) will prune the `|d|` factor for large corpora; the current path is brute-force over the input rows.
 
 ```cypher
 // Single document score

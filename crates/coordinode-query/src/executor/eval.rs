@@ -6,6 +6,7 @@
 //! the Project / Sort executor guards.
 
 use coordinode_core::graph::types::Value;
+use coordinode_vector::hnsw::VectorDomainError;
 
 use super::row::Row;
 use crate::function::ScalarFn;
@@ -120,9 +121,9 @@ fn collect_score_requirements_neutral(expr: &crate::plan::expr::Expr, out: &mut 
 ///
 /// Cypher evaluation is deliberately total almost everywhere: a type mismatch,
 /// a missing property or a NULL operand answers NULL rather than failing.
-/// Arithmetic is the exception, because the alternative to failing is answering
-/// a number that is simply wrong, and a caller has no way to tell one from a
-/// real result.
+/// Arithmetic and vector scores are the exception, because the alternative to
+/// failing is answering a number that is simply wrong, and a caller has no
+/// way to tell one from a real result.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
     /// A call to a function no evaluator owns.
@@ -147,6 +148,12 @@ pub enum EvalError {
     /// silently stopped growing pass for a total.
     #[error("long overflow")]
     LongOverflow,
+
+    /// Vectors a vector function's metric cannot evaluate: of different
+    /// widths, empty, non-finite, or zero under cosine. A score of 0, NULL or
+    /// NaN would pass for an answer.
+    #[error(transparent)]
+    VectorDomain(#[from] VectorDomainError),
 }
 
 /// `None` from a `checked_*` integer operation means the exact result does not
@@ -407,23 +414,15 @@ fn coerce_vector_pair(
 /// Coerce to a multi-vector (matrix of f32 rows) used by ColBERT-style
 /// late-interaction scoring. Accepts `Value::MultiVector` directly, or a
 /// `Value::Array` of `Value::Vector` / nested `Value::Array<Float|Int>`.
-/// Returns `None` on any row that doesn't coerce or whose width differs
-/// from the first row's width.
+/// Returns `None` on any row that doesn't coerce; the shape is the scorer's
+/// to judge.
 fn coerce_to_multi_vector(val: Option<&Value>) -> Option<Vec<Vec<f32>>> {
     match val {
         Some(Value::MultiVector(rows)) => Some(rows.clone()),
-        Some(Value::Array(arr)) => {
-            let mut rows: Vec<Vec<f32>> = Vec::with_capacity(arr.len());
-            for item in arr {
-                let row = coerce_to_vector(Some(item))?;
-                rows.push(row);
-            }
-            let width = rows.first().map(Vec::len)?;
-            if width == 0 || rows.iter().any(|r| r.len() != width) {
-                return None;
-            }
-            Some(rows)
-        }
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|item| coerce_to_vector(Some(item)))
+            .collect(),
         _ => None,
     }
 }
@@ -446,12 +445,38 @@ pub(crate) fn dispatch_scalar_function(
 ) -> Result<Value, EvalError> {
     let function =
         ScalarFn::resolve(name).ok_or_else(|| EvalError::UnknownFunction(name.to_string()))?;
-    Ok(eval_scalar_function(
-        function,
-        evaluated,
-        first_arg_var,
-        row,
-    ))
+    eval_scalar_function(function, evaluated, first_arg_var, row)
+}
+
+/// The exact score vector function `function` gives `a` against `b`: binary64
+/// over the retained f32 values by one canonical evaluation, so a scalar call,
+/// a threshold, an ORDER BY and an index rescore give the same bits. `None`
+/// for a function that is not a pairwise vector score.
+pub(crate) fn vector_score(
+    function: ScalarFn,
+    a: &[f32],
+    b: &[f32],
+) -> Option<Result<f64, VectorDomainError>> {
+    use coordinode_vector::metrics::exact;
+    Some(match function {
+        ScalarFn::VectorDistance => exact::l2(a, b),
+        ScalarFn::VectorSimilarity => exact::cosine_similarity(a, b),
+        ScalarFn::VectorDot => exact::dot(a, b),
+        ScalarFn::VectorManhattan => exact::l1(a, b),
+        _ => return None,
+    })
+}
+
+/// A pairwise vector function of the two arguments: NULL when either is not
+/// a vector, the exact score otherwise.
+fn pairwise_vector_function(function: ScalarFn, args: &[Value]) -> Result<Value, EvalError> {
+    let (Some(a), Some(b)) = coerce_vector_pair(args.first(), args.get(1)) else {
+        return Ok(Value::Null);
+    };
+    match vector_score(function, &a, &b) {
+        Some(score) => Ok(Value::Float(score?)),
+        None => Ok(Value::Null),
+    }
 }
 
 /// Evaluate a resolved scalar function. Every catalog function has an arm, so
@@ -461,9 +486,9 @@ fn eval_scalar_function(
     evaluated: Vec<Value>,
     first_arg_var: Option<&str>,
     row: &Row,
-) -> Value {
+) -> Result<Value, EvalError> {
     let args = evaluated.as_slice();
-    match function {
+    Ok(match function {
         ScalarFn::Coalesce => evaluated
             .into_iter()
             .find(|v| !v.is_null())
@@ -691,59 +716,27 @@ fn eval_scalar_function(
                     .unwrap_or(0),
             )
         }
-        // Vector distance/similarity functions
-        ScalarFn::VectorDistance => {
-            // vector_distance(a, b) → L2 distance
-            let (a, b) = coerce_vector_pair(evaluated.first(), evaluated.get(1));
-            match (a, b) {
-                (Some(a), Some(b)) if a.len() == b.len() => {
-                    Value::Float(coordinode_vector::metrics::euclidean_distance(&a, &b) as f64)
-                }
-                _ => Value::Null,
-            }
-        }
-        ScalarFn::VectorSimilarity => {
-            // vector_similarity(a, b) → cosine similarity
-            let (a, b) = coerce_vector_pair(evaluated.first(), evaluated.get(1));
-            match (a, b) {
-                (Some(a), Some(b)) if a.len() == b.len() => {
-                    Value::Float(coordinode_vector::metrics::cosine_similarity(&a, &b) as f64)
-                }
-                _ => Value::Null,
-            }
-        }
-        ScalarFn::VectorDot => {
-            // vector_dot(a, b) → dot product
-            let (a, b) = coerce_vector_pair(evaluated.first(), evaluated.get(1));
-            match (a, b) {
-                (Some(a), Some(b)) if a.len() == b.len() => {
-                    Value::Float(coordinode_vector::metrics::dot_product(&a, &b) as f64)
-                }
-                _ => Value::Null,
-            }
-        }
-        ScalarFn::VectorManhattan => {
-            // vector_manhattan(a, b) → L1 distance
-            match (evaluated.first(), evaluated.get(1)) {
-                (Some(Value::Vector(a)), Some(Value::Vector(b))) if a.len() == b.len() => {
-                    Value::Float(coordinode_vector::metrics::manhattan_distance(a, b) as f64)
-                }
-                _ => Value::Null,
-            }
-        }
+        // vector_distance (L2), vector_similarity (cosine), vector_dot,
+        // vector_manhattan (L1): NULL for an argument that is not a vector, a
+        // domain error for vectors the metric cannot evaluate (different
+        // widths, empty, non-finite, zero under cosine).
+        ScalarFn::VectorDistance
+        | ScalarFn::VectorSimilarity
+        | ScalarFn::VectorDot
+        | ScalarFn::VectorManhattan => pairwise_vector_function(function, args)?,
         // maxsim_score(doc_tokens, query_tokens) -> MaxSim (ColBERT-style)
         // late-interaction score. Each argument is a multi-vector matrix
         // (per-token f32 rows). Returns the sum over query tokens of the
         // best dot-product against any doc token. Pre-normalise rows to
-        // unit L2 norm if you want cosine semantics. Returns NULL when
-        // either side is missing, dim-mismatched, or empty.
+        // unit L2 norm if you want cosine semantics. NULL when either side
+        // is not a matrix; a domain error for matrices it cannot score
+        // (empty, rows of different widths, non-finite components).
         ScalarFn::MaxsimScore => {
             let doc = coerce_to_multi_vector(evaluated.first());
             let query = coerce_to_multi_vector(evaluated.get(1));
             match (doc, query) {
                 (Some(doc), Some(query)) => {
-                    let score = coordinode_vector::metrics::maxsim(&doc, &query);
-                    Value::Float(score as f64)
+                    Value::Float(coordinode_vector::metrics::exact::maxsim(&doc, &query)?)
                 }
                 _ => Value::Null,
             }
@@ -1122,7 +1115,7 @@ fn eval_scalar_function(
         ScalarFn::Haversin => float_fn(args, |x| (1.0 - x.cos()) / 2.0),
         ScalarFn::Degrees => float_fn(args, f64::to_degrees),
         ScalarFn::Radians => float_fn(args, f64::to_radians),
-    }
+    })
 }
 
 /// The first argument as a string, if it is one.

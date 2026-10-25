@@ -5,7 +5,54 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use coordinode_core::graph::types::VectorMetric;
-use coordinode_vector::hnsw::{HnswConfig, HnswIndex, QuantizationCodec};
+use coordinode_vector::hnsw::{HnswConfig, QuantizationCodec, SearchResult};
+
+/// The index under test, its fallible calls unwrapped: these tests insert and
+/// query vectors their metric can evaluate.
+struct HnswIndex(coordinode_vector::hnsw::HnswIndex);
+
+impl HnswIndex {
+    fn new(config: HnswConfig) -> Self {
+        Self(coordinode_vector::hnsw::HnswIndex::new(config))
+    }
+
+    fn insert(&mut self, id: u64, vector: Vec<f32>) {
+        self.0.insert(id, vector).expect("an admitted vector");
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        self.0.search(query, k).expect("an evaluable query")
+    }
+
+    fn search_with_visibility(
+        &self,
+        query: &[f32],
+        k: usize,
+        overfetch_factor: f64,
+        max_expansion_rounds: usize,
+        is_visible: impl Fn(u64) -> bool,
+    ) -> (
+        Vec<SearchResult>,
+        coordinode_core::graph::types::VectorMvccStats,
+    ) {
+        self.0
+            .search_with_visibility(query, k, overfetch_factor, max_expansion_rounds, is_visible)
+            .expect("an evaluable query")
+    }
+}
+
+impl std::ops::Deref for HnswIndex {
+    type Target = coordinode_vector::hnsw::HnswIndex;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for HnswIndex {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 fn config(metric: VectorMetric) -> HnswConfig {
     HnswConfig {
@@ -22,15 +69,16 @@ fn search(
     property: &str,
     query: &[f32],
     k: usize,
-) -> Option<Vec<coordinode_vector::hnsw::SearchResult>> {
-    let Ok(found) = registry.search(
-        label,
-        property,
-        query,
-        k,
-        &mut coordinode_core::budget::Unmetered,
-    );
-    found
+) -> Option<Vec<SearchResult>> {
+    registry
+        .search(
+            label,
+            property,
+            query,
+            k,
+            &mut coordinode_core::budget::Unmetered,
+        )
+        .expect("an evaluable query")
 }
 
 /// Wait until the vector worker has folded every applied commit into the
@@ -181,7 +229,7 @@ fn sq8_config(metric: VectorMetric) -> HnswConfig {
 /// stays acceptable compared to brute-force ground truth.
 #[test]
 fn sq8_hnsw_recall_384_dims() {
-    use coordinode_vector::metrics;
+    use coordinode_vector::metrics::exact;
     use std::collections::HashSet;
 
     let dims = 384; // Typical embedding size (e.g., MiniLM)
@@ -209,12 +257,12 @@ fn sq8_hnsw_recall_384_dims() {
 
     // Brute-force ground truth
     let query = &vectors[42]; // Arbitrary query
-    let mut ground_truth: Vec<(f32, u64)> = vectors
+    let mut ground_truth: Vec<(f64, u64)> = vectors
         .iter()
         .enumerate()
-        .map(|(i, v)| (metrics::euclidean_distance_squared(query, v), i as u64))
+        .map(|(i, v)| (exact::l2(query, v).unwrap(), i as u64))
         .collect();
-    ground_truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    ground_truth.sort_by(|a, b| exact::ranked_order(a.0, a.1, b.0, b.1));
     let gt_set: HashSet<u64> = ground_truth.iter().take(k).map(|&(_, id)| id).collect();
 
     let results = index.search(query, k);
@@ -231,13 +279,16 @@ fn sq8_hnsw_recall_384_dims() {
         "SQ8 384-dim recall {recall:.0}% too low (expected >= 50%)"
     );
 
-    // Verify reranked scores are exact f32 distances
-    let first_exact = metrics::euclidean_distance_squared(query, &vectors[results[0].id as usize]);
-    assert!(
-        (results[0].score - first_exact).abs() < 1e-5,
-        "reranked score should be exact f32: got {}, expected {first_exact}",
-        results[0].score
-    );
+    // Every score is the exact distance of the retained f32 values, not the
+    // quantized estimate the traversal used.
+    for r in &results {
+        assert_eq!(
+            r.score,
+            exact::l2(query, &vectors[r.id as usize]).unwrap(),
+            "the score of {} is the exact distance",
+            r.id
+        );
+    }
 }
 
 /// SQ8 + HNSW with cosine metric on 768-dim vectors (e.g., sentence-transformers).
@@ -266,9 +317,11 @@ fn sq8_hnsw_cosine_768_dims() {
     let results = index.search(&vectors[0], 5);
     assert_eq!(results.len(), 5);
     assert_eq!(results[0].id, 0, "self-query should return self as nearest");
+    // Exact cosine of a vector with itself is 1 up to the rounding of its
+    // norms: the distance is within a few binary64 ulps of zero.
     assert!(
-        results[0].score < 0.01,
-        "self-distance (cosine) should be near zero, got {}",
+        (0.0..=4.0 * f64::EPSILON).contains(&results[0].score),
+        "self-distance (cosine) should be zero to rounding, got {}",
         results[0].score
     );
 }
@@ -1093,16 +1146,17 @@ fn recall_benchmark_snapshot_vs_current() {
     // Calculate recall: how many of the top-K visible vectors (ground truth)
     // are found in the snapshot results?
     // Ground truth: brute-force top-K excluding churned IDs
-    let mut ground_truth: Vec<(u64, f32)> = vectors
+    let mut ground_truth: Vec<(u64, f64)> = vectors
         .iter()
         .enumerate()
         .filter(|(i, _)| !churned_ids.contains(&(*i as u64)))
         .map(|(i, v)| {
-            let dist = coordinode_vector::metrics::euclidean_distance(&query, v);
+            let dist = coordinode_vector::metrics::exact::l2(&query, v).unwrap();
             (i as u64, dist)
         })
         .collect();
-    ground_truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    ground_truth
+        .sort_by(|a, b| coordinode_vector::metrics::exact::ranked_order(a.1, a.0, b.1, b.0));
     let gt_ids: std::collections::HashSet<u64> =
         ground_truth.iter().take(k).map(|(id, _)| *id).collect();
 
@@ -1290,7 +1344,7 @@ fn hnsw_bulk_insert_and_search() {
         .map(|i| (i, vec![i as f32, (i as f32).sin(), (i as f32).cos(), 0.0]))
         .collect();
 
-    let count = reg.bulk_insert("Item", "vec", vectors.into_iter());
+    let count = reg.bulk_insert("Item", "vec", vectors.into_iter()).unwrap();
     assert_eq!(count, 100);
 
     // Search should work
@@ -2093,15 +2147,17 @@ fn forced_offload_search_through_registry() {
         StorageVectorLoader::new(db.engine_shared(), db.interner().expect("dictionary"), 1);
 
     let reg = db.vector_index_registry();
-    let Ok(results) = reg.search_with_loader(
-        "Widget",
-        "vec",
-        &[0.0, 1.0, 0.5],
-        5,
-        Some(&loader),
-        &mut coordinode_core::budget::Unmetered,
-    );
-    let results = results.expect("search should succeed");
+    let results = reg
+        .search_with_loader(
+            "Widget",
+            "vec",
+            &[0.0, 1.0, 0.5],
+            5,
+            Some(&loader),
+            &mut coordinode_core::budget::Unmetered,
+        )
+        .expect("an evaluable query")
+        .expect("search should succeed");
 
     assert_eq!(results.len(), 5, "should return 5 results");
 

@@ -75,13 +75,39 @@ pub fn is_zero(v: &[f32]) -> bool {
 }
 
 fn same_dims(a: &[f32], b: &[f32]) -> Result<(), VectorDomainError> {
-    if a.len() == b.len() {
-        Ok(())
-    } else {
-        Err(VectorDomainError::DimensionMismatch {
+    if a.len() != b.len() {
+        return Err(VectorDomainError::DimensionMismatch {
             left: a.len(),
             right: b.len(),
-        })
+        });
+    }
+    if a.is_empty() {
+        return Err(VectorDomainError::Empty);
+    }
+    Ok(())
+}
+
+/// `reduced` when it is finite, else the non-finite component of `a` or `b`
+/// it came from. Squares and products of finite f32 values are at most about
+/// 4.6e77 in binary64, so no reduction of a slice's worth of them overflows:
+/// a non-finite result is the only trace a non-finite input leaves, and the
+/// inputs are scanned only then.
+#[inline(always)]
+fn finite(reduced: f64, a: &[f32], b: &[f32]) -> Result<f64, VectorDomainError> {
+    if reduced.is_finite() {
+        Ok(reduced)
+    } else {
+        Err(non_finite_input(a, b))
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn non_finite_input(a: &[f32], b: &[f32]) -> VectorDomainError {
+    match validate(a).and_then(|()| validate(b)) {
+        Err(e) => e,
+        // Unreachable by the bound above; reported rather than trusted.
+        Ok(()) => VectorDomainError::NonFinite { index: 0 },
     }
 }
 
@@ -97,10 +123,12 @@ fn canonical(x: f64) -> f64 {
 ///
 /// # Errors
 ///
-/// [`VectorDomainError::DimensionMismatch`].
+/// [`VectorDomainError::DimensionMismatch`], [`VectorDomainError::Empty`] or
+/// [`VectorDomainError::NonFinite`]. The pairwise functions below fail the
+/// same way.
 pub fn dot(a: &[f32], b: &[f32]) -> Result<f64, VectorDomainError> {
     same_dims(a, b)?;
-    Ok(canonical(kernels().dot(a, b)))
+    finite(canonical(kernels().dot(a, b)), a, b)
 }
 
 /// Squared Euclidean distance, from the component differences (never from
@@ -108,17 +136,17 @@ pub fn dot(a: &[f32], b: &[f32]) -> Result<f64, VectorDomainError> {
 ///
 /// # Errors
 ///
-/// [`VectorDomainError::DimensionMismatch`].
+/// As [`dot`].
 pub fn squared_l2(a: &[f32], b: &[f32]) -> Result<f64, VectorDomainError> {
     same_dims(a, b)?;
-    Ok(canonical(kernels().squared_l2(a, b)))
+    finite(canonical(kernels().squared_l2(a, b)), a, b)
 }
 
 /// Euclidean distance: the correctly rounded square root of [`squared_l2`].
 ///
 /// # Errors
 ///
-/// [`VectorDomainError::DimensionMismatch`].
+/// As [`dot`].
 pub fn l2(a: &[f32], b: &[f32]) -> Result<f64, VectorDomainError> {
     Ok(squared_l2(a, b)?.sqrt())
 }
@@ -127,10 +155,10 @@ pub fn l2(a: &[f32], b: &[f32]) -> Result<f64, VectorDomainError> {
 ///
 /// # Errors
 ///
-/// [`VectorDomainError::DimensionMismatch`].
+/// As [`dot`].
 pub fn l1(a: &[f32], b: &[f32]) -> Result<f64, VectorDomainError> {
     same_dims(a, b)?;
-    Ok(canonical(kernels().l1(a, b)))
+    finite(canonical(kernels().l1(a, b)), a, b)
 }
 
 /// Sum of the squared components of `a`: what a cached norm holds. The norm
@@ -166,12 +194,14 @@ pub fn cosine_from_parts(
 ///
 /// # Errors
 ///
-/// [`VectorDomainError::DimensionMismatch`], or
-/// [`VectorDomainError::ZeroVectorCosine`] when either vector is all zeros.
+/// As [`dot`], or [`VectorDomainError::ZeroVectorCosine`] when either vector
+/// is all zeros.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f64, VectorDomainError> {
     same_dims(a, b)?;
     let (dot, ss_a, ss_b) = kernels().cosine_parts(a, b);
-    cosine_from_parts(dot, ss_a, ss_b)
+    // A non-finite component of either vector leaves the dot product
+    // non-finite (an infinity times anything is infinite or NaN).
+    cosine_from_parts(finite(dot, a, b)?, ss_a, ss_b)
 }
 
 /// Cosine similarity of `a` and `b` where `a`'s sum of squares is known, as
@@ -188,7 +218,7 @@ pub fn cosine_similarity_with_sum_of_squares(
 ) -> Result<f64, VectorDomainError> {
     same_dims(a, b)?;
     let (dot, _, ss_b) = kernels().cosine_parts(a, b);
-    cosine_from_parts(dot, sum_of_squares_a, ss_b)
+    cosine_from_parts(finite(dot, a, b)?, sum_of_squares_a, ss_b)
 }
 
 /// Cosine distance: binary64 `1 - ` the canonical similarity.
@@ -259,19 +289,20 @@ impl<'a> ExactQuery<'a> {
     ///
     /// # Errors
     ///
-    /// [`VectorDomainError::DimensionMismatch`], and
+    /// [`VectorDomainError::DimensionMismatch`] or
+    /// [`VectorDomainError::NonFinite`] for the candidate, and
     /// [`VectorDomainError::ZeroVectorCosine`] for a zero cosine candidate.
     pub fn distance(&self, candidate: &[f32]) -> Result<f64, VectorDomainError> {
         same_dims(self.vector, candidate)?;
-        let k = kernels();
+        let (q, k) = (self.vector, kernels());
         let d = match self.metric {
             VectorMetric::Cosine => {
-                let (dot, _, ss) = k.cosine_parts(self.vector, candidate);
-                1.0 - cosine_from_parts(dot, self.sum_of_squares, ss)?
+                let (dot, _, ss) = k.cosine_parts(q, candidate);
+                1.0 - cosine_from_parts(finite(dot, q, candidate)?, self.sum_of_squares, ss)?
             }
-            VectorMetric::L2 => k.squared_l2(self.vector, candidate).sqrt(),
-            VectorMetric::DotProduct => -k.dot(self.vector, candidate),
-            VectorMetric::L1 => k.l1(self.vector, candidate),
+            VectorMetric::L2 => finite(k.squared_l2(q, candidate), q, candidate)?.sqrt(),
+            VectorMetric::DotProduct => -finite(k.dot(q, candidate), q, candidate)?,
+            VectorMetric::L1 => finite(k.l1(q, candidate), q, candidate)?,
         };
         Ok(canonical(d))
     }
@@ -298,6 +329,51 @@ pub fn admit(vector: &[f32], metric: VectorMetric) -> Result<(), VectorDomainErr
 #[must_use]
 pub fn ranked_order(a: f64, a_id: u64, b: f64, b_id: u64) -> core::cmp::Ordering {
     a.total_cmp(&b).then(a_id.cmp(&b_id))
+}
+
+/// The canonical sum of `terms`: the same balanced tree over their order that
+/// reduces a metric's components.
+#[must_use]
+pub fn sum(terms: &[f64]) -> f64 {
+    canonical(reduce_scalar(terms.len(), |i| terms[i]))
+}
+
+/// Late-interaction MaxSim of `query` against `doc`: for each query row the
+/// largest exact dot product with any document row, summed canonically in
+/// query-row order.
+///
+/// # Errors
+///
+/// [`VectorDomainError::Empty`] for an empty matrix or row,
+/// [`VectorDomainError::DimensionMismatch`] for a row of another width than
+/// the first query row, [`VectorDomainError::NonFinite`] for a non-finite
+/// component.
+pub fn maxsim(doc: &[Vec<f32>], query: &[Vec<f32>]) -> Result<f64, VectorDomainError> {
+    let width = query.first().ok_or(VectorDomainError::Empty)?.len();
+    if doc.is_empty() {
+        return Err(VectorDomainError::Empty);
+    }
+    for row in doc.iter().chain(query) {
+        validate(row)?;
+        if row.len() != width {
+            return Err(VectorDomainError::DimensionMismatch {
+                left: row.len(),
+                right: width,
+            });
+        }
+    }
+    let kernels = kernels();
+    // Every row is finite and nonempty, so each dot product is finite and the
+    // fold's starting infinity is always replaced.
+    let best: Vec<f64> = query
+        .iter()
+        .map(|q| {
+            doc.iter()
+                .map(|d| canonical(kernels.dot(q, d)))
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+        .collect();
+    Ok(sum(&best))
 }
 
 // --- Canonical tree ---

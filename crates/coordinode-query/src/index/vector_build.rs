@@ -254,11 +254,14 @@ impl VectorBuild<'_> {
                     scanned += 1;
                     for target in self.targets {
                         if let Some(vec_data) = target.member(record) {
+                            // A stored vector the index cannot take fails the
+                            // build with the reason rather than leave the node
+                            // out of it.
                             super::vector_registry::insert_one(
                                 target.hnsw,
                                 node_id.as_raw(),
                                 &vec_data,
-                            );
+                            )?;
                             written += 1;
                         }
                     }
@@ -288,6 +291,7 @@ impl VectorBuild<'_> {
                 StoreError::Storage(StorageError::SnapshotOutsideRetention { .. }) => {
                     ScanFailure::Released(format!("shard scan: {e}"))
                 }
+                StoreError::VectorAdmission(refused) => ScanFailure::Failed(refused.to_string()),
                 e => ScanFailure::Failed(format!("shard scan: {e}")),
             })?;
         if cancelled || self.token.is_cancelled() {
@@ -351,7 +355,7 @@ impl VectorBuild<'_> {
             }
             for (graph, batch) in graphs.iter_mut().zip(batches) {
                 if !batch.is_empty() {
-                    graph.insert_batch(batch);
+                    graph.insert_batch(batch).map_err(|e| e.to_string())?;
                 }
             }
         }

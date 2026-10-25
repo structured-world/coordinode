@@ -1245,18 +1245,17 @@ async fn vector_search_hnsw_matches_brute_force() {
     assert_eq!(hnsw_res.len(), 5);
     assert_eq!(brute_res.len(), 5);
 
-    // Top-1 distance must match (both paths find the same nearest).
-    assert!(
-        (hnsw_res[0].distance - brute_res[0].distance).abs() < 1e-4,
-        "HNSW top-1 distance {} != brute-force top-1 distance {}",
-        hnsw_res[0].distance,
-        brute_res[0].distance
+    // Both paths score the same nearest node by the same exact evaluation:
+    // the same bits, not merely close.
+    assert_eq!(
+        hnsw_res[0].distance, brute_res[0].distance,
+        "HNSW and brute-force top-1 distances differ"
     );
 
     // Sum of top-5 distances should be close (results may differ in order
     // for ties but the total should match).
-    let hnsw_sum: f32 = hnsw_res.iter().map(|r| r.distance).sum();
-    let brute_sum: f32 = brute_res.iter().map(|r| r.distance).sum();
+    let hnsw_sum: f64 = hnsw_res.iter().map(|r| r.distance).sum();
+    let brute_sum: f64 = brute_res.iter().map(|r| r.distance).sum();
     assert!(
         (hnsw_sum - brute_sum).abs() < 0.01,
         "top-5 distance sums differ: hnsw={hnsw_sum} brute={brute_sum}"

@@ -3706,3 +3706,211 @@ fn probe_wide_pool_recall_distribution() {
         eprintln!("PROBE bulk={bulk} min={min} mean={mean:.1} max={max}");
     }
 }
+
+/// recall@10 of `index` over `queries`, against its exact top-10.
+fn recall_at_10(index: &HnswIndex, queries: &[Vec<f32>]) -> f64 {
+    let mut hits = 0usize;
+    for q in queries {
+        let exact: HashSet<u64> = index
+            .search_with_mode(q, 10, SearchMode::Exact)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        hits += index
+            .search(q, 10)
+            .iter()
+            .filter(|r| exact.contains(&r.id))
+            .count();
+    }
+    hits as f64 / (queries.len() * 10) as f64
+}
+
+/// The traversal estimator keeps its recall over the whole range of finite
+/// f32 inputs. The same points scaled by an exact power of two have the same
+/// exact neighbours under every metric; an estimator that overflows (huge
+/// components) or underflows (tiny ones) to one value for every candidate
+/// walks the graph blind and loses them, which no exact rerank of the
+/// candidates it kept can recover.
+#[test]
+fn traversal_recall_holds_across_the_f32_range() {
+    let base = uniform_points(2000, 16);
+    let queries: Vec<Vec<f32>> = uniform_points(2050, 16)[2000..]
+        .iter()
+        .map(|(_, v)| v.clone())
+        .collect();
+    let scaled = |v: &[f32], s: f32| v.iter().map(|x| x * s).collect::<Vec<f32>>();
+    let mut lost = Vec::new();
+    for metric in [
+        VectorMetric::L2,
+        VectorMetric::DotProduct,
+        VectorMetric::L1,
+        VectorMetric::Cosine,
+    ] {
+        let recall_at = |s: f32| {
+            let mut index = HnswIndex::new(HnswConfig {
+                ef_construction: 100,
+                ef_search: 64,
+                metric,
+                max_dimensions: 65_536,
+                ..Default::default()
+            });
+            for (id, v) in &base {
+                index.insert(*id, scaled(v, s));
+            }
+            let q: Vec<Vec<f32>> = queries.iter().map(|v| scaled(v, s)).collect();
+            recall_at_10(&index, &q)
+        };
+        let reference = recall_at(1.0);
+        for s in [2f32.powi(66), 2f32.powi(-84)] {
+            let r = recall_at(s);
+            eprintln!("{metric:?} scale {s:e}: recall@10 {r:.3} (unscaled {reference:.3})");
+            if r < reference - 0.02 {
+                lost.push(format!(
+                    "{metric:?} at scale {s:e}: {r:.3} vs {reference:.3}"
+                ));
+            }
+        }
+    }
+    assert!(lost.is_empty(), "recall lost: {lost:#?}");
+}
+
+/// The quantized estimators keep their recall over the f32 range too: SQ8
+/// and RaBitQ codes calibrated on the same points scaled by an exact power of
+/// two serve the same neighbours.
+#[test]
+fn quantized_traversal_recall_holds_across_the_f32_range() {
+    let base = uniform_points(1200, 16);
+    let queries: Vec<Vec<f32>> = uniform_points(1240, 16)[1200..]
+        .iter()
+        .map(|(_, v)| v.clone())
+        .collect();
+    let scaled = |v: &[f32], s: f32| v.iter().map(|x| x * s).collect::<Vec<f32>>();
+    let mut lost = Vec::new();
+    for (metric, quantization) in [
+        (VectorMetric::L2, QuantizationCodec::Sq8),
+        (VectorMetric::Cosine, QuantizationCodec::Sq8),
+        (VectorMetric::Cosine, QuantizationCodec::RaBitQ { bits: 1 }),
+        (VectorMetric::Cosine, QuantizationCodec::RaBitQ { bits: 4 }),
+    ] {
+        let recall_at = |s: f32| {
+            let mut index = HnswIndex::new(HnswConfig {
+                ef_construction: 100,
+                ef_search: 128,
+                metric,
+                quantization,
+                calibration_threshold: 400,
+                rerank_candidates: 100,
+                max_dimensions: 65_536,
+                ..Default::default()
+            });
+            for (id, v) in &base {
+                index.insert(*id, scaled(v, s));
+            }
+            let q: Vec<Vec<f32>> = queries.iter().map(|v| scaled(v, s)).collect();
+            recall_at_10(&index, &q)
+        };
+        let reference = recall_at(1.0);
+        for s in [2f32.powi(66), 2f32.powi(-84)] {
+            let r = recall_at(s);
+            eprintln!(
+                "{metric:?} {quantization:?} scale {s:e}: recall@10 {r:.3} (unscaled {reference:.3})"
+            );
+            if r < reference - 0.02 {
+                lost.push(format!(
+                    "{metric:?} {quantization:?} at {s:e}: {r:.3} vs {reference:.3}"
+                ));
+            }
+        }
+    }
+    assert!(lost.is_empty(), "recall lost: {lost:#?}");
+}
+
+/// The range-safe key orders as the binary64 distance does, over the whole
+/// range of signs and magnitudes, and stands for it to 20 bits.
+#[test]
+fn the_range_safe_key_orders_as_the_distance() {
+    // Down to 2^-298, the smallest nonzero square of an f32 difference; the
+    // key's truncation merges only binary64 subnormals far below it.
+    let values = [
+        -1e300, -3.5e40, -1.0, -1e-30, -1e-89, 0.0, 1e-89, 1e-45, 0.5, 1.0, 2.0, 3.4e38, 1e60,
+        1e300,
+    ];
+    for pair in values.windows(2) {
+        assert!(
+            ordered_key(pair[0]) < ordered_key(pair[1]),
+            "{} vs {}",
+            pair[0],
+            pair[1]
+        );
+    }
+    assert_eq!(ordered_key(-0.0).to_bits(), 0.0f32.to_bits());
+    for &d in &values {
+        assert!(ordered_key(d).is_finite(), "{d}");
+        let back = key_distance(ordered_key(d));
+        assert!(
+            (back - d).abs() <= d.abs() * 2f64.powi(-20),
+            "{d} -> {back}"
+        );
+    }
+}
+
+/// The fast estimators' domain: zero and in-range vectors are in it,
+/// vectors whose largest component is too large or too small are not, the
+/// f32 cosine and SQ8 codes take any finite vector, RaBitQ codes do not.
+#[test]
+fn the_fast_estimator_domain_is_bounded_by_the_largest_component() {
+    let none = QuantizationCodec::None;
+    let fast = |v: &[f32], metric| in_fast_domain(v, metric, &none);
+    assert!(fast(&[0.0, 0.0], VectorMetric::L2));
+    assert!(
+        fast(&[1e-10, 3.0], VectorMetric::L2),
+        "a tiny component beside a large one"
+    );
+    assert!(!fast(&[1e20, 0.0], VectorMetric::L2));
+    assert!(!fast(&[1e-20, 0.0], VectorMetric::DotProduct));
+    assert!(fast(&[1e20, 0.0], VectorMetric::L1));
+    assert!(!fast(&[1e31, 0.0], VectorMetric::L1));
+    assert!(fast(&[1e38, 1e-38], VectorMetric::Cosine));
+    assert!(!fast(&vec![1.0; MAX_FAST_DIMS + 1], VectorMetric::L2));
+    let sq8 = QuantizationCodec::Sq8;
+    assert!(in_fast_domain(&[1e38, 0.0], VectorMetric::Cosine, &sq8));
+    let rabitq = QuantizationCodec::RaBitQ { bits: 1 };
+    assert!(in_fast_domain(&[1.0, 0.0], VectorMetric::Cosine, &rabitq));
+    assert!(!in_fast_domain(&[1e20, 0.0], VectorMetric::Cosine, &rabitq));
+}
+
+/// The first vector outside the fast domain switches the index to the
+/// range-safe estimator for good, and the index then serves both scales; a
+/// query outside the domain is evaluated range-safely on an index that is
+/// not.
+#[test]
+fn an_out_of_domain_vector_switches_the_index_to_the_range_safe_estimator() {
+    let mut index = HnswIndex::new(HnswConfig {
+        metric: VectorMetric::L2,
+        ef_search: 64,
+        max_dimensions: 65_536,
+        ..Default::default()
+    });
+    let wide = |index: &HnswIndex| {
+        index
+            .wide_estimator
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
+    for (id, v) in uniform_points(200, 8) {
+        index.insert(id, v);
+    }
+    assert!(!wide(&index));
+    // The out-of-domain query alone does not switch the index.
+    let huge: Vec<f32> = uniform_points(201, 8)[200]
+        .1
+        .iter()
+        .map(|x| x * 2f32.powi(66))
+        .collect();
+    assert!(index.wide_for(&huge));
+    assert!(!wide(&index));
+    index.insert(500, huge.clone());
+    assert!(wide(&index));
+    assert_eq!(index.search(&huge, 1)[0].id, 500);
+    let near = uniform_points(1, 8)[0].1.clone();
+    assert_eq!(index.search(&near, 1)[0].id, 0);
+}

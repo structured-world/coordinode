@@ -150,14 +150,16 @@ fn an_index_search_answers_unfolded_writes_from_the_store() {
     db.execute_cypher("CREATE (:Embed {name: 'fresh', vec: [0.9, 0.0, 0.0]})")
         .expect("create fresh");
     held.await_worker();
-    db.vector_index_registry().on_vectors_written(
-        "Embed",
-        "vec",
-        vec![
-            (moved, vec![1.0, 0.0, 0.0]),
-            (doomed, vec![0.95, 0.05, 0.0]),
-        ],
-    );
+    db.vector_index_registry()
+        .on_vectors_written(
+            "Embed",
+            "vec",
+            vec![
+                (moved, vec![1.0, 0.0, 0.0]),
+                (doomed, vec![0.95, 0.05, 0.0]),
+            ],
+        )
+        .unwrap();
 
     let found = nearest(&mut db, 3);
     assert_eq!(names(&found), ["fresh", "stay", "moved"], "{found:?}");
@@ -191,11 +193,9 @@ fn a_filtered_top_k_ranks_unfolded_writes_by_their_rows() {
     db.execute_cypher("CREATE (:Embed {name: 'fresh', kind: 'k', vec: [0.9, 0.0, 0.0]})")
         .expect("create fresh");
     held.await_worker();
-    db.vector_index_registry().on_vectors_written(
-        "Embed",
-        "vec",
-        vec![(moved, vec![1.0, 0.0, 0.0])],
-    );
+    db.vector_index_registry()
+        .on_vectors_written("Embed", "vec", vec![(moved, vec![1.0, 0.0, 0.0])])
+        .unwrap();
 
     let rows = db
         .execute_cypher(
@@ -286,11 +286,9 @@ fn an_unknown_delta_ranks_from_the_store_alone() {
     db.execute_cypher("CREATE (:Embed {name: 'fresh', vec: [0.9, 0.0, 0.0]})")
         .expect("create fresh");
     held.await_worker();
-    db.vector_index_registry().on_vectors_written(
-        "Embed",
-        "vec",
-        vec![(moved, vec![1.0, 0.0, 0.0])],
-    );
+    db.vector_index_registry()
+        .on_vectors_written("Embed", "vec", vec![(moved, vec![1.0, 0.0, 0.0])])
+        .unwrap();
 
     assert_eq!(names(&nearest(&mut db, 3)), ["fresh", "stay", "moved"]);
 }
@@ -673,18 +671,20 @@ fn vector_search_executes_after_create_index() {
     .expect("create vector index");
 
     // Insert nodes AFTER index creation (auto-indexed via on_vector_written).
+    // Rank i sits at [i + 1, 0, 0]: no vector is all zeros, which a cosine
+    // index refuses.
     for i in 0u32..5 {
-        let vec = format!("[{}.0, 0.0, 0.0]", i);
+        let vec = format!("[{}.0, 0.0, 0.0]", i + 1);
         db.execute_cypher(&format!("CREATE (n:Item {{embedding: {vec}, rank: {i}}})"))
             .expect("insert node");
     }
 
-    // Nearest to [4.5, 0, 0]: rank=4 ([4.0, 0, 0]) has smallest distance.
+    // Nearest to [4.9, 0, 0]: rank=4 ([5.0, 0, 0]) has smallest distance.
     // Project rank alias in WITH alongside the distance (VectorTopK Pattern B).
     let rows = db
         .execute_cypher(
             "MATCH (n:Item) \
-             WITH n.rank AS rank, vector_distance(n.embedding, [4.5, 0.0, 0.0]) AS dist \
+             WITH n.rank AS rank, vector_distance(n.embedding, [4.9, 0.0, 0.0]) AS dist \
              ORDER BY dist \
              LIMIT 1 \
              RETURN rank",
@@ -695,7 +695,7 @@ fn vector_search_executes_after_create_index() {
     assert_eq!(
         rows[0].get("rank"),
         Some(&Value::Int(4)),
-        "nearest to [4.5,0,0] should be rank=4"
+        "nearest to [4.9,0,0] should be rank=4"
     );
 }
 
@@ -1462,4 +1462,209 @@ fn a_member_build_never_writes_the_replicated_definition() {
         version,
         "the rebuild on reopen left the definition as published"
     );
+}
+
+// ── Numerical domain ──────────────────────────────────────────────────
+
+use coordinode_embed::DatabaseError;
+use coordinode_vector::hnsw::VectorDomainError;
+
+/// The refusal `result` carries, for the index on `:Embed(vec)`.
+fn refused(
+    result: Result<Vec<std::collections::BTreeMap<String, Value>>, DatabaseError>,
+) -> VectorDomainError {
+    match result {
+        Err(DatabaseError::VectorRefused {
+            label,
+            property,
+            error,
+            element_id,
+        }) => {
+            assert_eq!((label.as_str(), property.as_str()), ("Embed", "vec"));
+            assert!(!element_id.is_empty());
+            error
+        }
+        other => panic!("expected a vector refusal, got {other:?}"),
+    }
+}
+
+fn embed_count(db: &mut Database) -> i64 {
+    match db
+        .execute_cypher("MATCH (n:Embed) RETURN count(n) AS c")
+        .expect("count")[0]
+        .get("c")
+    {
+        Some(Value::Int(c)) => *c,
+        other => panic!("count: {other:?}"),
+    }
+}
+
+/// A write that would give a vector index a vector it cannot take is refused
+/// before it commits, whichever way the vector arrives (a literal list, a
+/// vector parameter, a SET of an existing node), and nothing of the statement
+/// lands: the indexed data stays one the index holds whole.
+#[test]
+fn a_write_the_vector_index_cannot_take_is_refused_before_it_commits() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        r#"CREATE VECTOR INDEX cos_idx ON :Embed(vec) OPTIONS {metric: "cosine", dimensions: 3}"#,
+    )
+    .expect("create cosine index");
+    db.execute_cypher("CREATE (:Embed {name: 'ok', vec: [1.0, 0.0, 0.0]})")
+        .expect("an admitted vector");
+
+    // A zero vector has no direction under cosine.
+    assert_eq!(
+        refused(db.execute_cypher("CREATE (:Embed {name: 'zero', vec: [0.0, 0.0, 0.0]})")),
+        VectorDomainError::ZeroVectorCosine
+    );
+    // The declared width binds.
+    assert_eq!(
+        refused(db.execute_cypher("CREATE (:Embed {name: 'short', vec: [1.0, 0.0]})")),
+        VectorDomainError::DimensionMismatch { left: 2, right: 3 }
+    );
+    // A finite list component past the f32 range: the stored vector would
+    // hold an infinity.
+    assert_eq!(
+        refused(db.execute_cypher("CREATE (:Embed {name: 'huge', vec: [1e39, 0.0, 0.0]})")),
+        VectorDomainError::NonFinite { index: 0 }
+    );
+    // A SET onto an existing node, which keeps its admitted vector.
+    assert_eq!(
+        refused(db.execute_cypher("MATCH (n:Embed {name: 'ok'}) SET n.vec = [0.0, 0.0, 0.0]")),
+        VectorDomainError::ZeroVectorCosine
+    );
+    assert_eq!(embed_count(&mut db), 1, "no refused write landed");
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Embed {name: 'ok'}) RETURN vector_similarity(n.vec, [1.0, 0.0, 0.0]) AS s",
+        )
+        .expect("read back");
+    assert_eq!(rows[0].get("s"), Some(&Value::Float(1.0)));
+
+    // A label without a vector index stores a zero vector: only cosine
+    // refuses one, where it is evaluated.
+    db.execute_cypher("CREATE (:Plain {vec: [0.0, 0.0, 0.0]})")
+        .expect("stored without an index");
+}
+
+/// A vector parameter with a NaN or an infinity, or with no components, is
+/// refused as the statement starts, whatever the statement does with it and
+/// whether or not an index covers where it goes: nothing is read or written.
+#[test]
+fn a_vector_parameter_with_a_non_finite_component_is_refused_at_ingress() {
+    let (mut db, _dir) = open_db();
+    for (value, expected) in [
+        (
+            Value::Vector(vec![1.0, f32::NAN, 0.0]),
+            VectorDomainError::NonFinite { index: 1 },
+        ),
+        (
+            Value::Array(vec![Value::Vector(vec![f32::NEG_INFINITY])]),
+            VectorDomainError::NonFinite { index: 0 },
+        ),
+        (Value::Vector(Vec::new()), VectorDomainError::Empty),
+        (
+            Value::MultiVector(vec![vec![1.0], vec![f32::INFINITY]]),
+            VectorDomainError::NonFinite { index: 0 },
+        ),
+    ] {
+        let params = std::collections::HashMap::from([("v".to_string(), value)]);
+        match db.execute_cypher_with_params("CREATE (:Plain {vec: $v})", params) {
+            Err(DatabaseError::VectorDomain(e)) => assert_eq!(e, expected),
+            other => panic!("expected {expected:?}, got {other:?}"),
+        }
+    }
+    let rows = db
+        .execute_cypher("MATCH (n:Plain) RETURN count(n) AS c")
+        .expect("count");
+    assert_eq!(rows[0].get("c"), Some(&Value::Int(0)));
+}
+
+/// A transaction is judged as it commits: a statement of it may write a
+/// vector the index cannot take, and the commit refuses the whole
+/// transaction, so nothing of it lands.
+#[test]
+fn a_transaction_holding_an_unindexable_vector_is_refused_at_commit() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(r#"CREATE VECTOR INDEX cos_idx ON :Embed(vec) OPTIONS {metric: "cosine"}"#)
+        .expect("create cosine index");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(tx, "CREATE (:Embed {name: 'a', vec: [1.0, 0.0]})", None)
+        .expect("first write");
+    db.execute_in_transaction(tx, "CREATE (:Embed {name: 'b', vec: [0.0, 0.0]})", None)
+        .expect("a statement writes, the commit judges");
+    match db.commit_transaction(tx) {
+        Err(DatabaseError::VectorRefused { error, .. }) => {
+            assert_eq!(error, VectorDomainError::ZeroVectorCosine)
+        }
+        other => panic!("expected the commit to be refused, got {other:?}"),
+    }
+    assert_eq!(embed_count(&mut db), 0, "nothing of the transaction landed");
+}
+
+/// A query vector its metric cannot evaluate is a domain error of the
+/// statement, by the index's path and by the exhaustive one alike, never an
+/// empty or NaN-scored answer.
+#[test]
+fn an_unevaluable_query_vector_is_a_domain_error() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(r#"CREATE VECTOR INDEX l2_idx ON :Embed(vec) OPTIONS {metric: "l2"}"#)
+        .expect("create l2 index");
+    db.execute_cypher("CREATE (:Embed {name: 'a', vec: [1.0, 0.0, 0.0]})")
+        .expect("create");
+    let params = || {
+        std::collections::HashMap::from([(
+            "q".to_string(),
+            Value::Vector(vec![f32::INFINITY, 0.0, 0.0]),
+        )])
+    };
+    for query in [
+        "MATCH (n:Embed) WITH n, vector_distance(n.vec, $q) AS d ORDER BY d LIMIT 1 RETURN d",
+        "MATCH (n:Embed) RETURN vector_distance(n.vec, $q) AS d",
+    ] {
+        match db.execute_cypher_with_params(query, params()) {
+            Err(DatabaseError::VectorDomain(e)) => {
+                assert_eq!(e, VectorDomainError::NonFinite { index: 0 }, "{query}")
+            }
+            other => panic!("{query}: expected a domain error, got {other:?}"),
+        }
+    }
+    match db.execute_cypher("RETURN vector_similarity([0.0, 0.0], [1.0, 0.0]) AS s") {
+        Err(DatabaseError::VectorDomain(VectorDomainError::ZeroVectorCosine)) => {}
+        other => panic!("cosine of a zero vector: {other:?}"),
+    }
+}
+
+/// An index created over stored data its metric cannot evaluate fails its
+/// build with the reason, rather than leave the node out of an index that then
+/// reports complete.
+#[test]
+fn a_build_over_unindexable_stored_data_goes_offline_with_the_reason() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:Embed {name: 'ok', vec: [1.0, 0.0]})")
+        .expect("create");
+    db.execute_cypher("CREATE (:Embed {name: 'zero', vec: [0.0, 0.0]})")
+        .expect("stored before any index");
+    db.execute_cypher(r#"CREATE VECTOR INDEX cos_idx ON :Embed(vec) OPTIONS {metric: "cosine"}"#)
+        .expect("create cosine index");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match db.vector_index_registry().health_snapshot("Embed", "vec") {
+            Some(coordinode_vector::health::IndexHealthState::Offline { reason }) => {
+                assert!(reason.contains("zero"), "{reason}");
+                break;
+            }
+            Some(coordinode_vector::health::IndexHealthState::Ready { .. }) => {
+                panic!("a build that left a node out reported ready")
+            }
+            _ => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the build never ended"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
 }

@@ -78,6 +78,8 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::ProcedureCall,
         Reason::DivideByZero,
         Reason::LongOverflow,
+        Reason::VectorDomain,
+        Reason::VectorRefused,
         Reason::UnknownTransaction,
         Reason::TransactionAborted,
         Reason::TransactionBusy,

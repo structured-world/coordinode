@@ -107,7 +107,30 @@ pub enum ExecutionError {
     /// integer operation whose exact result leaves the `i64` range. Carries the
     /// message verbatim, so a driver sees the same text it would elsewhere.
     #[error("{0}")]
-    Arithmetic(#[from] super::eval::EvalError),
+    Arithmetic(super::eval::EvalError),
+
+    /// A vector its metric cannot evaluate: empty, non-finite, of another
+    /// dimension than the one it is compared with, or zero under cosine.
+    /// Nothing was answered.
+    #[error("{0}")]
+    VectorDomain(#[from] coordinode_vector::hnsw::VectorDomainError),
+
+    /// A write would give the vector index on `:{label}({property})` a vector
+    /// it cannot take. Nothing was written.
+    #[error(
+        "the vector index on :{label}({property}) cannot take the vector of node \
+         {element_id}: {error}"
+    )]
+    VectorRefused {
+        /// The indexed label.
+        label: String,
+        /// The indexed property.
+        property: String,
+        /// The elementId of the node.
+        element_id: String,
+        /// What is wrong with the vector.
+        error: coordinode_vector::hnsw::VectorDomainError,
+    },
 
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -470,8 +493,40 @@ impl From<coordinode_modality::StoreError> for ExecutionError {
             StoreError::Budget(stop) | StoreError::Storage(StorageError::Budget(stop)) => {
                 Self::Budget(stop)
             }
+            // A vector the metric cannot evaluate is the caller's input, not
+            // a store failure.
+            StoreError::VectorSearch(coordinode_vector::hnsw::VectorSearchError::Domain(e)) => {
+                Self::VectorDomain(e)
+            }
             other => Self::Modality(other),
         }
+    }
+}
+
+impl From<coordinode_vector::hnsw::SearchError<coordinode_core::budget::BudgetStop>>
+    for ExecutionError
+{
+    fn from(e: coordinode_vector::hnsw::SearchError<coordinode_core::budget::BudgetStop>) -> Self {
+        use coordinode_vector::hnsw::SearchError;
+        match e {
+            SearchError::Stopped(stop) => Self::Budget(stop),
+            SearchError::Failed(e) => coordinode_modality::StoreError::VectorSearch(e).into(),
+        }
+    }
+}
+
+impl From<super::eval::EvalError> for ExecutionError {
+    fn from(e: super::eval::EvalError) -> Self {
+        match e {
+            super::eval::EvalError::VectorDomain(e) => Self::VectorDomain(e),
+            other => Self::Arithmetic(other),
+        }
+    }
+}
+
+impl From<coordinode_vector::hnsw::VectorSearchError> for ExecutionError {
+    fn from(e: coordinode_vector::hnsw::VectorSearchError) -> Self {
+        coordinode_modality::StoreError::VectorSearch(e).into()
     }
 }
 
@@ -509,19 +564,22 @@ fn constraint_violation(
 }
 
 /// Check every node `txn` recorded for a post-state check against the
-/// presence and type constraints of its primary label, as the transaction
-/// leaves it: its buffered record with its pending document deltas applied.
-/// Called once, right before the commit, so a node built up over several
-/// writes or statements is judged as it lands, never mid-way. Reading each
-/// label's schema binds the commit to the revision checked against.
+/// presence and type constraints of its primary label and the vector indexes
+/// of that label, as the transaction leaves it: its buffered record with its
+/// pending document deltas applied. Called once, right before the commit, so
+/// a node built up over several writes or statements is judged as it lands,
+/// never mid-way. Reading each label's schema binds the commit to the
+/// revision checked against.
 ///
 /// # Errors
 ///
-/// The first node that breaks a constraint, or a read that failed.
+/// The first node that breaks a constraint or carries a vector its index
+/// cannot take, or a read that failed.
 pub fn check_post_state(
     txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
     engine: &StorageEngine,
     interner: &FieldInterner,
+    vectors: Option<&crate::index::VectorIndexRegistry>,
 ) -> Result<(), ExecutionError> {
     use coordinode_core::graph::node::{decode_node_key, decode_temporal_node_key};
     use coordinode_modality::{LocalNodeStore, LocalSchemaStore, SchemaStore as _};
@@ -533,6 +591,14 @@ pub fn check_post_state(
     keys.dedup();
     let store = LocalSchemaStore::new(engine);
     let mut schemas: HashMap<String, Option<LabelSchema>> = HashMap::new();
+    let node_of = |key: &[u8]| {
+        decode_node_key(key)
+            .map(|(_, node)| node)
+            .or_else(|| decode_temporal_node_key(key).map(|(_, node, _)| node))
+            .ok_or_else(|| {
+                ExecutionError::Serialization("a recorded node key does not decode".into())
+            })
+    };
     for key in keys {
         let Some(record) = LocalNodeStore::post_state(txn, &key)? else {
             continue;
@@ -540,6 +606,9 @@ pub fn check_post_state(
         let label = record.primary_label();
         if label.is_empty() {
             continue;
+        }
+        if let Some(vectors) = vectors {
+            check_vectors(vectors, &record, interner, || node_of(&key))?;
         }
         if !schemas.contains_key(label) {
             let schema = store.load_label_txn(txn, label)?;
@@ -551,13 +620,45 @@ pub fn check_post_state(
         let lookup = crate::index::registry::record_lookup(&record, interner);
         if let Err(e) = coordinode_core::schema::validation::check_node_constraints(schema, &lookup)
         {
-            let node = decode_node_key(&key)
-                .map(|(_, node)| node)
-                .or_else(|| decode_temporal_node_key(&key).map(|(_, node, _)| node))
-                .ok_or_else(|| {
-                    ExecutionError::Serialization("a recorded node key does not decode".into())
-                })?;
-            return Err(constraint_violation(e, label, node));
+            return Err(constraint_violation(e, label, node_of(&key)?));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `record` when one of the vector indexes of its primary label cannot
+/// take the vector it holds: the vector the index's maintenance would extract,
+/// checked as the index would check it, so every committed vector of an
+/// indexed property is one its index takes. `node` names the node, read only
+/// on a refusal.
+fn check_vectors(
+    vectors: &crate::index::VectorIndexRegistry,
+    record: &NodeRecord,
+    interner: &FieldInterner,
+    node: impl FnOnce() -> Result<NodeId, ExecutionError>,
+) -> Result<(), ExecutionError> {
+    let label = record.primary_label();
+    if !vectors.indexes_label(label) {
+        return Ok(());
+    }
+    for property in vectors.indexed_properties(label) {
+        let Some(vector) = interner
+            .lookup(&property)
+            .and_then(|field| record.props.get(&field))
+            .and_then(coordinode_core::graph::types::try_extract_vector)
+        else {
+            continue;
+        };
+        // The id only names the node in a refusal; the check never reads it.
+        if let Err(refused) =
+            vectors.check_admission(label, &property, NodeId::from_raw(0), &vector)
+        {
+            return Err(ExecutionError::VectorRefused {
+                label: label.to_string(),
+                property,
+                element_id: node()?.to_element_id(),
+                error: refused.error,
+            });
         }
     }
     Ok(())
@@ -2503,7 +2604,7 @@ impl<'a> ExecutionContext<'a> {
         // Delegate to Layer-4 LocalNodeStore (owns key encoding + msgpack);
         // the put buffers on the transaction for atomic flush.
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        if self.label_checks_nodes(record.primary_label())? {
+        if self.label_checks_writes(record.primary_label())? {
             self.txn
                 .note_post_state_check(&coordinode_core::graph::node::encode_node_key(
                     shard_id, node_id,
@@ -2578,14 +2679,31 @@ impl<'a> ExecutionContext<'a> {
         ))
     }
 
+    /// Whether a node written under `label` is checked before the commit:
+    /// the label has a presence or type constraint
+    /// ([`Self::label_checks_nodes`]) or a vector index, which refuses a
+    /// vector it cannot take before it is committed rather than after.
+    fn label_checks_writes(&mut self, label: &str) -> Result<bool, ExecutionError> {
+        let indexed = !label.is_empty()
+            && self
+                .vector_indexes
+                .as_ref()
+                .is_some_and(|v| v.registry.indexes_label(label));
+        Ok(indexed || self.label_checks_nodes(label)?)
+    }
+
     /// Refuse `record`, the state node `node_id` is stored in by a write that
     /// lands at once, outside the transaction, when it breaks a presence or
-    /// type constraint of its primary label.
+    /// type constraint of its primary label or carries a vector one of the
+    /// label's vector indexes cannot take.
     fn check_constraints_now(
         &mut self,
         node_id: NodeId,
         record: &NodeRecord,
     ) -> Result<(), ExecutionError> {
+        if let Some(vectors) = &self.vector_indexes {
+            check_vectors(vectors.registry, record, self.interner, || Ok(node_id))?;
+        }
         let label = record.primary_label();
         if !self.label_checks_nodes(label)? {
             return Ok(());
@@ -2723,7 +2841,7 @@ impl<'a> ExecutionContext<'a> {
         record: &NodeRecord,
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        if self.label_checks_nodes(record.primary_label())? {
+        if self.label_checks_writes(record.primary_label())? {
             self.txn.note_post_state_check(
                 &coordinode_core::graph::node::encode_temporal_node_key(
                     shard_id,
@@ -3149,7 +3267,7 @@ impl<'a> ExecutionContext<'a> {
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
         if let Some(label) = self.schema_label_for_node(shard_id, node_id)? {
-            if self.label_checks_nodes(&label)? {
+            if self.label_checks_writes(&label)? {
                 self.txn
                     .note_post_state_check(&coordinode_core::graph::node::encode_node_key(
                         shard_id, node_id,
@@ -3272,8 +3390,14 @@ impl<'a> ExecutionContext<'a> {
         // locus: OCC validation, commit_ts assignment, write-concern
         // fan-out, and the Raft proposal pipeline all live in `Transaction`.
         self.sync_txn_state();
-        // Constraints judge each node as the statement leaves it.
-        check_post_state(&mut self.txn, self.engine, self.interner)?;
+        // Constraints and vector indexes judge each node as the statement
+        // leaves it.
+        check_post_state(
+            &mut self.txn,
+            self.engine,
+            self.interner,
+            self.vector_indexes.as_ref().map(|v| v.registry),
+        )?;
         // Asked before the commit drains the buffers, which is the only
         // moment the answer exists.
         let wrote = !self.txn.write_buffer_is_empty() || self.txn.has_pending_merges();
@@ -3864,6 +3988,7 @@ pub fn execute_no_commit(
     let plan = if ctx.params.is_empty() {
         plan
     } else {
+        check_parameters(&ctx.params)?;
         plan_owned = {
             let mut p = plan.clone();
             p.substitute_params(&ctx.params);
@@ -7018,8 +7143,7 @@ fn execute_hnsw_scan(
     // other node.
     materialize_own_node_writes(ctx)?;
     let delta = read_delta(registry.delta(ctx.shard_id), ctx)?;
-    // (node, record, index score, exact score of the ORDER BY function)
-    let mut candidates: Vec<(u64, NodeRecord, f32, Option<f64>)> = Vec::new();
+    let mut candidates: Vec<(u64, NodeRecord)> = Vec::new();
     if delta != IndexDelta::Unknown {
         let superseded = match &delta {
             IndexDelta::Nodes(nodes) => nodes.len(),
@@ -7061,17 +7185,21 @@ fn execute_hnsw_scan(
                     let record = record?;
                     record
                         .has_label(label)
-                        .then_some((hit.id, record, hit.score, None))
+                        .then_some((hit.id, hit.score, record))
                 })
                 .collect();
-            if found.len() >= k || hits.len() < want {
-                held.grow(
-                    found
-                        .iter()
-                        .map(|(_, record, _, _)| record.held_bytes())
-                        .sum(),
-                )?;
-                candidates = found;
+            // The function orders as the index distance does, but rounding
+            // can give distinct scores one distance (cosine's 1 - s): every
+            // hit as near as the k-th kept one is fetched, so the exact
+            // function decides between them below.
+            let settled =
+                found.len() >= k && hits.last().is_some_and(|last| last.score > found[k - 1].1);
+            if settled || hits.len() < want {
+                held.grow(found.iter().map(|(_, _, record)| record.held_bytes()).sum())?;
+                candidates = found
+                    .into_iter()
+                    .map(|(id, _, record)| (id, record))
+                    .collect();
                 break;
             }
             want = want.checked_mul(2).ok_or_else(|| {
@@ -7079,39 +7207,33 @@ fn execute_hnsw_scan(
             })?;
         }
     }
+    let field = ctx.interner.lookup(property);
     if !delta.is_empty() {
-        // One scale for the index's hits and the written nodes: the function
-        // the query orders by, computed exactly on each vector.
-        let field = ctx.interner.lookup(property);
-        candidates.extend(
-            written_vector_nodes(&delta, label, field, qv.len(), ctx)?
-                .into_iter()
-                .map(|(id, record)| (id, record, f32::NAN, None)),
-        );
-        let mut scored: Vec<_> = candidates
-            .into_iter()
-            .filter_map(|(id, record, index_score, _)| {
-                let vector = record_vector(&record, field?)?;
-                let exact = vector_function_score(function, &qv, &vector)?;
-                Some((id, record, index_score, Some(exact)))
-            })
-            .collect();
-        let ascending = vector_function_ascending(function);
-        scored.sort_by(|a, b| {
-            let (x, y) = (a.3.unwrap_or(f64::NAN), b.3.unwrap_or(f64::NAN));
-            let order = if ascending {
-                x.total_cmp(&y)
-            } else {
-                y.total_cmp(&x)
-            };
-            order.then(a.0.cmp(&b.0))
-        });
-        candidates = scored;
+        candidates.extend(written_vector_nodes(&delta, label, field, ctx)?);
     }
-    candidates.truncate(k);
-    let mut results = Vec::with_capacity(candidates.len());
+    // One scale for the index's hits and the written nodes: the function the
+    // query orders by, computed exactly on each vector, equal scores by id.
+    let mut scored = Vec::with_capacity(candidates.len());
+    for (id, record) in candidates {
+        let Some(vector) = field.and_then(|field| record_vector(&record, field)) else {
+            continue;
+        };
+        let score = vector_function_score(function, &qv, &vector)?;
+        scored.push((id, record, score));
+    }
+    let ascending = vector_function_ascending(function);
+    scored.sort_by(|a, b| {
+        let order = if ascending {
+            a.2.total_cmp(&b.2)
+        } else {
+            b.2.total_cmp(&a.2)
+        };
+        order.then(a.0.cmp(&b.0))
+    });
+    scored.truncate(k);
+    let mut results = Vec::with_capacity(scored.len());
 
-    for (id, record, index_score, exact) in candidates {
+    for (id, record, score) in scored {
         let mut row = Row::new();
         row.insert(binding.to_string(), Value::Int(id as i64));
         for (field_id, value) in &record.props {
@@ -7128,16 +7250,7 @@ fn execute_hnsw_scan(
         inject_computed_properties(&mut row, binding, &primary_label, ctx)?;
 
         if let Some(alias) = distance_alias {
-            let score = exact.or_else(|| {
-                let node_vec = row
-                    .get(&format!("{binding}.{property}"))
-                    .and_then(coerce_value_to_vec)?;
-                vector_function_score(function, &qv, &node_vec)
-            });
-            row.insert(
-                alias.to_string(),
-                Value::Float(score.unwrap_or(index_score as f64)),
-            );
+            row.insert(alias.to_string(), Value::Float(score));
         }
         results.push(row);
     }
@@ -7211,19 +7324,57 @@ fn execute_text_index_scan(
     Ok(rows)
 }
 
-/// The scalar a vector ORDER BY function computes for `a` against `b`;
-/// `None` for an unknown function or vectors of different widths.
-fn vector_function_score(function: &str, a: &[f32], b: &[f32]) -> Option<f64> {
-    if a.len() != b.len() {
-        return None;
+/// Refuse a statement's parameters when a vector among them, or nested in
+/// their lists and maps, has no components or a non-finite one. Vectors enter
+/// a statement only as parameters, so this is their ingress check: call it
+/// before the parameters are bound into a plan.
+///
+/// # Errors
+///
+/// [`ExecutionError::VectorDomain`] naming the first offending component.
+pub fn check_parameters(params: &HashMap<String, Value>) -> Result<(), ExecutionError> {
+    params.values().try_for_each(check_vector_value)
+}
+
+/// [`check_parameters`] for one value. A zero vector is a value: only cosine
+/// refuses it, where it is evaluated.
+fn check_vector_value(value: &Value) -> Result<(), ExecutionError> {
+    use coordinode_vector::metrics::exact::validate;
+    match value {
+        Value::Vector(v) => validate(v)?,
+        Value::MultiVector(rows) => {
+            for row in rows {
+                validate(row)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                check_vector_value(item)?;
+            }
+        }
+        Value::Map(entries) => {
+            for item in entries.values() {
+                check_vector_value(item)?;
+            }
+        }
+        _ => {}
     }
-    Some(match function {
-        "vector_distance" => coordinode_vector::metrics::euclidean_distance(a, b) as f64,
-        "vector_similarity" => coordinode_vector::metrics::cosine_similarity(a, b) as f64,
-        "vector_dot" => coordinode_vector::metrics::dot_product(a, b) as f64,
-        "vector_manhattan" => coordinode_vector::metrics::manhattan_distance(a, b) as f64,
-        _ => return None,
-    })
+    Ok(())
+}
+
+/// The exact score vector function `function` gives `a` against `b`, the
+/// same value the scalar call returns.
+///
+/// # Errors
+///
+/// [`ExecutionError::VectorDomain`] for vectors the metric cannot evaluate;
+/// [`ExecutionError::Unsupported`] for a function that is not a vector score,
+/// which a plan never carries.
+fn vector_function_score(function: &str, a: &[f32], b: &[f32]) -> Result<f64, ExecutionError> {
+    let score = crate::function::ScalarFn::resolve(function)
+        .and_then(|f| super::eval::vector_score(f, a, b))
+        .ok_or_else(|| ExecutionError::Unsupported(format!("{function} is not a vector score")))?;
+    Ok(score?)
 }
 
 /// Whether a lower value of `function` ranks first (distances) rather than a
@@ -7238,14 +7389,14 @@ fn record_vector(record: &NodeRecord, field: u32) -> Option<Vec<f32>> {
 }
 
 /// The nodes `delta` names whose primary label is `label` (what a vector
-/// index of `label` holds) and that carry a `dims`-wide vector in `field`,
-/// as this statement reads them; every such node of the shard when the delta
-/// is unknown.
+/// index of `label` holds) and that carry a vector in `field`, as this
+/// statement reads them; every such node of the shard when the delta is
+/// unknown. A vector of another width than the query's is kept: scoring it
+/// is a domain error, not a reason to leave the node out.
 fn written_vector_nodes(
     delta: &IndexDelta,
     label: &str,
     field: Option<u32>,
-    dims: usize,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Vec<(u64, NodeRecord)>, ExecutionError> {
     use coordinode_modality::NodeStore as _;
@@ -7254,8 +7405,7 @@ fn written_vector_nodes(
         return Ok(Vec::new());
     };
     let indexed = |record: &NodeRecord| {
-        record.primary_label() == label
-            && record_vector(record, field).is_some_and(|v| v.len() == dims)
+        record.primary_label() == label && record_vector(record, field).is_some()
     };
     let nodes = coordinode_modality::LocalNodeStore;
     let mut written = Vec::new();
@@ -8757,25 +8907,21 @@ fn try_hnsw_vector_top_k(
         }
     }
 
-    // Intersect HNSW candidates with input rows, preserving HNSW order.
-    // `SearchResult::score` is raw HNSW distance (L2 or configured metric).
-    // For `vector_distance` (lower is better), HNSW already returns in that
-    // order. For `vector_similarity`/`vector_dot` (higher is better), we recompute
-    // the score for the requested function when writing distance_alias.
-    // A hit of a node the delta names is replaced by that node's row below.
-    let mut intersected: Vec<(f32, &Row)> = Vec::new();
+    // Intersect the HNSW candidates with the input rows. A hit of a node the
+    // delta names is replaced by that node's row.
+    let mut intersected: Vec<(u64, &Row)> = Vec::new();
     for result in &search_results {
         if delta.contains(NodeId::from_raw(result.id)) {
             continue;
         }
         if let Some(row) = row_by_id.get(&result.id) {
-            intersected.push((result.score, row));
+            intersected.push((result.id, row));
         }
     }
     if let IndexDelta::Nodes(written) = &delta {
         for id in written {
             if let Some(row) = row_by_id.get(&id.as_raw()) {
-                intersected.push((f32::NAN, row));
+                intersected.push((id.as_raw(), row));
             }
         }
     }
@@ -8787,84 +8933,53 @@ fn try_hnsw_vector_top_k(
         return Ok(None);
     }
 
-    if !delta.is_empty() {
-        // The written nodes have no index score: rank everything by the
-        // function the query orders by, computed exactly on each row.
-        let mut scored = Vec::with_capacity(intersected.len());
-        for (_, row) in intersected {
-            if let Some(exact) = recompute_score_for_row(vector_expr, &query_vec, function, row)? {
-                scored.push((exact, row));
-            }
+    // Ranked by the function the query orders by, computed exactly on each
+    // row, equal scores by node id: the index's own scores are its metric's
+    // ranking distance, and the written nodes have none.
+    let mut scored = Vec::with_capacity(intersected.len());
+    for (id, row) in intersected {
+        if let Some(exact) = recompute_score_for_row(vector_expr, &query_vec, function, row)? {
+            scored.push((exact, id, row));
         }
-        let ascending = vector_function_ascending(function);
-        scored.sort_by(|a, b| {
-            if ascending {
-                a.0.total_cmp(&b.0)
-            } else {
-                b.0.total_cmp(&a.0)
-            }
-        });
-        let mut result_rows = Vec::with_capacity(k);
-        for (exact, row) in scored.into_iter().take(k) {
-            let mut cloned = row.clone();
-            if let Some(alias) = distance_alias {
-                cloned.insert(alias.to_string(), Value::Float(exact));
-            }
-            result_rows.push(cloned);
-        }
-        return Ok(Some(result_rows));
     }
-
-    // For distance functions, HNSW order is already correct (ascending).
-    // For similarity/dot_product, we need to re-score with the actual function
-    // because HNSW returns L2 distances and the user asked for a different metric.
-    // Simplification: HNSW index is built for a specific metric; we trust it.
-    let mut result_rows: Vec<Row> = Vec::with_capacity(k);
-    for (dist, row) in intersected.into_iter().take(k) {
+    let ascending = vector_function_ascending(function);
+    scored.sort_by(|a, b| {
+        let order = if ascending {
+            a.0.total_cmp(&b.0)
+        } else {
+            b.0.total_cmp(&a.0)
+        };
+        order.then(a.1.cmp(&b.1))
+    });
+    let mut result_rows = Vec::with_capacity(k);
+    for (exact, _, row) in scored.into_iter().take(k) {
         let mut cloned = row.clone();
         if let Some(alias) = distance_alias {
-            // Compute the exact score using the requested function — HNSW may
-            // have returned raw L2 distance even when the user asked for
-            // `vector_similarity`. Re-evaluate to get the correct value.
-            let recomputed = recompute_score_for_row(vector_expr, &query_vec, function, &cloned)?;
-            cloned.insert(
-                alias.to_string(),
-                Value::Float(recomputed.unwrap_or(dist as f64)),
-            );
+            cloned.insert(alias.to_string(), Value::Float(exact));
         }
         result_rows.push(cloned);
     }
-
     Ok(Some(result_rows))
 }
 
-/// Recompute an exact vector score for a single row, using the requested function.
+/// The exact score of `function` for the vector `vector_expr` yields on
+/// `row` against `query_vec`; `None` when the row holds no vector there.
 ///
-/// HNSW indexes return raw L2 distances; if the user asked for `vector_similarity`
-/// (cosine) or `vector_dot`, we must recompute the score from the row's vector.
+/// # Errors
+///
+/// An expression that fails to evaluate, or a vector the metric cannot
+/// evaluate against the query.
 fn recompute_score_for_row(
     vector_expr: &crate::plan::expr::Expr,
     query_vec: &[f32],
     function: &str,
     row: &Row,
-) -> Result<Option<f64>, EvalError> {
-    // `Ok(None)` stays "this row has no score"; an evaluation that fails is an
-    // error rather than a missing score, so the two do not get conflated.
+) -> Result<Option<f64>, ExecutionError> {
     let vec_val = eval_neutral(vector_expr, row)?;
     let Some(a) = coerce_value_to_vec(&vec_val) else {
         return Ok(None);
     };
-    if a.len() != query_vec.len() {
-        return Ok(None);
-    }
-    let score = match function {
-        "vector_distance" => coordinode_vector::metrics::euclidean_distance(&a, query_vec) as f64,
-        "vector_similarity" => coordinode_vector::metrics::cosine_similarity(&a, query_vec) as f64,
-        "vector_dot" => coordinode_vector::metrics::dot_product(&a, query_vec) as f64,
-        "vector_manhattan" => coordinode_vector::metrics::manhattan_distance(&a, query_vec) as f64,
-        _ => return Ok(None),
-    };
-    Ok(Some(score))
+    vector_function_score(function, &a, query_vec).map(Some)
 }
 
 /// Brute-force top-K: compute distance per row, sort, take first K.
@@ -8890,43 +9005,39 @@ fn execute_vector_top_k_brute_force(
         None => return Ok(Vec::new()),
     };
 
-    // Compute (score, row) pairs, skipping rows with missing/mismatched vectors.
-    let mut scored: Vec<(f64, Row)> = Vec::with_capacity(rows.len());
+    // Compute (score, node, row) triples, skipping rows that hold no vector; a
+    // vector the metric cannot evaluate against the query is a domain error.
+    // The node is the one the vector expression reads, when it reads one.
+    let owner = match vector_expr {
+        crate::plan::expr::Expr::Property { base, .. } => match base.as_ref() {
+            crate::plan::expr::Expr::Variable(v) => Some(v.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut scored: Vec<(f64, Option<u64>, Row)> = Vec::with_capacity(rows.len());
     for row in rows {
-        let vec_val = eval_neutral(vector_expr, &row)?;
-        let a = match coerce_value_to_vec(&vec_val) {
-            Some(v) if v.len() == query_vec.len() => v,
-            _ => continue,
-        };
-        let score = match function {
-            "vector_distance" => {
-                coordinode_vector::metrics::euclidean_distance(&a, &query_vec) as f64
-            }
-            "vector_similarity" => {
-                coordinode_vector::metrics::cosine_similarity(&a, &query_vec) as f64
-            }
-            "vector_dot" => coordinode_vector::metrics::dot_product(&a, &query_vec) as f64,
-            "vector_manhattan" => {
-                coordinode_vector::metrics::manhattan_distance(&a, &query_vec) as f64
-            }
-            _ => continue,
-        };
-        scored.push((score, row));
+        if let Some(score) = recompute_score_for_row(vector_expr, &query_vec, function, &row)? {
+            let node = owner.and_then(|v| row_node_id(&row, v));
+            scored.push((score, node, row));
+        }
     }
 
-    // Sort: distance/manhattan ASC (lower is better), similarity/dot DESC (higher is better).
-    let ascending = matches!(function, "vector_distance" | "vector_manhattan");
-    scored.sort_by(|(a, _), (b, _)| {
-        if ascending {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    // Distance/manhattan ascending, similarity/dot descending, equal scores by
+    // node id. The sort is stable, so rows of no node keep the input's order.
+    let ascending = vector_function_ascending(function);
+    scored.sort_by(|(a, a_node, _), (b, b_node, _)| {
+        let order = if ascending {
+            a.total_cmp(b)
         } else {
-            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-        }
+            b.total_cmp(a)
+        };
+        order.then(a_node.cmp(b_node))
     });
 
     // Take top-K, optionally augment with distance alias.
     let mut result = Vec::with_capacity(k.min(scored.len()));
-    for (score, mut row) in scored.into_iter().take(k) {
+    for (score, _, mut row) in scored.into_iter().take(k) {
         if let Some(alias) = distance_alias {
             row.insert(alias.to_string(), Value::Float(score));
         }
@@ -8978,17 +9089,9 @@ fn execute_vector_filter(
             continue; // skip rows with non-vector values
         };
 
-        if a.len() != b.len() {
-            continue; // dimension mismatch
-        }
-
-        let raw_score = match params.function {
-            "vector_distance" => coordinode_vector::metrics::euclidean_distance(&a, &b) as f64,
-            "vector_similarity" => coordinode_vector::metrics::cosine_similarity(&a, &b) as f64,
-            "vector_dot" => coordinode_vector::metrics::dot_product(&a, &b) as f64,
-            "vector_manhattan" => coordinode_vector::metrics::manhattan_distance(&a, &b) as f64,
-            _ => continue,
-        };
+        // The exact score the scalar call returns: a threshold passes the
+        // same rows whichever plan evaluates it.
+        let raw_score = vector_function_score(params.function, &a, &b)?;
 
         let score = apply_decay_multiplier(raw_score, params.decay_field, row)?;
 
@@ -9384,6 +9487,27 @@ fn variable_for_method(expr: &crate::plan::expr::Expr) -> String {
     }
 }
 
+/// The exact score `metric` (cosine when `None`) gives `v` against `query`:
+/// the similarity for cosine, the metric's own value otherwise.
+///
+/// # Errors
+///
+/// [`ExecutionError::VectorDomain`] for vectors the metric cannot evaluate.
+fn metric_score(
+    metric: Option<coordinode_core::graph::types::VectorMetric>,
+    v: &[f32],
+    query: &[f32],
+) -> Result<f64, ExecutionError> {
+    use coordinode_core::graph::types::VectorMetric;
+    use coordinode_vector::metrics::exact;
+    Ok(match metric {
+        Some(VectorMetric::Cosine) | None => exact::cosine_similarity(v, query)?,
+        Some(VectorMetric::L2) => exact::l2(v, query)?,
+        Some(VectorMetric::DotProduct) => exact::dot(v, query)?,
+        Some(VectorMetric::L1) => exact::l1(v, query)?,
+    })
+}
+
 /// Score rows by a vector method, returning `row_ranks[i]` = competition rank
 /// (1-based) when the row has a usable vector for this method, `None` when
 /// the value was missing/wrong-type (→ penalty rank applied later).
@@ -9396,7 +9520,7 @@ fn score_vector_method(
     metric: Option<coordinode_core::graph::types::VectorMetric>,
     desc: bool,
     variable: &str,
-) -> Result<Vec<Option<usize>>, EvalError> {
+) -> Result<Vec<Option<usize>>, ExecutionError> {
     // (row_idx, score, node_id) for matched rows.
     let mut scored: Vec<(usize, f64, u64)> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
@@ -9404,23 +9528,7 @@ fn score_vector_method(
         let Some(v) = coerce_value_to_vec(&val) else {
             continue;
         };
-        if v.len() != query_vec.len() {
-            continue;
-        }
-        let s = match metric {
-            Some(coordinode_core::graph::types::VectorMetric::Cosine) | None => {
-                coordinode_vector::metrics::cosine_similarity(&v, query_vec) as f64
-            }
-            Some(coordinode_core::graph::types::VectorMetric::L2) => {
-                coordinode_vector::metrics::euclidean_distance(&v, query_vec) as f64
-            }
-            Some(coordinode_core::graph::types::VectorMetric::DotProduct) => {
-                coordinode_vector::metrics::dot_product(&v, query_vec) as f64
-            }
-            Some(coordinode_core::graph::types::VectorMetric::L1) => {
-                coordinode_vector::metrics::manhattan_distance(&v, query_vec) as f64
-            }
-        };
+        let s = metric_score(metric, &v, query_vec)?;
         let nid = row_node_id(row, variable).unwrap_or(u64::MAX);
         scored.push((i, s, nid));
     }
@@ -9526,30 +9634,14 @@ fn raw_scores_vector_method(
     query_vec: &[f32],
     metric: Option<coordinode_core::graph::types::VectorMetric>,
     desc: bool,
-) -> Result<Vec<Option<f64>>, EvalError> {
+) -> Result<Vec<Option<f64>>, ExecutionError> {
     let mut out: Vec<Option<f64>> = vec![None; rows.len()];
     for (i, row) in rows.iter().enumerate() {
         let val = eval_neutral(method_expr, row)?;
         let Some(v) = coerce_value_to_vec(&val) else {
             continue;
         };
-        if v.len() != query_vec.len() {
-            continue;
-        }
-        let raw = match metric {
-            Some(coordinode_core::graph::types::VectorMetric::Cosine) | None => {
-                coordinode_vector::metrics::cosine_similarity(&v, query_vec) as f64
-            }
-            Some(coordinode_core::graph::types::VectorMetric::L2) => {
-                coordinode_vector::metrics::euclidean_distance(&v, query_vec) as f64
-            }
-            Some(coordinode_core::graph::types::VectorMetric::DotProduct) => {
-                coordinode_vector::metrics::dot_product(&v, query_vec) as f64
-            }
-            Some(coordinode_core::graph::types::VectorMetric::L1) => {
-                coordinode_vector::metrics::manhattan_distance(&v, query_vec) as f64
-            }
-        };
+        let raw = metric_score(metric, &v, query_vec)?;
         // Normalise so higher = better. When the metric is ascending-by-
         // default (`desc == false`, distance metrics), flip the sign.
         let normalised = if desc { raw } else { -raw };
@@ -9832,10 +9924,7 @@ fn execute_doc_score(
             let Some(chunk_vec) = coerce_value_to_vec(&vec_val) else {
                 continue;
             };
-            if chunk_vec.len() != query_vec.len() {
-                continue;
-            }
-            let sim = coordinode_vector::metrics::cosine_similarity(&chunk_vec, &query_vec) as f64;
+            let sim = coordinode_vector::metrics::exact::cosine_similarity(&chunk_vec, &query_vec)?;
             if scored_count == 0 || sim > max_score {
                 max_score = sim;
             }
@@ -9892,21 +9981,18 @@ fn execute_maxsim_top_k(
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
 
-    // A score per row, held in the score list and the bounded heap while
-    // the rows are ranked.
+    // A score per row in the bounded heap while the rows are ranked.
     ctx.budget.work(rows.len() as u64)?;
     let budget = Arc::clone(&ctx.budget);
-    let _ranking = budget.reserve(
-        (rows.len() * core::mem::size_of::<f32>()
-            + (k.saturating_add(1)) * core::mem::size_of::<(f32, usize)>()) as u64,
-    )?;
+    let _ranking =
+        budget.reserve(((k.saturating_add(1)) * core::mem::size_of::<(f64, usize)>()) as u64)?;
 
     // Wrap (score, row_index) so we can use the std BinaryHeap as a
     // bounded min-heap on score. The row index is the tie-breaker and
     // keeps the heap order deterministic when scores collide.
     #[derive(Debug)]
     struct Scored {
-        score: f32,
+        score: f64,
         idx: usize,
     }
     impl Eq for Scored {}
@@ -9917,10 +10003,11 @@ fn execute_maxsim_top_k(
     }
     impl Ord for Scored {
         fn cmp(&self, other: &Self) -> Ordering {
-            // The lowest similarity at the top, a NaN (no score) lowest of
-            // all: the similarity negated is a distance, ranked by the
-            // distance order. Then natural idx order.
-            coordinode_vector::metrics::distance_order(-self.score, -other.score)
+            // The lowest score at the top (exact scores are finite, so the
+            // total order is the numeric one), then natural idx order.
+            other
+                .score
+                .total_cmp(&self.score)
                 .then_with(|| self.idx.cmp(&other.idx))
         }
     }
@@ -9931,16 +10018,13 @@ fn execute_maxsim_top_k(
     }
 
     let mut heap: BinaryHeap<Scored> = BinaryHeap::with_capacity(k.saturating_add(1));
-    let mut scores: Vec<f32> = Vec::with_capacity(rows.len());
 
     for (idx, row) in rows.iter().enumerate() {
         let doc_val = eval_neutral(doc_expr, row)?;
         let Some(doc) = coerce_value_to_multi_vector(&doc_val) else {
-            scores.push(f32::NEG_INFINITY);
             continue;
         };
-        let score = coordinode_vector::metrics::maxsim(&doc, &query);
-        scores.push(score);
+        let score = coordinode_vector::metrics::exact::maxsim(&doc, &query)?;
         heap.push(Scored { score, idx });
         if heap.len() > k {
             heap.pop();
@@ -9957,7 +10041,7 @@ fn execute_maxsim_top_k(
     for pick in picks {
         let mut row = rows[pick.idx].clone();
         if let Some(alias) = score_alias {
-            row.insert(alias.to_string(), Value::Float(pick.score as f64));
+            row.insert(alias.to_string(), Value::Float(pick.score));
         }
         out.push(row);
     }
@@ -9967,21 +10051,11 @@ fn execute_maxsim_top_k(
 /// Coerce a Value to a multi-vector matrix for the MaxSim executor.
 /// Mirrors the eval-layer helper but lives next to its single caller
 /// so the executor doesn't have to depend on the private eval helper.
+/// The shape is the scorer's to judge.
 fn coerce_value_to_multi_vector(val: &Value) -> Option<Vec<Vec<f32>>> {
     match val {
         Value::MultiVector(rows) => Some(rows.clone()),
-        Value::Array(arr) => {
-            let mut rows: Vec<Vec<f32>> = Vec::with_capacity(arr.len());
-            for item in arr {
-                let row = coerce_value_to_vec(item)?;
-                rows.push(row);
-            }
-            let width = rows.first().map(Vec::len)?;
-            if width == 0 || rows.iter().any(|r| r.len() != width) {
-                return None;
-            }
-            Some(rows)
-        }
+        Value::Array(arr) => arr.iter().map(coerce_value_to_vec).collect(),
         _ => None,
     }
 }

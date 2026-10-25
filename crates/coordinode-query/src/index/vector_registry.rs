@@ -11,11 +11,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use coordinode_cluster::VectorShardRouter;
 use coordinode_core::budget::Meter;
 use coordinode_core::graph::node::NodeId;
+use coordinode_core::graph::types::VectorMetric;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_vector::VectorLoader;
 use coordinode_vector::health::{HealthSignal, IndexHealthState};
 use coordinode_vector::hnsw::{
-    DEFAULT_RETIRED_BYTES_BUDGET, HnswConfig, HnswIndex, PublicationSnapshot, SearchResult,
+    AdmissionError, DEFAULT_RETIRED_BYTES_BUDGET, HnswConfig, HnswIndex, PublicationSnapshot,
+    SearchError, SearchResult, VectorDomainError,
 };
 use coordinode_vector::storage::lsm_backed::LsmVectorTier;
 use coordinode_vector::storage::{VectorTierHandle, VectorTierStorage};
@@ -34,31 +36,48 @@ pub type HnswHandle = Arc<RwLock<HnswIndex>>;
 /// Insert one vector under the shared lock, concurrently with searches and
 /// other inserts. The exclusive lock is taken only for the calibration the
 /// insert reports due.
-pub(crate) fn insert_one(handle: &RwLock<HnswIndex>, id: u64, vector: &[f32]) {
+///
+/// # Errors
+///
+/// The vector the index's metric cannot evaluate; the graph is unchanged.
+pub(crate) fn insert_one(
+    handle: &RwLock<HnswIndex>,
+    id: u64,
+    vector: &[f32],
+) -> Result<(), AdmissionError> {
     let due = match handle.read() {
-        Ok(graph) => graph.insert_shared(id, vector),
-        Err(_) => return,
+        Ok(graph) => graph.insert_shared(id, vector)?,
+        Err(_) => return Ok(()),
     };
     if due {
         calibrate(handle);
     }
+    Ok(())
 }
 
 /// [`insert_one`] for a batch, through [`HnswIndex::insert_batch_shared`].
-pub(crate) fn insert_many(handle: &RwLock<HnswIndex>, items: Vec<(u64, Vec<f32>)>) {
+///
+/// # Errors
+///
+/// The first vector the index cannot take; none of the batch is inserted.
+pub(crate) fn insert_many(
+    handle: &RwLock<HnswIndex>,
+    items: Vec<(u64, Vec<f32>)>,
+) -> Result<(), AdmissionError> {
     let due = match handle.read() {
-        Ok(graph) => graph.insert_batch_shared(items),
-        Err(_) => return,
+        Ok(graph) => graph.insert_batch_shared(items)?,
+        Err(_) => return Ok(()),
     };
     if due {
         calibrate(handle);
     }
+    Ok(())
 }
 
 /// What a partition's `results` may add to the merge map of a scattered
 /// search: an id and a score each, before duplicates across partitions fold.
 fn merged_bytes(results: &[SearchResult]) -> u64 {
-    (results.len() * core::mem::size_of::<(u64, f32)>()) as u64
+    (results.len() * core::mem::size_of::<(u64, f64)>()) as u64
 }
 
 #[cold]
@@ -84,6 +103,46 @@ struct ShardedLayout {
     shards: Vec<HnswHandle>,
     /// Maps a vector to its partitions (build `assign` / query `route`).
     router: Arc<dyn VectorShardRouter>,
+}
+
+impl ShardedLayout {
+    /// The metric every partition evaluates.
+    fn metric(&self) -> Option<VectorMetric> {
+        let shard = self.shards.first()?.read().ok()?;
+        Some(shard.config().metric)
+    }
+
+    /// The dimension a partition's first vector fixed, shared by them all.
+    fn dimension(&self) -> Option<usize> {
+        self.shards
+            .iter()
+            .find_map(|shard| shard.read().ok()?.dimension())
+    }
+}
+
+/// Refuse the first of `items` an index of `metric` cannot take: non-finite,
+/// empty, zero under cosine, or of a dimension other than `reference` (the
+/// declared one, else the one the index fixed, else the first item's).
+fn admit_all<'v>(
+    metric: VectorMetric,
+    mut reference: Option<usize>,
+    items: impl IntoIterator<Item = (u64, &'v [f32])>,
+) -> Result<(), AdmissionError> {
+    for (id, vector) in items {
+        coordinode_vector::metrics::exact::admit(vector, metric)
+            .map_err(|error| AdmissionError { id, error })?;
+        let dim = *reference.get_or_insert(vector.len());
+        if dim != vector.len() {
+            return Err(AdmissionError {
+                id,
+                error: VectorDomainError::DimensionMismatch {
+                    left: vector.len(),
+                    right: dim,
+                },
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Registry of active HNSW vector indexes.
@@ -524,11 +583,12 @@ impl VectorIndexRegistry {
     /// keeping the minimum score (closest occurrence) for an id seen in more
     /// than one partition (closure replication). `SearchResult.score` is a
     /// distance, so smaller wins.
-    fn accumulate_best(best: &mut HashMap<u64, f32>, results: Vec<SearchResult>) {
+    fn accumulate_best(best: &mut HashMap<u64, f64>, results: Vec<SearchResult>) {
         for r in results {
             best.entry(r.id)
                 .and_modify(|s| {
-                    if coordinode_vector::metrics::nearer(r.score, *s) {
+                    // Exact scores are finite: plain comparison is total here.
+                    if r.score < *s {
                         *s = r.score;
                     }
                 })
@@ -540,12 +600,14 @@ impl VectorIndexRegistry {
     /// by score (distance), equal scores by id, truncated to `k`. The map's
     /// iteration order is arbitrary, so the id tie-break is what makes the
     /// merge return the same results on every run.
-    fn finalize_merge(best: HashMap<u64, f32>, k: usize) -> Vec<SearchResult> {
+    fn finalize_merge(best: HashMap<u64, f64>, k: usize) -> Vec<SearchResult> {
         let mut out: Vec<SearchResult> = best
             .into_iter()
             .map(|(id, score)| SearchResult { id, score })
             .collect();
-        out.sort_by(|a, b| coordinode_vector::metrics::ranked_order(a.score, a.id, b.score, b.id));
+        out.sort_by(|a, b| {
+            coordinode_vector::metrics::exact::ranked_order(a.score, a.id, b.score, b.id)
+        });
         out.truncate(k);
         out
     }
@@ -562,9 +624,9 @@ impl VectorIndexRegistry {
         k: usize,
         loader: Option<&dyn VectorLoader>,
         meter: &mut M,
-    ) -> Result<Vec<SearchResult>, M::Stop> {
+    ) -> Result<Vec<SearchResult>, SearchError<M::Stop>> {
         let parts = layout.router.route(query, layout.shards.len());
-        let mut best: HashMap<u64, f32> = HashMap::new();
+        let mut best: HashMap<u64, f64> = HashMap::new();
         for &p in &parts {
             let Some(handle) = layout.shards.get(p as usize) else {
                 continue;
@@ -576,7 +638,9 @@ impl VectorIndexRegistry {
                 Some(l) => hnsw.search_with_loader_metered(query, k, l, meter)?,
                 None => hnsw.search_metered(query, k, meter)?,
             };
-            meter.scratch(merged_bytes(&results))?;
+            meter
+                .scratch(merged_bytes(&results))
+                .map_err(SearchError::Stopped)?;
             Self::accumulate_best(&mut best, results);
         }
         Ok(Self::finalize_merge(best, k))
@@ -597,12 +661,12 @@ impl VectorIndexRegistry {
         max_expansion_rounds: usize,
         is_visible: F,
         meter: &mut M,
-    ) -> Result<Vec<SearchResult>, M::Stop>
+    ) -> Result<Vec<SearchResult>, SearchError<M::Stop>>
     where
         F: Fn(u64) -> bool,
     {
         let parts = layout.router.route(query, layout.shards.len());
-        let mut best: HashMap<u64, f32> = HashMap::new();
+        let mut best: HashMap<u64, f64> = HashMap::new();
         for &p in &parts {
             let Some(handle) = layout.shards.get(p as usize) else {
                 continue;
@@ -618,7 +682,9 @@ impl VectorIndexRegistry {
                 &is_visible,
                 meter,
             )?;
-            meter.scratch(merged_bytes(&results))?;
+            meter
+                .scratch(merged_bytes(&results))
+                .map_err(SearchError::Stopped)?;
             Self::accumulate_best(&mut best, results);
         }
         Ok(Self::finalize_merge(best, k))
@@ -629,8 +695,26 @@ impl VectorIndexRegistry {
     /// `insert_batch` once per partition under a single write lock. Returns the
     /// number of distinct vectors (not insertions). Reused by the build and
     /// incremental-write paths.
-    fn insert_batch_sharded(layout: &ShardedLayout, items: Vec<(u64, Vec<f32>)>) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// The first vector a partition cannot take. Every vector is checked
+    /// before any partition is written, so a refused batch changes none.
+    fn insert_batch_sharded(
+        layout: &ShardedLayout,
+        declared: Option<usize>,
+        items: Vec<(u64, Vec<f32>)>,
+    ) -> Result<usize, AdmissionError> {
         let n = layout.shards.len();
+        // Routing reads the vector, so the whole batch is checked first,
+        // against the one dimension every partition shares.
+        if let Some(metric) = layout.metric() {
+            admit_all(
+                metric,
+                declared.or_else(|| layout.dimension()),
+                items.iter().map(|(id, v)| (*id, v.as_slice())),
+            )?;
+        }
         let mut per_shard: Vec<Vec<(u64, Vec<f32>)>> = (0..n).map(|_| Vec::new()).collect();
         let count = items.len();
         for (id, vec) in items {
@@ -644,9 +728,9 @@ impl VectorIndexRegistry {
             if batch.is_empty() {
                 continue;
             }
-            insert_many(&layout.shards[p], batch);
+            insert_many(&layout.shards[p], batch)?;
         }
-        count
+        Ok(count)
     }
 
     /// Register an index with a pre-built HNSW graph (e.g. after rebuild).
@@ -1039,6 +1123,15 @@ impl VectorIndexRegistry {
             .collect()
     }
 
+    /// Whether a vector index is registered for `label`.
+    pub fn indexes_label(&self, label: &str) -> bool {
+        self.definitions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(|(l, _)| l == label)
+    }
+
     /// Property names of every vector index registered for `label`.
     /// Empty when the label has no vector indexes — callers use this
     /// as a cheap pre-filter before decoding replicated node records.
@@ -1052,25 +1145,82 @@ impl VectorIndexRegistry {
             .collect()
     }
 
+    /// The dimension the definition of `(label, property)` declares, if it
+    /// declares one.
+    fn declared_dimension(&self, key: &VectorIndexKey) -> Option<usize> {
+        self.definitions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)?
+            .vector_config
+            .as_ref()
+            .map(|config| config.dimensions as usize)
+            .filter(|&dimensions| dimensions > 0)
+    }
+
+    /// Check, without changing the index, that the index of `(label,
+    /// property)` can take `vector` for `node_id`. A write is refused with
+    /// this before it commits, so every committed vector of an indexed
+    /// property is one its index takes. No index: nothing to check.
+    ///
+    /// # Errors
+    ///
+    /// The reason the index refuses the vector: non-finite, empty, zero under
+    /// cosine, or of another dimension than the declared or established one.
+    pub fn check_admission(
+        &self,
+        label: &str,
+        property: &str,
+        node_id: NodeId,
+        vector: &[f32],
+    ) -> Result<(), AdmissionError> {
+        let key = (label.to_string(), property.to_string());
+        let declared = self.declared_dimension(&key);
+        let id = node_id.as_raw();
+        {
+            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(layout) = sharded.get(&key) {
+                return match layout.metric() {
+                    Some(metric) => admit_all(
+                        metric,
+                        declared.or_else(|| layout.dimension()),
+                        [(id, vector)],
+                    ),
+                    None => Ok(()),
+                };
+            }
+        }
+        let Some(handle) = self.get(label, property) else {
+            return Ok(());
+        };
+        let Ok(graph) = handle.read() else {
+            return Ok(());
+        };
+        admit_all(
+            graph.config().metric,
+            declared.or_else(|| graph.dimension()),
+            [(id, vector)],
+        )
+    }
+
     /// Insert a vector into all applicable HNSW indexes for a node.
     ///
     /// Called on node creation or vector property update. For bulk
     /// loads use [`Self::on_vectors_written`], which spreads one batch
     /// across the rayon pool.
-    pub fn on_vector_written(&self, label: &str, node_id: NodeId, property: &str, vector: &[f32]) {
-        if self.build_owns_writes(label, property) {
-            return;
-        }
-        {
-            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
-                Self::insert_batch_sharded(layout, vec![(node_id.as_raw(), vector.to_vec())]);
-                return;
-            }
-        }
-        if let Some(handle) = self.get(label, property) {
-            insert_one(&handle, node_id.as_raw(), vector);
-        }
+    ///
+    /// # Errors
+    ///
+    /// The vector the index refuses (see [`Self::check_admission`]); the
+    /// index is unchanged.
+    pub fn on_vector_written(
+        &self,
+        label: &str,
+        node_id: NodeId,
+        property: &str,
+        vector: &[f32],
+    ) -> Result<(), AdmissionError> {
+        self.on_vectors_written(label, property, vec![(node_id, vector.to_vec())])
     }
 
     /// Batched variant: insert N vectors into the same (label,
@@ -1083,25 +1233,55 @@ impl VectorIndexRegistry {
     ///
     /// `items` is consumed: each `(NodeId, Vec<f32>)` is forwarded
     /// to the HNSW insert path without further copies.
-    pub fn on_vectors_written(&self, label: &str, property: &str, items: Vec<(NodeId, Vec<f32>)>) {
+    ///
+    /// # Errors
+    ///
+    /// The first vector the index refuses; none of the batch is inserted.
+    pub fn on_vectors_written(
+        &self,
+        label: &str,
+        property: &str,
+        items: Vec<(NodeId, Vec<f32>)>,
+    ) -> Result<(), AdmissionError> {
         if items.is_empty() || self.build_owns_writes(label, property) {
-            return;
+            return Ok(());
         }
+        let items: Vec<(u64, Vec<f32>)> =
+            items.into_iter().map(|(id, v)| (id.as_raw(), v)).collect();
+        self.insert_into(label, property, items).map(drop)
+    }
+
+    /// Insert `items` into the index of `(label, property)`, every vector
+    /// checked first against the declared dimension; the number inserted.
+    fn insert_into(
+        &self,
+        label: &str,
+        property: &str,
+        items: Vec<(u64, Vec<f32>)>,
+    ) -> Result<usize, AdmissionError> {
+        let key = (label.to_string(), property.to_string());
+        let declared = self.declared_dimension(&key);
         {
             let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
-                let batch: Vec<(u64, Vec<f32>)> =
-                    items.into_iter().map(|(id, v)| (id.as_raw(), v)).collect();
-                Self::insert_batch_sharded(layout, batch);
-                return;
+            if let Some(layout) = sharded.get(&key) {
+                return Self::insert_batch_sharded(layout, declared, items);
             }
         }
-        if let Some(handle) = self.get(label, property) {
-            insert_many(
-                &handle,
-                items.into_iter().map(|(id, v)| (id.as_raw(), v)).collect(),
-            );
+        let Some(handle) = self.get(label, property) else {
+            return Ok(0);
+        };
+        if let Some(dim) = declared {
+            if let Ok(graph) = handle.read() {
+                admit_all(
+                    graph.config().metric,
+                    Some(dim),
+                    items.iter().map(|(id, v)| (*id, v.as_slice())),
+                )?;
+            }
         }
+        let count = items.len();
+        insert_many(&handle, items)?;
+        Ok(count)
     }
 
     /// A statement deleted a node or its vector property, ahead of its
@@ -1160,7 +1340,8 @@ impl VectorIndexRegistry {
     ///
     /// # Errors
     ///
-    /// The stop `meter` returned.
+    /// The stop `meter` returned, or a query or candidate the index's metric
+    /// cannot evaluate.
     pub fn search<M: Meter>(
         &self,
         label: &str,
@@ -1168,7 +1349,7 @@ impl VectorIndexRegistry {
         query: &[f32],
         k: usize,
         meter: &mut M,
-    ) -> Result<Option<Vec<SearchResult>>, M::Stop> {
+    ) -> Result<Option<Vec<SearchResult>>, SearchError<M::Stop>> {
         self.search_with_loader(label, property, query, k, None, meter)
     }
 
@@ -1181,7 +1362,7 @@ impl VectorIndexRegistry {
     ///
     /// # Errors
     ///
-    /// The stop `meter` returned.
+    /// As [`Self::search`].
     pub fn search_with_loader<M: Meter>(
         &self,
         label: &str,
@@ -1190,7 +1371,7 @@ impl VectorIndexRegistry {
         k: usize,
         loader: Option<&dyn VectorLoader>,
         meter: &mut M,
-    ) -> Result<Option<Vec<SearchResult>>, M::Stop> {
+    ) -> Result<Option<Vec<SearchResult>>, SearchError<M::Stop>> {
         {
             let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
             if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
@@ -1226,7 +1407,7 @@ impl VectorIndexRegistry {
     ///
     /// # Errors
     ///
-    /// The stop `meter` returned.
+    /// As [`Self::search`].
     #[allow(clippy::too_many_arguments)]
     pub fn search_with_visibility<F, M: Meter>(
         &self,
@@ -1238,7 +1419,7 @@ impl VectorIndexRegistry {
         max_expansion_rounds: usize,
         is_visible: F,
         meter: &mut M,
-    ) -> Result<Option<Vec<SearchResult>>, M::Stop>
+    ) -> Result<Option<Vec<SearchResult>>, SearchError<M::Stop>>
     where
         F: Fn(u64) -> bool,
     {
@@ -1280,27 +1461,17 @@ impl VectorIndexRegistry {
     /// Used during index rebuild (on Database::open or CREATE VECTOR INDEX).
     /// The caller is responsible for scanning stored nodes and extracting
     /// vectors — this method just does the HNSW insertions.
+    ///
+    /// # Errors
+    ///
+    /// The first vector the index refuses; none of the batch is inserted.
     pub fn bulk_insert(
         &self,
         label: &str,
         property: &str,
         vectors: impl Iterator<Item = (u64, Vec<f32>)>,
-    ) -> usize {
-        {
-            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
-                return Self::insert_batch_sharded(layout, vectors.collect());
-            }
-        }
-        let handle = match self.get(label, property) {
-            Some(h) => h,
-            None => return 0,
-        };
-
-        let items: Vec<(u64, Vec<f32>)> = vectors.collect();
-        let count = items.len();
-        insert_many(&handle, items);
-        count
+    ) -> Result<usize, AdmissionError> {
+        self.insert_into(label, property, vectors.collect())
     }
 }
 

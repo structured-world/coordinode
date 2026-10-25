@@ -198,7 +198,11 @@ fn applied_entries_reach_the_index() {
         watermark()
     );
     let handle = fx.registry.get("Item", "embedding").unwrap();
-    let nearest = handle.read().unwrap().search(&[5.0, 0.0, 0.0, 0.0], 1);
+    let nearest = handle
+        .read()
+        .unwrap()
+        .search(&[5.0, 0.0, 0.0, 0.0], 1)
+        .unwrap();
     assert_eq!(nearest.first().map(|r| r.id), Some(5));
 }
 

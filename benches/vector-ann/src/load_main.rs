@@ -142,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => coordinode_core::graph::types::VectorMetric::L2,
         };
         let t = Instant::now();
-        let gt = crate::gt::brute_force_gt(&train_flat, &query_flat, dim, args.gt_k, metric);
+        let gt = crate::gt::brute_force_gt(&train_flat, &query_flat, dim, args.gt_k, metric)?;
         crate::fvecs::write_ivecs(gt_path, args.gt_k, &gt)?;
         info!(
             path = ?gt_path,

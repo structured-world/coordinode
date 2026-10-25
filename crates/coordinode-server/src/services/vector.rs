@@ -10,8 +10,7 @@ use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
 
 use crate::proto::{common, graph, query};
-use crate::services::cypher::value_to_proto_pub;
-use crate::services::db_err_to_status;
+use crate::services::cypher::{db_error_to_status, value_to_proto_pub};
 
 /// Backtick-escape a Cypher identifier (label or property key).
 ///
@@ -53,8 +52,7 @@ fn row_to_vector_result(
         _ => return None,
     };
     let distance = match row.get("_dist")? {
-        Value::Float(d) => *d as f32,
-        Value::Int(d) => *d as f32,
+        Value::Float(d) => *d,
         _ => return None,
     };
     let label = match row.get("n.__label__") {
@@ -193,9 +191,11 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         // keys on the raw (unescaped) label/property.
         let (rows, index_health) = super::blocking(|| {
             let db = self.database.read();
+            // A statement's failure: a query vector the metric cannot
+            // evaluate is the caller's, answered INVALID_ARGUMENT.
             let rows = db
                 .execute_cypher_shared(&cypher, Some(params), None, None, None)
-                .map_err(|e| db_err_to_status("vector search", e))?
+                .map_err(db_error_to_status)?
                 .rows;
             let health = db
                 .vector_index_registry()
@@ -277,7 +277,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
                 .read()
                 .execute_cypher_shared(&cypher, Some(params), None, None, None)
         })
-        .map_err(|e| db_err_to_status("hybrid search", e))?
+        .map_err(db_error_to_status)?
         .rows;
 
         let results: Vec<query::VectorResult> = super::blocking(|| {
