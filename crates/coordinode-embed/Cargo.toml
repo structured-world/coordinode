@@ -118,6 +118,10 @@ name = "vector_queries"
 harness = false
 
 [[bench]]
+name = "correlated_probe"
+harness = false
+
+[[bench]]
 name = "borrowed_point"
 harness = false
 
