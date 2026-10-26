@@ -255,6 +255,29 @@ fn recovered_operation(root: &Path) -> Result<OperationDescriptor> {
     Ok(op)
 }
 
+/// A physical backup is the same history: opened in place of the original, the
+/// descriptor committed before it settles without running again, and the
+/// increment it protects counts once.
+fn physical_recovery(root: &Path, op: OperationDescriptor) -> Result<()> {
+    let target = root.join("physical-backup");
+    {
+        let source = Database::open(root.join("crash-db"))?;
+        source.physical_backup(&target)?;
+    }
+    let mut recovered = Database::open(&target)?;
+    assert!(matches!(
+        recovered.resolve_operation(&op, Resolve::Lookup)?,
+        OperationOutcome::Committed { .. }
+    ));
+    assert_settled(run_operation(&recovered, op));
+    assert_eq!(
+        jobs(&mut recovered)?,
+        1,
+        "the backup's increment counts once"
+    );
+    Ok(())
+}
+
 /// A logical backup restored into a new store is a new domain: the data is
 /// there, and a descriptor issued before the backup is refused rather than run
 /// again or answered with an outcome the restored store never recorded.
@@ -441,12 +464,14 @@ fn main() -> Result<()> {
     concurrent_identity(&root.join("identity-db"))?;
     lease_fencing(&root.join("lease-db"))?;
     let op = recovered_operation(&root)?;
+    physical_recovery(&root, op)?;
     logical_restore(&root, op)?;
     hard_limit(&root.join("capped-db"))?;
     println!(
         "Installed consumer: schema, graph, unique identity under concurrent writers, atomic \
          audit/outbox, CAS and lease fencing, rollback, reopen, an increment retried after a \
-         process exit and across checkpoint and repair, logical restore into a new domain, \
+         process exit and across checkpoint and repair, a physical backup settling it in the \
+         same history, logical restore into a new domain, \
          and the owned-footprint limit passed"
     );
     Ok(())

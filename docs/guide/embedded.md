@@ -38,8 +38,8 @@ coordinode-storage = "0.9"
   `replication`. The broader consumer covers unique identity under concurrent
   writers, revision and lease-epoch fencing, an atomic audit and outbox,
   rollback and reopen, an increment retried after a process exit and across a
-  checkpoint and repair, a logical restore into a new domain, and the hard
-  limit. A process exit is not a power loss. Compiling with a feature is not
+  checkpoint and repair, a physical backup that settles it in the same
+  history, a logical restore into a new domain, and the hard limit. A process exit is not a power loss. Compiling with a feature is not
   the same as running it: run your own scenario with the features you enable
   on the build you ship.
 
@@ -273,6 +273,56 @@ system-wide cap also sets a file-system quota.
 
 Deleting a blob directly removes its metadata but does not reclaim
 unreferenced application chunks; do not count it as space released.
+
+## Backup and recovery
+
+There are two kinds of backup, and they recover different things.
+
+| | Physical backup | Logical export and restore |
+|---|---|---|
+| Made with | `Database::physical_backup(target)` | `coordinode_embed::backup::export` (binary, JSON or Cypher), then `Database::restore` into an empty database |
+| Holds | The whole database as of the call: data, schema, indexes, operation records | Nodes, edges and schema at one snapshot, with their node ids |
+| Opened as | `Database::open(target)`, the same database | A new database, a different domain |
+| An operation committed before the backup | Settled: its retry runs nothing | Refused with `ForeignOperation`: never run again, never answered |
+
+```rust
+use std::path::Path;
+
+use coordinode_embed::{Database, DatabaseError};
+
+fn back_up(db: &Database, backups: &Path) -> Result<(), DatabaseError> {
+    // `target` must not exist yet; put it on another device than the database.
+    db.physical_backup(&backups.join("2026-10-26"))?;
+    Ok(())
+}
+```
+
+A physical backup is taken while writes go on. On the same file system its
+files are hard links to the database's own, so it costs little space but
+shares the device; elsewhere they are copies. Backups outside the endpoint
+directory are not counted against the hard limit. The backup directory is a
+complete database in one directory, whatever endpoint layout the original
+had, and opens with plain `Database::open`.
+
+Recovering from a physical backup means running it in place of the lost
+database. Operations the backup holds are settled there exactly as in the
+original. An operation committed after the backup is unknown to it and runs
+once when retried: the backup does not have that write. Never run a backup
+beside the database it was taken from: both would answer the same descriptors
+from histories that have diverged. Results acknowledged after the backup
+(`acknowledge_operation`) are back to settled in it; what the application does
+about effects it already performed outside the database after the backup is
+its own recovery policy.
+
+A logical export is for moving data into a new database, on another version
+or with another layout. The restored database issues descriptors of its own
+and refuses the old ones. See [Transactions](./transactions) for operation
+identity and resolving a write whose outcome is unknown.
+
+`Database::checkpoint` is different again: it keeps repair bases under the
+database's own directory, for `verify_and_repair` to rebuild a damaged
+partition from, and protects against local corruption only, not the loss of
+the device.
 
 ## Build features
 

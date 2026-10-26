@@ -815,6 +815,117 @@ fn restored_data_breaking_a_constraint_is_reported() {
     );
 }
 
+/// A physical backup of a database opened from its own storage
+/// configuration opens with `Database::open` on the backup directory alone,
+/// with its unique index, text index and vector index answering for the
+/// data it holds. A database at its hard limit, refusing writes, still
+/// writes its backup to another directory, and keeps refusing.
+#[test]
+fn a_physical_backup_opens_as_a_database_of_its_own() {
+    use coordinode_embed::DatabaseError;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+    const LIMIT: u64 = 8 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = EndpointConfig::new(
+        "data",
+        dir.path(),
+        Media::Ssd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(LIMIT);
+    let mut db =
+        Database::open_with_config(StorageConfig::try_with_endpoints(vec![endpoint]).unwrap())
+            .unwrap();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .unwrap();
+    db.execute_cypher("CREATE TEXT INDEX u_bio ON :U(bio)")
+        .unwrap();
+    db.execute_cypher("CREATE VECTOR INDEX u_emb ON :U(emb) OPTIONS {metric: \"l2\"}")
+        .unwrap();
+    db.execute_cypher(
+        "CREATE (:U {email: 'a@x', bio: 'rust storage', emb: [1.0, 0.0]}), \
+         (:U {email: 'b@x', bio: 'gardening', emb: [0.0, 1.0]})",
+    )
+    .unwrap();
+    // Incompressible, so the stored bytes grow with the payload.
+    let pad = |seed: u64| {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut out = String::with_capacity(32 << 10);
+        while out.len() < 32 << 10 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push_str(&format!("{state:016x}"));
+        }
+        out
+    };
+    let mut full = false;
+    for i in 0..1024 {
+        match db.execute_cypher(&format!("CREATE (:Pad {{i: {i}, pad: '{}'}})", pad(i))) {
+            Ok(_) => {}
+            Err(DatabaseError::CapacityExhausted { .. }) => {
+                full = true;
+                break;
+            }
+            Err(other) => panic!("unexpected refusal: {other:?}"),
+        }
+    }
+    assert!(full, "the limit refused a write");
+
+    let pads = |db: &mut Database| {
+        db.execute_cypher("MATCH (p:Pad) RETURN count(p) AS n")
+            .unwrap()[0]
+            .get("n")
+            .cloned()
+    };
+    let held = pads(&mut db);
+    let backups = tempfile::tempdir().unwrap();
+    let target = backups.path().join("backup");
+    db.physical_backup(&target).unwrap();
+    // What the backup released (flushed memtables, retired journal) may take
+    // a few more writes before the limit refuses again.
+    let mut refused = false;
+    for i in 1024..1088 {
+        match db.execute_cypher(&format!("CREATE (:Pad {{i: {i}, pad: '{}'}})", pad(i))) {
+            Ok(_) => {}
+            Err(DatabaseError::CapacityExhausted { .. }) => {
+                refused = true;
+                break;
+            }
+            Err(other) => panic!("unexpected refusal: {other:?}"),
+        }
+    }
+    assert!(refused, "the backup did not lift the original's limit");
+    drop(db);
+
+    let mut restored = Database::open(&target).unwrap();
+    assert_eq!(pads(&mut restored), held);
+    let found = restored
+        .execute_cypher("MATCH (u:U {email: 'a@x'}) RETURN u.email AS email")
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(
+        restored
+            .execute_cypher("CREATE (:U {email: 'b@x'})")
+            .is_err(),
+        "the unique index holds the backed-up value"
+    );
+    let text = restored
+        .execute_cypher("MATCH (u:U) WHERE text_match(u.bio, 'rust') RETURN u.email AS email")
+        .unwrap();
+    assert_eq!(text.len(), 1, "{text:?}");
+    let vectors = restored
+        .vector_index_registry()
+        .get("U", "emb")
+        .map(|hnsw| hnsw.read().expect("hnsw lock").len());
+    assert_eq!(vectors, Some(2));
+    // The backup is no longer held to the original's limit.
+    restored.execute_cypher("CREATE (:Pad {i: -1})").unwrap();
+}
+
 /// Constraints travel with a dump that brings its schema: the restored
 /// database holds each one under its name, in the state it had, with the
 /// unique index it owns, and enforces them. A cypher dump carries data only,

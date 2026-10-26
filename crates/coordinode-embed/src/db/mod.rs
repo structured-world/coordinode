@@ -827,6 +827,34 @@ impl Database {
         Ok(path)
     }
 
+    /// Write a physical backup of the whole database into `target`, a
+    /// directory that must not exist yet, typically on another device.
+    ///
+    /// The backup is this database as of the call: its data, schema,
+    /// indexes and operation records, in one directory whatever endpoint
+    /// layout the database has. [`Database::open`] opens it as a database of
+    /// its own, the recovery of this one after its loss: a descriptor whose
+    /// write the backup holds is settled there, one whose write came later is
+    /// unknown there. Run it in place of this database, never beside it: both
+    /// would answer the same descriptors from diverging histories. Writes go
+    /// on while the backup is taken. On the same file system its files are
+    /// hard links, elsewhere copies.
+    ///
+    /// # Errors
+    ///
+    /// `target` already exists or cannot be created, or a tree or the
+    /// journal cannot be captured into it.
+    pub fn physical_backup(
+        &self,
+        target: &Path,
+    ) -> Result<coordinode_storage::engine::core::CheckpointSummary, DatabaseError> {
+        let summary = self.engine.create_checkpoint(target)?;
+        // The copy routes its levels to this database's endpoints; opening it
+        // once as a checkpoint binds them to its one directory.
+        drop(StorageEngine::open_checkpoint(target)?);
+        Ok(summary)
+    }
+
     /// Flush all in-memory writes to durable on-disk SSTs.
     ///
     /// Writes are already durable in the oplog journal once they return; this

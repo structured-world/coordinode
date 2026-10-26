@@ -204,6 +204,57 @@ fn a_logical_restore_refuses_descriptors_issued_before_it() {
     }
 }
 
+/// A physical backup is the same database at the moment it was taken, its
+/// operation records included: opened in place of the lost original, it
+/// settles a descriptor whose write the backup holds without running it
+/// again, and a descriptor whose write came after the backup is unknown
+/// there and runs once. The original is unaffected by the backup.
+#[test]
+fn a_physical_backup_settles_the_operations_it_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = tempfile::tempdir().unwrap();
+    let target = backups.path().join("backup");
+    let mut db = Database::open(dir.path()).unwrap();
+    let issuer = enrolled(&db);
+    let held = issuer.next().unwrap();
+    run(&db, &held, "CREATE (:Purchase {k: 1})").unwrap();
+
+    let summary = db.physical_backup(&target).unwrap();
+    assert!(summary.partitions > 0);
+    // A write after the backup reaches the original only.
+    let later = issuer.next().unwrap();
+    run(&db, &later, "CREATE (:Purchase {k: 2})").unwrap();
+    assert_eq!(count(&mut db, "Purchase"), 2);
+    // A second backup never overwrites the first.
+    assert!(db.physical_backup(&target).is_err());
+    drop(db);
+
+    let mut restored = Database::open(&target).unwrap();
+    assert_eq!(count(&mut restored, "Purchase"), 1);
+    assert!(matches!(
+        restored.resolve_operation(&held, Resolve::Lookup).unwrap(),
+        OperationOutcome::Committed { .. }
+    ));
+    let (outcome, differs) = settled(run(&restored, &held, "CREATE (:Purchase {k: 1})"));
+    assert!(matches!(outcome, OperationOutcome::Committed { .. }));
+    assert!(!differs);
+    assert_eq!(
+        restored.resolve_operation(&later, Resolve::Lookup).unwrap(),
+        OperationOutcome::Unknown
+    );
+    run(&restored, &later, "CREATE (:Purchase {k: 2})").unwrap();
+    settled(run(&restored, &later, "CREATE (:Purchase {k: 2})"));
+    assert_eq!(count(&mut restored, "Purchase"), 2);
+
+    // The backup reopens as the database it became.
+    drop(restored);
+    let mut reopened = Database::open(&target).unwrap();
+    assert_eq!(count(&mut reopened, "Purchase"), 2);
+    settled(run(&reopened, &held, "CREATE (:Purchase {k: 1})"));
+    let original = Database::open(dir.path()).unwrap();
+    settled(run(&original, &later, "CREATE (:Purchase {k: 2})"));
+}
+
 /// One number used for two different writes: the second is refused and
 /// told the first meant something else; nothing of it applies.
 #[test]
