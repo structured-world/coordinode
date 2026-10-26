@@ -225,8 +225,9 @@ struct Registered {
 /// An index in force, as a lookup through it needs it.
 #[derive(Debug, Clone)]
 pub struct GuardedIndex {
-    /// The definition as registered.
-    pub def: IndexDefinition,
+    /// The definition as registered, shared rather than copied: a
+    /// correlated lookup takes it once per outer row.
+    pub def: Arc<IndexDefinition>,
     /// Whether the use guard of this member's copy of its generation is
     /// stored in this run. A copy is used as evidence only once it is: see
     /// [`IndexRegistry::arm_copy`].
@@ -1196,7 +1197,7 @@ impl IndexRegistry {
         let catalog = self.indexes.read();
         let registered = catalog.by_id.get(&id)?;
         Some(GuardedIndex {
-            def: IndexDefinition::clone(&registered.def),
+            def: Arc::clone(&registered.def),
             armed: registered.armed.load(Ordering::Acquire),
             published: registered.version,
         })

@@ -776,6 +776,9 @@ pub struct LocalMultiModalCoordinator {
     /// `Partition::all()` keys every entry; `tree(part)` is the
     /// only sanctioned access path.
     trees: HashMap<Partition, lsm_tree::AnyTree>,
+    /// The same handles by partition discriminant: every read and write
+    /// finds its tree here, an index instead of a hash of the partition.
+    by_partition: Vec<Option<lsm_tree::AnyTree>>,
     /// Shared LSM seqno generator. All `Coordinator` writes pull
     /// from this counter; readers pin to `seqno.get()` for
     /// snapshot consistency across partitions.
@@ -831,8 +834,19 @@ impl LocalMultiModalCoordinator {
         gc_controller: Arc<GcWatermarkController>,
         flush_trigger: Arc<crate::engine::flush::FlushTrigger>,
     ) -> Self {
+        // A fieldless enum: its discriminants index the handles. The trees
+        // are opened once here and never replaced, so the two views agree.
+        let mut by_partition = Vec::new();
+        for (&part, tree) in &trees {
+            let at = part as usize;
+            if by_partition.len() <= at {
+                by_partition.resize(at + 1, None);
+            }
+            by_partition[at] = Some(tree.clone());
+        }
         Self {
             trees,
+            by_partition,
             seqno,
             cache,
             gc_watermark,
@@ -931,8 +945,9 @@ impl LocalMultiModalCoordinator {
     /// Reserved for engine-internal call sites (cascade eviction,
     /// persist, capacity refresh).
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
-        self.trees
-            .get(&part)
+        self.by_partition
+            .get(part as usize)
+            .and_then(Option::as_ref)
             .ok_or_else(|| StorageError::PartitionNotFound {
                 name: part.name().to_string(),
             })

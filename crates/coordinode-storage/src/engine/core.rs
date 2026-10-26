@@ -2084,12 +2084,7 @@ impl StorageEngine {
     /// the generation itself. Read and write through the engine's methods,
     /// which translate.
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
-        self.coordinator
-            .trees()
-            .get(&part)
-            .ok_or_else(|| StorageError::PartitionNotFound {
-                name: part.name().to_string(),
-            })
+        self.coordinator.tree(part)
     }
 
     /// The index tree's installation catalog, when `part` is the index
