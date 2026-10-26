@@ -161,8 +161,20 @@ fn a_merge_on_a_misattributed_value_matches_the_real_holder() {
 /// How long a test waits for a check or a rebuild.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Check the index `name` and wait for the outcome.
+/// Check the index `name` and wait for the outcome. A check that writers kept
+/// from settling ends in a rebuild into a new generation; the next check
+/// waits for that build to be ready, as only a ready index is checked.
 fn check(db: &Database, name: &str) -> (CheckStatus, CheckOutcome) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while index_named(db.engine(), name).expect("index").state
+        != coordinode_query::index::IndexState::Ready
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "index {name} never became ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let operation = db
         .check_index(&IndexSelector::Name(name.into()))
         .expect("start the check");
@@ -171,6 +183,29 @@ fn check(db: &Database, name: &str) -> (CheckStatus, CheckOutcome) {
         .expect("read the check")
         .expect("the check exists");
     (status, outcome.expect("the check ended"))
+}
+
+/// Wait until the catalog holds the report of a lookup through the index
+/// `name`. A lookup marks the generation at once in this process; the
+/// background reporter records it in the catalog, suspect, and admits a
+/// check, which may already have verified the generation again by the time
+/// this returns. A check started before the report is recorded meets it
+/// midway and passes again, ending with the generation suspect and another
+/// check pending.
+fn wait_report_recorded(db: &Database, name: &str) {
+    let generation = index_named(db.engine(), name).expect("index").generation;
+    let deadline = std::time::Instant::now() + WAIT;
+    while LocalIndexStore::new(db.engine())
+        .load_integrity(generation)
+        .expect("read integrity")
+        .is_none()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the report was not recorded"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// The ids of the `:U` nodes the indexed equality `property = value` finds.
@@ -274,6 +309,7 @@ fn a_check_removes_an_entry_that_no_record_holds() {
         .expect("an entry c does not hold");
 
     assert_eq!(found_by(&mut db, "city", "oslo"), vec![a]);
+    wait_report_recorded(&db, "u_city");
     let (status, outcome) = check(&db, "u_city");
     assert!(
         matches!(outcome, CheckOutcome::Verified { .. }),
@@ -525,24 +561,9 @@ fn a_check_that_cannot_spill_fails_and_lookups_keep_answering_from_the_records()
         .put(Partition::Idx, &entry_key(&db, "u_city", "oslo", r), &[])
         .expect("plant a stray entry");
     assert_eq!(found_by(&mut db, "city", "oslo").len(), 50);
-    // The lookup marked the generation here at once; the catalog records the
-    // suspicion when the background reporter takes the report. The check
-    // must find it suspect for "stays suspect" to mean anything.
-    let generation = index_named(db.engine(), "u_city")
-        .expect("index")
-        .generation;
-    let deadline = std::time::Instant::now() + WAIT;
-    while LocalIndexStore::new(db.engine())
-        .load_integrity(generation)
-        .expect("read integrity")
-        .is_none_or(|(record, _)| record.integrity != Integrity::Suspect)
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the report was not recorded"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    // The check must find it suspect for "stays suspect" to mean anything;
+    // no check of it can verify it, as none can spill.
+    wait_report_recorded(&db, "u_city");
 
     let (status, outcome) = check(&db, "u_city");
     assert!(
