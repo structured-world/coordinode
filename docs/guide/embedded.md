@@ -321,8 +321,13 @@ identity and resolving a write whose outcome is unknown.
 
 `Database::checkpoint` is different again: it keeps repair bases under the
 database's own directory, for `verify_and_repair` to rebuild a damaged
-partition from, and protects against local corruption only, not the loss of
-the device.
+partition or `STORAGE COLUMNAR` table from, and protects against local
+corruption only, not the loss of the device. A tree whose open fails
+structurally (a lost manifest) is repaired from its tables at open instead of
+failing the database; when that repair had to drop damaged data, the next
+`verify_and_repair` rebuilds the tree from the latest checkpoint plus the
+journal, and reports it as `corrupt_partitions` / `corrupt_tables` with
+nothing repaired when no checkpoint exists.
 
 ## Build features
 

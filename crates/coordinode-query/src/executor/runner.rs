@@ -13328,6 +13328,16 @@ fn execute_create_node(
         _ => (Vec::new(), false),
     };
     let table_label = labels.first().cloned().unwrap_or_default();
+    // A columnar table's rows land one by one as they are made, outside the
+    // commit that gates the partitions' writes: its own verdict refuses the
+    // statement before the first, so none of it lands.
+    if table_columnar
+        && !input_rows.is_empty()
+        && ctx.engine.columnar_write_pressure(&table_label)
+            == coordinode_storage::engine::core::WritePressure::Stop
+    {
+        return Err(ExecutionError::Backpressure);
+    }
 
     for input_row in input_rows {
         let node_id = ctx.id_allocator.next()?;

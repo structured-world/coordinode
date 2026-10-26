@@ -947,7 +947,7 @@ fn all_partitions_support_crud() {
 /// Remove every manifest snapshot (`v{id}`) and edit log (`edits-{id}`) of
 /// the tree at `tree_dir`, its tables left in place: the manifest loss an
 /// open repairs.
-fn lose_manifest(tree_dir: &std::path::Path) {
+pub(super) fn lose_manifest(tree_dir: &std::path::Path) {
     let numbered = |rest: Option<&str>| {
         rest.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
     };

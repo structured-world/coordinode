@@ -13,18 +13,17 @@
 //! feature-gated).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lsm_tree::config::{ColumnEncoding, ColumnEncodingPolicy};
-use lsm_tree::fs::{Fs, SyncMode};
+use lsm_tree::fs::Fs;
 use lsm_tree::rate_limiter::RateLimiter;
 use lsm_tree::table::columnar::{ColumnBatch, column_batch_to_entries, entries_to_column_batch};
-use lsm_tree::{
-    AnyTree, Cache, CapacityPool, Config, InternalValue, SharedSequenceNumberGenerator, ValueType,
-    WriteBufferBudget,
-};
+use lsm_tree::{AnyTree, Cache, CapacityPool, Config, InternalValue, ValueType, WriteBufferBudget};
 
+use crate::engine::flush::{TableLife, TableTree};
 use crate::error::{StorageError, StorageResult};
 
 /// A single row to write into a columnar tree: its key and its opaque value
@@ -101,14 +100,17 @@ pub fn columnar_batch_rows(batch: &ColumnBatch) -> StorageResult<Vec<(Vec<u8>, V
         .collect())
 }
 
+/// The directory, under every endpoint, that holds the table trees.
+pub(crate) const TABLES_DIR: &str = "tables";
+
 /// A registry of per-table columnar trees, keyed by table id.
 ///
 /// Each `STORAGE COLUMNAR` table owns one columnar-mode tree under
-/// `<base_dir>/<table_id>`. The registry opens those trees lazily, creating one
-/// on first use (`CREATE TABLE`), handing back a cheap `AnyTree` clone for
-/// reads/writes, and dropping the tree + its directory on `DROP TABLE`. On
-/// construction it re-opens every table tree already on disk so a restart
-/// recovers them.
+/// `<endpoint>/tables/<table_id>`. The registry opens those trees lazily,
+/// creating one on first use (`CREATE TABLE`), handing back a cheap `AnyTree`
+/// clone for reads/writes, and dropping the tree + its directories on
+/// `DROP TABLE`. On construction it re-opens every table tree already on disk
+/// so a restart recovers them, repairing one whose open fails structurally.
 ///
 /// The open-handle map is per-process: it is a cache of `AnyTree` handles, not
 /// the authoritative table set. The catalogue of which tables exist is schema
@@ -116,22 +118,55 @@ pub fn columnar_batch_rows(batch: &ColumnBatch) -> StorageResult<Vec<(Vec<u8>, V
 /// trees share the engine's sequence-number generator and block cache so their
 /// MVCC seqno line and cache budget match the rest of the engine.
 pub struct ColumnarTableRegistry {
-    base_dir: PathBuf,
     /// The engine's filesystem backend. All directory operations and the table
     /// trees go through this, so a `MemFs`-backed engine never touches the host
     /// filesystem (a real `std::fs` write to the engine's virtual path would
     /// hit the host root and fail).
     fs: Arc<dyn Fs>,
-    seqno: SharedSequenceNumberGenerator,
-    cache: Arc<Cache>,
     settings: TableTreeSettings,
-    trees: Mutex<HashMap<String, AnyTree>>,
+    trees: Mutex<HashMap<String, TableEntry>>,
+}
+
+/// An open table: its tree, its write-pressure verdict and its life.
+struct TableEntry {
+    tree: AnyTree,
+    pressure: Arc<AtomicU8>,
+    alive: TableLife,
+}
+
+/// A table tree repaired while the registry opened it: its open failed
+/// structurally and the block-salvaging repair rebuilt it from its tables.
+#[derive(Debug)]
+pub struct TableRepair {
+    /// The table whose tree was repaired.
+    pub table: String,
+    /// The full repair outcome, lost key coverage included.
+    pub report: lsm_tree::RepairReport,
+}
+
+impl TableRepair {
+    /// `true` when the salvage dropped data, which a rebuild from a
+    /// checkpoint plus the journal restores.
+    #[must_use]
+    pub fn is_lossy(&self) -> bool {
+        !matches!(
+            self.report.wal_replay_scope(),
+            lsm_tree::WalReplayScope::TailOnly
+        )
+    }
 }
 
 /// What every table tree shares with the engine's partition trees.
 pub(crate) struct TableTreeSettings {
-    /// Durability of every fsync the table trees issue.
-    pub(crate) sync: SyncMode,
+    /// The tree config of a table, built as the engine builds a partition's
+    /// (compression, level routing, sync mode, filesystem, page ECC) on the
+    /// engine's sequence-number generator.
+    pub(crate) config: Box<dyn Fn(&str) -> Config + Send + Sync>,
+    /// Every endpoint's directory of table trees, the primary one (where a
+    /// table's manifest lives) first: a table's levels can lie under each.
+    pub(crate) roots: Vec<PathBuf>,
+    /// The block cache every tree shares.
+    pub(crate) cache: Arc<Cache>,
     /// The maintenance budget the table trees' compactions draw from.
     pub(crate) maintenance: Arc<RateLimiter>,
     /// The write buffer the table trees' unflushed bytes count toward.
@@ -140,6 +175,8 @@ pub(crate) struct TableTreeSettings {
     pub(crate) capacity: Arc<CapacityPool>,
     /// How each level encodes the column pages.
     pub(crate) column_encoding: ColumnEncodingPolicy,
+    /// The thresholds each table's write-pressure verdict is judged against.
+    pub(crate) backpressure: lsm_tree::BackpressureThresholds,
 }
 
 impl TableTreeSettings {
@@ -157,66 +194,82 @@ impl TableTreeSettings {
 }
 
 impl ColumnarTableRegistry {
-    /// Open the registry rooted at `base_dir` on `fs`, re-opening every table
-    /// tree already present on disk (restart recovery). Trees share `fs`,
-    /// `seqno`, `cache` and `settings` with the engine.
+    /// Open the registry on `fs`, re-opening every table tree already present
+    /// on disk (restart recovery) with the trees `settings` describes. A tree
+    /// whose open fails structurally (a lost manifest pointer, a corrupt
+    /// version log) is repaired by block salvage instead of failing the open;
+    /// the repairs are returned with the registry.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Engine`] if the base directory cannot be created
-    /// or an existing table tree fails to re-open.
+    /// Returns [`StorageError::Engine`] if the primary directory cannot be
+    /// created or read, or an existing table tree fails to open and cannot be
+    /// repaired.
     pub(crate) fn open(
-        base_dir: PathBuf,
         fs: Arc<dyn Fs>,
-        seqno: SharedSequenceNumberGenerator,
-        cache: Arc<Cache>,
         settings: TableTreeSettings,
-    ) -> StorageResult<Self> {
-        fs.create_dir_all(&base_dir)
-            .map_err(lsm_tree::Error::from)?;
-        let mut registry = Self {
-            base_dir,
+    ) -> StorageResult<(Self, Vec<TableRepair>)> {
+        let primary = settings
+            .roots
+            .first()
+            .cloned()
+            .ok_or_else(|| StorageError::InvalidConfig("no table directory".into()))?;
+        fs.create_dir_all(&primary).map_err(lsm_tree::Error::from)?;
+        let registry = Self {
             fs,
-            seqno,
-            cache,
             settings,
             trees: Mutex::new(HashMap::new()),
         };
         let mut trees = HashMap::new();
+        let mut repairs = Vec::new();
         for entry in registry
             .fs
-            .read_dir(&registry.base_dir)
+            .read_dir(&primary)
             .map_err(lsm_tree::Error::from)?
         {
             if !entry.is_dir {
                 continue;
             }
-            let tree = registry.open_tree(&entry.path)?;
-            trees.insert(entry.file_name, tree);
+            let (tree, repair) = registry.open_tree(&entry.file_name)?;
+            if let Some(report) = repair {
+                tracing::warn!(
+                    table = %entry.file_name,
+                    recovered = report.recovered,
+                    salvaged = report.salvaged,
+                    scope = ?report.wal_replay_scope(),
+                    "columnar table tree structurally repaired at open"
+                );
+                repairs.push(TableRepair {
+                    table: entry.file_name.clone(),
+                    report,
+                });
+            }
+            trees.insert(entry.file_name, TableEntry::new(tree));
         }
-        registry.trees = Mutex::new(trees);
-        Ok(registry)
+        *registry.trees.lock().unwrap_or_else(|e| e.into_inner()) = trees;
+        Ok((registry, repairs))
     }
 
-    /// Open (creating if absent) a columnar-mode tree at `dir`, sharing the
-    /// engine's filesystem, seqno generator, block cache and table settings.
-    fn open_tree(&self, dir: &Path) -> StorageResult<AnyTree> {
-        // visible_seqno = seqno: every write is immediately visible, matching
-        // the partition trees opened by the engine. with_shared_fs keeps the
-        // tree on the engine's filesystem backend (e.g. MemFs for in-memory
-        // engines).
+    /// Open (creating if absent) the columnar-mode tree of `table_id` with
+    /// the table settings, repairing it by block salvage if its open fails
+    /// structurally.
+    fn open_tree(
+        &self,
+        table_id: &str,
+    ) -> StorageResult<(AnyTree, Option<lsm_tree::RepairReport>)> {
         let settings = &self.settings;
-        let tree = Config::new_with_generators(dir, self.seqno.clone(), self.seqno.clone())
-            .with_shared_fs(Arc::clone(&self.fs))
-            .use_cache(Arc::clone(&self.cache))
-            .sync_mode(settings.sync)
+        let (tree, repair) = (settings.config)(table_id)
+            .use_cache(Arc::clone(&settings.cache))
             .compaction_rate_limiter(Arc::clone(&settings.maintenance))
             .write_buffer_budget(Arc::clone(&settings.write_buffer))
             .compaction_capacity(Arc::clone(&settings.capacity))
             .column_encoding_policy(settings.column_encoding.clone())
-            .open()?;
+            .open_or_repair(lsm_tree::RepairPolicy::default().salvage(true))?;
         enable_columnar(&tree)?;
-        Ok(tree)
+        if let AnyTree::Standard(t) = &tree {
+            t.update_runtime_config(|cfg| cfg.backpressure = settings.backpressure)?;
+        }
+        Ok((tree, repair))
     }
 
     /// Return the columnar tree for `table_id`, creating + opening it on first
@@ -244,14 +297,27 @@ impl ColumnarTableRegistry {
         table_id: &str,
         on_create: impl FnOnce(&AnyTree) -> StorageResult<()>,
     ) -> StorageResult<AnyTree> {
+        self.open_judged(table_id, on_create).map(|(tree, _)| tree)
+    }
+
+    /// [`Self::create_or_open_with`], with the table's write-pressure tier
+    /// (see [`Self::pressure`]) read under the same lock: what a write to
+    /// the table needs, for one lookup.
+    pub(crate) fn open_judged(
+        &self,
+        table_id: &str,
+        on_create: impl FnOnce(&AnyTree) -> StorageResult<()>,
+    ) -> StorageResult<(AnyTree, u8)> {
         let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(tree) = trees.get(table_id) {
-            return Ok(tree.clone());
+        if let Some(entry) = trees.get(table_id) {
+            return Ok((entry.tree.clone(), entry.pressure.load(Ordering::Relaxed)));
         }
-        let tree = self.open_tree(&self.base_dir.join(table_id))?;
+        // A new table's directory holds no tree to repair, and the monitor
+        // has not judged it.
+        let (tree, _) = self.open_tree(table_id)?;
         on_create(&tree)?;
-        trees.insert(table_id.to_owned(), tree.clone());
-        Ok(tree)
+        trees.insert(table_id.to_owned(), TableEntry::new(tree.clone()));
+        Ok((tree, 0))
     }
 
     /// Return the open columnar tree for `table_id`, or `None` if no such table
@@ -261,26 +327,44 @@ impl ColumnarTableRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(table_id)
-            .cloned()
+            .map(|entry| entry.tree.clone())
     }
 
-    /// Drop a table: release the tree handle and delete its directory.
+    /// The write-pressure tier (0/1/2 = none/slowdown/stop) the compaction
+    /// monitor last latched for `table_id`; 0 for a table it has not judged.
+    pub(crate) fn pressure(&self, table_id: &str) -> u8 {
+        self.trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(table_id)
+            .map_or(0, |entry| entry.pressure.load(Ordering::Relaxed))
+    }
+
+    /// Drop a table: release the tree handle and delete its directory under
+    /// every endpoint. A flush or compaction of its tree that is running is
+    /// waited for, and one still queued finds the table gone and does
+    /// nothing, so none writes into a directory the drop removed.
     /// Idempotent — dropping an unknown table removes nothing and succeeds.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Engine`] if the directory removal fails.
+    /// Returns [`StorageError::Engine`] if a directory removal fails.
     pub fn drop_table(&self, table_id: &str) -> StorageResult<()> {
-        self.trees
+        let entry = self
+            .trees
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(table_id);
-        let dir = self.base_dir.join(table_id);
-        match self.fs.remove_dir_all(&dir) {
-            Ok(()) => {}
-            // A table that was never written to disk has no directory yet.
-            Err(e) if e.kind() == lsm_tree::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StorageError::Engine(e.into())),
+        if let Some(entry) = entry {
+            *entry.alive.write() = false;
+        }
+        for root in &self.settings.roots {
+            match self.fs.remove_dir_all(&root.join(table_id)) {
+                Ok(()) => {}
+                // A table that was never written there has no directory.
+                Err(e) if e.kind() == lsm_tree::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StorageError::Engine(e.into())),
+            }
         }
         Ok(())
     }
@@ -295,17 +379,22 @@ impl ColumnarTableRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .filter_map(|t| t.get_highest_seqno())
+            .filter_map(|entry| entry.tree.get_highest_seqno())
             .max()
     }
 
-    /// Every registered table with its tree handle, unordered.
-    pub(crate) fn trees(&self) -> Vec<(String, AnyTree)> {
+    /// Every registered table with its tree handle and verdict, unordered.
+    pub(crate) fn trees(&self) -> Vec<TableTree> {
         self.trees
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(id, tree)| (id.clone(), tree.clone()))
+            .map(|(id, entry)| TableTree {
+                id: id.clone(),
+                tree: entry.tree.clone(),
+                pressure: Arc::clone(&entry.pressure),
+                alive: Arc::clone(&entry.alive),
+            })
             .collect()
     }
 
@@ -320,6 +409,17 @@ impl ColumnarTableRegistry {
             .collect();
         ids.sort();
         ids
+    }
+}
+
+impl TableEntry {
+    /// A live table the compaction monitor has not judged yet.
+    fn new(tree: AnyTree) -> Self {
+        Self {
+            tree,
+            pressure: Arc::new(AtomicU8::new(0)),
+            alive: Arc::new(parking_lot::RwLock::new(true)),
+        }
     }
 }
 

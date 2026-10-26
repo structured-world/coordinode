@@ -191,6 +191,241 @@ fn a_statement_flushes_a_columnar_table_only_without_a_journal() {
     );
 }
 
+/// Insert row `i` into `table`, rewrite its anchor row and flush: one more
+/// L0 run, overlapping every earlier one through the anchor (tables of
+/// disjoint keys would line up as one run). The table then holds `i + 1`
+/// rows of its own plus the anchor.
+fn flushed_row(engine: &StorageEngine, table: &str, i: u32) {
+    for key in [format!("row:{i:06}"), "row:anchor".to_string()] {
+        engine
+            .columnar_insert(
+                table,
+                key.into_bytes(),
+                i.to_le_bytes().to_vec(),
+                engine.next_seqno(),
+            )
+            .unwrap();
+    }
+    engine.flush_columnar_table(table).unwrap();
+}
+
+/// Wait up to ten seconds for `done`, failing with `what`.
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A table whose L0 passes the stop threshold is judged on its own: its
+/// writes meet `Stop`, while another table's and the partitions' commits are
+/// judged by their own trees and meet nothing. Without the table's verdict
+/// its writes were never held back at all.
+#[test]
+fn a_table_past_its_stop_threshold_is_stopped_alone() {
+    use crate::engine::core::WritePressure;
+    use crate::engine::partition::Partition;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = persistent_config(dir.path());
+    config.backpressure.l0_slowdown = 3;
+    config.backpressure.l0_stop = 5;
+    // Nothing compacts the runs away.
+    config.compaction_workers = 0;
+    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(&config, std::sync::Arc::clone(&oracle)).unwrap();
+    engine.create_columnar_table("cold").unwrap();
+    for i in 0..3 {
+        flushed_row(&engine, "hot", i);
+    }
+    eventually("three runs never slowed the table", || {
+        engine.columnar_write_pressure("hot") == WritePressure::Slowdown
+    });
+    for i in 3..6 {
+        flushed_row(&engine, "hot", i);
+    }
+    eventually("six runs never stopped the table", || {
+        engine.columnar_write_pressure("hot") == WritePressure::Stop
+    });
+    assert_eq!(engine.columnar_write_pressure("cold"), WritePressure::None);
+    assert_eq!(engine.write_pressure(), WritePressure::None);
+    // A partition commit is not held back by the table.
+    let snap = engine.snapshot();
+    let mut txn = crate::engine::transaction::Transaction::new(
+        &engine,
+        Some(&oracle),
+        coordinode_core::txn::timestamp::Timestamp::from_raw(snap),
+        Some(snap),
+    );
+    txn.put(Partition::Node, b"node:after-stop", b"v").unwrap();
+    let concern = coordinode_core::txn::write_concern::WriteConcern::default();
+    txn.commit(&crate::engine::transaction::CommitContext {
+        write_concern: &concern,
+        pipeline: None,
+        id_gen: None,
+    })
+    .unwrap();
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:after-stop")
+            .unwrap()
+            .as_deref(),
+        Some(&b"v"[..])
+    );
+}
+
+/// A table written and flushed statement by statement, as one without a
+/// journal is, piles up an L0 run per statement; the compaction scheduler
+/// keeps it from reaching the slowdown threshold under the sustained load and
+/// brings it back to the urgent threshold once the load stops, every row
+/// still reading.
+#[test]
+fn a_table_written_statement_by_statement_keeps_its_l0_low() {
+    use lsm_tree::AbstractTree;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = persistent_config(dir.path());
+    let engine = StorageEngine::open(&config).unwrap();
+    let mut highest = 0;
+    for i in 0..200 {
+        flushed_row(&engine, "trades", i);
+        let tree = engine.columnar_table_tree("trades").unwrap();
+        highest = highest.max(tree.l0_run_count());
+    }
+    assert!(
+        highest < config.backpressure.l0_slowdown,
+        "the table's L0 reached {highest} runs under the load"
+    );
+    let tree = engine.columnar_table_tree("trades").unwrap();
+    eventually("the table's L0 stayed above the urgent threshold", || {
+        tree.l0_run_count() <= config.compaction_l0_urgent_threshold
+    });
+    assert_eq!(engine.columnar_scan("trades", u64::MAX).unwrap().len(), 201);
+}
+
+/// Dropping a table whose flushes and compactions are queued and running
+/// leaves none of them writing into it: its directories are gone under every
+/// endpoint once the drop returns and stay gone, a new table of the same name
+/// starts empty and is compacted in its turn, and a reopen finds only it.
+#[test]
+fn a_dropped_table_leaves_no_maintenance_behind() {
+    use lsm_tree::AbstractTree;
+
+    let hot = tempfile::tempdir().unwrap();
+    let cold = tempfile::tempdir().unwrap();
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "hot",
+            hot.path(),
+            Media::Ssd,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let dirs = || {
+        [hot.path(), cold.path()].map(|root| root.join(crate::columnar::TABLES_DIR).join("scratch"))
+    };
+    {
+        let engine = StorageEngine::open(&config).unwrap();
+        for round in 0..3u32 {
+            for i in 0..40 {
+                flushed_row(&engine, "scratch", round * 40 + i);
+            }
+            // The flushes woke the compaction monitor: its requests are
+            // queued or running when the table goes.
+            engine.drop_columnar_table("scratch").unwrap();
+            for dir in dirs() {
+                assert!(!dir.exists(), "{dir:?} outlived the drop");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for dir in dirs() {
+            assert!(!dir.exists(), "{dir:?} came back after the drop");
+        }
+        for i in 0..12 {
+            flushed_row(&engine, "scratch", i);
+        }
+        let tree = engine.columnar_table_tree("scratch").unwrap();
+        eventually("the new table of the name was never compacted", || {
+            tree.l0_run_count() < 12
+        });
+        assert_eq!(engine.columnar_scan("scratch", u64::MAX).unwrap().len(), 13);
+    }
+    let engine = StorageEngine::open(&config).unwrap();
+    assert_eq!(engine.columnar_scan("scratch", u64::MAX).unwrap().len(), 13);
+}
+
+/// A reopen gives every table back to both schedulers: an existing table's
+/// L0 piled up after the reopen is compacted, and its verdict is judged
+/// against the configured thresholds.
+#[test]
+fn a_reopen_gives_every_table_back_to_the_schedulers() {
+    use crate::engine::core::WritePressure;
+    use lsm_tree::AbstractTree;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = StorageEngine::open(&persistent_config(dir.path())).unwrap();
+        flushed_row(&engine, "orders", 0);
+        flushed_row(&engine, "trades", 0);
+    }
+    {
+        let engine = StorageEngine::open(&persistent_config(dir.path())).unwrap();
+        for i in 1..13 {
+            flushed_row(&engine, "orders", i);
+        }
+        let tree = engine.columnar_table_tree("orders").unwrap();
+        eventually("a reopened table was never compacted", || {
+            tree.l0_run_count() < 13
+        });
+    }
+    let mut config = persistent_config(dir.path());
+    config.backpressure.l0_slowdown = 1;
+    config.backpressure.l0_stop = 2;
+    config.compaction_workers = 0;
+    let engine = StorageEngine::open(&config).unwrap();
+    for i in 1..3 {
+        flushed_row(&engine, "trades", i);
+    }
+    eventually("a reopened table was never judged", || {
+        engine.columnar_write_pressure("trades") == WritePressure::Stop
+    });
+}
+
+/// A table whose manifest is lost is repaired from its tables at open, as a
+/// partition is, instead of failing the engine: its rows read, the repair
+/// lost nothing so nothing is owed, and the next open repairs nothing.
+#[test]
+fn a_table_with_a_lost_manifest_is_salvaged_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = StorageEngine::open(&persistent_config(dir.path())).unwrap();
+        for i in 0..5 {
+            flushed_row(&engine, "trades", i);
+        }
+    }
+    super::tests::lose_manifest(&dir.path().join(crate::columnar::TABLES_DIR).join("trades"));
+
+    let engine = StorageEngine::open(&persistent_config(dir.path())).unwrap();
+    assert_eq!(engine.columnar_scan("trades", u64::MAX).unwrap().len(), 6);
+    assert!(
+        engine.lossy_table_repairs().is_empty(),
+        "a repair with every table intact owes nothing"
+    );
+    drop(engine);
+    let engine = StorageEngine::open(&persistent_config(dir.path())).unwrap();
+    assert!(engine.lossy_table_repairs().is_empty());
+    assert_eq!(engine.columnar_scan("trades", u64::MAX).unwrap().len(), 6);
+}
+
 #[test]
 fn drop_columnar_table_removes_it() {
     let dir = tempfile::tempdir().unwrap();

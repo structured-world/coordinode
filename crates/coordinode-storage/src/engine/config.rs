@@ -581,12 +581,13 @@ impl CompressionConfig {
 /// Write-backpressure thresholds.
 ///
 /// Three axes, each with a slowdown and a stop level: the L0 run count of a
-/// partition tree (a tall L0 is what spikes read amplification), the
-/// pending-compaction byte debt the leveled strategy reports for it, and the
-/// memtable bytes every tree of the engine holds unflushed together. Crossing
-/// a slowdown level raises the partition's compaction priority and shows up
-/// in metrics; crossing a stop level makes the engine's cached verdict
-/// `Stop`, which the commit path consults to reject new client writes
+/// tree, a partition's or a `STORAGE COLUMNAR` table's (a tall L0 is what
+/// spikes read amplification), the pending-compaction byte debt the leveled
+/// strategy reports for it, and the memtable bytes every tree of the engine
+/// holds unflushed together. Crossing a slowdown level raises the tree's
+/// compaction priority and shows up in metrics; crossing a stop level makes
+/// the verdict `Stop`, which the commit path (for a partition) or the
+/// table's writes (for a table) consult to reject new client writes
 /// (retryable) until compaction or flushes catch up. Defaults follow the
 /// RocksDB family of stall levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1339,57 +1340,7 @@ impl StorageConfig {
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         routing: Option<&crate::engine::routing::PartitionRouting>,
     ) -> lsm_tree::Config {
-        // Build compression policy — partition-level override or global.
-        let compression_policy = if let Some(overrides) = &self.partition_compression {
-            if let Some(&(_, codec)) = overrides.iter().find(|&&(p, _)| p == part) {
-                lsm_tree::config::CompressionPolicy::all(codec.to_lsm_tree())
-            } else {
-                self.compression.to_compression_policy()
-            }
-        } else {
-            self.compression.to_compression_policy()
-        };
-
-        // The lsm-tree primary `Config.path` lives at the first
-        // configured endpoint — that endpoint hosts the partition's
-        // manifest. SST files land at per-level paths derived from
-        // `routing`: L0-L1 on the hot endpoint, L2-L3 on warm, L4-L6
-        // on cold. Levels routed to the primary endpoint fall through
-        // to `Config.path` (no explicit `LevelRoute` emitted).
-        //
-        // When `routing` is `None` — the bootstrap case (Schema
-        // partition, tests using `with_endpoints_no_persistence`) —
-        // the partition stays single-tier on the primary endpoint.
-        let primary_endpoint_id = self.endpoints[0].id.clone();
-        let partition_dir = self.endpoints[0].path.join(part.name());
-        let mut config = lsm_tree::Config::new_with_generators(
-            partition_dir,
-            Arc::clone(&seqno),
-            Arc::clone(&seqno), // visible_seqno = seqno: all writes immediately visible
-        )
-        .data_block_compression_policy(compression_policy)
-        .sync_mode(self.oplog_sync_method.tree_sync_mode());
-
-        // Custom filesystem backend (e.g., MemFs for in-memory tests)
-        let fs_for_routes: Arc<dyn lsm_tree::fs::Fs> = if let Some(ref fs) = self.fs {
-            config = config.with_shared_fs(Arc::clone(fs));
-            Arc::clone(fs)
-        } else {
-            Arc::new(lsm_tree::fs::StdFs)
-        };
-
-        // Wire per-LSM-level endpoint routing into lsm-tree config.
-        if let Some(routing) = routing {
-            let routes = routing.to_level_routes(
-                &self.endpoints,
-                part.name(),
-                &primary_endpoint_id,
-                Arc::clone(&fs_for_routes),
-            );
-            if !routes.is_empty() {
-                config = config.level_routes(routes);
-            }
-        }
+        let mut config = self.base_tree_config(part, part.name(), seqno, routing);
 
         // Merge operators, per partition:
         //
@@ -1436,9 +1387,87 @@ impl StorageConfig {
         // prefix_scan("adj:KNOWS:out:") is the hot path for graph traversal.
         // Index entries are binary, so their boundaries are decoded instead.
         if part == Partition::Idx {
-            config = config.prefix_extractor(Arc::new(IndexEntryPrefix));
+            config.prefix_extractor(Arc::new(IndexEntryPrefix))
         } else {
-            config = config.prefix_extractor(Arc::new(ColonSeparatedPrefix));
+            config.prefix_extractor(Arc::new(ColonSeparatedPrefix))
+        }
+    }
+
+    /// The tree config of `STORAGE COLUMNAR` table `table_id`, built as a
+    /// partition's: a table holds node rows kept apart, so it takes the node
+    /// partition's compression and per-level `routing` (its levels land on
+    /// the endpoints the node partition's do, under `tables/<table_id>`),
+    /// with the engine's sync mode, filesystem and page ECC.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn to_table_tree_config(
+        &self,
+        table_id: &str,
+        seqno: lsm_tree::SharedSequenceNumberGenerator,
+        routing: Option<&crate::engine::routing::PartitionRouting>,
+    ) -> lsm_tree::Config {
+        let dir = std::path::Path::new(crate::columnar::TABLES_DIR).join(table_id);
+        self.base_tree_config(Partition::Node, &dir.to_string_lossy(), seqno, routing)
+            .prefix_extractor(Arc::new(ColonSeparatedPrefix))
+    }
+
+    /// What a tree config under `dir` (relative to each endpoint) shares
+    /// across trees: `part`'s compression (its override, else the global
+    /// policy), sync mode, filesystem, per-level `routing` and page ECC.
+    fn base_tree_config(
+        &self,
+        part: Partition,
+        dir: &str,
+        seqno: lsm_tree::SharedSequenceNumberGenerator,
+        routing: Option<&crate::engine::routing::PartitionRouting>,
+    ) -> lsm_tree::Config {
+        // Build compression policy: partition-level override or global.
+        let compression_policy = match self
+            .partition_compression
+            .as_ref()
+            .and_then(|overrides| overrides.iter().find(|&&(p, _)| p == part))
+        {
+            Some(&(_, codec)) => lsm_tree::config::CompressionPolicy::all(codec.to_lsm_tree()),
+            None => self.compression.to_compression_policy(),
+        };
+
+        // The lsm-tree primary `Config.path` lives at the first
+        // configured endpoint, which hosts the tree's manifest. SST files
+        // land at per-level paths derived from `routing`: L0-L1 on the hot
+        // endpoint, L2-L3 on warm, L4-L6 on cold. Levels routed to the
+        // primary endpoint fall through to `Config.path` (no explicit
+        // `LevelRoute` emitted).
+        //
+        // When `routing` is `None` (the bootstrap case: the Schema
+        // partition, tests using `with_endpoints_no_persistence`), the
+        // tree stays single-tier on the primary endpoint.
+        let primary_endpoint_id = self.endpoints[0].id.clone();
+        let mut config = lsm_tree::Config::new_with_generators(
+            self.endpoints[0].path.join(dir),
+            Arc::clone(&seqno),
+            Arc::clone(&seqno), // visible_seqno = seqno: all writes immediately visible
+        )
+        .data_block_compression_policy(compression_policy)
+        .sync_mode(self.oplog_sync_method.tree_sync_mode());
+
+        // Custom filesystem backend (e.g., MemFs for in-memory tests)
+        let fs_for_routes: Arc<dyn lsm_tree::fs::Fs> = if let Some(ref fs) = self.fs {
+            config = config.with_shared_fs(Arc::clone(fs));
+            Arc::clone(fs)
+        } else {
+            Arc::new(lsm_tree::fs::StdFs)
+        };
+
+        // Wire per-LSM-level endpoint routing into lsm-tree config.
+        if let Some(routing) = routing {
+            let routes = routing.to_level_routes(
+                &self.endpoints,
+                dir,
+                &primary_endpoint_id,
+                Arc::clone(&fs_for_routes),
+            );
+            if !routes.is_empty() {
+                config = config.level_routes(routes);
+            }
         }
 
         // Per-block Reed-Solomon page ECC. The lsm-tree

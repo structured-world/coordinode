@@ -560,10 +560,11 @@ with a measured reason.
 ### Write backpressure
 
 Sustained write bursts can outrun background compaction and flushes. The
-engine tracks that on three axes: per partition tree, the L0 run count (a tall
-L0 inflates read amplification) and the pending-compaction byte debt; and for
-the whole engine, the memtable bytes not yet flushed to tables. It turns them
-into a verdict against six thresholds under `storage.backpressure`:
+engine tracks that on three axes: per tree (every partition and every
+`STORAGE COLUMNAR` table), the L0 run count (a tall L0 inflates read
+amplification) and the pending-compaction byte debt; and for the whole
+engine, the memtable bytes not yet flushed to tables. It turns them into a
+verdict against six thresholds under `storage.backpressure`:
 
 ```yaml
 storage:
@@ -583,16 +584,22 @@ writes can take while the flushes fall behind them (a slow disk, a flush that
 fails and is retried); the unflushed bytes are exported as
 `coordinode_storage_unflushed_memtable_bytes`.
 
-Crossing a *slowdown* level raises that partition's compaction priority to
-urgent and is visible in metrics (`coordinode_storage_backpressure_tier`,
-`coordinode_storage_compaction_debt_bytes`); writes still proceed at full
-rate. Crossing a *stop* level makes commits carrying writes fail with a
-retryable `WRITE_BACKPRESSURE` error (gRPC `RESOURCE_EXHAUSTED` with
-`RetryInfo`) until compaction or the flushes drain below the threshold; official
-drivers back off and retry on it automatically. The server never sleeps
-inside the write path on either tier, read-only traffic is unaffected, and
-replicated (Raft) entry application is never gated. Changing the thresholds
-requires a restart.
+Crossing a *slowdown* level raises that tree's compaction priority to urgent
+and is visible in metrics (`coordinode_storage_backpressure_tier`,
+`coordinode_storage_compaction_debt_bytes`); writes proceed at full rate
+unless `write_slowdown_mb_per_sec` holds them to a rate. Crossing a *stop*
+level makes writes fail with a retryable `WRITE_BACKPRESSURE` error (gRPC
+`RESOURCE_EXHAUSTED` with `RetryInfo`) until compaction or the flushes drain
+below the threshold; official drivers back off and retry on it automatically.
+Each tree is judged on its own: the worst partition's verdict gates commits
+carrying writes to the graph, and a columnar table's verdict gates the
+statements writing that table, refused before any of their rows lands, so a
+table that fell behind does not stop the graph and the graph does not stop
+the table. The memtable axis is shared and gates both. The tables appear in
+the metrics as one series, `partition="tables"` (the worst table's tier and
+the tables' total debt), whatever their number; the warning logged on a stop
+names the table. Read-only traffic is unaffected, and replicated (Raft) entry
+application is never gated. Changing the thresholds requires a restart.
 
 ### Oplog
 

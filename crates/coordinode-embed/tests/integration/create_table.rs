@@ -184,6 +184,77 @@ fn drop_columnar_table_removes_tree_and_allows_recreate() {
     assert!(db.engine().columnar_table_tree("Trade").is_some());
 }
 
+/// A columnar table whose L0 crossed the stop threshold refuses the next
+/// statement writing it with `WriteBackpressure`, before any of its rows
+/// lands, while a write to the graph, judged by the partitions' own
+/// verdict, goes through.
+#[test]
+fn a_stopped_columnar_table_refuses_its_statements_and_not_the_graphs() {
+    use coordinode_embed::DatabaseError;
+    use coordinode_storage::engine::core::WritePressure;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+        coordinode_storage::engine::config::EndpointConfig::new(
+            "default",
+            dir.path(),
+            coordinode_storage::engine::config::Media::Hdd,
+            coordinode_storage::engine::config::Durability::Durable,
+            coordinode_storage::engine::config::Tier::Warm,
+        ),
+    ]);
+    config.backpressure.l0_slowdown = 2;
+    config.backpressure.l0_stop = 3;
+    // Every statement's rows outgrow the memtable and are flushed as a run
+    // of their own, and nothing compacts the runs away.
+    config.max_write_buffer_bytes = 4 * 1024;
+    config.compaction_workers = 0;
+    let mut db = Database::open_with_config(config).expect("open db");
+    db.execute_cypher("CREATE TABLE Event (kind STRING, body STRING) STORAGE COLUMNAR")
+        .expect("create");
+    let body = "x".repeat(8 * 1024);
+    let insert = format!("CREATE (:Event {{kind: 'tick', body: '{body}'}})");
+    let count = |db: &mut Database| {
+        db.execute_cypher("MATCH (e:Event) RETURN count(e) AS n")
+            .expect("count")[0]
+            .get("n")
+            .cloned()
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut written = 0i64;
+    while db.engine().columnar_write_pressure("Event") != WritePressure::Stop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{written} statements never stopped the table"
+        );
+        match db.execute_cypher(&insert) {
+            Ok(_) => written += 1,
+            // The verdict latched between the check and the statement.
+            Err(DatabaseError::WriteBackpressure) => {}
+            Err(e) => panic!("{e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(written >= 3, "{written} statements stopped the table");
+    assert_eq!(count(&mut db), Some(Value::Int(written)));
+
+    let refused = db.execute_cypher(&insert);
+    assert!(
+        matches!(refused, Err(DatabaseError::WriteBackpressure)),
+        "the stopped table took the statement: {:?}",
+        refused.map(|rows| rows.len())
+    );
+    assert_eq!(
+        count(&mut db),
+        Some(Value::Int(written)),
+        "no row of it landed"
+    );
+
+    assert_eq!(db.engine().write_pressure(), WritePressure::None);
+    db.execute_cypher("CREATE (:Plain {x: 1})")
+        .expect("the graph is judged by its own verdict");
+}
+
 #[test]
 fn drop_unknown_table_errors() {
     let dir = tempfile::tempdir().unwrap();

@@ -108,9 +108,43 @@ impl MemtablePressure {
     }
 }
 
-/// The trees that come and go while the engine runs (the `STORAGE COLUMNAR`
-/// tables), listed afresh on every monitor pass.
-pub(crate) type TableSource = Box<dyn Fn() -> Vec<(String, lsm_tree::AnyTree)> + Send>;
+/// A tree that comes and goes while the engine runs: a `STORAGE COLUMNAR`
+/// table's, with where its write-pressure verdict is latched.
+#[derive(Clone)]
+pub(crate) struct TableTree {
+    /// The table's id.
+    pub(crate) id: String,
+    /// Its tree.
+    pub(crate) tree: lsm_tree::AnyTree,
+    /// The table's own verdict (0/1/2 = none/slowdown/stop), latched by the
+    /// compaction monitor and read by the table's writes.
+    pub(crate) pressure: Arc<AtomicU8>,
+    /// Whether the table still exists: a flush or compaction of it runs
+    /// under a read guard and only while it does, and `DROP TABLE` sets it
+    /// false under the write guard, after the running ones, before its
+    /// directories go.
+    pub(crate) alive: TableLife,
+}
+
+/// The life of a table: read-held by the maintenance of its tree, written
+/// once by its drop.
+pub(crate) type TableLife = Arc<parking_lot::RwLock<bool>>;
+
+/// Run `work` on a tree while it lives: always for a partition (`None`), for
+/// a table only while its drop has not taken it. `None` when it was dropped.
+pub(crate) fn while_alive<T>(life: Option<&TableLife>, work: impl FnOnce() -> T) -> Option<T> {
+    match life {
+        None => Some(work()),
+        Some(life) => {
+            // Held across the work: the drop waits for it.
+            let alive = life.read();
+            if *alive { Some(work()) } else { None }
+        }
+    }
+}
+
+/// The tables, listed afresh on every monitor pass.
+pub(crate) type TableSource = Box<dyn Fn() -> Vec<TableTree> + Send>;
 
 /// Which tree a flush request is for: the name its log lines carry.
 enum FlushSource {
@@ -139,6 +173,8 @@ struct FlushRequest {
     /// once the flush returned, so the monitor asks again for a partition
     /// whose sealed memtables are still there and nobody is flushing.
     queued: Arc<AtomicBool>,
+    /// A table's life: its flush runs only while it lives.
+    life: Option<TableLife>,
 }
 
 /// Background memtable → SST flush worker pool.
@@ -313,7 +349,7 @@ impl TreeState {
 fn consider_tree(
     tree: &lsm_tree::AnyTree,
     state: &mut TreeState,
-    source: impl FnOnce() -> (FlushSource, u64),
+    source: impl FnOnce() -> (FlushSource, u64, Option<TableLife>),
     now: Instant,
     cfg: &FlushMonitorConfig,
     squeezed: bool,
@@ -345,12 +381,13 @@ fn consider_tree(
     // per tree at a time, because a flush takes every sealed memtable of its
     // tree.
     if tree.sealed_memtable_count() > 0 && !state.queued.load(Ordering::Acquire) {
-        let (source, gc_watermark) = source();
+        let (source, gc_watermark, life) = source();
         let req = FlushRequest {
             tree: tree.clone(),
             source,
             gc_watermark,
             queued: Arc::clone(&state.queued),
+            life,
         };
         state.queued.store(true, Ordering::Release);
         // Non-blocking: with the workers busy the request waits for the next
@@ -400,14 +437,21 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                 (
                     FlushSource::Partition(*partition),
                     cfg.gc_watermarks.for_partition(*partition),
+                    None,
                 )
             };
             consider_tree(tree, state, source, now, &cfg, squeezed, &mut next_due);
         }
         if let Some(tables) = &cfg.tables {
             let listed = tables();
-            table_states.retain(|table, _| listed.iter().any(|(id, _)| id == table));
-            for (table, tree) in listed {
+            table_states.retain(|table, _| listed.iter().any(|t| &t.id == table));
+            for TableTree {
+                id: table,
+                tree,
+                alive,
+                ..
+            } in listed
+            {
                 let state = table_states
                     .entry(table.clone())
                     .or_insert_with(|| TreeState::new(now));
@@ -417,6 +461,7 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                     (
                         FlushSource::Table(table),
                         cfg.gc_watermarks.for_partition(Partition::Node),
+                        Some(alive),
                     )
                 };
                 consider_tree(&tree, state, source, now, &cfg, squeezed, &mut next_due);
@@ -446,21 +491,28 @@ fn flush_worker_loop(
         source,
         gc_watermark,
         queued,
+        life,
     }) = receiver.recv()
     {
-        // get_flush_lock() is not Send: it is acquired and used in this thread.
-        let flush_lock = tree.get_flush_lock();
-        // Every entry a sealed memtable holds was journaled before it was
-        // applied, so a sync now covers them all.
-        let result = match journal.map_or(Ok(()), sync_journal) {
-            Ok(()) => tree.flush(&flush_lock, gc_watermark),
-            Err(e) => Err(lsm_tree::Error::Io(lsm_tree::io::Error::other(
-                e.to_string(),
-            ))),
-        };
-        drop(flush_lock);
+        let result = while_alive(life.as_ref(), || {
+            // get_flush_lock() is not Send: it is acquired and used in this
+            // thread.
+            let flush_lock = tree.get_flush_lock();
+            // Every entry a sealed memtable holds was journaled before it was
+            // applied, so a sync now covers them all.
+            match journal.map_or(Ok(()), sync_journal) {
+                Ok(()) => tree.flush(&flush_lock, gc_watermark),
+                Err(e) => Err(lsm_tree::Error::Io(lsm_tree::io::Error::other(
+                    e.to_string(),
+                ))),
+            }
+        });
         // Before the wake below, so the pass it starts may ask again.
         queued.store(false, Ordering::Release);
+        // A table dropped since the request was queued has nothing to flush.
+        let Some(result) = result else {
+            continue;
+        };
         match result {
             Ok(Some(bytes)) => {
                 tracing::debug!(

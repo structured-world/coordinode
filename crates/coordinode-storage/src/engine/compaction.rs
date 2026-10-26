@@ -6,7 +6,8 @@
 //! → Low) via a flume channel to N worker threads. Workers call
 //! `tree.compact(strategy, gc_watermark)` with the tree's own strategy of the
 //! configured kind. The `STORAGE COLUMNAR` tables, created and dropped at run
-//! time, are compacted with the partitions. Between events nothing
+//! time, are compacted with the partitions, and each gets its own
+//! backpressure verdict, which gates its writes. Between events nothing
 //! runs: an idle engine has nothing to compact, and asking every tree again
 //! on a timer only costs wakeups.
 //!
@@ -30,7 +31,7 @@ use std::sync::{
 use lsm_tree::AbstractTree;
 
 use crate::engine::coordinator::GcWatermarks;
-use crate::engine::flush::TableSource;
+use crate::engine::flush::{TableLife, TableSource, TableTree, while_alive};
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 use coordinode_core::txn::wake::Wake;
@@ -96,6 +97,8 @@ struct CompactionRequest {
     strategy: Arc<dyn lsm_tree::compaction::CompactionStrategy>,
     priority: CompactionPriority,
     gc_watermark: u64,
+    /// A table's life: its compaction runs only while it lives.
+    life: Option<TableLife>,
 }
 
 /// Background priority-based LSM compaction worker pool.
@@ -166,6 +169,7 @@ impl CompactionScheduler {
                 tree: t.clone(),
                 source: CompactionSource::Partition(p),
                 strategy: strategy.for_tree(),
+                table: None,
             })
             .collect();
 
@@ -248,6 +252,16 @@ struct MonitoredTree {
     tree: lsm_tree::AnyTree,
     source: CompactionSource,
     strategy: Arc<dyn lsm_tree::compaction::CompactionStrategy>,
+    /// A table's id, where its own verdict is latched and its life; `None`
+    /// for a partition, whose verdict joins the partitions' one.
+    table: Option<MonitoredTable>,
+}
+
+/// What the monitor keeps of a table beside its tree.
+struct MonitoredTable {
+    id: String,
+    pressure: Arc<std::sync::atomic::AtomicU8>,
+    life: TableLife,
 }
 
 /// What the monitor runs with, bundled to keep its signature short.
@@ -263,8 +277,9 @@ struct MonitorConfig {
 }
 
 /// Monitor loop: polls all trees, assigns priorities, submits requests, and
-/// latches the worst per-partition backpressure verdict into `write_pressure`
-/// (0/1/2 = none/slowdown/stop) for the commit-path check.
+/// latches the backpressure verdicts (0/1/2 = none/slowdown/stop): the worst
+/// partition's into `write_pressure` for the commit-path check, each table's
+/// into its own, which that table's writes check.
 fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: &Wake) {
     wake.bind();
     // A table's strategy lives as long as the table, as a partition's does.
@@ -272,19 +287,43 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
     while !cfg.shutdown.load(Ordering::Relaxed) {
         if let Some(source) = &cfg.tables {
             let listed = source();
-            tables.retain(|table, _| listed.iter().any(|(id, _)| id == table));
-            for (table, tree) in listed {
-                tables.entry(table).or_insert_with(|| MonitoredTree {
-                    tree,
-                    source: CompactionSource::Table,
-                    strategy: cfg.strategy.for_tree(),
-                });
+            tables.retain(|table, _| listed.iter().any(|t| &t.id == table));
+            for TableTree {
+                id,
+                tree,
+                pressure,
+                alive,
+            } in listed
+            {
+                // A table dropped and created again under its id since the
+                // last pass is a new tree with a new life.
+                let known = tables.get(&id).and_then(|m| m.table.as_ref());
+                if known.is_some_and(|t| Arc::ptr_eq(&t.life, &alive)) {
+                    continue;
+                }
+                tables.insert(
+                    id.clone(),
+                    MonitoredTree {
+                        tree,
+                        source: CompactionSource::Table,
+                        strategy: cfg.strategy.for_tree(),
+                        table: Some(MonitoredTable {
+                            id,
+                            pressure,
+                            life: alive,
+                        }),
+                    },
+                );
             }
         }
         // Build requests sorted by priority: Urgent (0) first, Low (3) last.
-        // Along the way, compute the worst backpressure tier across the
-        // partitions: the commit path it gates writes no columnar table.
+        // Along the way, judge every tree's backpressure: the partitions'
+        // worst gates the commit path, a table's gates that table's writes.
+        // The tables share one metrics label whatever their number: their
+        // worst tier and their total debt.
         let mut worst_tier: u8 = 0;
+        let mut tables_tier: u8 = 0;
+        let mut tables_debt: u64 = 0;
         let mut requests: Vec<CompactionRequest> = trees
             .iter()
             .chain(tables.values())
@@ -293,6 +332,7 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                     tree,
                     source,
                     strategy,
+                    table,
                 } = monitored;
                 let l0 = tree.l0_run_count();
                 let debt = tree.compaction_debt(strategy.as_ref());
@@ -309,35 +349,34 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                     debt,
                     cfg.debt_urgent_bytes,
                 );
-                if let CompactionSource::Partition(_) = source {
-                    let tier = match tree.write_backpressure(strategy.as_ref()) {
-                        lsm_tree::Backpressure::None => 0u8,
-                        lsm_tree::Backpressure::Slowdown { .. } => 1,
-                        lsm_tree::Backpressure::Stop => 2,
-                    };
-                    if tier == 2 {
-                        // An operator seeing WRITE_BACKPRESSURE rejections
-                        // needs to know which partition tripped it and on
-                        // which axis.
-                        tracing::warn!(
-                            partition = source.name(),
-                            l0_run_count = l0,
-                            compaction_debt_bytes = debt,
-                            "write-backpressure STOP: shedding client writes until \
-                             compaction catches up"
-                        );
+                let tier = match tree.write_backpressure(strategy.as_ref()) {
+                    lsm_tree::Backpressure::None => 0u8,
+                    lsm_tree::Backpressure::Slowdown { .. } => 1,
+                    lsm_tree::Backpressure::Stop => 2,
+                };
+                if tier == 2 {
+                    // An operator seeing WRITE_BACKPRESSURE rejections needs
+                    // to know which tree tripped it and on which axis.
+                    tracing::warn!(
+                        partition = source.name(),
+                        table = table.as_ref().map(|t| t.id.as_str()),
+                        l0_run_count = l0,
+                        compaction_debt_bytes = debt,
+                        "write-backpressure STOP: shedding client writes until \
+                         compaction catches up"
+                    );
+                }
+                match table {
+                    Some(MonitoredTable { pressure, .. }) => {
+                        pressure.store(tier, Ordering::Relaxed);
+                        tables_tier = tables_tier.max(tier);
+                        // Bytes on the endpoints' disks: far below u64::MAX.
+                        tables_debt += debt;
                     }
-                    worst_tier = worst_tier.max(tier);
-                    metrics::gauge!(
-                        "coordinode_storage_backpressure_tier",
-                        "partition" => source.name()
-                    )
-                    .set(f64::from(tier));
-                    metrics::gauge!(
-                        "coordinode_storage_compaction_debt_bytes",
-                        "partition" => source.name()
-                    )
-                    .set(debt as f64);
+                    None => {
+                        worst_tier = worst_tier.max(tier);
+                        record_pressure(source.name(), tier, debt);
+                    }
                 }
                 CompactionRequest {
                     tree: tree.clone(),
@@ -345,10 +384,14 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                     strategy: Arc::clone(strategy),
                     priority,
                     gc_watermark: cfg.gc_watermarks.for_partition(partition),
+                    life: table.as_ref().map(|t| Arc::clone(&t.life)),
                 }
             })
             .collect();
         cfg.write_pressure.store(worst_tier, Ordering::Relaxed);
+        if cfg.tables.is_some() {
+            record_pressure(CompactionSource::Table.name(), tables_tier, tables_debt);
+        }
 
         requests.sort_by_key(|r| r.priority);
 
@@ -361,6 +404,14 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
 
         wake.wait(None);
     }
+}
+
+/// Publish one metrics label's backpressure tier and compaction debt.
+fn record_pressure(label: &'static str, tier: u8, debt: u64) {
+    metrics::gauge!("coordinode_storage_backpressure_tier", "partition" => label)
+        .set(f64::from(tier));
+    metrics::gauge!("coordinode_storage_compaction_debt_bytes", "partition" => label)
+        .set(debt as f64);
 }
 
 /// Worker loop: receives compaction requests and runs each under its tree's
@@ -378,10 +429,16 @@ fn compaction_worker_loop(receiver: flume::Receiver<CompactionRequest>, compacte
         strategy,
         priority,
         gc_watermark,
+        life,
     }) = receiver.recv()
     {
         let started = std::time::Instant::now();
-        match tree.compact(strategy, gc_watermark) {
+        // A table dropped since the request was queued has nothing to compact.
+        let Some(result) = while_alive(life.as_ref(), || tree.compact(strategy, gc_watermark))
+        else {
+            continue;
+        };
+        match result {
             Ok(result) if result.action != lsm_tree::compaction::CompactionAction::Nothing => {
                 metrics::counter!("coordinode_storage_compaction_total", "partition" => source.name())
                     .increment(1);

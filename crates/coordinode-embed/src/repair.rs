@@ -119,6 +119,11 @@ pub struct RepairReport {
     pub corrupt_partitions: Vec<Partition>,
     /// Partitions actually rebuilt from a checkpoint this pass.
     pub repaired: Vec<Partition>,
+    /// `STORAGE COLUMNAR` tables needing a rebuild, by id: structurally
+    /// repaired at engine open with data loss, or a rebuild cut short.
+    pub corrupt_tables: Vec<String>,
+    /// Tables actually rebuilt from a checkpoint this pass.
+    pub repaired_tables: Vec<String>,
     /// The subset of [`repaired`](Self::repaired) restored range-scoped:
     /// only the key ranges the open-time salvage dropped were cleared and
     /// rebuilt, leaving every other SST untouched. Partitions repaired by a
@@ -188,7 +193,14 @@ pub fn verify_and_repair(
     corrupt.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
     corrupt.dedup();
 
-    if corrupt.is_empty() {
+    // A columnar table repaired with loss at open, or whose rebuild a crash
+    // cut short, is rebuilt from the checkpoint as a partition is.
+    let mut corrupt_tables = engine.lossy_table_repairs();
+    corrupt_tables.extend(engine.pending_table_rebuilds()?);
+    corrupt_tables.sort();
+    corrupt_tables.dedup();
+
+    if corrupt.is_empty() && corrupt_tables.is_empty() {
         return Ok(RepairReport {
             clean_after: true,
             ..RepairReport::default()
@@ -198,10 +210,12 @@ pub fn verify_and_repair(
     let Some(checkpoint) = latest_checkpoint(checkpoint_root) else {
         tracing::error!(
             ?corrupt,
+            ?corrupt_tables,
             "corruption detected but no checkpoint exists; restore from backup"
         );
         return Ok(RepairReport {
             corrupt_partitions: corrupt,
+            corrupt_tables,
             clean_after: false,
             ..RepairReport::default()
         });
@@ -223,11 +237,18 @@ pub fn verify_and_repair(
         repaired.push(*part);
         scoped.push(*part);
     }
+    let mut repaired_tables = Vec::with_capacity(corrupt_tables.len());
+    for table in &corrupt_tables {
+        engine.repair_table_from_checkpoint(&checkpoint, &oplog_since, table)?;
+        repaired_tables.push(table.clone());
+    }
 
     let after = scrub_all(engine, &ScrubConfig::default())?;
     Ok(RepairReport {
         corrupt_partitions: corrupt,
         repaired,
+        corrupt_tables,
+        repaired_tables,
         scoped,
         checkpoint_used: Some(checkpoint),
         clean_after: !after.has_errors(),

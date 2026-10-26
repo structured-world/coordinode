@@ -237,6 +237,11 @@ pub struct StorageEngine {
     /// open so a restart recovers the tables.
     #[cfg(feature = "columnar")]
     columnar_tables: Arc<crate::columnar::ColumnarTableRegistry>,
+    /// The columnar tables whose tree this open repaired by block salvage
+    /// and which still owe what it lost; a lossy one is rebuilt from a
+    /// checkpoint by the repair orchestrator, as a partition is.
+    #[cfg(feature = "columnar")]
+    table_repairs: parking_lot::Mutex<Vec<crate::columnar::TableRepair>>,
     /// Partitions whose tree failed to open with positively-identified
     /// structural damage and was repaired (manifest rebuild, block salvage)
     /// during THIS open. Consumed by the repair orchestrator: a lossy
@@ -823,7 +828,10 @@ impl StorageEngine {
         }
 
         // Pass 2: load/initialise routing for each non-Schema partition,
-        // then open it with `level_routes` wired.
+        // then open it with `level_routes` wired. The node partition's
+        // routing also places the columnar tables' levels.
+        #[cfg(feature = "columnar")]
+        let mut node_routing = None;
         for &part in Partition::all() {
             if part == Partition::Schema {
                 continue;
@@ -857,6 +865,10 @@ impl StorageEngine {
                 });
             }
             trees.insert(part, tree);
+            #[cfg(feature = "columnar")]
+            if part == Partition::Node {
+                node_routing = Some(routing);
+            }
         }
 
         // The index tree's installations are known before anything reads or
@@ -928,7 +940,10 @@ impl StorageEngine {
                                     "a partition's journal coverage record is damaged; the \
                                      partition is rebuilt from the latest checkpoint"
                                 );
-                                write_rebuild_intent(config.data_dir(), part)?;
+                                write_rebuild_intent(
+                                    config.data_dir(),
+                                    RebuildTarget::Partition(part),
+                                )?;
                             }
                             Err(e) => return Err(e),
                         }
@@ -951,7 +966,7 @@ impl StorageEngine {
                     // A tree whose rebuild was cut short is left alone: its
                     // record no longer says what it holds, and the repair that
                     // follows rebuilds it from the checkpoint and this journal.
-                    let rebuilding = read_rebuild_intents(config.data_dir())?;
+                    let rebuilding = read_rebuild_intents(config.data_dir())?.partitions;
                     if !crate::engine::local_journal::holes_covered(
                         &entries,
                         journal.next_index(),
@@ -1188,7 +1203,7 @@ impl StorageEngine {
         // Opened before the flush manager, which flushes them with the
         // partition trees.
         #[cfg(feature = "columnar")]
-        let columnar_tables = {
+        let (columnar_tables, table_repairs) = {
             // Use the engine's configured filesystem backend (MemFs for
             // in-memory engines) so columnar table trees never touch the host
             // filesystem when the engine is virtual.
@@ -1196,21 +1211,33 @@ impl StorageEngine {
                 .fs
                 .clone()
                 .unwrap_or_else(|| Arc::new(lsm_tree::fs::StdFs));
-            Arc::new(crate::columnar::ColumnarTableRegistry::open(
-                config.endpoints[0].path.join("tables"),
+            let tree_config = {
+                let config = config.clone();
+                let seqno = Arc::clone(&seqno);
+                move |table_id: &str| {
+                    config.to_table_tree_config(table_id, Arc::clone(&seqno), node_routing.as_ref())
+                }
+            };
+            let (registry, repairs) = crate::columnar::ColumnarTableRegistry::open(
                 fs,
-                Arc::clone(&seqno),
-                Arc::clone(&cache),
                 crate::columnar::TableTreeSettings {
-                    sync: config.oplog_sync_method.tree_sync_mode(),
+                    config: Box::new(tree_config),
+                    roots: config
+                        .endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.path.join(crate::columnar::TABLES_DIR))
+                        .collect(),
+                    cache: Arc::clone(&cache),
                     maintenance: Arc::clone(&maintenance),
                     write_buffer: Arc::clone(&write_buffer),
                     capacity: Arc::clone(&capacity_pool),
                     column_encoding: crate::columnar::TableTreeSettings::column_encoding_from(
                         config.columnar_encoded_from_level,
                     ),
+                    backpressure: config.backpressure.to_thresholds(),
                 },
-            )?)
+            )?;
+            (Arc::new(registry), repairs)
         };
         // The columnar tables, listed afresh on each pass of the flush and
         // compaction monitors.
@@ -1464,6 +1491,8 @@ impl StorageEngine {
             oracle,
             #[cfg(feature = "columnar")]
             columnar_tables,
+            #[cfg(feature = "columnar")]
+            table_repairs: parking_lot::Mutex::new(table_repairs),
             open_repairs,
             write_pressure,
             memtable_pressure,
@@ -1492,7 +1521,56 @@ impl StorageEngine {
                 engine.acknowledge_open_repair(repair.partition)?;
             }
         }
+        #[cfg(feature = "columnar")]
+        {
+            let settled: Vec<String> = engine
+                .table_repairs
+                .lock()
+                .iter()
+                .filter(|repair| !repair.is_lossy())
+                .map(|repair| repair.table.clone())
+                .collect();
+            for table in settled {
+                engine.acknowledge_table_repair(&table)?;
+            }
+        }
         Ok(engine)
+    }
+
+    /// The columnar tables whose tree an open repaired with loss and which
+    /// still owe a rebuild from a checkpoint plus the journal, by id. Empty
+    /// in a build without columnar support.
+    #[must_use]
+    pub fn lossy_table_repairs(&self) -> Vec<String> {
+        #[cfg(feature = "columnar")]
+        {
+            self.table_repairs
+                .lock()
+                .iter()
+                .map(|repair| repair.table.clone())
+                .collect()
+        }
+        #[cfg(not(feature = "columnar"))]
+        Vec::new()
+    }
+
+    /// Let `table`'s tree stop owing the report of the repair an open ran on
+    /// it, once what it lost is restored. `false` when none is owed.
+    #[cfg(feature = "columnar")]
+    fn acknowledge_table_repair(&self, table: &str) -> StorageResult<bool> {
+        use lsm_tree::AbstractTree as _;
+        let mut repairs = self.table_repairs.lock();
+        let Some(at) = repairs.iter().position(|repair| repair.table == table) else {
+            return Ok(false);
+        };
+        let Some(tree) = self.columnar_tables.get(table) else {
+            // A table dropped since owes nothing.
+            repairs.remove(at);
+            return Ok(false);
+        };
+        let acknowledged = tree.acknowledge_repair_report(repairs[at].report.id)?;
+        repairs.remove(at);
+        Ok(acknowledged)
     }
 
     /// Let `partition`'s tree stop owing the report of the repair this open
@@ -1707,6 +1785,22 @@ impl StorageEngine {
         WritePressure::from_u8(tables.max(memtables))
     }
 
+    /// The write-pressure verdict a write to `STORAGE COLUMNAR` table
+    /// `table_id` meets: the worse of the table's own (its L0 height and
+    /// compaction debt, latched by the compaction monitor) and the memtables'
+    /// shared one. The partitions' verdict does not hold the table's writes
+    /// back, nor does the table's hold theirs. `Stop` means its writes should
+    /// be rejected (retryable) until compaction or flushes drain.
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub fn columnar_write_pressure(&self, table_id: &str) -> WritePressure {
+        let table = self.columnar_tables.pressure(table_id);
+        let memtables = self
+            .memtable_pressure
+            .load(std::sync::atomic::Ordering::Relaxed);
+        WritePressure::from_u8(table.max(memtables))
+    }
+
     /// Test-only override of the cached pressure tier (the production value
     /// is latched by the compaction monitor, which is timing-dependent).
     #[cfg(test)]
@@ -1737,17 +1831,17 @@ impl StorageEngine {
     /// Returns [`StorageError::Engine`] if the tree cannot be opened.
     #[cfg(feature = "columnar")]
     pub fn create_columnar_table(&self, table_id: &str) -> StorageResult<lsm_tree::AnyTree> {
-        self.open_columnar_table(table_id)
+        self.open_columnar_table(table_id).map(|(tree, _)| tree)
     }
 
-    /// The tree of `table_id`, created on first use. A table created here
-    /// holds none of the entries journalled before it existed (those belonged
-    /// to a dropped table of the same name, if any), so on a journalled engine
-    /// it gets a coverage base at the journal's next index, made durable
-    /// before any row can reach it.
+    /// The tree of `table_id`, created on first use, with the table's own
+    /// write-pressure tier. A table created here holds none of the entries
+    /// journalled before it existed (those belonged to a dropped table of the
+    /// same name, if any), so on a journalled engine it gets a coverage base
+    /// at the journal's next index, made durable before any row can reach it.
     #[cfg(feature = "columnar")]
-    fn open_columnar_table(&self, table_id: &str) -> StorageResult<lsm_tree::AnyTree> {
-        self.columnar_tables.create_or_open_with(table_id, |tree| {
+    fn open_columnar_table(&self, table_id: &str) -> StorageResult<(lsm_tree::AnyTree, u8)> {
+        self.columnar_tables.open_judged(table_id, |tree| {
             let Some(oplog) = &self.oplog else {
                 return Ok(());
             };
@@ -1809,7 +1903,18 @@ impl StorageEngine {
         // routed back to the table registry on recovery, and the table's own
         // tree records its coverage. No journal (cluster mode / plain open /
         // in-memory) → durability follows the tree's own flush.
-        let tree = self.open_columnar_table(table_id)?;
+        let (tree, table_tier) = self.open_columnar_table(table_id)?;
+        // Under slowdown a row waits its turn at the write rate, as a commit
+        // does; the stop tier refuses the statement before its first row.
+        let memtable_tier = self
+            .memtable_pressure
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if WritePressure::from_u8(table_tier.max(memtable_tier)) == WritePressure::Slowdown {
+            let delay = self.write_slowdown_delay((key.len() + value.len()) as u64);
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+        }
         let index = match &self.oplog {
             Some(oplog) => {
                 let mut guard = oplog
@@ -2045,7 +2150,7 @@ impl StorageEngine {
             }
             for (table_id, rows) in &tables {
                 self.columnar_tables.drop_table(table_id)?;
-                let tree = self.open_columnar_table(table_id)?;
+                let (tree, _) = self.open_columnar_table(table_id)?;
                 if !rows.is_empty() {
                     let rows: Vec<crate::columnar::ColumnarRow<'_>> = rows
                         .iter()
@@ -2764,6 +2869,101 @@ impl StorageEngine {
         Ok(base_len)
     }
 
+    /// Rebuild `STORAGE COLUMNAR` table `table_id` from a checkpoint plus the
+    /// journal, as [`Self::repair_partition_from_checkpoint`] rebuilds a
+    /// partition: after an open-time salvage lost part of its tree, or a
+    /// rebuild cut short. The table's tree is replaced by the checkpoint's
+    /// rows, the entries of `oplog_since` the checkpoint's copy of the table
+    /// lacks are replayed into it, and its coverage record is bound to the
+    /// journal. A table the checkpoint does not hold (created after it) is
+    /// rebuilt from the journal alone. Returns the number of checkpoint rows
+    /// reinstalled.
+    ///
+    /// Precondition, as for a partition: no write to the table is in flight.
+    ///
+    /// # Errors
+    ///
+    /// The checkpoint cannot be opened or read, or the table's tree cannot be
+    /// replaced or written.
+    #[cfg(feature = "columnar")]
+    pub fn repair_table_from_checkpoint(
+        &self,
+        checkpoint_dir: &Path,
+        oplog_since: &[OplogEntry],
+        table_id: &str,
+    ) -> StorageResult<usize> {
+        // 1. The checkpoint's rows of the table and the record of which
+        //    journal entries they hold; the checkpoint engine is dropped
+        //    before the live table is touched.
+        let (base, held) = {
+            let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
+            match ckpt.columnar_tables.get(table_id) {
+                Some(tree) => (
+                    ckpt.columnar_scan(table_id, ckpt.snapshot())?,
+                    Some(TreeCoverage::read(&tree, Domain::Journal)?),
+                ),
+                None => (Vec::new(), None),
+            }
+        };
+
+        // 2. Replace the live tree with one holding the base. The drop is on
+        //    disk at once while the rebuilt rows are not, so the intent goes
+        //    first.
+        let target = RebuildTarget::Table(table_id);
+        write_rebuild_intent(&self.data_dir, target)?;
+        self.columnar_tables.drop_table(table_id)?;
+        let tree = self
+            .columnar_tables
+            .create_or_open_with(table_id, |_| Ok(()))?;
+        let base_len = base.len();
+        for (key, value) in base {
+            apply_columnar_row(&tree, key, value, self.next_seqno(), None)?;
+        }
+
+        // 3. Replay the table's rows the base lacks, each at its entry's ts
+        //    with its marker, rolling the table forward to the journal's end.
+        for entry in oplog_since {
+            if held.as_ref().is_some_and(|h| h.contains(entry.index, 0)) {
+                continue;
+            }
+            for op in crate::oplog::convert::resolve_entry_ops(&entry.ops)?.iter() {
+                if let OplogOp::ColumnarInsert {
+                    table_id: table,
+                    key,
+                    value,
+                } = op
+                {
+                    if table == table_id {
+                        apply_columnar_row(
+                            &tree,
+                            key.clone(),
+                            value.clone(),
+                            entry.ts,
+                            Some(entry.index),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // 4. The tree holds every applied entry now: record it, after the
+        //    rebuilt rows, then persist the tree and drop the intent.
+        if let Some(coverage) = &self.coverage {
+            let (next, above) = coverage.applied_snapshot();
+            let domain = Domain::Journal;
+            let at = self.next_seqno();
+            tree.insert(domain.base_key(), coverage::encode_base(next, &[]), at);
+            for index in above {
+                tree.insert(domain.marker_key(index, 0).as_slice(), &[][..], at);
+            }
+        }
+        self.flush_memtables(&tree)?;
+        remove_rebuild_intent(&self.data_dir, target)?;
+        // What an open-time salvage of the table lost is restored.
+        self.acknowledge_table_repair(table_id)?;
+        Ok(base_len)
+    }
+
     /// This node's own records in `partition` (see
     /// [`raft_coverage::is_node_local`]), read from the live tree.
     fn node_local_rows(&self, partition: Partition) -> StorageResult<Rows> {
@@ -2815,14 +3015,24 @@ impl StorageEngine {
     ///
     /// The intent directory cannot be read.
     pub fn pending_rebuilds(&self) -> StorageResult<Vec<Partition>> {
-        read_rebuild_intents(&self.data_dir)
+        Ok(read_rebuild_intents(&self.data_dir)?.partitions)
+    }
+
+    /// The `STORAGE COLUMNAR` tables whose rebuild started and did not
+    /// finish, by id: like a partition's, only a new rebuild restores them.
+    ///
+    /// # Errors
+    ///
+    /// The intent directory cannot be read.
+    pub fn pending_table_rebuilds(&self) -> StorageResult<Vec<String>> {
+        Ok(read_rebuild_intents(&self.data_dir)?.tables)
     }
 
     /// Record, durably, that `partition` is about to be rebuilt. Written
     /// before the tree is cleared and removed by [`Self::finish_rebuild`]
     /// once the rebuilt tree is on disk.
     fn begin_rebuild(&self, partition: Partition) -> StorageResult<()> {
-        write_rebuild_intent(&self.data_dir, partition)
+        write_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))
     }
 
     /// Persist the rebuilt tree of `partition`, then drop its intent.
@@ -2832,15 +3042,7 @@ impl StorageEngine {
             // The dictionary was rebuilt: views read before it reread it.
             self.note_field_dictionary_change();
         }
-        let dir = self.data_dir.join(REBUILD_INTENT_DIR);
-        let io = |what: &str, e: std::io::Error| {
-            StorageError::Io(format!(
-                "rebuild intent for {}: {what}: {e}",
-                partition.name()
-            ))
-        };
-        std::fs::remove_file(dir.join(partition.name())).map_err(|e| io("remove", e))?;
-        sync_dir(&dir)
+        remove_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))
     }
 
     /// Apply one journal op during a checkpoint rebuild (shared by the full
@@ -6243,43 +6445,86 @@ fn release_cache_layers(
     }
 }
 
-/// Record, durably, that `partition` of the store at `data_dir` holds an
+/// The rebuild intent file of a `STORAGE COLUMNAR` table is its id behind
+/// this prefix, so a table never names a partition's.
+const TABLE_INTENT_PREFIX: &str = "table.";
+
+/// A tree a rebuild intent names.
+#[derive(Debug, Clone, Copy)]
+enum RebuildTarget<'a> {
+    Partition(Partition),
+    #[cfg_attr(not(feature = "columnar"), allow(dead_code))]
+    Table(&'a str),
+}
+
+impl RebuildTarget<'_> {
+    /// The intent's file name.
+    fn file_name(self) -> String {
+        match self {
+            Self::Partition(partition) => partition.name().to_string(),
+            Self::Table(table) => format!("{TABLE_INTENT_PREFIX}{table}"),
+        }
+    }
+}
+
+/// Record, durably, that `target` of the store at `data_dir` holds an
 /// unknown part of its data and of its coverage record, and must be rebuilt.
-fn write_rebuild_intent(data_dir: &Path, partition: Partition) -> StorageResult<()> {
+fn write_rebuild_intent(data_dir: &Path, target: RebuildTarget<'_>) -> StorageResult<()> {
     let dir = data_dir.join(REBUILD_INTENT_DIR);
+    let name = target.file_name();
     let io = |what: &str, e: std::io::Error| {
-        StorageError::Io(format!(
-            "rebuild intent for {}: {what}: {e}",
-            partition.name()
-        ))
+        StorageError::Io(format!("rebuild intent for {name}: {what}: {e}"))
     };
     // no-std: StoragePort trait, caller-injected
     std::fs::create_dir_all(&dir).map_err(|e| io("create dir", e))?;
-    let file = std::fs::File::create(dir.join(partition.name())).map_err(|e| io("create", e))?;
+    let file = std::fs::File::create(dir.join(&name)).map_err(|e| io("create", e))?;
     file.sync_all().map_err(|e| io("sync", e))?;
     sync_dir(&dir)?;
     sync_dir(data_dir)
 }
 
-fn read_rebuild_intents(data_dir: &Path) -> StorageResult<Vec<Partition>> {
+/// Drop the rebuild intent of `target`, its rebuilt tree on disk.
+fn remove_rebuild_intent(data_dir: &Path, target: RebuildTarget<'_>) -> StorageResult<()> {
+    let dir = data_dir.join(REBUILD_INTENT_DIR);
+    let name = target.file_name();
+    // no-std: StoragePort trait, caller-injected
+    std::fs::remove_file(dir.join(&name))
+        .map_err(|e| StorageError::Io(format!("rebuild intent for {name}: remove: {e}")))?;
+    sync_dir(&dir)
+}
+
+/// The trees whose rebuild started and did not finish.
+#[derive(Debug, Default)]
+struct RebuildIntents {
+    partitions: Vec<Partition>,
+    tables: Vec<String>,
+}
+
+fn read_rebuild_intents(data_dir: &Path) -> StorageResult<RebuildIntents> {
     let dir = data_dir.join(REBUILD_INTENT_DIR);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RebuildIntents::default());
+        }
         Err(e) => return Err(StorageError::Io(format!("read {dir:?}: {e}"))),
     };
-    let mut pending = Vec::new();
+    let mut pending = RebuildIntents::default();
     for entry in entries {
         let entry = entry.map_err(|e| StorageError::Io(format!("entry in {dir:?}: {e}")))?;
         let name = entry.file_name();
+        let unknown = || StorageError::Io(format!("unknown rebuild intent {name:?} in {dir:?}"));
+        let name = name.to_str().ok_or_else(unknown)?;
+        if let Some(table) = name.strip_prefix(TABLE_INTENT_PREFIX) {
+            pending.tables.push(table.to_string());
+            continue;
+        }
         let part = Partition::all()
             .iter()
             .copied()
-            .find(|p| name.as_os_str() == p.name())
-            .ok_or_else(|| {
-                StorageError::Io(format!("unknown rebuild intent {name:?} in {dir:?}"))
-            })?;
-        pending.push(part);
+            .find(|p| name == p.name())
+            .ok_or_else(unknown)?;
+        pending.partitions.push(part);
     }
     Ok(pending)
 }

@@ -1,5 +1,49 @@
 use super::*;
 
+/// A columnar table's tree lands its levels where the node partition's land,
+/// under `tables/<id>` on each endpoint instead of `node`, with its manifest
+/// on the primary endpoint and a prefix extractor for its node keys.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_table_tree_lands_its_levels_where_the_node_partition_does() {
+    use crate::engine::routing::PartitionRouting;
+    use std::path::PathBuf;
+
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new("hot", "/hot", Media::Nvme, Durability::Durable, Tier::Hot),
+        EndpointConfig::new("warm", "/warm", Media::Ssd, Durability::Durable, Tier::Warm),
+        EndpointConfig::new("cold", "/cold", Media::Hdd, Durability::Durable, Tier::Cold),
+    ]);
+    let routing = PartitionRouting::default_for_endpoints(&config.endpoints);
+    let seqno: lsm_tree::SharedSequenceNumberGenerator =
+        Arc::new(lsm_tree::SequenceNumberCounter::default());
+    let routes = |tree: &lsm_tree::Config| {
+        tree.level_routes.as_ref().map(|routes| {
+            routes
+                .iter()
+                .map(|route| (route.levels.clone(), route.path.clone()))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let table = config.to_table_tree_config("trades", Arc::clone(&seqno), Some(&routing));
+    let node = config.to_tree_config_with_routing(Partition::Node, seqno, Some(&routing));
+    assert_eq!(table.path, PathBuf::from("/hot/tables/trades"));
+    assert_eq!(
+        routes(&table),
+        Some(vec![
+            (2..4, PathBuf::from("/warm/tables/trades")),
+            (4..7, PathBuf::from("/cold/tables/trades")),
+        ])
+    );
+    assert_eq!(
+        routes(&node).map(|r| r.into_iter().map(|(levels, _)| levels).collect::<Vec<_>>()),
+        Some(vec![2..4, 4..7]),
+        "the node partition's levels land on the same endpoints"
+    );
+    assert!(table.prefix_extractor.is_some());
+}
+
 #[test]
 fn compression_codec_default_is_lz4() {
     assert_eq!(CompressionCodec::default(), CompressionCodec::Lz4);

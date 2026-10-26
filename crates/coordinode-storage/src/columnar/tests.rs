@@ -1,14 +1,27 @@
 use super::*;
 use lsm_tree::Config;
+use lsm_tree::SharedSequenceNumberGenerator;
+use lsm_tree::fs::SyncMode;
 
-/// The engine's defaults for the table trees, syncing at `sync`.
-fn settings(sync: SyncMode) -> TableTreeSettings {
+/// The engine's defaults for the table trees under `roots` (the first the
+/// primary) on `fs`, syncing at `sync`.
+fn settings(roots: Vec<PathBuf>, fs: Arc<dyn Fs>, sync: SyncMode) -> TableTreeSettings {
+    let seqno: SharedSequenceNumberGenerator =
+        std::sync::Arc::new(lsm_tree::SequenceNumberCounter::default());
+    let primary = roots[0].clone();
     TableTreeSettings {
-        sync,
+        config: Box::new(move |table_id| {
+            Config::new_with_generators(primary.join(table_id), seqno.clone(), seqno.clone())
+                .with_shared_fs(Arc::clone(&fs))
+                .sync_mode(sync)
+        }),
+        roots,
+        cache: std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(8 * 1024 * 1024)),
         maintenance: std::sync::Arc::new(RateLimiter::new(0)),
         write_buffer: std::sync::Arc::new(lsm_tree::WriteBufferBudget::default()),
         capacity: std::sync::Arc::new(lsm_tree::CapacityPool::default()),
         column_encoding: TableTreeSettings::column_encoding_from(3),
+        backpressure: lsm_tree::BackpressureThresholds::default(),
     }
 }
 
@@ -56,17 +69,13 @@ fn write_columnar_rows_succeeds_on_columnar_tree() {
 
 fn new_registry(base: &std::path::Path) -> ColumnarTableRegistry {
     let fs: std::sync::Arc<dyn lsm_tree::fs::Fs> = std::sync::Arc::new(lsm_tree::fs::StdFs);
-    let seqno: SharedSequenceNumberGenerator =
-        std::sync::Arc::new(lsm_tree::SequenceNumberCounter::default());
-    let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(8 * 1024 * 1024));
-    ColumnarTableRegistry::open(
-        base.to_path_buf(),
-        fs,
-        seqno,
-        cache,
-        settings(SyncMode::Full),
+    let (registry, repairs) = ColumnarTableRegistry::open(
+        Arc::clone(&fs),
+        settings(vec![base.to_path_buf()], fs, SyncMode::Full),
     )
-    .unwrap()
+    .unwrap();
+    assert!(repairs.is_empty(), "{repairs:?}");
+    registry
 }
 
 #[test]
@@ -108,6 +117,51 @@ fn registry_drop_removes_table() {
     reg.drop_table("missing").unwrap();
 }
 
+/// A drop waits for the maintenance running on the table's tree before its
+/// directory goes, and maintenance that reaches the tree after the drop finds
+/// it gone and does nothing: no flush or compaction writes into a directory
+/// being removed.
+#[test]
+fn a_drop_waits_for_running_maintenance_and_turns_away_the_rest() {
+    use crate::engine::flush::while_alive;
+
+    let dir = tempfile::tempdir().unwrap();
+    let reg = Arc::new(new_registry(dir.path()));
+    reg.create_or_open("t").unwrap();
+    let table = reg.trees().pop().expect("the table");
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (finish, finish_rx) = std::sync::mpsc::channel::<()>();
+    let life = Arc::clone(&table.alive);
+    let maintenance = std::thread::spawn(move || {
+        while_alive(Some(&life), || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        })
+    });
+    started.recv().unwrap();
+
+    let dropper = {
+        let reg = Arc::clone(&reg);
+        std::thread::spawn(move || reg.drop_table("t"))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !dropper.is_finished(),
+        "the drop did not wait for the maintenance"
+    );
+    assert!(dir.path().join("t").exists());
+    finish.send(()).unwrap();
+    assert_eq!(maintenance.join().unwrap(), Some(()));
+    dropper.join().unwrap().unwrap();
+    assert!(!dir.path().join("t").exists());
+
+    assert_eq!(
+        while_alive(Some(&table.alive), || ()),
+        None,
+        "maintenance queued before the drop ran after it"
+    );
+}
+
 #[test]
 fn registry_recovers_tables_on_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -137,11 +191,12 @@ fn table_trees_sync_at_the_registry_mode() {
                     lsm_tree::fs::StdFs,
                     std::sync::Arc::clone(&injector),
                 ));
-            let seqno: SharedSequenceNumberGenerator =
-                std::sync::Arc::new(lsm_tree::SequenceNumberCounter::default());
-            let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(1024 * 1024));
-            ColumnarTableRegistry::open(dir.path().to_path_buf(), fs, seqno, cache, settings(mode))
-                .unwrap()
+            ColumnarTableRegistry::open(
+                Arc::clone(&fs),
+                settings(vec![dir.path().to_path_buf()], fs, mode),
+            )
+            .unwrap()
+            .0
         };
 
         let tree = open().create_or_open("orders").unwrap();

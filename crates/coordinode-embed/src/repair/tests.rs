@@ -732,6 +732,177 @@ fn lossy_open_repair_forces_checkpoint_rebuild() {
     );
 }
 
+/// A columnar table whose tree an open repaired with loss (a lost manifest
+/// over corrupt post-checkpoint tables) is rebuilt as a partition is: the
+/// orchestrator restores the checkpoint's rows and replays the journal's,
+/// the table reads whole, and neither the repair nor a rebuild is owed after.
+#[test]
+fn a_lossy_table_repair_rebuilds_the_table_from_the_checkpoint() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let open = || {
+        StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded")
+    };
+    let row = |engine: &StorageEngine, i: u32, value: &[u8]| {
+        engine
+            .columnar_insert(
+                "trades",
+                format!("row:{i:06}").into_bytes(),
+                value.to_vec(),
+                oracle.next().as_raw(),
+            )
+            .expect("columnar insert");
+    };
+    {
+        let engine = open();
+        for i in 0..50 {
+            row(&engine, i, b"base-A");
+        }
+        create_checkpoint(&engine, &root).expect("checkpoint");
+        for i in 50..80 {
+            row(&engine, i, b"tail-B");
+        }
+        engine.persist().expect("persist");
+    }
+
+    let table_dir = dir.path().join("tables").join("trades");
+    let corrupted = corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root);
+    assert!(corrupted > 0, "test must corrupt a post-checkpoint table");
+    lose_manifest(&table_dir);
+
+    let engine = open();
+    assert_eq!(engine.lossy_table_repairs(), vec!["trades".to_string()]);
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert_eq!(
+        report.corrupt_tables,
+        vec!["trades".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(
+        report.repaired_tables,
+        vec!["trades".to_string()],
+        "{report:?}"
+    );
+    assert!(report.is_clean(), "{report:?}");
+    let rows = engine
+        .columnar_scan("trades", u64::MAX)
+        .expect("scan the rebuilt table");
+    assert_eq!(rows.len(), 80);
+    assert!(rows[..50].iter().all(|(_, v)| v == b"base-A"));
+    assert!(rows[50..].iter().all(|(_, v)| v == b"tail-B"));
+    assert!(engine.lossy_table_repairs().is_empty());
+    assert!(engine.pending_table_rebuilds().expect("intents").is_empty());
+
+    drop(engine);
+    let engine = open();
+    assert!(engine.lossy_table_repairs().is_empty());
+    assert_eq!(
+        engine
+            .columnar_scan("trades", u64::MAX)
+            .expect("scan")
+            .len(),
+        80
+    );
+}
+
+/// A table rebuild a crash cut short leaves its intent, and only that says
+/// the table holds an unknown part of its rows: the next pass rebuilds it
+/// again from the checkpoint and the journal, and drops the intent. The
+/// table's name may be a partition's without being taken for it.
+#[test]
+fn a_table_rebuild_cut_short_is_rebuilt_again() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let open = || {
+        StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded")
+    };
+    {
+        let engine = open();
+        for i in 0..10u32 {
+            engine
+                .columnar_insert(
+                    "node",
+                    format!("row:{i:06}").into_bytes(),
+                    b"kept".to_vec(),
+                    oracle.next().as_raw(),
+                )
+                .expect("columnar insert");
+        }
+        create_checkpoint(&engine, &root).expect("checkpoint");
+    }
+    // The intent a rebuild writes before it clears the table.
+    let intents = dir.path().join("rebuild");
+    std::fs::create_dir_all(&intents).expect("intent dir");
+    std::fs::write(intents.join("table.node"), b"").expect("intent");
+
+    let engine = open();
+    assert_eq!(
+        engine.pending_table_rebuilds().expect("intents"),
+        vec!["node".to_string()]
+    );
+    assert!(engine.pending_rebuilds().expect("intents").is_empty());
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert_eq!(
+        report.repaired_tables,
+        vec!["node".to_string()],
+        "{report:?}"
+    );
+    assert!(report.repaired.is_empty(), "{report:?}");
+    assert!(report.is_clean(), "{report:?}");
+    assert!(engine.pending_table_rebuilds().expect("intents").is_empty());
+    assert_eq!(
+        engine.columnar_scan("node", u64::MAX).expect("scan").len(),
+        10
+    );
+}
+
+/// A lossy table repair with no checkpoint to rebuild from is reported, not
+/// absorbed: the table is listed, nothing claims a rebuild, and the next open
+/// reports the same loss.
+#[test]
+fn a_lossy_table_repair_without_a_checkpoint_reports_not_clean() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let open = || {
+        StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded")
+    };
+    {
+        let engine = open();
+        for i in 0..40u32 {
+            engine
+                .columnar_insert(
+                    "trades",
+                    format!("row:{i:06}").into_bytes(),
+                    b"unbacked".to_vec(),
+                    oracle.next().as_raw(),
+                )
+                .expect("columnar insert");
+        }
+        engine.persist().expect("persist");
+    }
+    let table_dir = dir.path().join("tables").join("trades");
+    assert!(corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root) > 0);
+    lose_manifest(&table_dir);
+
+    let engine = open();
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert_eq!(
+        report.corrupt_tables,
+        vec!["trades".to_string()],
+        "{report:?}"
+    );
+    assert!(report.repaired_tables.is_empty(), "{report:?}");
+    assert!(!report.is_clean(), "{report:?}");
+    drop(engine);
+    assert_eq!(open().lossy_table_repairs(), vec!["trades".to_string()]);
+}
+
 /// The reported dead end: a lossy open repair with NO checkpoint to rebuild
 /// from. The loss must be REPORTED (partition listed, not clean), never
 /// silently absorbed, and nothing may claim a repair happened.

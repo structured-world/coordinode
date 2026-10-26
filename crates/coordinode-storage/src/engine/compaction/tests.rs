@@ -179,6 +179,7 @@ fn a_compaction_that_did_work_is_counted_for_its_partition() {
                 strategy: CompactionStrategyKind::Leveled.for_tree(),
                 priority: CompactionPriority::Urgent,
                 gc_watermark: seqno.get(),
+                life: None,
             })
             .expect("queue");
     }
