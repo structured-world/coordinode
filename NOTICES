@@ -29,6 +29,18 @@ the original authors is carried in that crate's own repository and source
 headers, not here.
 
 
+## Embedded data
+
+`crates/coordinode-search/data/jieba/dict.txt.zst` is jieba's default Chinese
+dictionary, `src/data/dict.txt` of `jieba-rs` 0.11.0 (MIT, Copyright (c)
+2018 - 2019 messense, Copyright (c) 2019 Paul Meng; the dictionary comes from
+the jieba project, MIT, Copyright (c) 2013 Sun Junyi), recompressed with zstd.
+Both licences, in full, are in `crates/coordinode-search/data/jieba/LICENSE`
+beside it. It is unmodified: it
+decodes to the original byte for byte, which the crate's tests check. It is
+built into binaries with the `cjk-zh` feature.
+
+
 ## Provenance
 
 During private development, before the first public release (April 2026),

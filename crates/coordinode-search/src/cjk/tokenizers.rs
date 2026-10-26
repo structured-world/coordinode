@@ -40,20 +40,30 @@ pub struct JiebaTokenizer {
     jieba: Arc<jieba_rs::Jieba>,
 }
 
+/// jieba's default dictionary (jieba-rs 0.11.0 `src/data/dict.txt`, MIT; see
+/// `assets/jieba/LICENSE`), compressed with zstd: `zstd -19 dict.txt -o
+/// dict.txt.zst`. jieba-rs embeds the same file compressed with C zstd, which
+/// is why its default dictionary is not used.
 #[cfg(feature = "cjk-zh")]
-impl Default for JiebaTokenizer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+const DEFAULT_DICT_ZST: &[u8] = include_bytes!("../../assets/jieba/dict.txt.zst");
 
 #[cfg(feature = "cjk-zh")]
 impl JiebaTokenizer {
     /// Create a new jieba tokenizer with the default embedded dictionary.
-    pub fn new() -> Self {
-        Self {
-            jieba: Arc::new(jieba_rs::Jieba::new()),
-        }
+    ///
+    /// # Errors
+    ///
+    /// The embedded dictionary does not decode or parse: a broken build,
+    /// which the crate's tests catch.
+    pub fn new() -> Result<Self, String> {
+        let mut dict = std::io::BufReader::new(structured_zstd::decoding::StreamingDecoder::new(
+            DEFAULT_DICT_ZST,
+        ));
+        let jieba = jieba_rs::Jieba::with_dict(&mut dict)
+            .map_err(|e| format!("failed to load the embedded jieba dictionary: {e}"))?;
+        Ok(Self {
+            jieba: Arc::new(jieba),
+        })
     }
 
     /// Create a jieba tokenizer loading the dictionary from a file path.

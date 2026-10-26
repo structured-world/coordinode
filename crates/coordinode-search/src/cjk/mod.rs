@@ -72,7 +72,7 @@ impl CjkDictConfig {
         if let Some(ref path) = self.chinese_dict_path {
             JiebaTokenizer::with_dict_path(path)
         } else {
-            Ok(JiebaTokenizer::new())
+            JiebaTokenizer::new()
         }
     }
 

@@ -69,7 +69,10 @@ whatlang = "0.18"
 
 # CJK tokenization (optional, per-language feature flags)
 lindera = { version = "6", default-features = false }
-jieba-rs = "0.11"
+# Without its embedded dictionary, which it compresses with C zstd: the
+# Chinese analyzer embeds the same dictionary itself, compressed with the
+# pure-Rust structured-zstd.
+jieba-rs = { version = "0.11", default-features = false }
 
 # gRPC
 tonic = "0.14"

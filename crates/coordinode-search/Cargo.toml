@@ -12,7 +12,7 @@ documentation = "https://docs.rs/coordinode-search"
 
 [features]
 # Per-language CJK tokenization — include only what you need
-cjk-zh = ["dep:jieba-rs"]                            # Chinese (jieba-rs, +21MB)
+cjk-zh = ["dep:jieba-rs", "dep:structured-zstd"]    # Chinese (jieba-rs, +21MB)
 cjk-ja = ["dep:lindera", "lindera/embed-ipadic"]     # Japanese (lindera IPAdic, +15MB)
 cjk-ko = ["dep:lindera", "lindera/embed-ko-dic"]     # Korean (lindera KO-dic, +34MB)
 # Umbrella: all CJK languages (~70MB total)
@@ -38,6 +38,8 @@ rand = { workspace = true }
 # CJK tokenization (optional, activated by per-language features)
 lindera = { workspace = true, optional = true }
 jieba-rs = { workspace = true, optional = true }
+# Decompresses the embedded jieba dictionary.
+structured-zstd = { version = "0.2", optional = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]

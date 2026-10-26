@@ -2,10 +2,34 @@ use super::*;
 
 // -- Jieba (Chinese) tests --
 
+/// The embedded dictionary decodes to jieba's default dictionary byte for
+/// byte (jieba-rs 0.11.0 `src/data/dict.txt`), so the analyzer segments as
+/// jieba's own default does.
+#[cfg(feature = "cjk-zh")]
+#[test]
+fn the_embedded_dictionary_is_jiebas_default() {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+
+    let mut dict = Vec::new();
+    structured_zstd::decoding::StreamingDecoder::new(DEFAULT_DICT_ZST)
+        .read_to_end(&mut dict)
+        .expect("the embedded dictionary decodes");
+    assert_eq!(dict.len(), 5_071_843);
+    let digest: String = sha2::Sha256::digest(&dict)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        digest,
+        "139519822fe8ab9e10d9d07e68ea0451045380aedaf54ecc51e2a28c6b42a13f"
+    );
+}
+
 #[cfg(feature = "cjk-zh")]
 #[test]
 fn jieba_basic_segmentation() {
-    let mut tok = JiebaTokenizer::new();
+    let mut tok = JiebaTokenizer::new().expect("embedded dictionary");
     let mut stream = tok.token_stream("我来到北京清华大学");
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -21,7 +45,7 @@ fn jieba_basic_segmentation() {
 #[cfg(feature = "cjk-zh")]
 #[test]
 fn jieba_search_mode_fine_grained() {
-    let mut tok = JiebaTokenizer::new();
+    let mut tok = JiebaTokenizer::new().expect("embedded dictionary");
     let mut stream = tok.token_stream("中华人民共和国");
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -36,7 +60,7 @@ fn jieba_search_mode_fine_grained() {
 #[cfg(feature = "cjk-zh")]
 #[test]
 fn jieba_byte_offsets_correct() {
-    let mut tok = JiebaTokenizer::new();
+    let mut tok = JiebaTokenizer::new().expect("embedded dictionary");
     let text = "今天天气真好";
     let mut stream = tok.token_stream(text);
     while stream.advance() {
@@ -57,7 +81,7 @@ fn jieba_byte_offsets_correct() {
 #[cfg(feature = "cjk-zh")]
 #[test]
 fn jieba_overlapping_segments_keep_their_place_in_the_text() {
-    let mut tok = JiebaTokenizer::new();
+    let mut tok = JiebaTokenizer::new().expect("embedded dictionary");
     let text = "数据库系统设计";
     let mut stream = tok.token_stream(text);
     let mut tokens = Vec::new();
@@ -96,7 +120,7 @@ fn jieba_overlapping_segments_keep_their_place_in_the_text() {
 #[cfg(feature = "cjk-zh")]
 #[test]
 fn jieba_empty_input() {
-    let mut tok = JiebaTokenizer::new();
+    let mut tok = JiebaTokenizer::new().expect("embedded dictionary");
     let mut stream = tok.token_stream("");
     assert!(!stream.advance(), "empty input should produce no tokens");
 }
@@ -104,7 +128,7 @@ fn jieba_empty_input() {
 #[cfg(feature = "cjk-zh")]
 #[test]
 fn jieba_mixed_cjk_and_ascii() {
-    let mut tok = JiebaTokenizer::new();
+    let mut tok = JiebaTokenizer::new().expect("embedded dictionary");
     let mut stream = tok.token_stream("我喜欢Rust编程语言");
     let mut tokens = Vec::new();
     while stream.advance() {
