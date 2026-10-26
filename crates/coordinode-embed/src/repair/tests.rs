@@ -1017,6 +1017,267 @@ fn a_lossy_table_repair_without_a_checkpoint_reports_not_clean() {
     assert_eq!(open().lossy_table_repairs(), vec!["trades".to_string()]);
 }
 
+/// A table rebuilt from a checkpoint keeps the history the checkpoint's copy
+/// holds, each version at its own seqno: a snapshot taken before an overwrite,
+/// a point deletion or a range deletion reads the table as it read before the
+/// loss. Rewriting the copy's current rows at fresh seqnos would answer every
+/// older snapshot with nothing.
+#[test]
+fn a_table_rebuild_keeps_the_checkpoints_history() {
+    use lsm_tree::AbstractTree as _;
+
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let open = || {
+        StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded")
+    };
+    let row = |engine: &StorageEngine, key: &[u8], value: &[u8]| -> u64 {
+        let ts = oracle.next().as_raw();
+        engine
+            .columnar_insert("trades", key.to_vec(), value.to_vec(), ts)
+            .expect("columnar insert");
+        ts
+    };
+    // Snapshot seqnos to read at: each sees the versions strictly below it.
+    let mut snapshots = Vec::new();
+    let expected = {
+        let engine = open();
+        row(&engine, b"row:a", b"a-v1");
+        row(&engine, b"row:b", b"b-live");
+        row(&engine, b"row:c", b"c-live");
+        row(&engine, b"row:d", b"d-live");
+        snapshots.push(row(&engine, b"row:a", b"a-v2"));
+        let tree = engine.columnar_table_tree("trades").expect("table tree");
+        let deleted = oracle.next().as_raw();
+        snapshots.push(deleted);
+        tree.remove(b"row:b".to_vec(), deleted);
+        let ranged = oracle.next().as_raw();
+        snapshots.push(ranged);
+        tree.remove_range(b"row:c".to_vec(), b"row:e".to_vec(), ranged);
+        snapshots.push(oracle.next().as_raw());
+        engine.persist().expect("persist");
+        create_checkpoint(&engine, &root).expect("checkpoint");
+        for i in 0..30u32 {
+            row(&engine, format!("tail:{i:06}").as_bytes(), b"tail");
+        }
+        engine.persist().expect("persist");
+        snapshots.push(u64::MAX);
+        snapshots
+            .iter()
+            .map(|&at| engine.columnar_scan("trades", at).expect("scan before"))
+            .collect::<Vec<_>>()
+    };
+    // The reads differ, or the test would not tell history from the latest.
+    assert_ne!(expected[0], expected[1]);
+    assert_ne!(expected[1], expected[2]);
+    assert_ne!(expected[2], expected[3]);
+
+    let table_dir = dir.path().join("tables").join("trades");
+    assert!(corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root) > 0);
+    lose_manifest(&table_dir);
+
+    let engine = open();
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert_eq!(
+        report.repaired_tables,
+        vec!["trades".to_string()],
+        "{report:?}"
+    );
+    assert!(report.is_clean(), "{report:?}");
+    for (at, before) in snapshots.iter().zip(&expected) {
+        assert_eq!(
+            &engine.columnar_scan("trades", *at).expect("scan after"),
+            before,
+            "the rebuilt table reads differently at snapshot {at}"
+        );
+    }
+}
+
+/// A table the checkpoint holds no copy of is not rebuilt as an empty table:
+/// a table created after the checkpoint and one whose section went missing
+/// cannot be told apart, so the rebuild refuses and changes nothing, and the
+/// loss stays reported.
+#[test]
+fn a_table_missing_from_the_checkpoint_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let open = || {
+        StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded")
+    };
+    {
+        let engine = open();
+        create_checkpoint(&engine, &root).expect("checkpoint");
+        for i in 0..40u32 {
+            engine
+                .columnar_insert(
+                    "late",
+                    format!("row:{i:06}").into_bytes(),
+                    b"after".to_vec(),
+                    oracle.next().as_raw(),
+                )
+                .expect("columnar insert");
+        }
+        engine.persist().expect("persist");
+    }
+    let table_dir = dir.path().join("tables").join("late");
+    assert!(corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root) > 0);
+    lose_manifest(&table_dir);
+
+    let engine = open();
+    let salvaged = engine.columnar_scan("late", u64::MAX).expect("scan");
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert_eq!(
+        report.refused_tables,
+        vec![(
+            "late".to_string(),
+            TableRebuildRefusal::MissingFromCheckpoint
+        )],
+        "{report:?}"
+    );
+    assert!(report.repaired_tables.is_empty(), "{report:?}");
+    assert!(!report.is_clean(), "{report:?}");
+    assert_eq!(
+        engine.columnar_scan("late", u64::MAX).expect("scan"),
+        salvaged,
+        "a refused rebuild changes nothing"
+    );
+    drop(engine);
+    assert_eq!(open().lossy_table_repairs(), vec!["late".to_string()]);
+}
+
+/// A catalog change to the table after the checkpoint may be a DROP and a
+/// re-create under the same name: the checkpoint's rows then belong to a
+/// table that no longer exists, so the rebuild refuses rather than bring them
+/// back.
+#[test]
+fn a_table_rebuild_across_a_catalog_change_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let open = || {
+        StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded")
+    };
+    let pointer = encode_label_current_revision_key("trades");
+    {
+        let engine = open();
+        put(
+            &engine,
+            oracle.next().as_raw(),
+            PartitionId::Schema,
+            &pointer,
+            &1u64.to_be_bytes(),
+        );
+        for i in 0..20u32 {
+            engine
+                .columnar_insert(
+                    "trades",
+                    format!("row:{i:06}").into_bytes(),
+                    b"dropped".to_vec(),
+                    oracle.next().as_raw(),
+                )
+                .expect("columnar insert");
+        }
+        create_checkpoint(&engine, &root).expect("checkpoint");
+        // The table is dropped and created again under its name.
+        engine.drop_columnar_table("trades").expect("drop");
+        put(
+            &engine,
+            oracle.next().as_raw(),
+            PartitionId::Schema,
+            &pointer,
+            &2u64.to_be_bytes(),
+        );
+        for i in 0..40u32 {
+            engine
+                .columnar_insert(
+                    "trades",
+                    format!("new:{i:06}").into_bytes(),
+                    b"current".to_vec(),
+                    oracle.next().as_raw(),
+                )
+                .expect("columnar insert");
+        }
+        engine.persist().expect("persist");
+    }
+    // The re-created tree numbers its tables from the start again, under the
+    // names the checkpoint's copy has: every one of them is the new table's.
+    let no_checkpoint = TempDir::new().expect("tempdir");
+    let table_dir = dir.path().join("tables").join("trades");
+    assert!(corrupt_post_checkpoint_tables(&table_dir.join("tables"), no_checkpoint.path()) > 0);
+    lose_manifest(&table_dir);
+
+    let engine = open();
+    let salvaged = engine.columnar_scan("trades", u64::MAX).expect("scan");
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert!(
+        matches!(
+            report.refused_tables.as_slice(),
+            [(table, TableRebuildRefusal::CatalogChanged { .. })] if table == "trades"
+        ),
+        "{report:?}"
+    );
+    assert!(!report.is_clean(), "{report:?}");
+    assert_eq!(
+        engine.columnar_scan("trades", u64::MAX).expect("scan"),
+        salvaged,
+        "a refused rebuild brings no row of the checkpoint's table back"
+    );
+}
+
+/// An applied journal entry that neither the checkpoint's copy nor the
+/// journal suffix holds is lost data: the rebuild refuses instead of binding
+/// the table's coverage past it.
+#[test]
+fn a_table_rebuild_missing_part_of_the_journal_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+        .expect("open_embedded");
+    let row = |key: String| {
+        engine
+            .columnar_insert(
+                "trades",
+                key.into_bytes(),
+                b"v".to_vec(),
+                oracle.next().as_raw(),
+            )
+            .expect("columnar insert");
+    };
+    for i in 0..10u32 {
+        row(format!("row:{i:06}"));
+    }
+    let checkpoint = create_checkpoint(&engine, &root).expect("checkpoint");
+    for i in 10..20u32 {
+        row(format!("row:{i:06}"));
+    }
+    let from = StorageEngine::checkpoint_replay_floor(&checkpoint).expect("floor");
+    let mut suffix = engine
+        .oplog_read_since(from)
+        .expect("read journal")
+        .expect("journal");
+    let lost = suffix.pop().expect("an entry after the checkpoint").index;
+    let before = engine.columnar_scan("trades", u64::MAX).expect("scan");
+
+    let outcome = engine
+        .repair_table_from_checkpoint(&checkpoint, &suffix, "trades", &[])
+        .expect("rebuild");
+    assert_eq!(
+        outcome,
+        TableRebuild::Refused(TableRebuildRefusal::UncoveredEntry { index: lost })
+    );
+    assert_eq!(
+        engine.columnar_scan("trades", u64::MAX).expect("scan"),
+        before,
+        "a refused rebuild changes nothing"
+    );
+}
+
 /// The reported dead end: a lossy open repair with NO checkpoint to rebuild
 /// from. The loss must be REPORTED (partition listed, not clean), never
 /// silently absorbed, and nothing may claim a repair happened.

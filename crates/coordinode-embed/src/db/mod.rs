@@ -919,25 +919,26 @@ impl Database {
                 || !engine.pending_table_rebuilds()?.is_empty()
             {
                 match crate::repair::verify_and_repair(&engine, &root) {
-                    Ok(report)
-                        if !report.repaired.is_empty() || !report.repaired_tables.is_empty() =>
-                    {
-                        tracing::warn!(
-                            repaired = ?report.repaired,
-                            repaired_tables = ?report.repaired_tables,
-                            clean = report.clean_after,
-                            "auto-repaired corrupt partitions and tables on open"
-                        );
+                    Ok(report) => {
+                        if !report.repaired.is_empty() || !report.repaired_tables.is_empty() {
+                            tracing::warn!(
+                                repaired = ?report.repaired,
+                                repaired_tables = ?report.repaired_tables,
+                                clean = report.clean_after,
+                                "auto-repaired corrupt partitions and tables on open"
+                            );
+                        }
+                        if !report.is_clean() {
+                            tracing::error!(
+                                corrupt = ?report.corrupt_partitions,
+                                corrupt_tables = ?report.corrupt_tables,
+                                refused_tables = ?report.refused_tables,
+                                checkpoint = ?report.checkpoint_used,
+                                "partitions or tables still need a rebuild the checkpoint \
+                                 and the journal cannot give; restore from an off-device backup"
+                            );
+                        }
                     }
-                    Ok(report) if !report.is_clean() => {
-                        tracing::error!(
-                            corrupt = ?report.corrupt_partitions,
-                            corrupt_tables = ?report.corrupt_tables,
-                            "partitions or tables need a rebuild but no checkpoint exists; \
-                             restore from an off-device backup"
-                        );
-                    }
-                    Ok(_) => {}
                     Err(e) => {
                         tracing::error!(error = %e, "auto-repair on open failed; continuing")
                     }

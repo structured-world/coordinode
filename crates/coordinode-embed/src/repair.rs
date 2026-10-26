@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use coordinode_core::schema::definition::encode_label_current_revision_key;
 use coordinode_core::txn::wake::Wake;
+use coordinode_storage::columnar::{TableRebuild, TableRebuildRefusal};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
@@ -124,6 +126,10 @@ pub struct RepairReport {
     pub corrupt_tables: Vec<String>,
     /// Tables actually rebuilt from a checkpoint this pass.
     pub repaired_tables: Vec<String>,
+    /// Tables left as they were because the checkpoint and the journal cannot
+    /// prove their state, with the reason. Each stays reported until a later
+    /// pass rebuilds it or it is restored from an off-device backup.
+    pub refused_tables: Vec<(String, TableRebuildRefusal)>,
     /// The subset of [`repaired`](Self::repaired) restored range-scoped:
     /// only the key ranges the open-time salvage dropped were cleared and
     /// rebuilt, leaving every other SST untouched. Partitions repaired by a
@@ -238,9 +244,28 @@ pub fn verify_and_repair(
         scoped.push(*part);
     }
     let mut repaired_tables = Vec::with_capacity(corrupt_tables.len());
+    let mut refused_tables = Vec::new();
     for table in &corrupt_tables {
-        engine.repair_table_from_checkpoint(&checkpoint, &oplog_since, table)?;
-        repaired_tables.push(table.clone());
+        // A columnar table's id is its label name, and its catalog entry is
+        // the label's current-revision pointer: CREATE, ALTER and DROP all
+        // write it.
+        let catalog_keys = [encode_label_current_revision_key(table)];
+        match engine.repair_table_from_checkpoint(
+            &checkpoint,
+            &oplog_since,
+            table,
+            &catalog_keys,
+        )? {
+            TableRebuild::Rebuilt { .. } => repaired_tables.push(table.clone()),
+            TableRebuild::Refused(reason) => {
+                tracing::error!(
+                    table = %table,
+                    %reason,
+                    "table not rebuilt: its state cannot be proved; restore from backup"
+                );
+                refused_tables.push((table.clone(), reason));
+            }
+        }
     }
 
     let after = scrub_all(engine, &ScrubConfig::default())?;
@@ -249,9 +274,10 @@ pub fn verify_and_repair(
         repaired,
         corrupt_tables,
         repaired_tables,
+        clean_after: !after.has_errors() && refused_tables.is_empty(),
+        refused_tables,
         scoped,
         checkpoint_used: Some(checkpoint),
-        clean_after: !after.has_errors(),
     })
 }
 
