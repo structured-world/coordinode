@@ -2727,6 +2727,51 @@ fn a_filter_keeping_non_null_keys_lets_the_index_answer_a_descending_ordering() 
     assert!(run(&mut db, &filtered(3), Value::Null).is_empty());
 }
 
+/// A query vector the metric cannot evaluate against the stored vectors is
+/// a domain error in every top-k form, with and without an index, and never
+/// a NULL key: the rows without a vector beside it do not turn the refusal
+/// into an ordering.
+#[test]
+fn a_query_vector_the_metric_cannot_evaluate_is_refused_in_every_top_k_form() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_embed::DatabaseError;
+    use coordinode_vector::hnsw::VectorDomainError;
+    for indexed in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+        if indexed {
+            db.execute_cypher("CREATE VECTOR INDEX t_e ON :T(e) OPTIONS {metric: \"l2\"}")
+                .expect("index");
+        }
+        top_k_fixture(&mut db);
+        let wide = Value::Array(vec![
+            Value::Float(1.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+        ]);
+        for query in [
+            "MATCH (n:T) RETURN n.i AS i ORDER BY vector_distance(n.e, $q) LIMIT 3",
+            "MATCH (n:T) WITH n, vector_distance(n.e, $q) AS d ORDER BY d LIMIT 3 RETURN n.i AS i",
+            "MATCH (n:T) RETURN n.i AS i ORDER BY vector_similarity(n.e, $q) DESC LIMIT 3",
+            "MATCH (n:T) RETURN n.i AS i ORDER BY vector_distance(n.e, $q) LIMIT 30",
+        ] {
+            let result = db.execute_cypher_with_params(
+                query,
+                [("q".to_string(), wide.clone())].into_iter().collect(),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(DatabaseError::VectorDomain(
+                        VectorDomainError::DimensionMismatch { .. }
+                    ))
+                ),
+                "indexed {indexed}: {query}: {result:?}"
+            );
+        }
+    }
+}
+
 /// The `i` column of `rows`, in order.
 fn top_k_column(rows: &[coordinode_query::executor::Row], column: &str) -> Vec<i64> {
     rows.iter()
