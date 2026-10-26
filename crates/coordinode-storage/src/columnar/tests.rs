@@ -163,60 +163,133 @@ fn a_drop_waits_for_running_maintenance_and_turns_away_the_rest() {
     );
 }
 
-/// A table created again under a name whose drop is still running waits for
-/// the drop to finish: the drop's removal of the old table's directory and
-/// series, by name, never reaches the new table.
-#[test]
-fn a_recreate_waits_for_the_drop_of_its_name() {
+/// Hold `table`'s life the way running maintenance does, until the returned
+/// sender is used (or dropped).
+fn hold_life(
+    table: &crate::engine::flush::TableTree,
+) -> (
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<Option<()>>,
+) {
     use crate::engine::flush::while_alive;
 
-    let dir = tempfile::tempdir().unwrap();
-    let reg = Arc::new(new_registry(dir.path()));
-    reg.create_or_open("t").unwrap();
-    let table = reg.trees().pop().expect("the table");
     let (started_tx, started) = std::sync::mpsc::channel();
     let (finish, finish_rx) = std::sync::mpsc::channel::<()>();
     let life = Arc::clone(&table.alive);
     let maintenance = std::thread::spawn(move || {
         while_alive(Some(&life), || {
             started_tx.send(()).unwrap();
-            finish_rx.recv().unwrap();
+            // The test releases the life by sending or by dropping `finish`.
+            let _released = finish_rx.recv();
         })
     });
     started.recv().unwrap();
+    (finish, maintenance)
+}
 
-    // The drop waits for the maintenance; the re-create comes in meanwhile.
+/// Wait until the registry's retirement state of `name` satisfies `reached`.
+fn wait_for_state(
+    reg: &ColumnarTableRegistry,
+    name: &str,
+    what: &str,
+    reached: impl Fn(bool, usize) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (running, waiting) = reg.retirement_state(name);
+        if reached(running, waiting) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never reached: {what}"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// A table created again under a name whose drop is still running waits for
+/// the drop to finish: the drop's removal of the old table's directory and
+/// series, by name, never reaches the new table.
+#[test]
+fn a_recreate_waits_for_the_drop_of_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = Arc::new(new_registry(dir.path()));
+    reg.create_or_open("t").unwrap();
+    let table = reg.trees().pop().expect("the table");
+    let (finish, maintenance) = hold_life(&table);
+
+    // The drop has published the name as retiring and waits for the life.
     let dropper = {
         let reg = Arc::clone(&reg);
         std::thread::spawn(move || reg.drop_table("t"))
     };
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    wait_for_state(&reg, "t", "the drop running", |running, _| running);
+    // The re-create waits on the drop.
     let creator = {
         let reg = Arc::clone(&reg);
         std::thread::spawn(move || reg.create_or_open("t").map(|_| ()))
     };
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    assert!(
-        !creator.is_finished(),
-        "the re-create did not wait for the drop of its name"
-    );
+    wait_for_state(&reg, "t", "the re-create waiting", |running, waiting| {
+        running && waiting == 1
+    });
+    assert!(reg.get("t").is_none(), "nothing is served under the name");
 
     finish.send(()).unwrap();
     maintenance.join().unwrap();
     dropper.join().unwrap().unwrap();
     creator.join().unwrap().unwrap();
-    assert!(reg.get("t").is_some(), "the new table is registered");
+    let new = reg.trees().pop().expect("the new table");
+    assert!(
+        !Arc::ptr_eq(&new.alive, &table.alive),
+        "the new table has a life of its own"
+    );
+    assert!(*new.alive.read(), "the new table lives");
     assert!(
         dir.path().join("t").exists(),
         "the drop removed the new table's directory"
     );
-    assert!(
-        !Arc::ptr_eq(
-            &reg.trees().pop().expect("the new table").alive,
-            &table.alive
-        ),
-        "the new table has a life of its own"
-    );
+}
+
+/// Two drops of one table and a create under its name meet: the second drop
+/// waits for the first and drops the same, old table, so the table the create
+/// makes after them survives, whichever of the second drop and the create
+/// goes first once the first drop is done.
+#[test]
+fn a_second_drop_of_a_table_never_drops_the_one_created_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = Arc::new(new_registry(dir.path()));
+    reg.create_or_open("t").unwrap();
+    let table = reg.trees().pop().expect("the table");
+    let (finish, maintenance) = hold_life(&table);
+
+    let first = {
+        let reg = Arc::clone(&reg);
+        std::thread::spawn(move || reg.drop_table("t"))
+    };
+    wait_for_state(&reg, "t", "the first drop running", |running, _| running);
+    let second = {
+        let reg = Arc::clone(&reg);
+        std::thread::spawn(move || reg.drop_table("t"))
+    };
+    wait_for_state(&reg, "t", "the second drop waiting", |_, waiting| {
+        waiting == 1
+    });
+    let creator = {
+        let reg = Arc::clone(&reg);
+        std::thread::spawn(move || reg.create_or_open("t").map(|_| ()))
+    };
+    wait_for_state(&reg, "t", "the create waiting", |_, waiting| waiting == 2);
+
+    finish.send(()).unwrap();
+    maintenance.join().unwrap();
+    first.join().unwrap().unwrap();
+    second.join().unwrap().unwrap();
+    creator.join().unwrap().unwrap();
+    let new = reg.trees().pop().expect("the created table survives");
+    assert!(!Arc::ptr_eq(&new.alive, &table.alive));
+    assert!(*new.alive.read(), "the new table lives");
+    assert!(dir.path().join("t").exists());
 }
 
 /// A drop that fails before its directories are gone leaves the name refused:

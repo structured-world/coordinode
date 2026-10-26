@@ -137,6 +137,9 @@ pub struct ColumnarTableRegistry {
 struct Tables {
     live: HashMap<String, TableEntry>,
     retiring: HashMap<String, Retirement>,
+    /// Callers waiting for a drop to finish, for tests to see one waiting.
+    #[cfg(test)]
+    waiting: usize,
 }
 
 /// Where the drop of a table name stands.
@@ -280,6 +283,38 @@ impl ColumnarTableRegistry {
         self.trees.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Wait, releasing `tables`, until a drop finishes.
+    fn wait_retired<'a>(
+        &self,
+        tables: std::sync::MutexGuard<'a, Tables>,
+    ) -> std::sync::MutexGuard<'a, Tables> {
+        #[cfg(test)]
+        let tables = {
+            let mut tables = tables;
+            tables.waiting += 1;
+            tables
+        };
+        let tables = self.retired.wait(tables).unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        let tables = {
+            let mut tables = tables;
+            tables.waiting -= 1;
+            tables
+        };
+        tables
+    }
+
+    /// Whether the drop of `table_id` is running, and how many callers wait
+    /// for a drop to finish.
+    #[cfg(test)]
+    pub(crate) fn retirement_state(&self, table_id: &str) -> (bool, usize) {
+        let tables = self.lock();
+        (
+            tables.retiring.get(table_id) == Some(&Retirement::Running),
+            tables.waiting,
+        )
+    }
+
     /// Open (creating if absent) the columnar-mode tree of `table_id` with
     /// the table settings, repairing it by block salvage if its open fails
     /// structurally.
@@ -347,9 +382,7 @@ impl ColumnarTableRegistry {
                 None => break,
                 // The drop of the name would remove the new table's
                 // directory and series: wait for it.
-                Some(Retirement::Running) => {
-                    tables = self.retired.wait(tables).unwrap_or_else(|e| e.into_inner());
-                }
+                Some(Retirement::Running) => tables = self.wait_retired(tables),
                 Some(Retirement::Unfinished) => {
                     return Err(StorageError::Io(format!(
                         "table {table_id} is not created: its drop did not finish removing \
@@ -393,6 +426,9 @@ impl ColumnarTableRegistry {
     /// drop is done no table of the name can be opened or created, so its
     /// removal by name never reaches a table created again under it; a drop
     /// that fails leaves the name refused until a drop of it finishes.
+    /// A drop that finds another drop of the name running drops the same
+    /// table: it waits for that drop and returns, taking over only a removal
+    /// left unfinished, never a table created under the name after it.
     /// Idempotent — dropping an unknown table removes nothing and succeeds.
     ///
     /// # Errors
@@ -401,8 +437,15 @@ impl ColumnarTableRegistry {
     pub fn drop_table(&self, table_id: &str) -> StorageResult<()> {
         let entry = {
             let mut tables = self.lock();
-            while tables.retiring.get(table_id) == Some(&Retirement::Running) {
-                tables = self.retired.wait(tables).unwrap_or_else(|e| e.into_inner());
+            if tables.retiring.get(table_id) == Some(&Retirement::Running) {
+                while tables.retiring.get(table_id) == Some(&Retirement::Running) {
+                    tables = self.wait_retired(tables);
+                }
+                if !tables.retiring.contains_key(table_id) {
+                    // That drop removed the table; whatever is under the
+                    // name now came after both drops.
+                    return Ok(());
+                }
             }
             tables
                 .retiring
