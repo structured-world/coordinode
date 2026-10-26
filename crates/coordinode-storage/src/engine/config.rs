@@ -1447,7 +1447,14 @@ impl StorageConfig {
             Arc::clone(&seqno), // visible_seqno = seqno: all writes immediately visible
         )
         .data_block_compression_policy(compression_policy)
-        .sync_mode(self.oplog_sync_method.tree_sync_mode());
+        .sync_mode(self.oplog_sync_method.tree_sync_mode())
+        // A power cut mid-append tears the manifest edit log's last record,
+        // which was never acknowledged: roll it back and open at the durable
+        // prefix, rather than rebuild the manifest from the tables (which
+        // drops in-flight edits and the tree's retention floor).
+        .manifest_recovery_mode(
+            lsm_tree::config::ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        );
 
         // Custom filesystem backend (e.g., MemFs for in-memory tests)
         let fs_for_routes: Arc<dyn lsm_tree::fs::Fs> = if let Some(ref fs) = self.fs {

@@ -967,6 +967,85 @@ pub(super) fn lose_manifest(tree_dir: &std::path::Path) {
     );
 }
 
+/// A power cut mid-append leaves a torn last record in a tree's manifest edit
+/// log. That record was never acknowledged, so the open rolls it back and
+/// opens at the durable prefix: no repair (which would rebuild the manifest
+/// from the tables and forget the tree's retention floor), every written row
+/// still there.
+#[test]
+fn a_torn_manifest_tail_opens_without_a_repair() {
+    use lsm_tree::AbstractTree;
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let tree_dir = dir.path().join(Partition::Node.name());
+    // The edit logs of the tree with their sizes.
+    let logs = || -> Vec<(std::path::PathBuf, u64)> {
+        std::fs::read_dir(&tree_dir)
+            .expect("read tree dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("edits-"))
+                    .is_some_and(|id| id.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .map(|path| {
+                let len = std::fs::metadata(&path).expect("metadata").len();
+                (path, len)
+            })
+            .collect()
+    };
+    let (log, durable) = {
+        let engine = StorageEngine::open(&config).expect("initial open");
+        let tree = engine.tree(Partition::Node).expect("tree");
+        engine
+            .put(Partition::Node, b"node:torn-tail", b"survives")
+            .expect("put");
+        tree.flush_active_memtable(0).expect("flush");
+        let before = logs();
+        // A second flush appends one record: the one the power cut tears.
+        engine
+            .put(Partition::Node, b"node:torn-away", b"unacknowledged")
+            .expect("put");
+        tree.flush_active_memtable(0).expect("flush");
+        logs()
+            .into_iter()
+            .find_map(|(path, len)| {
+                let was = before.iter().find(|(p, _)| p == &path)?.1;
+                (len > was).then_some((path, was))
+            })
+            .expect("the second flush appended to an edit log")
+    };
+    // Five bytes of the torn record reached the disk.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&log)
+        .expect("open edit log")
+        .set_len(durable + 5)
+        .expect("tear the tail");
+
+    let engine = StorageEngine::open(&config).expect("open after a torn tail");
+    assert!(
+        engine.open_repairs().is_empty(),
+        "a torn tail was repaired: {:?}",
+        engine.open_repairs()
+    );
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:torn-tail")
+            .expect("get")
+            .as_deref(),
+        Some(&b"survives"[..])
+    );
+}
+
 /// Losing a partition's manifest (its tables intact) must not make the whole
 /// engine unopenable: open repairs the tree from its SSTs, reports the repair
 /// so the caller can decide whether a replay is owed, and once the open has
