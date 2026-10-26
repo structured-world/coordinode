@@ -340,40 +340,45 @@ fn writes_during_a_build_are_drained_into_the_index() {
     .expect("write during build");
     drop(hold);
 
-    // The build's own end, waited for by a query that waits for it (an index
-    // that blocks reads during its build): the bound only stops a hung build
-    // from hanging the run.
-    db.execute_cypher(
-        "MATCH (n:Doc) WITH n, vector_similarity(n.embedding, [0.0, 1.0, 0.0]) AS s \
-         ORDER BY s DESC LIMIT 1 RETURN n.tag AS tag /*+ vector_build_wait('10m') */",
-    )
-    .expect("the build finishes");
-    assert!(
-        !health.snapshot().is_rebuilding(),
-        "a query that waited for the build was served before it ended"
-    );
-
-    // Every late vector must be its own nearest neighbour. A vector the build
-    // missed answers with something else entirely.
-    for i in (1..=200).map(|i| i as f32) {
-        let rows = db
-            .execute_cypher(&format!(
-                "MATCH (n:Doc) WITH n, vector_similarity(n.embedding, [0.0, {i:.1}, 0.0]) AS s \
-                 ORDER BY s DESC LIMIT 1 RETURN n.tag AS tag"
-            ))
-            .expect("vector search");
-        assert_eq!(
-            rows.len(),
-            1,
-            "expected one nearest neighbour for the late vector {i}"
+    // The build's own end; the bound only stops a hung build from hanging
+    // the run.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while health.snapshot().is_rebuilding() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build never ended"
         );
-        let tag = rows[0]
-            .get("tag")
-            .and_then(|v| v.as_str().map(String::from));
-        assert_eq!(
-            tag.as_deref(),
-            Some("late"),
-            "a vector written during the build was not folded into the index"
-        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
+
+    // Every late vector is in the graph itself, looked up by node, and a
+    // search of the graph reaches them: the nearest to the direction they
+    // all share is a late node, which no seed vector (all along the first
+    // axis) can be. A search answered from the label's records would prove
+    // nothing about the graph.
+    let late: std::collections::HashSet<u64> = db
+        .execute_cypher("MATCH (n:Doc {tag: 'late'}) RETURN id(n) AS id")
+        .expect("late nodes")
+        .iter()
+        .filter_map(|row| row.get("id").and_then(|v| v.as_int()))
+        .map(|id| id as u64)
+        .collect();
+    assert_eq!(late.len(), 200);
+    let graph = graph.read().expect("the graph");
+    assert_eq!(
+        graph.len(),
+        700,
+        "every seed and late vector is in the graph"
+    );
+    assert!(
+        late.iter().all(|id| graph.contains(*id)),
+        "a vector written during the build was not folded into the index"
+    );
+    let hits = graph
+        .search(&[0.0, 1.0, 0.0], 1)
+        .expect("an evaluable query");
+    assert!(
+        hits.first().is_some_and(|hit| late.contains(&hit.id)),
+        "the graph's search does not reach the late vectors: {hits:?}"
+    );
 }

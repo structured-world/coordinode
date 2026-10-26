@@ -2077,17 +2077,25 @@ fn promote_hnsw_scan(op: LogicalOp, registry: &crate::index::VectorIndexRegistry
             hnsw_index,
             predicate,
         } => {
-            let rewrite = hnsw_scan_target(&input, &vector_expr, &function, &predicate, registry);
+            let rewrite = hnsw_scan_target(
+                &input,
+                &vector_expr,
+                &query_vector,
+                &function,
+                &predicate,
+                registry,
+            );
             match rewrite {
-                Some((binding, label, property, index_name)) => LogicalOp::HnswScan {
-                    label,
-                    property,
-                    binding,
+                Some(target) => LogicalOp::HnswScan {
+                    label: target.label,
+                    property: target.property,
+                    binding: target.binding,
                     query_vector,
                     k,
                     function,
                     distance_alias,
-                    index_name,
+                    index_name: target.index_name,
+                    vectors_only: target.vectors_only,
                 },
                 None => LogicalOp::VectorTopK {
                     input: Box::new(promote_hnsw_scan(*input, registry)),
@@ -2173,30 +2181,68 @@ fn promote_hnsw_scan(op: LogicalOp, registry: &crate::index::VectorIndexRegistry
     }
 }
 
-/// Decide whether a `VectorTopK` qualifies for the HnswScan access path.
-/// Returns `(binding, label, property, index_name)` when ALL of:
+/// Where an HnswScan answers a `VectorTopK`.
+struct HnswScanTarget {
+    binding: String,
+    label: String,
+    property: String,
+    index_name: String,
+    vectors_only: bool,
+}
+
+/// Decide whether a `VectorTopK` qualifies for the HnswScan access path,
+/// when ALL of:
 ///
 /// - the input is a BARE single-label `NodeScan` with no inline
-///   property filters (any Filter / Traverse in between disqualifies —
+///   property filters, or one filtered only by `<ordering expression> IS
+///   NOT NULL` (any other Filter / Traverse in between disqualifies —
 ///   those compose with filtered HNSW search instead),
 /// - the vector expression is `scan_variable.property`,
 /// - the pushdown predicate is absent or just the scan label
 ///   (annotate_vector_top_k synthesises `LabelEq` even for pure scans),
 /// - the registry has an index for `(label, property)` whose metric
 ///   matches the ORDER BY function, so the index order IS the result
-///   order.
+///   order,
+/// - the nodes without a vector cannot change the answer: ascending they
+///   follow every score, descending they come first unless the filter
+///   keeps them out.
 fn hnsw_scan_target(
     input: &LogicalOp,
     vector_expr: &crate::plan::expr::Expr,
+    query_vector: &crate::plan::expr::Expr,
     function: &str,
     predicate: &Option<crate::planner::logical::VectorPredicate>,
     registry: &crate::index::VectorIndexRegistry,
-) -> Option<(String, String, String, String)> {
+) -> Option<HnswScanTarget> {
+    // The ordering expression's own `IS NOT NULL`: the scalar is NULL
+    // exactly when the node's value or the query is not a vector, so the
+    // filter keeps the nodes the index holds and no others.
+    let (scan, vectors_only) = match input {
+        LogicalOp::Filter {
+            input: scan,
+            predicate:
+                crate::plan::expr::Expr::IsNull {
+                    operand,
+                    negated: true,
+                },
+        } if matches!(
+            operand.as_ref(),
+            crate::plan::expr::Expr::Call { name, args, distinct: false }
+                if name == function
+                    && args.len() == 2
+                    && &args[0] == vector_expr
+                    && &args[1] == query_vector
+        ) =>
+        {
+            (scan.as_ref(), true)
+        }
+        other => (other, false),
+    };
     let LogicalOp::NodeScan {
         variable,
         labels,
         property_filters,
-    } = input
+    } = scan
     else {
         return None;
     };
@@ -2243,13 +2289,22 @@ fn hnsw_scan_target(
     if !compatible {
         return None;
     }
+    // A node without a vector orders with a NULL key, before every score
+    // descending: the index, which holds only vectors, cannot answer a
+    // descending top k unless the query keeps such nodes out. Ascending
+    // they come after every score, which the scan supplies itself when the
+    // index has fewer than k.
+    if !vectors_only && !matches!(function, "vector_distance" | "vector_manhattan") {
+        return None;
+    }
 
-    Some((
-        variable.clone(),
-        label.clone(),
-        property.clone(),
-        def.to_string(),
-    ))
+    Some(HnswScanTarget {
+        binding: variable.clone(),
+        label: label.clone(),
+        property: property.clone(),
+        index_name: def.to_string(),
+        vectors_only,
+    })
 }
 
 /// Extract a single label from a NodeScan (or Filter over NodeScan) in the plan subtree.

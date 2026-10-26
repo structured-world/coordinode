@@ -12035,6 +12035,7 @@ fn hnsw_scan_executor_returns_index_top_k() {
             function: "vector_distance".to_string(),
             distance_alias: Some("_dist".to_string()),
             index_name: "item_emb_idx".to_string(),
+            vectors_only: false,
         },
         snapshot_ts: None,
         vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),

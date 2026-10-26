@@ -974,6 +974,11 @@ pub enum LogicalOp {
         distance_alias: Option<String>,
         /// Registered index name (for EXPLAIN and executor lookup).
         index_name: String,
+        /// The query keeps only nodes whose ordering key is not NULL (it
+        /// filters `<ordering expression> IS NOT NULL`): exactly the nodes
+        /// the index holds. Otherwise nodes without a vector take part with
+        /// NULL keys, which only a scan of the label finds.
+        vectors_only: bool,
     },
 
     /// Full-text index access path: a SOURCE operator (peer of NodeScan).
@@ -2342,14 +2347,16 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             function,
             index_name,
             distance_alias,
+            vectors_only,
             ..
         } => {
             let alias_info = distance_alias
                 .as_deref()
                 .map(|a| format!(" AS {a}"))
                 .unwrap_or_default();
+            let only = if *vectors_only { ", vectors only" } else { "" };
             output.push_str(&format!(
-                "{prefix}HnswScan({binding}:{label} ON {index_name}({property}), {function} k={k}{alias_info})\n"
+                "{prefix}HnswScan({binding}:{label} ON {index_name}({property}), {function} k={k}{alias_info}{only})\n"
             ));
         }
         LogicalOp::TextIndexScan {

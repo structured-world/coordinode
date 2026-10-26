@@ -2590,6 +2590,143 @@ fn order_by_reads_variables_the_projection_drops() {
     assert_eq!(names, vec![want("p0"), want("p1"), want("p2")]);
 }
 
+/// Rows without a vector keep their place in a vector ordering, as NULL keys
+/// do in any ORDER BY: after every score ascending, before every score
+/// descending, in scan order among themselves; a NULL query vector makes
+/// every key NULL. Each form (the vector not returned, the distance returned
+/// under an alias) answers as a plain sort of the same key does, with and
+/// without an index, for k beyond the vectors, both directions, SKIP and a
+/// second key.
+#[test]
+fn rows_without_a_vector_keep_their_place_in_a_vector_ordering() {
+    use coordinode_core::graph::types::Value;
+    for indexed in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+        if indexed {
+            db.execute_cypher("CREATE VECTOR INDEX t_e ON :T(e) OPTIONS {metric: \"l2\"}")
+                .expect("index");
+        }
+        top_k_fixture(&mut db);
+        db.execute_cypher("CREATE (:T {i: 201, g: 1})")
+            .expect("another without a vector");
+        let run = |db: &mut Database, query: &str, q: Value| {
+            let rows = db
+                .execute_cypher_with_params(query, [("q".to_string(), q)].into_iter().collect())
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            top_k_column(&rows, "i")
+        };
+        let q = Value::Array(vec![Value::Float(1.0), Value::Float(0.0)]);
+        // (function, direction, tail after ORDER BY, query vector)
+        let cases: Vec<(&str, &str, &str, Value)> = vec![
+            ("vector_distance", "", "LIMIT 25", q.clone()),
+            ("vector_distance", "", "LIMIT 3", q.clone()),
+            ("vector_similarity", "DESC", "LIMIT 3", q.clone()),
+            ("vector_similarity", "DESC", "LIMIT 25", q.clone()),
+            ("vector_distance", "", "LIMIT 4", Value::Null),
+            ("vector_similarity", "DESC", "LIMIT 4", Value::Null),
+            ("vector_distance", "", "SKIP 19 LIMIT 4", q.clone()),
+            ("vector_similarity", "DESC", "SKIP 1 LIMIT 3", q.clone()),
+        ];
+        for (function, direction, tail, q) in cases {
+            let key = format!("{function}(n.e, $q)");
+            let reference = run(
+                &mut db,
+                &format!(
+                    "MATCH (n:T) RETURN n.i AS i ORDER BY {key} + 0.0 {direction}, n.i {tail}"
+                ),
+                q.clone(),
+            );
+            let dropped = run(
+                &mut db,
+                &format!("MATCH (n:T) RETURN n.i AS i ORDER BY {key} {direction} {tail}"),
+                q.clone(),
+            );
+            let aliased = run(
+                &mut db,
+                &format!(
+                    "MATCH (n:T) WITH n, {key} AS d ORDER BY d {direction} {tail} RETURN n.i AS i"
+                ),
+                q.clone(),
+            );
+            let what = format!("indexed {indexed}: {key} {direction} {tail} q={q:?}");
+            assert_eq!(dropped, reference, "{what}");
+            assert_eq!(aliased, reference, "{what}");
+        }
+        // The NULL keys themselves: last ascending, first descending.
+        let ascending = run(
+            &mut db,
+            "MATCH (n:T) RETURN n.i AS i ORDER BY vector_distance(n.e, $q) LIMIT 25",
+            q.clone(),
+        );
+        assert_eq!(ascending.len(), 23, "every node, 21 with a vector");
+        assert_eq!(&ascending[21..], &[200, 201], "vectorless last ascending");
+        let descending = run(
+            &mut db,
+            "MATCH (n:T) RETURN n.i AS i ORDER BY vector_similarity(n.e, $q) DESC LIMIT 3",
+            q.clone(),
+        );
+        assert_eq!(descending, vec![200, 201, 0], "vectorless first descending");
+        let no_query = run(
+            &mut db,
+            "MATCH (n:T) WITH n, vector_distance(n.e, $q) AS d ORDER BY d LIMIT 2 \
+             RETURN n.i AS i, d",
+            Value::Null,
+        );
+        assert_eq!(no_query, vec![0, 1], "a NULL query keeps the scan order");
+    }
+}
+
+/// A query that keeps only non-NULL keys (`<ordering expression> IS NOT
+/// NULL`) proves the nodes without a vector out of the answer: a descending
+/// similarity is then answered from the index alone, with the rows a sort
+/// under the same filter gives, none without a vector, k beyond the vectors
+/// answered with all of them, and a NULL query with none.
+#[test]
+fn a_filter_keeping_non_null_keys_lets_the_index_answer_a_descending_ordering() {
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("CREATE VECTOR INDEX t_e ON :T(e) OPTIONS {metric: \"cosine\"}")
+        .expect("index");
+    top_k_fixture(&mut db);
+    let run = |db: &mut Database, query: &str, q: Value| {
+        let rows = db
+            .execute_cypher_with_params(query, [("q".to_string(), q)].into_iter().collect())
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        top_k_column(&rows, "i")
+    };
+    let q = Value::Array(vec![Value::Float(1.0), Value::Float(0.0)]);
+    let filtered = |limit: usize| {
+        format!(
+            "MATCH (n:T) WHERE vector_similarity(n.e, $q) IS NOT NULL \
+             RETURN n.i AS i ORDER BY vector_similarity(n.e, $q) DESC LIMIT {limit}"
+        )
+    };
+    let plan = db
+        .explain_cypher(&filtered(3).replace("$q", "[1.0, 0.0]"))
+        .expect("explain");
+    assert!(
+        plan.contains("HnswScan(") && plan.contains("vectors only"),
+        "the index answers alone: {plan}"
+    );
+    for limit in [3, 25] {
+        let reference = run(
+            &mut db,
+            &format!(
+                "MATCH (n:T) WHERE vector_similarity(n.e, $q) IS NOT NULL \
+                 RETURN n.i AS i ORDER BY vector_similarity(n.e, $q) + 0.0 DESC, n.i LIMIT {limit}"
+            ),
+            q.clone(),
+        );
+        let got = run(&mut db, &filtered(limit), q.clone());
+        assert_eq!(got, reference, "LIMIT {limit}");
+        assert!(!got.contains(&200), "no node without a vector: {got:?}");
+    }
+    assert_eq!(run(&mut db, &filtered(25), q.clone()).len(), 21);
+    assert!(run(&mut db, &filtered(3), Value::Null).is_empty());
+}
+
 /// The `i` column of `rows`, in order.
 fn top_k_column(rows: &[coordinode_query::executor::Row], column: &str) -> Vec<i64> {
     rows.iter()
@@ -2655,7 +2792,8 @@ fn a_distance_ordering_whose_projection_drops_the_vector_is_a_top_k() {
                  ORDER BY vector_similarity(n.e, [1.0, 0.0]) DESC LIMIT 4",
                 "MATCH (n:T) WITH n, vector_similarity(n.e, [1.0, 0.0]) AS s \
                  ORDER BY s DESC LIMIT 4 RETURN n.i AS i",
-                vec![0, 3, 6, 9],
+                // The node without a vector has a NULL key: first descending.
+                vec![200, 0, 3, 6],
             ),
             (
                 "MATCH (n:T) WHERE n.g = 0 RETURN n.i AS i \

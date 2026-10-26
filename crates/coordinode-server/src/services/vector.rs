@@ -172,9 +172,13 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         // `WITH *` preserves all n.* columns through the Project so that labels
         // and properties are available in result rows (VectorTopK optimization
         // operates on the pre-WITH NodeScan rows and passes them through Star).
+        // A vector search ranks the nodes that hold a vector: the filter keeps
+        // out the rest, which an ordinary ordering would rank with NULL keys,
+        // and lets the index alone answer.
         let (dist_fn, order_dir) = metric_cypher(req.metric);
         let cypher = format!(
             "MATCH (n:{label}) \
+             WHERE {dist_fn}(n.{property}, $qv) IS NOT NULL \
              WITH *, {dist_fn}(n.{property}, $qv) AS _dist \
              ORDER BY _dist {order_dir} \
              LIMIT {top_k} \
@@ -259,7 +263,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         let (dist_fn, order_dir) = metric_cypher(req.metric);
         let cypher = format!(
             "MATCH (start)-[:{edge_type}*1..{max_depth}]->(n) \
-             WHERE start = $start_id \
+             WHERE start = $start_id AND {dist_fn}(n.{property}, $qv) IS NOT NULL \
              WITH *, {dist_fn}(n.{property}, $qv) AS _dist \
              ORDER BY _dist {order_dir} \
              LIMIT {top_k} \

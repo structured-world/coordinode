@@ -1067,6 +1067,85 @@ fn hnsw_scan_not_planned_with_filter() {
     );
 }
 
+/// A descending top k puts nodes without a vector first, which the index
+/// does not hold: with nothing proving there are none, the plan stays the
+/// top k over the scan, even with a matching cosine index.
+#[test]
+fn hnsw_scan_not_planned_for_a_descending_ordering() {
+    let registry = test_registry_with_cosine_doc_index();
+    let root = plan_root(
+        "MATCH (n:Doc) \
+             RETURN n.name \
+             ORDER BY vector_similarity(n.embedding, [1.0, 0.0]) DESC \
+             LIMIT 10",
+    );
+    let root = apply_hnsw_scan_access_path(root, &registry, VectorConsistencyMode::Current);
+    assert!(find_hnsw_scan(&root).is_none(), "{root:?}");
+    assert!(find_vector_top_k(&root).is_some(), "{root:?}");
+}
+
+/// `IS NOT NULL` over the ordering expression itself keeps exactly the nodes
+/// the index holds: a descending ordering is then the index's alone. The
+/// property's own `IS NOT NULL` proves nothing (a value that is not a vector
+/// passes it), nor does the expression with another query vector.
+#[test]
+fn hnsw_scan_planned_for_a_descending_ordering_over_non_null_keys() {
+    let registry = test_registry_with_cosine_doc_index();
+    let plan_with = |filter: &str| {
+        let root = plan_root(&format!(
+            "MATCH (n:Doc) WHERE {filter} \
+             RETURN n.name \
+             ORDER BY vector_similarity(n.embedding, [1.0, 0.0]) DESC \
+             LIMIT 10"
+        ));
+        apply_hnsw_scan_access_path(root, &registry, VectorConsistencyMode::Current)
+    };
+    let proved = plan_with("vector_similarity(n.embedding, [1.0, 0.0]) IS NOT NULL");
+    assert!(
+        matches!(
+            find_hnsw_scan(&proved),
+            Some(LogicalOp::HnswScan {
+                vectors_only: true,
+                ..
+            })
+        ),
+        "{proved:?}"
+    );
+    for filter in [
+        "n.embedding IS NOT NULL",
+        "vector_similarity(n.embedding, [0.0, 1.0]) IS NOT NULL",
+    ] {
+        let root = plan_with(filter);
+        assert!(find_hnsw_scan(&root).is_none(), "{filter}: {root:?}");
+    }
+}
+
+fn test_registry_with_cosine_doc_index() -> crate::index::VectorIndexRegistry {
+    let registry = crate::index::VectorIndexRegistry::new();
+    registry.register(
+        crate::index::IndexDescriptor::hnsw(
+            "doc_cos_idx",
+            "Doc",
+            "embedding",
+            crate::index::VectorIndexConfig {
+                dimensions: 2,
+                metric: coordinode_core::graph::types::VectorMetric::Cosine,
+                m: 16,
+                ef_construction: 200,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+                offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
+            },
+        )
+        .bind(
+            crate::index::IndexId::from_raw(1),
+            crate::index::GenerationId::from_raw(1),
+        ),
+    );
+    registry
+}
+
 /// No registered index for the (label, property) → no HnswScan.
 #[test]
 fn hnsw_scan_not_planned_without_index() {

@@ -487,12 +487,12 @@ fn explain_shows_hnsw_scan_after_create() {
             "MATCH (n:Item) WITH n, vector_similarity(n.embedding, [1.0, 0.0, 0.0]) AS s ORDER BY s DESC LIMIT 5 RETURN n, s",
         )
         .expect("explain after");
-    // The access path replaces NodeScan+VectorTopK with the HnswScan
-    // source operator; the EXPLAIN line carries index, property, and
-    // the ORDER BY function (which implies the metric).
+    // A descending ordering ranks nodes without a vector first, which the
+    // index does not hold: the top k reads the label and is ranked through
+    // the index, rather than the index alone being the row source.
     assert!(
-        after.contains("HnswScan(n:Item ON item_emb(embedding), vector_similarity"),
-        "expected HnswScan access path after index, got:\n{after}"
+        after.contains("strategy: HnswScan(item_emb, cosine)"),
+        "expected the index to rank the top k after create, got:\n{after}"
     );
 }
 
@@ -531,8 +531,8 @@ fn drop_vector_index_removes_index() {
         )
         .expect("explain after create");
     assert!(
-        after_create.contains("HnswScan(n:Item ON item_emb(embedding), vector_similarity"),
-        "expected HnswScan access path after create, got:\n{after_create}"
+        after_create.contains("strategy: HnswScan(item_emb, cosine)"),
+        "expected the index to rank the top k after create, got:\n{after_create}"
     );
 
     // Drop the index.
@@ -603,8 +603,8 @@ fn vector_index_persists_across_reopen() {
             )
             .expect("explain after reopen");
         assert!(
-            plan.contains("ON persist_idx("),
-            "expected HnswScan access path after reopen, got:\n{plan}"
+            plan.contains("HnswScan(persist_idx, cosine)"),
+            "expected the index to rank the top k after reopen, got:\n{plan}"
         );
     }
 }
@@ -871,8 +871,8 @@ fn drop_then_recreate_vector_index_succeeds() {
         )
         .expect("explain after re-create");
     assert!(
-        plan.contains("ON item_emb2("),
-        "expected HnswScan access path after re-create, got:\n{plan}"
+        plan.contains("HnswScan(item_emb2, cosine)"),
+        "expected the new index to rank the top k after re-create, got:\n{plan}"
     );
 }
 

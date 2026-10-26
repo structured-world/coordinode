@@ -4423,8 +4423,9 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             function,
             distance_alias,
             index_name,
+            vectors_only,
         } => {
-            let rows = execute_hnsw_scan(
+            match execute_hnsw_scan(
                 label,
                 property,
                 binding,
@@ -4433,9 +4434,53 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 function,
                 distance_alias.as_deref(),
                 index_name,
+                *vectors_only,
                 ctx,
-            )?;
-            charge_returned(ctx, 0, rows)
+            )? {
+                Some(rows) => charge_returned(ctx, 0, rows),
+                // The answer needs nodes the index does not hold: the same
+                // top k over a scan of the label, under the same filter.
+                None => {
+                    use crate::plan::expr::Expr as PExpr;
+                    let vector_expr = PExpr::Property {
+                        base: Box::new(PExpr::Variable(binding.clone())),
+                        key: property.clone(),
+                    };
+                    let scan = LogicalOp::NodeScan {
+                        variable: binding.clone(),
+                        labels: vec![label.clone()],
+                        property_filters: Vec::new(),
+                    };
+                    let input = if *vectors_only {
+                        LogicalOp::Filter {
+                            input: Box::new(scan),
+                            predicate: PExpr::IsNull {
+                                operand: Box::new(PExpr::Call {
+                                    name: function.clone(),
+                                    args: vec![vector_expr.clone(), query_vector.clone()],
+                                    distinct: false,
+                                }),
+                                negated: true,
+                            },
+                        }
+                    } else {
+                        scan
+                    };
+                    execute_op(
+                        &LogicalOp::VectorTopK {
+                            input: Box::new(input),
+                            vector_expr,
+                            query_vector: query_vector.clone(),
+                            function: function.clone(),
+                            k: *k,
+                            distance_alias: distance_alias.clone(),
+                            hnsw_index: None,
+                            predicate: None,
+                        },
+                        ctx,
+                    )
+                }
+            }
         }
 
         // Index access path for text_match over one label: the index's
@@ -5178,13 +5223,45 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 s.split(", ").next().unwrap_or(s)
             });
 
+            // The ordering key of a row is NULL when the row or the query
+            // holds no vector, as the scalar function gives it, and a NULL
+            // key orders after every score ascending and before every score
+            // descending, rows among themselves in input order: the order a
+            // Sort over the same rows gives.
+            let k = *k;
+            let query_is_vector = match rows.first() {
+                Some(first) => coerce_value_to_vec(&eval_neutral(query_vector, first)?).is_some(),
+                None => true,
+            };
+            if !query_is_vector {
+                let mut kept = rows;
+                kept.truncate(k);
+                if let Some(alias) = distance_alias {
+                    for row in &mut kept {
+                        row.insert(alias.clone(), Value::Null);
+                    }
+                }
+                return charge_returned(ctx, 0, kept);
+            }
+            let ascending = vector_function_ascending(function);
+            // Descending, the rows without a vector come first: only as many
+            // scored rows as they leave room for are ranked.
+            let leading_nulls = if ascending {
+                Vec::new()
+            } else {
+                rows_without_vector(&rows, vector_expr, k)?
+            };
+            let ranked_k = k - leading_nulls.len();
+
             // Try HNSW-accelerated top-K path.
-            let result = if let Some(hnsw_result) = try_hnsw_vector_top_k(
+            let ranked = if ranked_k == 0 {
+                Vec::new()
+            } else if let Some(hnsw_result) = try_hnsw_vector_top_k(
                 &rows,
                 vector_expr,
                 query_vector,
                 function,
-                *k,
+                ranked_k,
                 distance_alias.as_deref(),
                 hnsw_index_name,
                 predicate.as_ref(),
@@ -5194,13 +5271,36 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             } else {
                 // Fallback: brute-force distance computation per row, sort, take top-K.
                 execute_vector_top_k_brute_force(
-                    rows,
+                    &rows,
                     vector_expr,
                     query_vector,
                     function,
-                    *k,
+                    ranked_k,
                     distance_alias.as_deref(),
                 )?
+            };
+            let null_row = |at: usize| {
+                let mut row = rows[at].clone();
+                if let Some(alias) = distance_alias {
+                    row.insert(alias.clone(), Value::Null);
+                }
+                row
+            };
+            let result = if ascending {
+                // Ascending, the rows without a vector follow every score.
+                let short = k - ranked.len();
+                let trailing = if short == 0 {
+                    Vec::new()
+                } else {
+                    rows_without_vector(&rows, vector_expr, short)?
+                };
+                let mut result = ranked;
+                result.extend(trailing.into_iter().map(null_row));
+                result
+            } else {
+                let mut result: Vec<Row> = leading_nulls.into_iter().map(null_row).collect();
+                result.extend(ranked);
+                result
             };
             charge_returned(ctx, 0, result)
         }
@@ -7229,8 +7329,9 @@ fn execute_hnsw_scan(
     function: &str,
     distance_alias: Option<&str>,
     index_name: &str,
+    vectors_only: bool,
     ctx: &mut ExecutionContext<'_>,
-) -> Result<Vec<Row>, ExecutionError> {
+) -> Result<Option<Vec<Row>>, ExecutionError> {
     let Some(indexes) = ctx.vector_indexes else {
         return Err(ExecutionError::Unsupported(format!(
             "HnswScan({index_name}) requires vector indexes in ExecutionContext"
@@ -7241,11 +7342,12 @@ fn execute_hnsw_scan(
     // scan-then-rank path does.
     gate_vector_index_read(indexes, label, property)?;
 
+    // A query that is not a vector gives every node a NULL key: the order is
+    // the scan's, which the index cannot give, or nothing when the query
+    // keeps only non-NULL keys.
     let qv_val = eval_neutral(query_vector, &Row::new())?;
     let Some(qv) = coerce_value_to_vec(&qv_val) else {
-        return Err(ExecutionError::Unsupported(format!(
-            "HnswScan({index_name}): query vector did not evaluate to a vector"
-        )));
+        return Ok(vectors_only.then(Vec::new));
     };
 
     use coordinode_modality::NodeStore as _;
@@ -7284,9 +7386,8 @@ fn execute_hnsw_scan(
             let mut search = coordinode_core::budget::BatchedWork::new(&budget);
             let Some(hits) = registry.search(label, property, &qv, want, &mut search)? else {
                 // Index disappeared between planning and execution (concurrent
-                // DROP). Empty result keeps the read path total; the planner
-                // will not pick HnswScan on the next statement.
-                return Ok(Vec::new());
+                // DROP): the scan answers.
+                return Ok(None);
             };
             search.finish()?;
             let kept: Vec<_> = hits
@@ -7341,6 +7442,11 @@ fn execute_hnsw_scan(
         let score = vector_function_score(function, &qv, &vector)?;
         scored.push((id, record, score));
     }
+    // Fewer than k vectors: the nodes without one follow them, with NULL
+    // keys, and only the scan finds those, unless the query keeps them out.
+    if scored.len() < k && !vectors_only {
+        return Ok(None);
+    }
     let ascending = vector_function_ascending(function);
     scored.sort_by(|a, b| {
         let order = if ascending {
@@ -7374,7 +7480,7 @@ fn execute_hnsw_scan(
         }
         results.push(row);
     }
-    Ok(results)
+    Ok(Some(results))
 }
 
 /// Execute the `TextIndexScan` access path: every node the text index of
@@ -9115,6 +9221,11 @@ fn try_hnsw_vector_top_k(
             scored.push((exact, id, row));
         }
     }
+    // A written node that no longer holds a vector leaves fewer than k scored
+    // hits, and the rows the index did not return may hold the missing ones.
+    if scored.len() < k.min(rows.len()) {
+        return Ok(None);
+    }
     let ascending = vector_function_ascending(function);
     scored.sort_by(|a, b| {
         let order = if ascending {
@@ -9160,7 +9271,7 @@ fn recompute_score_for_row(
 /// Used as fallback when `try_hnsw_vector_top_k` returns `None` (no index,
 /// non-NodeScan input rows, or insufficient HNSW intersection).
 fn execute_vector_top_k_brute_force(
-    rows: Vec<Row>,
+    rows: &[Row],
     vector_expr: &crate::plan::expr::Expr,
     query_vector_expr: &crate::plan::expr::Expr,
     function: &str,
@@ -9188,10 +9299,10 @@ fn execute_vector_top_k_brute_force(
         },
         _ => None,
     };
-    let mut scored: Vec<(f64, Option<u64>, Row)> = Vec::with_capacity(rows.len());
+    let mut scored: Vec<(f64, Option<u64>, &Row)> = Vec::with_capacity(rows.len());
     for row in rows {
-        if let Some(score) = recompute_score_for_row(vector_expr, &query_vec, function, &row)? {
-            let node = owner.and_then(|v| row_node_id(&row, v));
+        if let Some(score) = recompute_score_for_row(vector_expr, &query_vec, function, row)? {
+            let node = owner.and_then(|v| row_node_id(row, v));
             scored.push((score, node, row));
         }
     }
@@ -9210,13 +9321,58 @@ fn execute_vector_top_k_brute_force(
 
     // Take top-K, optionally augment with distance alias.
     let mut result = Vec::with_capacity(k.min(scored.len()));
-    for (score, _, mut row) in scored.into_iter().take(k) {
+    for (score, _, row) in scored.into_iter().take(k) {
+        let mut row = row.clone();
         if let Some(alias) = distance_alias {
             row.insert(alias.to_string(), Value::Float(score));
         }
         result.push(row);
     }
     Ok(result)
+}
+
+/// The positions, in input order, of the first `limit` rows of `rows` whose
+/// `vector_expr` holds no vector: their ordering key is NULL.
+fn rows_without_vector(
+    rows: &[Row],
+    vector_expr: &crate::plan::expr::Expr,
+    limit: usize,
+) -> Result<Vec<usize>, ExecutionError> {
+    // A node property is the row's `var.prop` column: read in place, the
+    // vector is not copied to be looked at.
+    let column = match vector_expr {
+        crate::plan::expr::Expr::Property { base, key } => match base.as_ref() {
+            crate::plan::expr::Expr::Variable(v) => Some(format!("{v}.{key}")),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut found = Vec::new();
+    for (at, row) in rows.iter().enumerate() {
+        if found.len() == limit {
+            break;
+        }
+        let holds_vector = match column.as_deref().and_then(|c| row.get(c)) {
+            Some(value) => is_vector_value(value),
+            None => coerce_value_to_vec(&eval_neutral(vector_expr, row)?).is_some(),
+        };
+        if !holds_vector {
+            found.push(at);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether `val` is a vector to the vector functions, as
+/// [`coerce_value_to_vec`] reads one, without copying it.
+fn is_vector_value(val: &Value) -> bool {
+    match val {
+        Value::Vector(_) => true,
+        Value::Array(items) => items
+            .iter()
+            .all(|item| matches!(item, Value::Float(_) | Value::Int(_))),
+        _ => false,
+    }
 }
 
 /// VectorFilter: evaluate vector distance/similarity per row and filter.
