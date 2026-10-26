@@ -290,6 +290,174 @@ fn the_planned_strategy_compacts_a_tree() {
     drop(sched);
 }
 
+/// The monitor judges each table on its own and latches its verdict where
+/// that table's writes read it, not into the partitions' verdict, and the
+/// tables reach the metrics as one series under `partition="tables"` (the
+/// worst tier) whatever their number, with no label per table.
+#[test]
+fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
+    use metrics::{GaugeFn, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+    use std::sync::Mutex;
+
+    /// Each gauge's labels and last value, by name.
+    type Gauges = Mutex<Vec<(String, Vec<(String, String)>, f64)>>;
+    struct Handle(Key, Arc<Gauges>);
+    impl GaugeFn for Handle {
+        fn increment(&self, _: f64) {}
+        fn decrement(&self, _: f64) {}
+        fn set(&self, value: f64) {
+            let labels = self
+                .0
+                .labels()
+                .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                .collect();
+            self.1
+                .lock()
+                .expect("gauges")
+                .push((self.0.name().to_owned(), labels, value));
+        }
+    }
+    struct Capture(Arc<Gauges>);
+    impl Recorder for Capture {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::from_arc(Arc::new(Handle(key.clone(), Arc::clone(&self.0))))
+        }
+        fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    let (trees, dir) = make_test_trees();
+    let seqno: lsm_tree::SharedSequenceNumberGenerator =
+        Arc::new(lsm_tree::SequenceNumberCounter::default());
+    let table = |name: &str, runs: u64| {
+        let tree = lsm_tree::Config::new_with_generators(
+            dir.path().join(name),
+            Arc::clone(&seqno),
+            Arc::clone(&seqno),
+        )
+        .open()
+        .expect("open table tree");
+        if let lsm_tree::AnyTree::Standard(t) = &tree {
+            t.update_runtime_config(|cfg| {
+                cfg.backpressure = lsm_tree::BackpressureThresholds {
+                    l0_stop: Some(2),
+                    ..lsm_tree::BackpressureThresholds::OFF
+                };
+            })
+            .expect("thresholds");
+        }
+        // Overlapping runs: each rewrites the same key.
+        for round in 0..runs {
+            tree.insert(b"key", round.to_le_bytes(), seqno.next());
+            tree.rotate_memtable();
+            let lock = tree.get_flush_lock();
+            tree.flush(&lock, 0).expect("flush");
+        }
+        TableTree {
+            id: name.to_string(),
+            tree,
+            pressure: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            alive: Arc::new(parking_lot::RwLock::new(true)),
+        }
+    };
+    let tables = vec![table("behind", 3), table("idle", 0)];
+    let (behind, idle) = (
+        Arc::clone(&tables[0].pressure),
+        Arc::clone(&tables[1].pressure),
+    );
+
+    let gauges = Arc::new(Gauges::default());
+    let (sender, _receiver) = flume::bounded(64);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let write_pressure = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let wake = Arc::new(Wake::default());
+    let monitor = {
+        let recorder = Capture(Arc::clone(&gauges));
+        let monitored = trees
+            .iter()
+            .map(|(&p, t)| MonitoredTree {
+                tree: t.clone(),
+                source: CompactionSource::Partition(p),
+                strategy: CompactionStrategyKind::Leveled.for_tree(),
+                table: None,
+            })
+            .collect();
+        let cfg = MonitorConfig {
+            sender,
+            gc_watermarks: GcWatermarks::uniform(&Arc::new(AtomicU64::new(0))),
+            l0_urgent_threshold: 8,
+            debt_urgent_bytes: 64 * 1024 * 1024 * 1024,
+            write_pressure: Arc::clone(&write_pressure),
+            shutdown: Arc::clone(&shutdown),
+            strategy: CompactionStrategyKind::Leveled,
+            tables: Some(Box::new(move || tables.clone())),
+        };
+        let wake = Arc::clone(&wake);
+        std::thread::spawn(move || {
+            metrics::with_local_recorder(&recorder, || {
+                compaction_monitor_loop(monitored, cfg, &wake)
+            });
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while behind.load(Ordering::Relaxed) != 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the table was never judged"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    shutdown.store(true, Ordering::Relaxed);
+    wake.notify();
+    monitor.join().expect("monitor");
+
+    assert_eq!(
+        idle.load(Ordering::Relaxed),
+        0,
+        "a table is judged on its own tree"
+    );
+    assert_eq!(
+        write_pressure.load(Ordering::Relaxed),
+        0,
+        "a table's verdict is not the partitions'"
+    );
+    let gauges = gauges.lock().expect("gauges");
+    let last = |name: &str, partition: &str| {
+        gauges
+            .iter()
+            .rev()
+            .find(|(n, labels, _)| {
+                n == name
+                    && labels
+                        .iter()
+                        .any(|(k, v)| k == "partition" && v == partition)
+            })
+            .map(|(_, _, value)| *value)
+    };
+    assert_eq!(
+        last("coordinode_storage_backpressure_tier", "tables"),
+        Some(2.0)
+    );
+    assert!(last("coordinode_storage_compaction_debt_bytes", "tables").is_some());
+    assert_eq!(
+        last("coordinode_storage_backpressure_tier", "node"),
+        Some(0.0)
+    );
+    assert!(
+        gauges
+            .iter()
+            .all(|(_, labels, _)| labels.iter().all(|(k, _)| k == "partition")),
+        "no label per table: {gauges:?}"
+    );
+}
+
 #[test]
 fn compaction_scheduler_multiple_workers_no_panic() {
     let (trees, _dir) = make_test_trees();
