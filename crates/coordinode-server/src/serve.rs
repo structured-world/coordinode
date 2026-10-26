@@ -1129,11 +1129,21 @@ pub(crate) async fn serve(
                 .unwrap_or_else(|e| format!(r#"{{"error":"version report: {e}"}}"#))
         })
     };
+    // The series that go with what they describe: a columnar table's with
+    // its drop, a label's with its last node.
+    let owned_series: ops::OwnedSeries = {
+        let engine = Arc::clone(&engine);
+        Arc::new(move |out: &mut String| {
+            engine.table_metrics().render(out);
+            engine.node_counts().render(out);
+        })
+    };
     tokio::spawn(async move {
         if let Err(e) = ops::start_ops_server(
             ops_listener,
             ops_readiness,
             sample_gauges,
+            owned_series,
             version_view,
             reload,
         )

@@ -336,7 +336,8 @@ fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
     let (trees, dir) = make_test_trees();
     let seqno: lsm_tree::SharedSequenceNumberGenerator =
         Arc::new(lsm_tree::SequenceNumberCounter::default());
-    let table = |name: &str, runs: u64| {
+    let table_metrics = Arc::new(crate::engine::owned_metrics::TableMetrics::default());
+    let table = |name: &str, runs: u64, alive: bool| {
         let tree = lsm_tree::Config::new_with_generators(
             dir.path().join(name),
             Arc::clone(&seqno),
@@ -364,10 +365,16 @@ fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
             id: name.to_string(),
             tree,
             pressure: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-            alive: Arc::new(parking_lot::RwLock::new(true)),
+            alive: Arc::new(parking_lot::RwLock::new(alive)),
+            metrics: Arc::clone(&table_metrics),
         }
     };
-    let tables = vec![table("behind", 3), table("idle", 0)];
+    // `dropped` was listed before its drop took its life.
+    let tables = vec![
+        table("behind", 3, true),
+        table("idle", 0, true),
+        table("dropped", 3, false),
+    ];
     let (behind, idle) = (
         Arc::clone(&tables[0].pressure),
         Arc::clone(&tables[1].pressure),
@@ -454,8 +461,20 @@ fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
         gauges
             .iter()
             .all(|(_, labels, _)| labels.iter().all(|(k, _)| k == "partition")),
-        "no label per table: {gauges:?}"
+        "the facade series carry no label per table: {gauges:?}"
     );
+    // Each live table has its own series; a dropped one has none.
+    let mut rendered = String::new();
+    table_metrics.render(&mut rendered);
+    assert!(
+        rendered.contains("coordinode_storage_table_backpressure_tier{table=\"behind\"} 2\n"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("coordinode_storage_table_backpressure_tier{table=\"idle\"} 0\n"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("dropped"), "{rendered}");
 }
 
 #[test]

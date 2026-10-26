@@ -243,6 +243,12 @@ pub struct StorageEngine {
     /// checkpoint by the repair orchestrator, as a partition is.
     #[cfg(feature = "columnar")]
     table_repairs: parking_lot::Mutex<Vec<crate::columnar::TableRepair>>,
+    /// Each live columnar table's write-pressure series; empty in a build
+    /// without columnar support.
+    table_metrics: Arc<crate::engine::owned_metrics::TableMetrics>,
+    /// The stored nodes of each label that has any, sampled by the capacity
+    /// scanner.
+    node_counts: Arc<crate::engine::owned_metrics::NodeCounts>,
     /// Partitions whose tree failed to open with positively-identified
     /// structural damage and was repaired (manifest rebuild, block salvage)
     /// during THIS open. Consumed by the repair orchestrator: a lossy
@@ -1203,6 +1209,7 @@ impl StorageEngine {
         // budget and write buffer; re-opens any table tree already on disk.
         // Opened before the flush manager, which flushes them with the
         // partition trees.
+        let table_metrics = Arc::new(crate::engine::owned_metrics::TableMetrics::default());
         #[cfg(feature = "columnar")]
         let (columnar_tables, table_repairs) = {
             // Use the engine's configured filesystem backend (MemFs for
@@ -1236,6 +1243,7 @@ impl StorageEngine {
                         config.columnar_encoded_from_level,
                     ),
                     backpressure: config.backpressure.to_thresholds(),
+                    metrics: Arc::clone(&table_metrics),
                 },
             )?;
             (Arc::new(registry), repairs)
@@ -1335,7 +1343,9 @@ impl StorageEngine {
         // eviction run only where an endpoint has a `hard_limit_bytes`. The
         // closure captures cheap snapshots (AnyTree is internally Arc'd) so
         // no circular reference with `Self`.
+        let node_counts = Arc::new(crate::engine::owned_metrics::NodeCounts::default());
         let capacity_scanner = {
+            let node_counts_c = Arc::clone(&node_counts);
             let tracked = config.endpoints.iter().any(|ep| ep.hard_limit_bytes > 0);
             let tracker_c = Arc::clone(&capacity_arc);
             let endpoints_c = config.endpoints.clone();
@@ -1346,7 +1356,7 @@ impl StorageEngine {
             let interval = std::time::Duration::from_secs(5);
             Some(
                 crate::engine::capacity::CapacityScanner::start(interval, move || {
-                    publish_label_counts(&trees_c, &seqno_c);
+                    publish_label_counts(&trees_c, &seqno_c, &node_counts_c);
                     #[cfg(feature = "lsm-metrics")]
                     publish_tree_metrics(&trees_c);
                     if !tracked {
@@ -1494,6 +1504,8 @@ impl StorageEngine {
             columnar_tables,
             #[cfg(feature = "columnar")]
             table_repairs: parking_lot::Mutex::new(table_repairs),
+            table_metrics,
+            node_counts,
             open_repairs,
             write_pressure,
             memtable_pressure,
@@ -1536,6 +1548,21 @@ impl StorageEngine {
             }
         }
         Ok(engine)
+    }
+
+    /// Each live `STORAGE COLUMNAR` table's write-pressure series, for an
+    /// operations endpoint to render beside the process's other metrics. A
+    /// table's series exists exactly while the table does.
+    #[must_use]
+    pub fn table_metrics(&self) -> &crate::engine::owned_metrics::TableMetrics {
+        &self.table_metrics
+    }
+
+    /// The stored nodes of each label that has any, for an operations
+    /// endpoint to render. A label whose last node is gone has no series.
+    #[must_use]
+    pub fn node_counts(&self) -> &crate::engine::owned_metrics::NodeCounts {
+        &self.node_counts
     }
 
     /// The columnar tables whose tree an open repaired with loss and which
@@ -6036,11 +6063,14 @@ fn publish_tree_metrics(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
 
 /// Publish the stored nodes per label (`coordinode_graph_nodes_total`), from
 /// the counters the write path keeps on the same transaction as the nodes:
-/// one read per label, sampled on the capacity-scan cadence. A counter below
-/// zero is not published; no sequence of committed writes leaves one.
+/// one read per label, sampled on the capacity-scan cadence. The sample
+/// replaces the last one, and a label with no node left is not in it. A
+/// counter below zero is not published; no sequence of committed writes
+/// leaves one. A scan that fails keeps the last sample.
 fn publish_label_counts(
     trees: &HashMap<Partition, lsm_tree::AnyTree>,
     seqno: &lsm_tree::SharedSequenceNumberGenerator,
+    published: &crate::engine::owned_metrics::NodeCounts,
 ) {
     use coordinode_core::graph::stats::LABEL_KEY_PREFIX;
     use lsm_tree::{AbstractTree, Guard as _};
@@ -6048,6 +6078,7 @@ fn publish_label_counts(
     let Some(tree) = trees.get(&Partition::Counter) else {
         return;
     };
+    let mut counts = std::collections::BTreeMap::new();
     for guard in tree.prefix(LABEL_KEY_PREFIX, seqno.get(), None) {
         let (key, value) = match guard.into_inner() {
             Ok(kv) => kv,
@@ -6060,9 +6091,11 @@ fn publish_label_counts(
             continue;
         };
         match crate::engine::merge::decode_counter(&value) {
-            Ok(count) if count >= 0 => {
-                metrics::gauge!("coordinode_graph_nodes_total", "label" => label.to_owned())
-                    .set(count as f64);
+            // A label with no node left has no series.
+            Ok(0) => {}
+            Ok(count) if count > 0 => {
+                // Positive, so the cast is exact.
+                counts.insert(label.to_owned(), count as u64);
             }
             Ok(count) => {
                 tracing::warn!(label, count, "label counter below zero; not published");
@@ -6072,6 +6105,7 @@ fn publish_label_counts(
             }
         }
     }
+    published.replace(counts);
 }
 
 /// Free function form of `StorageEngine::refresh_capacity` — the

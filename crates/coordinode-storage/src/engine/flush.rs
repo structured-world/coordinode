@@ -124,6 +124,8 @@ pub(crate) struct TableTree {
     /// false under the write guard, after the running ones, before its
     /// directories go.
     pub(crate) alive: TableLife,
+    /// Where the table's write-pressure series is set, under `alive`.
+    pub(crate) metrics: Arc<crate::engine::owned_metrics::TableMetrics>,
 }
 
 /// The life of a table: read-held by the maintenance of its tree, written

@@ -597,8 +597,12 @@ statements writing that table, refused before any of their rows lands, so a
 table that fell behind does not stop the graph and the graph does not stop
 the table. The memtable axis is shared and gates both. The tables appear in
 the metrics as one series, `partition="tables"` (the worst table's tier and
-the tables' total debt), whatever their number; the warning logged on a stop
-names the table. Read-only traffic is unaffected, and replicated (Raft) entry
+the tables' total debt), and each table also as its own
+`coordinode_storage_table_backpressure_tier{table="…"}` and
+`coordinode_storage_table_compaction_debt_bytes{table="…"}`. A table's series
+exists exactly while the table does: `DROP TABLE` removes it at once, and a
+table created again under the name starts a series of its own. The warning
+logged on a stop names the table. Read-only traffic is unaffected, and replicated (Raft) entry
 application is never gated. Changing the thresholds requires a restart.
 
 ### Oplog
@@ -985,7 +989,8 @@ horizon for both time-travel reads and lagging-consumer recovery.
   limit. On the same cadence `coordinode_graph_nodes_total{label}` reports
   the stored nodes per label, read from counters that change in the same
   transaction as the nodes (a temporal node counts once per stored
-  version).
+  version). A label with no node left has no series from the next sample
+  on.
 - `registry_heartbeat_ms` and `registry_eviction_ms` tune the
   consumer-retention registry's background service: the window over which
   buffered consumer heartbeats are coalesced into one proposal (opened by the

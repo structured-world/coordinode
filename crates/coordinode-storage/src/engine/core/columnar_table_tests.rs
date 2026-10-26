@@ -118,6 +118,51 @@ fn the_compaction_scheduler_compacts_a_columnar_table() {
     assert!(rows.iter().all(|(_, v)| v == &11u32.to_le_bytes().to_vec()));
 }
 
+/// A table's write-pressure series lives exactly as long as the table: the
+/// compaction monitor publishes it once the table is judged, `DROP TABLE`
+/// takes it away at once, and a table created again under the name gets its
+/// own once judged.
+#[test]
+fn a_dropped_table_takes_its_series_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::open(&persistent_config(dir.path())).unwrap();
+    let rendered = || {
+        let mut out = String::new();
+        engine.table_metrics().render(&mut out);
+        out
+    };
+    let write_and_flush = || {
+        engine
+            .columnar_insert(
+                "trades",
+                b"row:0001".to_vec(),
+                b"v".to_vec(),
+                engine.next_seqno(),
+            )
+            .unwrap();
+        // A flush wakes the compaction monitor, which judges the table.
+        engine.flush_columnar_table("trades").unwrap();
+    };
+    let wait_for_series = || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !rendered().contains("table=\"trades\"") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the table was never judged"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+
+    write_and_flush();
+    wait_for_series();
+    engine.drop_columnar_table("trades").unwrap();
+    assert!(!rendered().contains("trades"), "{}", rendered());
+
+    write_and_flush();
+    wait_for_series();
+}
+
 /// A columnar table's tree encodes its column pages from the configured level
 /// down, plain above it.
 #[test]

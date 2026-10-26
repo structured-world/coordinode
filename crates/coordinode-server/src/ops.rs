@@ -127,16 +127,23 @@ pub(crate) type SampleGauges = Arc<dyn Fn() + Send + Sync>;
 /// Renders this member's version report as JSON, at request time.
 pub(crate) type VersionView = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// Appends the series kept outside the `metrics` facade to a `/metrics`
+/// body: those that must disappear with what they describe, which the facade
+/// cannot remove.
+pub(crate) type OwnedSeries = Arc<dyn Fn(&mut String) + Send + Sync>;
+
 /// Start the operational HTTP server on `listener`, bound by the caller at
 /// startup so a busy port fails the start.
 ///
 /// Handles /health, /ready, /metrics, /version and `POST /reload`; `/ready`
-/// follows `readiness`, `/metrics` runs `sample` first, `/version` renders
-/// `version`, and `/reload` runs `reload`. Runs until the process exits.
+/// follows `readiness`, `/metrics` runs `sample` first and appends `owned`,
+/// `/version` renders `version`, and `/reload` runs `reload`. Runs until the
+/// process exits.
 pub(crate) async fn start_ops_server(
     listener: TcpListener,
     readiness: Readiness,
     sample: SampleGauges,
+    owned: OwnedSeries,
     version: VersionView,
     reload: Option<ReloadHook>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -163,6 +170,7 @@ pub(crate) async fn start_ops_server(
 
         let handle = prometheus_handle.clone();
         let sample = Arc::clone(&sample);
+        let owned = Arc::clone(&owned);
         let version = Arc::clone(&version);
         let reload = reload.clone();
         let ready = readiness.get();
@@ -203,7 +211,9 @@ pub(crate) async fn start_ops_server(
                     ready,
                     || {
                         sample();
-                        handle.render()
+                        let mut body = handle.render();
+                        owned(&mut body);
+                        body
                     },
                     || version(),
                 )

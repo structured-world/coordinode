@@ -180,7 +180,9 @@ fn register_query_metrics() {
 }
 
 fn register_graph_metrics() {
-    metrics::describe_gauge!("coordinode_graph_nodes_total", "Node count per label");
+    // `coordinode_graph_nodes_total` is the engine's own series
+    // (`NodeCounts`): a label's goes with its last node, which the facade
+    // cannot do, so it is not described here.
     metrics::describe_gauge!("coordinode_graph_edges_total", "Edge count per type");
     metrics::describe_gauge!(
         "coordinode_graph_properties_total",

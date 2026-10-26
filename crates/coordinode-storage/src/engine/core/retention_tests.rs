@@ -1220,13 +1220,11 @@ fn footprint_gauges_are_sampled_without_capacity_limits() {
 }
 
 /// The engine's background sampling publishes the stored nodes per label
-/// from the label counters, and leaves out a counter below zero.
+/// from the label counters, leaves out a counter below zero, and drops the
+/// series of a label whose last node is gone.
 #[test]
 fn node_counts_per_label_are_sampled() {
     use coordinode_core::graph::stats::{counter_delta_operand, label_count_key};
-
-    let sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    metrics::set_global_recorder(GaugeCapture(Arc::clone(&sink))).expect("recorder");
 
     let dir = TempDir::new().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -1252,30 +1250,46 @@ fn node_counts_per_label_are_sampled() {
         )
         .expect("an underflowed counter");
 
-    let gauge = |label: &str| {
-        sink.lock()
-            .iter()
-            .rev()
-            .find(|(name, labels, _)| {
-                name == "coordinode_graph_nodes_total"
-                    && labels.iter().any(|(k, v)| k == "label" && v == label)
-            })
-            .map(|(_, _, value)| *value)
+    let rendered = || {
+        let mut out = String::new();
+        engine.node_counts().render(&mut out);
+        out
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while gauge("Project").is_none() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no node count sample within 30 s"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert_eq!(gauge("Project"), Some(3.0));
-    assert_eq!(
-        gauge("Broken"),
-        None,
+    // An empty `sample` waits for no series at all.
+    let wait_for = |sample: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let seen = || {
+            let out = rendered();
+            if sample.is_empty() {
+                out.is_empty()
+            } else {
+                out.contains(sample)
+            }
+        };
+        while !seen() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no sample {sample:?} within 30 s: {}",
+                rendered()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for("coordinode_graph_nodes_total{label=\"Project\"} 3\n");
+    assert!(
+        !rendered().contains("Broken"),
         "a counter below zero is not published"
     );
+
+    // The last Project node goes: its series goes with the next sample.
+    engine
+        .merge(
+            Partition::Counter,
+            &label_count_key("Project"),
+            &counter_delta_operand(-3),
+        )
+        .expect("delete Project's nodes");
+    wait_for("");
 }
 
 /// The capacity refresh publishes the two gauges per partition with the

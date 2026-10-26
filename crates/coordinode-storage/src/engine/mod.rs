@@ -22,6 +22,7 @@ pub mod metered_fs;
 pub mod open_txns;
 pub mod operations;
 pub mod oplog_journal;
+pub mod owned_metrics;
 pub mod partition;
 pub mod pending;
 pub mod rebuild;

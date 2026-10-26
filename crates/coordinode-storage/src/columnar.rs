@@ -177,6 +177,8 @@ pub(crate) struct TableTreeSettings {
     pub(crate) column_encoding: ColumnEncodingPolicy,
     /// The thresholds each table's write-pressure verdict is judged against.
     pub(crate) backpressure: lsm_tree::BackpressureThresholds,
+    /// The tables' write-pressure series: a table's goes with its drop.
+    pub(crate) metrics: Arc<crate::engine::owned_metrics::TableMetrics>,
 }
 
 impl TableTreeSettings {
@@ -356,7 +358,11 @@ impl ColumnarTableRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .remove(table_id);
         if let Some(entry) = entry {
-            *entry.alive.write() = false;
+            let mut alive = entry.alive.write();
+            *alive = false;
+            // Under the life it ends: a monitor pass of this table that was
+            // about to set its series has done so or never will.
+            self.settings.metrics.remove(table_id);
         }
         for root in &self.settings.roots {
             match self.fs.remove_dir_all(&root.join(table_id)) {
@@ -394,6 +400,7 @@ impl ColumnarTableRegistry {
                 tree: entry.tree.clone(),
                 pressure: Arc::clone(&entry.pressure),
                 alive: Arc::clone(&entry.alive),
+                metrics: Arc::clone(&self.settings.metrics),
             })
             .collect()
     }

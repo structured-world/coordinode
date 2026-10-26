@@ -262,6 +262,7 @@ struct MonitoredTable {
     id: String,
     pressure: Arc<std::sync::atomic::AtomicU8>,
     life: TableLife,
+    metrics: Arc<crate::engine::owned_metrics::TableMetrics>,
 }
 
 /// What the monitor runs with, bundled to keep its signature short.
@@ -293,6 +294,7 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                 tree,
                 pressure,
                 alive,
+                metrics,
             } in listed
             {
                 // A table dropped and created again under its id since the
@@ -311,6 +313,7 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                             id,
                             pressure,
                             life: alive,
+                            metrics,
                         }),
                     },
                 );
@@ -319,8 +322,8 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
         // Build requests sorted by priority: Urgent (0) first, Low (3) last.
         // Along the way, judge every tree's backpressure: the partitions'
         // worst gates the commit path, a table's gates that table's writes.
-        // The tables share one metrics label whatever their number: their
-        // worst tier and their total debt.
+        // The tables share one partition label, their worst tier and total
+        // debt, beside each live table's own series.
         let mut worst_tier: u8 = 0;
         let mut tables_tier: u8 = 0;
         let mut tables_debt: u64 = 0;
@@ -367,8 +370,17 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                     );
                 }
                 match table {
-                    Some(MonitoredTable { pressure, .. }) => {
+                    Some(MonitoredTable {
+                        id,
+                        pressure,
+                        life,
+                        metrics,
+                    }) => {
                         pressure.store(tier, Ordering::Relaxed);
+                        // Only while the table lives: its drop removes the
+                        // series under the same life, so a dropped table, or
+                        // the one it was before a re-create, sets none.
+                        while_alive(Some(life), || metrics.set(id, tier, debt));
                         tables_tier = tables_tier.max(tier);
                         // Bytes on the endpoints' disks: far below u64::MAX.
                         tables_debt += debt;

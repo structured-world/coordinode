@@ -22,6 +22,7 @@ fn settings(roots: Vec<PathBuf>, fs: Arc<dyn Fs>, sync: SyncMode) -> TableTreeSe
         capacity: std::sync::Arc::new(lsm_tree::CapacityPool::default()),
         column_encoding: TableTreeSettings::column_encoding_from(3),
         backpressure: lsm_tree::BackpressureThresholds::default(),
+        metrics: Arc::default(),
     }
 }
 
