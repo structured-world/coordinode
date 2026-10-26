@@ -525,6 +525,24 @@ fn a_check_that_cannot_spill_fails_and_lookups_keep_answering_from_the_records()
         .put(Partition::Idx, &entry_key(&db, "u_city", "oslo", r), &[])
         .expect("plant a stray entry");
     assert_eq!(found_by(&mut db, "city", "oslo").len(), 50);
+    // The lookup marked the generation here at once; the catalog records the
+    // suspicion when the background reporter takes the report. The check
+    // must find it suspect for "stays suspect" to mean anything.
+    let generation = index_named(db.engine(), "u_city")
+        .expect("index")
+        .generation;
+    let deadline = std::time::Instant::now() + WAIT;
+    while LocalIndexStore::new(db.engine())
+        .load_integrity(generation)
+        .expect("read integrity")
+        .is_none_or(|(record, _)| record.integrity != Integrity::Suspect)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the report was not recorded"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 
     let (status, outcome) = check(&db, "u_city");
     assert!(
