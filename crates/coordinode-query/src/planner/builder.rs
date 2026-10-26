@@ -93,6 +93,28 @@ pub enum PlanError {
          and `n.prop IS NOT NULL`"
     )]
     UnsupportedIndexFilter,
+
+    /// ORDER BY after a projection reads what the projection does not keep
+    /// where it cannot: past DISTINCT or an aggregation only the projected
+    /// columns exist (openCypher, ORDER BY scoping).
+    #[error(
+        "ORDER BY after a projection with {projection} can only use its columns; \
+         `{variable}` is not one of them"
+    )]
+    OrderByOutOfScope {
+        projection: &'static str,
+        variable: String,
+    },
+
+    /// ORDER BY reads both a variable the projection drops and a column whose
+    /// expression cannot be evaluated again before the projection (a subquery
+    /// or a function giving a new value each call).
+    #[error(
+        "ORDER BY combines a variable the projection drops with the column `{column}`, \
+         which cannot be evaluated again before the projection; return the variable \
+         or order by the column alone"
+    )]
+    OrderByColumnNotRepeatable { column: String },
 }
 
 /// Build the optimized logical root for a single query branch (one clause
@@ -527,18 +549,16 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         }
         Clause::OrderBy(items) => {
             let input = current.unwrap_or(LogicalOp::Empty);
-            Ok(LogicalOp::Sort {
-                input: Box::new(input),
-                items: items
-                    .iter()
-                    .map(|s| {
-                        Ok(crate::plan::SortItem {
-                            expr: super::lower_expr(&s.expr)?,
-                            ascending: s.ascending,
-                        })
+            let items = items
+                .iter()
+                .map(|s| {
+                    Ok(crate::plan::SortItem {
+                        expr: super::lower_expr(&s.expr)?,
+                        ascending: s.ascending,
                     })
-                    .collect::<Result<Vec<_>, PlanError>>()?,
-            })
+                })
+                .collect::<Result<Vec<_>, PlanError>>()?;
+            build_order_by(input, items)
         }
         Clause::Skip(expr) => {
             let input = current.unwrap_or(LogicalOp::Empty);
@@ -3094,6 +3114,45 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
         }
     };
 
+    // A projection over a sort whose key it does not return (ORDER BY reads
+    // a variable before the projection): the top k is taken below it, as a
+    // per-row projection keeps the rows and their order.
+    if let LogicalOp::Project {
+        input: projected,
+        items,
+        distinct: false,
+    } = *limit_input
+    {
+        if !matches!(projected.as_ref(), LogicalOp::Sort { .. }) {
+            return LogicalOp::Limit {
+                input: Box::new(LogicalOp::Project {
+                    input: projected,
+                    items,
+                    distinct: false,
+                }),
+                count,
+            };
+        }
+        return match rewrite_top_k_at_root(LogicalOp::Limit {
+            input: projected,
+            count,
+        }) {
+            LogicalOp::Limit { input, count } => LogicalOp::Limit {
+                input: Box::new(LogicalOp::Project {
+                    input,
+                    items,
+                    distinct: false,
+                }),
+                count,
+            },
+            top_k => LogicalOp::Project {
+                input: Box::new(top_k),
+                items,
+                distinct: false,
+            },
+        };
+    }
+
     // Inner must be Sort with exactly one item.
     let inner_sort = match *limit_input {
         LogicalOp::Sort { input, items } if items.len() == 1 => (input, items),
@@ -3741,6 +3800,506 @@ fn build_return_op(input: LogicalOp, rc: &ReturnClause) -> Result<LogicalOp, Pla
             items,
             distinct: rc.distinct,
         })
+    }
+}
+
+/// Order the rows of `input` by `items`.
+///
+/// After a projection, ORDER BY sees the projection's columns and, unless
+/// the projection is DISTINCT or aggregates, every variable in scope before
+/// it (openCypher). A projection drops what it does not return, so a key
+/// reading such a variable is evaluated below the projection, with the
+/// projection's aliases replaced by the expressions they name; the
+/// projection then runs over the ordered rows. Keys the projection's
+/// columns answer keep the order above it.
+fn build_order_by(
+    input: LogicalOp,
+    items: Vec<crate::plan::SortItem>,
+) -> Result<LogicalOp, PlanError> {
+    let LogicalOp::Project {
+        input: below,
+        items: columns,
+        distinct,
+    } = input
+    else {
+        return Ok(LogicalOp::Sort {
+            input: Box::new(input),
+            items,
+        });
+    };
+    let outputs = ProjectionOutputs::of(&columns);
+    let dropped = items
+        .iter()
+        .find_map(|item| outputs.first_unresolved(&item.expr, &mut Vec::new()));
+    let Some(variable) = dropped else {
+        return Ok(LogicalOp::Sort {
+            input: Box::new(LogicalOp::Project {
+                input: below,
+                items: columns,
+                distinct,
+            }),
+            items,
+        });
+    };
+    if distinct || matches!(below.as_ref(), LogicalOp::Aggregate { .. }) {
+        return Err(PlanError::OrderByOutOfScope {
+            projection: if distinct {
+                "DISTINCT"
+            } else {
+                "an aggregation"
+            },
+            variable,
+        });
+    }
+    // A projection has a handful of columns: a slice is the lookup.
+    let aliases: Vec<(&str, &crate::plan::expr::Expr)> = columns
+        .iter()
+        .filter_map(|c| c.alias.as_deref().map(|a| (a, &c.expr)))
+        .collect();
+    let items = items
+        .into_iter()
+        .map(|item| {
+            Ok(crate::plan::SortItem {
+                expr: substitute_aliases(item.expr, &aliases, &mut Vec::new())?,
+                ascending: item.ascending,
+            })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    Ok(LogicalOp::Project {
+        input: Box::new(LogicalOp::Sort {
+            input: below,
+            items,
+        }),
+        items: columns,
+        distinct,
+    })
+}
+
+/// What the rows of a projection hold, for resolving an ORDER BY key over
+/// them: every column (`*`), whole variables carried through (with their
+/// properties), and the named columns.
+struct ProjectionOutputs<'a> {
+    star: bool,
+    whole: Vec<&'a str>,
+    columns: Vec<String>,
+}
+
+impl<'a> ProjectionOutputs<'a> {
+    fn of(items: &'a [ProjectItem]) -> Self {
+        use crate::plan::expr::Expr as PExpr;
+        let mut outputs = Self {
+            star: false,
+            whole: Vec::new(),
+            columns: Vec::new(),
+        };
+        for item in items {
+            match (&item.expr, item.alias.as_deref()) {
+                (PExpr::Star, _) => outputs.star = true,
+                (PExpr::Variable(v), None) => outputs.whole.push(v),
+                // A renamed variable is carried with its properties too.
+                (PExpr::Variable(_), Some(alias)) => outputs.whole.push(alias),
+                (_, Some(alias)) => outputs.columns.push(alias.to_string()),
+                (PExpr::Property { base, key }, None) => {
+                    if let PExpr::Variable(v) = base.as_ref() {
+                        outputs.columns.push(format!("{v}.{key}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        outputs
+    }
+
+    /// The first variable `expr` reads that these rows do not hold; `bound`
+    /// holds the names local binders in scope introduce.
+    fn first_unresolved(
+        &self,
+        expr: &crate::plan::expr::Expr,
+        bound: &mut Vec<String>,
+    ) -> Option<String> {
+        use crate::plan::expr::Expr as PExpr;
+        if self.star {
+            return None;
+        }
+        let held = |name: &str, bound: &[String]| {
+            bound.iter().any(|b| b == name)
+                || self.whole.contains(&name)
+                || self.columns.iter().any(|c| c == name)
+        };
+        match expr {
+            PExpr::Variable(name) => {
+                let var = name.split('.').next().unwrap_or(name);
+                (!held(name, bound) && !held(var, bound)).then(|| var.to_string())
+            }
+            PExpr::Property { base, key } => match base.as_ref() {
+                PExpr::Variable(v) => {
+                    (!held(v, bound) && !held(&format!("{v}.{key}"), bound)).then(|| v.clone())
+                }
+                other => self.first_unresolved(other, bound),
+            },
+            PExpr::ListComprehension {
+                var,
+                list,
+                filter,
+                map,
+            } => self.first_unresolved(list, bound).or_else(|| {
+                bound.push(var.clone());
+                let found = filter
+                    .iter()
+                    .chain(map.iter())
+                    .find_map(|e| self.first_unresolved(e, bound));
+                bound.pop();
+                found
+            }),
+            PExpr::ListQuantifier {
+                var,
+                list,
+                predicate,
+                ..
+            } => self.first_unresolved(list, bound).or_else(|| {
+                bound.push(var.clone());
+                let found = self.first_unresolved(predicate, bound);
+                bound.pop();
+                found
+            }),
+            PExpr::Reduce {
+                acc,
+                init,
+                var,
+                list,
+                step,
+            } => self
+                .first_unresolved(init, bound)
+                .or_else(|| self.first_unresolved(list, bound))
+                .or_else(|| {
+                    bound.push(acc.clone());
+                    bound.push(var.clone());
+                    let found = self.first_unresolved(step, bound);
+                    bound.truncate(bound.len() - 2);
+                    found
+                }),
+            // A subquery reads its outer row through its own correlation;
+            // where its keys stand is left as it is.
+            PExpr::ExistsSubplan(_)
+            | PExpr::CountSubplan(_)
+            | PExpr::CollectSubplan { .. }
+            | PExpr::PatternComprehension { .. } => None,
+            // A score function reads the score column its own operator
+            // computes, which the planner carries through the projection.
+            call @ PExpr::Call { .. }
+                if crate::executor::eval::expr_score_requirements_neutral(call).any() =>
+            {
+                None
+            }
+            other => {
+                let mut found = None;
+                for_each_child(other, |child| {
+                    if found.is_none() {
+                        found = self.first_unresolved(child, bound);
+                    }
+                });
+                found
+            }
+        }
+    }
+}
+
+/// Call `f` on each direct child expression of `expr` that is evaluated in
+/// the same scope (local binders and subqueries are the caller's).
+fn for_each_child(expr: &crate::plan::expr::Expr, mut f: impl FnMut(&crate::plan::expr::Expr)) {
+    use crate::plan::expr::{Expr as PExpr, MapProjItem};
+    match expr {
+        PExpr::Property { base, .. } => f(base),
+        PExpr::Binary { left, right, .. } => {
+            f(left);
+            f(right);
+        }
+        PExpr::Unary { operand, .. }
+        | PExpr::IsNull { operand, .. }
+        | PExpr::IsTyped { operand, .. } => f(operand),
+        PExpr::Call { args, .. } | PExpr::List(args) => args.iter().for_each(f),
+        PExpr::Map(entries) => entries.iter().for_each(|(_, e)| f(e)),
+        PExpr::MapProjection { base, items } => {
+            f(base);
+            for item in items {
+                if let MapProjItem::Computed(_, e) = item {
+                    f(e);
+                }
+            }
+        }
+        PExpr::In { item, list } => {
+            f(item);
+            f(list);
+        }
+        PExpr::StringMatch { value, pattern, .. } => {
+            f(value);
+            f(pattern);
+        }
+        PExpr::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            if let Some(op) = operand {
+                f(op);
+            }
+            for (cond, result) in branches {
+                f(cond);
+                f(result);
+            }
+            if let Some(e) = otherwise {
+                f(e);
+            }
+        }
+        PExpr::Subscript { base, index } => {
+            f(base);
+            f(index);
+        }
+        PExpr::Slice { base, start, end } => {
+            f(base);
+            start.iter().chain(end.iter()).for_each(|e| f(e));
+        }
+        PExpr::Literal(_)
+        | PExpr::Parameter(_)
+        | PExpr::Variable(_)
+        | PExpr::Star
+        | PExpr::ListComprehension { .. }
+        | PExpr::ListQuantifier { .. }
+        | PExpr::Reduce { .. }
+        | PExpr::ExistsSubplan(_)
+        | PExpr::CountSubplan(_)
+        | PExpr::CollectSubplan { .. }
+        | PExpr::PatternComprehension { .. } => {}
+    }
+}
+
+/// `expr` with each projection alias it reads replaced by the expression
+/// the alias names, so it evaluates before the projection. A local binder
+/// shadows an alias of its name. An alias whose expression would not give
+/// the same value when evaluated again is refused.
+fn substitute_aliases(
+    expr: crate::plan::expr::Expr,
+    aliases: &[(&str, &crate::plan::expr::Expr)],
+    bound: &mut Vec<String>,
+) -> Result<crate::plan::expr::Expr, PlanError> {
+    use crate::plan::expr::{Expr as PExpr, MapProjItem};
+    let sub = |e: Box<PExpr>, bound: &mut Vec<String>| -> Result<Box<PExpr>, PlanError> {
+        Ok(Box::new(substitute_aliases(*e, aliases, bound)?))
+    };
+    Ok(match expr {
+        PExpr::Variable(name) if !bound.contains(&name) => match aliases
+            .iter()
+            .find_map(|(alias, named)| (*alias == name).then_some(*named))
+        {
+            Some(named) => {
+                if !repeatable(named) {
+                    return Err(PlanError::OrderByColumnNotRepeatable { column: name });
+                }
+                (*named).clone()
+            }
+            None => PExpr::Variable(name),
+        },
+        PExpr::Property { base, key } => PExpr::Property {
+            base: sub(base, bound)?,
+            key,
+        },
+        PExpr::Binary { left, op, right } => PExpr::Binary {
+            left: sub(left, bound)?,
+            op,
+            right: sub(right, bound)?,
+        },
+        PExpr::Unary { op, operand } => PExpr::Unary {
+            op,
+            operand: sub(operand, bound)?,
+        },
+        PExpr::Call {
+            name,
+            args,
+            distinct,
+        } => PExpr::Call {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| substitute_aliases(a, aliases, bound))
+                .collect::<Result<_, _>>()?,
+            distinct,
+        },
+        PExpr::List(items) => PExpr::List(
+            items
+                .into_iter()
+                .map(|a| substitute_aliases(a, aliases, bound))
+                .collect::<Result<_, _>>()?,
+        ),
+        PExpr::Map(entries) => PExpr::Map(
+            entries
+                .into_iter()
+                .map(|(k, v)| Ok((k, substitute_aliases(v, aliases, bound)?)))
+                .collect::<Result<_, PlanError>>()?,
+        ),
+        PExpr::MapProjection { base, items } => PExpr::MapProjection {
+            base: sub(base, bound)?,
+            items: items
+                .into_iter()
+                .map(|item| {
+                    Ok(match item {
+                        MapProjItem::Computed(k, v) => {
+                            MapProjItem::Computed(k, substitute_aliases(v, aliases, bound)?)
+                        }
+                        other => other,
+                    })
+                })
+                .collect::<Result<_, PlanError>>()?,
+        },
+        PExpr::In { item, list } => PExpr::In {
+            item: sub(item, bound)?,
+            list: sub(list, bound)?,
+        },
+        PExpr::IsNull { operand, negated } => PExpr::IsNull {
+            operand: sub(operand, bound)?,
+            negated,
+        },
+        PExpr::IsTyped {
+            operand,
+            type_name,
+            negated,
+        } => PExpr::IsTyped {
+            operand: sub(operand, bound)?,
+            type_name,
+            negated,
+        },
+        PExpr::StringMatch { value, op, pattern } => PExpr::StringMatch {
+            value: sub(value, bound)?,
+            op,
+            pattern: sub(pattern, bound)?,
+        },
+        PExpr::Case {
+            operand,
+            branches,
+            otherwise,
+        } => PExpr::Case {
+            operand: operand.map(|o| sub(o, bound)).transpose()?,
+            branches: branches
+                .into_iter()
+                .map(|(c, r)| {
+                    Ok((
+                        substitute_aliases(c, aliases, bound)?,
+                        substitute_aliases(r, aliases, bound)?,
+                    ))
+                })
+                .collect::<Result<_, PlanError>>()?,
+            otherwise: otherwise.map(|o| sub(o, bound)).transpose()?,
+        },
+        PExpr::Subscript { base, index } => PExpr::Subscript {
+            base: sub(base, bound)?,
+            index: sub(index, bound)?,
+        },
+        PExpr::Slice { base, start, end } => PExpr::Slice {
+            base: sub(base, bound)?,
+            start: start.map(|s| sub(s, bound)).transpose()?,
+            end: end.map(|e| sub(e, bound)).transpose()?,
+        },
+        PExpr::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            let list = sub(list, bound)?;
+            bound.push(var.clone());
+            let filter = filter.map(|f| sub(f, bound)).transpose();
+            let map = map.map(|m| sub(m, bound)).transpose();
+            bound.pop();
+            PExpr::ListComprehension {
+                var,
+                list,
+                filter: filter?,
+                map: map?,
+            }
+        }
+        PExpr::ListQuantifier {
+            kind,
+            var,
+            list,
+            predicate,
+        } => {
+            let list = sub(list, bound)?;
+            bound.push(var.clone());
+            let predicate = sub(predicate, bound);
+            bound.pop();
+            PExpr::ListQuantifier {
+                kind,
+                var,
+                list,
+                predicate: predicate?,
+            }
+        }
+        PExpr::Reduce {
+            acc,
+            init,
+            var,
+            list,
+            step,
+        } => {
+            let init = sub(init, bound)?;
+            let list = sub(list, bound)?;
+            bound.push(acc.clone());
+            bound.push(var.clone());
+            let step = sub(step, bound);
+            bound.truncate(bound.len() - 2);
+            PExpr::Reduce {
+                acc,
+                init,
+                var,
+                list,
+                step: step?,
+            }
+        }
+        other => other,
+    })
+}
+
+/// Whether evaluating `expr` again over the same row gives the value the
+/// projection gave: no subquery (the sort evaluates without storage) and no
+/// function returning a new value per call.
+fn repeatable(expr: &crate::plan::expr::Expr) -> bool {
+    use crate::plan::expr::Expr as PExpr;
+    match expr {
+        PExpr::ExistsSubplan(_)
+        | PExpr::CountSubplan(_)
+        | PExpr::CollectSubplan { .. }
+        | PExpr::PatternComprehension { .. } => false,
+        PExpr::Call { name, .. }
+            if ["rand", "randomuuid", "timestamp", "now"]
+                .iter()
+                .any(|f| name.eq_ignore_ascii_case(f)) =>
+        {
+            false
+        }
+        other => {
+            let mut all = true;
+            for_each_child(other, |child| all &= repeatable(child));
+            if let PExpr::ListComprehension {
+                list, filter, map, ..
+            } = other
+            {
+                all &= repeatable(list)
+                    && filter.as_deref().is_none_or(repeatable)
+                    && map.as_deref().is_none_or(repeatable);
+            }
+            if let PExpr::ListQuantifier {
+                list, predicate, ..
+            } = other
+            {
+                all &= repeatable(list) && repeatable(predicate);
+            }
+            if let PExpr::Reduce {
+                init, list, step, ..
+            } = other
+            {
+                all &= repeatable(init) && repeatable(list) && repeatable(step);
+            }
+            all
+        }
     }
 }
 

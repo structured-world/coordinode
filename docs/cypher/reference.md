@@ -91,7 +91,16 @@ Sorts the result. Supports multiple sort keys, ASC (default) and DESC.
 ```cypher
 RETURN n.name ORDER BY n.name
 RETURN n.name, n.age ORDER BY n.age DESC, n.name ASC
+RETURN n.name ORDER BY n.age                -- a variable the projection drops
 ```
+
+A key can read the projection's columns and aliases, and any variable bound
+before the `RETURN` or `WITH` it follows. After `DISTINCT` or an aggregation
+only the projected columns exist: ordering by anything else is refused with
+an error naming the variable. Ordering by a `rand()` / `randomUUID()` /
+`timestamp()` / `now()` alias together with a variable the projection drops is
+refused too, since that value would be computed a second time. Equal keys keep
+no defined order unless a later key decides it.
 
 #### SKIP and LIMIT ✅
 

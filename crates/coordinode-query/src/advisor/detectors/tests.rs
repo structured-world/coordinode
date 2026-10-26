@@ -294,6 +294,47 @@ fn knn_without_index_detected() {
     assert_eq!(suggestions[0].severity, Severity::Info);
 }
 
+/// A distance ordering read before a projection that drops the location
+/// sorts below the projection, and is still a KNN query to suggest an index
+/// for.
+#[test]
+fn knn_without_index_detected_below_a_projection() {
+    let sort_op = LogicalOp::Sort {
+        input: Box::new(node_scan("n", "Place")),
+        items: vec![crate::plan::SortItem {
+            expr: nx(Expr::FunctionCall {
+                name: "point.distance".to_string(),
+                args: vec![
+                    Expr::PropertyAccess {
+                        expr: Box::new(Expr::Variable("n".to_string())),
+                        property: "location".to_string(),
+                    },
+                    Expr::Literal(Value::Float(0.0)),
+                ],
+                distinct: false,
+            }),
+            ascending: true,
+        }],
+    };
+    let p = plan(LogicalOp::Limit {
+        input: Box::new(LogicalOp::Project {
+            input: Box::new(sort_op),
+            items: vec![crate::planner::logical::ProjectItem {
+                expr: nx(Expr::PropertyAccess {
+                    expr: Box::new(Expr::Variable("n".to_string())),
+                    property: "name".to_string(),
+                }),
+                alias: None,
+            }],
+            distinct: false,
+        }),
+        count: crate::plan::expr::Expr::Literal(Value::Int(10)),
+    });
+    let suggestions = detect_suggestions(&p, None);
+    assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+    assert_eq!(suggestions[0].kind, SuggestionKind::CreateVectorIndex);
+}
+
 /// Sort without Limit → no KNN suggestion.
 #[test]
 fn sort_without_limit_no_knn() {

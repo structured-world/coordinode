@@ -2,7 +2,7 @@
 //!
 //! Tests the vector index lifecycle: build, search, recall.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use coordinode_core::graph::types::VectorMetric;
 use coordinode_vector::hnsw::{HnswConfig, QuantizationCodec, SearchResult};
@@ -2572,4 +2572,139 @@ fn decay_weighted_threshold_is_exact_with_an_index() {
         vec!["kept".to_string()],
         "the weighted score decides membership: 0.8 passes, 0.8 x 0.3 does not"
     );
+}
+
+/// ORDER BY an expression over a variable the projection does not return
+/// orders by that expression, as openCypher scopes it before the projection.
+#[test]
+fn order_by_reads_variables_the_projection_drops() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("UNWIND [3, 1, 4, 0, 2] AS a CREATE (:P {name: 'p' + toString(a), age: a})")
+        .expect("people");
+    let rows = db
+        .execute_cypher("MATCH (n:P) RETURN n.name AS name ORDER BY n.age LIMIT 3")
+        .expect("order by a dropped property");
+    let names: Vec<_> = rows.iter().map(|r| r.get("name").cloned()).collect();
+    let want = |s: &str| Some(coordinode_core::graph::types::Value::String(s.into()));
+    assert_eq!(names, vec![want("p0"), want("p1"), want("p2")]);
+}
+
+/// The `i` column of `rows`, in order.
+fn top_k_column(rows: &[coordinode_query::executor::Row], column: &str) -> Vec<i64> {
+    rows.iter()
+        .map(|r| match r.get(column) {
+            Some(coordinode_core::graph::types::Value::Int(i)) => *i,
+            other => panic!("expected an int in {column}, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Twenty `:T` nodes with 2-d vectors whose angle from `[1, 0]` is
+/// `(7 i mod 20) * 0.15`, so the order of distance is not the order of
+/// creation (nearest first: i = 0, 3, 6, 9, 12, 15, ...); one more node
+/// sharing the vector of i = 9 (a tie), one without a vector, and one node of
+/// another label nearer than all of them.
+fn top_k_fixture(db: &mut Database) {
+    db.execute_cypher(
+        "UNWIND range(0, 19) AS i \
+         CREATE (:T {i: i, g: i % 3, \
+                     e: [cos(((7 * i) % 20) * 0.15), sin(((7 * i) % 20) * 0.15)]})",
+    )
+    .expect("vectors");
+    db.execute_cypher(
+        "WITH 9 AS i CREATE (:T {i: 100, g: 0, \
+                     e: [cos(((7 * i) % 20) * 0.15), sin(((7 * i) % 20) * 0.15)]})",
+    )
+    .expect("a tie with i = 9");
+    db.execute_cypher("CREATE (:T {i: 200, g: 0})")
+        .expect("no vector");
+    db.execute_cypher("CREATE (:Other {i: 300, e: [1.0, 0.0]})")
+        .expect("another label");
+}
+
+/// `ORDER BY vector_distance(...) LIMIT k` whose projection drops the vector
+/// returns what the form carrying the distance through an alias returns:
+/// the same nodes, in the same order, ties by node, with and without an
+/// index, ascending distance and descending similarity, with a filter, a
+/// computed projection and an aggregate over the top k. The plan ranks with
+/// the top-k operator rather than sorting every row.
+#[test]
+fn a_distance_ordering_whose_projection_drops_the_vector_is_a_top_k() {
+    for indexed in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+        if indexed {
+            db.execute_cypher("CREATE VECTOR INDEX t_e ON :T(e) OPTIONS {metric: \"l2\"}")
+                .expect("index");
+        }
+        top_k_fixture(&mut db);
+        // Ascending distance from [1, 0]: i = 0, 3, 6, then the tie 9 and 100
+        // (100 created later, so its node id is greater), then 12.
+        let nearest = vec![0, 3, 6, 9, 100, 12];
+        let cases: [(&str, &str, Vec<i64>); 6] = [
+            (
+                "MATCH (n:T) RETURN n.i AS i \
+                 ORDER BY vector_distance(n.e, [1.0, 0.0]) LIMIT 6",
+                "MATCH (n:T) WITH n, vector_distance(n.e, [1.0, 0.0]) AS d \
+                 ORDER BY d LIMIT 6 RETURN n.i AS i",
+                nearest.clone(),
+            ),
+            (
+                "MATCH (n:T) RETURN n.i AS i \
+                 ORDER BY vector_similarity(n.e, [1.0, 0.0]) DESC LIMIT 4",
+                "MATCH (n:T) WITH n, vector_similarity(n.e, [1.0, 0.0]) AS s \
+                 ORDER BY s DESC LIMIT 4 RETURN n.i AS i",
+                vec![0, 3, 6, 9],
+            ),
+            (
+                "MATCH (n:T) WHERE n.g = 0 RETURN n.i AS i \
+                 ORDER BY vector_distance(n.e, [1.0, 0.0]) LIMIT 3",
+                "MATCH (n:T) WHERE n.g = 0 WITH n, vector_distance(n.e, [1.0, 0.0]) AS d \
+                 ORDER BY d LIMIT 3 RETURN n.i AS i",
+                vec![0, 3, 6],
+            ),
+            (
+                "MATCH (n:T) RETURN n.i * 10 AS i \
+                 ORDER BY vector_distance(n.e, [1.0, 0.0]) LIMIT 3",
+                "MATCH (n:T) WITH n, vector_distance(n.e, [1.0, 0.0]) AS d \
+                 ORDER BY d LIMIT 3 RETURN n.i * 10 AS i",
+                vec![0, 30, 60],
+            ),
+            (
+                "MATCH (n:T) WITH n.i AS i, n.e AS e \
+                 ORDER BY vector_distance(e, [1.0, 0.0]) LIMIT 2 RETURN i",
+                "MATCH (n:T) WITH n.i AS i, vector_distance(n.e, [1.0, 0.0]) AS d \
+                 ORDER BY d LIMIT 2 RETURN i",
+                vec![0, 3],
+            ),
+            (
+                "MATCH (n:T) WITH n ORDER BY vector_distance(n.e, [1.0, 0.0]) LIMIT 5 \
+                 RETURN sum(n.i) AS i",
+                "MATCH (n:T) WITH n, vector_distance(n.e, [1.0, 0.0]) AS d \
+                 ORDER BY d LIMIT 5 RETURN sum(n.i) AS i",
+                vec![118],
+            ),
+        ];
+        for (dropped, aliased, want) in cases {
+            let got = top_k_column(&db.execute_cypher(dropped).expect(dropped), "i");
+            assert_eq!(got, want, "indexed {indexed}: {dropped}");
+            let through_alias = top_k_column(&db.execute_cypher(aliased).expect(aliased), "i");
+            assert_eq!(through_alias, want, "indexed {indexed}: {aliased}");
+        }
+        let plan = db
+            .explain_cypher(
+                "MATCH (n:T) RETURN n.i AS i ORDER BY vector_distance(n.e, [1.0, 0.0]) LIMIT 6",
+            )
+            .expect("explain");
+        assert!(
+            !plan.contains("Sort"),
+            "indexed {indexed}: ranks without sorting every row: {plan}"
+        );
+        assert_eq!(
+            plan.contains("HnswScan"),
+            indexed,
+            "the index ranks when there is one: {plan}"
+        );
+    }
 }

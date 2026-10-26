@@ -188,7 +188,12 @@ fn detect_knn_without_index(
     // so we emit the suggestion unconditionally — the user benefits from knowing
     // that ORDER BY distance is a KNN query.
     if let LogicalOp::Limit { input, .. } = op {
-        if let LogicalOp::Sort { input: _, items } = input.as_ref() {
+        // An ordering read before the projection sorts below it.
+        let sorted = match input.as_ref() {
+            LogicalOp::Project { input, .. } => input.as_ref(),
+            other => other,
+        };
+        if let LogicalOp::Sort { input: _, items } = sorted {
             for item in items {
                 if expr_contains_distance_fn(&item.expr) {
                     suggestions.push(

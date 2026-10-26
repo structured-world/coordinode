@@ -841,22 +841,112 @@ fn vector_top_k_multi_item_order_not_optimized() {
     );
 }
 
-/// Pattern A with RETURN that drops the vector variable → NOT optimized.
-/// `RETURN n.name` removes `n.embedding` from intermediate rows, so the
-/// optimizer must fall back to plain Sort+Limit. This guards against the
-/// regression found by the forced_offload_cypher_e2e integration test.
+/// Pattern A with a RETURN that drops the vector: the order is taken before
+/// the projection, so the top k is too, over the scan's rows, and the
+/// projection runs over the k rows it keeps.
 #[test]
-fn vector_top_k_pattern_a_dropped_variable_not_optimized() {
+fn vector_top_k_pattern_a_dropped_variable_ranks_below_the_projection() {
     let root = plan_root(
         "MATCH (n:Doc) \
              RETURN n.name \
              ORDER BY vector_distance(n.embedding, [1.0, 0.0]) \
              LIMIT 5",
     );
+    let LogicalOp::Project { input, .. } = &root else {
+        panic!("the projection over the top k: {root:?}");
+    };
+    let LogicalOp::VectorTopK { k, input, .. } = input.as_ref() else {
+        panic!("the top k below the projection: {root:?}");
+    };
+    assert_eq!(*k, 5);
     assert!(
-        find_vector_top_k(&root).is_none(),
-        "Pattern A must skip optimization when Project drops the vector variable: {root:?}"
+        matches!(input.as_ref(), LogicalOp::NodeScan { .. }),
+        "ranks the scan's rows: {root:?}"
     );
+}
+
+/// ORDER BY a variable the projection drops sorts below the projection,
+/// with an alias it also reads replaced by the aliased expression.
+#[test]
+fn order_by_a_dropped_variable_sorts_below_the_projection() {
+    let root = plan_root("MATCH (n:P) RETURN n.name AS name, n.a + 1 AS x ORDER BY x, n.age");
+    let LogicalOp::Project { input, .. } = &root else {
+        panic!("the projection over the sort: {root:?}");
+    };
+    let LogicalOp::Sort { items, .. } = input.as_ref() else {
+        panic!("the sort below the projection: {root:?}");
+    };
+    let x = &items[0].expr;
+    assert!(
+        matches!(x, crate::plan::expr::Expr::Binary { .. }),
+        "the alias x is replaced by n.a + 1: {x:?}"
+    );
+}
+
+/// ORDER BY the projection's own columns keeps the sort above it.
+#[test]
+fn order_by_projected_columns_sorts_above_the_projection() {
+    for query in [
+        "MATCH (n:P) RETURN n.name AS name ORDER BY name",
+        "MATCH (n:P) RETURN n.name ORDER BY n.name",
+        "MATCH (n:P) RETURN n ORDER BY n.age",
+        "MATCH (n:P) RETURN * ORDER BY n.age",
+        "MATCH (n:P) RETURN n.tags AS t ORDER BY size([x IN t WHERE x > 1 | x])",
+    ] {
+        let root = plan_root(query);
+        assert!(
+            matches!(root, LogicalOp::Sort { .. }),
+            "{query}: sort above the projection: {root:?}"
+        );
+    }
+}
+
+/// Past DISTINCT or an aggregation only the projected columns exist: ORDER
+/// BY a variable before the projection is refused, naming it, rather than
+/// ordering by NULL.
+#[test]
+fn order_by_a_dropped_variable_past_distinct_or_aggregation_is_refused() {
+    for (query, projection) in [
+        (
+            "MATCH (n:P) RETURN DISTINCT n.name ORDER BY n.age",
+            "DISTINCT",
+        ),
+        (
+            "MATCH (n:P) RETURN n.name, count(*) AS c ORDER BY n.age",
+            "an aggregation",
+        ),
+        (
+            "MATCH (n:P) WITH DISTINCT n.name AS name ORDER BY n.age RETURN name",
+            "DISTINCT",
+        ),
+    ] {
+        let parsed = parse(query).expect("parse");
+        match build_logical_plan(&parsed) {
+            Err(PlanError::OrderByOutOfScope {
+                projection: got,
+                variable,
+            }) => {
+                assert_eq!(got, projection, "{query}");
+                assert_eq!(variable, "n", "{query}");
+            }
+            other => panic!("{query}: expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+/// An alias of a value that changes per evaluation cannot be evaluated again
+/// below the projection: ordering by it together with a dropped variable is
+/// refused; ordering by it alone keeps the projected value.
+#[test]
+fn order_by_a_non_repeatable_alias_with_a_dropped_variable_is_refused() {
+    let parsed =
+        parse("MATCH (n:P) RETURN n.name AS name, rand() AS r ORDER BY r, n.age").expect("parse");
+    assert!(matches!(
+        build_logical_plan(&parsed),
+        Err(PlanError::OrderByColumnNotRepeatable { ref column }) if column == "r"
+    ));
+    let root = plan_root("MATCH (n:P) RETURN n.name AS name, rand() AS r ORDER BY r");
+    assert!(matches!(root, LogicalOp::Sort { .. }), "{root:?}");
 }
 
 // --- HnswScan access-path tests ---
