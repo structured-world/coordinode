@@ -28,13 +28,18 @@ fn a_table_tree_lands_its_levels_where_the_node_partition_does() {
 
     let table = config.to_table_tree_config("trades", Arc::clone(&seqno), Some(&routing));
     let node = config.to_tree_config_with_routing(Partition::Node, seqno, Some(&routing));
-    assert_eq!(table.path, PathBuf::from("/hot/tables/trades"));
+    // The endpoint paths as the config holds them (absolute on every
+    // platform, with a drive on Windows).
+    let under = |endpoint: usize| -> PathBuf {
+        config.endpoints[endpoint]
+            .path
+            .join("tables")
+            .join("trades")
+    };
+    assert_eq!(table.path, under(0));
     assert_eq!(
         routes(&table),
-        Some(vec![
-            (2..4, PathBuf::from("/warm/tables/trades")),
-            (4..7, PathBuf::from("/cold/tables/trades")),
-        ])
+        Some(vec![(2..4, under(1)), (4..7, under(2))])
     );
     assert_eq!(
         routes(&node).map(|r| r.into_iter().map(|(levels, _)| levels).collect::<Vec<_>>()),
