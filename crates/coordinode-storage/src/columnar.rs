@@ -137,18 +137,18 @@ struct TableEntry {
 /// A table tree repaired while the registry opened it: its open failed
 /// structurally and the block-salvaging repair rebuilt it from its tables.
 #[derive(Debug)]
-pub struct TableRepair {
+pub(crate) struct TableRepair {
     /// The table whose tree was repaired.
-    pub table: String,
+    pub(crate) table: String,
     /// The full repair outcome, lost key coverage included.
-    pub report: lsm_tree::RepairReport,
+    pub(crate) report: lsm_tree::RepairReport,
 }
 
 impl TableRepair {
     /// `true` when the salvage dropped data, which a rebuild from a
     /// checkpoint plus the journal restores.
     #[must_use]
-    pub fn is_lossy(&self) -> bool {
+    pub(crate) fn is_lossy(&self) -> bool {
         !matches!(
             self.report.wal_replay_scope(),
             lsm_tree::WalReplayScope::TailOnly
