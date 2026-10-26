@@ -118,6 +118,11 @@ name = "flush_compaction"
 harness = false
 
 [[bench]]
+name = "table_flush_compaction"
+harness = false
+required-features = ["columnar"]
+
+[[bench]]
 name = "write_batch_parallel"
 harness = false
 
