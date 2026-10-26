@@ -926,6 +926,76 @@ fn a_physical_backup_opens_as_a_database_of_its_own() {
     restored.execute_cypher("CREATE (:Pad {i: -1})").unwrap();
 }
 
+/// A physical backup taken while writes go on holds every journal entry its
+/// tables hold and the ones between: the backup, opened, written to, closed
+/// and opened again, finds no gap in its journal. Entries that landed between
+/// the copy of the journal and the copy of the tables used to leave the
+/// backup's journal without them, so the backup's next entries came after a
+/// hole no table covered, and its second open was refused.
+#[test]
+fn a_physical_backup_taken_under_writes_reopens_after_its_own_writes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for round in 0..10 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.execute_cypher_shared("CREATE (:Other {k: 0})", None, None, None, None)
+            .unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let target = backups.path().join("backup");
+        let writing = AtomicBool::new(true);
+        std::thread::scope(|s| {
+            let writer = s.spawn(|| {
+                let mut i = 0u64;
+                while writing.load(Ordering::Relaxed) {
+                    db.execute_cypher_shared(
+                        &format!("CREATE (:Busy {{i: {i}}})"),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    i += 1;
+                }
+            });
+            // Let the writer get going, so entries land during the backup.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            db.physical_backup(&target).unwrap();
+            writing.store(false, Ordering::Relaxed);
+            writer.join().unwrap();
+        });
+        drop(db);
+
+        let mut backup = Database::open(&target).unwrap();
+        backup.execute_cypher("CREATE (:After {k: 1})").unwrap();
+        let busy = backup
+            .execute_cypher("MATCH (n:Busy) RETURN count(n) AS n")
+            .unwrap()[0]
+            .get("n")
+            .cloned();
+        drop(backup);
+        let mut reopened = Database::open(&target)
+            .unwrap_or_else(|e| panic!("round {round}: the backup reopens: {e}"));
+        assert_eq!(
+            reopened
+                .execute_cypher("MATCH (n:Busy) RETURN count(n) AS n")
+                .unwrap()[0]
+                .get("n")
+                .cloned(),
+            busy,
+            "round {round}"
+        );
+        assert_eq!(
+            reopened
+                .execute_cypher("MATCH (n:After) RETURN n")
+                .unwrap()
+                .len(),
+            1,
+            "round {round}"
+        );
+    }
+}
+
 /// Constraints travel with a dump that brings its schema: the restored
 /// database holds each one under its name, in the state it had, with the
 /// unique index it owns, and enforces them. A cypher dump carries data only,

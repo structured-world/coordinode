@@ -432,6 +432,69 @@ fn a_second_journal_capture_into_the_same_directory_leaves_the_segment_intact() 
     );
 }
 
+/// Entries appended after the first capture of the journal reach the copy
+/// through the tail capture: a new segment is added, the grown active one
+/// is captured again, and the copy reads every entry in order. A sealed
+/// segment the copy already links stays the same file.
+#[test]
+fn the_tail_capture_brings_the_journal_copy_up_to_the_journal() {
+    use crate::oplog::entry::{OplogEntry, OplogOp};
+    let entry = |index: u64| OplogEntry {
+        ts: index,
+        term: 1,
+        index,
+        shard: 0,
+        ops: vec![OplogOp::Insert {
+            partition: 1,
+            key: format!("k{index}").into_bytes(),
+            value: vec![b'v'; 64],
+        }],
+        is_migration: false,
+        pre_images: None,
+    };
+    let dir = TempDir::new().expect("tempdir");
+    let (src, segment) = sealed_journal(dir.path());
+    let target = dir.path().join("ckpt");
+    claim_checkpoint_dir(&target).expect("claim");
+    let dst = target.join("oplog");
+    let footprints = Default::default();
+    capture_journal(&src, &dst, &footprints).expect("first capture");
+
+    let mut log = crate::oplog::OplogManager::open(&src, 0, 64 * 1024 * 1024, 1000, 3600)
+        .expect("reopen journal");
+    for index in 9..=12u64 {
+        log.append(&entry(index)).expect("append");
+    }
+    log.flush().expect("flush");
+    capture_journal_tail(&src, &dst, &footprints).expect("tail capture");
+    // Grown again: the active segment's copy is replaced, not appended to.
+    log.append(&entry(13)).expect("append");
+    log.flush().expect("flush");
+    drop(log);
+    capture_journal_tail(&src, &dst, &footprints).expect("second tail capture");
+
+    let mut copy = crate::oplog::OplogManager::open(&dst, 0, 64 * 1024 * 1024, 1000, 3600)
+        .expect("open the copy");
+    let indices: Vec<u64> = copy
+        .read_range(0, u64::MAX)
+        .expect("read the copy")
+        .iter()
+        .map(|e| e.index)
+        .collect();
+    assert_eq!(indices, (1..=13).collect::<Vec<_>>());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let name = segment.file_name().expect("segment name");
+        let ino = |p: &std::path::Path| std::fs::metadata(p).expect("metadata").ino();
+        assert_eq!(
+            ino(&dst.join(name)),
+            ino(&segment),
+            "the sealed segment is still the same file"
+        );
+    }
+}
+
 /// Two checkpoints into the same directory at once: exactly one gets the
 /// directory, the other is refused as `TargetExists`, and the journal's
 /// sealed segment keeps its bytes.

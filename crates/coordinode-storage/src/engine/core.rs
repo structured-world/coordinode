@@ -2536,15 +2536,25 @@ impl StorageEngine {
         // which the trees' checkpoint below then carries; copied after the
         // trees instead, a purge could drop entries that reached the trees
         // only after their checkpoint, and the copy would hold them nowhere.
-        if let Ok(endpoint) = self.select_oplog_endpoint(0) {
-            let src_oplog = endpoint.path.join("oplog");
-            if src_oplog.exists() {
-                summary.oplog_bytes =
-                    capture_journal(&src_oplog, &target.join("oplog"), &self.footprints)?;
-            }
+        let src_oplog = self
+            .select_oplog_endpoint(0)
+            .ok()
+            .map(|endpoint| endpoint.path.join("oplog"))
+            .filter(|dir| dir.exists());
+        if let Some(src) = &src_oplog {
+            summary.oplog_bytes = capture_journal(src, &target.join("oplog"), &self.footprints)?;
         }
 
         self.checkpoint_trees(target, &mut summary)?;
+        // And once more after the trees: entries written meanwhile reached
+        // the trees of the partitions they touch, but not the first copy of
+        // the journal. Without them the copy's next entry would follow a gap
+        // the other trees do not cover, and the copy would not open again.
+        if let Some(src) = &src_oplog {
+            summary.oplog_bytes +=
+                capture_journal_tail(src, &target.join("oplog"), &self.footprints)?;
+        }
+        self.seal_checkpoint(target)?;
         // The newest checkpoint is the one a rebuild starts from: its trees
         // hold every entry below the folded base, and the journal keeps the
         // rest for it.
@@ -2605,6 +2615,11 @@ impl StorageEngine {
                 summary.max_seqno = summary.max_seqno.max(info.seqno);
             }
         }
+        Ok(())
+    }
+
+    /// Make the checkpoint in `target` durable and name it a store.
+    fn seal_checkpoint(&self, target: &Path) -> StorageResult<()> {
         // A checkpoint is a base the Raft log is kept for: durable, both the
         // flushed trees under the endpoints and the copy, before its marker
         // names it a store.
@@ -5947,6 +5962,68 @@ fn capture_journal(
                 Err(StorageError::Io(_)) if !from.exists() => {}
                 Err(e) => return Err(e),
             }
+        }
+    }
+    Ok(bytes)
+}
+
+/// Bring the journal copy in `dst`, taken by [`capture_journal`], up to the
+/// journal in `src`: a segment it lacks is linked or copied as there, and a
+/// segment that grew since its copy (the active one, sealed or still
+/// active) is captured again. A segment the copy holds whole is left as it
+/// is, and one the purge removed since stays in the copy. Returns the bytes
+/// copied.
+fn capture_journal_tail(
+    src: &Path,
+    dst: &Path,
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<u64> {
+    let mut bytes = 0u64;
+    let entries =
+        std::fs::read_dir(src).map_err(|e| StorageError::Io(format!("read dir {src:?}: {e}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| StorageError::Io(format!("dir entry in {src:?}: {e}")))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| StorageError::Io(format!("file type {:?}: {e}", entry.path())))?;
+        let to = dst.join(entry.file_name());
+        let from = entry.path();
+        if file_type.is_dir() {
+            if to.exists() {
+                bytes += capture_journal_tail(&from, &to, footprints)?;
+            } else {
+                bytes += capture_journal(&from, &to, footprints)?;
+            }
+            continue;
+        }
+        let len = |path: &Path| std::fs::metadata(path).map(|m| m.len());
+        match (len(&from), len(&to)) {
+            // Removed by the purge since the listing: it held only entries
+            // the trees already carry.
+            (Err(_), _) => continue,
+            // A segment never shrinks: one as long as its copy is the copy.
+            (Ok(now), Ok(copied)) if now == copied => continue,
+            (Ok(_), Ok(_)) => {
+                // The copy is a stale copy of the active segment, never a
+                // link: a linked segment is sealed and keeps its length.
+                std::fs::remove_file(&to)
+                    .map_err(|e| StorageError::Io(format!("replace {to:?}: {e}")))?;
+                footprints.removed(&to);
+            }
+            (Ok(_), Err(_)) => {}
+        }
+        if crate::oplog::segment::is_sealed(&from).unwrap_or(false)
+            && std::fs::hard_link(&from, &to).is_ok()
+        {
+            footprints
+                .linked(&from, &to)
+                .map_err(|e| StorageError::Io(format!("link {to:?}: {e}")))?;
+            continue;
+        }
+        match copy_new(&from, &to, footprints) {
+            Ok(copied) => bytes += copied,
+            Err(StorageError::Io(_)) if !from.exists() => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(bytes)
