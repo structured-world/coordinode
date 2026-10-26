@@ -97,9 +97,9 @@ fn a_write_landing_below_the_tap_snapshot_is_delivered() {
     assert_eq!(keys(tap.take()), vec![b"late".to_vec()]);
 }
 
-/// A clear, a range tombstone and a range drop cannot be listed key by key,
-/// so the tap reports the partition replaced and the consumer starts over;
-/// a rebase empties it and keys flow again.
+/// A clear and a range tombstone cannot be listed key by key, so the tap
+/// reports the partition replaced and the consumer starts over; a rebase
+/// empties it and keys flow again.
 #[test]
 fn replacing_the_partition_is_reported_and_a_rebase_resumes() {
     let dir = TempDir::new().expect("tempdir");
@@ -121,10 +121,8 @@ fn replacing_the_partition_is_reported_and_a_rebase_resumes() {
     assert_eq!(tap.take(), Tapped::Replaced);
 
     engine.rebase_tap(&tap).expect("rebase");
-    engine
-        .drop_range::<&[u8], _>(Partition::Node, ..)
-        .expect("drop range");
-    assert_eq!(tap.take(), Tapped::Replaced);
+    engine.put(Partition::Node, b"d", b"v").expect("put");
+    assert_eq!(keys(tap.take()), vec![b"d".to_vec()]);
 }
 
 /// A dropped tap stops collecting, and the writes after it cost only the

@@ -2712,8 +2712,8 @@ impl StorageEngine {
 
         // 2. Physically clear the live (corrupt) tables, reinstall the base.
         //    `clear_partition` deletes the table files without reading their
-        //    blocks; a `drop_range` here would instead run a compaction that
-        //    re-reads the corrupt block we are repairing and abort with a
+        //    blocks; a range tombstone here would leave them to a compaction
+        //    that re-reads the corrupt block we are repairing and aborts with a
         //    ChecksumMismatch. The clear is on disk at once while the rebuilt
         //    data is not, so the intent goes first.
         self.begin_rebuild(partition)?;
@@ -3334,7 +3334,8 @@ impl StorageEngine {
     ///   window, the consumer floor and live snapshot pins drive together.
     /// - **Physical** — each partition tree's persisted retention floor. A
     ///   compaction that collected below watermark `w` records `w - 1`; a
-    ///   `drop_range` or a `clear` records its own install seqno, which prunes
+    ///   `clear` records its own install seqno, and dropping the tables a
+    ///   range tombstone spans records up to its seqno, which prunes
     ///   history independently of the window, so this can sit above the
     ///   watermark. A read at or below the floor is refused by the tree itself
     ///   (`lsm_tree::Error::SnapshotBelowRetention`), hence the `+ 1`.
@@ -3620,8 +3621,8 @@ impl StorageEngine {
 
     /// Delete the half-open range `[start, end)` of a partition with one MVCC
     /// range tombstone. Snapshot-aware and seqno'd, so it replicates and
-    /// PITR-replays correctly — unlike [`drop_range`](Self::drop_range), which is
-    /// an eager, non-MVCC table-level drop. Invalidates the partition's cache:
+    /// PITR-replays correctly; a compaction above the tombstone's seqno
+    /// reclaims the tables it spans whole. Invalidates the partition's cache:
     /// the tombstone leaves the shadowed keys physically present, so a stale
     /// cache hit would otherwise return a deleted value, and the cache cannot
     /// range-query to invalidate precisely.
@@ -4271,38 +4272,12 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Bulk-delete all keys in a range by dropping entire LSM tables.
-    ///
-    /// This is a table-level operation — far more efficient than individual
-    /// deletes for large contiguous key ranges. Tables fully contained within
-    /// the range are dropped; partially overlapping tables are untouched
-    /// (their keys remain until compaction handles them).
-    ///
-    /// Use cases: TTL cleanup, cascading graph deletes, index drop.
-    ///
-    /// Invalidates tiered cache for the entire partition (range unknown to cache layer).
-    pub fn drop_range<K: AsRef<[u8]>, R: std::ops::RangeBounds<K>>(
-        &self,
-        part: Partition,
-        range: R,
-    ) -> StorageResult<()> {
-        let tree = self.tree(part)?;
-        tree.drop_range(range)?;
-        self.write_taps.replaced(part);
-        // A read is answered from the cache before the tree, so a dropped
-        // key's cached value would outlive the drop.
-        if let Some(cache) = &self.tiered_cache {
-            cache.clear_partition(part);
-        }
-        Ok(())
-    }
-
     /// Physically reset a partition to empty: install a fresh empty version and
     /// delete every obsolete table / blob file WITHOUT reading their blocks.
     ///
-    /// Unlike [`drop_range`](Self::drop_range) over the full range — which runs a
-    /// drop-range *compaction* that reads the tables it rewrites — `clear` never
-    /// touches block contents. That distinction is load-bearing for repair: when
+    /// Unlike a [`remove_range`](Self::remove_range) over the full range, whose
+    /// tables a compaction later reclaims, `clear` never touches block
+    /// contents and leaves no tombstone. That distinction is load-bearing for repair: when
     /// a partition is being rebuilt because one of its SSTs is corrupt, a
     /// compaction would re-read (and trip on) the very block we are discarding.
     /// Use this before reinstalling a known-good base.

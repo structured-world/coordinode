@@ -836,59 +836,6 @@ fn prefix_extractor_valid_scan_boundary() {
     assert!(!ext.is_valid_scan_boundary(b""));
 }
 
-// ── drop_range integration ──────────────────────────────────────
-
-#[test]
-fn drop_range_deletes_keys_in_range() {
-    use crate::engine::core::StorageEngine;
-    use crate::engine::partition::Partition;
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![default_disk_endpoint(dir.path())]);
-    let engine = StorageEngine::open(&config).expect("open");
-
-    // Write 10 keys to Idx partition
-    for i in 0u32..10 {
-        let key = format!("idx:test:{i:04}");
-        engine
-            .put(Partition::Idx, key.as_bytes(), b"val")
-            .expect("put");
-    }
-
-    // Verify all 10 exist
-    let count_before: usize = engine
-        .prefix_scan(Partition::Idx, b"idx:test:")
-        .expect("scan")
-        .count();
-    assert_eq!(count_before, 10);
-
-    // Flush to SST (drop_range operates on tables, not memtable)
-    engine.persist().expect("persist");
-
-    // Drop range: keys 0003..0007
-    engine
-        .drop_range(
-            Partition::Idx,
-            "idx:test:0003".as_bytes()..="idx:test:0007".as_bytes(),
-        )
-        .expect("drop_range");
-
-    // Count remaining — some keys in the range should be gone
-    // Note: drop_range drops TABLES, not individual keys.
-    // With only 10 keys, they may all be in one table → either all or none dropped.
-    // This test verifies the API works without error; precise key-level
-    // deletion depends on table boundaries (tested in lsm-tree itself).
-    let count_after: usize = engine
-        .prefix_scan(Partition::Idx, b"idx:test:")
-        .expect("scan")
-        .count();
-    // Either all dropped (one table fully in range) or none (table spans beyond range)
-    assert!(
-        count_after == 0 || count_after == 10,
-        "drop_range should drop whole tables: got {count_after} keys"
-    );
-}
-
 #[test]
 fn prefix_extractor_edgeprop_key() {
     use lsm_tree::PrefixExtractor;
@@ -926,36 +873,6 @@ fn prefix_extractor_blobref_key() {
     assert_eq!(
         prefixes,
         vec![b"blobref:" as &[u8], b"blobref:42:" as &[u8],]
-    );
-}
-
-#[test]
-fn drop_range_on_merge_partition() {
-    // Verify drop_range works on Adj partition (has PostingListMerge operator).
-    use crate::engine::core::StorageEngine;
-    use crate::engine::partition::Partition;
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![default_disk_endpoint(dir.path())]);
-    let engine = StorageEngine::open(&config).expect("open");
-
-    // Write keys to Adj partition
-    for i in 0u32..5 {
-        let key = format!("adj:TEST:out:{i:04}");
-        engine
-            .put(Partition::Adj, key.as_bytes(), b"posting_data")
-            .expect("put");
-    }
-    engine.persist().expect("persist");
-
-    // drop_range should not error on merge-operator partition
-    let result = engine.drop_range(
-        Partition::Adj,
-        "adj:TEST:out:0000".as_bytes()..="adj:TEST:out:9999".as_bytes(),
-    );
-    assert!(
-        result.is_ok(),
-        "drop_range on merge partition should not error"
     );
 }
 

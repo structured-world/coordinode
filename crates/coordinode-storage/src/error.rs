@@ -69,8 +69,9 @@ pub enum StorageError {
     /// Raised by this engine's own policy guard (the configured time-travel
     /// window, see `StorageEngine::set_retention_window`) and, as a backstop,
     /// lifted from the tree's `SnapshotBelowRetention` when the physical
-    /// history was pruned past the requested seqno — which a `drop_range`, a
-    /// `clear` or a filtering compaction can do independently of the window.
+    /// history was pruned past the requested seqno, which a `clear`, the
+    /// tables a range tombstone spans being dropped, or a filtering
+    /// compaction can do independently of the window.
     #[error(
         "snapshot {snapshot} is below the MVCC retention horizon {watermark}: \
          history that old may already be collected"

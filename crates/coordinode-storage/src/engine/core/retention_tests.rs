@@ -1475,8 +1475,8 @@ fn default_retention_window_is_five_minutes() {
 }
 
 /// The engine's own guard is a policy boundary; the tree keeps a physical one
-/// and prunes history for reasons the window knows nothing about. `drop_range`
-/// is one: it raises the tree's retention floor to its own install seqno, so a
+/// and prunes history for reasons the window knows nothing about. A clear is
+/// one: it raises the tree's retention floor to its own install seqno, so a
 /// snapshot the window still permits can become unservable.
 ///
 /// The read must then be refused with the same typed error the policy guard

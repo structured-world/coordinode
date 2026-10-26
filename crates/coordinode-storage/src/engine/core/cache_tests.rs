@@ -76,20 +76,27 @@ fn only_the_vector_truth_tier_caches_its_values() {
     );
 }
 
-/// Keys a range drop removed are not served from the cache.
+/// Keys a range tombstone removed are not served from the cache, though
+/// their tables are still on disk until a compaction reclaims them.
 #[test]
-fn a_dropped_range_is_not_served_from_the_cache() {
+fn a_removed_range_is_not_served_from_the_cache() {
     let dir = TempDir::new().expect("tempdir");
     let engine = StorageEngine::open(&cached_config(dir.path())).expect("open");
     engine.put(Partition::Idx, b"idx:a", b"v").expect("put");
+    engine.put(Partition::Idx, b"idx;", b"after").expect("put");
     engine.persist().expect("persist");
     assert!(engine.get(Partition::Idx, b"idx:a").expect("get").is_some());
     engine
-        .drop_range::<&[u8], _>(Partition::Idx, &b"idx:"[..]..&b"idx;"[..])
-        .expect("drop range");
+        .remove_range(Partition::Idx, b"idx:", b"idx;")
+        .expect("remove range");
     assert_eq!(
         engine.get(Partition::Idx, b"idx:a").expect("get"),
         None,
-        "the cache served a key the range drop removed"
+        "the cache served a key the range tombstone removed"
+    );
+    assert_eq!(
+        engine.get(Partition::Idx, b"idx;").expect("get").as_deref(),
+        Some(&b"after"[..]),
+        "the end of the range is not in it"
     );
 }
