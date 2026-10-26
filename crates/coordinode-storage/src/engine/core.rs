@@ -2848,6 +2848,7 @@ impl StorageEngine {
         if let Some(refusal) = rebuild::uncovered_entry(&held, oplog_since, (next, &above)) {
             return Ok(Rebuild::Refused(refusal));
         }
+        let source_floor = source.retention_floor();
         // The copy's entries are stored under its own installations.
         let source_bindings = ckpt.installations_of(partition).map(|i| i.current());
         // This node's own records (its consensus state) are newer in the live
@@ -2933,11 +2934,45 @@ impl StorageEngine {
         }
         self.coordinator.flush_trigger().wrote_unmeasured();
         self.rebind_coverage(partition, next, &above)?;
+        // 4. With the history on disk and the intent still in place, serve it.
+        self.flush_memtables(tree)?;
+        self.restore_retention_floor(tree, partition, source_floor)?;
         self.finish_rebuild(partition)?;
         // The rebuilt tree is on disk: whatever an open-time repair of it
         // lost is restored.
         self.acknowledge_open_repair(partition)?;
         Ok(Rebuild::Rebuilt { versions, replayed })
+    }
+
+    /// Lower the retention floor of `tree`, rebuilt as `partition`'s and
+    /// raised by the rebuild's clear, to what its reinstalled history serves:
+    /// the checkpoint copy's own floor `source_floor`, or just below the GC
+    /// watermark the rebuilt tree has been flushed under, whichever is
+    /// higher, since a flush may have collected history below that
+    /// watermark. A floor already at or below it is left alone.
+    ///
+    /// Precondition: the reinstalled history is on disk, and the rebuild's
+    /// intent is still in place, so a crash before this call leaves the clear's
+    /// floor and a rebuild still owed.
+    fn restore_retention_floor(
+        &self,
+        tree: &lsm_tree::AnyTree,
+        partition: Partition,
+        source_floor: lsm_tree::SeqNo,
+    ) -> StorageResult<()> {
+        // A snapshot at or above the watermark W reads intact history: the
+        // collection below W keeps each key's newest version below it. The
+        // clamp is the rule itself: a watermark of 0 collected nothing, so
+        // nothing is refused.
+        let collected = self
+            .coordinator
+            .gc_watermark_value_for(partition)
+            .saturating_sub(1);
+        let floor = source_floor.max(collected);
+        if floor < tree.retention_floor() {
+            tree.lower_retention_floor(floor)?;
+        }
+        Ok(())
     }
 
     /// Write one event of a checkpoint copy's history into the rebuilt
@@ -3114,16 +3149,20 @@ impl StorageEngine {
         {
             return Ok(Rebuild::Refused(refusal));
         }
+        let source_floor = source.retention_floor();
 
         // 2. Replace the live tree with the checkpoint's copy, version by
         //    version. The drop is on disk at once while the rebuilt tree is
-        //    not, so the intent goes first.
+        //    not, so the intent goes first. The new tree is cleared before
+        //    the history goes in: its floor then refuses every older snapshot
+        //    until the whole history is back.
         let target = RebuildTarget::Table(table_id);
         write_rebuild_intent(&self.data_dir, target)?;
         self.columnar_tables.drop_table(table_id)?;
         let tree = self
             .columnar_tables
             .create_or_open_with(table_id, |_| Ok(()))?;
+        tree.clear()?;
         let mut versions = 0;
         for event in rebuild::tree_history(&source)? {
             let (added, memtable) = rebuild::replay_event(&tree, event);
@@ -3163,7 +3202,9 @@ impl StorageEngine {
         }
 
         // 4. The tree holds every entry proved in step 1: record it, after
-        //    the rebuilt rows, then persist the tree and drop the intent.
+        //    the rebuilt rows, then persist the tree, serve its history and
+        //    drop the intent. A table keeps the versions the node partition
+        //    keeps, under its watermark.
         let domain = Domain::Journal;
         let at = self.next_seqno();
         tree.insert(domain.base_key(), coverage::encode_base(next, &[]), at);
@@ -3171,6 +3212,7 @@ impl StorageEngine {
             tree.insert(domain.marker_key(index, 0).as_slice(), &[][..], at);
         }
         self.flush_memtables(&tree)?;
+        self.restore_retention_floor(&tree, Partition::Node, source_floor)?;
         remove_rebuild_intent(&self.data_dir, target)?;
         // What an open-time salvage of the table lost is restored.
         self.acknowledge_table_repair(table_id)?;

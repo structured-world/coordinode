@@ -1649,6 +1649,66 @@ fn a_rebuilt_partition_keeps_its_commit_timestamps() {
     }
 }
 
+/// A rebuilt partition serves the history it reinstalled: a snapshot inside
+/// the retention window, taken before an overwrite, reads the version it read
+/// before the rebuild instead of being refused at the rebuild's clear.
+#[test]
+fn a_rebuilt_partition_serves_its_history() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+        .expect("open_embedded");
+    put(
+        &engine,
+        oracle.next().as_raw(),
+        PartitionId::Node,
+        b"node:0:a",
+        b"a-v1",
+    );
+    let before_overwrite = oracle.next().as_raw();
+    put(
+        &engine,
+        before_overwrite,
+        PartitionId::Node,
+        b"node:0:a",
+        b"a-v2",
+    );
+    engine.persist().expect("persist");
+    let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
+    put(
+        &engine,
+        oracle.next().as_raw(),
+        PartitionId::Node,
+        b"node:0:b",
+        b"b",
+    );
+
+    let read_at = |at: u64| -> Vec<(Vec<u8>, Vec<u8>)> {
+        engine
+            .prefix_scan_at(Partition::Node, b"node:0:", at)
+            .expect("a snapshot inside the window")
+            .map(|guard| {
+                let (k, v) = guard.into_owned().expect("entry");
+                (k, v.to_vec())
+            })
+            .collect()
+    };
+    let before = read_at(before_overwrite);
+    assert_eq!(before, vec![(b"node:0:a".to_vec(), b"a-v1".to_vec())]);
+
+    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let since = engine
+        .oplog_read_since(from)
+        .expect("read")
+        .expect("journal");
+    let outcome = engine
+        .repair_partition_from_checkpoint(&ckpt, &since, Partition::Node)
+        .expect("rebuild");
+    assert!(matches!(outcome, Rebuild::Rebuilt { .. }), "{outcome:?}");
+    assert_eq!(read_at(before_overwrite), before);
+}
+
 /// A partition rebuild whose journal suffix misses an applied entry is
 /// refused and leaves the partition as it was: binding its coverage past the
 /// entry would certify data the rebuild never had.
@@ -1932,14 +1992,19 @@ fn lossy_open_repair_losing_the_coverage_record_rebuilds_in_full() {
         Some(b"tail-B".as_slice())
     );
 
-    // The discriminator: a full rebuild clears the partition's history, so
-    // the pre-damage snapshot is no longer servable at all.
-    assert!(
-        matches!(
-            engine.prefix_scan_at(Partition::Node, b"node:0:00000042", snap_before_damage),
-            Err(coordinode_storage::error::StorageError::SnapshotOutsideRetention { .. })
-        ),
-        "a full rebuild must have replaced the partition's history"
+    // The full rebuild (not the range-scoped one, asserted above) reinstalls
+    // the partition's history: the pre-damage snapshot reads what it read.
+    let probe: Vec<(Vec<u8>, Vec<u8>)> = engine
+        .prefix_scan_at(Partition::Node, b"node:0:00000042", snap_before_damage)
+        .expect("the pre-damage snapshot is served")
+        .map(|guard| {
+            let (k, v) = guard.into_owned().expect("entry");
+            (k, v.to_vec())
+        })
+        .collect();
+    assert_eq!(
+        probe,
+        vec![(b"node:0:00000042".to_vec(), b"base-A".to_vec())]
     );
 }
 
