@@ -251,23 +251,46 @@ fn a_recreate_waits_for_the_drop_of_its_name() {
     );
 }
 
-/// Two drops of one table and a create under its name meet: the second drop
-/// waits for the first and drops the same, old table, so the table the create
-/// makes after them survives, whichever of the second drop and the create
-/// goes first once the first drop is done.
+/// The series rendered for `table`, as `(tier, debt)` lines.
+fn series_of(reg: &ColumnarTableRegistry, table: &str) -> Vec<String> {
+    let mut out = String::new();
+    reg.settings.metrics.render(&mut out);
+    out.lines()
+        .filter(|line| line.contains(&format!("{{table=\"{table}\"}}")))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Two drops of one table and a create under its name meet, in the order
+/// that matters: the first drop finishes, the create registers the new table
+/// and publishes its series, and only then does the second drop, which
+/// waited on the first, go on. It drops the same, old table, so it returns
+/// and the new table, its directory and its series survive; the old table's
+/// series went with the first drop.
 #[test]
 fn a_second_drop_of_a_table_never_drops_the_one_created_after() {
+    use crate::engine::flush::while_alive;
+
     let dir = tempfile::tempdir().unwrap();
     let reg = Arc::new(new_registry(dir.path()));
     reg.create_or_open("t").unwrap();
-    let table = reg.trees().pop().expect("the table");
-    let (finish, maintenance) = hold_life(&table);
+    let old = reg.trees().pop().expect("the table");
+    while_alive(Some(&old.alive), || reg.settings.metrics.set("t", 2, 100));
+    assert_eq!(series_of(&reg, "t").len(), 2, "the old table's series");
+    let (finish, maintenance) = hold_life(&old);
 
     let first = {
         let reg = Arc::clone(&reg);
         std::thread::spawn(move || reg.drop_table("t"))
     };
     wait_for_state(&reg, "t", "the first drop running", |running, _| running);
+    // The second drop stops, once the first is done, until the test lets it on.
+    let (paused_tx, paused) = std::sync::mpsc::channel::<()>();
+    let (resume, resume_rx) = std::sync::mpsc::channel::<()>();
+    *reg.pause_after_drop_wait.lock().unwrap() = Some(Box::new(move || {
+        paused_tx.send(()).unwrap();
+        resume_rx.recv().unwrap();
+    }));
     let second = {
         let reg = Arc::clone(&reg);
         std::thread::spawn(move || reg.drop_table("t"))
@@ -275,21 +298,36 @@ fn a_second_drop_of_a_table_never_drops_the_one_created_after() {
     wait_for_state(&reg, "t", "the second drop waiting", |_, waiting| {
         waiting == 1
     });
-    let creator = {
-        let reg = Arc::clone(&reg);
-        std::thread::spawn(move || reg.create_or_open("t").map(|_| ()))
-    };
-    wait_for_state(&reg, "t", "the create waiting", |_, waiting| waiting == 2);
 
     finish.send(()).unwrap();
     maintenance.join().unwrap();
     first.join().unwrap().unwrap();
+    paused.recv().unwrap();
+    assert!(
+        series_of(&reg, "t").is_empty(),
+        "the old table's series went with its drop"
+    );
+
+    // The new table registers and its monitor publishes its series while the
+    // second drop is held after its wait.
+    reg.create_or_open("t").unwrap();
+    let new = reg.trees().pop().expect("the new table");
+    assert!(!Arc::ptr_eq(&new.alive, &old.alive));
+    while_alive(Some(&new.alive), || reg.settings.metrics.set("t", 0, 7));
+    resume.send(()).unwrap();
     second.join().unwrap().unwrap();
-    creator.join().unwrap().unwrap();
-    let new = reg.trees().pop().expect("the created table survives");
-    assert!(!Arc::ptr_eq(&new.alive, &table.alive));
+
+    assert!(reg.get("t").is_some(), "the new table is still registered");
     assert!(*new.alive.read(), "the new table lives");
-    assert!(dir.path().join("t").exists());
+    assert!(dir.path().join("t").exists(), "its directory is in place");
+    assert_eq!(
+        series_of(&reg, "t"),
+        vec![
+            "coordinode_storage_table_backpressure_tier{table=\"t\"} 0".to_owned(),
+            "coordinode_storage_table_compaction_debt_bytes{table=\"t\"} 7".to_owned(),
+        ],
+        "its series is in place"
+    );
 }
 
 /// A drop that fails before its directories are gone leaves the name refused:

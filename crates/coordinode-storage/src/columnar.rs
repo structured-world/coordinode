@@ -128,6 +128,11 @@ pub struct ColumnarTableRegistry {
     /// Notified when a table's drop finishes, for the open or drop of the
     /// same name waiting on it.
     retired: Condvar,
+    /// Run, with the registry unlocked, by the next drop that waited for
+    /// another drop of its name, before it decides what is left to drop: the
+    /// point at which tests let another caller in.
+    #[cfg(test)]
+    pause_after_drop_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The tables the registry holds: the open ones, and the names whose drop
@@ -247,6 +252,8 @@ impl ColumnarTableRegistry {
             settings,
             trees: Mutex::new(Tables::default()),
             retired: Condvar::new(),
+            #[cfg(test)]
+            pause_after_drop_wait: Mutex::new(None),
         };
         let mut trees = HashMap::new();
         let mut repairs = Vec::new();
@@ -329,6 +336,12 @@ impl ColumnarTableRegistry {
             .write_buffer_budget(Arc::clone(&settings.write_buffer))
             .compaction_capacity(Arc::clone(&settings.capacity))
             .column_encoding_policy(settings.column_encoding.clone())
+            // The empty files a table's folder keeps ready for the next
+            // tables are made by the flush or compaction that claims one,
+            // under the table's life, not by a thread of their own: one made
+            // after the life ends would land in a folder its drop is
+            // removing.
+            .table_file_refill_inline(true)
             .open_or_repair(lsm_tree::RepairPolicy::default().salvage(true))?;
         enable_columnar(&tree)?;
         if let AnyTree::Standard(t) = &tree {
@@ -440,6 +453,19 @@ impl ColumnarTableRegistry {
             if tables.retiring.get(table_id) == Some(&Retirement::Running) {
                 while tables.retiring.get(table_id) == Some(&Retirement::Running) {
                     tables = self.wait_retired(tables);
+                }
+                #[cfg(test)]
+                {
+                    let pause = self
+                        .pause_after_drop_wait
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    if let Some(pause) = pause {
+                        drop(tables);
+                        pause();
+                        tables = self.lock();
+                    }
                 }
                 if !tables.retiring.contains_key(table_id) {
                     // That drop removed the table; whatever is under the
