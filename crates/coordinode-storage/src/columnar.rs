@@ -414,6 +414,24 @@ impl ColumnarTableRegistry {
         Ok((tree, 0))
     }
 
+    /// Run `work` on the tree of `table_id` while the table lives, as its
+    /// scheduled flushes and compactions run: a drop waits for it, and
+    /// `None` when there is no such table or its drop has taken it. Whatever
+    /// writes the table's folder goes through here, so nothing is written
+    /// into a folder a drop is removing.
+    pub(crate) fn with_live<T>(
+        &self,
+        table_id: &str,
+        work: impl FnOnce(&AnyTree) -> T,
+    ) -> Option<T> {
+        let (tree, life) = {
+            let tables = self.lock();
+            let entry = tables.live.get(table_id)?;
+            (entry.tree.clone(), Arc::clone(&entry.alive))
+        };
+        crate::engine::flush::while_alive(Some(&life), || work(&tree))
+    }
+
     /// Return the open columnar tree for `table_id`, or `None` if no such table
     /// is registered.
     pub fn get(&self, table_id: &str) -> Option<AnyTree> {

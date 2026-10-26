@@ -251,6 +251,48 @@ fn a_recreate_waits_for_the_drop_of_its_name() {
     );
 }
 
+/// Work on a table through `with_live` (a flush, a checkpoint capture) holds
+/// the table's drop off its folder until it is done, and work asked for once
+/// the drop has taken the table does not run at all.
+#[test]
+fn work_on_a_live_table_holds_its_drop_and_none_runs_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = Arc::new(new_registry(dir.path()));
+    reg.create_or_open("t").unwrap();
+
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (finish, finish_rx) = std::sync::mpsc::channel::<()>();
+    let worker = {
+        let reg = Arc::clone(&reg);
+        std::thread::spawn(move || {
+            reg.with_live("t", |_tree| {
+                started_tx.send(()).unwrap();
+                let _released = finish_rx.recv();
+            })
+        })
+    };
+    started.recv().unwrap();
+    let dropper = {
+        let reg = Arc::clone(&reg);
+        std::thread::spawn(move || reg.drop_table("t"))
+    };
+    wait_for_state(&reg, "t", "the drop running", |running, _| running);
+    assert!(
+        dir.path().join("t").exists(),
+        "the drop removed the folder under running work"
+    );
+    finish.send(()).unwrap();
+    assert_eq!(worker.join().unwrap(), Some(()));
+    dropper.join().unwrap().unwrap();
+    assert!(!dir.path().join("t").exists());
+
+    assert_eq!(
+        reg.with_live("t", |_tree| ()),
+        None,
+        "no work runs on a dropped table"
+    );
+}
+
 /// The series rendered for `table`, as `(tier, debt)` lines.
 fn series_of(reg: &ColumnarTableRegistry, table: &str) -> Vec<String> {
     let mut out = String::new();

@@ -1979,13 +1979,13 @@ impl StorageEngine {
     }
 
     /// Flush one `STORAGE COLUMNAR` table's memtables durably, the journal
-    /// synced first. A no-op if the table has no tree.
+    /// synced first, while the table lives. A no-op if the table has no tree
+    /// or its drop has taken it.
     #[cfg(feature = "columnar")]
     pub(crate) fn flush_columnar_table(&self, table_id: &str) -> StorageResult<()> {
-        if let Some(tree) = self.columnar_tables.get(table_id) {
-            self.flush_memtables(&tree)?;
-        }
-        Ok(())
+        self.columnar_tables
+            .with_live(table_id, |tree| self.flush_memtables(tree))
+            .unwrap_or(Ok(()))
     }
 
     /// Scan every row of a `STORAGE COLUMNAR` table visible at `snapshot`,
@@ -2735,15 +2735,19 @@ impl StorageEngine {
             std::fs::create_dir_all(&tables)
                 .map_err(|e| StorageError::Io(format!("create {tables:?}: {e}")))?;
             for table_id in self.columnar_tables.table_ids() {
-                let Some(tree) = self.columnar_tables.get(&table_id) else {
+                // Under the table's life: a table dropped meanwhile is not in
+                // the checkpoint, and none is flushed into a folder its drop
+                // is removing.
+                let captured = self.columnar_tables.with_live(&table_id, |tree| {
+                    self.flush_memtables_in_order(tree)?;
+                    tree.create_checkpoint(&tables.join(&table_id))
+                        .map_err(|e| {
+                            StorageError::Io(format!("checkpoint columnar table {table_id}: {e}"))
+                        })
+                });
+                let Some(info) = captured.transpose()? else {
                     continue;
                 };
-                self.flush_memtables_in_order(&tree)?;
-                let info = tree
-                    .create_checkpoint(&tables.join(&table_id))
-                    .map_err(|e| {
-                        StorageError::Io(format!("checkpoint columnar table {table_id}: {e}"))
-                    })?;
                 summary.total_bytes += info.total_bytes;
                 summary.max_seqno = summary.max_seqno.max(info.seqno);
             }
@@ -4965,11 +4969,12 @@ impl StorageEngine {
         for tree in self.coordinator.trees().values() {
             self.flush_memtables_in_order(tree)?;
         }
+        // A table dropped meanwhile has nothing left to persist.
         #[cfg(feature = "columnar")]
         for table_id in self.columnar_tables.table_ids() {
-            if let Some(tree) = self.columnar_tables.get(&table_id) {
-                self.flush_memtables_in_order(&tree)?;
-            }
+            self.columnar_tables
+                .with_live(&table_id, |tree| self.flush_memtables_in_order(tree))
+                .unwrap_or(Ok(()))?;
         }
         // Once per device, not once per tree: every tree lies under the
         // endpoints.
