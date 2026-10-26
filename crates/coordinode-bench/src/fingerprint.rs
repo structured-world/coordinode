@@ -106,8 +106,16 @@ pub fn hardware_fingerprint() -> HardwareFingerprint {
 
 /// Invoke `git` with given args, trimming the stdout. Returns
 /// [`BenchError::Git`] on non-zero exit.
+///
+/// Only reads: without optional locks `status` does not refresh and rewrite
+/// the index (submodules' included, the variable reaches their git), which
+/// on Windows fails a concurrent reader of the same index with "Permission
+/// denied" when benches or the user's own git run beside it.
 fn run_git(args: &[&str]) -> BenchResult<String> {
-    let out = Command::new("git").args(args).output()?;
+    let out = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(args)
+        .output()?;
     if !out.status.success() {
         return Err(BenchError::Git(format!(
             "git {} failed: {}",
