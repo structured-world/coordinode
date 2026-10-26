@@ -916,19 +916,24 @@ impl Database {
             // checkpoint has gone since.
             if crate::repair::latest_checkpoint(&root).is_some()
                 || !engine.pending_rebuilds()?.is_empty()
+                || !engine.pending_table_rebuilds()?.is_empty()
             {
                 match crate::repair::verify_and_repair(&engine, &root) {
-                    Ok(report) if !report.repaired.is_empty() => {
+                    Ok(report)
+                        if !report.repaired.is_empty() || !report.repaired_tables.is_empty() =>
+                    {
                         tracing::warn!(
                             repaired = ?report.repaired,
+                            repaired_tables = ?report.repaired_tables,
                             clean = report.clean_after,
-                            "auto-repaired corrupt partitions on open"
+                            "auto-repaired corrupt partitions and tables on open"
                         );
                     }
                     Ok(report) if !report.is_clean() => {
                         tracing::error!(
                             corrupt = ?report.corrupt_partitions,
-                            "partitions need a rebuild but no checkpoint exists; \
+                            corrupt_tables = ?report.corrupt_tables,
+                            "partitions or tables need a rebuild but no checkpoint exists; \
                              restore from an off-device backup"
                         );
                     }

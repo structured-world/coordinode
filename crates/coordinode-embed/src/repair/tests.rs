@@ -860,6 +860,50 @@ fn a_table_rebuild_cut_short_is_rebuilt_again() {
     );
 }
 
+/// The database open finishes a table rebuild a crash cut short, as it does a
+/// partition's, before it serves anything: the intent alone says the table is
+/// incomplete.
+#[test]
+fn database_open_finishes_an_interrupted_table_rebuild() {
+    let dir = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let data_dir = {
+        let engine = StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded");
+        for i in 0..4u32 {
+            engine
+                .columnar_insert(
+                    "trades",
+                    format!("row:{i:06}").into_bytes(),
+                    b"kept".to_vec(),
+                    oracle.next().as_raw(),
+                )
+                .expect("columnar insert");
+        }
+        let root = checkpoint_root(engine.data_dir());
+        create_checkpoint(&engine, &root).expect("checkpoint");
+        engine.data_dir().to_path_buf()
+    };
+    let intents = data_dir.join("rebuild");
+    std::fs::create_dir_all(&intents).expect("intent dir");
+    std::fs::write(intents.join("table.trades"), b"").expect("intent");
+
+    let db = crate::Database::open(&data_dir).expect("open repairs");
+    assert!(
+        db.engine()
+            .pending_table_rebuilds()
+            .expect("intents")
+            .is_empty()
+    );
+    assert_eq!(
+        db.engine()
+            .columnar_scan("trades", u64::MAX)
+            .expect("scan")
+            .len(),
+        4
+    );
+}
+
 /// A lossy table repair with no checkpoint to rebuild from is reported, not
 /// absorbed: the table is listed, nothing claims a rebuild, and the next open
 /// reports the same loss.
@@ -1274,7 +1318,12 @@ fn database_open_finishes_an_interrupted_rebuild() {
             Some(value)
         );
     }
-    assert!(db.engine().pending_rebuilds().expect("intents").is_empty());
+    let pending = db.engine().pending_rebuilds().expect("intents");
+    assert!(
+        pending.is_empty(),
+        "the open left {pending:?} unrebuilt; a repair now gives {:?}",
+        db.verify_and_repair()
+    );
 }
 
 /// A full rebuild clears the tree on disk before the rebuilt data reaches
