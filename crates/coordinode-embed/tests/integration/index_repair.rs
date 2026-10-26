@@ -1310,6 +1310,54 @@ fn a_correlated_lookup_answered_by_the_records_finds_every_holder() {
     assert_eq!(rows, vec![("a@x".into(), a), ("b@x".into(), b)]);
 }
 
+/// A correlated join whose left rows share keys, through an index with a
+/// wrong entry: the first statement meets the entry inside its batch of
+/// keys, the next finds the index unable to answer for the whole batch.
+/// Both answer every left row from the records, the same rows each time.
+#[test]
+fn a_correlated_join_through_a_damaged_index_answers_every_shared_key() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    for email in ["a@x", "b@x", "z@x"] {
+        db.execute_cypher(&format!("CREATE (:U {{email: '{email}'}})"))
+            .expect("node");
+    }
+    db.execute_cypher("UNWIND ['a@x', 'b@x', 'a@x', 'q@x', 'b@x', 'a@x'] AS e CREATE (:S {e: e})")
+        .expect("left rows");
+    let a = id_of(&mut db, "a@x");
+    let b = id_of(&mut db, "b@x");
+    let z = id_of(&mut db, "z@x");
+    misattribute(&db, "u_email", "a@x", z);
+
+    let query = "MATCH (s:S) MATCH (u:U) WHERE u.email = s.e RETURN s.e AS e, id(u) AS id";
+    let plan = db.explain_cypher(query).expect("plan");
+    assert!(
+        plan.contains("IndexScan"),
+        "the join reads the index: {plan}"
+    );
+    let want: Vec<(String, i64)> = vec![
+        ("a@x".into(), a),
+        ("a@x".into(), a),
+        ("a@x".into(), a),
+        ("b@x".into(), b),
+        ("b@x".into(), b),
+    ];
+    for statement in ["meets the entry", "index unable to answer"] {
+        let mut rows: Vec<(String, i64)> = db
+            .execute_cypher(query)
+            .expect("correlated join")
+            .iter()
+            .map(|row| match (row.get("e"), row.get("id")) {
+                (Some(Value::String(e)), Some(Value::Int(id))) => (e.clone(), *id),
+                other => panic!("unexpected row {other:?}"),
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(rows, want, "{statement}");
+    }
+}
+
 /// Inside an interactive transaction, a lookup answered from the records
 /// sees the transaction's own writes exactly as the sound index would: a
 /// value written by the transaction is found, a value it removed is not,

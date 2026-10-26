@@ -3875,6 +3875,91 @@ fn a_correlated_join_over_many_keys_finds_every_holder() {
     assert_eq!(rows_of(&mut indexed), want);
 }
 
+/// Rows of a correlated join `query`, sorted, after `ddl` and `load`; and
+/// whether its plan reads an index.
+fn correlated_join_rows(
+    ddl: &[&str],
+    load: &[&str],
+    query: &str,
+) -> (
+    Vec<Vec<(String, coordinode_core::graph::types::Value)>>,
+    bool,
+) {
+    let mut db = open_db();
+    for statement in ddl.iter().chain(load) {
+        db.execute_cypher(statement).unwrap();
+    }
+    let plan = db.explain_cypher(query).unwrap();
+    let mut rows: Vec<Vec<(String, coordinode_core::graph::types::Value)>> = db
+        .execute_cypher(query)
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            let mut fields: Vec<_> = row.into_iter().collect();
+            fields.sort_by(|a, b| a.0.cmp(&b.0));
+            fields
+        })
+        .collect();
+    rows.sort_by_key(|row| format!("{row:?}"));
+    (rows, plan.contains("IndexScan"))
+}
+
+/// Keys with more holders than one candidate batch (looked up alone), keys
+/// whose holders together outgrow a batch (read in separate groups), and
+/// shared integer and boolean keys: the join through a non-unique index
+/// gives the rows the join without an index gives.
+#[test]
+fn a_correlated_join_beyond_a_batch_of_holders_matches_the_unindexed_join() {
+    let load = [
+        "UNWIND range(1, 300) AS n CREATE (:A {key: 'big', n: n})",
+        "UNWIND range(1, 200) AS n CREATE (:A {key: 'mid', n: n})",
+        "UNWIND range(1, 100) AS n CREATE (:A {key: 'small', n: n})",
+        "CREATE (:A {key: 7, n: 1}), (:A {key: 7, n: 2}), (:A {key: true, n: 1})",
+        "UNWIND ['big', 'mid', 'small', 7, true, 'none', 'big', 'mid', 'small', 7, true] AS p \
+         CREATE (:S {parent: p})",
+    ];
+    let query = "MATCH (s:S) MATCH (a:A) WHERE a.key = s.parent RETURN s.parent AS p, a.n AS n";
+    let (plain, _) = correlated_join_rows(&[], &load, query);
+    let (indexed, reads_index) =
+        correlated_join_rows(&["CREATE INDEX a_key ON :A(key)"], &load, query);
+    assert!(reads_index, "the join reads the index");
+    assert_eq!(plain.len(), 2 * (300 + 200 + 100 + 2 + 1));
+    assert_eq!(indexed, plain);
+}
+
+/// A correlated join into a temporal label resolves each candidate at the
+/// statement's instant, key by key: through the index it gives the rows the
+/// join without an index gives, the current version of each key once per
+/// left row naming it.
+#[test]
+fn a_correlated_join_into_a_temporal_label_matches_the_unindexed_join() {
+    let ddl = "CREATE NODE TYPE T TEMPORAL WITH \
+               (key: STRING NOT NULL, name: STRING, valid_from: INT NOT NULL, valid_to: INT)";
+    let load = [
+        "CREATE (:T {key: 'k1', name: 'old', valid_from: 1, valid_to: 2})",
+        "CREATE (:T {key: 'k1', name: 'now', valid_from: 2})",
+        "CREATE (:T {key: 'k2', name: 'two', valid_from: 1})",
+        "UNWIND ['k1', 'k2', 'k1', 'k9'] AS p CREATE (:S {parent: p})",
+    ];
+    let query =
+        "MATCH (s:S) MATCH (t:T) WHERE t.key = s.parent RETURN s.parent AS p, t.name AS name";
+    let (plain, _) = correlated_join_rows(&[ddl], &load, query);
+    let (indexed, reads_index) =
+        correlated_join_rows(&[ddl, "CREATE INDEX t_key ON :T(key)"], &load, query);
+    assert!(reads_index, "the join reads the index");
+    let names: Vec<_> = plain
+        .iter()
+        .map(|row| {
+            row.iter()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.clone())
+        })
+        .collect();
+    let now = |name: &str| Some(coordinode_core::graph::types::Value::String(name.into()));
+    assert_eq!(names, vec![now("now"), now("now"), now("two")], "{plain:?}");
+    assert_eq!(indexed, plain);
+}
+
 #[test]
 fn with_distinct_passthrough() {
     use coordinode_core::graph::types::Value;
