@@ -19,12 +19,13 @@ pub enum Partition {
     /// Key format: `edgeprop:<TYPE>:<src>:<tgt>`
     EdgeProp,
 
-    /// `blob:` — BlobStore content-addressed chunks (256KB, SHA-256 key).
-    /// Key format: `blob:<sha256_hex>`
+    /// `blob:`: BlobStore chunk payload, one immutable copy per content
+    /// and generation. Key format: `blob:<scope><content><generation>`
     Blob,
 
-    /// `blobref:` — Blob references from nodes to blob chunks.
-    /// Key format: `blobref:<node_id>:<property_name>`
+    /// BlobStore records: the catalog of chunk copies (`blobcat:`), the
+    /// owners referencing chunks (`blobmeta:`, `s3:`, `blobref:`), staged
+    /// uploads (`blobstage:`) and release candidates (`blobcand:`).
     BlobRef,
 
     /// `schema:` — Graph schema definitions (labels, edge types, constraints).

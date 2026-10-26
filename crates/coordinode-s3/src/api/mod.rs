@@ -2,9 +2,13 @@
 //!
 //! Implements a subset of the AWS S3 API for CoordiNode BlobStore.
 //! CE: GetObject, PutObject, DeleteObject, ListBuckets, ListObjectsV2.
+//!
+//! Each object key is an owner of its bytes. Putting an object replaces what
+//! its key held and releases it in the same commit; deleting it releases it.
+//! Bytes another object shares stay, and storage nothing needs any more is
+//! reclaimed in the background.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -17,32 +21,28 @@ use sha2::Digest;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use coordinode_core::graph::blob::{self, BlobRef, encode_blob_key};
-use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
+use coordinode_core::graph::blob::{SharingScope, s3_owner_key};
+use coordinode_storage::blob::{BlobStore, OwnerWrite};
 
 use crate::mapping;
 
-/// Start the S3-compatible HTTP server.
-pub async fn serve(
-    addr: SocketAddr,
-    engine: Arc<StorageEngine>,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// Start the S3-compatible HTTP server over `store`.
+pub async fn serve(addr: SocketAddr, store: BlobStore) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     info!(addr = %addr, "S3 gateway listening");
 
     loop {
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);
-        let engine = engine.clone();
+        let store = store.clone();
 
         tokio::spawn(async move {
             if let Err(e) = http1::Builder::new()
                 .serve_connection(
                     io,
                     service_fn(move |req| {
-                        let engine = engine.clone();
-                        async move { handle_request(req, engine).await }
+                        let store = store.clone();
+                        async move { handle_request(req, store).await }
                     }),
                 )
                 .await
@@ -55,19 +55,22 @@ pub async fn serve(
 
 async fn handle_request(
     req: Request<Incoming>,
-    engine: Arc<StorageEngine>,
+    store: BlobStore,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
     let result = match (&method, path.as_str()) {
         (&Method::GET, "/") => list_buckets(),
-        (&Method::PUT, _) if mapping::parse_s3_path(&path).is_some() => {
-            put_object(req, &engine, &path).await
+        (&Method::PUT, _) if mapping::parse_s3_path(&path).is_some() => match req.collect().await {
+            Ok(body) => put_object(&store, &path, body.to_bytes()).await,
+            Err(e) => Err(format!("body read error: {e}")),
+        },
+        (&Method::GET, _) if mapping::parse_s3_path(&path).is_some() => {
+            get_object(&store, &path).await
         }
-        (&Method::GET, _) if mapping::parse_s3_path(&path).is_some() => get_object(&engine, &path),
         (&Method::DELETE, _) if mapping::parse_s3_path(&path).is_some() => {
-            delete_object(&engine, &path).await
+            delete_object(&store, &path).await
         }
         _ => Ok(xml_response(
             StatusCode::NOT_FOUND,
@@ -98,22 +101,17 @@ fn list_buckets() -> Result<Response<Full<Bytes>>, String> {
     Ok(xml_response(StatusCode::OK, xml))
 }
 
-/// `PUT /<bucket>/<key>`: upload an object as a blob. The object is durable
-/// on this gateway's store before the answer.
+/// `PUT /<bucket>/<key>`: store `body` as the object at `path`, replacing
+/// what the key held. The object is durable on this gateway's store before
+/// the answer.
 ///
 /// Interim blob payload path: the storage substrate's extent/stream write,
 /// with the bucket's write concern and protection, replaces this one.
 async fn put_object(
-    req: Request<Incoming>,
-    engine: &Arc<StorageEngine>,
+    store: &BlobStore,
     path: &str,
+    body: Bytes,
 ) -> Result<Response<Full<Bytes>>, String> {
-    let body = req
-        .collect()
-        .await
-        .map_err(|e| format!("body read error: {e}"))?
-        .to_bytes();
-
     if body.is_empty() {
         return Ok(xml_response(
             StatusCode::BAD_REQUEST,
@@ -121,25 +119,21 @@ async fn put_object(
         ));
     }
 
-    let (blob_ref, chunks) = blob::create_blob(&body);
+    // Compute ETag (SHA-256 of full content)
+    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&body)));
+    let size = body.len();
 
-    // The chunks are durable before the metadata naming them, and both
-    // before the answer. Flushing blocks, so it runs off the async runtime.
-    let meta_key = s3_meta_key(path);
-    let meta_value = blob_ref.to_msgpack().map_err(|e| e.to_string())?;
-    let writer = Arc::clone(engine);
+    // Flushing blocks, so it runs off the async runtime.
+    let writer = store.clone();
+    let key = s3_owner_key(path);
     tokio::task::spawn_blocking(move || {
-        coordinode_storage::blob::put_chunks_durably(&writer, &chunks)?;
-        coordinode_storage::blob::put_meta_durably(&writer, &meta_key, &meta_value)
+        writer.put(&key, SharingScope::STORE, &body, OwnerWrite::Replace, None)
     })
     .await
     .map_err(|e| format!("object write did not finish: {e}"))?
     .map_err(|e| e.to_string())?;
 
-    // Compute ETag (SHA-256 of full content)
-    let etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(&body)));
-
-    info!(path = %path, size = body.len(), "S3 PutObject");
+    info!(path = %path, size, "S3 PutObject");
 
     let resp = Response::builder()
         .status(StatusCode::OK)
@@ -149,36 +143,32 @@ async fn put_object(
     Ok(resp)
 }
 
-/// `GET /<bucket>/<key>`: download an object.
-fn get_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Bytes>>, String> {
-    let meta_key = s3_meta_key(path);
-    let meta_bytes = engine
-        .get(Partition::BlobRef, &meta_key)
-        .map_err(|e| e.to_string())?;
-
-    let meta_bytes = match meta_bytes {
-        Some(b) => b,
-        None => {
-            return Ok(xml_response(
-                StatusCode::NOT_FOUND,
-                "<Error><Code>NoSuchKey</Code></Error>",
-            ));
+/// `GET /<bucket>/<key>`: the object at `path`, read whole at one snapshot.
+async fn get_object(store: &BlobStore, path: &str) -> Result<Response<Full<Bytes>>, String> {
+    let reader = store.clone();
+    let key = s3_owner_key(path);
+    let data = tokio::task::spawn_blocking(move || {
+        let Some(opened) = reader.open(&key).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let blob = &opened.record().blob;
+        // A capacity hint only: an object too large for this platform's
+        // addresses fails when it is read, not here.
+        let mut data = Vec::with_capacity(usize::try_from(blob.total_size).unwrap_or(0));
+        for index in 0..blob.chunk_count() {
+            data.extend_from_slice(&opened.chunk(index).map_err(|e| e.to_string())?);
         }
+        Ok::<_, String>(Some(data))
+    })
+    .await
+    .map_err(|e| format!("object read did not finish: {e}"))??;
+
+    let Some(data) = data else {
+        return Ok(xml_response(
+            StatusCode::NOT_FOUND,
+            "<Error><Code>NoSuchKey</Code></Error>",
+        ));
     };
-
-    let blob_ref = BlobRef::from_msgpack(&meta_bytes).map_err(|e| e.to_string())?;
-
-    // Reassemble blob from chunks
-    let mut data = Vec::with_capacity(blob_ref.total_size as usize);
-    for chunk_id in &blob_ref.chunks {
-        let key = encode_blob_key(chunk_id);
-        let chunk_data = engine
-            .get(Partition::Blob, &key)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("missing chunk {}", chunk_id.to_hex()))?;
-        data.extend_from_slice(&chunk_data);
-    }
-
     let resp = Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
@@ -188,30 +178,16 @@ fn get_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Bytes>
     Ok(resp)
 }
 
-/// `DELETE /<bucket>/<key>`: delete an object, durably before the answer.
-async fn delete_object(
-    engine: &Arc<StorageEngine>,
-    path: &str,
-) -> Result<Response<Full<Bytes>>, String> {
-    let meta_key = s3_meta_key(path);
-    let exists = engine
-        .get(Partition::BlobRef, &meta_key)
-        .map_err(|e| e.to_string())?
-        .is_some();
-
-    if exists {
-        // Only the metadata goes. Chunks are content-addressed and shared
-        // with every other object, blob or property holding the same bytes,
-        // so this object cannot tell whether a chunk is still referenced;
-        // unreferenced chunks are reclaimed by chunk GC instead.
-        let writer = Arc::clone(engine);
-        tokio::task::spawn_blocking(move || {
-            coordinode_storage::blob::delete_meta_durably(&writer, &meta_key)
-        })
+/// `DELETE /<bucket>/<key>`: delete the object at `path`, durably before the
+/// answer. Deleting a key that holds nothing succeeds, as in S3.
+async fn delete_object(store: &BlobStore, path: &str) -> Result<Response<Full<Bytes>>, String> {
+    let writer = store.clone();
+    let key = s3_owner_key(path);
+    let deleted = tokio::task::spawn_blocking(move || writer.delete(&key))
         .await
         .map_err(|e| format!("object delete did not finish: {e}"))?
         .map_err(|e| e.to_string())?;
-
+    if deleted.is_some() {
         info!(path = %path, "S3 DeleteObject");
     }
 
@@ -219,14 +195,6 @@ async fn delete_object(
         .status(StatusCode::NO_CONTENT)
         .body(Full::new(Bytes::new()))
         .map_err(|e| e.to_string())
-}
-
-/// Encode S3 path as BlobRef key: `s3:<path>`.
-fn s3_meta_key(path: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(3 + path.len());
-    key.extend_from_slice(b"s3:");
-    key.extend_from_slice(path.as_bytes());
-    key
 }
 
 fn xml_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {

@@ -65,9 +65,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Tier::Warm,
         ),
     ]);
-    let engine = Arc::new(coordinode_storage::engine::core::StorageEngine::open(
-        &config,
-    )?);
+    // Object writes commit as transactions, which take their timestamps
+    // from the store's own clock.
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = Arc::new(
+        coordinode_storage::engine::core::StorageEngine::open_embedded(
+            &config,
+            Arc::clone(&oracle),
+        )?,
+    );
+    let store = coordinode_storage::blob::BlobStore::direct(engine, oracle);
 
     info!(
         addr = %addr,
@@ -76,7 +83,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION")
     );
 
-    api::serve(addr, engine).await?;
+    api::serve(addr, store).await?;
     Ok(())
 }
 

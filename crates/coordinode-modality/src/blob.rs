@@ -1,62 +1,37 @@
-//! Blob store — content-addressed chunks + per-property blob refs.
+//! Blob store: large property values as owners of shared blob content.
 //!
-//! Large property values (≥ [`INLINE_THRESHOLD`]) are split into
-//! content-addressed chunks ([`Partition::Blob`]). Each (node, prop)
-//! that holds such a value carries a `BlobRef` listing chunk hashes
-//! ([`Partition::BlobRef`]). Content-addressing gives automatic
-//! deduplication — identical chunks are stored once cluster-wide.
-//!
-//! The store exposes:
-//!
-//! - Per-chunk put/get (idempotent — content-addressed, so a re-put
-//!   of an existing chunk hash is a no-op semantically).
-//! - Per-(node, prop) blob ref put/get/delete.
-//!
-//! Chunk garbage collection (dropping orphan chunks once no `BlobRef`
-//! references them) is a Layer 3 concern and lives outside this
-//! trait: it requires a global scan across all blob refs and runs as
-//! a background sweep. The store deliberately does not expose
-//! `delete_chunk` directly — the only safe way to drop a chunk is
-//! through the GC.
+//! A property value of at least [`INLINE_THRESHOLD`] bytes is held as a blob:
+//! the (node, property) pair is an owner whose record lists the value's
+//! chunks, and the chunks' bytes are shared with every other owner of the
+//! same content. The protocol every blob path follows lives in
+//! [`coordinode_storage::blob`]; this store adapts it to properties.
 //!
 //! ## Data plane vs metadata plane
 //!
-//! Blobs follow the object-store separation that lets Ceph/MinIO scale:
-//! bulk object **data** is placed directly on storage, **never** routed
-//! through the consensus log, while small **metadata** is transactional.
+//! Blobs keep bulk **data** out of the consensus log and transactional
+//! write buffers, while small **metadata** is transactional:
 //!
-//! - **Chunks (data plane)** — `put_chunk` / `put_chunks` / `get_chunk`
-//!   take an engine handle and read/write `Partition::Blob` directly.
-//!   Chunks are content-addressed and immutable: a given [`ChunkId`]
-//!   always maps to the same bytes, so writes are idempotent and need
-//!   no MVCC version, OCC conflict tracking, or Raft proposal. Payloads
-//!   are large (multi-MB) and must never sit in a transaction's
-//!   in-memory write buffer or be shipped as a single consensus entry.
-//!   Cluster durability for chunks is the placement layer's job —
-//!   replication / Reed-Solomon erasure coding under CRUSH failure-
-//!   domain rules (see the erasure-coding and segments architecture),
-//!   not the transaction commit path.
-//! - **Blob refs (metadata plane)** — `put_blob_ref` / `get_blob_ref` /
-//!   `delete_blob_ref` thread the active [`Transaction`]: the per-(node,
-//!   prop) ref is small and commits atomically with the node write that
-//!   produced it, and reads see it through the same MVCC snapshot as the
-//!   node (time-travel consistent).
+//! - **Upload (data plane):** [`BlobStore::upload`] admits the value,
+//!   pinning its contents, and writes their payload durably, in commits of
+//!   its own and before the property write. Payload is large (multi-MB) and
+//!   never sits in a transaction's in-memory buffer.
+//! - **Publication (metadata plane):** [`BlobStore::put_blob`] stages, in the
+//!   active [`Transaction`], the property's owner record together with the
+//!   reference counts it moves and the end of the upload, so they commit
+//!   atomically with the node write that produced them, or not at all.
+//!   [`BlobStore::delete_blob_ref`] releases the property in the same way.
+//!   Reads see the property through the transaction's MVCC snapshot, and the
+//!   chunks stay readable at that snapshot for as long as the reader lives.
 //!
-//! Interim blob payload path: until that placement layer carries chunks,
-//! a chunk write is made durable on this member before it returns, so a ref
-//! committed after it never names bytes a crash took. The storage
-//! substrate's extent/stream write replaces it.
-//!
-//! Atomicity between a chunk and the ref pointing at it is **eventual**:
-//! chunks are placed first, the ref commits second, and orphan chunks
-//! (ref never committed, or ref later deleted) are reclaimed by the
-//! Layer 3 reference-counting GC sweep — exactly the RADOS / MinIO model.
+//! An upload whose property write never commits is abandoned
+//! ([`BlobStore::abandon`]) or, if its writer is gone, fenced and collected:
+//! its pins and payload are never leaked into a reference nobody holds.
 //!
 //! [`Transaction`]: coordinode_storage::engine::transaction::Transaction
 
-use coordinode_core::graph::blob::{BlobRef, ChunkId, encode_blob_key, encode_blobref_key};
+use coordinode_core::graph::blob::{BlobRef, OwnerRecord, SharingScope, encode_blobref_key};
 use coordinode_core::graph::node::NodeId;
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::blob::{BlobReader, OwnerWrite, StagedUpload};
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 
@@ -64,39 +39,32 @@ use crate::error::{StoreError, StoreResult};
 
 pub use coordinode_core::graph::blob::INLINE_THRESHOLD;
 
-/// Layer 4 blob store: content-addressed chunk CAS (data plane, direct
-/// to the engine) + per-property blob references (metadata plane,
-/// transactional). Hides partition layout and key encoders.
+/// Layer 4 blob store for node properties: uploads ahead of the property
+/// write, then publication, release and reads through the active
+/// transaction. Hides partition layout and key encoders.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a blob store for node properties",
+    label = "`{Self}` does not implement `BlobStore`",
+    note = "`LocalBlobStore::new` wraps the store's `coordinode_storage::blob::BlobStore`"
+)]
 pub trait BlobStore {
-    /// Persist a chunk by content hash directly to the engine
-    /// (data plane). Idempotent: re-putting an existing `chunk_id`
-    /// overwrites identical bytes.
-    fn put_chunk(&self, engine: &StorageEngine, chunk_id: &ChunkId, data: &[u8])
-    -> StoreResult<()>;
+    /// Admit `data` and write its payload durably, ahead of the property
+    /// write that publishes it with [`Self::put_blob`].
+    fn upload(&self, data: &[u8]) -> StoreResult<StagedUpload>;
 
-    /// Persist many chunks in one durable write (data plane), through
-    /// [`coordinode_storage::blob::put_chunks_durably`]. Useful when a new
-    /// blob ref pulls in multiple new chunks.
-    fn put_chunks(&self, engine: &StorageEngine, chunks: &[(ChunkId, Vec<u8>)]) -> StoreResult<()>;
-
-    /// Fetch a chunk by content hash (data plane). Returns `None` if not
-    /// stored (either never written, or already swept by GC because no
-    /// ref pointed at it).
-    fn get_chunk(&self, engine: &StorageEngine, chunk_id: &ChunkId)
-    -> StoreResult<Option<Vec<u8>>>;
-
-    /// Persist the [`BlobRef`] for a (node, prop) pair (metadata plane).
-    /// Overwrites any previous ref at the same key. Buffered on `txn`.
-    fn put_blob_ref(
+    /// Stage, in `txn`, `upload` as the value of property `prop_id` of
+    /// `node_id`, releasing whatever the property held. Returns the
+    /// reference the property now holds.
+    fn put_blob(
         &self,
         txn: &mut Transaction,
         node_id: NodeId,
         prop_id: u32,
-        blob_ref: &BlobRef,
-    ) -> StoreResult<()>;
+        upload: &StagedUpload,
+    ) -> StoreResult<BlobRef>;
 
-    /// Fetch the [`BlobRef`] for a (node, prop) pair (metadata plane),
-    /// through the transaction's MVCC snapshot.
+    /// The [`BlobRef`] property `prop_id` of `node_id` holds, through the
+    /// transaction's MVCC snapshot.
     fn get_blob_ref(
         &self,
         txn: &Transaction,
@@ -104,73 +72,61 @@ pub trait BlobStore {
         prop_id: u32,
     ) -> StoreResult<Option<BlobRef>>;
 
-    /// Remove the [`BlobRef`] for a (node, prop) pair (metadata plane).
-    /// Chunks remain in [`Partition::Blob`] — orphan chunks are reclaimed
-    /// by the Layer 3 GC sweep. Buffered on `txn`.
+    /// Open the blob property `prop_id` of `node_id` holds for reading, at
+    /// the transaction's snapshot.
+    fn open_blob(
+        &self,
+        txn: &Transaction,
+        node_id: NodeId,
+        prop_id: u32,
+    ) -> StoreResult<Option<BlobReader>>;
+
+    /// Stage, in `txn`, the removal of the blob property `prop_id` of
+    /// `node_id`, releasing its references. Bytes other owners share stay.
     fn delete_blob_ref(
         &self,
         txn: &mut Transaction,
         node_id: NodeId,
         prop_id: u32,
     ) -> StoreResult<()>;
+
+    /// Give up `upload` when the property write that would publish it does
+    /// not commit.
+    fn abandon(&self, upload: &StagedUpload) -> StoreResult<()>;
 }
 
-/// CE single-shard implementation of [`BlobStore`]. Stateless: chunk
-/// (data-plane) ops take the engine handle directly, blob-ref
-/// (metadata-plane) ops thread the transaction.
-pub struct LocalBlobStore;
+/// CE implementation of [`BlobStore`] over one store's
+/// [`coordinode_storage::blob::BlobStore`].
+pub struct LocalBlobStore {
+    store: coordinode_storage::blob::BlobStore,
+}
+
+impl LocalBlobStore {
+    /// A property blob store over `store`.
+    pub fn new(store: coordinode_storage::blob::BlobStore) -> Self {
+        Self { store }
+    }
+}
 
 impl BlobStore for LocalBlobStore {
-    fn put_chunk(
-        &self,
-        engine: &StorageEngine,
-        chunk_id: &ChunkId,
-        data: &[u8],
-    ) -> StoreResult<()> {
-        engine.put(Partition::Blob, &encode_blob_key(chunk_id), data)?;
-        // Interim blob payload path: durable here before a ref can name it;
-        // the substrate's durable sealing replaces this flush.
-        engine.persist_partition(Partition::Blob)?;
-        Ok(())
+    fn upload(&self, data: &[u8]) -> StoreResult<StagedUpload> {
+        Ok(self.store.upload(SharingScope::STORE, data)?)
     }
 
-    fn put_chunks(&self, engine: &StorageEngine, chunks: &[(ChunkId, Vec<u8>)]) -> StoreResult<()> {
-        if chunks.is_empty() {
-            return Ok(());
-        }
-        // Interim blob payload path: written and made durable through the
-        // one place every blob payload writer shares.
-        coordinode_storage::blob::put_chunks_durably(engine, chunks)?;
-        Ok(())
-    }
-
-    fn get_chunk(
-        &self,
-        engine: &StorageEngine,
-        chunk_id: &ChunkId,
-    ) -> StoreResult<Option<Vec<u8>>> {
-        Ok(engine
-            .get(Partition::Blob, &encode_blob_key(chunk_id))?
-            .map(|b| b.to_vec()))
-    }
-
-    fn put_blob_ref(
+    fn put_blob(
         &self,
         txn: &mut Transaction,
         node_id: NodeId,
         prop_id: u32,
-        blob_ref: &BlobRef,
-    ) -> StoreResult<()> {
-        let body = blob_ref.to_msgpack().map_err(|e| StoreError::Decode {
-            kind: "blob ref",
-            message: format!("encode for node {}: {e}", node_id.as_raw()),
-        })?;
-        txn.put(
-            Partition::BlobRef,
+        upload: &StagedUpload,
+    ) -> StoreResult<BlobRef> {
+        let outcome = self.store.publish_into(
+            txn,
             &encode_blobref_key(node_id, prop_id),
-            &body,
+            OwnerWrite::Replace,
+            upload,
         )?;
-        Ok(())
+        Ok(outcome.record.blob)
     }
 
     fn get_blob_ref(
@@ -184,12 +140,26 @@ impl BlobStore for LocalBlobStore {
         else {
             return Ok(None);
         };
-        BlobRef::from_msgpack(&bytes)
-            .map(Some)
+        OwnerRecord::from_msgpack(&bytes)
+            .map(|record| Some(record.blob))
             .map_err(|e| StoreError::Decode {
-                kind: "blob ref",
+                kind: "blob owner record",
                 message: format!("decode for node {}: {e}", node_id.as_raw()),
             })
+    }
+
+    fn open_blob(
+        &self,
+        txn: &Transaction,
+        node_id: NodeId,
+        prop_id: u32,
+    ) -> StoreResult<Option<BlobReader>> {
+        let key = encode_blobref_key(node_id, prop_id);
+        let reader = match txn.snapshot() {
+            Some(snapshot) => self.store.open_at(&key, snapshot)?,
+            None => self.store.open(&key)?,
+        };
+        Ok(reader)
     }
 
     fn delete_blob_ref(
@@ -198,7 +168,13 @@ impl BlobStore for LocalBlobStore {
         node_id: NodeId,
         prop_id: u32,
     ) -> StoreResult<()> {
-        txn.delete(Partition::BlobRef, &encode_blobref_key(node_id, prop_id))?;
+        self.store
+            .delete_into(txn, &encode_blobref_key(node_id, prop_id))?;
+        Ok(())
+    }
+
+    fn abandon(&self, upload: &StagedUpload) -> StoreResult<()> {
+        self.store.abandon(upload.staging_id())?;
         Ok(())
     }
 }

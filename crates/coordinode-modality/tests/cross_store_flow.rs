@@ -315,54 +315,81 @@ fn vector_spatial_timeseries_on_same_logical_entity() {
     assert_eq!(sensor_after.primary_label(), "Sensor");
 }
 
-/// Schema + Blob + NodeStore: register a label, store a blob ref on a
-/// node, verify both stores see consistent state.
+/// Blob + NodeStore: a node and the blob property it holds commit in one
+/// transaction, and an attempt that does not commit leaves neither behind.
 #[test]
-fn schema_blob_node_consistency() {
-    use coordinode_core::graph::blob::{BlobRef, ChunkId};
+fn a_node_and_its_blob_property_commit_together() {
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+    use coordinode_storage::engine::core::StorageEngine;
+    use std::sync::Arc;
 
-    let fx = open_shared_engine();
-    let engine = &fx.engine;
-    let blobs = LocalBlobStore;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine =
+        Arc::new(StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("open"));
+    let blobs = LocalBlobStore::new(coordinode_storage::blob::BlobStore::direct(
+        Arc::clone(&engine),
+        Arc::clone(&oracle),
+    ));
+    let payload = vec![0x5c_u8; coordinode_core::graph::blob::INLINE_THRESHOLD * 3];
+
+    // An attempt dropped before its commit: neither the node nor the
+    // property exists, and its upload is abandoned.
+    let dropped = NodeId::from_raw(8);
+    let upload = blobs.upload(&payload).expect("upload");
+    {
+        let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+        LocalNodeStore
+            .put(&mut txn, 0, dropped, &NodeRecord::new("Document"))
+            .expect("node");
+        blobs
+            .put_blob(&mut txn, dropped, 0, &upload)
+            .expect("property");
+    }
+    blobs.abandon(&upload).expect("abandon");
 
     let node = NodeId::from_raw(7);
-    put_node(engine, 0, node, &NodeRecord::new("Document"));
+    let upload = blobs.upload(&payload).expect("upload");
+    let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+    LocalNodeStore
+        .put(&mut txn, 0, node, &NodeRecord::new("Document"))
+        .expect("node");
+    blobs
+        .put_blob(&mut txn, node, 0, &upload)
+        .expect("property");
+    commit(&mut txn);
 
-    // Two chunks + a blob ref pointing at them.
-    let chunks = vec![
-        (ChunkId::from_data(b"chunk-a"), b"chunk-a".to_vec()),
-        (ChunkId::from_data(b"chunk-b"), b"chunk-b".to_vec()),
-    ];
-    let blob_ref = BlobRef {
-        total_size: 14,
-        chunks: chunks.iter().map(|(id, _)| *id).collect(),
-    };
-    // Chunks land on the data plane (direct); the ref on the metadata
-    // plane (transactional).
-    blobs.put_chunks(engine, &chunks).expect("chunks");
-    write_txn(engine, |txn| {
-        blobs.put_blob_ref(txn, node, 0, &blob_ref).expect("ref");
-    });
-
-    // Cross-store assertions.
-    let loaded_ref =
-        read_txn(engine, |txn| blobs.get_blob_ref(txn, node, 0).expect("ok")).expect("ref present");
-    assert_eq!(loaded_ref.total_size, 14);
-    assert_eq!(loaded_ref.chunks.len(), 2);
-
-    // Chunks reassemble to the original payload.
-    let mut reassembled = Vec::new();
-    for id in &loaded_ref.chunks {
-        let chunk = blobs
-            .get_chunk(engine, id)
-            .expect("ok")
-            .expect("chunk present");
-        reassembled.extend_from_slice(&chunk);
-    }
-    assert_eq!(reassembled, b"chunk-achunk-b");
-
-    // The node itself is still readable and untouched by the blob
-    // writes.
-    let node_after = get_node(engine, 0, node).expect("Some");
-    assert_eq!(node_after.primary_label(), "Document");
+    let txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+    assert!(
+        LocalNodeStore
+            .get(&txn, 0, dropped)
+            .expect("read")
+            .is_none()
+    );
+    assert!(blobs.get_blob_ref(&txn, dropped, 0).expect("ok").is_none());
+    assert_eq!(
+        LocalNodeStore
+            .get(&txn, 0, node)
+            .expect("read")
+            .expect("node")
+            .primary_label(),
+        "Document"
+    );
+    let reader = blobs
+        .open_blob(&txn, node, 0)
+        .expect("open")
+        .expect("property");
+    let read: Vec<u8> = (0..reader.record().blob.chunk_count())
+        .flat_map(|i| reader.chunk(i).expect("chunk"))
+        .collect();
+    assert_eq!(read, payload);
 }

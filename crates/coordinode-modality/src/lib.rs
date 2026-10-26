@@ -32,9 +32,10 @@
 //! exceptions: [`IndexStore`] is a hybrid whose secondary-index entry
 //! writes stay engine-direct while DDL definition writes thread a
 //! [`Transaction`]; [`BlobStore`] splits data plane from metadata plane
-//! (large content-addressed chunks go straight to the engine — the
-//! object-store pattern that keeps bulk data off the consensus path —
-//! while small per-(node, prop) refs are transactional); and
+//! (an upload writes large chunks ahead of the property write in commits
+//! of its own, the object-store pattern that keeps bulk data out of
+//! transaction buffers, while the per-(node, prop) owner record and the
+//! reference counts it moves are transactional); and
 //! [`VectorStore`], whose HNSW graph is in-memory only (rebuilt on open,
 //! no partition surface to thread).
 //!
@@ -46,7 +47,7 @@
 //! | Document (path-targeted DOCUMENT merge deltas) | [`DocumentStore`] | [`LocalDocumentStore`] | `Transaction` |
 //! | Spatial (CRS point index) | [`SpatialStore`] | [`LocalSpatialStore`] | `Transaction` |
 //! | TimeSeries (bucket + overflow) | [`TimeSeriesStore`] | [`LocalTimeSeriesStore`] | `Transaction` |
-//! | Blob (binary chunks + blob references) | [`BlobStore`] | [`LocalBlobStore`] | split (chunks `engine` data-plane, refs `Transaction`) |
+//! | Blob (property owners of shared chunks) | [`BlobStore`] | [`LocalBlobStore`] | split (upload ahead, publication `Transaction`) |
 //! | Index (secondary indexes — btree, hash, fulltext term postings) | [`IndexStore`] | [`LocalIndexStore`] | hybrid (entries `engine`, DDL `Transaction`) |
 //! | Table key (unique declared key → row) | [`TableKeyStore`] | [`LocalTableKeyStore`] | `Transaction` |
 //! | Vector (HNSW KNN index) | [`VectorStore`] | [`LocalVectorStore`] | `engine` (in-memory graph) |

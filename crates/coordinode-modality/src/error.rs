@@ -70,6 +70,10 @@ pub enum StoreError {
     /// A vector search could not evaluate its query or a candidate.
     #[error(transparent)]
     VectorSearch(#[from] coordinode_vector::hnsw::VectorSearchError),
+
+    /// A blob could not be uploaded, published, released or read.
+    #[error(transparent)]
+    Blob(#[from] coordinode_storage::blob::BlobError),
 }
 
 // Convenience: `iter_guard.into_inner()?` inside store scan loops

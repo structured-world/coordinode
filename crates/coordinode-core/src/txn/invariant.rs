@@ -275,6 +275,15 @@ pub enum ClaimPredicate {
         /// The revision being activated.
         revision: u64,
     },
+    /// The attempt retires the eligible representation `generation` of the
+    /// blob content whose catalog entry the [`ClaimScope::Record`] scope
+    /// names. Its result depends on no owner referencing the content and no
+    /// upload holding it in the post-state: a reference admitted after the
+    /// attempt read would otherwise resolve to payload about to be erased.
+    BlobRetired {
+        /// The generation being retired.
+        generation: u64,
+    },
     /// The attempt gives `node` the unique value its scope names, and its
     /// result depends on no other node holding it in the post-state. Two
     /// attempts giving one value to the same node agree; to different nodes
@@ -468,6 +477,12 @@ impl Claim {
             // The condition was evaluated against one version of the record;
             // any other claim on that record can have moved it.
             (CleanupCondition { .. }, _) | (_, CleanupCondition { .. }) => false,
+
+            // Two retirements of one content each decided from the state the
+            // other is about to change. The references they race are not
+            // claims: an admission is conditioned on the catalog entry this
+            // writes, so the commit's write scope keeps the two apart.
+            (BlobRetired { .. }, _) | (_, BlobRetired { .. }) => false,
 
             // Writes validated under one schema do not depend on each other,
             // whichever revision each read: a stale read is refused by its

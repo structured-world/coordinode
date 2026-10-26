@@ -97,13 +97,33 @@ CREATE (d:Document {
 | Map | Nested document | Config, structured data |
 | Bytes/Blob | BlobStore | Large binary objects |
 
-### Blob durability
+### Blobs
 
-A blob uploaded through `BlobService.UploadBlob` or the S3 gateway is split
-into content-addressed chunks; identical chunks are stored once. The upload
-is answered only once its chunks and then its metadata are durable on the
-member that took it, so a reference committed after the answer never names
-bytes a crash lost. A delete is durable before its answer in the same way.
+A blob is stored through `BlobService.UploadBlob`, the S3 gateway, or
+`Database::upload_blob` in an embedded database. Its bytes are split into
+chunks of up to 256KB, each identified by its SHA-256 digest and length, and
+identical chunks are stored once, however many blobs hold them.
+
+Every upload is its own blob with its own id, even when another blob holds the
+same bytes: deleting one leaves the other whole. An S3 key is one blob too;
+putting an object replaces what the key held. An upload that names a client
+operation (`BlobChunk.operation` on its first message) takes effect at most
+once and names the same blob on every attempt: a retry after a lost answer is
+refused with `OPERATION_SETTLED`, its `blob_id` metadata naming the blob the
+operation stored.
+
+The upload is answered only once its chunks and the blob naming them are
+durable on the member that took it, so an answered upload is one a crash
+keeps. A delete is durable before its answer in the same way. A download reads
+the blob as it stood when the download began, chunk by chunk, however slowly
+the client consumes it, and a chunk whose bytes do not match its digest is
+refused, never served.
+
+Deleting a blob ends its hold on its chunks; it does not yet return their
+storage, and `DeleteBlobResponse.chunks_deleted` is `0`. Do not count a
+delete as space released.
+
+A store written by an earlier engine format is refused at open, untouched.
 
 Blob payload is not yet carried to other members of a replicated group: on a
 member whose group has other members (voters or learners), blob uploads and

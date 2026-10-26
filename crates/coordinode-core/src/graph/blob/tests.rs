@@ -1,46 +1,90 @@
 use super::*;
 
+/// The identity carries the length as well as the digest, so content of a
+/// different length is different content even before the digest is compared.
 #[test]
-fn chunk_id_from_data() {
-    let id = ChunkId::from_data(b"hello world");
-    assert_eq!(id.as_bytes().len(), 32);
+fn content_id_records_digest_and_length() {
+    let id = ContentId::of(b"hello world");
+    assert_eq!(id.len(), 11);
+    assert_eq!(id.algorithm(), DigestAlgorithm::Sha256);
+    assert_eq!(id, ContentId::of(b"hello world"));
+    assert_ne!(id, ContentId::of(b"hello world!"));
+}
+
+/// `matches` is the read path's integrity check: a payload whose bytes are
+/// not the content, by length or by digest, must not pass it.
+#[test]
+fn matches_refuses_other_bytes() {
+    let id = ContentId::of(b"payload");
+    assert!(id.matches(b"payload"));
+    assert!(!id.matches(b"payloaD"));
+    assert!(!id.matches(b"payload "));
+}
+
+/// The key form decodes back to the same identity, and a truncated or
+/// unknown-algorithm form is refused rather than read as some other content.
+#[test]
+fn content_id_key_form_round_trips_and_refuses_damage() {
+    let id = ContentId::of(b"chunk");
+    let mut raw = Vec::new();
+    id.encode_into(&mut raw);
+    assert_eq!(raw.len(), ContentId::ENCODED_LEN);
+    assert_eq!(ContentId::decode(&raw), Some(id));
+    assert_eq!(ContentId::decode(&raw[..raw.len() - 1]), None);
+    raw[0] = 0xEE;
+    assert_eq!(ContentId::decode(&raw), None);
 }
 
 #[test]
-fn chunk_id_deterministic() {
-    let id1 = ChunkId::from_data(b"same data");
-    let id2 = ChunkId::from_data(b"same data");
-    assert_eq!(id1, id2);
+fn scoped_content_key_form_round_trips() {
+    let scoped = ScopedContent::new(SharingScope::from_raw(7), ContentId::of(b"x"));
+    let key = catalog_key(&scoped);
+    let decoded = ScopedContent::decode(&key[CATALOG_PREFIX.len()..]).expect("decode");
+    assert_eq!(decoded, scoped);
+}
+
+/// Two generations of one content have different payload keys, which is what
+/// keeps a cleanup of a retired copy away from a later copy of the same bytes.
+#[test]
+fn payload_keys_differ_by_generation() {
+    let scoped = ScopedContent::new(SharingScope::STORE, ContentId::of(b"same"));
+    assert_ne!(payload_key(&scoped, 1), payload_key(&scoped, 2));
+    assert!(payload_key(&scoped, 1).starts_with(PAYLOAD_PREFIX));
+}
+
+/// The same bytes in two scopes are two catalog entries: a digest is never
+/// authority to share across scopes.
+#[test]
+fn scopes_separate_catalog_entries() {
+    let content = ContentId::of(b"shared bytes");
+    let a = ScopedContent::new(SharingScope::from_raw(1), content);
+    let b = ScopedContent::new(SharingScope::from_raw(2), content);
+    assert_ne!(catalog_key(&a), catalog_key(&b));
+    assert_ne!(refs_counter_key(&a), refs_counter_key(&b));
+    assert_ne!(refs_counter_key(&a), pins_counter_key(&a));
+}
+
+/// Releases by different owners, or by one owner at different incarnations,
+/// write different candidate keys, so concurrent releases never conflict on
+/// one record.
+#[test]
+fn candidate_keys_are_per_release() {
+    let scoped = ScopedContent::new(SharingScope::STORE, ContentId::of(b"c"));
+    let first = candidate_key(&scoped, b"blobmeta:a", 1);
+    assert_ne!(first, candidate_key(&scoped, b"blobmeta:b", 1));
+    assert_ne!(first, candidate_key(&scoped, b"blobmeta:a", 2));
 }
 
 #[test]
-fn chunk_id_different_data() {
-    let id1 = ChunkId::from_data(b"data a");
-    let id2 = ChunkId::from_data(b"data b");
-    assert_ne!(id1, id2);
-}
-
-#[test]
-fn chunk_id_hex_roundtrip() {
-    let id = ChunkId::from_data(b"test");
-    let hex = id.to_hex();
-    assert_eq!(hex.len(), 64);
-    let restored = ChunkId::from_hex(&hex).expect("parse hex");
-    assert_eq!(id, restored);
-}
-
-#[test]
-fn chunk_id_from_hex_invalid() {
-    assert!(ChunkId::from_hex("short").is_none());
-    assert!(ChunkId::from_hex(&"zz".repeat(32)).is_none());
-}
-
-#[test]
-fn chunk_id_display() {
-    let id = ChunkId::from_data(b"test");
-    let display = format!("{id}");
-    assert_eq!(display.len(), 64);
-    assert_eq!(display, id.to_hex());
+fn owner_keys_are_recognised() {
+    assert!(is_owner_key(&direct_owner_key(&[1; 16])));
+    assert!(is_owner_key(&s3_owner_key("/b/k")));
+    assert!(is_owner_key(&encode_blobref_key(NodeId::from_raw(1), 2)));
+    assert!(!is_owner_key(&staging_key(1)));
+    assert!(!is_owner_key(&catalog_key(&ScopedContent::new(
+        SharingScope::STORE,
+        ContentId::of(b"z")
+    ))));
 }
 
 #[test]
@@ -69,17 +113,28 @@ fn chunk_data_multiple_chunks() {
 
 #[test]
 fn chunk_data_empty() {
-    let chunks = chunk_data(b"", DEFAULT_CHUNK_SIZE);
-    assert!(chunks.is_empty());
+    assert!(chunk_data(b"", DEFAULT_CHUNK_SIZE).is_empty());
 }
 
+/// Repeated chunks keep their order and multiplicity in the reference, while
+/// ownership counts each distinct content once.
 #[test]
-fn chunk_data_dedup() {
-    // Two identical chunks should have same ChunkId
-    let data = vec![0xFFu8; DEFAULT_CHUNK_SIZE * 2];
-    let chunks = chunk_data(&data, DEFAULT_CHUNK_SIZE);
-    assert_eq!(chunks.len(), 2);
-    assert_eq!(chunks[0].0, chunks[1].0); // same content = same hash
+fn blob_ref_keeps_multiplicity_and_counts_distinct_once() {
+    let mut data = vec![0xFFu8; DEFAULT_CHUNK_SIZE * 2];
+    data.extend_from_slice(b"tail");
+    let (blob_ref, chunks) = create_blob(SharingScope::STORE, &data);
+    assert_eq!(chunks.len(), 3);
+    assert_eq!(blob_ref.chunks[0], blob_ref.chunks[1]);
+    assert_eq!(blob_ref.chunk_count(), 3);
+    let distinct = blob_ref.distinct();
+    assert_eq!(distinct.len(), 2);
+    assert!(
+        distinct.windows(2).all(|w| w[0] < w[1]),
+        "sorted, no repeats"
+    );
+    for content in [blob_ref.chunks[0], blob_ref.chunks[2]] {
+        assert!(distinct.contains(&ScopedContent::new(SharingScope::STORE, content)));
+    }
 }
 
 #[test]
@@ -97,41 +152,53 @@ fn should_inline_large() {
 #[test]
 fn create_blob_roundtrip() {
     let data = vec![0xABu8; DEFAULT_CHUNK_SIZE * 2 + 500];
-    let (blob_ref, chunks) = create_blob(&data);
+    let (blob_ref, chunks) = create_blob(SharingScope::STORE, &data);
 
     assert_eq!(blob_ref.total_size, data.len() as u64);
     assert_eq!(blob_ref.chunk_count(), 3);
-    assert_eq!(chunks.len(), 3);
-
-    // Reassemble
-    let mut reassembled = Vec::new();
-    for (_, chunk_data) in &chunks {
-        reassembled.extend_from_slice(chunk_data);
-    }
+    let reassembled: Vec<u8> = chunks.iter().flat_map(|(_, c)| c.iter().copied()).collect();
     assert_eq!(reassembled, data);
 }
 
 #[test]
-fn blob_ref_msgpack_roundtrip() {
-    let (blob_ref, _) = create_blob(b"test data for blob");
-    let bytes = blob_ref.to_msgpack().expect("serialize");
-    let restored = BlobRef::from_msgpack(&bytes).expect("deserialize");
-    assert_eq!(blob_ref, restored);
-}
-
-#[test]
-fn blob_key_encoding() {
-    let id = ChunkId::from_data(b"test");
-    let key = encode_blob_key(&id);
-    assert!(key.starts_with(b"blob:"));
-    // 5 + 64 = 69 bytes
-    assert_eq!(key.len(), 69);
-}
-
-#[test]
-fn blobref_key_encoding() {
-    let key = encode_blobref_key(NodeId::from_raw(42), 3);
-    assert!(key.starts_with(b"blobref:"));
+fn records_msgpack_roundtrip() {
+    let (blob_ref, _) = create_blob(SharingScope::STORE, b"test data for blob");
+    let owner = OwnerRecord {
+        incarnation: 9,
+        blob: blob_ref.clone(),
+    };
+    assert_eq!(
+        OwnerRecord::from_msgpack(&owner.to_msgpack().expect("encode")).expect("decode"),
+        owner
+    );
+    let entry = CatalogEntry {
+        eligible: Some(Representation {
+            generation: 3,
+            codec: Codec::Raw,
+            encoded_len: 18,
+        }),
+        retired: vec![1, 2],
+    };
+    assert_eq!(
+        CatalogEntry::from_msgpack(&entry.to_msgpack().expect("encode")).expect("decode"),
+        entry
+    );
+    let staged = StagingRecord {
+        admitted_at_micros: 5,
+        contents: blob_ref
+            .distinct()
+            .into_iter()
+            .map(|content| StagedContent {
+                content,
+                generation: 4,
+                writes: true,
+            })
+            .collect(),
+    };
+    assert_eq!(
+        StagingRecord::from_msgpack(&staged.to_msgpack().expect("encode")).expect("decode"),
+        staged
+    );
 }
 
 #[test]
@@ -144,7 +211,7 @@ fn blobref_keys_sort_by_node_id() {
 #[test]
 fn custom_chunk_size() {
     let data = vec![0u8; 1000];
-    let (blob_ref, chunks) = create_blob_with_chunk_size(&data, 300);
+    let (blob_ref, chunks) = create_blob_with_chunk_size(SharingScope::STORE, &data, 300);
     assert_eq!(chunks.len(), 4); // 300+300+300+100
     assert_eq!(blob_ref.chunk_count(), 4);
     assert_eq!(blob_ref.total_size, 1000);

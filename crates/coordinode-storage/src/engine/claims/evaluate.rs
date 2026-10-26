@@ -314,6 +314,13 @@ impl<'a> Evaluation<'a> {
                 },
             ),
 
+            // The registry and the write scope keep admissions in flight out;
+            // this answers for those already committed, whose references and
+            // upload pins are in the counts as they stand now.
+            (ClaimScope::Record(key), ClaimPredicate::BlobRetired { .. }) => {
+                blob_content_unheld(engine, key)
+            }
+
             // The writes were validated under the schema the attempt read. Any
             // write to its pointer or to the revision it named since then is a
             // different schema, including a property edited in place at the
@@ -1104,6 +1111,43 @@ fn endpoint_unreferenced(
             {
                 return Ok(Verdict::Broken);
             }
+        }
+    }
+    Ok(Verdict::Holds)
+}
+
+/// Whether the blob content whose catalog entry is `catalog_key` has no
+/// owner referencing it and no upload holding it, as committed now.
+///
+/// A count below zero is a broken invariant, and an entry key that names no
+/// content is not a blob claim: neither decides the retirement either way.
+fn blob_content_unheld(engine: &StorageEngine, catalog_key: &[u8]) -> StorageResult<Verdict> {
+    use coordinode_core::graph::blob::{
+        CATALOG_PREFIX, ScopedContent, pins_counter_key, refs_counter_key,
+    };
+
+    let Some(content) = catalog_key
+        .strip_prefix(CATALOG_PREFIX)
+        .and_then(ScopedContent::decode)
+    else {
+        return Ok(Verdict::Undecidable);
+    };
+    for key in [refs_counter_key(&content), pins_counter_key(&content)] {
+        let count = match engine.get(Partition::Counter, &key)? {
+            Some(bytes) => crate::engine::merge::decode_counter(&bytes).map_err(|_| {
+                crate::error::StorageError::Serialization(format!(
+                    "blob count {}: holds {} bytes, expected 8",
+                    crate::error::printable_key(&key),
+                    bytes.len()
+                ))
+            })?,
+            None => 0,
+        };
+        if count < 0 {
+            return Ok(Verdict::Undecidable);
+        }
+        if count > 0 {
+            return Ok(Verdict::Broken);
         }
     }
     Ok(Verdict::Holds)

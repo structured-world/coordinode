@@ -266,6 +266,15 @@ impl Member {
             let begun = Arc::clone(&begun);
             database.set_interactive_begun_hook(Arc::new(move || begun.notify_one()));
         }
+        // Weak: the node outlives none of the database's users, and a node
+        // that is gone answers as a group of unknown size.
+        {
+            let node = Arc::downgrade(&node);
+            database.set_group_members(Arc::new(move || {
+                node.upgrade()
+                    .map_or(usize::MAX, |node| node.member_count())
+            }));
+        }
         // A copy of an index found damaged on this member alone is replaced
         // from a peer's copy; a member without peers answers from its records
         // instead.

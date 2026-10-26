@@ -1,17 +1,19 @@
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
 
-use sha2::Digest;
-
-use coordinode_core::graph::blob::{self, BlobRef, encode_blob_key};
-use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
+use coordinode_core::graph::blob::OwnerRecord;
+use coordinode_embed::db::BlobId;
+use coordinode_embed::{Database, DatabaseError};
+// no-std: spin::RwLock (drop-in).
+use parking_lot::RwLock;
 
 use crate::proto::graph;
-use crate::services::error_details::{Reason, status_with_reason};
-use crate::services::storage_err_to_status;
+use crate::services::cypher::db_error_to_status;
+use crate::services::error_details::{Reason, invalid_field, status_with_reason};
 
 /// gRPC BlobService implementation.
 ///
@@ -24,19 +26,22 @@ use crate::services::storage_err_to_status;
 /// write, with payload journaled on the members the write concern names,
 /// replaces both.
 pub struct BlobServiceImpl {
-    engine: std::sync::Arc<StorageEngine>,
-    node: Option<std::sync::Arc<coordinode_raft::cluster::RaftNode>>,
+    database: Arc<RwLock<Database>>,
+    node: Option<Arc<coordinode_raft::cluster::RaftNode>>,
 }
 
 impl BlobServiceImpl {
-    /// A service over `engine`, standalone.
-    pub fn new(engine: std::sync::Arc<StorageEngine>) -> Self {
-        Self { engine, node: None }
+    /// A service over `database`, standalone.
+    pub fn new(database: Arc<RwLock<Database>>) -> Self {
+        Self {
+            database,
+            node: None,
+        }
     }
 
     /// Refuse writes while the group `node` belongs to has other members.
     #[must_use]
-    pub fn with_node(mut self, node: std::sync::Arc<coordinode_raft::cluster::RaftNode>) -> Self {
+    pub fn with_node(mut self, node: Arc<coordinode_raft::cluster::RaftNode>) -> Self {
         self.node = Some(node);
         self
     }
@@ -59,45 +64,78 @@ impl BlobServiceImpl {
     }
 }
 
-/// Encode a blob_id from a BlobRef (first chunk hash used as identifier).
-fn blob_id_from_ref(blob_ref: &BlobRef) -> String {
-    if blob_ref.chunks.is_empty() {
-        return String::new();
-    }
-    // Use hash of all chunk IDs concatenated for a unique identifier
-    let mut hasher = sha2::Sha256::new();
-    for chunk_id in &blob_ref.chunks {
-        sha2::Digest::update(&mut hasher, chunk_id.as_bytes());
-    }
-    let hash = sha2::Digest::finalize(hasher);
-    hex::encode(hash)
-}
-
-/// Storage key for blob metadata: `blobmeta:<blob_id_hex>`
-fn encode_blobmeta_key(blob_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(9 + blob_id.len());
-    key.extend_from_slice(b"blobmeta:");
-    key.extend_from_slice(blob_id.as_bytes());
-    key
-}
+/// The chunks of a download, as the service streams them.
+type DownloadStream = ReceiverStream<Result<graph::BlobChunk, Status>>;
 
 #[tonic::async_trait]
 impl graph::blob_service_server::BlobService for BlobServiceImpl {
-    type DownloadBlobStream = ReceiverStream<Result<graph::BlobChunk, Status>>;
+    type DownloadBlobStream = DownloadStream;
 
     async fn upload_blob(
         &self,
         request: Request<Streaming<graph::BlobChunk>>,
     ) -> Result<Response<graph::UploadBlobResponse>, Status> {
-        let mut stream = request.into_inner();
+        self.upload(request.into_inner()).await.map(Response::new)
+    }
 
-        // Collect all chunk data from the stream
-        let mut data = Vec::new();
-        while let Some(chunk) = stream
-            .message()
+    async fn download_blob(
+        &self,
+        request: Request<graph::DownloadBlobRequest>,
+    ) -> Result<Response<Self::DownloadBlobStream>, Status> {
+        self.download(&request.into_inner().blob_id)
             .await
-            .map_err(|e| Status::internal(format!("stream error: {e}")))?
-        {
+            .map(Response::new)
+    }
+
+    async fn delete_blob(
+        &self,
+        request: Request<graph::DeleteBlobRequest>,
+    ) -> Result<Response<graph::DeleteBlobResponse>, Status> {
+        self.delete(&request.into_inner().blob_id)
+            .await
+            .map(Response::new)
+    }
+
+    async fn get_blob_meta(
+        &self,
+        request: Request<graph::GetBlobMetaRequest>,
+    ) -> Result<Response<graph::BlobMeta>, Status> {
+        self.meta(&request.into_inner().blob_id)
+            .await
+            .map(Response::new)
+    }
+}
+
+impl BlobServiceImpl {
+    /// Store the object `stream` carries as a new blob, under the operation
+    /// its first message names, if any.
+    async fn upload<S>(&self, mut stream: S) -> Result<graph::UploadBlobResponse, Status>
+    where
+        S: tokio_stream::Stream<Item = Result<graph::BlobChunk, Status>> + Unpin,
+    {
+        use tokio_stream::StreamExt as _;
+
+        let mut data = Vec::new();
+        let mut operation = None;
+        let mut first = true;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| Status::internal(format!("stream error: {e}")))?;
+            match (&chunk.operation, first) {
+                (Some(reference), true) => {
+                    operation = Some(super::operation::descriptor_from_proto(
+                        "operation",
+                        reference,
+                    )?);
+                }
+                (Some(_), false) => {
+                    return Err(invalid_field(
+                        "operation",
+                        "the operation is named on the first message of an upload only",
+                    ));
+                }
+                (None, _) => {}
+            }
+            first = false;
             data.extend_from_slice(&chunk.data);
         }
 
@@ -106,164 +144,131 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
         }
         self.refuse_in_a_group()?;
 
-        // Create blob chunks
-        let (blob_ref, chunks) = blob::create_blob(&data);
-        let blob_id = blob_id_from_ref(&blob_ref);
-        let meta_key = encode_blobmeta_key(&blob_id);
-        let meta_value = blob_ref
-            .to_msgpack()
-            .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
-
-        // The chunks are durable before the metadata naming them is written,
-        // and both before the answer: an upload answered is one a crash keeps.
-        // Flushing blocks, so it runs off the async runtime.
-        let engine = std::sync::Arc::clone(&self.engine);
-        let held = tokio::task::spawn_blocking(move || {
-            let held = coordinode_storage::blob::put_chunks_durably(&engine, &chunks)?;
-            coordinode_storage::blob::put_meta_durably(&engine, &meta_key, &meta_value)?;
-            Ok::<_, coordinode_storage::error::StorageError>(held)
+        // The chunks are durable before the blob naming them is published,
+        // and both before the answer: an upload answered is one a crash
+        // keeps. Flushing blocks, so it runs off the async runtime.
+        let database = Arc::clone(&self.database);
+        let descriptor = operation;
+        let uploaded = tokio::task::spawn_blocking(move || {
+            database.read().upload_blob(&data, descriptor.as_ref())
         })
         .await
         .map_err(|e| Status::internal(format!("blob write did not finish: {e}")))?
-        .map_err(|e| storage_err_to_status("blob storage", e))?;
-        // At most one per chunk, and a blob's chunk count fits a u32.
-        let dedup_count = u32::try_from(held).unwrap_or(u32::MAX);
+        .map_err(|e| match (e, &operation) {
+            (
+                e @ DatabaseError::OperationSettled {
+                    outcome,
+                    intent_differs,
+                    ..
+                },
+                Some(descriptor),
+            ) => super::operation::settled_status_naming(
+                format!("blob upload: {e}"),
+                outcome,
+                intent_differs,
+                vec![("blob_id", BlobId::for_operation(descriptor).to_string())],
+            ),
+            (e, _) => db_error_to_status(e),
+        })?;
 
-        let chunk_ids: Vec<String> = blob_ref.chunks.iter().map(|id| id.to_hex()).collect();
-
+        let blob = &uploaded.record.blob;
         info!(
-            blob_id = %blob_id,
-            total_size = blob_ref.total_size,
-            chunks = blob_ref.chunk_count(),
-            dedup = dedup_count,
+            blob_id = %uploaded.id,
+            total_size = blob.total_size,
+            chunks = blob.chunk_count(),
+            dedup = uploaded.shared,
             "blob uploaded"
         );
-
-        Ok(Response::new(graph::UploadBlobResponse {
-            blob_id,
-            chunk_ids,
-            total_size: blob_ref.total_size,
-            dedup_chunks: dedup_count,
-        }))
+        Ok(graph::UploadBlobResponse {
+            blob_id: uploaded.id.to_string(),
+            chunk_ids: blob.chunks.iter().map(|c| c.digest_hex()).collect(),
+            total_size: blob.total_size,
+            // At most one per chunk, and a blob's chunk count fits a u32.
+            dedup_chunks: uploaded.shared as u32,
+        })
     }
 
-    async fn download_blob(
-        &self,
-        request: Request<graph::DownloadBlobRequest>,
-    ) -> Result<Response<Self::DownloadBlobStream>, Status> {
-        let blob_id = request.into_inner().blob_id;
-
-        // Load blob metadata
-        let meta_key = encode_blobmeta_key(&blob_id);
-        let meta_bytes = self
-            .engine
-            .get(Partition::BlobRef, &meta_key)
-            .map_err(|e| storage_err_to_status("blob storage", e))?
+    /// Stream the blob `blob_id` names back, chunk by chunk, as it stood
+    /// when the download began.
+    async fn download(&self, blob_id: &str) -> Result<DownloadStream, Status> {
+        let id = parse_id(blob_id)?;
+        let database = Arc::clone(&self.database);
+        let reader = tokio::task::spawn_blocking(move || database.read().open_blob(&id))
+            .await
+            .map_err(|e| Status::internal(format!("blob read did not finish: {e}")))?
+            .map_err(db_error_to_status)?
             .ok_or_else(|| Status::not_found(format!("blob {blob_id} not found")))?;
 
-        let blob_ref = BlobRef::from_msgpack(&meta_bytes)
-            .map_err(|e| Status::internal(format!("deserialize error: {e}")))?;
-
-        // Stream chunks back to client
+        // The reader holds the snapshot every chunk resolves at until the
+        // last chunk is sent or the client goes away; a bounded channel lets
+        // a slow client slow the reads down rather than buffer the blob.
         let (tx, rx) = mpsc::channel(4);
-        let engine = self.engine.clone();
-
-        tokio::spawn(async move {
-            for (seq, chunk_id) in blob_ref.chunks.iter().enumerate() {
-                let key = encode_blob_key(chunk_id);
-                match engine.get(Partition::Blob, &key) {
-                    Ok(Some(data)) => {
-                        let chunk = graph::BlobChunk {
-                            data: data.to_vec(),
-                            sequence: seq as u32,
-                        };
-                        if tx.send(Ok(chunk)).await.is_err() {
-                            break; // Client disconnected
-                        }
-                    }
-                    Ok(None) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!(
-                                "chunk {} missing",
-                                chunk_id.to_hex()
-                            ))))
-                            .await;
-                        break;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(storage_err_to_status("blob storage", e))).await;
-                        break;
-                    }
+        tokio::task::spawn_blocking(move || {
+            for seq in 0..reader.record().blob.chunk_count() {
+                let message = reader
+                    .chunk(seq)
+                    .map(|data| graph::BlobChunk {
+                        data,
+                        // A blob's chunk count fits a u32.
+                        sequence: seq as u32,
+                        operation: None,
+                    })
+                    .map_err(|e| Status::data_loss(format!("blob chunk {seq}: {e}")));
+                let failed = message.is_err();
+                if tx.blocking_send(message).is_err() || failed {
+                    // The client went away, or the blob cannot be read whole.
+                    break;
                 }
             }
         });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(ReceiverStream::new(rx))
     }
 
-    async fn delete_blob(
-        &self,
-        request: Request<graph::DeleteBlobRequest>,
-    ) -> Result<Response<graph::DeleteBlobResponse>, Status> {
-        let blob_id = request.into_inner().blob_id;
+    /// Delete the blob `blob_id` names.
+    async fn delete(&self, blob_id: &str) -> Result<graph::DeleteBlobResponse, Status> {
         // A delete on one member of a group would leave the others' copy.
         self.refuse_in_a_group()?;
-
-        let meta_key = encode_blobmeta_key(&blob_id);
-        if self
-            .engine
-            .get(Partition::BlobRef, &meta_key)
-            .map_err(|e| storage_err_to_status("blob storage", e))?
-            .is_none()
-        {
+        let id = parse_id(blob_id)?;
+        let database = Arc::clone(&self.database);
+        let deleted = tokio::task::spawn_blocking(move || database.read().delete_blob(&id))
+            .await
+            .map_err(|e| Status::internal(format!("blob delete did not finish: {e}")))?
+            .map_err(db_error_to_status)?;
+        if deleted.is_none() {
             return Err(Status::not_found(format!("blob {blob_id} not found")));
         }
-
-        // Only the metadata goes. Chunks are content-addressed and shared
-        // with every other blob, object or property holding the same bytes,
-        // so one owner cannot tell whether a chunk is still referenced; and
-        // an upload racing this delete skips writing a chunk it sees
-        // present. Unreferenced chunks are reclaimed by chunk GC instead,
-        // so no chunk is deleted here. The removal is durable before the
-        // answer, so a deleted blob does not come back after a crash.
-        let engine = std::sync::Arc::clone(&self.engine);
-        tokio::task::spawn_blocking(move || {
-            coordinode_storage::blob::delete_meta_durably(&engine, &meta_key)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("blob delete did not finish: {e}")))?
-        .map_err(|e| storage_err_to_status("blob storage", e))?;
-
         info!(blob_id = %blob_id, "blob deleted");
-
-        Ok(Response::new(graph::DeleteBlobResponse {
-            chunks_deleted: 0,
-        }))
+        // The chunks' storage is reclaimed in the background, once nothing
+        // needs them; this call reclaimed none.
+        Ok(graph::DeleteBlobResponse { chunks_deleted: 0 })
     }
 
-    async fn get_blob_meta(
-        &self,
-        request: Request<graph::GetBlobMetaRequest>,
-    ) -> Result<Response<graph::BlobMeta>, Status> {
-        let blob_id = request.into_inner().blob_id;
-
-        let meta_key = encode_blobmeta_key(&blob_id);
-        let meta_bytes = self
-            .engine
-            .get(Partition::BlobRef, &meta_key)
-            .map_err(|e| storage_err_to_status("blob storage", e))?
-            .ok_or_else(|| Status::not_found(format!("blob {blob_id} not found")))?;
-
-        let blob_ref = BlobRef::from_msgpack(&meta_bytes)
-            .map_err(|e| Status::internal(format!("deserialize error: {e}")))?;
-
-        Ok(Response::new(graph::BlobMeta {
-            blob_id,
-            total_size: blob_ref.total_size,
-            chunk_count: blob_ref.chunk_count() as u32,
-            chunk_ids: blob_ref.chunks.iter().map(|id| id.to_hex()).collect(),
-        }))
+    /// The metadata of the blob `blob_id` names.
+    async fn meta(&self, blob_id: &str) -> Result<graph::BlobMeta, Status> {
+        let id = parse_id(blob_id)?;
+        let database = Arc::clone(&self.database);
+        let record: OwnerRecord =
+            tokio::task::spawn_blocking(move || database.read().blob_record(&id))
+                .await
+                .map_err(|e| Status::internal(format!("blob read did not finish: {e}")))?
+                .map_err(db_error_to_status)?
+                .ok_or_else(|| Status::not_found(format!("blob {blob_id} not found")))?;
+        let blob = &record.blob;
+        Ok(graph::BlobMeta {
+            blob_id: blob_id.to_owned(),
+            total_size: blob.total_size,
+            // A blob's chunk count fits a u32.
+            chunk_count: blob.chunk_count() as u32,
+            chunk_ids: blob.chunks.iter().map(|c| c.digest_hex()).collect(),
+        })
     }
+}
+
+/// The blob id `text` names; text that names none is a blob that is not
+/// there.
+fn parse_id(text: &str) -> Result<BlobId, Status> {
+    text.parse()
+        .map_err(|_| Status::not_found(format!("blob {text} not found")))
 }
 
 #[cfg(test)]

@@ -439,6 +439,10 @@ pub struct Database {
     /// Called after an interactive transaction opens, so an idle reaper with
     /// nothing to reap can sleep until there is something.
     interactive_begun: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// How many members this database's group holds now, set by the member
+    /// that opened it. Blob payload is held only where it is written, so
+    /// blob writes are refused while the group holds others.
+    group_members: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
 }
 
 /// A query whose parse + analyze + logical-plan-build succeeded, kept
@@ -1140,6 +1144,7 @@ impl Database {
             operation_admission_window: Self::DEFAULT_OPERATION_ADMISSION_WINDOW,
             max_interactive_txn_bytes: Self::DEFAULT_MAX_INTERACTIVE_TXN_BYTES,
             interactive_begun: None,
+            group_members: None,
         };
         // A store that owns its log takes up its unfinished index builds now;
         // a cluster member does it once it leads, since the builds are
@@ -3778,6 +3783,7 @@ fn query_memory_limit_from_mib(text: &str) -> Result<u64, SessionSettingRefused>
 }
 
 mod after_commit;
+mod blob;
 mod catalog;
 mod client_ops;
 mod error;
@@ -3788,6 +3794,7 @@ mod index_maintenance;
 mod interactive;
 mod package;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
+pub use blob::{BlobId, UploadedBlob};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
 pub use coordinode_core::txn::command::{
     ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,

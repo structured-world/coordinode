@@ -7,7 +7,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use coordinode_core::graph::blob::ChunkId;
+use coordinode_core::graph::blob::INLINE_THRESHOLD;
 use coordinode_core::graph::doc_delta::PathTarget;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
@@ -498,20 +498,49 @@ fn bench_timeseries_bucket(c: &mut Criterion) {
     group.finish();
 }
 
-/// Blob chunk round-trip at varying payload sizes.
+/// Reading one chunk of a blob property, verified against its content, at
+/// varying payload sizes.
 fn bench_blob_chunk(c: &mut Criterion) {
     let mut group = c.benchmark_group("blob_chunk_round_trip");
     group.sample_size(20);
-    for &n in &[1024usize, 8 * 1024, 64 * 1024] {
-        let (_dir, engine) = mk_engine();
-        let store = LocalBlobStore;
+    for &n in &[INLINE_THRESHOLD, 64 * 1024, 256 * 1024] {
+        let dir = TempDir::new().unwrap();
+        let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        let oracle = std::sync::Arc::new(TimestampOracle::new());
+        let engine = std::sync::Arc::new(
+            StorageEngine::open_embedded(&cfg, std::sync::Arc::clone(&oracle)).unwrap(),
+        );
+        let store = LocalBlobStore::new(coordinode_storage::blob::BlobStore::direct(
+            std::sync::Arc::clone(&engine),
+            std::sync::Arc::clone(&oracle),
+        ));
         let payload = vec![0xab_u8; n];
-        let id = ChunkId::from_data(&payload);
-        // Chunks are data-plane: written/read directly against the engine.
-        store.put_chunk(&engine, &id, &payload).unwrap();
+        let upload = store.upload(&payload).unwrap();
+        let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+        store
+            .put_blob(&mut txn, NodeId::from_raw(1), 0, &upload)
+            .unwrap();
+        let wc = WriteConcern::majority();
+        txn.commit(&CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+        })
+        .unwrap();
+        let rtxn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+        let reader = store
+            .open_blob(&rtxn, NodeId::from_raw(1), 0)
+            .unwrap()
+            .unwrap();
         group.throughput(Throughput::Bytes(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| store.get_chunk(&engine, &id).unwrap())
+            b.iter(|| reader.chunk(0).unwrap())
         });
     }
     group.finish();

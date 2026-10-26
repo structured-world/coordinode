@@ -271,8 +271,39 @@ backups written elsewhere, a store received from a replicated group) are in
 The engine cannot hold unrelated processes to a size: a host that needs a
 system-wide cap also sets a file-system quota.
 
-Deleting a blob directly removes its metadata but does not reclaim
-unreferenced application chunks; do not count it as space released.
+## Blobs
+
+Large binary objects are stored by id beside the graph. Each upload is its own
+blob, and identical chunks of different blobs are stored once:
+
+```rust
+use coordinode_embed::{Database, DatabaseError};
+
+fn store_and_read(db: &Database, bytes: &[u8]) -> Result<Vec<u8>, DatabaseError> {
+    let uploaded = db.upload_blob(bytes, None)?;
+    let Some(reader) = db.open_blob(&uploaded.id)? else {
+        return Ok(Vec::new());
+    };
+    // The reader holds the state it opened at until it is dropped: a delete
+    // meanwhile does not take the chunks from under it.
+    let mut read = Vec::new();
+    for index in 0..reader.record().blob.chunk_count() {
+        read.extend(reader.chunk(index)?);
+    }
+    db.delete_blob(&uploaded.id)?;
+    Ok(read)
+}
+```
+
+With a client operation (`Some(&descriptor)`), an upload takes effect at most
+once and names the same blob on every attempt (`BlobId::for_operation`); a
+retry of an operation that already stored its blob is refused with
+`DatabaseError::OperationSettled`. A replicated member whose group holds
+other members refuses blob writes with `DatabaseError::Unsupported`: blob
+bytes are held only on the member that writes them.
+
+Deleting a blob ends its hold on its chunks but does not yet reclaim their
+storage; do not count it as space released.
 
 ## Backup and recovery
 

@@ -1,215 +1,185 @@
+use std::sync::Arc;
+
 use super::*;
-use coordinode_core::graph::blob::create_blob;
-use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+use coordinode_core::graph::blob::{ContentId, ScopedContent, refs_counter_key};
+use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_core::txn::write_concern::WriteConcern;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::CommitContext;
 
-/// Logic-test fixture (memory backing, env-flippable). Blob
-/// chunk CRUD verifies store contract, not persistence.
-fn open_engine() -> coordinode_test_fixtures::EngineFixture {
-    coordinode_test_fixtures::engine_for_logic()
+struct Fixture {
+    engine: Arc<StorageEngine>,
+    oracle: Arc<TimestampOracle>,
+    store: LocalBlobStore,
+    _dir: tempfile::TempDir,
 }
 
-/// Apply blob writes in one MVCC transaction and commit, so the
-/// buffered chunk / ref mutations land for a subsequent read.
-fn write_blob(engine: &StorageEngine, body: impl FnOnce(&LocalBlobStore, &mut Transaction)) {
-    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
-    let read_ts = oracle.next();
-    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
-    body(&LocalBlobStore, &mut txn);
-    let wc = WriteConcern::majority();
-    let ctx = CommitContext {
-        write_concern: &wc,
-        pipeline: None,
-        id_gen: None,
-    };
-    txn.commit(&ctx).expect("commit blob");
-}
-
-/// Run a blob read closure against the latest committed snapshot.
-fn read_blob<R>(
-    engine: &StorageEngine,
-    body: impl FnOnce(&LocalBlobStore, &Transaction) -> R,
-) -> R {
-    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
-    let read_ts = oracle.next();
-    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
-    body(&LocalBlobStore, &txn)
-}
-
-#[test]
-fn chunk_round_trip() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalBlobStore;
-    let id = ChunkId::from_data(b"abc");
-    assert!(store.get_chunk(engine, &id).expect("none").is_none());
-    store.put_chunk(engine, &id, b"abc").expect("put");
-    let got = store.get_chunk(engine, &id).expect("some").expect("Some");
-    assert_eq!(got, b"abc");
-}
-
-#[test]
-fn put_chunks_commits_together() {
-    // All chunks land in one engine WriteBatch ⇒ visible together.
-    // Smoke check: write three chunks via put_chunks, then verify
-    // each individually.
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalBlobStore;
-    let chunks = vec![
-        (ChunkId::from_data(b"a"), b"a".to_vec()),
-        (ChunkId::from_data(b"b"), b"b".to_vec()),
-        (ChunkId::from_data(b"c"), b"c".to_vec()),
-    ];
-    store.put_chunks(engine, &chunks).expect("batch");
-    for (id, expected) in &chunks {
-        let got = store.get_chunk(engine, id).expect("ok");
-        assert_eq!(got.as_deref(), Some(expected.as_slice()));
+fn open() -> Fixture {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine =
+        Arc::new(StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("open"));
+    let store = LocalBlobStore::new(coordinode_storage::blob::BlobStore::direct(
+        Arc::clone(&engine),
+        Arc::clone(&oracle),
+    ));
+    Fixture {
+        engine,
+        oracle,
+        store,
+        _dir: dir,
     }
 }
 
-#[test]
-fn put_chunks_empty_is_noop() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    LocalBlobStore
-        .put_chunks(engine, &[])
-        .expect("empty batch ok");
+impl Fixture {
+    /// Run `body` in one transaction and commit it.
+    fn write(&self, body: impl FnOnce(&LocalBlobStore, &mut Transaction)) {
+        let mut txn = Transaction::begin(&self.engine, Some(&self.oracle), self.oracle.next());
+        body(&self.store, &mut txn);
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+        };
+        txn.commit(&ctx).expect("commit");
+    }
+
+    /// Run `body` against the latest committed state.
+    fn read<R>(&self, body: impl FnOnce(&LocalBlobStore, &Transaction) -> R) -> R {
+        let txn = Transaction::begin(&self.engine, Some(&self.oracle), self.oracle.next());
+        body(&self.store, &txn)
+    }
+
+    fn refs(&self, data: &[u8]) -> i64 {
+        let key = refs_counter_key(&ScopedContent::new(
+            SharingScope::STORE,
+            ContentId::of(data),
+        ));
+        self.engine
+            .get(Partition::Counter, &key)
+            .expect("count")
+            .map_or(0, |b| {
+                coordinode_storage::engine::merge::decode_counter(&b).expect("decode")
+            })
+    }
+
+    /// The bytes property `prop` of `node` holds, read whole.
+    fn bytes(&self, node: NodeId, prop: u32) -> Option<Vec<u8>> {
+        self.read(|s, txn| {
+            let reader = s.open_blob(txn, node, prop).expect("open")?;
+            Some(
+                (0..reader.record().blob.chunk_count())
+                    .flat_map(|i| reader.chunk(i).expect("chunk"))
+                    .collect(),
+            )
+        })
+    }
 }
 
+/// A property value published with the node write that holds it reads back
+/// whole through the transaction, and counts one reference.
 #[test]
-fn blob_ref_round_trip() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalBlobStore;
-    let node_id = NodeId::from_raw(42);
-    let prop_id = 7;
-
-    // Construct a real BlobRef from a >threshold-byte payload.
+fn a_published_property_reads_back() {
+    let fx = open();
+    let node = NodeId::from_raw(42);
     let payload = vec![0xaa_u8; INLINE_THRESHOLD + 64];
-    let (blob_ref, chunks) = create_blob(&payload);
-    // Chunks land on the data plane (direct), the ref on the
-    // metadata plane (transactional).
-    store.put_chunks(engine, &chunks).expect("chunks");
-    write_blob(engine, |s, txn| {
-        s.put_blob_ref(txn, node_id, prop_id, &blob_ref)
-            .expect("put ref");
+    let upload = fx.store.upload(&payload).expect("upload");
+    fx.write(|s, txn| {
+        s.put_blob(txn, node, 7, &upload).expect("publish");
     });
 
-    let loaded = read_blob(engine, |s, txn| {
-        s.get_blob_ref(txn, node_id, prop_id).expect("some")
-    })
-    .expect("Some");
-    assert_eq!(loaded, blob_ref);
-
-    // Reassemble payload via chunk gets.
-    let mut reassembled = Vec::with_capacity(loaded.total_size as usize);
-    for id in &loaded.chunks {
-        let chunk = store
-            .get_chunk(engine, id)
-            .expect("ok")
-            .expect("chunk present");
-        reassembled.extend_from_slice(&chunk);
-    }
-    assert_eq!(reassembled, payload);
+    let loaded = fx
+        .read(|s, txn| s.get_blob_ref(txn, node, 7).expect("ok"))
+        .expect("present");
+    assert_eq!(&loaded, upload.blob());
+    assert_eq!(fx.bytes(node, 7).expect("present"), payload);
+    assert_eq!(fx.refs(&payload), 1);
 }
 
+/// Replacing a property releases the value it held in the same commit, and
+/// deleting it releases the rest; bytes another property shares stay.
 #[test]
-fn delete_blob_ref_removes_pointer_keeps_chunks() {
-    // Deleting the ref must NOT touch chunks — orphan chunks are
-    // GC'd by Layer 3 sweep, not by the store. Verifies the
-    // dedup-friendly behaviour.
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalBlobStore;
-    let node_id = NodeId::from_raw(11);
-    let payload = vec![0x33_u8; INLINE_THRESHOLD + 8];
-    let (blob_ref, chunks) = create_blob(&payload);
-    store.put_chunks(engine, &chunks).expect("chunks");
-    write_blob(engine, |s, txn| {
-        s.put_blob_ref(txn, node_id, 0, &blob_ref).expect("put ref");
-    });
+fn replace_and_delete_release_in_the_property_commit() {
+    let fx = open();
+    let node = NodeId::from_raw(11);
+    let first = vec![0x33_u8; INLINE_THRESHOLD + 8];
+    let second = vec![0x44_u8; INLINE_THRESHOLD + 8];
+    for (prop, data) in [(0, &first), (1, &first)] {
+        let upload = fx.store.upload(data).expect("upload");
+        fx.write(|s, txn| {
+            s.put_blob(txn, node, prop, &upload).expect("publish");
+        });
+    }
+    assert_eq!(fx.refs(&first), 2, "two properties hold the same bytes");
 
-    write_blob(engine, |s, txn| {
-        s.delete_blob_ref(txn, node_id, 0).expect("delete");
+    let upload = fx.store.upload(&second).expect("upload");
+    fx.write(|s, txn| {
+        s.put_blob(txn, node, 0, &upload).expect("replace");
     });
+    assert_eq!(fx.refs(&first), 1);
+    assert_eq!(fx.refs(&second), 1);
 
+    fx.write(|s, txn| {
+        s.delete_blob_ref(txn, node, 0).expect("delete");
+    });
+    assert_eq!(fx.refs(&second), 0);
+    assert!(fx.bytes(node, 0).is_none(), "the property is gone");
+    assert_eq!(fx.bytes(node, 1).expect("the other property stays"), first);
+}
+
+/// An upload whose property write is abandoned holds nothing afterwards and
+/// can no longer be published.
+#[test]
+fn an_abandoned_upload_cannot_be_published() {
+    let fx = open();
+    let node = NodeId::from_raw(5);
+    let payload = vec![0x55_u8; INLINE_THRESHOLD + 1];
+    let upload = fx.store.upload(&payload).expect("upload");
+    fx.store.abandon(&upload).expect("abandon");
+    let mut txn = Transaction::begin(&fx.engine, Some(&fx.oracle), fx.oracle.next());
+    let refused = fx.store.put_blob(&mut txn, node, 0, &upload);
     assert!(
-        read_blob(engine, |s, txn| s
-            .get_blob_ref(txn, node_id, 0)
-            .expect("ok"))
-        .is_none(),
-        "ref must be gone",
+        matches!(
+            refused,
+            Err(StoreError::Blob(
+                coordinode_storage::blob::BlobError::Fenced
+            ))
+        ),
+        "{refused:?}"
     );
-    for (id, _) in &chunks {
-        assert!(
-            store.get_chunk(engine, id).expect("ok").is_some(),
-            "chunks must remain (Layer 3 GC's job, not store's)",
-        );
-    }
+    assert_eq!(fx.refs(&payload), 0);
 }
 
 #[test]
-fn put_chunk_overwrites_with_identical_bytes() {
-    // Content-addressed: same ChunkId means same bytes. Putting
-    // twice must be idempotent (the engine accepts the overwrite
-    // silently).
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalBlobStore;
-    let id = ChunkId::from_data(b"xyz");
-    store.put_chunk(engine, &id, b"xyz").expect("first put");
-    store.put_chunk(engine, &id, b"xyz").expect("second put");
-    let got = store.get_chunk(engine, &id).expect("ok");
-    assert_eq!(got.as_deref(), Some(b"xyz".as_slice()));
-}
-
-#[test]
-fn multiple_blob_refs_per_node_distinct_prop_ids() {
-    // (node_id, prop_id) is the key. Same node with two property
-    // IDs must keep two distinct refs.
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalBlobStore;
+fn multiple_blob_properties_per_node_stay_distinct() {
+    let fx = open();
     let node = NodeId::from_raw(7);
     let payload_a = vec![0x01_u8; INLINE_THRESHOLD + 4];
     let payload_b = vec![0x02_u8; INLINE_THRESHOLD + 4];
-    let (ref_a, chunks_a) = create_blob(&payload_a);
-    let (ref_b, chunks_b) = create_blob(&payload_b);
-    store.put_chunks(engine, &chunks_a).expect("chunks a");
-    store.put_chunks(engine, &chunks_b).expect("chunks b");
-    write_blob(engine, |s, txn| {
-        s.put_blob_ref(txn, node, 1, &ref_a).expect("ref a");
-        s.put_blob_ref(txn, node, 2, &ref_b).expect("ref b");
+    let upload_a = fx.store.upload(&payload_a).expect("a");
+    let upload_b = fx.store.upload(&payload_b).expect("b");
+    fx.write(|s, txn| {
+        s.put_blob(txn, node, 1, &upload_a).expect("ref a");
+        s.put_blob(txn, node, 2, &upload_b).expect("ref b");
     });
-
-    let loaded_a = read_blob(engine, |s, txn| s.get_blob_ref(txn, node, 1).expect("ok"))
-        .expect("ref a present");
-    let loaded_b = read_blob(engine, |s, txn| s.get_blob_ref(txn, node, 2).expect("ok"))
-        .expect("ref b present");
-    assert_eq!(loaded_a, ref_a);
-    assert_eq!(loaded_b, ref_b);
-    assert_ne!(loaded_a, loaded_b);
+    assert_eq!(fx.bytes(node, 1).expect("a"), payload_a);
+    assert_eq!(fx.bytes(node, 2).expect("b"), payload_b);
 }
 
 #[test]
-fn get_chunk_missing_is_none() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let id = ChunkId::from_data(b"never");
-    assert!(LocalBlobStore.get_chunk(engine, &id).expect("ok").is_none());
-}
-
-#[test]
-fn corrupt_blob_ref_surfaces_as_decode_error() {
-    let fx = open_engine();
-    let engine = &fx.engine;
+fn corrupt_owner_record_surfaces_as_decode_error() {
+    let fx = open();
     let node_id = NodeId::from_raw(99);
-    // Inject garbage bytes at the BlobRef key through a committed
-    // transaction.
-    write_blob(engine, |_s, txn| {
+    fx.write(|_s, txn| {
         txn.put(
             Partition::BlobRef,
             &encode_blobref_key(node_id, 0),
@@ -217,13 +187,11 @@ fn corrupt_blob_ref_surfaces_as_decode_error() {
         )
         .expect("inject");
     });
-    let err = read_blob(engine, |s, txn| {
-        s.get_blob_ref(txn, node_id, 0).expect_err("must error")
-    });
+    let err = fx.read(|s, txn| s.get_blob_ref(txn, node_id, 0).expect_err("must error"));
     assert!(matches!(
         err,
         StoreError::Decode {
-            kind: "blob ref",
+            kind: "blob owner record",
             ..
         }
     ));

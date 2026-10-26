@@ -92,6 +92,17 @@ pub(crate) fn settled_status(
     outcome: OperationOutcome,
     intent_differs: bool,
 ) -> Status {
+    settled_status_naming(message, outcome, intent_differs, Vec::new())
+}
+
+/// [`settled_status`] with `named` added to its metadata: what the settled
+/// operation produced, for a client that lost the answer naming it.
+pub(crate) fn settled_status_naming(
+    message: String,
+    outcome: OperationOutcome,
+    intent_differs: bool,
+    named: Vec<(&'static str, String)>,
+) -> Status {
     let (state, commit_ts) = outcome_to_proto(outcome);
     let name = state
         .as_str_name()
@@ -104,6 +115,7 @@ pub(crate) fn settled_status(
     if state == wire::OperationState::Committed {
         metadata.push(("commit_ts", commit_ts.to_string()));
     }
+    metadata.extend(named);
     status_with_reason(
         Code::FailedPrecondition,
         message,

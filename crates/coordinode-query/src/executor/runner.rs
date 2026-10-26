@@ -21332,7 +21332,7 @@ pub fn catalog_commit_error(
 /// `CommitError::Storage(StorageError::CapacityExhausted { .. })`, which this
 /// mapping forwards verbatim; the server's `db_err_to_status` drills into both
 /// `Storage` and `Execution` variants when resolving capacity.
-fn commit_err_to_execution(
+pub fn commit_err_to_execution(
     err: coordinode_storage::engine::transaction::CommitError,
 ) -> ExecutionError {
     use coordinode_storage::engine::transaction::CommitError;

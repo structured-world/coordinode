@@ -1,15 +1,17 @@
-//! Integration tests: Database and BlobService share a single StorageEngine.
+//! Integration tests: graph data and blobs live in one StorageEngine.
 //!
 //! Verifies that engine_shared() returns an Arc to the SAME storage instance
-//! used by Database — writes through one handle are visible through the other.
+//! used by Database, so writes through one handle are visible through the
+//! other, and that blobs stored through the database live beside graph data
+//! in it.
 //! No separate blob_store subdirectory; all partitions in one storage DB.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::{Arc, Mutex};
 
-use coordinode_core::graph::blob::{self, encode_blob_key};
 use coordinode_embed::Database;
+use coordinode_embed::db::BlobId;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
@@ -17,6 +19,14 @@ fn open_db() -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Database::open(dir.path()).expect("open db");
     (db, dir)
+}
+
+/// The bytes of the blob `id` names, read whole.
+fn read_blob(db: &Database, id: &BlobId) -> Vec<u8> {
+    let reader = db.open_blob(id).expect("open").expect("present");
+    (0..reader.record().blob.chunk_count())
+        .flat_map(|i| reader.chunk(i).expect("chunk"))
+        .collect()
 }
 
 // ── engine_shared() identity ────────────────────────────────────────
@@ -28,38 +38,19 @@ fn shared_engine_write_visible_through_database() {
     let (db, _dir) = open_db();
     let shared: Arc<StorageEngine> = db.engine_shared();
 
-    // Write a blob chunk through the shared Arc handle.
-    let data = b"hello coordinode blob";
-    let (blob_ref, chunks) = blob::create_blob(data);
-    assert_eq!(chunks.len(), 1, "small data = single chunk");
-
-    let (chunk_id, chunk_data) = &chunks[0];
-    let key = encode_blob_key(chunk_id);
+    let key = b"blob:shared-identity";
+    let value = b"hello coordinode";
     shared
-        .put(Partition::Blob, &key, chunk_data)
+        .put(Partition::Blob, key, value)
         .expect("put via shared");
 
     // Read through Database.engine() — must see the same data.
     let got = db
         .engine()
-        .get(Partition::Blob, &key)
+        .get(Partition::Blob, key)
         .expect("get via engine()")
-        .expect("chunk must exist");
-    assert_eq!(got.as_ref(), chunk_data.as_slice());
-
-    // Verify blob_ref metadata round-trip through BlobRef partition.
-    let meta_key = b"blobmeta:test1";
-    let meta_val = blob_ref.to_msgpack().expect("serialize");
-    shared
-        .put(Partition::BlobRef, meta_key, &meta_val)
-        .expect("put blobref via shared");
-
-    let got_meta = db
-        .engine()
-        .get(Partition::BlobRef, meta_key)
-        .expect("get blobref via engine()")
-        .expect("blobref must exist");
-    assert_eq!(got_meta.as_ref(), meta_val.as_slice());
+        .expect("value must exist");
+    assert_eq!(got.as_ref(), value.as_slice());
 }
 
 /// Write through Database.engine(), read through engine_shared() — symmetry.
@@ -83,95 +74,47 @@ fn database_write_visible_through_shared_engine() {
 
 // ── Cypher + Blob coexistence ───────────────────────────────────────
 
-/// Database executes Cypher while BlobService uses the shared engine.
-/// Both write to different partitions of the same storage instance.
+/// Cypher writes and blob uploads land in the same storage instance without
+/// disturbing each other.
 #[test]
 fn cypher_and_blob_coexist_in_same_engine() {
     let (mut db, _dir) = open_db();
-    let shared: Arc<StorageEngine> = db.engine_shared();
 
-    // Write graph data via Cypher.
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
         .expect("create node");
-
-    // Write blob data via shared engine (simulating BlobService).
     let data = b"blob content alongside graph data";
-    let (_blob_ref, chunks) = blob::create_blob(data);
-    for (chunk_id, chunk_data) in &chunks {
-        let key = encode_blob_key(chunk_id);
-        shared
-            .put(Partition::Blob, &key, chunk_data)
-            .expect("put blob chunk");
-    }
+    let uploaded = db.upload_blob(data, None).expect("upload");
 
-    // Both are visible: Cypher query returns the node...
     let rows = db
         .execute_cypher("MATCH (n:User) RETURN n.name")
         .expect("match");
     assert_eq!(rows.len(), 1);
-
-    // ...and blob chunk is readable.
-    let (chunk_id, chunk_data) = &chunks[0];
-    let key = encode_blob_key(chunk_id);
-    let got = shared
-        .get(Partition::Blob, &key)
-        .expect("get blob")
-        .expect("blob must exist");
-    assert_eq!(got.as_ref(), chunk_data.as_slice());
+    assert_eq!(read_blob(&db, &uploaded.id), data);
 }
 
 // ── Persistence across reopen ───────────────────────────────────────
 
-/// Blob data written through engine_shared() survives Database close + reopen.
+/// A blob survives Database close + reopen together with the graph.
 #[test]
 fn blob_persists_across_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let blob_key;
-    let expected_data;
+    let data = b"persistent blob payload".to_vec();
 
     // Session 1: write blob and graph data.
-    {
+    let id = {
         let mut db = Database::open(dir.path()).expect("open");
-        let shared = db.engine_shared();
-
         db.execute_cypher("CREATE (n:Doc {title: 'Persistence Test'})")
             .expect("create node");
-
-        let data = b"persistent blob payload";
-        expected_data = data.to_vec();
-        let (_blob_ref, chunks) = blob::create_blob(data);
-        let (chunk_id, chunk_data) = &chunks[0];
-        blob_key = encode_blob_key(chunk_id);
-        shared
-            .put(Partition::Blob, &blob_key, chunk_data)
-            .expect("put blob");
-    }
+        db.upload_blob(&data, None).expect("upload").id
+    };
 
     // Session 2: reopen and verify both graph and blob data survived.
-    {
-        let mut db = Database::open(dir.path()).expect("reopen");
-
-        // Graph data persisted.
-        let rows = db
-            .execute_cypher("MATCH (n:Doc) RETURN n.title")
-            .expect("match");
-        assert_eq!(rows.len(), 1);
-
-        // Blob data persisted — readable through engine() and engine_shared().
-        let got = db
-            .engine()
-            .get(Partition::Blob, &blob_key)
-            .expect("get blob after reopen")
-            .expect("blob must survive reopen");
-        assert_eq!(got.as_ref(), expected_data.as_slice());
-
-        let got_shared = db
-            .engine_shared()
-            .get(Partition::Blob, &blob_key)
-            .expect("get blob via shared after reopen")
-            .expect("blob via shared must survive reopen");
-        assert_eq!(got_shared.as_ref(), expected_data.as_slice());
-    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let rows = db
+        .execute_cypher("MATCH (n:Doc) RETURN n.title")
+        .expect("match");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(read_blob(&db, &id), data);
 }
 
 // ── Concurrent access ───────────────────────────────────────────────
@@ -226,21 +169,13 @@ fn concurrent_blob_and_graph_writes() {
 
 // ── Server scenario: Arc<Mutex<Database>> + engine_shared() ─────────
 
-/// Simulates the exact pattern from coordinode-server main.rs:
-/// Database wrapped in Arc<Mutex<>>, BlobService gets engine_shared()
-/// through a Mutex lock, then both operate independently.
+/// The server pattern: one Database behind a lock serves Cypher and blob
+/// calls alike, and neither disturbs the other.
 #[test]
-fn server_pattern_mutex_database_with_shared_blob_engine() {
+fn server_pattern_mutex_database_serves_cypher_and_blobs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let database = Arc::new(Mutex::new(Database::open(dir.path()).expect("open")));
 
-    // BlobService gets engine_shared() — same pattern as main.rs line 114-117
-    let blob_engine: Arc<StorageEngine> = database
-        .lock()
-        .expect("lock for engine_shared")
-        .engine_shared();
-
-    // CypherService writes graph data through Mutex-locked Database
     {
         let mut db = database.lock().expect("lock for cypher");
         db.execute_cypher("CREATE (n:User {name: 'Alice'})")
@@ -249,22 +184,14 @@ fn server_pattern_mutex_database_with_shared_blob_engine() {
             .expect("create doc");
     }
 
-    // BlobService writes blob data through the shared engine (no Mutex needed)
     let data = b"binary attachment for the report";
-    let (blob_ref, chunks) = blob::create_blob(data);
-    for (chunk_id, chunk_data) in &chunks {
-        let key = encode_blob_key(chunk_id);
-        blob_engine
-            .put(Partition::Blob, &key, chunk_data)
-            .expect("blob put");
-    }
-    let meta_key = b"blobmeta:report_attachment";
-    let meta_val = blob_ref.to_msgpack().expect("serialize blobref");
-    blob_engine
-        .put(Partition::BlobRef, meta_key, &meta_val)
-        .expect("blobref put");
+    let id = database
+        .lock()
+        .expect("lock for upload")
+        .upload_blob(data, None)
+        .expect("upload")
+        .id;
 
-    // CypherService queries graph — blob data doesn't interfere
     {
         let mut db = database.lock().expect("lock for query");
         let rows = db
@@ -272,17 +199,7 @@ fn server_pattern_mutex_database_with_shared_blob_engine() {
             .expect("match");
         assert_eq!(rows.len(), 1);
     }
-
-    // Blob data readable through Database.engine() (same storage instance)
-    {
-        let db = database.lock().expect("lock for verify");
-        let got = db
-            .engine()
-            .get(Partition::BlobRef, meta_key)
-            .expect("get blobref")
-            .expect("blobref must exist");
-        assert_eq!(got.as_ref(), meta_val.as_slice());
-    }
+    assert_eq!(read_blob(&database.lock().expect("lock"), &id), data);
 }
 
 /// Simulates concurrent CypherService and BlobService operations
