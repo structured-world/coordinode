@@ -242,6 +242,21 @@ pub trait IndexStore {
         budget: &coordinode_core::budget::QueryBudget,
     ) -> StoreResult<Option<Vec<NodeId>>>;
 
+    /// [`Self::scan_exact`] of the single-property `index` for each of
+    /// `keys`, in their order: a unique index reads all their entries in one
+    /// batched read. Each result is what `scan_exact` gives for that key.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::scan_exact`].
+    fn scan_exact_each(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        keys: &[&Value],
+        budget: &coordinode_core::budget::QueryBudget,
+    ) -> StoreResult<Vec<Option<Vec<NodeId>>>>;
+
     /// One page of the entries of the single-property `index` whose value is
     /// in `[from, to)`, in value order, after the entry key `after` when
     /// given: the ordered read that finds the values below a bound without
@@ -1122,6 +1137,53 @@ impl IndexStore for LocalIndexStore<'_> {
         })?;
         kept.keep_until_query_ends();
         Ok(Some(out))
+    }
+
+    fn scan_exact_each(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        keys: &[&Value],
+        budget: &coordinode_core::budget::QueryBudget,
+    ) -> StoreResult<Vec<Option<Vec<NodeId>>>> {
+        if !index.unique {
+            let mut out = Vec::with_capacity(keys.len());
+            for key in keys {
+                out.push(self.scan_exact(txn, index, core::slice::from_ref(*key), budget)?);
+            }
+            return Ok(out);
+        }
+        // One entry key per value that has one; the rest have no answer.
+        let mut entry_keys: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+        let mut slots: Vec<Option<usize>> = Vec::with_capacity(keys.len());
+        for key in keys {
+            match encode_tuple(core::slice::from_ref(*key)) {
+                Ok(tuple) => {
+                    slots.push(Some(entry_keys.len()));
+                    entry_keys.push(encode_unique_entry_key(index.generation, &tuple));
+                }
+                Err(_) => slots.push(None),
+            }
+        }
+        budget.work(entry_keys.len() as u64)?;
+        let id_bytes = core::mem::size_of::<NodeId>() as u64;
+        let mut kept = budget.empty_charge();
+        // At most one holder per entry read: the product fits in u64.
+        kept.grow(entry_keys.len() as u64 * id_bytes)?;
+        let borrowed: Vec<&[u8]> = entry_keys.iter().map(Vec::as_slice).collect();
+        let found = txn.multi_read_untracked(Partition::Idx, &borrowed)?;
+        let mut out = Vec::with_capacity(keys.len());
+        for slot in slots {
+            out.push(match slot {
+                Some(at) => Some(match &found[at] {
+                    Some(bytes) => vec![decode_holder(bytes)?],
+                    None => Vec::new(),
+                }),
+                None => None,
+            });
+        }
+        kept.keep_until_query_ends();
+        Ok(out)
     }
 
     fn scan_entries_in(

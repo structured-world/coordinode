@@ -2062,9 +2062,53 @@ impl<'a> ExecutionContext<'a> {
         id: crate::index::IndexId,
         value: &Value,
     ) -> Result<Result<Vec<NodeId>, IndexUnanswered>, ExecutionError> {
-        use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
+        let index = match self.answering_index(id) {
+            Ok(index) => index,
+            Err(why) => return Ok(Err(why)),
+        };
+        self.sync_txn_state();
+        match LocalIndexStore::new(self.engine).scan_exact(
+            &mut self.txn,
+            &index,
+            std::slice::from_ref(value),
+            &self.budget,
+        )? {
+            Some(ids) => Ok(Ok(ids)),
+            None => Ok(Err(IndexUnanswered::NotServing)),
+        }
+    }
+
+    /// [`Self::index_lookup`] for each of `keys`, in their order: the index
+    /// is judged once, and a unique index's entries are read in one batch.
+    pub fn index_lookup_each(
+        &mut self,
+        id: crate::index::IndexId,
+        keys: &[&Value],
+    ) -> Result<Result<Vec<KeyCandidates>, IndexUnanswered>, ExecutionError> {
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
+        let index = match self.answering_index(id) {
+            Ok(index) => index,
+            Err(why) => return Ok(Err(why)),
+        };
+        self.sync_txn_state();
+        Ok(Ok(LocalIndexStore::new(self.engine).scan_exact_each(
+            &mut self.txn,
+            &index,
+            keys,
+            &self.budget,
+        )?))
+    }
+
+    /// The definition of index `id` when its entries can answer this
+    /// statement's snapshot, or why they cannot.
+    fn answering_index(
+        &mut self,
+        id: crate::index::IndexId,
+    ) -> Result<Arc<crate::index::IndexDefinition>, IndexUnanswered> {
+        use coordinode_modality::ENTRY_LAYOUT;
         let Some(registry) = self.btree_index_registry else {
-            return Ok(Err(IndexUnanswered::NotServing));
+            return Err(IndexUnanswered::NotServing);
         };
         let Some(crate::index::registry::GuardedIndex {
             def: index,
@@ -2072,7 +2116,7 @@ impl<'a> ExecutionContext<'a> {
             published,
         }) = registry.get_guarded(id)
         else {
-            return Ok(Err(IndexUnanswered::NotServing));
+            return Err(IndexUnanswered::NotServing);
         };
         // The snapshot this statement reads: a named timestamp, or its own.
         // A timestamp before the epoch reads nothing an index could miss.
@@ -2084,30 +2128,21 @@ impl<'a> ExecutionContext<'a> {
             || index.state != IndexState::Ready
             || index.layout != ENTRY_LAYOUT
         {
-            return Ok(Err(IndexUnanswered::NotServing));
+            return Err(IndexUnanswered::NotServing);
         }
         // A snapshot before the index was published may read a generation
         // its build had not filled yet; the records answer it.
         if published.is_some_and(|at| read_ts < at) {
-            return Ok(Err(IndexUnanswered::Unproved));
+            return Err(IndexUnanswered::Unproved);
         }
         // A copy is evidence only under its stored use guard: one that cannot
         // be guarded answers from the records, as an unproved one does.
         if (!armed && !registry.arm_copy(self.engine, index.generation))
             || !registry.answers_at(index.generation, read_ts)
         {
-            return Ok(Err(IndexUnanswered::Unproved));
+            return Err(IndexUnanswered::Unproved);
         }
-        self.sync_txn_state();
-        match LocalIndexStore::new(self.engine).scan_exact(
-            &mut self.txn,
-            &index,
-            std::slice::from_ref(value),
-            &self.budget,
-        )? {
-            Some(ids) => Ok(Ok(ids)),
-            None => Ok(Err(IndexUnanswered::NotServing)),
-        }
+        Ok(index)
     }
 
     /// Whether the entry of the B-tree index `id` under `value` that named
@@ -4875,9 +4910,24 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // a filter variable not bound within the right subtree, so a
             // genuinely uncorrelated cross product keeps the fast global path.
             if is_relationship_merge(right) || right_has_correlated_filter(right) {
-                if let LogicalOp::IndexScan { value_expr, .. } = right.as_ref() {
+                if let LogicalOp::IndexScan {
+                    variable,
+                    label,
+                    index,
+                    property,
+                    value_expr,
+                    ..
+                } = right.as_ref()
+                {
                     if !is_relationship_merge(right) {
-                        return join_by_index_key(left_rows, right, value_expr, ctx);
+                        let scan = IndexKeyScan {
+                            variable,
+                            label,
+                            index: *index,
+                            property,
+                            value_expr,
+                        };
+                        return join_by_index_key(left_rows, right, scan, ctx);
                     }
                 }
                 let prev_corr = ctx.correlated_row.take();
@@ -7054,8 +7104,47 @@ fn execute_btree_index_scan(
             coordinode_modality::LocalNodeStore.get_many(&ctx.txn, ctx.shard_id, batch)?
         };
         let _batch = budget.reserve(records.iter().flatten().map(NodeRecord::held_bytes).sum())?;
-        for (&id, record_opt) in batch.iter().zip(records) {
-            budget.work(1)?;
+        let candidates = IndexCandidates {
+            variable,
+            labels: &labels,
+            index,
+            property,
+            key: &lookup_val,
+        };
+        if !candidates.rows(batch, records, &mut kept, &mut results, ctx)? {
+            drop(results);
+            drop(kept);
+            return scan_records(ctx, IndexUnanswered::Unproved, lookup_val);
+        }
+    }
+    kept.keep_until_query_ends();
+    Ok(results)
+}
+
+/// The candidates a B-tree index lookup of `key` returned, as they turn
+/// into rows.
+struct IndexCandidates<'a> {
+    variable: &'a str,
+    labels: &'a [String],
+    index: crate::index::IndexId,
+    property: &'a str,
+    key: &'a Value,
+}
+
+impl IndexCandidates<'_> {
+    /// Append the rows of `ids`, whose records are `records`, to `results`,
+    /// charging them to `kept`. `false` when an entry shows the index wrong:
+    /// the caller answers the key from the records instead.
+    fn rows(
+        &self,
+        ids: &[NodeId],
+        records: Vec<Option<NodeRecord>>,
+        kept: &mut coordinode_core::budget::MemoryCharge<'_>,
+        results: &mut Vec<Row>,
+        ctx: &mut ExecutionContext<'_>,
+    ) -> Result<bool, ExecutionError> {
+        for (&id, record_opt) in ids.iter().zip(records) {
+            ctx.budget.work(1)?;
             // The index finds a list by each of its elements, and a temporal
             // node by any value it ever held; the equality the query asked
             // holds only for the value the record carries itself. A
@@ -7064,13 +7153,11 @@ fn execute_btree_index_scan(
             // wrong: its other entries prove nothing either, and the records
             // answer instead, within the same budget.
             let held = record_opt.as_ref().and_then(|record| {
-                crate::index::registry::record_lookup(record, ctx.interner)(property)
+                crate::index::registry::record_lookup(record, ctx.interner)(self.property)
             });
-            if held.as_ref() != Some(&lookup_val) {
-                if ctx.index_entry_disagrees(index, &lookup_val, id, record_opt.as_ref())? {
-                    drop(results);
-                    drop(kept);
-                    return scan_records(ctx, IndexUnanswered::Unproved, lookup_val);
+            if held.as_ref() != Some(self.key) {
+                if ctx.index_entry_disagrees(self.index, self.key, id, record_opt.as_ref())? {
+                    return Ok(false);
                 }
                 continue;
             }
@@ -7079,15 +7166,14 @@ fn execute_btree_index_scan(
             };
             // The label check guards against entries of relabeled nodes.
             if let Some(row) =
-                node_row_if_matching(variable, &labels, id.as_raw(), &record, &[], ctx)?
+                node_row_if_matching(self.variable, self.labels, id.as_raw(), &record, &[], ctx)?
             {
                 kept.grow(crate::executor::row::row_held_bytes(&row))?;
                 results.push(row);
             }
         }
+        Ok(true)
     }
-    kept.keep_until_query_ends();
-    Ok(results)
 }
 
 /// Index candidates whose records are read, and held, at once.
@@ -10672,62 +10758,73 @@ fn keep_joined(
 }
 
 /// A correlated join whose right side is an index lookup alone: its rows
-/// depend on nothing but the key each left row computes, so the lookup runs
-/// once per distinct key and every left row with that key joins the same
+/// depend on nothing but the key each left row computes, so each distinct
+/// key is answered once and every left row with that key joins the same
 /// rows. Left rows that share a key (the fields of one record pointing at
-/// it, for one) pay one lookup, not one each. Rows come out in left-row
-/// order, each left row's matches in lookup order, as the per-row join gives.
+/// it, for one) pay one lookup, not one each, and the distinct keys are
+/// looked up together: a unique index's entries and the candidates' records
+/// are read in batches. Rows come out in left-row order, each left row's
+/// matches in lookup order, as the per-row join gives.
 fn join_by_index_key(
     left_rows: Vec<Row>,
     right: &LogicalOp,
-    value_expr: &crate::plan::expr::Expr,
+    scan: IndexKeyScan<'_>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     use crate::executor::row::{DistinctIndex, values_hash};
     let prev_corr = ctx.correlated_row.take();
     let joined = (|| {
-        // The keys looked up and their rows, held until the join ends: the
-        // rows were charged to the statement as the lookups built them.
+        // The keys and their rows, held until the join ends: the rows were
+        // charged to the statement as the lookups built them.
         let budget = Arc::clone(&ctx.budget);
         let mut held = budget.empty_charge();
         let mut index = DistinctIndex::default();
-        // No more keys than left rows.
+        // No more keys than left rows, and one key slot per left row.
         index.reserve(left_rows.len(), &mut held)?;
-        let mut keys: Vec<(Value, Vec<Row>)> = Vec::new();
-        let mut result = Vec::new();
-        for lr in left_rows {
-            let key = eval_neutral(value_expr, &lr)?;
+        held.grow((left_rows.len() * core::mem::size_of::<Option<usize>>()) as u64)?;
+        let mut keys: Vec<SharedKey> = Vec::new();
+        let mut slots: Vec<Option<usize>> = Vec::with_capacity(left_rows.len());
+        for (row, lr) in left_rows.iter().enumerate() {
+            let key = eval_neutral(scan.value_expr, lr)?;
             // Equal keys of these kinds are one index key. Other keys are
             // looked up every time: equal floats can differ (0.0, -0.0), and
             // the lookup, not this comparison, decides what they match.
-            let shared = matches!(
+            if !matches!(
                 key,
                 Value::Null | Value::Bool(_) | Value::Int(_) | Value::String(_)
-            );
+            ) {
+                slots.push(None);
+                continue;
+            }
+            let hash = values_hash([&key]);
+            let (found, asked) = index.find(hash, |at| keys[at].key == key);
+            ctx.budget.work(1 + asked)?;
+            let at = match found {
+                Some(at) => at,
+                None => {
+                    let shared = SharedKey {
+                        key,
+                        row,
+                        rows: Vec::new(),
+                    };
+                    crate::executor::row::push_charged(&mut keys, shared, &mut held)?;
+                    index.keep(hash)
+                }
+            };
+            slots.push(Some(at));
+        }
+        answer_shared_keys(&mut keys, &left_rows, right, &scan, ctx)?;
+
+        let mut result = Vec::new();
+        for (lr, slot) in left_rows.into_iter().zip(slots) {
             let fresh;
-            let rows: &[Row] = if shared {
-                let hash = values_hash([&key]);
-                let (found, asked) = index.find(hash, |at| keys[at].0 == key);
-                ctx.budget.work(1 + asked)?;
-                let at = match found {
-                    Some(at) => at,
-                    None => {
-                        crate::executor::row::push_charged(
-                            &mut keys,
-                            (key, Vec::new()),
-                            &mut held,
-                        )?;
-                        let at = index.keep(hash);
-                        ctx.correlated_row = Some(lr.clone());
-                        keys[at].1 = execute_op(right, ctx)?;
-                        at
-                    }
-                };
-                &keys[at].1
-            } else {
-                ctx.correlated_row = Some(lr.clone());
-                fresh = execute_op(right, ctx)?;
-                &fresh
+            let rows: &[Row] = match slot {
+                Some(at) => &keys[at].rows,
+                None => {
+                    ctx.correlated_row = Some(lr.clone());
+                    fresh = execute_op(right, ctx)?;
+                    &fresh
+                }
             };
             let last = rows.len().checked_sub(1);
             let mut lr = Some(lr);
@@ -10746,6 +10843,133 @@ fn join_by_index_key(
     })();
     ctx.correlated_row = prev_corr;
     joined
+}
+
+/// The nodes an index lookup of one key names; `None` when the key has no
+/// index encoding.
+pub type KeyCandidates = Option<Vec<NodeId>>;
+
+/// The index lookup on the right of a [`join_by_index_key`].
+struct IndexKeyScan<'a> {
+    variable: &'a str,
+    label: &'a str,
+    index: crate::index::IndexId,
+    property: &'a str,
+    value_expr: &'a crate::plan::expr::Expr,
+}
+
+/// A distinct key of a [`join_by_index_key`]: the first left row computing
+/// it, and the rows it matches once answered.
+struct SharedKey {
+    key: Value,
+    row: usize,
+    rows: Vec<Row>,
+}
+
+/// Answer every key of `keys`: a batch of keys at a time their entries are
+/// read in one lookup, and the records of their candidates a batch of
+/// candidates at a time. A key the batch cannot answer as the per-row
+/// lookup would (no key encoding, an index that cannot answer, a temporal
+/// label, more candidates than a batch, an entry that shows the index
+/// wrong) runs the lookup itself for its first left row, which reaches the
+/// per-row answer, records included.
+fn answer_shared_keys(
+    keys: &mut [SharedKey],
+    left_rows: &[Row],
+    right: &LogicalOp,
+    scan: &IndexKeyScan<'_>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use coordinode_modality::NodeStore as _;
+    let alone = |at: usize, keys: &mut [SharedKey], ctx: &mut ExecutionContext<'_>| {
+        ctx.correlated_row = Some(left_rows[keys[at].row].clone());
+        keys[at].rows = execute_op(right, ctx)?;
+        Ok::<(), ExecutionError>(())
+    };
+    cache_label_schema(scan.label, ctx)?;
+    if matches!(ctx.label_schema_cache.get(scan.label), Some(Some(s)) if s.temporal) {
+        // A temporal candidate resolves to its state at the variable's
+        // instant, one node at a time: nothing to batch.
+        for at in 0..keys.len() {
+            alone(at, keys, ctx)?;
+        }
+        return Ok(());
+    }
+    let labels = [scan.label.to_string()];
+    let budget = Arc::clone(&ctx.budget);
+    for start in (0..keys.len()).step_by(CANDIDATE_BATCH) {
+        let end = (start + CANDIDATE_BATCH).min(keys.len());
+        let found = {
+            let values: Vec<&Value> = keys[start..end].iter().map(|k| &k.key).collect();
+            ctx.index_lookup_each(scan.index, &values)?
+        };
+        let Ok(found) = found else {
+            for at in start..end {
+                alone(at, keys, ctx)?;
+            }
+            continue;
+        };
+        // The keys this batch answers, with their candidates.
+        let mut pending: Vec<(usize, Vec<NodeId>)> = Vec::new();
+        for (at, ids) in (start..end).zip(found) {
+            match ids {
+                Some(ids) if ids.len() <= CANDIDATE_BATCH => pending.push((at, ids)),
+                _ => alone(at, keys, ctx)?,
+            }
+        }
+        // Keys whose candidates together fit one batch read their records
+        // at once; those records are held, and charged, while their rows
+        // are built.
+        let mut group = pending.into_iter().peekable();
+        while group.peek().is_some() {
+            let mut members: Vec<(usize, Vec<NodeId>)> = Vec::new();
+            let mut ids: Vec<NodeId> = Vec::new();
+            while let Some((_, next)) = group.peek() {
+                if !members.is_empty() && ids.len() + next.len() > CANDIDATE_BATCH {
+                    break;
+                }
+                let Some((at, member_ids)) = group.next() else {
+                    break;
+                };
+                ids.extend_from_slice(&member_ids);
+                members.push((at, member_ids));
+            }
+            let mut records = coordinode_modality::LocalNodeStore
+                .get_many(&ctx.txn, ctx.shard_id, &ids)?
+                .into_iter();
+            let _batch = budget.reserve(
+                records
+                    .as_slice()
+                    .iter()
+                    .flatten()
+                    .map(NodeRecord::held_bytes)
+                    .sum(),
+            )?;
+            for (at, member_ids) in members {
+                let member_records: Vec<Option<NodeRecord>> =
+                    records.by_ref().take(member_ids.len()).collect();
+                let mut rows = Vec::new();
+                let mut kept = budget.empty_charge();
+                let answered = IndexCandidates {
+                    variable: scan.variable,
+                    labels: &labels,
+                    index: scan.index,
+                    property: scan.property,
+                    key: &keys[at].key,
+                }
+                .rows(&member_ids, member_records, &mut kept, &mut rows, ctx)?;
+                if answered {
+                    kept.keep_until_query_ends();
+                    keys[at].rows = rows;
+                } else {
+                    drop(rows);
+                    drop(kept);
+                    alone(at, keys, ctx)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`keep_joined`] into a list whose slot for the row, `slot` bytes, was

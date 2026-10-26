@@ -3769,11 +3769,14 @@ fn an_exists_subquery_keyed_by_an_outer_value_finds_its_node() {
 #[test]
 fn a_correlated_join_by_key_matches_every_left_row_sharing_the_key() {
     use coordinode_core::graph::types::Value;
-    for indexed in [false, true] {
+    for indexed in [
+        None,
+        Some("CREATE UNIQUE INDEX a_key ON :A(key)"),
+        Some("CREATE INDEX a_key ON :A(key)"),
+    ] {
         let mut db = open_db();
-        if indexed {
-            db.execute_cypher("CREATE UNIQUE INDEX a_key ON :A(key)")
-                .unwrap();
+        if let Some(ddl) = indexed {
+            db.execute_cypher(ddl).unwrap();
         }
         db.execute_cypher(
             "CREATE (:A {key: 'a/1', name: 'one'}), (:A {key: 'a/2', name: 'two'}), \
@@ -3811,9 +3814,65 @@ fn a_correlated_join_by_key_matches_every_left_row_sharing_the_key() {
                 want(8, "float"),
                 want(9, "zero")
             ],
-            "indexed {indexed}"
+            "{indexed:?}"
         );
     }
+}
+
+/// More distinct keys than one lookup batch, several holders per key
+/// through a non-unique index, keys without a holder in between: the join
+/// through the index gives exactly every matching pair.
+#[test]
+fn a_correlated_join_over_many_keys_finds_every_holder() {
+    use coordinode_core::graph::types::Value;
+    let query = "MATCH (s:S) MATCH (a:A) WHERE a.key = s.parent \
+                 RETURN s.i AS i, a.n AS n ORDER BY i, n";
+    let load = |db: &mut coordinode_embed::Database| {
+        // 700 keys, two holders each; every third left row names no key.
+        db.execute_cypher(
+            "UNWIND range(0, 699) AS k \
+             CREATE (:A {key: 'k' + toString(k), n: 2 * k}), (:A {key: 'k' + toString(k), n: 2 * k + 1})",
+        )
+        .unwrap();
+        db.execute_cypher(
+            "UNWIND range(0, 1499) AS i \
+             CREATE (:S {i: i, parent: CASE WHEN i % 3 = 2 THEN 'none' ELSE 'k' + toString(i % 700) END})",
+        )
+        .unwrap();
+    };
+    let rows_of = |db: &mut coordinode_embed::Database| -> Vec<(Value, Value)> {
+        db.execute_cypher(query)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r.get("i").cloned().unwrap_or(Value::Null),
+                    r.get("n").cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect()
+    };
+    let want: Vec<(Value, Value)> = (0..1500_i64)
+        .filter(|i| i % 3 != 2)
+        .flat_map(|i| {
+            let k = i % 700;
+            [
+                (Value::Int(i), Value::Int(2 * k)),
+                (Value::Int(i), Value::Int(2 * k + 1)),
+            ]
+        })
+        .collect();
+    let mut indexed = open_db();
+    indexed
+        .execute_cypher("CREATE INDEX a_key ON :A(key)")
+        .unwrap();
+    load(&mut indexed);
+    let plan = indexed.explain_cypher(query).unwrap();
+    assert!(
+        plan.contains("IndexScan"),
+        "the join reads the index: {plan}"
+    );
+    assert_eq!(rows_of(&mut indexed), want);
 }
 
 #[test]
