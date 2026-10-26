@@ -482,10 +482,15 @@ fn the_tail_capture_brings_the_journal_copy_up_to_the_journal() {
         .map(|e| e.index)
         .collect();
     assert_eq!(indices, (1..=13).collect::<Vec<_>>());
+    let name = segment.file_name().expect("segment name");
+    assert_eq!(
+        std::fs::read(dst.join(name)).expect("read the copy's segment"),
+        std::fs::read(&segment).expect("read the segment"),
+        "the sealed segment's copy is unchanged"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        let name = segment.file_name().expect("segment name");
         let ino = |p: &std::path::Path| std::fs::metadata(p).expect("metadata").ino();
         assert_eq!(
             ino(&dst.join(name)),
