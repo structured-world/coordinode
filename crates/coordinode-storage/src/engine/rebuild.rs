@@ -41,6 +41,9 @@ pub enum RebuildRefusal {
     /// The engine keeps no journal, so what was applied after the checkpoint
     /// cannot be replayed.
     NoJournal,
+    /// The checkpoint's copy of the tree opened only by a repair that dropped
+    /// data: what survived of it is not the copy.
+    CheckpointDamaged,
     /// Journal entry `index` is applied, but neither the checkpoint's copy of
     /// the tree nor the journal suffix holds it.
     UncoveredEntry {
@@ -61,6 +64,9 @@ impl core::fmt::Display for RebuildRefusal {
         match self {
             Self::MissingFromCheckpoint => f.write_str("the checkpoint holds no copy of the table"),
             Self::NoJournal => f.write_str("no journal to replay the entries after the checkpoint"),
+            Self::CheckpointDamaged => {
+                f.write_str("the checkpoint's copy opened only by a repair that dropped data")
+            }
             Self::UncoveredEntry { index } => write!(
                 f,
                 "journal entry {index} is applied but neither the checkpoint nor the journal holds it"

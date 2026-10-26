@@ -1086,13 +1086,86 @@ fn a_table_rebuild_keeps_the_checkpoints_history() {
         "{report:?}"
     );
     assert!(report.is_clean(), "{report:?}");
+    // What the checkpoint's copy itself reads, to tell a wrong copy from a
+    // wrong rebuild when the comparison fails.
+    let checkpoint_reads = || {
+        let checkpoint = latest_checkpoint(&root).expect("a checkpoint");
+        let copy = StorageEngine::open_checkpoint(&checkpoint).expect("open the checkpoint");
+        snapshots
+            .iter()
+            .map(|&at| copy.columnar_scan("trades", at).expect("scan the copy"))
+            .collect::<Vec<_>>()
+    };
     for (at, before) in snapshots.iter().zip(&expected) {
+        let after = engine.columnar_scan("trades", *at).expect("scan after");
         assert_eq!(
-            &engine.columnar_scan("trades", *at).expect("scan after"),
+            &after,
             before,
-            "the rebuilt table reads differently at snapshot {at}"
+            "the rebuilt table reads differently at snapshot {at}; snapshots {snapshots:?}, \
+             the checkpoint's copy reads {:?}",
+            checkpoint_reads()
         );
     }
+}
+
+/// A checkpoint whose copy of the table opens only by a repair that dropped
+/// data is no base to rebuild from: the rebuild refuses rather than install
+/// what survived of the copy as the table.
+#[test]
+fn a_table_rebuild_from_a_damaged_checkpoint_copy_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let open = || {
+        StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded")
+    };
+    let checkpoint = {
+        let engine = open();
+        for i in 0..40u32 {
+            engine
+                .columnar_insert(
+                    "trades",
+                    format!("row:{i:06}").into_bytes(),
+                    b"base".to_vec(),
+                    oracle.next().as_raw(),
+                )
+                .expect("columnar insert");
+        }
+        engine.persist().expect("persist");
+        let checkpoint = create_checkpoint(&engine, &root).expect("checkpoint");
+        for i in 40..80u32 {
+            engine
+                .columnar_insert(
+                    "trades",
+                    format!("row:{i:06}").into_bytes(),
+                    b"tail".to_vec(),
+                    oracle.next().as_raw(),
+                )
+                .expect("columnar insert");
+        }
+        engine.persist().expect("persist");
+        checkpoint
+    };
+    // The checkpoint's copy loses its manifest over a damaged table, so it
+    // opens only by salvage; the live tree is damaged the same way.
+    let no_checkpoint = TempDir::new().expect("tempdir");
+    let copy_dir = checkpoint.join("tables").join("trades");
+    assert!(corrupt_post_checkpoint_tables(&copy_dir.join("tables"), no_checkpoint.path()) > 0);
+    lose_manifest(&copy_dir);
+    let table_dir = dir.path().join("tables").join("trades");
+    corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root);
+    lose_manifest(&table_dir);
+
+    let engine = open();
+    assert_eq!(engine.lossy_table_repairs(), vec!["trades".to_string()]);
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert_eq!(
+        report.refused_tables,
+        vec![("trades".to_string(), RebuildRefusal::CheckpointDamaged)],
+        "{report:?}"
+    );
+    assert!(!report.is_clean(), "{report:?}");
 }
 
 /// A table the checkpoint holds no copy of is not rebuilt as an empty table:

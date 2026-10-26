@@ -2828,6 +2828,13 @@ impl StorageEngine {
 
         // 1. Prove the state before touching the live partition.
         let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
+        if ckpt
+            .open_repairs()
+            .iter()
+            .any(|r| r.partition == partition && r.is_lossy())
+        {
+            return Ok(Rebuild::Refused(RebuildRefusal::CheckpointDamaged));
+        }
         let source = ckpt.tree(partition)?.clone();
         let held = TreeCoverage::read(&source, Domain::Journal)?;
         // Read once: the coverage written in step 4 is exactly what was proved.
@@ -3089,6 +3096,9 @@ impl StorageEngine {
         let Some(source) = ckpt.columnar_tables.get(table_id) else {
             return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
         };
+        if ckpt.lossy_table_repairs().iter().any(|t| t == table_id) {
+            return Ok(Rebuild::Refused(RebuildRefusal::CheckpointDamaged));
+        }
         let held = TreeCoverage::read(&source, Domain::Journal)?;
         let catalog_held = TreeCoverage::read(ckpt.tree(Partition::Schema)?, Domain::Journal)?;
         // Read once: the coverage written in step 4 is exactly what was proved.
@@ -3323,6 +3333,13 @@ impl StorageEngine {
         //    engine is mutated.
         let (base, held): (Rows, TreeCoverage) = {
             let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
+            if ckpt
+                .open_repairs()
+                .iter()
+                .any(|r| r.partition == partition && r.is_lossy())
+            {
+                return Ok(Rebuild::Refused(RebuildRefusal::CheckpointDamaged));
+            }
             let mut rows = Vec::new();
             for (start, end) in &ranges {
                 for guard in ckpt.scan_range_at(

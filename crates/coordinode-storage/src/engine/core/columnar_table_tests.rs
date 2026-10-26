@@ -163,6 +163,147 @@ fn a_dropped_table_takes_its_series_with_it() {
     wait_for_series();
 }
 
+/// A flush does not change what a table reads at any snapshot: a segment
+/// holding several versions of a key answers an older snapshot with the
+/// version that snapshot sees, not with nothing.
+#[test]
+fn a_flush_keeps_every_snapshots_read() {
+    use lsm_tree::AbstractTree as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = persistent_config(dir.path());
+    config.compaction_workers = 0;
+    let engine = StorageEngine::open(&config).unwrap();
+    let mut snapshots = Vec::new();
+    for (key, value) in [
+        (&b"row:a"[..], &b"a-v1"[..]),
+        (b"row:b", b"b-live"),
+        (b"row:c", b"c-live"),
+    ] {
+        engine
+            .columnar_insert("t", key.to_vec(), value.to_vec(), engine.next_seqno())
+            .unwrap();
+    }
+    let overwrite = engine.next_seqno();
+    snapshots.push(overwrite);
+    engine
+        .columnar_insert("t", b"row:a".to_vec(), b"a-v2".to_vec(), overwrite)
+        .unwrap();
+    let tree = engine.columnar_table_tree("t").unwrap();
+    let deleted = engine.next_seqno();
+    snapshots.push(deleted);
+    tree.remove(b"row:b".to_vec(), deleted);
+    snapshots.push(engine.next_seqno());
+    snapshots.push(u64::MAX);
+
+    let before: Vec<_> = snapshots
+        .iter()
+        .map(|&at| engine.columnar_scan("t", at).unwrap())
+        .collect();
+    let row = |k: &[u8], v: &[u8]| (k.to_vec(), v.to_vec());
+    assert_eq!(
+        before[0],
+        vec![
+            row(b"row:a", b"a-v1"),
+            row(b"row:b", b"b-live"),
+            row(b"row:c", b"c-live")
+        ],
+        "before the overwrite"
+    );
+    assert_eq!(
+        before[1],
+        vec![
+            row(b"row:a", b"a-v2"),
+            row(b"row:b", b"b-live"),
+            row(b"row:c", b"c-live")
+        ],
+        "before the delete"
+    );
+    engine.flush_columnar_table("t").unwrap();
+    for (at, before) in snapshots.iter().zip(&before) {
+        assert_eq!(
+            &engine.columnar_scan("t", *at).unwrap(),
+            before,
+            "snapshot {at} reads differently after the flush"
+        );
+    }
+}
+
+/// A table's history copied event by event into a new tree reads the same
+/// at every snapshot, however the source's versions are laid out over its
+/// memtable and flushed segments.
+#[test]
+fn a_copied_table_history_reads_the_same_at_every_snapshot() {
+    use lsm_tree::AbstractTree as _;
+
+    // Flush after each of these writes (by index), or never.
+    for flush_after in [
+        vec![],
+        vec![0, 1, 2, 3, 4, 5, 6],
+        vec![6],
+        vec![3],
+        vec![4, 5],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = persistent_config(dir.path());
+        config.compaction_workers = 0;
+        let engine = StorageEngine::open(&config).unwrap();
+        let mut snapshots = Vec::new();
+        let mut step = 0;
+        let mut after = |engine: &StorageEngine| {
+            if flush_after.contains(&step) {
+                engine.flush_columnar_table("source").unwrap();
+            }
+            step += 1;
+        };
+        for (key, value) in [
+            (&b"row:a"[..], &b"a-v1"[..]),
+            (b"row:b", b"b-live"),
+            (b"row:c", b"c-live"),
+            (b"row:d", b"d-live"),
+        ] {
+            engine
+                .columnar_insert("source", key.to_vec(), value.to_vec(), engine.next_seqno())
+                .unwrap();
+            after(&engine);
+        }
+        let overwrite = engine.next_seqno();
+        snapshots.push(overwrite);
+        engine
+            .columnar_insert("source", b"row:a".to_vec(), b"a-v2".to_vec(), overwrite)
+            .unwrap();
+        after(&engine);
+        let source = engine.columnar_table_tree("source").unwrap();
+        let deleted = engine.next_seqno();
+        snapshots.push(deleted);
+        source.remove(b"row:b".to_vec(), deleted);
+        after(&engine);
+        let ranged = engine.next_seqno();
+        snapshots.push(ranged);
+        source.remove_range(b"row:c".to_vec(), b"row:e".to_vec(), ranged);
+        after(&engine);
+        snapshots.push(engine.next_seqno());
+        snapshots.push(u64::MAX);
+
+        let copy = engine.create_columnar_table("copy").unwrap();
+        for event in crate::engine::rebuild::tree_history(&source).unwrap() {
+            crate::engine::rebuild::replay_event(&copy, event);
+        }
+        for flush_copy in [false, true] {
+            if flush_copy {
+                engine.flush_columnar_table("copy").unwrap();
+            }
+            for &at in &snapshots {
+                assert_eq!(
+                    engine.columnar_scan("copy", at).unwrap(),
+                    engine.columnar_scan("source", at).unwrap(),
+                    "flushes after {flush_after:?}, copy flushed {flush_copy}, snapshot {at}"
+                );
+            }
+        }
+    }
+}
+
 /// A columnar table's tree encodes its column pages from the configured level
 /// down, plain above it.
 #[test]
