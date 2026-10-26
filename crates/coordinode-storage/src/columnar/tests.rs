@@ -163,6 +163,103 @@ fn a_drop_waits_for_running_maintenance_and_turns_away_the_rest() {
     );
 }
 
+/// A table created again under a name whose drop is still running waits for
+/// the drop to finish: the drop's removal of the old table's directory and
+/// series, by name, never reaches the new table.
+#[test]
+fn a_recreate_waits_for_the_drop_of_its_name() {
+    use crate::engine::flush::while_alive;
+
+    let dir = tempfile::tempdir().unwrap();
+    let reg = Arc::new(new_registry(dir.path()));
+    reg.create_or_open("t").unwrap();
+    let table = reg.trees().pop().expect("the table");
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (finish, finish_rx) = std::sync::mpsc::channel::<()>();
+    let life = Arc::clone(&table.alive);
+    let maintenance = std::thread::spawn(move || {
+        while_alive(Some(&life), || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        })
+    });
+    started.recv().unwrap();
+
+    // The drop waits for the maintenance; the re-create comes in meanwhile.
+    let dropper = {
+        let reg = Arc::clone(&reg);
+        std::thread::spawn(move || reg.drop_table("t"))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let creator = {
+        let reg = Arc::clone(&reg);
+        std::thread::spawn(move || reg.create_or_open("t").map(|_| ()))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !creator.is_finished(),
+        "the re-create did not wait for the drop of its name"
+    );
+
+    finish.send(()).unwrap();
+    maintenance.join().unwrap();
+    dropper.join().unwrap().unwrap();
+    creator.join().unwrap().unwrap();
+    assert!(reg.get("t").is_some(), "the new table is registered");
+    assert!(
+        dir.path().join("t").exists(),
+        "the drop removed the new table's directory"
+    );
+    assert!(
+        !Arc::ptr_eq(
+            &reg.trees().pop().expect("the new table").alive,
+            &table.alive
+        ),
+        "the new table has a life of its own"
+    );
+}
+
+/// A drop that fails before its directories are gone leaves the name refused:
+/// a create would open what is left of the dropped table. A second drop
+/// finishes the removal, and the name is free again.
+#[test]
+fn a_name_whose_drop_failed_is_refused_until_a_drop_finishes() {
+    use lsm_tree::fs::{Fault, FaultInjector, FaultOp, FaultRule};
+
+    let dir = tempfile::tempdir().unwrap();
+    let injector = Arc::new(FaultInjector::new());
+    let fs: Arc<dyn Fs> = Arc::new(lsm_tree::fs::FaultFs::with_injector(
+        lsm_tree::fs::StdFs,
+        Arc::clone(&injector),
+    ));
+    let reg = ColumnarTableRegistry::open(
+        Arc::clone(&fs),
+        settings(vec![dir.path().to_path_buf()], fs, SyncMode::Normal),
+    )
+    .unwrap()
+    .0;
+    reg.create_or_open("t").unwrap();
+
+    injector.arm(
+        FaultRule::new(
+            FaultOp::RemoveDirAll,
+            Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+        )
+        .once(),
+    );
+    assert!(reg.drop_table("t").is_err(), "the armed removal fails");
+    assert!(reg.get("t").is_none(), "the dropped table is not served");
+    assert!(
+        reg.create_or_open("t").is_err(),
+        "a create over the unfinished drop is refused"
+    );
+
+    reg.drop_table("t").unwrap();
+    assert!(!dir.path().join("t").exists());
+    reg.create_or_open("t").unwrap();
+    assert!(reg.get("t").is_some());
+}
+
 #[test]
 fn registry_recovers_tables_on_reopen() {
     let dir = tempfile::tempdir().unwrap();

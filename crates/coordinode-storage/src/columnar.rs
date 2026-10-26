@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use lsm_tree::config::{ColumnEncoding, ColumnEncodingPolicy};
 use lsm_tree::fs::Fs;
@@ -124,7 +124,29 @@ pub struct ColumnarTableRegistry {
     /// hit the host root and fail).
     fs: Arc<dyn Fs>,
     settings: TableTreeSettings,
-    trees: Mutex<HashMap<String, TableEntry>>,
+    trees: Mutex<Tables>,
+    /// Notified when a table's drop finishes, for the open or drop of the
+    /// same name waiting on it.
+    retired: Condvar,
+}
+
+/// The tables the registry holds: the open ones, and the names whose drop
+/// has started and not finished. A drop removes its directories and series
+/// by name, so no table of that name may exist until it is done.
+#[derive(Default)]
+struct Tables {
+    live: HashMap<String, TableEntry>,
+    retiring: HashMap<String, Retirement>,
+}
+
+/// Where the drop of a table name stands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retirement {
+    /// Running: an open or drop of the name waits for it.
+    Running,
+    /// Failed before its directories were gone: the name is refused to an
+    /// open, which would find what is left, until a drop finishes it.
+    Unfinished,
 }
 
 /// An open table: its tree, its write-pressure verdict and its life.
@@ -220,7 +242,8 @@ impl ColumnarTableRegistry {
         let registry = Self {
             fs,
             settings,
-            trees: Mutex::new(HashMap::new()),
+            trees: Mutex::new(Tables::default()),
+            retired: Condvar::new(),
         };
         let mut trees = HashMap::new();
         let mut repairs = Vec::new();
@@ -248,8 +271,13 @@ impl ColumnarTableRegistry {
             }
             trees.insert(entry.file_name, TableEntry::new(tree));
         }
-        *registry.trees.lock().unwrap_or_else(|e| e.into_inner()) = trees;
+        registry.lock().live = trees;
         Ok((registry, repairs))
+    }
+
+    /// The registry's tables, locked.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Tables> {
+        self.trees.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Open (creating if absent) the columnar-mode tree of `table_id` with
@@ -310,24 +338,41 @@ impl ColumnarTableRegistry {
         table_id: &str,
         on_create: impl FnOnce(&AnyTree) -> StorageResult<()>,
     ) -> StorageResult<(AnyTree, u8)> {
-        let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = trees.get(table_id) {
-            return Ok((entry.tree.clone(), entry.pressure.load(Ordering::Relaxed)));
+        let mut tables = self.lock();
+        loop {
+            if let Some(entry) = tables.live.get(table_id) {
+                return Ok((entry.tree.clone(), entry.pressure.load(Ordering::Relaxed)));
+            }
+            match tables.retiring.get(table_id) {
+                None => break,
+                // The drop of the name would remove the new table's
+                // directory and series: wait for it.
+                Some(Retirement::Running) => {
+                    tables = self.retired.wait(tables).unwrap_or_else(|e| e.into_inner());
+                }
+                Some(Retirement::Unfinished) => {
+                    return Err(StorageError::Io(format!(
+                        "table {table_id} is not created: its drop did not finish removing \
+                         its directories; drop it again"
+                    )));
+                }
+            }
         }
         // A new table's directory holds no tree to repair, and the monitor
         // has not judged it.
         let (tree, _) = self.open_tree(table_id)?;
         on_create(&tree)?;
-        trees.insert(table_id.to_owned(), TableEntry::new(tree.clone()));
+        tables
+            .live
+            .insert(table_id.to_owned(), TableEntry::new(tree.clone()));
         Ok((tree, 0))
     }
 
     /// Return the open columnar tree for `table_id`, or `None` if no such table
     /// is registered.
     pub fn get(&self, table_id: &str) -> Option<AnyTree> {
-        self.trees
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.lock()
+            .live
             .get(table_id)
             .map(|entry| entry.tree.clone())
     }
@@ -335,9 +380,8 @@ impl ColumnarTableRegistry {
     /// The write-pressure tier (0/1/2 = none/slowdown/stop) the compaction
     /// monitor last latched for `table_id`; 0 for a table it has not judged.
     pub(crate) fn pressure(&self, table_id: &str) -> u8 {
-        self.trees
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.lock()
+            .live
             .get(table_id)
             .map_or(0, |entry| entry.pressure.load(Ordering::Relaxed))
     }
@@ -345,18 +389,41 @@ impl ColumnarTableRegistry {
     /// Drop a table: release the tree handle and delete its directory under
     /// every endpoint. A flush or compaction of its tree that is running is
     /// waited for, and one still queued finds the table gone and does
-    /// nothing, so none writes into a directory the drop removed.
+    /// nothing, so none writes into a directory the drop removed. Until the
+    /// drop is done no table of the name can be opened or created, so its
+    /// removal by name never reaches a table created again under it; a drop
+    /// that fails leaves the name refused until a drop of it finishes.
     /// Idempotent — dropping an unknown table removes nothing and succeeds.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError::Engine`] if a directory removal fails.
     pub fn drop_table(&self, table_id: &str) -> StorageResult<()> {
-        let entry = self
-            .trees
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(table_id);
+        let entry = {
+            let mut tables = self.lock();
+            while tables.retiring.get(table_id) == Some(&Retirement::Running) {
+                tables = self.retired.wait(tables).unwrap_or_else(|e| e.into_inner());
+            }
+            tables
+                .retiring
+                .insert(table_id.to_owned(), Retirement::Running);
+            tables.live.remove(table_id)
+        };
+        let outcome = self.retire(table_id, entry);
+        let mut tables = self.lock();
+        match outcome {
+            Ok(()) => tables.retiring.remove(table_id),
+            Err(_) => tables
+                .retiring
+                .insert(table_id.to_owned(), Retirement::Unfinished),
+        };
+        self.retired.notify_all();
+        outcome
+    }
+
+    /// End the life of a dropped table `entry`, if it was open, and remove
+    /// its series and directories. The caller holds the name retiring.
+    fn retire(&self, table_id: &str, entry: Option<TableEntry>) -> StorageResult<()> {
         if let Some(entry) = entry {
             let mut alive = entry.alive.write();
             *alive = false;
@@ -381,9 +448,8 @@ impl ColumnarTableRegistry {
     /// restore alone would miss a columnar-only workload's seqno line).
     pub fn max_highest_seqno(&self) -> Option<u64> {
         use lsm_tree::AbstractTree;
-        self.trees
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.lock()
+            .live
             .values()
             .filter_map(|entry| entry.tree.get_highest_seqno())
             .max()
@@ -391,9 +457,8 @@ impl ColumnarTableRegistry {
 
     /// Every registered table with its tree handle and verdict, unordered.
     pub(crate) fn trees(&self) -> Vec<TableTree> {
-        self.trees
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.lock()
+            .live
             .iter()
             .map(|(id, entry)| TableTree {
                 id: id.clone(),
@@ -407,13 +472,7 @@ impl ColumnarTableRegistry {
 
     /// Sorted list of currently-registered table ids.
     pub fn table_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .trees
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect();
+        let mut ids: Vec<String> = self.lock().live.keys().cloned().collect();
         ids.sort();
         ids
     }
