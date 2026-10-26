@@ -3761,6 +3761,61 @@ fn an_exists_subquery_keyed_by_an_outer_value_finds_its_node() {
     }
 }
 
+/// A correlated join through an index looks each distinct key up once and
+/// joins every left row with that key to the same rows: several left rows
+/// sharing a key each get their match, a key with no match or a NULL key
+/// none, a float key (looked up per row) its match, and the rows keep the
+/// left order. Same answers with and without the index.
+#[test]
+fn a_correlated_join_by_key_matches_every_left_row_sharing_the_key() {
+    use coordinode_core::graph::types::Value;
+    for indexed in [false, true] {
+        let mut db = open_db();
+        if indexed {
+            db.execute_cypher("CREATE UNIQUE INDEX a_key ON :A(key)")
+                .unwrap();
+        }
+        db.execute_cypher(
+            "CREATE (:A {key: 'a/1', name: 'one'}), (:A {key: 'a/2', name: 'two'}), \
+             (:A {key: 1.5, name: 'float'}), \
+             (:S {i: 1, parent: 'a/1'}), (:S {i: 2, parent: 'a/2'}), (:S {i: 3, parent: 'a/1'}), \
+             (:S {i: 4, parent: 'a/9'}), (:S {i: 5}), (:S {i: 6, parent: 'a/1'}), \
+             (:S {i: 7, parent: 1.5}), (:S {i: 8, parent: 1.5}), \
+             (:A {key: 0.0, name: 'zero'}), (:S {i: 9, parent: -0.0})",
+        )
+        .unwrap();
+        let rows = db
+            .execute_cypher(
+                "MATCH (s:S) MATCH (a:A) WHERE a.key = s.parent \
+                 RETURN s.i AS i, a.name AS name ORDER BY i",
+            )
+            .unwrap();
+        let got: Vec<(Value, Value)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get("i").cloned().unwrap_or(Value::Null),
+                    r.get("name").cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        let want = |i: i64, name: &str| (Value::Int(i), Value::String(name.into()));
+        assert_eq!(
+            got,
+            vec![
+                want(1, "one"),
+                want(2, "two"),
+                want(3, "one"),
+                want(6, "one"),
+                want(7, "float"),
+                want(8, "float"),
+                want(9, "zero")
+            ],
+            "indexed {indexed}"
+        );
+    }
+}
+
 #[test]
 fn with_distinct_passthrough() {
     use coordinode_core::graph::types::Value;

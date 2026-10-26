@@ -4875,6 +4875,11 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // a filter variable not bound within the right subtree, so a
             // genuinely uncorrelated cross product keeps the fast global path.
             if is_relationship_merge(right) || right_has_correlated_filter(right) {
+                if let LogicalOp::IndexScan { value_expr, .. } = right.as_ref() {
+                    if !is_relationship_merge(right) {
+                        return join_by_index_key(left_rows, right, value_expr, ctx);
+                    }
+                }
                 let prev_corr = ctx.correlated_row.take();
                 let mut result = Vec::new();
                 // Each left row's right side holds its rows only until they
@@ -10664,6 +10669,83 @@ fn keep_joined(
     results: &mut Vec<Row>,
 ) -> Result<(), ExecutionError> {
     keep_joined_in(ctx, row, results, 0)
+}
+
+/// A correlated join whose right side is an index lookup alone: its rows
+/// depend on nothing but the key each left row computes, so the lookup runs
+/// once per distinct key and every left row with that key joins the same
+/// rows. Left rows that share a key (the fields of one record pointing at
+/// it, for one) pay one lookup, not one each. Rows come out in left-row
+/// order, each left row's matches in lookup order, as the per-row join gives.
+fn join_by_index_key(
+    left_rows: Vec<Row>,
+    right: &LogicalOp,
+    value_expr: &crate::plan::expr::Expr,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use crate::executor::row::{DistinctIndex, values_hash};
+    let prev_corr = ctx.correlated_row.take();
+    let joined = (|| {
+        // The keys looked up and their rows, held until the join ends: the
+        // rows were charged to the statement as the lookups built them.
+        let budget = Arc::clone(&ctx.budget);
+        let mut held = budget.empty_charge();
+        let mut index = DistinctIndex::default();
+        // No more keys than left rows.
+        index.reserve(left_rows.len(), &mut held)?;
+        let mut keys: Vec<(Value, Vec<Row>)> = Vec::new();
+        let mut result = Vec::new();
+        for lr in left_rows {
+            let key = eval_neutral(value_expr, &lr)?;
+            // Equal keys of these kinds are one index key. Other keys are
+            // looked up every time: equal floats can differ (0.0, -0.0), and
+            // the lookup, not this comparison, decides what they match.
+            let shared = matches!(
+                key,
+                Value::Null | Value::Bool(_) | Value::Int(_) | Value::String(_)
+            );
+            let fresh;
+            let rows: &[Row] = if shared {
+                let hash = values_hash([&key]);
+                let (found, asked) = index.find(hash, |at| keys[at].0 == key);
+                ctx.budget.work(1 + asked)?;
+                let at = match found {
+                    Some(at) => at,
+                    None => {
+                        crate::executor::row::push_charged(
+                            &mut keys,
+                            (key, Vec::new()),
+                            &mut held,
+                        )?;
+                        let at = index.keep(hash);
+                        ctx.correlated_row = Some(lr.clone());
+                        keys[at].1 = execute_op(right, ctx)?;
+                        at
+                    }
+                };
+                &keys[at].1
+            } else {
+                ctx.correlated_row = Some(lr.clone());
+                fresh = execute_op(right, ctx)?;
+                &fresh
+            };
+            let last = rows.len().checked_sub(1);
+            let mut lr = Some(lr);
+            for (i, r) in rows.iter().enumerate() {
+                // The left row moves into its last match.
+                let mut merged = if Some(i) == last {
+                    lr.take().unwrap_or_default()
+                } else {
+                    lr.clone().unwrap_or_default()
+                };
+                merged.extend(r.iter().map(|(k, v)| (k.clone(), v.clone())));
+                keep_joined(ctx, merged, &mut result)?;
+            }
+        }
+        Ok(result)
+    })();
+    ctx.correlated_row = prev_corr;
+    joined
 }
 
 /// [`keep_joined`] into a list whose slot for the row, `slot` bytes, was
