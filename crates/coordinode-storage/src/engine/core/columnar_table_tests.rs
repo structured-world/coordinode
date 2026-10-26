@@ -251,21 +251,7 @@ fn a_table_past_its_stop_threshold_is_stopped_alone() {
     assert_eq!(engine.columnar_write_pressure("cold"), WritePressure::None);
     assert_eq!(engine.write_pressure(), WritePressure::None);
     // A partition commit is not held back by the table.
-    let snap = engine.snapshot();
-    let mut txn = crate::engine::transaction::Transaction::new(
-        &engine,
-        Some(&oracle),
-        coordinode_core::txn::timestamp::Timestamp::from_raw(snap),
-        Some(snap),
-    );
-    txn.put(Partition::Node, b"node:after-stop", b"v").unwrap();
-    let concern = coordinode_core::txn::write_concern::WriteConcern::default();
-    txn.commit(&crate::engine::transaction::CommitContext {
-        write_concern: &concern,
-        pipeline: None,
-        id_gen: None,
-    })
-    .unwrap();
+    commit_node_write(&engine, &oracle, b"node:after-stop", b"v");
     assert_eq!(
         engine
             .get(Partition::Node, b"node:after-stop")
@@ -273,6 +259,75 @@ fn a_table_past_its_stop_threshold_is_stopped_alone() {
             .as_deref(),
         Some(&b"v"[..])
     );
+}
+
+/// A table past its slowdown threshold holds its rows to the write rate, as
+/// a slowed commit is held: past the limiter's burst a megabyte at a megabyte
+/// a second waits. The table's slowdown does not hold the partitions.
+#[test]
+fn a_slowed_table_holds_its_rows_to_the_write_rate() {
+    use crate::engine::core::WritePressure;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = persistent_config(dir.path());
+    config.backpressure.l0_slowdown = 2;
+    config.compaction_workers = 0;
+    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(&config, std::sync::Arc::clone(&oracle)).unwrap();
+    for i in 0..2 {
+        flushed_row(&engine, "slow", i);
+    }
+    eventually("two runs never slowed the table", || {
+        engine.columnar_write_pressure("slow") == WritePressure::Slowdown
+    });
+    assert_eq!(engine.write_pressure(), WritePressure::None);
+    engine.set_write_slowdown_rate(1024 * 1024);
+    let value = vec![7u8; 1024 * 1024];
+    let insert = |key: &[u8]| {
+        let started = std::time::Instant::now();
+        engine
+            .columnar_insert("slow", key.to_vec(), value.clone(), engine.next_seqno())
+            .unwrap();
+        started.elapsed()
+    };
+    insert(b"row:big-1");
+    let held = insert(b"row:big-2");
+    assert!(
+        held >= std::time::Duration::from_millis(500),
+        "a megabyte past the burst at a megabyte a second took {held:?}"
+    );
+    let started = std::time::Instant::now();
+    commit_node_write(&engine, &oracle, b"node:free", &value);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "the table's slowdown held a partition commit"
+    );
+}
+
+/// Commit a write of `value` at `key` to the node partition through the
+/// commit path, where the partitions' verdict gates it.
+fn commit_node_write(
+    engine: &StorageEngine,
+    oracle: &coordinode_core::txn::timestamp::TimestampOracle,
+    key: &[u8],
+    value: &[u8],
+) {
+    let snap = engine.snapshot();
+    let mut txn = crate::engine::transaction::Transaction::new(
+        engine,
+        Some(oracle),
+        coordinode_core::txn::timestamp::Timestamp::from_raw(snap),
+        Some(snap),
+    );
+    txn.put(crate::engine::partition::Partition::Node, key, value)
+        .unwrap();
+    let concern = coordinode_core::txn::write_concern::WriteConcern::default();
+    txn.commit(&crate::engine::transaction::CommitContext {
+        write_concern: &concern,
+        pipeline: None,
+        id_gen: None,
+    })
+    .unwrap();
 }
 
 /// A table written and flushed statement by statement, as one without a
