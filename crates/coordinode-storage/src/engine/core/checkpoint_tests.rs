@@ -83,6 +83,58 @@ fn checkpoint_carries_the_columnar_tables() {
     );
 }
 
+/// A checkpoint is a repair base and is opened as one: nothing compacts it,
+/// so the versions it holds are all still there however long it is open. A
+/// compaction there would collect superseded versions under a watermark the
+/// checkpoint's own clock never set, and a rebuild reading the copy would
+/// lose the history the copy was taken to keep.
+#[cfg(feature = "columnar")]
+#[test]
+fn an_open_checkpoint_keeps_every_version_it_holds() {
+    let src_dir = TempDir::new().expect("src tempdir");
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        src_dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    config.compaction_workers = 0;
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+    // Overlapping runs past the level-0 trigger: a compaction is due.
+    const RUNS: usize = 8;
+    for round in 0..RUNS {
+        engine
+            .columnar_insert(
+                "t",
+                b"k".to_vec(),
+                (round as u64).to_le_bytes().to_vec(),
+                oracle.next().as_raw(),
+            )
+            .expect("insert");
+        engine.flush_columnar_table("t").expect("flush");
+    }
+    let ckpt_parent = TempDir::new().expect("ckpt parent");
+    let target = ckpt_parent.path().join("snap");
+    engine.create_checkpoint(&target).expect("checkpoint");
+    drop(engine);
+
+    let checkpoint = StorageEngine::open_checkpoint(&target).expect("open the checkpoint");
+    let tree = checkpoint.columnar_table_tree("t").expect("the copy");
+    let versions = || {
+        crate::engine::rebuild::tree_history(&tree)
+            .expect("history")
+            .filter(|e| e.key().as_ref() == b"k")
+            .count()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        assert_eq!(versions(), RUNS, "an open checkpoint lost versions");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// A store spread over several endpoints checkpoints into one directory, and
 /// the checkpoint opens there: its persisted per-level routing names
 /// endpoints the checkpoint does not have.

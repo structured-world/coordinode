@@ -2783,16 +2783,22 @@ impl StorageEngine {
     /// The errors of [`Self::open`].
     pub fn open_checkpoint(checkpoint_dir: &Path) -> StorageResult<Self> {
         use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
-        Self::open(
-            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                checkpoint_dir,
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )])
-            .relocated(),
-        )
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            checkpoint_dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )])
+        .relocated();
+        // A repair base is read, never maintained: no compaction rewrites
+        // it, and it serves every snapshot it physically holds. Its seqnos
+        // are the clock that wrote them, so it opens on a clock, as every
+        // open of a directory must.
+        config.compaction_workers = 0;
+        config.retention_window_secs = u64::MAX;
+        let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+        Self::open_with_oracle(&config, oracle)
     }
 
     /// Rebuild a corrupt partition from a checkpoint plus oplog replay
