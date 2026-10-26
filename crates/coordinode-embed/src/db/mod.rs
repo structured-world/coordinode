@@ -2804,37 +2804,43 @@ impl Database {
         mut plan: planner::logical::LogicalPlan,
         stats: &dyn Fn() -> Option<&'s dyn coordinode_core::graph::stats::StorageStats>,
     ) -> planner::logical::LogicalPlan {
+        plan.root = self.optimize_op(plan.root, plan.vector_consistency, stats);
+        plan
+    }
+
+    /// The access paths and push-down of [`Self::plan_for_execution`] for
+    /// one operator tree, and for every subquery plan its expressions hold:
+    /// a subquery's lookup by an outer key goes through the index as the
+    /// same lookup outside it does, instead of a label scan per outer row.
+    fn optimize_op<'s>(
+        &self,
+        root: planner::logical::LogicalOp,
+        consistency: coordinode_core::graph::types::VectorConsistencyMode,
+        stats: &dyn Fn() -> Option<&'s dyn coordinode_core::graph::stats::StorageStats>,
+    ) -> planner::logical::LogicalOp {
         // Filter(NodeScan) becomes IndexScan when a matching B-tree index is
         // registered.
-        plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
+        let root = planner::optimize_index_selection(root, &self.index_registry);
         // VectorTopK carries the resolved HNSW index name into execution.
-        plan.root = planner::annotate_vector_top_k(
-            plan.root,
-            &self.vector_index_registry,
-            plan.vector_consistency,
-        );
+        let root = planner::annotate_vector_top_k(root, &self.vector_index_registry, consistency);
         // Pure vector top-K reads through the index as its row source and
         // fetches only the k result nodes; filtered queries keep VectorTopK.
-        plan.root = planner::apply_hnsw_scan_access_path(
-            plan.root,
-            &self.vector_index_registry,
-            plan.vector_consistency,
-        );
+        let root =
+            planner::apply_hnsw_scan_access_path(root, &self.vector_index_registry, consistency);
         // text_match over one label reads its matches from the text index
         // instead of scanning the label to keep them.
-        plan.root =
-            planner::apply_text_index_scan_access_path(plan.root, &self.text_index_registry);
+        let root = planner::apply_text_index_scan_access_path(root, &self.text_index_registry);
         // count over one bare label reads the label's node counter instead
         // of scanning the label, where the catalog lets the counter stand
         // for the scan. A catalog that cannot be read keeps the scan.
-        plan.root = planner::apply_node_count_from_counter(plan.root, &|label| {
+        let root = planner::apply_node_count_from_counter(root, &|label| {
             coordinode_query::executor::runner::node_counter_answers_scan(&self.engine, label)
                 .unwrap_or(false)
         });
         // Every VectorFilter after a Traverse gets its strategy (graph_first /
         // acorn_filtered / vector_first) from the push-down cost model.
-        plan.root = planner::optimize_push_down_lazy(plan.root, stats);
-        plan
+        let root = planner::optimize_push_down_lazy(root, stats);
+        root.map_subplans(&mut |sub| self.optimize_op(sub, consistency, stats))
     }
 
     /// The plan a Cypher query runs as, with the session's vector

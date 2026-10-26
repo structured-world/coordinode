@@ -3761,6 +3761,94 @@ fn an_exists_subquery_keyed_by_an_outer_value_finds_its_node() {
     }
 }
 
+/// A subquery's lookup by a key the outer row holds goes through the index on
+/// that key, as the same lookup does outside a subquery: EXISTS, NOT EXISTS,
+/// COUNT, COLLECT and a pattern comprehension, keyed inline, by WHERE, by a
+/// WITH alias, and one subquery inside another. Each answers what the scan
+/// answers: an outer row with a match, one without, one whose key is NULL.
+/// Without this the subquery scanned the label once per outer row.
+#[test]
+fn a_subquery_keyed_by_an_outer_value_reads_through_the_index() {
+    use coordinode_core::graph::types::Value;
+    let queries = [
+        "MATCH (a:Owner) WHERE EXISTS { MATCH (p:Probe {key: a.key}) } \
+         RETURN a.i AS r ORDER BY r",
+        "MATCH (a:Owner) WHERE NOT EXISTS { MATCH (p:Probe {key: a.key}) } \
+         RETURN a.i AS r ORDER BY r",
+        "MATCH (a:Owner) WHERE EXISTS { MATCH (p:Probe) WHERE p.key = a.key } \
+         RETURN a.i AS r ORDER BY r",
+        "MATCH (a:Owner) WITH a, a.key AS k WHERE EXISTS { MATCH (p:Probe {key: k}) } \
+         RETURN a.i AS r ORDER BY r",
+        "MATCH (a:Owner) RETURN a.i AS i, COUNT { MATCH (p:Probe {key: a.key}) } AS r \
+         ORDER BY i",
+        "MATCH (a:Owner) RETURN a.i AS i, COLLECT { MATCH (p:Probe {key: a.key}) RETURN p.v } AS r \
+         ORDER BY i",
+        "MATCH (a:Owner) RETURN a.i AS i, [(p:Probe {key: a.key}) | p.v] AS r ORDER BY i",
+        "MATCH (a:Owner) WHERE EXISTS { MATCH (p:Probe {key: a.key}) \
+         WHERE EXISTS { MATCH (q:Probe {key: p.v}) } } RETURN a.i AS r ORDER BY r",
+        "MATCH (a:Owner) WHERE EXISTS { MATCH (m:Marker), (p:Probe {key: a.key}) } \
+         RETURN a.i AS r ORDER BY r",
+        "MATCH (a:Owner) CALL { WITH a MATCH (m:Marker) \
+         OPTIONAL MATCH (p:Probe) WHERE p.key = a.key RETURN count(p) AS r } \
+         RETURN a.i AS i, r ORDER BY i",
+    ];
+    let answers = |indexed: bool| -> Vec<Vec<(Value, Value)>> {
+        let mut db = open_db();
+        if indexed {
+            db.execute_cypher("CREATE INDEX probe_key ON :Probe(key)")
+                .unwrap();
+        }
+        db.execute_cypher(
+            "CREATE (:Owner {i: 1, key: 'k1'}), (:Owner {i: 2, key: 'k2'}), \
+             (:Owner {i: 3, key: 'missing'}), (:Owner {i: 4}), \
+             (:Probe {key: 'k1', v: 'k2'}), (:Probe {key: 'k1', v: 'x'}), \
+             (:Probe {key: 'k2', v: 'none'}), (:Marker)",
+        )
+        .unwrap();
+        queries
+            .iter()
+            .map(|query| {
+                if indexed {
+                    let plan = format!("{:?}", db.explain_plan(query, None).unwrap().root);
+                    assert!(
+                        plan.contains("IndexScan")
+                            && !plan.contains("NodeScan { variable: \"p\"")
+                            && !plan.contains("NodeScan { variable: \"q\""),
+                        "{query}: {plan}"
+                    );
+                }
+                db.execute_cypher(query)
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        let mut r = row.get("r").cloned().unwrap_or(Value::Null);
+                        if let Value::Array(items) = &mut r {
+                            items.sort_by_key(|v| format!("{v:?}"));
+                        }
+                        (row.get("i").cloned().unwrap_or(Value::Null), r)
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let scanned = answers(false);
+    assert_eq!(scanned[0].len(), 2, "two owners have a probe");
+    assert_eq!(scanned[1].len(), 2, "two owners have none");
+    assert_eq!(scanned[7].len(), 1, "only k1's probe names another");
+    assert_eq!(
+        scanned[8], scanned[0],
+        "a second pattern keeps the outer key"
+    );
+    // k1 has two probes, k2 one, the others none.
+    let counts: Vec<Value> = scanned[9].iter().map(|(_, r)| r.clone()).collect();
+    assert_eq!(
+        counts,
+        [2, 1, 0, 0].map(Value::Int).to_vec(),
+        "an optional match keeps the outer key"
+    );
+    assert_eq!(answers(true), scanned);
+}
+
 /// A correlated join through an index looks each distinct key up once and
 /// joins every left row with that key to the same rows: several left rows
 /// sharing a key each get their match, a key with no match or a NULL key

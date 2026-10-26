@@ -1434,6 +1434,50 @@ fn assert_push_down_invariant(op: &LogicalOp) -> Result<(), String> {
     }
 }
 
+/// Every subquery plan the operators' expressions hold reaches the pass a
+/// query applies to its subplans: an EXISTS in a filter, a COUNT and a
+/// COLLECT in a projection, a pattern comprehension inside another
+/// expression. One nested in a subplan is the pass's own to reach, so a
+/// recursive pass reaches it once and a flat one not at all.
+#[test]
+fn map_subplans_reaches_every_subquery_plan_once() {
+    let query = "MATCH (a:A) WHERE EXISTS { MATCH (p:P {k: a.k}) WHERE EXISTS { MATCH (q:Q) } } \
+                 RETURN COUNT { MATCH (c:C) } AS n, \
+                 size(COLLECT { MATCH (s:S) RETURN s.v }) + size([(t:T) | t.v]) AS m";
+    let label_of = |op: &LogicalOp| {
+        ["P", "Q", "C", "S", "T"]
+            .into_iter()
+            .find(|label| format!("{op:?}").contains(&format!("labels: [\"{label}\"]")))
+            .unwrap_or("?")
+    };
+
+    let mut flat = Vec::new();
+    let root = plan_root(query).map_subplans(&mut |op| {
+        flat.push(label_of(&op));
+        LogicalOp::Empty
+    });
+    assert_eq!(
+        flat,
+        ["P", "C", "S", "T"],
+        "each top subplan once, in order"
+    );
+    let mut left = 0;
+    let _ = root.map_subplans(&mut |op| {
+        assert_eq!(op, LogicalOp::Empty, "each root is the pass's result");
+        left += 1;
+        op
+    });
+    assert_eq!(left, 4);
+
+    fn recurse(op: LogicalOp, seen: &mut Vec<String>) -> LogicalOp {
+        seen.push(format!("{op:?}").chars().take(40).collect());
+        op.map_subplans(&mut |sub| recurse(sub, seen))
+    }
+    let mut seen = Vec::new();
+    let _ = recurse(plan_root(query), &mut seen);
+    assert_eq!(seen.len(), 6, "the query and its five subplans: {seen:?}");
+}
+
 fn optimized_plan(input: &str) -> LogicalOp {
     // Mirror the order of passes the Database engine applies in
     // execute_cypher_impl: index selection → top-k annotation →

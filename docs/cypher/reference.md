@@ -334,6 +334,14 @@ DROP INDEX user_email
 DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
 ```
 
+- **Where a lookup uses it.** An equality on the indexed property
+  (`{email: $e}`, `WHERE n.email = k`) reads the index wherever it stands:
+  at the top of a query, on the right of a join keyed by an earlier row
+  (`MATCH (s:S) MATCH (u:User) WHERE u.email = s.owner`), and inside a
+  subquery keyed by its outer row (`EXISTS { MATCH (u:User {email: a.owner}) }`,
+  `COUNT { … }`, `COLLECT { … }`, a pattern comprehension). The key may come
+  from the outer row, a `WITH` alias, or an enclosing join; the key must not
+  read the matched node itself.
 - **Entries commit with the data.** An index entry is written by the same
   transaction as the node it indexes: a failed or rolled-back statement leaves
   none, a crash keeps both or neither, and every replica holds the same

@@ -6343,6 +6343,72 @@ fn index_scan_resolves_correlated_key() {
     );
 }
 
+/// Executor: an optional match run under an enclosing correlation (a
+/// subquery's outer row) sees that row beside its own left row, so a right
+/// side keyed by the outer row finds its node. A lost outer row read the key
+/// as NULL and left the optional side empty.
+#[test]
+fn optional_match_under_an_enclosing_correlation_sees_the_outer_row() {
+    use coordinode_core::graph::types::Value;
+    let (_dir, engine, mut interner) = setup_test_graph();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+    let (env, builds) = btree_member(engine, &interner);
+    let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
+
+    // The outer row binds o.k = "Bob"; the left side binds Alice alone.
+    let mut outer = Row::new();
+    outer.insert("o.k".to_string(), Value::String("Bob".into()));
+    ctx.correlated_row = Some(outer.clone());
+    let name_of = |variable: &str| {
+        Box::new(Expr::PropertyAccess {
+            expr: Box::new(Expr::Variable(variable.to_string())),
+            property: "name".to_string(),
+        })
+    };
+    let join = LogicalOp::LeftOuterJoin {
+        left: Box::new(LogicalOp::NodeScan {
+            variable: "x".to_string(),
+            labels: vec!["User".to_string()],
+            property_filters: vec![(
+                "name".to_string(),
+                nx(Expr::Literal(Value::String("Alice".into()))),
+            )],
+        }),
+        right: Box::new(LogicalOp::Filter {
+            input: Box::new(LogicalOp::NodeScan {
+                variable: "u".to_string(),
+                labels: vec!["User".to_string()],
+                property_filters: vec![],
+            }),
+            predicate: nx(Expr::BinaryOp {
+                left: name_of("u"),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::PropertyAccess {
+                    expr: Box::new(Expr::Variable("o".to_string())),
+                    property: "k".to_string(),
+                }),
+            }),
+        }),
+    };
+    let rows = execute_op(&join, &mut ctx).expect("optional match");
+
+    assert_eq!(rows.len(), 1, "one left row, one match: {rows:?}");
+    assert_eq!(
+        rows[0].get("u.name"),
+        Some(&Value::String("Bob".into())),
+        "the right side reads the outer key: {rows:?}"
+    );
+    assert!(
+        !rows[0].contains_key("o.k"),
+        "the outer row is seen, not joined: {rows:?}"
+    );
+    assert_eq!(
+        ctx.correlated_row,
+        Some(outer),
+        "the outer row comes back after the join"
+    );
+}
+
 // -- edgeprop_write_key routing --
 
 #[test]

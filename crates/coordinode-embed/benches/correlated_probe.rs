@@ -1,8 +1,9 @@
 //! A correlated equality join through a unique index: for every row of one
-//! label, the row of another whose indexed key the first row names. Three
+//! label, the row of another whose indexed key the first row names. Four
 //! shapes: three left rows per key (the fields of one record pointing at
-//! it), one left row per key, and a search that filters the left rows,
-//! joins their records and counts and pages the distinct records. The
+//! it), one left row per key, a search that filters the left rows, joins
+//! their records and counts and pages the distinct records, and an EXISTS
+//! subquery probing the key, against the same subquery over a scan. The
 //! latency distribution (p50, p99, p999) of the whole statement, and the
 //! heap allocations and bytes per statement, for a growing number of probes.
 
@@ -155,13 +156,52 @@ fn search(size: usize) {
     );
 }
 
+/// An EXISTS subquery probing, for each of `size` rows, the row its key
+/// names; half the keys name none. Without the index the subquery scans the
+/// label once per row, which is what it did with the index too before
+/// subqueries got the index access path.
+fn exists(size: usize, indexed: bool) {
+    let dir = tempfile::tempdir_in(".").expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    if indexed {
+        db.execute_cypher("CREATE UNIQUE INDEX a_key ON :A(key)")
+            .expect("index");
+    }
+    for start in (0..size).step_by(5_000) {
+        let end = (start + 5_000).min(size) - 1;
+        db.execute_cypher(&format!(
+            "UNWIND range({start}, {end}) AS i \
+             CREATE (:A {{key: 'a/' + toString(i), owner: 'a/' + toString(i * 2)}})"
+        ))
+        .expect("load");
+    }
+    measure(
+        &db,
+        &format!(
+            "exists over {size} rows, {}",
+            if indexed { "index" } else { "label scan" }
+        ),
+        "MATCH (a:A) WHERE EXISTS { MATCH (o:A {key: a.owner}) } RETURN count(*) AS n",
+        &|rows| assert_eq!(rows[0].get("n"), Some(&Value::Int(size.div_ceil(2) as i64))),
+    );
+}
+
 fn main() {
-    // `search` alone: `CORRELATED_PROBE=search`.
-    if std::env::var("CORRELATED_PROBE").as_deref() != Ok("search") {
+    // One shape alone: `CORRELATED_PROBE=search` or `CORRELATED_PROBE=exists`.
+    let only = std::env::var("CORRELATED_PROBE").ok();
+    if only.is_none() {
         for size in SIZES {
             join(size, &["name", "description", "serial"]);
             join(size, &["name"]);
         }
     }
-    search(10_000);
+    if only.as_deref() != Some("exists") {
+        search(10_000);
+    }
+    if only.as_deref() != Some("search") {
+        exists(1_000, false);
+        for size in [1_000, 10_000] {
+            exists(size, true);
+        }
+    }
 }

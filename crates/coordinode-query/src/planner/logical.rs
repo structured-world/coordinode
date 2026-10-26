@@ -1198,14 +1198,35 @@ impl LogicalOp {
 
     /// Replace all `Expr::Parameter` nodes in this operator tree with literal values.
     pub fn substitute_params(&mut self, params: &HashMap<String, Value>) {
+        self.for_each_expr_mut(&mut |expr| expr.substitute_params(params));
+    }
+
+    /// Replace the root of every subquery plan the operator tree's
+    /// expressions hold with `f(root)`. Plans nested inside a subquery plan
+    /// are `f`'s to reach: a pass applying itself to the whole query passes
+    /// itself as `f`.
+    #[must_use]
+    pub fn map_subplans(mut self, f: &mut impl FnMut(LogicalOp) -> LogicalOp) -> LogicalOp {
+        let mut on_plan = |plan: &mut LogicalPlan| {
+            let root = std::mem::replace(&mut plan.root, LogicalOp::Empty);
+            plan.root = f(root);
+        };
+        self.for_each_expr_mut(&mut |expr| expr.for_each_subplan_mut(&mut on_plan));
+        self
+    }
+
+    /// Call `f` on every expression the operator tree holds (each operator's
+    /// own, its inputs', the MERGE and UPSERT patterns' and SET items'), at
+    /// its top: the expression's children are `f`'s to reach.
+    pub fn for_each_expr_mut(&mut self, f: &mut impl FnMut(&mut crate::plan::expr::Expr)) {
         match self {
-            // Opaque extension payload carries no Expr params to substitute.
+            // Opaque extension payload carries no expressions.
             LogicalOp::Extension { .. } => {}
             LogicalOp::NodeScan {
                 property_filters, ..
             } => {
                 for (_, expr) in property_filters {
-                    expr.substitute_params(params);
+                    f(expr);
                 }
             }
             LogicalOp::Traverse {
@@ -1214,28 +1235,24 @@ impl LogicalOp {
                 edge_filters,
                 ..
             } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 for (_, expr) in target_filters {
-                    expr.substitute_params(params);
+                    f(expr);
                 }
                 for (_, expr) in edge_filters {
-                    expr.substitute_params(params);
+                    f(expr);
                 }
             }
-            LogicalOp::IndexScan { value_expr, .. } => {
-                value_expr.substitute_params(params);
-            }
-            LogicalOp::NodeCountFromCounter { fallback, .. } => {
-                fallback.substitute_params(params);
-            }
+            LogicalOp::IndexScan { value_expr, .. } => f(value_expr),
+            LogicalOp::NodeCountFromCounter { fallback, .. } => fallback.for_each_expr_mut(f),
             LogicalOp::Filter { input, predicate } => {
-                input.substitute_params(params);
-                predicate.substitute_params(params);
+                input.for_each_expr_mut(f);
+                f(predicate);
             }
             LogicalOp::Project { input, items, .. } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 for item in items {
-                    item.expr.substitute_params(params);
+                    f(&mut item.expr);
                 }
             }
             LogicalOp::Aggregate {
@@ -1243,61 +1260,61 @@ impl LogicalOp {
                 group_by,
                 aggregates,
             } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 for expr in group_by {
-                    expr.substitute_params(params);
+                    f(expr);
                 }
                 for agg in aggregates {
-                    agg.arg.substitute_params(params);
+                    f(&mut agg.arg);
                 }
             }
             LogicalOp::Sort { input, items } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 for item in items {
-                    item.expr.substitute_params(params);
+                    f(&mut item.expr);
                 }
             }
             LogicalOp::Limit { input, count } | LogicalOp::Skip { input, count } => {
-                input.substitute_params(params);
-                count.substitute_params(params);
+                input.for_each_expr_mut(f);
+                f(count);
             }
             LogicalOp::CartesianProduct { left, right }
             | LogicalOp::LeftOuterJoin { left, right } => {
-                left.substitute_params(params);
-                right.substitute_params(params);
+                left.for_each_expr_mut(f);
+                right.for_each_expr_mut(f);
             }
             LogicalOp::Union { inputs, .. } => {
                 for input in inputs {
-                    input.substitute_params(params);
+                    input.for_each_expr_mut(f);
                 }
             }
             LogicalOp::Foreach {
                 input, list, body, ..
             } => {
-                input.substitute_params(params);
-                list.substitute_params(params);
-                body.substitute_params(params);
+                input.for_each_expr_mut(f);
+                f(list);
+                body.for_each_expr_mut(f);
             }
             LogicalOp::CallSubquery { input, body, .. } => {
-                input.substitute_params(params);
-                body.substitute_params(params);
+                input.for_each_expr_mut(f);
+                body.for_each_expr_mut(f);
             }
             LogicalOp::CreateNode {
                 input, properties, ..
             } => {
                 if let Some(inp) = input {
-                    inp.substitute_params(params);
+                    inp.for_each_expr_mut(f);
                 }
                 for (_, expr) in properties {
-                    expr.substitute_params(params);
+                    f(expr);
                 }
             }
             LogicalOp::CreateEdge {
                 input, properties, ..
             } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 for (_, expr) in properties {
-                    expr.substitute_params(params);
+                    f(expr);
                 }
             }
             LogicalOp::Update {
@@ -1305,31 +1322,25 @@ impl LogicalOp {
                 items,
                 violation_mode: _,
             } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 for item in items {
-                    substitute_params_in_set_item(item, params);
+                    for_each_set_item_expr(item, f);
                 }
             }
-            LogicalOp::RemoveOp { input, .. } => {
-                input.substitute_params(params);
-            }
-            LogicalOp::Delete { input, .. } => {
-                input.substitute_params(params);
-            }
+            LogicalOp::RemoveOp { input, .. }
+            | LogicalOp::Delete { input, .. }
+            | LogicalOp::TextFilter { input, .. }
+            | LogicalOp::ShortestPath { input, .. }
+            | LogicalOp::RedirectEdges { input, .. } => input.for_each_expr_mut(f),
             LogicalOp::DetachDocument {
                 input, transfer, ..
-            } => {
-                input.substitute_params(params);
-                if let Some(ref mut t) = transfer {
-                    t.predicate.substitute_params(params);
-                }
             }
-            LogicalOp::AttachDocument {
+            | LogicalOp::AttachDocument {
                 input, transfer, ..
             } => {
-                input.substitute_params(params);
-                if let Some(ref mut t) = transfer {
-                    t.predicate.substitute_params(params);
+                input.for_each_expr_mut(f);
+                if let Some(t) = transfer {
+                    f(&mut t.predicate);
                 }
             }
             LogicalOp::Merge {
@@ -1338,12 +1349,9 @@ impl LogicalOp {
                 on_create,
                 ..
             } => {
-                pattern.substitute_params(params);
-                for item in on_match {
-                    substitute_params_in_set_item(item, params);
-                }
-                for item in on_create {
-                    substitute_params_in_set_item(item, params);
+                pattern.for_each_expr_mut(f);
+                for item in on_match.iter_mut().chain(on_create) {
+                    for_each_set_item_expr(item, f);
                 }
             }
             LogicalOp::Upsert {
@@ -1351,77 +1359,61 @@ impl LogicalOp {
                 on_match,
                 on_create_patterns,
             } => {
-                pattern.substitute_params(params);
+                pattern.for_each_expr_mut(f);
                 for item in on_match {
-                    substitute_params_in_set_item(item, params);
+                    for_each_set_item_expr(item, f);
                 }
                 for pat in on_create_patterns {
-                    substitute_params_in_pattern(pat, params);
+                    for_each_pattern_expr(pat, f);
                 }
             }
             LogicalOp::Unwind { input, expr, .. } => {
-                input.substitute_params(params);
-                expr.substitute_params(params);
+                input.for_each_expr_mut(f);
+                f(expr);
             }
             LogicalOp::VectorFilter {
                 input,
                 vector_expr,
                 query_vector,
                 ..
-            } => {
-                input.substitute_params(params);
-                vector_expr.substitute_params(params);
-                query_vector.substitute_params(params);
             }
-            LogicalOp::HnswScan { query_vector, .. } => {
-                query_vector.substitute_params(params);
+            | LogicalOp::VectorTopK {
+                input,
+                vector_expr,
+                query_vector,
+                ..
             }
-            // The query string is a literal the planner extracted.
-            LogicalOp::TextIndexScan { .. } => {}
-            LogicalOp::VectorTopK {
+            | LogicalOp::EdgeVectorSearch {
                 input,
                 vector_expr,
                 query_vector,
                 ..
             } => {
-                input.substitute_params(params);
-                vector_expr.substitute_params(params);
-                query_vector.substitute_params(params);
+                input.for_each_expr_mut(f);
+                f(vector_expr);
+                f(query_vector);
             }
+            LogicalOp::HnswScan { query_vector, .. } => f(query_vector),
+            // The query string is a literal the planner extracted.
+            LogicalOp::TextIndexScan { .. } => {}
             LogicalOp::MaxSimTopK {
                 input,
                 doc_expr,
                 query_expr,
                 ..
             } => {
-                input.substitute_params(params);
-                doc_expr.substitute_params(params);
-                query_expr.substitute_params(params);
-            }
-            LogicalOp::EdgeVectorSearch {
-                input,
-                vector_expr,
-                query_vector,
-                ..
-            } => {
-                input.substitute_params(params);
-                vector_expr.substitute_params(params);
-                query_vector.substitute_params(params);
-            }
-            LogicalOp::TextFilter { input, .. } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
+                f(doc_expr);
+                f(query_expr);
             }
             LogicalOp::EncryptedFilter {
                 input,
                 field_expr,
                 token_expr,
             } => {
-                input.substitute_params(params);
-                field_expr.substitute_params(params);
-                token_expr.substitute_params(params);
-            }
-            LogicalOp::ShortestPath { input, .. } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
+                f(field_expr);
+                f(token_expr);
             }
             LogicalOp::ProcedureCall {
                 input,
@@ -1429,12 +1421,12 @@ impl LogicalOp {
                 filter,
                 ..
             } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 for arg in args {
-                    arg.substitute_params(params);
+                    f(arg);
                 }
                 if let Some(filter) = filter {
-                    filter.substitute_params(params);
+                    f(filter);
                 }
             }
             LogicalOp::RankFuse {
@@ -1444,15 +1436,15 @@ impl LogicalOp {
                 query_text,
                 ..
             } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 for m in methods {
-                    m.substitute_params(params);
+                    f(m);
                 }
                 if let Some(qv) = query_vector {
-                    qv.substitute_params(params);
+                    f(qv);
                 }
                 if let Some(qt) = query_text {
-                    qt.substitute_params(params);
+                    f(qt);
                 }
             }
             LogicalOp::DocScore {
@@ -1463,19 +1455,19 @@ impl LogicalOp {
                 gamma,
                 ..
             } => {
-                input.substitute_params(params);
-                query_vector.substitute_params(params);
-                alpha.substitute_params(params);
-                beta.substitute_params(params);
-                gamma.substitute_params(params);
+                input.for_each_expr_mut(f);
+                f(query_vector);
+                f(alpha);
+                f(beta);
+                f(gamma);
             }
             LogicalOp::MergeNodes {
                 input, conflict, ..
             } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 if let crate::plan::MergeNodesConflictStrategy::SetExpressions(items) = conflict {
                     for item in items {
-                        substitute_params_in_set_item(item, params);
+                        for_each_set_item_expr(item, f);
                     }
                 }
             }
@@ -1485,16 +1477,13 @@ impl LogicalOp {
                 as_of,
                 ..
             } => {
-                input.substitute_params(params);
+                input.for_each_expr_mut(f);
                 for item in set_items {
-                    substitute_params_in_set_item(item, params);
+                    for_each_set_item_expr(item, f);
                 }
                 if let Some(e) = as_of {
-                    e.substitute_params(params);
+                    f(e);
                 }
-            }
-            LogicalOp::RedirectEdges { input, .. } => {
-                input.substitute_params(params);
             }
             LogicalOp::AlterLabel { .. }
             | LogicalOp::CreateTextIndex { .. }
@@ -1525,37 +1514,31 @@ impl LogicalOp {
     }
 }
 
-/// Substitute parameters in a SetItem's expressions.
-fn substitute_params_in_set_item(item: &mut crate::plan::SetItem, params: &HashMap<String, Value>) {
+/// Call `f` on a SET item's expressions.
+fn for_each_set_item_expr(
+    item: &mut crate::plan::SetItem,
+    f: &mut impl FnMut(&mut crate::plan::expr::Expr),
+) {
     use crate::plan::SetItem;
     match item {
         SetItem::Property { expr, .. }
         | SetItem::PropertyPath { expr, .. }
         | SetItem::ReplaceProperties { expr, .. }
-        | SetItem::MergeProperties { expr, .. } => {
-            expr.substitute_params(params);
-        }
-        SetItem::DocFunction { value_expr, .. } => {
-            value_expr.substitute_params(params);
-        }
+        | SetItem::MergeProperties { expr, .. } => f(expr),
+        SetItem::DocFunction { value_expr, .. } => f(value_expr),
         SetItem::AddLabel { .. } => {}
     }
 }
 
-/// Substitute parameters in Pattern property expressions.
-fn substitute_params_in_pattern(pattern: &mut Pattern, params: &HashMap<String, Value>) {
+/// Call `f` on a pattern's property expressions.
+fn for_each_pattern_expr(pattern: &mut Pattern, f: &mut impl FnMut(&mut crate::plan::expr::Expr)) {
     for element in &mut pattern.elements {
-        match element {
-            PatternElement::Node(node) => {
-                for (_, expr) in &mut node.properties {
-                    expr.substitute_params(params);
-                }
-            }
-            PatternElement::Relationship(rel) => {
-                for (_, expr) in &mut rel.properties {
-                    expr.substitute_params(params);
-                }
-            }
+        let properties = match element {
+            PatternElement::Node(node) => &mut node.properties,
+            PatternElement::Relationship(rel) => &mut rel.properties,
+        };
+        for (_, expr) in properties {
+            f(expr);
         }
     }
 }

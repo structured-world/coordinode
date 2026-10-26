@@ -172,57 +172,46 @@ pub enum Expr {
     Star,
 }
 
+/// A direct child of an [`Expr`]: an expression, or the subplan of a graph
+/// subquery.
+pub enum ExprChild<'a> {
+    /// An operand, argument, item or branch.
+    Expr(&'a mut Expr),
+    /// The plan a subquery form runs for each row.
+    Plan(&'a mut LogicalPlan),
+}
+
 impl Expr {
-    /// Replace every [`Expr::Parameter`] node with its bound literal from `params`.
-    ///
-    /// Parameters absent from the map are left as-is (they evaluate to `Null`).
-    /// Graph-subquery forms recurse into their embedded subplan, so a parameter
-    /// used inside a correlated subquery is bound too.
-    pub fn substitute_params(&mut self, params: &HashMap<String, Value>) {
+    /// Call `f` on each direct child of this expression, in written order.
+    /// A pass over expressions recurses through this, so no child escapes it.
+    pub fn for_each_child_mut(&mut self, f: &mut impl FnMut(ExprChild<'_>)) {
+        let mut expr = |e: &mut Expr| f(ExprChild::Expr(e));
         match self {
-            Expr::Parameter(name) => {
-                if let Some(value) = params.get(name.as_str()) {
-                    *self = Expr::Literal(value.clone());
-                }
-            }
-            Expr::Property { base, .. } => base.substitute_params(params),
+            Expr::Property { base, .. } => expr(base),
             Expr::Binary { left, right, .. } => {
-                left.substitute_params(params);
-                right.substitute_params(params);
+                expr(left);
+                expr(right);
             }
-            Expr::Unary { operand, .. } => operand.substitute_params(params),
-            Expr::Call { args, .. } => {
-                for arg in args {
-                    arg.substitute_params(params);
-                }
-            }
-            Expr::List(items) => {
-                for item in items {
-                    item.substitute_params(params);
-                }
-            }
-            Expr::Map(entries) => {
-                for (_, v) in entries {
-                    v.substitute_params(params);
-                }
-            }
+            Expr::Unary { operand, .. }
+            | Expr::IsNull { operand, .. }
+            | Expr::IsTyped { operand, .. } => expr(operand),
+            Expr::Call { args: items, .. } | Expr::List(items) => items.iter_mut().for_each(expr),
+            Expr::Map(entries) => entries.iter_mut().for_each(|(_, v)| expr(v)),
             Expr::MapProjection { base, items } => {
-                base.substitute_params(params);
+                expr(base);
                 for item in items {
-                    if let MapProjItem::Computed(_, ref mut value) = item {
-                        value.substitute_params(params);
+                    if let MapProjItem::Computed(_, value) = item {
+                        expr(value);
                     }
                 }
             }
             Expr::In { item, list } => {
-                item.substitute_params(params);
-                list.substitute_params(params);
+                expr(item);
+                expr(list);
             }
-            Expr::IsNull { operand, .. } => operand.substitute_params(params),
-            Expr::IsTyped { operand, .. } => operand.substitute_params(params),
             Expr::StringMatch { value, pattern, .. } => {
-                value.substitute_params(params);
-                pattern.substitute_params(params);
+                expr(value);
+                expr(pattern);
             }
             Expr::Case {
                 operand,
@@ -230,68 +219,95 @@ impl Expr {
                 otherwise,
             } => {
                 if let Some(op) = operand {
-                    op.substitute_params(params);
+                    expr(op);
                 }
                 for (cond, result) in branches {
-                    cond.substitute_params(params);
-                    result.substitute_params(params);
+                    expr(cond);
+                    expr(result);
                 }
                 if let Some(el) = otherwise {
-                    el.substitute_params(params);
+                    expr(el);
                 }
             }
             Expr::Subscript { base, index } => {
-                base.substitute_params(params);
-                index.substitute_params(params);
+                expr(base);
+                expr(index);
             }
             Expr::Slice { base, start, end } => {
-                base.substitute_params(params);
+                expr(base);
                 if let Some(s) = start {
-                    s.substitute_params(params);
+                    expr(s);
                 }
                 if let Some(e) = end {
-                    e.substitute_params(params);
+                    expr(e);
                 }
             }
             Expr::ListComprehension {
                 list, filter, map, ..
             } => {
-                list.substitute_params(params);
+                expr(list);
                 if let Some(p) = filter {
-                    p.substitute_params(params);
+                    expr(p);
                 }
                 if let Some(m) = map {
-                    m.substitute_params(params);
+                    expr(m);
                 }
             }
             Expr::ListQuantifier {
                 list, predicate, ..
             } => {
-                list.substitute_params(params);
-                predicate.substitute_params(params);
+                expr(list);
+                expr(predicate);
             }
             Expr::Reduce {
                 init, list, step, ..
             } => {
-                init.substitute_params(params);
-                list.substitute_params(params);
-                step.substitute_params(params);
+                expr(init);
+                expr(list);
+                expr(step);
             }
             Expr::ExistsSubplan(subplan) | Expr::CountSubplan(subplan) => {
-                subplan.substitute_params(params);
+                f(ExprChild::Plan(subplan));
             }
             Expr::CollectSubplan {
                 subplan,
-                projection,
+                projection: other,
+            }
+            | Expr::PatternComprehension {
+                subplan,
+                map: other,
             } => {
-                subplan.substitute_params(params);
-                projection.substitute_params(params);
+                f(ExprChild::Plan(subplan));
+                f(ExprChild::Expr(other));
             }
-            Expr::PatternComprehension { subplan, map } => {
-                subplan.substitute_params(params);
-                map.substitute_params(params);
-            }
-            Expr::Literal(_) | Expr::Variable(_) | Expr::Star => {}
+            Expr::Parameter(_) | Expr::Literal(_) | Expr::Variable(_) | Expr::Star => {}
         }
+    }
+
+    /// Call `f` on every subquery plan this expression holds, outside other
+    /// subquery plans: a plan nested in one is `f`'s to reach.
+    pub fn for_each_subplan_mut(&mut self, f: &mut impl FnMut(&mut LogicalPlan)) {
+        self.for_each_child_mut(&mut |child| match child {
+            ExprChild::Expr(e) => e.for_each_subplan_mut(f),
+            ExprChild::Plan(plan) => f(plan),
+        });
+    }
+
+    /// Replace every [`Expr::Parameter`] node with its bound literal from `params`.
+    ///
+    /// Parameters absent from the map are left as-is (they evaluate to `Null`).
+    /// Graph-subquery forms recurse into their embedded subplan, so a parameter
+    /// used inside a correlated subquery is bound too.
+    pub fn substitute_params(&mut self, params: &HashMap<String, Value>) {
+        if let Expr::Parameter(name) = self {
+            if let Some(value) = params.get(name.as_str()) {
+                *self = Expr::Literal(value.clone());
+            }
+            return;
+        }
+        self.for_each_child_mut(&mut |child| match child {
+            ExprChild::Expr(e) => e.substitute_params(params),
+            ExprChild::Plan(plan) => plan.substitute_params(params),
+        });
     }
 }

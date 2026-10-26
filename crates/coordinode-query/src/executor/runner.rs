@@ -4982,15 +4982,29 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 let mut joined = Ok(());
                 for lr in left_rows {
                     // The left row is lent to the right side and taken back:
-                    // only a right side yielding several rows copies it.
-                    ctx.correlated_row = Some(lr);
+                    // only a right side yielding several rows copies it. Under
+                    // an enclosing correlation the right side sees that row
+                    // too, and the left row alone is what joins.
+                    let mut base = None;
+                    ctx.correlated_row = Some(match &prev_corr {
+                        None => lr,
+                        Some(outer) => {
+                            let scope = correlation_scope(outer, &lr);
+                            base = Some(lr);
+                            scope
+                        }
+                    });
                     joined = ctx.in_budget_part(
                         |ctx| execute_op(right, ctx),
                         |ctx, rr| {
                             // Every operator that replaces the correlated row
                             // restores it, so the right side hands back this one.
-                            let mut lr = ctx.correlated_row.take();
-                            debug_assert!(lr.is_some(), "the correlated row was not restored");
+                            let restored = ctx.correlated_row.take();
+                            debug_assert!(
+                                restored.is_some(),
+                                "the correlated row was not restored"
+                            );
+                            let mut lr = base.take().or(restored);
                             let last = rr.len().checked_sub(1);
                             for (i, r) in rr.into_iter().enumerate() {
                                 let mut merged = if Some(i) == last {
@@ -10941,7 +10955,11 @@ fn join_by_index_key(
         let mut keys: Vec<SharedKey> = Vec::new();
         let mut slots: Vec<Option<usize>> = Vec::with_capacity(left_rows.len());
         for (row, lr) in left_rows.iter().enumerate() {
-            let key = eval_neutral(scan.value_expr, lr)?;
+            // Under an enclosing correlation the key may read its row too.
+            let key = match &prev_corr {
+                None => eval_neutral(scan.value_expr, lr)?,
+                Some(outer) => eval_neutral(scan.value_expr, &correlation_scope(outer, lr))?,
+            };
             // Equal keys of these kinds are one index key. Other keys are
             // looked up every time: equal floats can differ (0.0, -0.0), and
             // the lookup, not this comparison, decides what they match.
@@ -10969,7 +10987,7 @@ fn join_by_index_key(
             };
             slots.push(Some(at));
         }
-        answer_shared_keys(&mut keys, &left_rows, right, &scan, ctx)?;
+        answer_shared_keys(&mut keys, &left_rows, right, &scan, prev_corr.as_ref(), ctx)?;
 
         let mut result = Vec::new();
         for (lr, slot) in left_rows.into_iter().zip(slots) {
@@ -10977,7 +10995,10 @@ fn join_by_index_key(
             let rows: &[Row] = match slot {
                 Some(at) => &keys[at].rows,
                 None => {
-                    ctx.correlated_row = Some(lr.clone());
+                    ctx.correlated_row = Some(match &prev_corr {
+                        None => lr.clone(),
+                        Some(outer) => correlation_scope(outer, &lr),
+                    });
                     fresh = execute_op(right, ctx)?;
                     &fresh
                 }
@@ -10999,6 +11020,16 @@ fn join_by_index_key(
     })();
     ctx.correlated_row = prev_corr;
     joined
+}
+
+/// The row a join's right side sees for its left row `left` under an
+/// enclosing correlation `outer` (the outer row of a subquery, the left row
+/// of an enclosing join): both bindings, the left row's where they share a
+/// name.
+fn correlation_scope(outer: &Row, left: &Row) -> Row {
+    let mut scope = outer.clone();
+    scope.extend(left.iter().map(|(k, v)| (k.clone(), v.clone())));
+    scope
 }
 
 /// The nodes an index lookup of one key names; `None` when the key has no
@@ -11028,17 +11059,23 @@ struct SharedKey {
 /// lookup would (no key encoding, an index that cannot answer, a temporal
 /// label, more candidates than a batch, an entry that shows the index
 /// wrong) runs the lookup itself for its first left row, which reaches the
-/// per-row answer, records included.
+/// per-row answer, records included. `outer` is the enclosing correlation
+/// that lookup sees under its left row.
 fn answer_shared_keys(
     keys: &mut [SharedKey],
     left_rows: &[Row],
     right: &LogicalOp,
     scan: &IndexKeyScan<'_>,
+    outer: Option<&Row>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
     use coordinode_modality::NodeStore as _;
     let alone = |at: usize, keys: &mut [SharedKey], ctx: &mut ExecutionContext<'_>| {
-        ctx.correlated_row = Some(left_rows[keys[at].row].clone());
+        let left = &left_rows[keys[at].row];
+        ctx.correlated_row = Some(match outer {
+            None => left.clone(),
+            Some(outer) => correlation_scope(outer, left),
+        });
         keys[at].rows = execute_op(right, ctx)?;
         Ok::<(), ExecutionError>(())
     };
@@ -11190,24 +11227,35 @@ fn execute_left_outer_join_correlated(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let prev_correlated = ctx.correlated_row.take();
-    let joined = join_correlated(left_rows, right_op, right_vars, ctx);
+    let joined = join_correlated(
+        left_rows,
+        right_op,
+        right_vars,
+        prev_correlated.as_ref(),
+        ctx,
+    );
     // The outer scope comes back whether the join finished or was refused.
     ctx.correlated_row = prev_correlated;
     joined
 }
 
 /// The rows of [`execute_left_outer_join_correlated`], each left row's right
-/// side run with it as the correlated row.
+/// side run with it, under the enclosing correlation `outer`, as the
+/// correlated row.
 fn join_correlated(
     left_rows: &[Row],
     right_op: &LogicalOp,
     right_vars: &[String],
+    outer: Option<&Row>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
 
     for left_row in left_rows {
-        ctx.correlated_row = Some(left_row.clone());
+        ctx.correlated_row = Some(match outer {
+            None => left_row.clone(),
+            Some(outer) => correlation_scope(outer, left_row),
+        });
 
         // The right side's rows are held only until they are joined.
         ctx.in_budget_part(
