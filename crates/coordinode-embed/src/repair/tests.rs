@@ -904,6 +904,76 @@ fn database_open_finishes_an_interrupted_table_rebuild() {
     );
 }
 
+/// A table rebuild cut short with no checkpoint to finish it from is reported
+/// by the database open, not passed over: the open names the table in its
+/// error, and the intent stays for the operator's restore.
+#[test]
+fn database_open_reports_a_table_rebuild_it_cannot_finish() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// Every error event's fields, rendered.
+    struct Errors(Arc<parking_lot::Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Errors {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            if *event.metadata().level() == tracing::Level::ERROR {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().push(fields.0);
+            }
+        }
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let data_dir = {
+        let engine = StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded");
+        engine
+            .columnar_insert(
+                "trades",
+                b"row:000000".to_vec(),
+                b"kept".to_vec(),
+                oracle.next().as_raw(),
+            )
+            .expect("columnar insert");
+        engine.data_dir().to_path_buf()
+    };
+    let intents = data_dir.join("rebuild");
+    std::fs::create_dir_all(&intents).expect("intent dir");
+    std::fs::write(intents.join("table.trades"), b"").expect("intent");
+
+    let errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Errors(Arc::clone(&errors)));
+    let db = tracing::subscriber::with_default(subscriber, || crate::Database::open(&data_dir))
+        .expect("the open serves what it has");
+    let errors = errors.lock();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("corrupt_tables=[\"trades\"]")),
+        "the open did not report the table: {errors:?}"
+    );
+    assert_eq!(
+        db.engine().pending_table_rebuilds().expect("intents"),
+        vec!["trades".to_string()],
+        "the intent is kept until a restore finishes it"
+    );
+}
+
 /// A lossy table repair with no checkpoint to rebuild from is reported, not
 /// absorbed: the table is listed, nothing claims a rebuild, and the next open
 /// reports the same loss.
