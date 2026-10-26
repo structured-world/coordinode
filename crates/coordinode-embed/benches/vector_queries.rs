@@ -1,6 +1,7 @@
 //! Vector statements end to end, measured the same way before and after a
 //! change to the vector arithmetic: the latency distribution (p50, p99,
-//! p999) of an index top-k with its exact rerank, an exhaustive top-k, a
+//! p999) of an index top-k with its exact rerank (with the distance returned
+//! and with only the ordering reading it), an exhaustive top-k, a
 //! distance threshold, a similarity projection over every row, and the index
 //! top-k while another thread writes vectors.
 //!
@@ -156,6 +157,15 @@ fn main() {
             &db,
             &format!("{shape} index top-10"),
             TOP_K_V,
+            &queries,
+            HOT,
+        );
+        // The ordering read before a projection that drops the vector: the
+        // same top-10, served from the index too.
+        measure(
+            &db,
+            &format!("{shape} index top-10, vector not returned"),
+            "MATCH (n:V) RETURN n.i AS i ORDER BY vector_distance(n.e, $q) LIMIT 10",
             &queries,
             HOT,
         );
