@@ -1132,10 +1132,7 @@ fn a_table_missing_from_the_checkpoint_is_refused() {
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
     assert_eq!(
         report.refused_tables,
-        vec![(
-            "late".to_string(),
-            TableRebuildRefusal::MissingFromCheckpoint
-        )],
+        vec![("late".to_string(), RebuildRefusal::MissingFromCheckpoint)],
         "{report:?}"
     );
     assert!(report.repaired_tables.is_empty(), "{report:?}");
@@ -1217,7 +1214,7 @@ fn a_table_rebuild_across_a_catalog_change_is_refused() {
     assert!(
         matches!(
             report.refused_tables.as_slice(),
-            [(table, TableRebuildRefusal::CatalogChanged { .. })] if table == "trades"
+            [(table, RebuildRefusal::CatalogChanged { .. })] if table == "trades"
         ),
         "{report:?}"
     );
@@ -1269,7 +1266,7 @@ fn a_table_rebuild_missing_part_of_the_journal_is_refused() {
         .expect("rebuild");
     assert_eq!(
         outcome,
-        TableRebuild::Refused(TableRebuildRefusal::UncoveredEntry { index: lost })
+        Rebuild::Refused(RebuildRefusal::UncoveredEntry { index: lost })
     );
     assert_eq!(
         engine.columnar_scan("trades", u64::MAX).expect("scan"),
@@ -1448,9 +1445,10 @@ fn a_rebuild_of_the_index_partition_keeps_every_family() {
         .oplog_read_since(from)
         .expect("read")
         .expect("journal");
-    engine
+    let outcome = engine
         .repair_partition_from_checkpoint(&ckpt, &since, Partition::Idx)
         .expect("rebuild");
+    assert!(matches!(outcome, Rebuild::Rebuilt { .. }), "{outcome:?}");
     for (key, value) in [
         (entry.as_slice(), &b"holder"[..]),
         (b"tkey:1", b"table"),
@@ -1496,9 +1494,10 @@ fn a_rebuild_replays_what_the_checkpoint_tree_lacks() {
         .oplog_read_since(from)
         .expect("read")
         .expect("journal");
-    engine
+    let outcome = engine
         .repair_partition_from_checkpoint(&ckpt, &since, Partition::Node)
         .expect("rebuild");
+    assert!(matches!(outcome, Rebuild::Rebuilt { .. }), "{outcome:?}");
     assert_eq!(
         engine
             .get(Partition::Node, b"node:0:late")
@@ -1512,6 +1511,106 @@ fn a_rebuild_replays_what_the_checkpoint_tree_lacks() {
             .expect("get")
             .as_deref(),
         Some(b"base".as_slice())
+    );
+}
+
+/// A rebuilt partition keeps every version at the seqno it was committed at:
+/// the checkpoint's copy is reinstalled version by version and the journal
+/// replayed at each entry's commit timestamp. A change-feed cursor past the
+/// last commit sees nothing new, and one just before the post-checkpoint
+/// commit sees exactly its key; rewriting the rows at fresh seqnos would hand
+/// every consumer the whole partition again as changed.
+#[test]
+fn a_rebuilt_partition_keeps_its_commit_timestamps() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = open(&dir);
+    let root = checkpoint_root(dir.path());
+    put(&engine, 10, PartitionId::Node, b"node:0:a", b"a-v1");
+    put(&engine, 20, PartitionId::Node, b"node:0:a", b"a-v2");
+    put(&engine, 30, PartitionId::Node, b"node:0:b", b"b");
+    engine.persist().expect("persist");
+    let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
+    put(&engine, 40, PartitionId::Node, b"node:0:c", b"c");
+
+    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let since = engine
+        .oplog_read_since(from)
+        .expect("read")
+        .expect("journal");
+    let outcome = engine
+        .repair_partition_from_checkpoint(&ckpt, &since, Partition::Node)
+        .expect("rebuild");
+    assert!(matches!(outcome, Rebuild::Rebuilt { .. }), "{outcome:?}");
+
+    assert_eq!(
+        engine
+            .changed_keys_since(Partition::Node, 41)
+            .expect("changed since the last commit"),
+        Vec::<Vec<u8>>::new()
+    );
+    assert_eq!(
+        engine
+            .changed_keys_since(Partition::Node, 31)
+            .expect("changed since the checkpoint"),
+        vec![b"node:0:c".to_vec()]
+    );
+    assert_eq!(
+        engine
+            .changed_keys_since(Partition::Node, 11)
+            .expect("changed since the first commit"),
+        vec![
+            b"node:0:a".to_vec(),
+            b"node:0:b".to_vec(),
+            b"node:0:c".to_vec()
+        ]
+    );
+    for (key, value) in [
+        (&b"node:0:a"[..], &b"a-v2"[..]),
+        (b"node:0:b", b"b"),
+        (b"node:0:c", b"c"),
+    ] {
+        assert_eq!(
+            engine.get(Partition::Node, key).expect("get").as_deref(),
+            Some(value)
+        );
+    }
+}
+
+/// A partition rebuild whose journal suffix misses an applied entry is
+/// refused and leaves the partition as it was: binding its coverage past the
+/// entry would certify data the rebuild never had.
+#[test]
+fn a_partition_rebuild_missing_part_of_the_journal_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = open(&dir);
+    let root = checkpoint_root(dir.path());
+    put(&engine, 10, PartitionId::Node, b"node:0:a", b"a");
+    engine.persist().expect("persist");
+    let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
+    put(&engine, 20, PartitionId::Node, b"node:0:b", b"b");
+    put(&engine, 30, PartitionId::Node, b"node:0:c", b"c");
+
+    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let mut since = engine
+        .oplog_read_since(from)
+        .expect("read")
+        .expect("journal");
+    let lost = since.pop().expect("an entry after the checkpoint").index;
+    let outcome = engine
+        .repair_partition_from_checkpoint(&ckpt, &since, Partition::Node)
+        .expect("rebuild");
+    assert_eq!(
+        outcome,
+        Rebuild::Refused(RebuildRefusal::UncoveredEntry { index: lost })
+    );
+    assert!(engine.pending_rebuilds().expect("intents").is_empty());
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:c")
+            .expect("get")
+            .as_deref(),
+        Some(b"c".as_slice()),
+        "a refused rebuild changes nothing"
     );
 }
 

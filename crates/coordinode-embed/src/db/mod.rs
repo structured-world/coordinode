@@ -932,6 +932,7 @@ impl Database {
                             tracing::error!(
                                 corrupt = ?report.corrupt_partitions,
                                 corrupt_tables = ?report.corrupt_tables,
+                                refused_partitions = ?report.refused_partitions,
                                 refused_tables = ?report.refused_tables,
                                 checkpoint = ?report.checkpoint_used,
                                 "partitions or tables still need a rebuild the checkpoint \

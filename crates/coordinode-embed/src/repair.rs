@@ -22,9 +22,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use coordinode_core::schema::definition::encode_label_current_revision_key;
 use coordinode_core::txn::wake::Wake;
-use coordinode_storage::columnar::{TableRebuild, TableRebuildRefusal};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::rebuild::{Rebuild, RebuildRefusal};
 use coordinode_storage::error::{StorageError, StorageResult};
 use coordinode_storage::scrub::{ScrubConfig, scrub_all};
 
@@ -121,6 +121,9 @@ pub struct RepairReport {
     pub corrupt_partitions: Vec<Partition>,
     /// Partitions actually rebuilt from a checkpoint this pass.
     pub repaired: Vec<Partition>,
+    /// Partitions left as they were because the checkpoint and the journal
+    /// cannot prove their state, with the reason.
+    pub refused_partitions: Vec<(Partition, RebuildRefusal)>,
     /// `STORAGE COLUMNAR` tables needing a rebuild, by id: structurally
     /// repaired at engine open with data loss, or a rebuild cut short.
     pub corrupt_tables: Vec<String>,
@@ -129,7 +132,7 @@ pub struct RepairReport {
     /// Tables left as they were because the checkpoint and the journal cannot
     /// prove their state, with the reason. Each stays reported until a later
     /// pass rebuilds it or it is restored from an off-device backup.
-    pub refused_tables: Vec<(String, TableRebuildRefusal)>,
+    pub refused_tables: Vec<(String, RebuildRefusal)>,
     /// The subset of [`repaired`](Self::repaired) restored range-scoped:
     /// only the key ranges the open-time salvage dropped were cleared and
     /// rebuilt, leaving every other SST untouched. Partitions repaired by a
@@ -234,14 +237,34 @@ pub fn verify_and_repair(
 
     let mut repaired = Vec::with_capacity(corrupt.len());
     let mut scoped = Vec::with_capacity(scoped_jobs.len());
+    let mut refused_partitions = Vec::new();
+    let mut refuse = |part: Partition, reason: RebuildRefusal| {
+        tracing::error!(
+            partition = part.name(),
+            %reason,
+            "partition not rebuilt: its state cannot be proved; restore from backup"
+        );
+        refused_partitions.push((part, reason));
+    };
     for &part in &full {
-        engine.repair_partition_from_checkpoint(&checkpoint, &oplog_since, part)?;
-        repaired.push(part);
+        match engine.repair_partition_from_checkpoint(&checkpoint, &oplog_since, part)? {
+            Rebuild::Rebuilt { .. } => repaired.push(part),
+            Rebuild::Refused(reason) => refuse(part, reason),
+        }
     }
     for (part, ranges) in &scoped_jobs {
-        engine.repair_partition_ranges_from_checkpoint(&checkpoint, &oplog_since, *part, ranges)?;
-        repaired.push(*part);
-        scoped.push(*part);
+        match engine.repair_partition_ranges_from_checkpoint(
+            &checkpoint,
+            &oplog_since,
+            *part,
+            ranges,
+        )? {
+            Rebuild::Rebuilt { .. } => {
+                repaired.push(*part);
+                scoped.push(*part);
+            }
+            Rebuild::Refused(reason) => refuse(*part, reason),
+        }
     }
     let mut repaired_tables = Vec::with_capacity(corrupt_tables.len());
     let mut refused_tables = Vec::new();
@@ -256,8 +279,8 @@ pub fn verify_and_repair(
             table,
             &catalog_keys,
         )? {
-            TableRebuild::Rebuilt { .. } => repaired_tables.push(table.clone()),
-            TableRebuild::Refused(reason) => {
+            Rebuild::Rebuilt { .. } => repaired_tables.push(table.clone()),
+            Rebuild::Refused(reason) => {
                 tracing::error!(
                     table = %table,
                     %reason,
@@ -274,7 +297,10 @@ pub fn verify_and_repair(
         repaired,
         corrupt_tables,
         repaired_tables,
-        clean_after: !after.has_errors() && refused_tables.is_empty(),
+        clean_after: !after.has_errors()
+            && refused_partitions.is_empty()
+            && refused_tables.is_empty(),
+        refused_partitions,
         refused_tables,
         scoped,
         checkpoint_used: Some(checkpoint),

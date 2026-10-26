@@ -329,13 +329,15 @@ failing the database; when that repair had to drop damaged data, the next
 journal, and reports it as `corrupt_partitions` / `corrupt_tables` with
 nothing repaired when no checkpoint exists.
 
-A table is rebuilt with the history its checkpoint copy holds (older
-versions and deletions keep their timestamps) and only when the checkpoint
-and the journal prove its state. Otherwise the table is left as the open
-repair left it and listed in `refused_tables` with the reason: the checkpoint
-holds no copy of it, part of the journal after the checkpoint is gone, or the
-table was dropped, re-created or altered after the checkpoint. The report is
-then not clean, and the table is restored from an off-device backup.
+A partition or table is rebuilt with the history its checkpoint copy holds
+(older versions and deletions keep their timestamps, and the journal is
+replayed at each entry's commit timestamp), and only when the checkpoint and
+the journal prove its state. Otherwise it is left as the open repair left it
+and listed in `refused_partitions` or `refused_tables` with the reason: part of
+the journal after the checkpoint is gone, the checkpoint holds no copy of the
+table, or the table was dropped, re-created or altered after the checkpoint.
+The report is then not clean, and the data is restored from an off-device
+backup.
 
 ## Build features
 

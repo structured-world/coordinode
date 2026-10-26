@@ -468,6 +468,29 @@ impl Bindings {
     pub(crate) fn logical_ranges(&self, min: &[u8], max: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut past_max = max.to_vec();
         past_max.push(0x00);
+        self.logical_ranges_until(min, past_max)
+    }
+
+    /// The logical key of the physical `key` of a tree this catalog belongs
+    /// to: `key` as written outside the generation domain, its generation in
+    /// the slot under an installation the catalog names, and `None` under one
+    /// it does not (a retired installation, whose entries nothing reads).
+    pub(crate) fn logical_key(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if domain_tag(key).is_none() {
+            return Some(key.to_vec());
+        }
+        let generation = self.generation(slot(key)?)?;
+        let mut out = Vec::with_capacity(key.len());
+        with_slot(key, generation, &mut out);
+        Some(out)
+    }
+
+    /// [`Self::logical_ranges`] of the physical range `[min, past_max)`.
+    pub(crate) fn logical_ranges_until(
+        &self,
+        min: &[u8],
+        past_max: Vec<u8>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::new();
         let first_tag = [GENERATION_TAGS[0]];
         let past_tags = [GENERATION_TAGS[GENERATION_TAGS.len() - 1] + 1];

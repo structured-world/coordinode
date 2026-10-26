@@ -156,64 +156,6 @@ impl TableRepair {
     }
 }
 
-/// The outcome of rebuilding a table from a checkpoint plus the journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableRebuild {
-    /// The table was rebuilt: `versions` versions and deletions taken from the
-    /// checkpoint at their original seqnos, `replayed` rows from the journal.
-    Rebuilt {
-        /// Versions, merge operands and deletions copied from the checkpoint.
-        versions: usize,
-        /// Rows replayed from the journal suffix.
-        replayed: usize,
-    },
-    /// Nothing was changed: the checkpoint and the journal cannot prove the
-    /// table's state, and an unproved state is never installed as the table.
-    Refused(TableRebuildRefusal),
-}
-
-/// Why a table rebuild was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableRebuildRefusal {
-    /// The checkpoint holds no tree for the table. A table created after the
-    /// checkpoint and a table whose section is missing look the same, and the
-    /// second must not become an empty table.
-    MissingFromCheckpoint,
-    /// The engine keeps no journal, so what was applied after the checkpoint
-    /// cannot be replayed.
-    NoJournal,
-    /// Journal entry `index` is applied, but neither the checkpoint's copy of
-    /// the table nor the journal suffix holds it.
-    UncoveredEntry {
-        /// The first such entry.
-        index: u64,
-    },
-    /// The journal suffix changes the table's catalog entry at entry `index`:
-    /// a DROP and a re-create under the same name may stand between the
-    /// checkpoint's table and the live one.
-    CatalogChanged {
-        /// The first entry changing it.
-        index: u64,
-    },
-}
-
-impl core::fmt::Display for TableRebuildRefusal {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::MissingFromCheckpoint => f.write_str("the checkpoint holds no copy of the table"),
-            Self::NoJournal => f.write_str("no journal to replay the entries after the checkpoint"),
-            Self::UncoveredEntry { index } => write!(
-                f,
-                "journal entry {index} is applied but neither the checkpoint nor the journal holds it"
-            ),
-            Self::CatalogChanged { index } => write!(
-                f,
-                "journal entry {index} changes the table's catalog entry after the checkpoint"
-            ),
-        }
-    }
-}
-
 /// What every table tree shares with the engine's partition trees.
 pub(crate) struct TableTreeSettings {
     /// The tree config of a table, built as the engine builds a partition's

@@ -29,6 +29,7 @@ use crate::engine::oplog_journal::{
     EmbeddedOplog, OplogJournalConfig, apply_oplog_ops_at, op_partition,
 };
 use crate::engine::partition::Partition;
+use crate::engine::rebuild::{self, Rebuild, RebuildRefusal};
 use crate::engine::routing::PartitionRouting;
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp};
@@ -2771,41 +2772,49 @@ impl StorageEngine {
     /// (WAL-replay-repair, repair path 2). Used when no healthy replica can
     /// serve the partition — the single-node / embedded / RF=1 case.
     ///
-    /// Opens `checkpoint_dir` read-only, exports the partition's base
-    /// key-values, physically drops the live (corrupt) partition tables,
-    /// reinstalls the base, then replays the entries of `oplog_since` the
-    /// base lacks to roll the partition forward to its current state.
-    /// Returns the number of base entries reinstalled.
+    /// Opens `checkpoint_dir` read-only, physically drops the live (corrupt)
+    /// partition tables, reinstalls every version, merge operand and deletion
+    /// the checkpoint's copy holds, each at its original seqno, then replays
+    /// the entries of `oplog_since` that copy lacks, each at its own commit
+    /// timestamp, to roll the partition forward to its current state.
+    ///
+    /// The rebuild is refused, changing nothing, unless it can prove the
+    /// partition's state: the engine keeps a journal, and every applied
+    /// journal entry is in the checkpoint's copy or in `oplog_since`.
     ///
     /// Same-disk checkpoints only protect against localized corruption;
     /// whole-device loss requires an off-device backup (PITR).
+    ///
+    /// # Errors
+    ///
+    /// The checkpoint cannot be opened or read, the journal suffix does not
+    /// decode, or the partition cannot be cleared or written.
     pub fn repair_partition_from_checkpoint(
         &self,
         checkpoint_dir: &Path,
         oplog_since: &[OplogEntry],
         partition: Partition,
-    ) -> StorageResult<usize> {
-        // 1. Open the checkpoint read-only and export the partition base, with
-        //    the record of which journal entries the base holds. The
-        //    checkpoint engine is dropped before we mutate the live engine.
-        let (base, held, checkpoint_local): (Rows, TreeCoverage, Rows) = {
-            let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
-            let snapshot = ckpt.snapshot();
-            // Every key of the partition, whatever family wrote it; this
-            // node's own records (its consensus state) are newer in the live
-            // store than in any checkpoint and are not taken back from it,
-            // unless the live store cannot give them.
-            let (rows, local): (Rows, Rows) = ckpt
-                .snapshot_prefix_scan(&snapshot, partition, &[])?
-                .into_iter()
-                .map(|(k, v)| (k, v.to_vec()))
-                .partition(|(k, _)| !raft_coverage::is_node_local(partition, k));
-            (
-                rows,
-                TreeCoverage::read(ckpt.tree(partition)?, Domain::Journal)?,
-                local,
-            )
+    ) -> StorageResult<Rebuild> {
+        let Some(coverage) = self.coverage.as_ref().filter(|_| self.oplog.is_some()) else {
+            return Ok(Rebuild::Refused(RebuildRefusal::NoJournal));
         };
+
+        // 1. Prove the state before touching the live partition.
+        let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
+        let source = ckpt.tree(partition)?.clone();
+        let held = TreeCoverage::read(&source, Domain::Journal)?;
+        // Read once: the coverage written in step 4 is exactly what was proved.
+        let (next, above) = coverage.applied_snapshot();
+        if let Some(refusal) = rebuild::uncovered_entry(&held, oplog_since, (next, &above)) {
+            return Ok(Rebuild::Refused(refusal));
+        }
+        // The copy's entries are stored under its own installations.
+        let source_bindings = ckpt.installations_of(partition).map(|i| i.current());
+        // This node's own records (its consensus state) are newer in the live
+        // store than in any checkpoint and are not taken back from it, unless
+        // the live store cannot give them.
+        let checkpoint_local = ckpt.node_local_rows(partition)?;
+
         // The clear below removes this node's own records with the rest of
         // the tree, so they are read first and put back after the base. A
         // live tree that cannot give them (the corruption reaches them) gives
@@ -2838,15 +2847,26 @@ impl StorageEngine {
         //    data is not, so the intent goes first.
         self.begin_rebuild(partition)?;
         self.clear_partition(partition)?;
-        let base_len = base.len();
-        for (key, value) in base.iter().chain(&local) {
+        let mut versions = 0;
+        for event in rebuild::tree_history(&source)? {
+            if self.reinstall_event(partition, source_bindings.as_deref(), event)? {
+                versions += 1;
+            }
+        }
+        drop(source);
+        drop(ckpt);
+        for (key, value) in &local {
             self.put(partition, key, value)?;
         }
 
-        // 3. Replay the granular oplog ops the base lacks for this partition,
-        //    rolling it forward to the current state. What the base holds is
+        // 3. Replay the journal entries the copy lacks for this partition at
+        //    their own commit timestamps, each with its coverage marker,
+        //    rolling it forward to the current state. What the copy holds is
         //    its own record, not a journal position: a commit landing while
-        //    the checkpoint was taken can be in the base or not.
+        //    the checkpoint was taken can be in it or not.
+        let tree = self.tree(partition)?;
+        let installations = self.installations_of(partition);
+        let mut replayed = 0;
         for entry in oplog_since {
             if held.contains(entry.index, 0) {
                 continue;
@@ -2854,19 +2874,146 @@ impl StorageEngine {
             // A rebuilt index partition derives its DERIVED entries from the
             // journal entry's own data ops, which it does not replay itself.
             let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
-            for op in ops.iter() {
-                if op_partition(op) != Some(partition) {
-                    continue;
-                }
-                self.apply_repair_op(partition, op)?;
+            let ops: Vec<&OplogOp> = ops
+                .iter()
+                .filter(|op| op_partition(op) == Some(partition))
+                .collect();
+            if ops.is_empty() {
+                continue;
             }
+            apply_oplog_ops_at(
+                tree,
+                installations,
+                &ops,
+                entry.ts,
+                entry.index,
+                Domain::Journal,
+            )?;
+            replayed += 1;
         }
-        self.rebind_coverage(partition)?;
+        self.coordinator.flush_trigger().wrote_unmeasured();
+        self.rebind_coverage(partition, next, &above)?;
         self.finish_rebuild(partition)?;
         // The rebuilt tree is on disk: whatever an open-time repair of it
         // lost is restored.
         self.acknowledge_open_repair(partition)?;
-        Ok(base_len)
+        Ok(Rebuild::Rebuilt { versions, replayed })
+    }
+
+    /// Write one event of a checkpoint copy's history into the rebuilt
+    /// `partition` at its original seqno, translated from the copy's
+    /// installations (`source_bindings`, for the index partition) to this
+    /// engine's. Returns whether the event belongs to the rebuilt tree: the
+    /// reserved keys do not (the coverage record is written once the rebuild
+    /// is proved, and the index catalog stays this member's), nor do this
+    /// node's own records (taken from the live tree) or entries under a
+    /// retired installation.
+    fn reinstall_event(
+        &self,
+        partition: Partition,
+        source_bindings: Option<&crate::engine::installation::Bindings>,
+        event: lsm_tree::ScanSinceEvent,
+    ) -> StorageResult<bool> {
+        use lsm_tree::ScanSinceEvent;
+
+        let tree = self.tree(partition)?;
+        let mut addressing = crate::engine::installation::Addressing::new(
+            self.installations_of(partition),
+            tree,
+            event.seqno(),
+        );
+        let written = match event {
+            ScanSinceEvent::RangeTombstone {
+                start_key,
+                end_key,
+                seqno,
+            } => {
+                let start = coverage::clamp_user_start(&start_key);
+                // The consensus partition holds only this node's own records.
+                if start >= end_key.as_ref() || partition == Partition::Raft {
+                    return Ok(false);
+                }
+                let logical = match source_bindings {
+                    Some(bindings) => bindings.logical_ranges_until(start, end_key.to_vec()),
+                    None => vec![(start.to_vec(), end_key.to_vec())],
+                };
+                let mut added = 0;
+                for (start, end) in logical {
+                    let stored = addressing.range(&start, &end);
+                    let staging = addressing.staging_range(&start, &end);
+                    for (start, end) in stored.into_iter().chain(staging) {
+                        if start < end {
+                            added += tree.remove_range(start, end, seqno);
+                        }
+                    }
+                }
+                Some((added, tree.active_memtable().size()))
+            }
+            ScanSinceEvent::Insert { key, value, seqno } => {
+                self.reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
+                    tree.insert(key, value.clone(), seqno)
+                })?
+            }
+            ScanSinceEvent::MergeOperand {
+                key,
+                operand,
+                seqno,
+            } => {
+                self.reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
+                    tree.merge(key, operand.clone(), seqno)
+                })?
+            }
+            ScanSinceEvent::PointTombstone { key, seqno } => {
+                self.reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
+                    tree.remove(key, seqno)
+                })?
+            }
+            ScanSinceEvent::WeakTombstone { key, seqno } => {
+                self.reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
+                    tree.remove_weak(key, seqno)
+                })?
+            }
+        };
+        let Some((added, memtable)) = written else {
+            return Ok(false);
+        };
+        self.coordinator.flush_trigger().wrote(added, memtable);
+        Ok(true)
+    }
+
+    /// The point write of [`Self::reinstall_event`]: `write` applied to the
+    /// stored key of the copy's physical `key` and to its replacement's, or
+    /// `None` when the key does not belong to the rebuilt tree.
+    fn reinstall_point(
+        &self,
+        partition: Partition,
+        source_bindings: Option<&crate::engine::installation::Bindings>,
+        addressing: &mut crate::engine::installation::Addressing<'_>,
+        key: &[u8],
+        write: impl Fn(Vec<u8>) -> (u64, u64),
+    ) -> StorageResult<Option<(u64, u64)>> {
+        if coverage::is_reserved(key) {
+            return Ok(None);
+        }
+        let logical = match source_bindings {
+            Some(bindings) => match bindings.logical_key(key) {
+                Some(logical) => logical,
+                None => return Ok(None),
+            },
+            None => key.to_vec(),
+        };
+        if raft_coverage::is_node_local(partition, &logical) {
+            return Ok(None);
+        }
+        let stored = addressing.point(&logical)?.to_vec();
+        let staging = addressing.staging_point(&logical).map(<[u8]>::to_vec);
+        let (mut added, mut memtable) = write(stored);
+        if let Some(staging) = staging {
+            let (more, size) = write(staging);
+            added += more;
+            memtable = size;
+        }
+        Ok(Some((added, memtable)))
     }
 
     /// Rebuild `STORAGE COLUMNAR` table `table_id` from a checkpoint plus the
@@ -2902,32 +3049,27 @@ impl StorageEngine {
         oplog_since: &[OplogEntry],
         table_id: &str,
         catalog_keys: &[Vec<u8>],
-    ) -> StorageResult<crate::columnar::TableRebuild> {
-        use crate::columnar::{TableRebuild, TableRebuildRefusal};
-
+    ) -> StorageResult<Rebuild> {
         let Some(coverage) = self.coverage.as_ref().filter(|_| self.oplog.is_some()) else {
-            return Ok(TableRebuild::Refused(TableRebuildRefusal::NoJournal));
+            return Ok(Rebuild::Refused(RebuildRefusal::NoJournal));
         };
 
-        // 1. Prove the state before touching the live table.
+        // 1. Prove the state before touching the live table. A catalog change
+        //    the checkpoint does not hold may be a DROP and a re-create: the
+        //    checkpoint's table and the live one are then different tables
+        //    under one name.
         let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
         let Some(source) = ckpt.columnar_tables.get(table_id) else {
-            return Ok(TableRebuild::Refused(
-                TableRebuildRefusal::MissingFromCheckpoint,
-            ));
+            return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
         };
         let held = TreeCoverage::read(&source, Domain::Journal)?;
         let catalog_held = TreeCoverage::read(ckpt.tree(Partition::Schema)?, Domain::Journal)?;
         // Read once: the coverage written in step 4 is exactly what was proved.
         let (next, above) = coverage.applied_snapshot();
-        if let Some(refusal) = unproved_table_state(
-            &held,
-            &catalog_held,
-            oplog_since,
-            (next, above.as_slice()),
-            catalog_keys,
-        )? {
-            return Ok(TableRebuild::Refused(refusal));
+        if let Some(refusal) = rebuild::catalog_change(&catalog_held, oplog_since, catalog_keys)?
+            .or_else(|| rebuild::uncovered_entry(&held, oplog_since, (next, &above)))
+        {
+            return Ok(Rebuild::Refused(refusal));
         }
 
         // 2. Replace the live tree with the checkpoint's copy, version by
@@ -2940,8 +3082,8 @@ impl StorageEngine {
             .columnar_tables
             .create_or_open_with(table_id, |_| Ok(()))?;
         let mut versions = 0;
-        for event in tree_history(&source)? {
-            let (added, memtable) = replay_version(&tree, event);
+        for event in rebuild::tree_history(&source)? {
+            let (added, memtable) = rebuild::replay_event(&tree, event);
             self.coordinator.flush_trigger().wrote(added, memtable);
             versions += 1;
         }
@@ -2989,7 +3131,7 @@ impl StorageEngine {
         remove_rebuild_intent(&self.data_dir, target)?;
         // What an open-time salvage of the table lost is restored.
         self.acknowledge_table_repair(table_id)?;
-        Ok(TableRebuild::Rebuilt { versions, replayed })
+        Ok(Rebuild::Rebuilt { versions, replayed })
     }
 
     /// This node's own records in `partition` (see
@@ -3011,23 +3153,17 @@ impl StorageEngine {
     }
 
     /// After a rebuild replayed the journal into `partition` up to its end,
-    /// record in the partition's tree that it holds every applied entry. The
-    /// clear removed its old record, and the replayed ops carry none.
-    ///
-    /// Precondition: no commit is in flight, so every journal entry is
-    /// applied and the rebuild replayed all of them.
-    fn rebind_coverage(&self, partition: Partition) -> StorageResult<()> {
-        let Some(coverage) = &self.coverage else {
-            return Ok(());
-        };
+    /// record in the partition's tree that it holds the applied set it proved
+    /// it holds: every index below `next`, and `above`. The clear removed its
+    /// old record.
+    fn rebind_coverage(&self, partition: Partition, next: u64, above: &[u64]) -> StorageResult<()> {
         let tree = self.tree(partition)?;
-        let (next, above) = coverage.applied_snapshot();
         // Written after the rebuilt data, so a persisted record implies the
         // data it covers is persisted.
         let at = self.next_seqno();
         let domain = Domain::Journal;
         tree.insert(domain.base_key(), coverage::encode_base(next, &[]), at);
-        for index in above {
+        for &index in above {
             tree.insert(domain.marker_key(index, 0).as_slice(), &[][..], at);
         }
         self.coordinator.flush_trigger().wrote_unmeasured();
@@ -3107,15 +3243,26 @@ impl StorageEngine {
     /// holds the op's final effect, and re-applying the delete at a fresh
     /// seqno would erase writes that originally landed after it.
     ///
-    /// Returns the number of checkpoint base entries reinstalled.
+    /// The restored rows are written above the clearing range tombstone, so
+    /// at fresh seqnos. Refused, changing nothing, as a full rebuild is when
+    /// the checkpoint and the journal cannot prove the partition's state.
+    ///
+    /// # Errors
+    ///
+    /// The checkpoint cannot be opened or read, the journal suffix does not
+    /// decode, or the partition cannot be written.
     pub fn repair_partition_ranges_from_checkpoint(
         &self,
         checkpoint_dir: &Path,
         oplog_since: &[OplogEntry],
         partition: Partition,
         ranges: &[KeyRange],
-    ) -> StorageResult<usize> {
+    ) -> StorageResult<Rebuild> {
         use std::ops::Bound;
+
+        let Some(coverage) = self.coverage.as_ref().filter(|_| self.oplog.is_some()) else {
+            return Ok(Rebuild::Refused(RebuildRefusal::NoJournal));
+        };
         // The lost ranges are ranges of the tree as stored; everything below
         // works in the keys the application addresses, `[start, end)`. In the
         // index tree a stored range maps to one logical range per installation
@@ -3166,6 +3313,10 @@ impl StorageEngine {
                 TreeCoverage::read(ckpt.tree(partition)?, Domain::Journal)?,
             )
         };
+        let (next, above) = coverage.applied_snapshot();
+        if let Some(refusal) = rebuild::uncovered_entry(&held, oplog_since, (next, &above)) {
+            return Ok(Rebuild::Refused(refusal));
+        }
 
         // 2. Clear the lost ranges on the live tree, reinstall the base. A
         //    crash part way leaves the ranges' state unknown while the
@@ -3182,10 +3333,12 @@ impl StorageEngine {
 
         // 3. Replay the ops the base lacks that intersect the lost ranges, in
         //    journal order, DERIVED work derived from the whole entry first.
+        let mut replayed = 0;
         for entry in oplog_since {
             if held.contains(entry.index, 0) {
                 continue;
             }
+            replayed += 1;
             let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
             for op in ops.iter() {
                 if op_partition(op) != Some(partition) {
@@ -3221,7 +3374,10 @@ impl StorageEngine {
         self.finish_rebuild(partition)?;
         // The lost ranges are restored and on disk.
         self.acknowledge_open_repair(partition)?;
-        Ok(base_len)
+        Ok(Rebuild::Rebuilt {
+            versions: base_len,
+            replayed,
+        })
     }
 
     /// Read journal entries with `index >= from_index` from the embedded oplog,
@@ -6592,103 +6748,6 @@ fn apply_columnar_row(
         batch.insert(Domain::Journal.marker_key(index, 0).as_slice(), &[][..]);
     }
     Ok(tree.apply_batch(batch, seqno)?)
-}
-
-/// Why a table rebuilt from a checkpoint copy whose coverage is `held` and
-/// the journal suffix `suffix` would not be the table, or `None` when it
-/// would. `applied` is the engine's applied set (its contiguous prefix and
-/// the indices above it); `catalog_held` the checkpoint's schema partition
-/// coverage, and `catalog_keys` the schema keys of the table's catalog entry.
-#[cfg(feature = "columnar")]
-fn unproved_table_state(
-    held: &TreeCoverage,
-    catalog_held: &TreeCoverage,
-    suffix: &[OplogEntry],
-    applied: (u64, &[u64]),
-    catalog_keys: &[Vec<u8>],
-) -> StorageResult<Option<crate::columnar::TableRebuildRefusal>> {
-    use crate::columnar::TableRebuildRefusal;
-
-    // A catalog change the checkpoint does not hold may be a DROP and a
-    // re-create: the checkpoint's table and the live one are then different
-    // tables under one name.
-    for entry in suffix {
-        if catalog_held.contains(entry.index, 0) {
-            continue;
-        }
-        for op in crate::oplog::convert::resolve_entry_ops(&entry.ops)?.iter() {
-            if op_partition(op) != Some(Partition::Schema) {
-                continue;
-            }
-            let touched = match op {
-                OplogOp::Insert { key, .. }
-                | OplogOp::Delete { key, .. }
-                | OplogOp::Merge { key, .. } => catalog_keys.iter().any(|k| k == key),
-                OplogOp::RemoveRange { start, end, .. } => catalog_keys
-                    .iter()
-                    .any(|k| start.as_slice() <= k.as_slice() && k.as_slice() < end.as_slice()),
-                _ => false,
-            };
-            if touched {
-                return Ok(Some(TableRebuildRefusal::CatalogChanged {
-                    index: entry.index,
-                }));
-            }
-        }
-    }
-
-    // Every applied entry is in the checkpoint's copy or in the suffix: a
-    // purged or unread stretch of the journal is lost data, not an empty one.
-    let mut in_suffix: Vec<u64> = suffix.iter().map(|e| e.index).collect();
-    in_suffix.sort_unstable();
-    let (next, above) = applied;
-    let from = held.base().map_or(0, |(base, _)| base);
-    let covered = |index: u64| held.contains(index, 0) || in_suffix.binary_search(&index).is_ok();
-    if let Some(index) = (from..next)
-        .chain(above.iter().copied())
-        .find(|&index| !covered(index))
-    {
-        return Ok(Some(TableRebuildRefusal::UncoveredEntry { index }));
-    }
-    Ok(None)
-}
-
-/// Every version, merge operand and deletion `tree` still holds, oldest seqno
-/// first.
-#[cfg(feature = "columnar")]
-fn tree_history(
-    tree: &lsm_tree::AnyTree,
-) -> StorageResult<Box<dyn Iterator<Item = lsm_tree::ScanSinceEvent>>> {
-    Ok(match tree {
-        lsm_tree::AnyTree::Standard(t) => Box::new(t.scan_since_seqno(0)?),
-        lsm_tree::AnyTree::Blob(t) => Box::new(t.scan_since_seqno(0)?),
-    })
-}
-
-/// Write one event of a tree's history into `tree` at its original seqno.
-/// Returns the bytes the write added and the memtable's size after it.
-#[cfg(feature = "columnar")]
-fn replay_version(tree: &lsm_tree::AnyTree, event: lsm_tree::ScanSinceEvent) -> (u64, u64) {
-    use lsm_tree::ScanSinceEvent;
-
-    match event {
-        ScanSinceEvent::Insert { key, value, seqno } => tree.insert(key, value, seqno),
-        ScanSinceEvent::MergeOperand {
-            key,
-            operand,
-            seqno,
-        } => tree.merge(key, operand, seqno),
-        ScanSinceEvent::PointTombstone { key, seqno } => tree.remove(key, seqno),
-        ScanSinceEvent::WeakTombstone { key, seqno } => tree.remove_weak(key, seqno),
-        ScanSinceEvent::RangeTombstone {
-            start_key,
-            end_key,
-            seqno,
-        } => {
-            let added = tree.remove_range(start_key, end_key, seqno);
-            (added, tree.active_memtable().size())
-        }
-    }
 }
 
 mod raft_coverage;

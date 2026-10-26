@@ -24,6 +24,7 @@ pub mod operations;
 pub mod oplog_journal;
 pub mod partition;
 pub mod pending;
+pub mod rebuild;
 pub mod retention_stats;
 pub mod routing;
 pub mod space;
