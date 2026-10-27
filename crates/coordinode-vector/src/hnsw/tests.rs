@@ -2621,6 +2621,53 @@ fn a_blind_wave_build_leaves_every_node_findable() {
     }
 }
 
+/// A draw whose uniform is zero gives a finite level: an infinite one cast
+/// to `usize` asked for `usize::MAX` layers and aborted the insert. The
+/// generator state 1 reaches that draw at once.
+#[test]
+fn a_level_draw_is_always_finite() {
+    let index = seeded_l2_index(0);
+    assert_eq!(
+        index.rng_state.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the state whose first draw has a zero uniform"
+    );
+    let level = index.random_level();
+    assert!(level < 64, "a level of {level}");
+}
+
+/// Concurrent inserts each take a draw of their own: the generator advances
+/// once per draw however many threads draw at once. A read and a separate
+/// store let threads take the same state, so they drew the same level and
+/// the build's level spread followed how the threads ran.
+#[test]
+fn concurrent_level_draws_never_repeat_a_state() {
+    let index = seeded_l2_index(7);
+    let start = index.rng_state.load(std::sync::atomic::Ordering::Relaxed);
+    let threads = 8u64;
+    let draws = 20_000u64;
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                for _ in 0..draws {
+                    index.random_level();
+                }
+            });
+        }
+    });
+    let mut expected = start;
+    for _ in 0..threads * draws {
+        expected ^= expected << 13;
+        expected ^= expected >> 7;
+        expected ^= expected << 17;
+    }
+    assert_eq!(
+        index.rng_state.load(std::sync::atomic::Ordering::Relaxed),
+        expected,
+        "every draw advanced the generator once"
+    );
+}
+
 /// A build batch on a wide thread pool leaves no node unreachable, and its
 /// self-recall stays near that of inserting one by one. Pruning a full
 /// list can drop a node's last incoming edge, and inserts in flight together

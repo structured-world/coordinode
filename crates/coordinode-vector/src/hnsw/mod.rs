@@ -3001,15 +3001,24 @@ impl HnswIndex {
 
     /// Generate a random level for a new element.
     fn random_level(&self) -> usize {
-        // Xorshift64 RNG feeding the exponential level distribution.
-        let mut state = self.rng_state.load(std::sync::atomic::Ordering::Relaxed);
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        self.rng_state
-            .store(state, std::sync::atomic::Ordering::Relaxed);
+        // Xorshift64 RNG feeding the exponential level distribution. One
+        // atomic step per draw: concurrent inserts must not take the same
+        // state and so the same level.
+        let step = |mut state: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let previous = self.rng_state.update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            step,
+        );
+        let state = step(previous);
 
-        let uniform = (state >> 33) as f64 / (1u64 << 31) as f64;
+        // In (0, 1]: a zero uniform has an infinite level.
+        let uniform = ((state >> 33) + 1) as f64 / (1u64 << 31) as f64;
         (-uniform.ln() * self.level_mult).floor() as usize
     }
 

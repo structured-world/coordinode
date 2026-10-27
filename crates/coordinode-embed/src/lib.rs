@@ -12,7 +12,7 @@
 //! ```
 //!
 //! The registry package includes generated protocol bindings, so consumers do
-//! not need a proto submodule or protobuf generation tools. Rust 1.92 or newer.
+//! not need a proto submodule or protobuf generation tools. Rust 1.95 or newer.
 //! `Database::open_with_config` takes a `coordinode_storage` configuration:
 //! add `coordinode-storage = "0.9"` to set endpoints, limits or retention.
 //!
