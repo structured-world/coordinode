@@ -64,7 +64,7 @@ apply when neither the config file nor a flag sets the value.
 | `--addr` | `[::]:7080` | gRPC listen address. Carries the native API and inter-node Raft RPCs. A port already in use fails the start before storage is opened; so does a busy `--rest-addr` or `--ops-addr`. |
 | `--advertise-addr` | same as `--addr` | Address other nodes use to reach this node. Set it when `--addr` binds `0.0.0.0` or `[::]` so peers learn the real host/IP. |
 | `--rest-addr` | `[::]:7081` | REST/JSON listen address. Present only when built with the `rest-proxy` feature. A port already in use fails the start. Pass port `0` for an ephemeral port. |
-| `--ops-addr` | `[::]:7084` | Operational HTTP address for `/metrics`, `/health` (200 while the process runs), `/ready` (200 while the gRPC server serves; 503 while starting and from the shutdown signal on) and `POST /reload` (reads a cluster member's node identity files again, see [Node identity](#node-identity)). Consensus that stops on a fatal error, such as a failed log write or sync, shuts the process down with a non-zero exit status: after a failed sync the unsynced pages may already be gone, so the node does not carry on; its supervisor restarts it and recovery replays the durable state, which holds every acknowledged write. Run the server under a supervisor that restarts it (`restart: unless-stopped` in Compose, `Restart=on-failure` in systemd). A port already in use fails the start, so a health check on this port can never be answered by another process. Pass port `0` to let the OS assign an ephemeral port (handy in tests). |
+| `--ops-addr` | `[::]:7084` | Operational HTTP address for `/metrics`, `/health` (200 while the process runs), `/ready` (200 while the gRPC server serves; 503 while starting and from the shutdown signal on), `POST /reload` (reads a cluster member's node identity files again, see [Node identity](#node-identity)), and `GET /blob-gc` / `POST /blob-gc/run` (orphan blob collection status and an immediate pass, see [Orphan blob collection](#orphan-blob-collection)). Bind it to an operators' network: whoever reaches it can read these and ask for a pass, though a pass cannot do more than the collector does by itself. Consensus that stops on a fatal error, such as a failed log write or sync, shuts the process down with a non-zero exit status: after a failed sync the unsynced pages may already be gone, so the node does not carry on; its supervisor restarts it and recovery replays the durable state, which holds every acknowledged write. Run the server under a supervisor that restarts it (`restart: unless-stopped` in Compose, `Restart=on-failure` in systemd). A port already in use fails the start, so a health check on this port can never be answered by another process. Pass port `0` to let the OS assign an ephemeral port (handy in tests). |
 | `--pg-addr` | (disabled) | PostgreSQL wire-protocol listen address (for example `127.0.0.1:7085`). Unset = the Postgres frontend is off. Serves SQL over the Postgres Simple Query protocol with trust authentication (no password), so bind it to a trusted interface only. |
 | `--data` | `./data` | Data directory. Holds the storage engine state. |
 | `--peers` | (none) | Comma-separated peer addresses, for example `node2:7080,node3:7080`. Presence enables Raft consensus, and then the node needs a `node_identity` (see [Node identity](#node-identity)). |
@@ -155,6 +155,14 @@ the key is unset.
 | `checkpoint_interval_secs` | `3600` (1 hour) | restart | Seconds between periodic checkpoints. A rebuild from the latest checkpoint replays the Raft log from the oldest entry the checkpoint lacks, so the log is kept from there: a longer interval keeps more log on disk. |
 | `checkpoint_dir` | `<data_dir>/checkpoints` | restart | Directory checkpoints are written under. |
 | `checkpoint_keep` | `3` | restart | Number of recent checkpoints to retain; older ones are pruned. |
+| `blob_gc_grace_secs` | `86400` (24 hours) | live (`Database::set_blob_gc_policy`) | Least time a blob chunk nothing holds any more is kept before it is collected. The MVCC retention window (`retention_window_secs`) raises it when longer, and a reader, retained history, a lagging change-stream consumer or an upload in progress holds a chunk longer still: the grace is a minimum, never a promise of when the space returns. See [Orphan blob collection](#orphan-blob-collection). |
+| `blob_gc_upload_expiry_secs` | `3600` (1 hour) | live (`Database::set_blob_gc_policy`) | How long an upload may stay admitted without being published before it is fenced and its chunks collected. An upload is published milliseconds after its bytes are written unless the process failed in between, so this only ever reaches uploads nobody will finish; a late attempt to publish one is refused. |
+| `blob_gc_batch` | `1024` | live (`Database::set_blob_gc_policy`) | Most items one collection pass takes from each of its queues (released chunks whose grace has passed, expired uploads, retired copies to delete). A longer backlog is worked through in further passes straight after. Zero is refused. |
+| `blob_gc_reconcile_interval_secs` | `86400` | live (`Database::set_blob_gc_policy`) | Interval between reconciliations of blob accounting against the blobs that hold chunks. A reconciliation corrects a count that drifted, gives a released chunk a lost collection record back, and collects stored bytes nothing names; one also runs before anything is collected for the first time. Zero is refused. |
+| `blob_gc_reconcile_max_contents` | `1000000` | live (`Database::set_blob_gc_policy`) | About how many distinct chunks one reconciliation holds in memory at a time, some 100 bytes each; a store with more is reconciled in slices, each rereading the blob records. Zero is refused. |
+| `blob_gc_compact_after_mb` | `64` | live (`Database::set_blob_gc_policy`) | MiB of blob payload deleted since the last compaction at which the next one runs to return their space. A compaction rewrites the blob partition's index and the value files it relocates, so it waits for a value file's worth (64 MiB) to be gone: such a file is then dropped whole instead of rewritten. `0` compacts after every cleanup, which returns space soonest at the cost of foreground latency under steady deletion. |
+| `blob_gc_compact_after_secs` | `600` | live (`Database::set_blob_gc_policy`) | Longest deleted payload waits for its compaction when less than `blob_gc_compact_after_mb` was deleted. |
+| `blob_gc_retry_interval_secs` | `60` | live (`Database::set_blob_gc_policy`) | How soon collection tries again while work is held: by an upload in progress, by a reader or retained history keeping deleted bytes from the compaction that frees them, or after a failure. Collection otherwise sleeps until a deletion wakes it or the earliest grace ends. Zero is refused. |
 | `trigger_max_cascade_depth` | `10` | live (setParameter) | Async AFTER COMMIT cascade-depth cap. A self- or mutually-triggering chain deeper than this is dead-lettered as a cascade overflow rather than looping. Per-trigger `CASCADE_LIMIT n` overrides it. |
 | `trigger_default_retry_attempts` | `3` | live (setParameter) | Default total execution attempts for an AFTER COMMIT trigger that declares no `ON ERROR` clause, before its event is dead-lettered into `trigger_failures`. Per-trigger `ON ERROR RETRY n` overrides it. |
 | `trigger_default_backoff_ms` | `1000` | live (setParameter) | Default base retry backoff in ms for AFTER COMMIT triggers with no `ON ERROR` clause; per-attempt wait is `backoff * 2^attempt`. Per-trigger `WITH BACKOFF ms` overrides it. |
@@ -164,6 +172,50 @@ the key is unset.
 The three `live` knobs are runtime-tunable on a running database by an owner via
 the privileged setParameter surface, without a restart; the config file sets
 their startup value.
+
+### Orphan blob collection
+
+Deleting or replacing a blob (a `BlobService` blob, an S3 object) releases its
+chunks; a background collector on each node returns their space, with nothing
+for a client to scan, compact or restart. A chunk another blob still holds is
+never touched. A chunk nothing holds is kept through its grace
+(`blob_gc_grace_secs`, at least the retention window) and for as long as a
+reader, retained history, a lagging change-stream consumer or an upload in
+progress needs it; then it is retired, its bytes deleted, and the blob
+partition compacted. A value file a compaction leaves with nothing live in it
+is freed by the next compaction, not by that one: on a node that writes no
+more blobs, the last batch's files stay on disk, reported as
+`stale_blob_bytes`, until something is deleted again. Uploads never published are
+collected after `blob_gc_upload_expiry_secs`. Collection is checked against
+the blob records periodically (`blob_gc_reconcile_interval_secs`) and before
+it first deletes anything; a record that does not decode makes ownership
+unknown, and nothing is collected until it is gone.
+
+The collector sleeps until a deletion wakes it or the earliest grace ends; it
+does not poll an idle node, and runs at most one pass a second however many
+deletions wake it. Its work is bounded per pass (`blob_gc_batch`), it
+compacts once a value file's worth of payload is gone or the oldest deletion
+has waited `blob_gc_compact_after_secs`, its compactions draw on the
+maintenance budget (`maintenance_mb_per_sec`), and
+near a full disk it uses the room kept for maintenance, since collection is
+what brings room back. A member of a group that holds other members collects
+nothing, as it accepts no blob writes. A hard-linked checkpoint keeps the
+files it shares until it is pruned, and the collector does not erase media
+securely.
+
+On the [ops port](#ports), `GET /blob-gc` returns the collector's status as
+JSON: released chunks waiting and how many are due, the oldest of them and
+when the next falls due, unpublished uploads, retired copies awaiting
+deletion and their bytes, whether a compaction still owes space back, what
+has been reclaimed (payload chunks and bytes deleted, and bytes the blob
+partition shrank by), the blob partition's size and its unreturned garbage,
+why collection is stopped if it is, and the last pass. `POST /blob-gc/run`
+runs a pass now and returns what it did; `POST /blob-gc/run?reconcile=true`
+reconciles as well. A pass run this way is the one the collector runs by
+itself: it cannot shorten the grace or pass a reader, history or an upload.
+`/metrics` carries the same figures as `coordinode_blob_gc_*` and
+`coordinode_blobstore_*` series. An embedded database exposes them as
+`Database::blob_gc_status` and `Database::run_blob_gc`.
 
 ### Settings for a downstream distribution
 
@@ -305,7 +357,7 @@ Environment=COORDINODE_LOG_FORMAT=json
 |------|----------|---------|
 | 7080 | gRPC | Native API and inter-node Raft |
 | 7081 | HTTP/REST | JSON transcoding (with the `rest-proxy` feature) |
-| 7084 | HTTP | `/metrics`, `/health`, `/ready`, `/version`, `POST /reload` |
+| 7084 | HTTP | `/metrics`, `/health`, `/ready`, `/version`, `POST /reload`, `GET /blob-gc`, `POST /blob-gc/run` |
 | 7085 | PostgreSQL wire | SQL over the Postgres protocol (opt-in via `--pg-addr`; trust auth) |
 
 Bind the ops address to loopback in production and scrape it through a reverse
@@ -468,6 +520,17 @@ scrub_enabled: false
 # checkpoint_interval_secs: 3600
 # checkpoint_dir: /var/lib/coordinode/checkpoints
 # checkpoint_keep: 3
+
+# Orphan blob collection: how long released chunks are kept (at least the
+# retention window), when unpublished uploads are fenced, and its pacing.
+# blob_gc_grace_secs: 86400
+# blob_gc_upload_expiry_secs: 3600
+# blob_gc_batch: 1024
+# blob_gc_reconcile_interval_secs: 86400
+# blob_gc_reconcile_max_contents: 1000000
+# blob_gc_retry_interval_secs: 60
+# blob_gc_compact_after_mb: 64
+# blob_gc_compact_after_secs: 600
 ```
 
 Set any tunable directly in this file. To override one value without editing the

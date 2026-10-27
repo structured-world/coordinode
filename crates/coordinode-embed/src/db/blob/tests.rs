@@ -91,6 +91,131 @@ fn blob_writes_are_refused_in_a_group_with_other_members() {
     assert_eq!(read(&db, &kept.id), b"before the group grew");
 }
 
+/// `len` bytes that do not compress, so the space they take is what they are.
+fn incompressible(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ seed;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// A database whose collector takes released content at once, with no
+/// retained history holding it either.
+fn collecting_at_once() -> (Database, tempfile::TempDir) {
+    let (db, dir) = open();
+    db.set_retention_window(std::time::Duration::ZERO);
+    db.set_blob_gc_policy(crate::db::GcPolicy {
+        grace: std::time::Duration::ZERO,
+        compact_after_bytes: 0,
+        ..crate::db::GcPolicy::default()
+    });
+    (db, dir)
+}
+
+/// A deleted blob's bytes are collected and their space returned by the
+/// database's own collector: the deleted payload is counted, and the Blob
+/// partition shrinks back to well under the blob's size.
+#[test]
+fn a_deleted_blob_is_collected_and_its_space_returns() {
+    let (db, _dir) = collecting_at_once();
+    let data = incompressible(1, 4 * DEFAULT_CHUNK_SIZE);
+    let stored = db.upload_blob(&data, None).expect("upload");
+    let full = db.blob_gc_status().expect("status").blob_disk_bytes;
+    assert!(full >= data.len() as u64, "{full}");
+
+    db.delete_blob(&stored.id).expect("delete");
+    // This pass, or the worker the deletion woke, collects it; either way it
+    // is done when the pass returns, passes being run one at a time.
+    db.run_blob_gc(true).expect("pass");
+    let status = db.blob_gc_status().expect("status");
+    assert_eq!(status.reclaimed_bytes, data.len() as u64);
+    assert_eq!((status.candidates, status.retired_pending), (0, 0));
+    // The emptied value file goes with the next compaction, here the one
+    // for another deleted blob.
+    let other = db
+        .upload_blob(&incompressible(9, DEFAULT_CHUNK_SIZE), None)
+        .expect("upload");
+    db.delete_blob(&other.id).expect("delete");
+    db.run_blob_gc(false).expect("pass");
+    let status = db.blob_gc_status().expect("status");
+    assert!(
+        status.blob_disk_bytes < full / 2,
+        "{} of {full} bytes still on disk",
+        status.blob_disk_bytes
+    );
+}
+
+/// Nobody has to ask: the background worker, woken by the deletion,
+/// collects the blob on its own.
+#[test]
+fn the_collector_reclaims_a_deleted_blob_on_its_own() {
+    let (db, _dir) = collecting_at_once();
+    let data = incompressible(2, 2 * DEFAULT_CHUNK_SIZE);
+    let stored = db.upload_blob(&data, None).expect("upload");
+    db.delete_blob(&stored.id).expect("delete");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let status = db.blob_gc_status().expect("status");
+        if status.reclaimed_bytes == data.len() as u64 && !status.compaction_pending {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the collector did not reclaim the blob: {status:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A manual run is the automatic one: it does not shorten the grace, so a
+/// blob deleted a moment ago keeps its bytes and its candidate waits.
+#[test]
+fn a_manual_run_keeps_the_grace() {
+    let (db, _dir) = open();
+    let data = incompressible(3, DEFAULT_CHUNK_SIZE);
+    let stored = db.upload_blob(&data, None).expect("upload");
+    db.delete_blob(&stored.id).expect("delete");
+    let pass = db.run_blob_gc(true).expect("pass");
+    assert_eq!(pass.retired, 0);
+    let status = db.blob_gc_status().expect("status");
+    assert_eq!((status.candidates, status.candidates_due), (1, 0));
+    assert_eq!(status.grace_secs, 24 * 60 * 60);
+    assert_eq!(status.reclaimed_bytes, 0);
+}
+
+/// A member of a group that holds other members collects nothing and says
+/// why: blob payload lives only where it was written.
+#[test]
+fn a_member_of_a_larger_group_collects_nothing() {
+    let (mut db, _dir) = open();
+    let stored = db
+        .upload_blob(&incompressible(4, DEFAULT_CHUNK_SIZE), None)
+        .expect("alone");
+    db.delete_blob(&stored.id).expect("delete alone");
+    db.set_group_members(Arc::new(|| 3));
+    // Due now, were the member alone.
+    db.set_retention_window(std::time::Duration::ZERO);
+    db.set_blob_gc_policy(crate::db::GcPolicy {
+        grace: std::time::Duration::ZERO,
+        ..crate::db::GcPolicy::default()
+    });
+    let pass = db.run_blob_gc(true).expect("pass");
+    assert_eq!(pass.retired, 0);
+    assert_eq!(db.blob_gc_status().expect("status").reclaimed_bytes, 0);
+    assert!(
+        pass.blockers.iter().any(|b| b.contains("group")),
+        "{:?}",
+        pass.blockers
+    );
+    assert!(!db.blob_gc_status().expect("status").active);
+}
+
 #[test]
 fn blob_ids_round_trip_through_text() {
     let id = BlobId::from_bytes([0xA5; 16]);

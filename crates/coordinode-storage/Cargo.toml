@@ -170,5 +170,9 @@ harness = false
 name = "blob_cache_fill"
 harness = false
 
+[[bench]]
+name = "blob_gc"
+harness = false
+
 [lints]
 workspace = true

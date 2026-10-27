@@ -74,7 +74,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&oracle),
         )?,
     );
-    let store = coordinode_storage::blob::BlobStore::direct(engine, oracle);
+    // The gateway's own store collects its own orphans: a deleted or
+    // replaced object's bytes return once nothing else holds them.
+    let collector = coordinode_storage::blob::gc::BlobCollector::new(
+        coordinode_storage::blob::BlobStore::direct(engine, oracle),
+        coordinode_storage::blob::gc::GcPolicy::default(),
+        Arc::new(|| true),
+    );
+    let _collection = collector.spawn();
+    let store = collector.store().clone();
 
     info!(
         addr = %addr,

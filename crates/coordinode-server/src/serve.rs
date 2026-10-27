@@ -153,6 +153,7 @@ pub(crate) async fn serve(
     // (config-file surface; applied to the Database / worker below).
     let trigger_dispatch_cfg = cfg.trigger_dispatch_config();
     let trigger_dispatch_interval = cfg.trigger_dispatch_interval();
+    let blob_gc_policy = cfg.blob_gc_policy();
     let statement_defaults = cfg.statement_defaults();
     let peer_timeouts = cfg.peer_timeouts();
     // Refused at start: a timing that keeps a healthy group electing is not
@@ -257,6 +258,15 @@ pub(crate) async fn serve(
         checkpoint_interval_secs: _,
         checkpoint_dir: _,
         checkpoint_keep: _,
+        // Already captured above (blob_gc_policy) before the move.
+        blob_gc_grace_secs: _,
+        blob_gc_upload_expiry_secs: _,
+        blob_gc_batch: _,
+        blob_gc_reconcile_interval_secs: _,
+        blob_gc_reconcile_max_contents: _,
+        blob_gc_retry_interval_secs: _,
+        blob_gc_compact_after_mb: _,
+        blob_gc_compact_after_secs: _,
         // Already captured above (trigger_dispatch_cfg / _interval) before the move.
         trigger_max_cascade_depth: _,
         trigger_default_retry_attempts: _,
@@ -823,6 +833,9 @@ pub(crate) async fn serve(
         // AFTER COMMIT trigger dispatch knobs from the config file.
         // The same setter is the runtime `setParameters` seam.
         db.set_trigger_dispatch_config(trigger_dispatch_cfg);
+        // Orphan blob collection from the config file; the same setter
+        // retunes the running collector.
+        db.set_blob_gc_policy(blob_gc_policy);
         // Let SHOW SESSIONS / SHOW TRANSACTIONS read the live registry.
         // The annotated binding coerces the concrete `Arc<SessionRegistry>`
         // to the trait object the setter expects.
@@ -912,6 +925,12 @@ pub(crate) async fn serve(
                     .set(if report.read_only.is_some() { 1.0 } else { 0.0 });
                 metrics::gauge!("coordinode_version_pause_seconds")
                     .set(report.pause_ms.map_or(0.0, |ms| ms as f64 / 1000.0));
+            }
+            // Orphan blob collection: backlog, what holds it, and what came
+            // back, sampled per scrape.
+            match db_metrics.read().blob_gc_status() {
+                Ok(status) => ops::sample_blob_gc(&status),
+                Err(e) => tracing::warn!(error = %e, "blob collection status unavailable"),
             }
             {
                 let committed = engine_metrics.snapshot();
@@ -1137,6 +1156,24 @@ pub(crate) async fn serve(
             engine.node_counts().render(out);
         })
     };
+    // The operator's view of orphan blob collection: its status, and a pass
+    // run now.
+    let blob_gc: ops::BlobGcView = {
+        let database = Arc::clone(&database);
+        Arc::new(move |request| {
+            let db = database.read();
+            match request {
+                ops::BlobGcRequest::Status => db
+                    .blob_gc_status()
+                    .map_err(|e| e.to_string())
+                    .and_then(|status| serde_json::to_string(&status).map_err(|e| e.to_string())),
+                ops::BlobGcRequest::Run { reconcile } => db
+                    .run_blob_gc(reconcile)
+                    .map_err(|e| e.to_string())
+                    .and_then(|pass| serde_json::to_string(&pass).map_err(|e| e.to_string())),
+            }
+        })
+    };
     tokio::spawn(async move {
         if let Err(e) = ops::start_ops_server(
             ops_listener,
@@ -1145,6 +1182,7 @@ pub(crate) async fn serve(
             owned_series,
             version_view,
             reload,
+            blob_gc,
         )
         .await
         {

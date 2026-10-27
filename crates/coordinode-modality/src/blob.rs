@@ -27,6 +27,10 @@
 //! ([`BlobStore::abandon`]) or, if its writer is gone, fenced and collected:
 //! its pins and payload are never leaked into a reference nobody holds.
 //!
+//! A release committed through the caller's transaction reaches the orphan
+//! collector at its next pass; the committer can wake it at once with
+//! [`coordinode_storage::blob::BlobStore::notify_collector`].
+//!
 //! [`Transaction`]: coordinode_storage::engine::transaction::Transaction
 
 use coordinode_core::graph::blob::{BlobRef, OwnerRecord, SharingScope, encode_blobref_key};

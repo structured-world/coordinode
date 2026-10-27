@@ -25,10 +25,18 @@
 //! 5. **Retirement.** A representation is retired by a commit conditioned on
 //!    its catalog entry and claiming that no owner references the content
 //!    and no upload holds it; the claim is decided against committed state.
-//!    New references then need a new representation under a new generation.
-//! 6. **Reading.** A reader pins one snapshot and resolves the owner, the
+//!    The entry leaves the catalog and a retirement record names the exact
+//!    generation. New references then need a new representation under a new
+//!    generation.
+//! 6. **Cleanup.** The payload of a retired generation is deleted with its
+//!    retirement record, by that exact generation, so a cleanup can never
+//!    reach a newer copy of the same bytes; the space returns once a
+//!    compaction passes the deletion. [`gc::BlobCollector`] drives retirement,
+//!    cleanup and compaction from the candidates.
+//! 7. **Reading.** A reader pins one snapshot and resolves the owner, the
 //!    catalog and every chunk at it, so payload it resolved stays readable
-//!    until the reader is dropped, however slowly it is consumed.
+//!    until the reader is dropped, however slowly it is consumed, and no
+//!    compaction collects it meanwhile.
 //!
 //! Interim blob payload path: payload is written into the store's own tree
 //! and made durable on this member before it is published, a single-member
@@ -38,15 +46,19 @@
 use std::sync::Arc;
 
 use coordinode_core::graph::blob::{
-    BlobRef, CatalogEntry, Codec, ContentId, OwnerRecord, Representation, ScopedContent,
-    SharingScope, StagedContent, StagingRecord, candidate_key, catalog_key, create_blob,
-    payload_key, pins_counter_key, refs_counter_key, staging_key,
+    BlobRef, COMPACTION_PENDING_KEY, CatalogEntry, Codec, ContentId, OwnerRecord,
+    RECLAIMED_BYTES_KEY, RECLAIMED_CHUNKS_KEY, Representation, ScopedContent, SharingScope,
+    StagedContent, StagingRecord, UNCOMPACTED_BYTES_KEY, candidate_key, catalog_key, create_blob,
+    payload_key, pins_counter_key, refs_counter_key, retired_key, staging_key,
 };
 use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
 use coordinode_core::txn::operation::{IntentDigest, OperationId};
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::TimestampOracle;
+use coordinode_core::txn::wake::Wake;
 use coordinode_core::txn::write_concern::WriteConcern;
+
+pub mod gc;
 
 use crate::engine::coordinator::SnapshotPin;
 use crate::engine::core::StorageEngine;
@@ -143,6 +155,10 @@ pub struct PutOutcome {
     pub record: OwnerRecord,
     /// Distinct contents whose payload was already held and shared.
     pub shared: usize,
+    /// Work the publication left the collector: contents the owner let go,
+    /// and copies this upload wrote that another one's publication made
+    /// redundant.
+    pub released: usize,
 }
 
 /// An upload admitted and written, not yet published. It holds its contents
@@ -202,6 +218,8 @@ pub struct BlobStore {
     pipeline: Option<Arc<dyn ProposalPipeline>>,
     id_gen: Option<Arc<ProposalIdGenerator>>,
     now_micros: fn() -> i64,
+    /// Wakes the collector when a commit of this store leaves it work.
+    collector: Option<Arc<Wake>>,
 }
 
 impl std::fmt::Debug for BlobStore {
@@ -222,6 +240,7 @@ impl BlobStore {
             pipeline: None,
             id_gen: None,
             now_micros: wall_clock_micros,
+            collector: None,
         }
     }
 
@@ -239,6 +258,7 @@ impl BlobStore {
             pipeline: Some(pipeline),
             id_gen: Some(id_gen),
             now_micros: wall_clock_micros,
+            collector: None,
         }
     }
 
@@ -248,6 +268,28 @@ impl BlobStore {
     pub fn with_clock(mut self, now_micros: fn() -> i64) -> Self {
         self.now_micros = now_micros;
         self
+    }
+
+    /// Wake `collector` whenever a commit of this store leaves it work.
+    #[must_use]
+    fn waking(mut self, collector: Arc<Wake>) -> Self {
+        self.collector = Some(collector);
+        self
+    }
+
+    /// Tell the collector a commit left it work: a release or a retirement
+    /// staged with [`Self::publish_into`] or [`Self::delete_into`] in a
+    /// transaction the caller committed. The store's own commits do this
+    /// themselves.
+    pub fn notify_collector(&self) {
+        if let Some(collector) = &self.collector {
+            collector.notify();
+        }
+    }
+
+    /// Now, by the store's clock, in microseconds since the epoch.
+    pub(crate) fn now(&self) -> i64 {
+        (self.now_micros)()
     }
 
     /// The engine the store lives in.
@@ -328,7 +370,7 @@ impl BlobStore {
                 let key = catalog_key(content);
                 let (entry, version) = store.catalog_entry(&key)?;
                 txn.expect_version(Partition::BlobRef, &key, version)?;
-                let staged = match entry.and_then(|e| e.eligible) {
+                let staged = match entry.map(|e| e.eligible) {
                     Some(eligible) => StagedContent {
                         content: *content,
                         generation: eligible.generation,
@@ -398,7 +440,7 @@ impl BlobStore {
         upload: &StagedUpload,
         operation: Option<(OperationId, IntentDigest)>,
     ) -> BlobResult<PutOutcome> {
-        self.retrying(|store| {
+        let outcome = self.retrying(|store| {
             let mut txn = store.begin();
             if let Some((op, intent)) = operation {
                 txn.bind_operation(op, intent);
@@ -406,7 +448,11 @@ impl BlobStore {
             let outcome = store.publish_into(&mut txn, owner_key, write, upload)?;
             store.commit(txn)?;
             Ok(outcome)
-        })
+        })?;
+        if outcome.released > 0 {
+            self.notify_collector();
+        }
+        Ok(outcome)
     }
 
     /// Stage, in `txn`, the publication of `upload` as what `owner_key`
@@ -442,14 +488,15 @@ impl BlobStore {
         txn.delete(Partition::BlobRef, &stage_key)?;
 
         let mut shared = 0;
+        let mut released = 0;
+        let now = (self.now_micros)();
         for item in &upload.staged.contents {
             txn.push_counter_delta(&pins_counter_key(&item.content), -1);
             let key = catalog_key(&item.content);
             let (entry, version) = self.catalog_entry(&key)?;
             txn.expect_version(Partition::BlobRef, &key, version)?;
-            let mut entry = entry.unwrap_or_default();
-            match entry.eligible {
-                Some(eligible) if eligible.generation == item.generation => {
+            match entry {
+                Some(entry) if entry.eligible.generation == item.generation => {
                     shared += 1;
                 }
                 // Another upload published the content first: readers
@@ -457,18 +504,20 @@ impl BlobStore {
                 // cleanup by its exact generation.
                 Some(_) => {
                     if item.writes {
-                        entry.retired.push(item.generation);
-                        txn.put(Partition::BlobRef, &key, &encode(&entry, "catalog entry")?)?;
+                        retire_into(txn, &item.content, item.generation, now)?;
+                        released += 1;
                     } else {
                         shared += 1;
                     }
                 }
                 None if item.writes => {
-                    entry.eligible = Some(Representation {
-                        generation: item.generation,
-                        codec: Codec::Raw,
-                        encoded_len: item.content.content.len(),
-                    });
+                    let entry = CatalogEntry {
+                        eligible: Representation {
+                            generation: item.generation,
+                            codec: Codec::Raw,
+                            encoded_len: item.content.content.len(),
+                        },
+                    };
                     txn.put(Partition::BlobRef, &key, &encode(&entry, "catalog entry")?)?;
                 }
                 // A shared representation cannot be retired while this
@@ -486,14 +535,18 @@ impl BlobStore {
             return Err(BlobError::OwnerExists);
         }
         txn.expect_version(Partition::BlobRef, owner_key, owner_version)?;
-        self.release_into(txn, owner_key, old.as_ref(), Some(&record.blob))?;
+        released += self.release_into(txn, owner_key, old.as_ref(), Some(&record.blob))?;
         self.acquire_into(txn, old.as_ref(), &record.blob);
         txn.put(
             Partition::BlobRef,
             owner_key,
             &encode(&record, "owner record")?,
         )?;
-        Ok(PutOutcome { record, shared })
+        Ok(PutOutcome {
+            record,
+            shared,
+            released,
+        })
     }
 
     /// Give up the upload staged as `staging_id`: remove its record, lower
@@ -505,7 +558,7 @@ impl BlobStore {
     ///
     /// A storage, commit or decoding failure; the record then stays.
     pub fn abandon(&self, staging_id: u64) -> BlobResult<bool> {
-        self.retrying(|store| {
+        let abandoned = self.retrying(|store| {
             let stage_key = staging_key(staging_id);
             let Some((bytes, version)) =
                 store.engine.get_versioned(Partition::BlobRef, &stage_key)?
@@ -513,6 +566,7 @@ impl BlobStore {
                 return Ok(false);
             };
             let staged: StagingRecord = decode(&stage_key, &bytes, StagingRecord::from_msgpack)?;
+            let now = (store.now_micros)();
             let mut txn = store.begin();
             txn.expect_version(Partition::BlobRef, &stage_key, Some(version))?;
             txn.delete(Partition::BlobRef, &stage_key)?;
@@ -521,21 +575,24 @@ impl BlobStore {
                 if !item.writes {
                     continue;
                 }
+                // Only the upload's own publication makes its generation
+                // eligible, and that removes this record; checked all the
+                // same, since retiring a copy readers resolve to loses data.
                 let key = catalog_key(&item.content);
                 let (entry, version) = store.catalog_entry(&key)?;
-                let mut entry = entry.unwrap_or_default();
-                if entry.eligible.map(|e| e.generation) == Some(item.generation)
-                    || entry.retired.contains(&item.generation)
-                {
+                if entry.map(|e| e.eligible.generation) == Some(item.generation) {
                     continue;
                 }
                 txn.expect_version(Partition::BlobRef, &key, version)?;
-                entry.retired.push(item.generation);
-                txn.put(Partition::BlobRef, &key, &encode(&entry, "catalog entry")?)?;
+                retire_into(&mut txn, &item.content, item.generation, now)?;
             }
             store.commit(txn)?;
             Ok(true)
-        })
+        })?;
+        if abandoned {
+            self.notify_collector();
+        }
+        Ok(abandoned)
     }
 
     /// Delete what `owner_key` holds. Returns the record it held, or `None`
@@ -545,14 +602,18 @@ impl BlobStore {
     ///
     /// A storage, commit or decoding failure; the owner then stays.
     pub fn delete(&self, owner_key: &[u8]) -> BlobResult<Option<OwnerRecord>> {
-        self.retrying(|store| {
+        let deleted = self.retrying(|store| {
             let mut txn = store.begin();
             let Some(old) = store.delete_into(&mut txn, owner_key)? else {
                 return Ok(None);
             };
             store.commit(txn)?;
             Ok(Some(old))
-        })
+        })?;
+        if deleted.is_some() {
+            self.notify_collector();
+        }
+        Ok(deleted)
     }
 
     /// Stage, in `txn`, the deletion of what `owner_key` holds: the owner
@@ -641,7 +702,7 @@ impl BlobStore {
                 .engine
                 .snapshot_get(&snapshot, Partition::BlobRef, &key)?
             {
-                Some(bytes) => decode(&key, &bytes, CatalogEntry::from_msgpack)?.eligible,
+                Some(bytes) => Some(decode(&key, &bytes, CatalogEntry::from_msgpack)?.eligible),
                 None => None,
             };
             let Some(eligible) = eligible else {
@@ -683,12 +744,13 @@ impl BlobStore {
         let key = catalog_key(content);
         self.retrying(|store| {
             let (entry, version) = store.catalog_entry(&key)?;
-            let Some(mut entry) = entry else {
+            let Some(entry) = entry else {
                 return Ok(Retirement::NotEligible);
             };
-            if entry.eligible.map(|e| e.generation) != Some(generation) {
+            if entry.eligible.generation != generation {
                 return Ok(Retirement::NotEligible);
             }
+            let now = (store.now_micros)();
             // Every admission of the content is conditioned on the entry this
             // rewrites, so under steady uploads the retirement would lose to
             // whichever came first, every time. Its commit waits for the
@@ -702,9 +764,8 @@ impl BlobStore {
                 ClaimPredicate::BlobRetired { generation },
                 revision,
             ));
-            entry.eligible = None;
-            entry.retired.push(generation);
-            txn.put(Partition::BlobRef, &key, &encode(&entry, "catalog entry")?)?;
+            txn.delete(Partition::BlobRef, &key)?;
+            retire_into(&mut txn, content, generation, now)?;
             match store.commit(txn) {
                 Ok(()) => Ok(Retirement::Retired),
                 Err(BlobError::Commit(CommitError::InvariantRefused { .. })) => {
@@ -715,21 +776,155 @@ impl BlobStore {
         })
     }
 
+    /// [`Self::retire`] each of `items`, in one commit when none is held.
+    /// Each retirement carries its own claim, so the commit is refused as a
+    /// whole if any content turns out referenced or held; the items are then
+    /// retired one by one, each deciding for itself. Returns each item's
+    /// decision, in order.
+    ///
+    /// # Errors
+    ///
+    /// A storage, commit or decoding failure; nothing is retired then, or,
+    /// one by one, what was retired before it stands.
+    pub fn retire_many(&self, items: &[(ScopedContent, u64)]) -> BlobResult<Vec<Retirement>> {
+        let together = self.retrying(|store| {
+            let now = (store.now_micros)();
+            let mut txn = store.begin();
+            let revision = txn.schema_generation();
+            let mut decided = Vec::with_capacity(items.len());
+            for (content, generation) in items {
+                let key = catalog_key(content);
+                let (entry, version) = store.catalog_entry(&key)?;
+                if entry.map(|e| e.eligible.generation) != Some(*generation) {
+                    decided.push(Retirement::NotEligible);
+                    continue;
+                }
+                txn.expect_version(Partition::BlobRef, &key, version)?;
+                txn.claim(Claim::new(
+                    ClaimScope::Record(key.clone()),
+                    ClaimPredicate::BlobRetired {
+                        generation: *generation,
+                    },
+                    revision,
+                ));
+                txn.delete(Partition::BlobRef, &key)?;
+                retire_into(&mut txn, content, *generation, now)?;
+                decided.push(Retirement::Retired);
+            }
+            if decided.iter().all(|d| *d == Retirement::NotEligible) {
+                return Ok(Some(decided));
+            }
+            match store.commit(txn) {
+                Ok(()) => Ok(Some(decided)),
+                Err(BlobError::Commit(CommitError::InvariantRefused { .. })) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })?;
+        match together {
+            Some(decided) => Ok(decided),
+            None => items
+                .iter()
+                .map(|(content, generation)| self.retire(content, *generation))
+                .collect(),
+        }
+    }
+
+    /// Delete the payload of each retired representation in `retired`, by
+    /// exact generation, in one commit with the end of its retirement record
+    /// and the count of what was deleted. A representation whose record is
+    /// gone was cleaned up already and is skipped, so this is safe to repeat
+    /// after a crash. Space returns once a compaction passes the commit, so
+    /// the commit also marks that one is due.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::Damaged`] when a retired generation is the one readers
+    /// resolve to, which nothing should ever bring about and which no
+    /// cleanup may act on; a storage or commit failure otherwise, after which
+    /// nothing was deleted.
+    pub fn clean_up(&self, retired: &[(ScopedContent, u64)]) -> BlobResult<CleanedUp> {
+        self.retrying(|store| {
+            let mut txn = store.begin();
+            let mut cleaned = CleanedUp::default();
+            for (content, generation) in retired {
+                let record = retired_key(content, *generation);
+                let Some(version) = store.engine.record_version(Partition::BlobRef, &record)?
+                else {
+                    continue;
+                };
+                txn.expect_version(Partition::BlobRef, &record, Some(version))?;
+                let entry_key = catalog_key(content);
+                let (entry, entry_version) = store.catalog_entry(&entry_key)?;
+                if entry.map(|e| e.eligible.generation) == Some(*generation) {
+                    return Err(BlobError::Damaged {
+                        key: printable_key(&record),
+                        message: "the generation it retires is the one readers resolve to".into(),
+                    });
+                }
+                // The generation can never become eligible again, and the
+                // entry's version is checked so a retirement and its cleanup
+                // are never decided from two different catalog states.
+                txn.expect_version(Partition::BlobRef, &entry_key, entry_version)?;
+                txn.delete(Partition::BlobRef, &record)?;
+                cleaned.representations += 1;
+                let payload = payload_key(content, *generation);
+                if !store.payload_present(&payload)? {
+                    continue;
+                }
+                txn.delete(Partition::Blob, &payload)?;
+                cleaned.chunks += 1;
+                cleaned.bytes += u64::from(content.content.len());
+            }
+            if cleaned.representations == 0 {
+                return Ok(cleaned);
+            }
+            if cleaned.chunks > 0 {
+                // Both counts are bounded by the batch: chunks by its length,
+                // bytes by its length times the 16MB chunk ceiling.
+                txn.push_counter_delta(RECLAIMED_CHUNKS_KEY, cleaned.chunks as i64);
+                txn.push_counter_delta(RECLAIMED_BYTES_KEY, cleaned.bytes as i64);
+                txn.push_counter_delta(UNCOMPACTED_BYTES_KEY, cleaned.bytes as i64);
+                // The mark keeps the time of the oldest cleanup still owed a
+                // compaction, and takes this commit as its version.
+                let oldest = match store
+                    .engine
+                    .get(Partition::BlobRef, COMPACTION_PENDING_KEY)?
+                {
+                    Some(oldest) => oldest.to_vec(),
+                    None => store.now().to_be_bytes().to_vec(),
+                };
+                txn.put(Partition::BlobRef, COMPACTION_PENDING_KEY, &oldest)?;
+            }
+            store.commit(txn)?;
+            Ok(cleaned)
+        })
+    }
+
+    /// Whether the payload at `key` is stored, read without its bytes.
+    fn payload_present(&self, key: &[u8]) -> BlobResult<bool> {
+        // Payload keys are all one length, so the key is its own prefix.
+        match self.engine.prefix_scan(Partition::Blob, key)?.next() {
+            Some(guard) => Ok(guard.key().map_err(StorageError::from)?.as_ref() == key),
+            None => Ok(false),
+        }
+    }
+
     /// Stage, in `txn`, the release of every content `old` references that
     /// `new` does not: one reference fewer each, and a candidate naming the
-    /// release.
+    /// release. Returns how many it released.
     fn release_into(
         &self,
         txn: &mut Transaction<'_>,
         owner_key: &[u8],
         old: Option<&OwnerRecord>,
         new: Option<&BlobRef>,
-    ) -> BlobResult<()> {
+    ) -> BlobResult<usize> {
         let Some(old) = old else {
-            return Ok(());
+            return Ok(0);
         };
         let kept = new.map(BlobRef::distinct).unwrap_or_default();
         let now = (self.now_micros)();
+        let mut released = 0;
         for content in old.blob.distinct() {
             if kept.binary_search(&content).is_ok() {
                 continue;
@@ -737,11 +932,12 @@ impl BlobStore {
             txn.push_counter_delta(&refs_counter_key(&content), -1);
             txn.put(
                 Partition::BlobRef,
-                &candidate_key(&content, owner_key, old.incarnation),
-                &now.to_be_bytes(),
+                &candidate_key(now, &content, owner_key, old.incarnation),
+                &[],
             )?;
+            released += 1;
         }
-        Ok(())
+        Ok(released)
     }
 
     /// Stage, in `txn`, one reference more for every content `new`
@@ -867,6 +1063,35 @@ impl BlobReader {
         }
         Ok(data.to_vec())
     }
+}
+
+/// What a cleanup deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CleanedUp {
+    /// Retired representations whose cleanup is done.
+    pub representations: u64,
+    /// Payload chunks deleted; a representation whose payload was never
+    /// written, such as an upload abandoned before it wrote, deletes none.
+    pub chunks: u64,
+    /// Payload bytes deleted.
+    pub bytes: u64,
+}
+
+/// Stage, in `txn`, the retirement of `content`'s representation
+/// `generation`: no reader or reference may resolve to it from then on, and
+/// its payload awaits cleanup by exact generation from `now`.
+fn retire_into(
+    txn: &mut Transaction<'_>,
+    content: &ScopedContent,
+    generation: u64,
+    now: i64,
+) -> BlobResult<()> {
+    txn.put(
+        Partition::BlobRef,
+        &retired_key(content, generation),
+        &now.to_be_bytes(),
+    )?;
+    Ok(())
 }
 
 fn encode<T>(value: &T, what: &'static str) -> BlobResult<Vec<u8>>

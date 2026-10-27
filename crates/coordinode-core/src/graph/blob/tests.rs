@@ -70,9 +70,94 @@ fn scopes_separate_catalog_entries() {
 #[test]
 fn candidate_keys_are_per_release() {
     let scoped = ScopedContent::new(SharingScope::STORE, ContentId::of(b"c"));
-    let first = candidate_key(&scoped, b"blobmeta:a", 1);
-    assert_ne!(first, candidate_key(&scoped, b"blobmeta:b", 1));
-    assert_ne!(first, candidate_key(&scoped, b"blobmeta:a", 2));
+    let first = candidate_key(10, &scoped, b"blobmeta:a", 1);
+    assert_ne!(first, candidate_key(10, &scoped, b"blobmeta:b", 1));
+    assert_ne!(first, candidate_key(10, &scoped, b"blobmeta:a", 2));
+}
+
+/// Candidates sort by release time whatever their content, which is what lets
+/// a collector stop at the first one still in its grace; the key gives back
+/// the time and content it was written with.
+#[test]
+fn candidate_keys_sort_by_release_time_and_decode() {
+    let early = ScopedContent::new(SharingScope::STORE, ContentId::of(b"zzz"));
+    let late = ScopedContent::new(SharingScope::STORE, ContentId::of(b"aaa"));
+    let early_key = candidate_key(5, &early, b"blobmeta:a", 1);
+    let late_key = candidate_key(6, &late, b"blobmeta:a", 1);
+    assert!(early_key < late_key);
+    assert_eq!(
+        decode_candidate_key(&early_key),
+        Some(Candidate {
+            released_at_micros: 5,
+            content: early,
+        })
+    );
+    // The bound past time 5 sorts after every candidate released at 5 and
+    // before every later one.
+    let bound = candidates_released_after(5);
+    assert!(early_key < bound && bound < late_key);
+    assert_eq!(decode_candidate_key(b"blobcand:short"), None);
+    assert_eq!(decode_candidate_key(&staging_key(1)), None);
+}
+
+/// A time read before the epoch sorts as the epoch rather than wrapping to
+/// the far future, where a collector would never reach it.
+#[test]
+fn a_negative_release_time_sorts_as_the_epoch() {
+    let scoped = ScopedContent::new(SharingScope::STORE, ContentId::of(b"c"));
+    let key = candidate_key(-7, &scoped, b"blobmeta:a", 1);
+    assert_eq!(
+        decode_candidate_key(&key).map(|c| c.released_at_micros),
+        Some(0)
+    );
+    assert!(key < candidate_key(1, &scoped, b"blobmeta:a", 1));
+}
+
+/// Retired and payload keys give back the exact content and generation, so a
+/// cleanup reaches only the copy it names; a key of another length is refused.
+#[test]
+fn retired_and_payload_keys_decode_their_generation() {
+    let scoped = ScopedContent::new(SharingScope::from_raw(3), ContentId::of(b"r"));
+    assert_eq!(
+        decode_retired_key(&retired_key(&scoped, 9)),
+        Some((scoped, 9))
+    );
+    assert_eq!(
+        decode_payload_key(&payload_key(&scoped, 9)),
+        Some((scoped, 9))
+    );
+    let mut long = retired_key(&scoped, 9);
+    long.push(0);
+    assert_eq!(decode_retired_key(&long), None);
+    assert_eq!(decode_payload_key(&retired_key(&scoped, 9)), None);
+}
+
+/// Counter keys give back the content they count; a key of the other counter,
+/// with a malformed scope or with damaged hex is not read as some content.
+#[test]
+fn counter_keys_decode_their_content() {
+    let scoped = ScopedContent::new(SharingScope::from_raw(12), ContentId::of(b"k"));
+    let refs = refs_counter_key(&scoped);
+    assert_eq!(decode_counter_key(REFS_COUNTER_PREFIX, &refs), Some(scoped));
+    assert_eq!(decode_counter_key(PINS_COUNTER_PREFIX, &refs), None);
+    assert_eq!(
+        decode_counter_key(PINS_COUNTER_PREFIX, &pins_counter_key(&scoped)),
+        Some(scoped)
+    );
+    assert_eq!(
+        decode_counter_key(REFS_COUNTER_PREFIX, b"counter:blob_refs:x:00"),
+        None
+    );
+    let mut damaged = refs.clone();
+    let last = damaged.len() - 1;
+    damaged[last] = b'g';
+    assert_eq!(decode_counter_key(REFS_COUNTER_PREFIX, &damaged), None);
+}
+
+#[test]
+fn staging_keys_decode_their_id() {
+    assert_eq!(decode_staging_key(&staging_key(77)), Some(77));
+    assert_eq!(decode_staging_key(b"blobstage:abc"), None);
 }
 
 #[test]
@@ -81,6 +166,10 @@ fn owner_keys_are_recognised() {
     assert!(is_owner_key(&s3_owner_key("/b/k")));
     assert!(is_owner_key(&encode_blobref_key(NodeId::from_raw(1), 2)));
     assert!(!is_owner_key(&staging_key(1)));
+    let scoped = ScopedContent::new(SharingScope::STORE, ContentId::of(b"z"));
+    assert!(!is_owner_key(&retired_key(&scoped, 1)));
+    assert!(!is_owner_key(&candidate_key(1, &scoped, b"blobmeta:a", 1)));
+    assert!(!is_owner_key(COMPACTION_PENDING_KEY));
     assert!(!is_owner_key(&catalog_key(&ScopedContent::new(
         SharingScope::STORE,
         ContentId::of(b"z")
@@ -172,12 +261,11 @@ fn records_msgpack_roundtrip() {
         owner
     );
     let entry = CatalogEntry {
-        eligible: Some(Representation {
+        eligible: Representation {
             generation: 3,
             codec: Codec::Raw,
             encoded_len: 18,
-        }),
-        retired: vec![1, 2],
+        },
     };
     assert_eq!(
         CatalogEntry::from_msgpack(&entry.to_msgpack().expect("encode")).expect("decode"),

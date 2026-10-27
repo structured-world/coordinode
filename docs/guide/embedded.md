@@ -302,8 +302,49 @@ retry of an operation that already stored its blob is refused with
 other members refuses blob writes with `DatabaseError::Unsupported`: blob
 bytes are held only on the member that writes them.
 
-Deleting a blob ends its hold on its chunks but does not yet reclaim their
-storage; do not count it as space released.
+Deleting a blob ends its hold on its chunks. The database collects the chunks
+nothing holds any more on its own thread, woken by the deletion: after a grace
+period (24 hours by default, never less than the retention window), and once
+no reader, retained history or upload in progress needs them, their bytes are
+deleted and the storage compacted; the files of the most recent batch are
+freed by the compaction after that, so a database that deletes nothing more
+keeps them (`stale_blob_bytes` in the status) until it does. A chunk another
+blob shares stays. An upload never published, such as one interrupted by a
+crash, is collected an hour after it began. Nothing has to be called for any
+of this; the same collector also answers on demand:
+
+```rust
+use std::time::Duration;
+
+use coordinode_embed::{Database, DatabaseError};
+use coordinode_embed::db::GcPolicy;
+
+fn collect_now(db: &Database) -> Result<u64, DatabaseError> {
+    // Keep released chunks for two hours instead of a day.
+    db.set_blob_gc_policy(GcPolicy {
+        grace: Duration::from_secs(2 * 60 * 60),
+        ..db.blob_gc_policy()
+    });
+    // A pass run now is the one the collector runs by itself: it never
+    // shortens the grace or passes a reader, history or an upload.
+    let pass = db.run_blob_gc(false)?;
+    let status = db.blob_gc_status()?;
+    println!(
+        "{} retired this pass; {} candidates waiting, {} bytes on disk",
+        pass.retired, status.candidates, status.blob_disk_bytes
+    );
+    Ok(status.reclaimed_bytes)
+}
+```
+
+`blob_gc_status` reports what waits (released chunks, unpublished uploads,
+retired copies awaiting deletion), when the oldest of each began, whether a
+compaction still owes space back, what has been reclaimed (payload bytes
+deleted, and bytes the storage shrank by), and why collection is stopped if it
+is: a record that does not decode makes ownership unknown, and nothing is
+collected until it is gone. A member of a group that holds other members
+collects nothing. A hard-linked checkpoint keeps the files it shares until it
+is pruned.
 
 ## Backup and recovery
 

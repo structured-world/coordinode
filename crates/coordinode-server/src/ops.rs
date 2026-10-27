@@ -7,6 +7,9 @@
 //! - GET /metrics: Prometheus OpenMetrics
 //! - GET /version: this member's version report (its pair, its group's, why
 //!   it is read-only if it is, each voter's pair, the current write pause)
+//! - POST /reload: read the node's credentials and trust again
+//! - GET /blob-gc: where orphan blob collection stands
+//! - POST /blob-gc/run[?reconcile=true]: run a collection pass now
 //!
 //! # Cluster-ready notes
 //! - Each CE node (3-node HA) has its own :7084.
@@ -119,6 +122,132 @@ fn reload_response(
     }
 }
 
+/// What `/blob-gc` asks of the orphan blob collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlobGcRequest {
+    /// Where collection stands.
+    Status,
+    /// Run one pass now, reconciling accounting as well when asked.
+    Run { reconcile: bool },
+}
+
+/// Answers a [`BlobGcRequest`] as JSON, or says why it could not.
+pub(crate) type BlobGcView = Arc<dyn Fn(BlobGcRequest) -> Result<String, String> + Send + Sync>;
+
+/// Status line, content type and body of a `/blob-gc` request: `GET
+/// /blob-gc` reports, `POST /blob-gc/run` (with `?reconcile=true` to check
+/// accounting too) runs a pass. Whoever reaches the ops port can ask for
+/// either: a pass is the one the collector runs on its own, which cannot
+/// shorten the grace or pass a reader, retained history or an upload, so it
+/// grants nothing.
+fn blob_gc_response(
+    method: &str,
+    target: &str,
+    view: &BlobGcView,
+) -> (&'static str, &'static str, String) {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let request = match (method, path) {
+        ("GET", "/blob-gc") => BlobGcRequest::Status,
+        ("POST", "/blob-gc/run") => BlobGcRequest::Run {
+            reconcile: query.split('&').any(|pair| pair == "reconcile=true"),
+        },
+        (_, "/blob-gc") => {
+            return (
+                "405 Method Not Allowed",
+                "application/json",
+                r#"{"error":"GET for the status, POST /blob-gc/run to run a pass"}"#.to_string(),
+            );
+        }
+        (_, "/blob-gc/run") => {
+            return (
+                "405 Method Not Allowed",
+                "application/json",
+                r#"{"error":"POST to run a pass"}"#.to_string(),
+            );
+        }
+        _ => {
+            return (
+                "404 Not Found",
+                "application/json",
+                r#"{"error":"not found"}"#.to_string(),
+            );
+        }
+    };
+    match view(request) {
+        Ok(body) => ("200 OK", "application/json", body),
+        Err(e) => (
+            "500 Internal Server Error",
+            "application/json",
+            serde_json::json!({ "error": e }).to_string(),
+        ),
+    }
+}
+
+/// Set the orphan blob collection series from `status`.
+pub(crate) fn sample_blob_gc(status: &coordinode_embed::db::GcStatus) {
+    let flag = |on: bool| if on { 1.0 } else { 0.0 };
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros());
+    let oldest = status.oldest_candidate_micros.map_or(0.0, |at| {
+        // A release stamped after this read is no age.
+        u128::try_from(at)
+            .ok()
+            .and_then(|at| now_micros.checked_sub(at))
+            .map_or(0.0, |age| age as f64 / 1e6)
+    });
+    let gauges: [(&'static str, f64); 10] = [
+        (
+            "coordinode_blobstore_disk_bytes",
+            status.blob_disk_bytes as f64,
+        ),
+        (
+            "coordinode_blobstore_stale_bytes",
+            status.stale_blob_bytes as f64,
+        ),
+        ("coordinode_blob_gc_candidates", status.candidates as f64),
+        (
+            "coordinode_blob_gc_candidates_due",
+            status.candidates_due as f64,
+        ),
+        ("coordinode_blob_gc_oldest_candidate_seconds", oldest),
+        (
+            "coordinode_blob_gc_staged_uploads",
+            status.staged_uploads as f64,
+        ),
+        (
+            "coordinode_blob_gc_retired_pending_bytes",
+            status.retired_pending_bytes as f64,
+        ),
+        (
+            "coordinode_blob_gc_compaction_pending",
+            flag(status.compaction_pending),
+        ),
+        ("coordinode_blob_gc_blocked", flag(status.blocked.is_some())),
+        ("coordinode_blob_gc_active", flag(status.active)),
+    ];
+    for (name, value) in gauges {
+        metrics::gauge!(name).set(value);
+    }
+    let counters: [(&'static str, u64); 3] = [
+        (
+            "coordinode_blob_gc_reclaimed_bytes_total",
+            status.reclaimed_bytes,
+        ),
+        (
+            "coordinode_blob_gc_reclaimed_chunks_total",
+            status.reclaimed_chunks,
+        ),
+        (
+            "coordinode_blob_gc_reclaimed_disk_bytes_total",
+            status.reclaimed_disk_bytes,
+        ),
+    ];
+    for (name, value) in counters {
+        metrics::counter!(name).absolute(value);
+    }
+}
+
 /// Sets the gauges whose value is only meaningful when sampled, right before
 /// `/metrics` renders them: a scrape samples them, and nothing samples them
 /// between scrapes.
@@ -135,10 +264,10 @@ pub(crate) type OwnedSeries = Arc<dyn Fn(&mut String) + Send + Sync>;
 /// Start the operational HTTP server on `listener`, bound by the caller at
 /// startup so a busy port fails the start.
 ///
-/// Handles /health, /ready, /metrics, /version and `POST /reload`; `/ready`
-/// follows `readiness`, `/metrics` runs `sample` first and appends `owned`,
-/// `/version` renders `version`, and `/reload` runs `reload`. Runs until the
-/// process exits.
+/// Handles /health, /ready, /metrics, /version, `POST /reload` and
+/// `/blob-gc`; `/ready` follows `readiness`, `/metrics` runs `sample` first
+/// and appends `owned`, `/version` renders `version`, `/reload` runs `reload`
+/// and `/blob-gc` asks `blob_gc`. Runs until the process exits.
 pub(crate) async fn start_ops_server(
     listener: TcpListener,
     readiness: Readiness,
@@ -146,6 +275,7 @@ pub(crate) async fn start_ops_server(
     owned: OwnedSeries,
     version: VersionView,
     reload: Option<ReloadHook>,
+    blob_gc: BlobGcView,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Install Prometheus metrics recorder
     let prometheus_handle = PrometheusBuilder::new()
@@ -173,6 +303,7 @@ pub(crate) async fn start_ops_server(
         let owned = Arc::clone(&owned);
         let version = Arc::clone(&version);
         let reload = reload.clone();
+        let blob_gc = Arc::clone(&blob_gc);
         let ready = readiness.get();
 
         tokio::spawn(async move {
@@ -197,6 +328,21 @@ pub(crate) async fn start_ops_server(
                 // Reading the files blocks; keep it off the runtime.
                 let method = method.to_owned();
                 tokio::task::spawn_blocking(move || reload_response(&method, reload.as_ref()))
+                    .await
+                    .unwrap_or_else(|e| {
+                        (
+                            "500 Internal Server Error",
+                            "application/json",
+                            serde_json::json!({ "error": e.to_string() }).to_string(),
+                        )
+                    })
+            } else if path == "/blob-gc"
+                || path.starts_with("/blob-gc/")
+                || path.starts_with("/blob-gc?")
+            {
+                // A pass reads and writes the store; keep it off the runtime.
+                let (method, target) = (method.to_owned(), path.to_owned());
+                tokio::task::spawn_blocking(move || blob_gc_response(&method, &target, &blob_gc))
                     .await
                     .unwrap_or_else(|e| {
                         (

@@ -178,11 +178,18 @@ async fn an_operation_on_a_later_message_is_refused() {
 /// the snapshot it began at, and holds it until the stream ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_download_survives_deletion_and_cleanup_of_its_blob() {
-    use coordinode_core::graph::blob::{CatalogEntry, catalog_key, payload_key};
-    use coordinode_storage::blob::Retirement;
-    use coordinode_storage::engine::partition::Partition;
-
     let (service, database, _dir) = open_service();
+    // The collector takes a deleted blob at once, and no retained history
+    // holds its payload either: only the download does.
+    {
+        let db = database.read();
+        db.set_retention_window(std::time::Duration::ZERO);
+        db.set_blob_gc_policy(coordinode_embed::db::GcPolicy {
+            grace: std::time::Duration::ZERO,
+            compact_after_bytes: 0,
+            ..coordinode_embed::db::GcPolicy::default()
+        });
+    }
     // Distinct chunks, more than the stream buffers ahead of the client.
     let data: Vec<u8> = (0..blob::DEFAULT_CHUNK_SIZE * 12)
         .map(|i| (i / blob::DEFAULT_CHUNK_SIZE) as u8)
@@ -203,27 +210,14 @@ async fn a_download_survives_deletion_and_cleanup_of_its_blob() {
         .expect("chunk")
         .data;
     service.delete(&stored.blob_id).await.expect("delete");
-    let store = database.read().blob_store();
-    for content in record.blob.distinct() {
-        let entry = store
-            .engine()
-            .get(Partition::BlobRef, &catalog_key(&content))
-            .expect("get")
-            .expect("catalog entry");
-        let generation = CatalogEntry::from_msgpack(&entry)
-            .expect("decode")
-            .eligible
-            .expect("eligible")
-            .generation;
-        assert_eq!(
-            store.retire(&content, generation).expect("retire"),
-            Retirement::Retired
-        );
-        store
-            .engine()
-            .delete(Partition::Blob, &payload_key(&content, generation))
-            .expect("erase");
-    }
+    // Collected under the running download, by this pass or by the worker
+    // the deletion woke: every copy retired and its payload deleted, the
+    // compaction left waiting for the download.
+    database.read().run_blob_gc(true).expect("collect");
+    let status = database.read().blob_gc_status().expect("status");
+    assert_eq!(status.reclaimed_bytes, data.len() as u64, "{status:?}");
+    assert_eq!(status.reclaimed_chunks, record.blob.distinct().len() as u64);
+    assert!(status.compaction_pending, "the download holds the payload");
     while let Some(chunk) = stream.next().await {
         read.extend_from_slice(&chunk.expect("chunk").data);
     }
@@ -235,6 +229,24 @@ async fn a_download_survives_deletion_and_cleanup_of_its_blob() {
             .code(),
         tonic::Code::NotFound
     );
+    // Once the download has let go, the compaction runs and the deleted
+    // payload is garbage awaiting the next one. Its reader is dropped by the
+    // task that streamed it, a moment after the last chunk.
+    drop(stream);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        database.read().run_blob_gc(false).expect("collect");
+        let status = database.read().blob_gc_status().expect("status");
+        if !status.compaction_pending {
+            assert!(status.stale_blob_bytes > 0, "{status:?}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the compaction never ran: {status:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// Blob payload is held only on the member that writes it, so a member of a

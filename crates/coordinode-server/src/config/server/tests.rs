@@ -1006,6 +1006,53 @@ fn trigger_dispatch_knobs_parse_from_config_file_only() {
     );
 }
 
+/// With no blob collection keys in the file, the collector runs under its
+/// built-in policy.
+#[test]
+fn blob_gc_policy_defaults_when_unset() {
+    assert_eq!(
+        ServerConfig::default().blob_gc_policy(),
+        coordinode_embed::db::GcPolicy::default()
+    );
+}
+
+/// Blob collection keys come from the config file; each one set replaces
+/// its default and the rest keep theirs, and a zero where none is allowed is
+/// refused rather than read as "never".
+#[test]
+fn blob_gc_knobs_parse_from_config_file_only() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "blob_gc_grace_secs: 7200\n\
+         blob_gc_upload_expiry_secs: 600\n\
+         blob_gc_batch: 64\n\
+         blob_gc_reconcile_interval_secs: 3600\n\
+         blob_gc_compact_after_mb: 16\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    let policy = c.blob_gc_policy();
+    let d = coordinode_embed::db::GcPolicy::default();
+    assert_eq!(policy.grace, Duration::from_secs(7200));
+    assert_eq!(policy.upload_expiry, Duration::from_secs(600));
+    assert_eq!(policy.batch, 64);
+    assert_eq!(policy.reconcile_every, Duration::from_secs(3600));
+    assert_eq!(policy.compact_after_bytes, 16 << 20);
+    assert_eq!(policy.reconcile_max_contents, d.reconcile_max_contents);
+    assert_eq!(policy.retry_interval, d.retry_interval);
+    assert_eq!(policy.compact_after, d.compact_after);
+
+    let zero = dir.path().join("zero.yaml");
+    std::fs::write(&zero, "blob_gc_batch: 0\n").unwrap();
+    assert!(
+        ServerConfig::load(Some(zero.to_str().unwrap())).is_err(),
+        "a pass that takes nothing would never collect"
+    );
+}
+
 #[test]
 fn extension_settings_survive_the_unknown_key_check() {
     // Keys the base server does not know are rejected, which is what makes a

@@ -53,9 +53,59 @@ fn register_storage_metrics() {
     metrics::describe_histogram!("coordinode_wal_sync_duration_seconds", "WAL fsync duration");
     metrics::describe_counter!("coordinode_wal_entries_total", "WAL entries written");
 
-    // BlobStore
-    metrics::describe_gauge!("coordinode_blobstore_chunks_total", "Total chunks stored");
-    metrics::describe_gauge!("coordinode_blobstore_bytes_total", "Total blob bytes");
+    // BlobStore and its orphan collection
+    metrics::describe_gauge!(
+        "coordinode_blobstore_disk_bytes",
+        "Size of the blob payload partition on disk"
+    );
+    metrics::describe_gauge!(
+        "coordinode_blobstore_stale_bytes",
+        "Bytes in blob value files no live key points to, not yet returned by a compaction"
+    );
+    metrics::describe_gauge!(
+        "coordinode_blob_gc_candidates",
+        "Released blob contents awaiting collection"
+    );
+    metrics::describe_gauge!(
+        "coordinode_blob_gc_candidates_due",
+        "Released blob contents whose grace has passed"
+    );
+    metrics::describe_gauge!(
+        "coordinode_blob_gc_oldest_candidate_seconds",
+        "Age of the oldest released blob content awaiting collection"
+    );
+    metrics::describe_gauge!(
+        "coordinode_blob_gc_staged_uploads",
+        "Blob uploads admitted and not yet published"
+    );
+    metrics::describe_gauge!(
+        "coordinode_blob_gc_retired_pending_bytes",
+        "Payload bytes of retired blob copies awaiting deletion"
+    );
+    metrics::describe_gauge!(
+        "coordinode_blob_gc_compaction_pending",
+        "1 while deleted blob payload awaits the compaction that returns its space"
+    );
+    metrics::describe_gauge!(
+        "coordinode_blob_gc_blocked",
+        "1 while blob collection is stopped because accounting cannot be verified"
+    );
+    metrics::describe_gauge!(
+        "coordinode_blob_gc_active",
+        "1 while this member collects orphan blobs"
+    );
+    metrics::describe_counter!(
+        "coordinode_blob_gc_reclaimed_bytes_total",
+        "Blob payload bytes the collector deleted"
+    );
+    metrics::describe_counter!(
+        "coordinode_blob_gc_reclaimed_chunks_total",
+        "Blob payload chunks the collector deleted"
+    );
+    metrics::describe_counter!(
+        "coordinode_blob_gc_reclaimed_disk_bytes_total",
+        "Bytes the blob payload partition shrank by in the collector's compactions"
+    );
 
     // Page integrity
     metrics::describe_counter!("coordinode_page_checksum_verified_total", "Pages verified");

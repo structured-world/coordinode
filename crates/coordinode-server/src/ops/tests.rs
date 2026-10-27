@@ -1,6 +1,68 @@
 use std::sync::Arc;
 
-use super::{Readiness, ReloadHook, reload_response, respond};
+use parking_lot::Mutex;
+
+use super::{
+    BlobGcRequest, BlobGcView, Readiness, ReloadHook, blob_gc_response, reload_response, respond,
+};
+
+/// A view that records what it was asked and answers with its name.
+fn recording_view() -> (BlobGcView, Arc<Mutex<Vec<BlobGcRequest>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&asked);
+    let view: BlobGcView = Arc::new(move |request| {
+        seen.lock().push(request);
+        Ok(format!("{request:?}"))
+    });
+    (view, asked)
+}
+
+/// `GET /blob-gc` reports and `POST /blob-gc/run` runs a pass, reconciling
+/// only when asked; the wrong method is refused before the collector is
+/// asked anything, and an unknown path under the prefix is not found.
+#[test]
+fn blob_gc_reports_on_get_and_runs_on_post() {
+    let (view, asked) = recording_view();
+    let (status, content_type, _) = blob_gc_response("GET", "/blob-gc", &view);
+    assert_eq!((status, content_type), ("200 OK", "application/json"));
+    let (status, _, _) = blob_gc_response("POST", "/blob-gc/run", &view);
+    assert_eq!(status, "200 OK");
+    let (status, _, _) = blob_gc_response("POST", "/blob-gc/run?reconcile=true", &view);
+    assert_eq!(status, "200 OK");
+    assert_eq!(
+        *asked.lock(),
+        vec![
+            BlobGcRequest::Status,
+            BlobGcRequest::Run { reconcile: false },
+            BlobGcRequest::Run { reconcile: true },
+        ]
+    );
+
+    let (view, asked) = recording_view();
+    assert_eq!(
+        blob_gc_response("GET", "/blob-gc/run", &view).0,
+        "405 Method Not Allowed",
+        "a GET runs nothing"
+    );
+    assert_eq!(
+        blob_gc_response("POST", "/blob-gc", &view).0,
+        "405 Method Not Allowed"
+    );
+    assert_eq!(
+        blob_gc_response("GET", "/blob-gc/other", &view).0,
+        "404 Not Found"
+    );
+    assert!(asked.lock().is_empty());
+}
+
+/// A collector that fails says so as an error the caller sees.
+#[test]
+fn blob_gc_reports_the_collector_failure() {
+    let failing: BlobGcView = Arc::new(|_| Err("the store is damaged".to_owned()));
+    let (status, _, body) = blob_gc_response("POST", "/blob-gc/run", &failing);
+    assert_eq!(status, "500 Internal Server Error");
+    assert!(body.contains("the store is damaged"), "{body}");
+}
 
 /// `POST /reload` runs the reload and reports its outcome; a refused reload
 /// is an error the caller sees, any other method changes nothing, and a node

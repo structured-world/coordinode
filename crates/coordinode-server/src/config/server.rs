@@ -595,6 +595,36 @@ pub struct ServerConfig {
     pub checkpoint_dir: Option<String>,
     /// Number of recent checkpoints to retain; older ones are pruned. Default 3.
     pub checkpoint_keep: usize,
+    // ── Orphan blob collection ───────────────────────────────────────────────
+    // Fine tunables: config-file only, no CLI flag. All take effect live
+    // through `Database::set_blob_gc_policy`, applied at startup.
+    /// Least time released blob content is kept before it is collected, in
+    /// seconds. The MVCC retention window raises it when longer. `None` =
+    /// 86400 (24 h).
+    pub blob_gc_grace_secs: Option<u64>,
+    /// How long an upload may stay admitted without publishing before it is
+    /// fenced and its payload collected, in seconds. `None` = 3600.
+    pub blob_gc_upload_expiry_secs: Option<u64>,
+    /// Most items one collection pass takes from each of its queues. `None` =
+    /// 1024.
+    pub blob_gc_batch: Option<NonZeroUsize>,
+    /// Interval between reconciliations of blob accounting against the
+    /// owners, in seconds. `None` = 86400.
+    pub blob_gc_reconcile_interval_secs: Option<NonZeroU64>,
+    /// About how many distinct blob contents one reconciliation holds in
+    /// memory at a time; a larger store is reconciled in slices. `None` =
+    /// 1000000.
+    pub blob_gc_reconcile_max_contents: Option<NonZeroUsize>,
+    /// How soon collection retries while work is held by an upload, a reader,
+    /// retained history or a failure, in seconds. `None` = 60.
+    pub blob_gc_retry_interval_secs: Option<NonZeroU64>,
+    /// MiB of blob payload deleted since the last compaction at which the
+    /// next one runs to return their space. `0` compacts after every
+    /// cleanup. `None` = 64.
+    pub blob_gc_compact_after_mb: Option<u64>,
+    /// Longest deleted blob payload waits for its compaction when less than
+    /// `blob_gc_compact_after_mb` was deleted, in seconds. `None` = 600.
+    pub blob_gc_compact_after_secs: Option<u64>,
     // ── AFTER COMMIT trigger dispatch ────────────────────────────────────────
     // Fine tunables: config-file only, no CLI flag. The first three also have a runtime seam
     // (`Database::set_trigger_dispatch_config`) the future `setParameters` admin
@@ -724,6 +754,14 @@ impl Default for ServerConfig {
             checkpoint_interval_secs: 3600,
             checkpoint_dir: None,
             checkpoint_keep: 3,
+            blob_gc_grace_secs: None,
+            blob_gc_upload_expiry_secs: None,
+            blob_gc_batch: None,
+            blob_gc_reconcile_interval_secs: None,
+            blob_gc_reconcile_max_contents: None,
+            blob_gc_retry_interval_secs: None,
+            blob_gc_compact_after_mb: None,
+            blob_gc_compact_after_secs: None,
             trigger_max_cascade_depth: None,
             trigger_default_retry_attempts: None,
             trigger_default_backoff_ms: None,
@@ -920,6 +958,39 @@ impl ServerConfig {
             default_backoff_ms: self
                 .trigger_default_backoff_ms
                 .unwrap_or(d.default_backoff_ms),
+        }
+    }
+
+    /// The orphan blob collector's policy: each value the file sets, the
+    /// built-in default for the rest. Applied to the `Database` at startup
+    /// through `set_blob_gc_policy`, which also retunes it live.
+    #[must_use]
+    pub fn blob_gc_policy(&self) -> coordinode_embed::db::GcPolicy {
+        use std::time::Duration;
+        let d = coordinode_embed::db::GcPolicy::default();
+        coordinode_embed::db::GcPolicy {
+            grace: self.blob_gc_grace_secs.map_or(d.grace, Duration::from_secs),
+            upload_expiry: self
+                .blob_gc_upload_expiry_secs
+                .map_or(d.upload_expiry, Duration::from_secs),
+            batch: self.blob_gc_batch.map_or(d.batch, NonZeroUsize::get),
+            reconcile_every: self
+                .blob_gc_reconcile_interval_secs
+                .map_or(d.reconcile_every, |s| Duration::from_secs(s.get())),
+            reconcile_max_contents: self
+                .blob_gc_reconcile_max_contents
+                .map_or(d.reconcile_max_contents, NonZeroUsize::get),
+            retry_interval: self
+                .blob_gc_retry_interval_secs
+                .map_or(d.retry_interval, |s| Duration::from_secs(s.get())),
+            // More MiB than bytes can count is a threshold never reached,
+            // which is what so large a setting asks for.
+            compact_after_bytes: self
+                .blob_gc_compact_after_mb
+                .map_or(d.compact_after_bytes, |mb| mb.saturating_mul(1 << 20)),
+            compact_after: self
+                .blob_gc_compact_after_secs
+                .map_or(d.compact_after, Duration::from_secs),
         }
     }
 

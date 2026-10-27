@@ -441,8 +441,13 @@ pub struct Database {
     interactive_begun: Option<Arc<dyn Fn() + Send + Sync>>,
     /// How many members this database's group holds now, set by the member
     /// that opened it. Blob payload is held only where it is written, so
-    /// blob writes are refused while the group holds others.
-    group_members: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    /// blob writes are refused and no blob is collected while the group
+    /// holds others. Shared with the collector, which asks before each pass.
+    group_members: Arc<parking_lot::RwLock<Option<blob::GroupMembers>>>,
+    /// The orphan blob collector of this database's store.
+    blob_collector: Arc<coordinode_storage::blob::gc::BlobCollector>,
+    /// Its background worker, stopped on drop.
+    _blob_collector_worker: coordinode_storage::blob::gc::CollectorWorker,
 }
 
 /// A query whose parse + analyze + logical-plan-build succeeded, kept
@@ -1096,6 +1101,23 @@ impl Database {
         // does the lookup.
         engine.set_node_shard(1);
 
+        // Orphan blob collection runs on its own thread, woken by releases
+        // and by the work it knows falls due; a group that holds other
+        // members collects nothing (see `blob::GroupMembers`).
+        let group_members: Arc<parking_lot::RwLock<Option<blob::GroupMembers>>> =
+            Arc::new(parking_lot::RwLock::new(None));
+        let blob_collector = coordinode_storage::blob::gc::BlobCollector::new(
+            coordinode_storage::blob::BlobStore::through_pipeline(
+                Arc::clone(&engine),
+                Arc::clone(&oracle),
+                Arc::clone(&pipeline),
+                Arc::clone(&proposal_id_gen),
+            ),
+            coordinode_storage::blob::gc::GcPolicy::default(),
+            blob::collection_activity(Arc::clone(&group_members), follow_raft_applies),
+        );
+        let blob_collector_worker = blob_collector.spawn();
+
         let db = Self {
             engine,
             fields,
@@ -1144,7 +1166,9 @@ impl Database {
             operation_admission_window: Self::DEFAULT_OPERATION_ADMISSION_WINDOW,
             max_interactive_txn_bytes: Self::DEFAULT_MAX_INTERACTIVE_TXN_BYTES,
             interactive_begun: None,
-            group_members: None,
+            group_members,
+            blob_collector,
+            _blob_collector_worker: blob_collector_worker,
         };
         // A store that owns its log takes up its unfinished index builds now;
         // a cluster member does it once it leads, since the builds are
@@ -3794,10 +3818,13 @@ mod index_maintenance;
 mod interactive;
 mod package;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
-pub use blob::{BlobId, UploadedBlob};
+pub use blob::{BlobId, GroupMembers, UploadedBlob};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
 pub use coordinode_core::txn::command::{
     ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,
+};
+pub use coordinode_storage::blob::gc::{
+    CleanedUpReport, CompactionReport, GcPass, GcPolicy, GcStatus, Reconciliation,
 };
 pub use error::{DatabaseError, PeerFailure, ReadFenceFailure, StorageFailure};
 pub use fields::FieldDictionary;

@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use coordinode_core::graph::blob::{
     CANDIDATE_PREFIX, CatalogEntry, ContentId, DEFAULT_CHUNK_SIZE, ScopedContent, SharingScope,
-    catalog_key, direct_owner_key, payload_key, pins_counter_key, refs_counter_key, staging_key,
+    catalog_key, direct_owner_key, payload_key, pins_counter_key, refs_counter_key, retired_key,
+    staging_key,
 };
 use coordinode_core::txn::timestamp::TimestampOracle;
 use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs};
@@ -99,7 +100,32 @@ fn entry(store: &BlobStore, content: &ScopedContent) -> CatalogEntry {
 }
 
 fn eligible_generation(store: &BlobStore, content: &ScopedContent) -> u64 {
-    entry(store, content).eligible.expect("eligible").generation
+    entry(store, content).eligible.generation
+}
+
+fn has_entry(store: &BlobStore, content: &ScopedContent) -> bool {
+    store
+        .engine()
+        .get(Partition::BlobRef, &catalog_key(content))
+        .expect("get")
+        .is_some()
+}
+
+/// Whether `content`'s representation `generation` awaits cleanup.
+fn is_retired(store: &BlobStore, content: &ScopedContent, generation: u64) -> bool {
+    store
+        .engine()
+        .get(Partition::BlobRef, &retired_key(content, generation))
+        .expect("get")
+        .is_some()
+}
+
+fn has_payload(store: &BlobStore, content: &ScopedContent, generation: u64) -> bool {
+    store
+        .engine()
+        .get(Partition::Blob, &payload_key(content, generation))
+        .expect("get")
+        .is_some()
 }
 
 fn read_all(store: &BlobStore, owner_key: &[u8]) -> Vec<u8> {
@@ -226,9 +252,11 @@ fn retirement_waits_for_the_last_owner_and_recreation_gets_a_new_generation() {
         store.retire(&content, generation).expect("again"),
         Retirement::NotEligible
     );
-    let retired = entry(&store, &content);
-    assert_eq!(retired.eligible, None);
-    assert_eq!(retired.retired, vec![generation]);
+    assert!(
+        !has_entry(&store, &content),
+        "a retired copy leaves the catalog"
+    );
+    assert!(is_retired(&store, &content, generation));
 
     put(&store, 2, &data);
     let recreated = eligible_generation(&store, &content);
@@ -236,13 +264,99 @@ fn retirement_waits_for_the_last_owner_and_recreation_gets_a_new_generation() {
         recreated, generation,
         "a retired generation is never reused"
     );
-    // Cleanup of the retired generation, by its exact key, leaves the new
-    // copy whole.
+    // A cleanup of the retired generation, however late, reaches only that
+    // generation and leaves the new copy whole.
+    let cleaned = store.clean_up(&[(content, generation)]).expect("cleanup");
+    assert_eq!(
+        cleaned,
+        CleanedUp {
+            representations: 1,
+            chunks: 1,
+            bytes: data.len() as u64,
+        }
+    );
+    assert!(!has_payload(&store, &content, generation));
+    assert!(has_payload(&store, &content, recreated));
+    assert_eq!(read_all(&store, &owner(2)), data);
+    // Repeated after it finished, as a retry after a crash would, the
+    // cleanup finds its record gone and deletes nothing.
+    assert_eq!(
+        store.clean_up(&[(content, generation)]).expect("again"),
+        CleanedUp::default()
+    );
+    // And an old retirement of the recreated content is refused outright.
+    assert_eq!(
+        store.retire(&content, generation).expect("stale retire"),
+        Retirement::NotEligible
+    );
+    assert_eq!(read_all(&store, &owner(2)), data);
+}
+
+/// Retiring a batch decides each item for itself: a content an owner still
+/// references stays, however the batch is committed, while the rest of the
+/// batch is retired and an item no longer eligible is said to be.
+#[test]
+fn a_batch_retirement_keeps_a_referenced_content_and_retires_the_rest() {
+    let (store, _dir) = open_store();
+    let (kept, gone, stale) = (
+        b"still referenced".to_vec(),
+        b"released".to_vec(),
+        b"stale".to_vec(),
+    );
+    put(&store, 1, &kept);
+    put(&store, 2, &gone);
+    put(&store, 3, &stale);
+    let kept_copy = (scoped(&kept), eligible_generation(&store, &scoped(&kept)));
+    let gone_copy = (scoped(&gone), eligible_generation(&store, &scoped(&gone)));
+    let stale_copy = (scoped(&stale), eligible_generation(&store, &scoped(&stale)));
+    store.delete(&owner(2)).expect("delete");
+    store.delete(&owner(3)).expect("delete");
+    assert_eq!(
+        store.retire(&stale_copy.0, stale_copy.1).expect("retire"),
+        Retirement::Retired
+    );
+
+    let decided = store
+        .retire_many(&[kept_copy, gone_copy, stale_copy])
+        .expect("retire");
+    assert_eq!(
+        decided,
+        vec![
+            Retirement::Held,
+            Retirement::Retired,
+            Retirement::NotEligible
+        ]
+    );
+    assert_eq!(eligible_generation(&store, &kept_copy.0), kept_copy.1);
+    assert!(is_retired(&store, &gone_copy.0, gone_copy.1));
+    assert_eq!(read_all(&store, &owner(1)), kept);
+}
+
+/// A cleanup refuses to act on a retirement record that names the copy
+/// readers resolve to: deleting it would lose referenced data, and nothing
+/// but damage can bring such a record about.
+#[test]
+fn a_cleanup_never_deletes_the_eligible_copy() {
+    let (store, _dir) = open_store();
+    let data = b"still eligible".to_vec();
+    let content = scoped(&data);
+    put(&store, 1, &data);
+    let generation = eligible_generation(&store, &content);
     store
         .engine()
-        .delete(Partition::Blob, &payload_key(&content, generation))
-        .expect("cleanup");
-    assert_eq!(read_all(&store, &owner(2)), data);
+        .put(
+            Partition::BlobRef,
+            &retired_key(&content, generation),
+            &0_i64.to_be_bytes(),
+        )
+        .expect("damage");
+    let refused = store.clean_up(&[(content, generation)]);
+    assert!(
+        matches!(refused, Err(BlobError::Damaged { .. })),
+        "{refused:?}"
+    );
+    assert!(has_payload(&store, &content, generation));
+    assert_eq!(read_all(&store, &owner(1)), data);
 }
 
 /// An upload that is staged but not yet published holds its content: a
@@ -291,11 +405,11 @@ fn a_fenced_upload_cannot_publish() {
         "fencing repeats safely"
     );
     assert_eq!(pins(&store, &content), 0);
-    assert_eq!(
-        entry(&store, &content).retired,
-        vec![staged.staged().contents[0].generation],
+    assert!(
+        is_retired(&store, &content, staged.staged().contents[0].generation),
         "the payload it wrote waits for cleanup by its exact generation"
     );
+    assert!(!has_entry(&store, &content), "nothing was published");
     assert!(
         store
             .engine()
@@ -325,13 +439,13 @@ fn concurrent_first_uploads_of_one_content_publish_one_copy() {
     assert_ne!(first_copy.generation, second_copy.generation);
 
     publish(&store, 1, &first).expect("publish first");
-    publish(&store, 2, &second).expect("publish second");
-    let published = entry(&store, &content);
+    let second_outcome = publish(&store, 2, &second).expect("publish second");
+    assert_eq!(eligible_generation(&store, &content), first_copy.generation);
+    assert!(is_retired(&store, &content, second_copy.generation));
     assert_eq!(
-        published.eligible.map(|e| e.generation),
-        Some(first_copy.generation)
+        second_outcome.released, 1,
+        "the redundant copy is work for the collector"
     );
-    assert_eq!(published.retired, vec![second_copy.generation]);
     assert_eq!(refs(&store, &content), 2);
     assert_eq!(pins(&store, &content), 0);
     assert_eq!(read_all(&store, &owner(2)), data);
@@ -356,10 +470,13 @@ fn a_reader_keeps_its_payload_across_deletion_and_cleanup() {
             store.retire(&content, generation).expect("retire"),
             Retirement::Retired
         );
-        store
-            .engine()
-            .delete(Partition::Blob, &payload_key(&content, generation))
-            .expect("cleanup");
+        assert_eq!(
+            store
+                .clean_up(&[(content, generation)])
+                .expect("cleanup")
+                .chunks,
+            1
+        );
     }
 
     let mut read = first;
@@ -444,16 +561,12 @@ fn admission_and_retirement_race_without_losing_a_referenced_copy() {
                     else {
                         continue;
                     };
-                    let entry = CatalogEntry::from_msgpack(&bytes).expect("decode");
-                    let Some(eligible) = entry.eligible else {
-                        continue;
-                    };
+                    let eligible = CatalogEntry::from_msgpack(&bytes).expect("decode").eligible;
                     if store.retire(&content, eligible.generation).expect("retire")
                         == Retirement::Retired
                     {
                         store
-                            .engine()
-                            .delete(Partition::Blob, &payload_key(&content, eligible.generation))
+                            .clean_up(&[(content, eligible.generation)])
                             .expect("erase");
                         retired += 1;
                     }

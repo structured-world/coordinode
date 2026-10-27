@@ -8,9 +8,13 @@
 //! operation decides, so a retry whose answer was lost never leaves a second
 //! blob nobody knows the id of.
 
+use std::sync::Arc;
+
 use coordinode_core::graph::blob::{OwnerRecord, SharingScope, direct_owner_key};
 use coordinode_core::txn::operation::IntentDigest;
+use coordinode_storage::blob::gc::{Activity, GcPass, GcPolicy, GcStatus};
 use coordinode_storage::blob::{BlobError, BlobReader, BlobStore, OwnerWrite};
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
 use super::{Database, DatabaseError};
@@ -102,22 +106,74 @@ pub struct UploadedBlob {
     pub shared: usize,
 }
 
+/// Says how many members the group a database belongs to holds now.
+pub type GroupMembers = Arc<dyn Fn() -> usize + Send + Sync>;
+
+/// How many members the group holds now, as `members` says; a replicated
+/// database whose member did not say is as unknown as a group of many.
+fn members_now(members: &RwLock<Option<GroupMembers>>, replicated: bool) -> usize {
+    match &*members.read() {
+        Some(members) => members(),
+        None if replicated => usize::MAX,
+        None => 1,
+    }
+}
+
+/// Whether the collector may collect: only where blob payload lives, on a
+/// member that is the whole of its group.
+pub(super) fn collection_activity(
+    members: Arc<RwLock<Option<GroupMembers>>>,
+    replicated: bool,
+) -> Activity {
+    Arc::new(move || members_now(&members, replicated) <= 1)
+}
+
 impl Database {
     /// The BlobStore of this database, committing through its write
-    /// pipeline like every other write.
+    /// pipeline like every other write, and waking the collector when a
+    /// commit leaves it work.
     pub fn blob_store(&self) -> BlobStore {
-        BlobStore::through_pipeline(
-            std::sync::Arc::clone(&self.engine),
-            std::sync::Arc::clone(&self.oracle),
-            std::sync::Arc::clone(&self.pipeline),
-            std::sync::Arc::clone(&self.proposal_id_gen),
-        )
+        self.blob_collector.store().clone()
     }
 
     /// Let `members` say how many members the group this database belongs
     /// to holds now. Called by the member that opens it.
-    pub fn set_group_members(&mut self, members: std::sync::Arc<dyn Fn() -> usize + Send + Sync>) {
-        self.group_members = Some(members);
+    pub fn set_group_members(&mut self, members: GroupMembers) {
+        *self.group_members.write() = Some(members);
+    }
+
+    /// Run one pass of the orphan blob collector now, after any pass already
+    /// running: what the background worker does on its own, at once. With
+    /// `reconcile`, accounting is also checked against the owners whether or
+    /// not that is due. A pass never shortens the grace, fences a live
+    /// upload, or passes a reader or retained history.
+    ///
+    /// # Errors
+    ///
+    /// A storage or commit failure; what the pass did before it stands.
+    pub fn run_blob_gc(&self, reconcile: bool) -> Result<GcPass, DatabaseError> {
+        self.blob_collector.run(reconcile).map_err(blob_error)
+    }
+
+    /// Where orphan blob collection stands: what waits, what holds it, what
+    /// was reclaimed, and the last pass. Reads every queue the collector
+    /// keeps, so its cost grows with the backlog.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or a record that does not decode.
+    pub fn blob_gc_status(&self) -> Result<GcStatus, DatabaseError> {
+        self.blob_collector.status().map_err(blob_error)
+    }
+
+    /// The policy the orphan blob collector runs under.
+    pub fn blob_gc_policy(&self) -> GcPolicy {
+        self.blob_collector.policy()
+    }
+
+    /// Run the orphan blob collector under `policy` from its next pass on.
+    pub fn set_blob_gc_policy(&self, policy: GcPolicy) {
+        self.blob_collector.set_policy(policy);
     }
 
     /// Store `data` as a new blob. With `operation`, the upload takes effect
@@ -208,14 +264,7 @@ impl Database {
     /// is held only on the member that writes it, and a leader change would
     /// lose it.
     fn refuse_blob_writes_in_a_group(&self) -> Result<(), DatabaseError> {
-        let members = match &self.group_members {
-            Some(members) => members(),
-            // A replicated database whose member did not say how many it
-            // has: as unknown as a group of many.
-            None if self.cluster_mode => usize::MAX,
-            None => 1,
-        };
-        if members <= 1 {
+        if members_now(&self.group_members, self.cluster_mode) <= 1 {
             return Ok(());
         }
         Err(DatabaseError::Unsupported(

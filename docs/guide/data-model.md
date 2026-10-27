@@ -119,9 +119,21 @@ the blob as it stood when the download began, chunk by chunk, however slowly
 the client consumes it, and a chunk whose bytes do not match its digest is
 refused, never served.
 
-Deleting a blob ends its hold on its chunks; it does not yet return their
-storage, and `DeleteBlobResponse.chunks_deleted` is `0`. Do not count a
-delete as space released.
+Deleting a blob ends its hold on its chunks; the space comes back later, from
+the server's own collector, with nothing for a client to scan, compact or
+restart. A chunk another blob still holds stays. One nothing holds any more is
+kept for a grace period (24 hours by default, never less than the MVCC
+retention window) and for as long as a reader, retained history or an upload
+in progress still needs it; then its bytes are deleted and the storage
+compacted. The files of the most recent batch are freed by the compaction
+after that one, so a node that deletes nothing more keeps them until it
+does. `DeleteBlobResponse.chunks_deleted`
+is therefore `0`: the delete itself frees nothing, and a delete is not space
+released. An upload that was never published, such as one cut off by a crash,
+is collected the same way once it is an hour old. Where collection stands,
+including what is waiting, what holds it and how much it has reclaimed, is on
+the [ops port](configuration.md#ports) as `GET /blob-gc`; see
+[Orphan blob collection](configuration.md#orphan-blob-collection).
 
 A store written by an earlier engine format is refused at open, untouched.
 

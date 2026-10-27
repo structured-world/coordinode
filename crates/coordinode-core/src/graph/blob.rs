@@ -21,15 +21,20 @@
 //! Blob partition
 //!   blob:<scope><content><generation>        → encoded chunk bytes
 //! BlobRef partition
-//!   blobcat:<scope><content>                 → CatalogEntry
+//!   blobcat:<scope><content>                 → CatalogEntry (eligible copy)
 //!   blobmeta:<owner id>                      → OwnerRecord (direct blob)
 //!   s3:<path>                                → OwnerRecord (S3 object)
 //!   blobref:<node id><property id>           → OwnerRecord (node property)
 //!   blobstage:<staging id>                   → StagingRecord
-//!   blobcand:<scope><content><owner>         → release time (µs)
+//!   blobcand:<release µs><scope><content><owner><incarnation>
+//!                                            → (release candidate)
+//!   blobretired:<scope><content><generation> → (payload awaiting cleanup)
+//!   blobgc:compact                           → oldest cleanup awaiting compaction (µs)
+//!   blobgc:state                             → collector record
 //! Counter partition
 //!   counter:blob_refs:<scope>:<content hex>  → owners referencing the content
 //!   counter:blob_pins:<scope>:<content hex>  → uploads holding the content
+//!   counter:blob_gc:<measure>                → what the collector reclaimed
 //! ```
 //!
 //! ## Inline threshold
@@ -272,14 +277,14 @@ pub struct Representation {
     pub encoded_len: u32,
 }
 
-/// The catalog's record of one scoped content.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The catalog's record of one scoped content, kept while the content has a
+/// representation readers and new references resolve to. A retired
+/// representation leaves the catalog and waits for cleanup under its own
+/// [`retired_key`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEntry {
-    /// The representation readers and new references resolve to, if any.
-    pub eligible: Option<Representation>,
-    /// Generations whose payload is no longer eligible and waits for physical
-    /// cleanup, by exact generation.
-    pub retired: Vec<u64>,
+    /// The representation readers and new references resolve to.
+    pub eligible: Representation,
 }
 
 impl CatalogEntry {
@@ -420,6 +425,30 @@ pub const PROPERTY_OWNER_PREFIX: &[u8] = b"blobref:";
 pub const STAGING_PREFIX: &[u8] = b"blobstage:";
 /// Key prefix of release candidates.
 pub const CANDIDATE_PREFIX: &[u8] = b"blobcand:";
+/// Key prefix of retired representations awaiting cleanup.
+pub const RETIRED_PREFIX: &[u8] = b"blobretired:";
+/// The key whose presence says payload was cleaned up and the compaction
+/// that returns its space has not run since. Its value is when the oldest
+/// such cleanup ran (microseconds since the epoch, big-endian); its version
+/// is the latest one's commit, which the compaction must pass.
+pub const COMPACTION_PENDING_KEY: &[u8] = b"blobgc:compact";
+/// Counter of the payload bytes cleaned up since the last compaction the
+/// collector ran.
+pub const UNCOMPACTED_BYTES_KEY: &[u8] = b"counter:blob_gc:uncompacted_bytes";
+/// The collector's own record: when accounting was last reconciled, and why
+/// collection is stopped if it is.
+pub const COLLECTOR_STATE_KEY: &[u8] = b"blobgc:state";
+/// Key prefix of the owner reference counters.
+pub const REFS_COUNTER_PREFIX: &[u8] = b"counter:blob_refs:";
+/// Key prefix of the upload pin counters.
+pub const PINS_COUNTER_PREFIX: &[u8] = b"counter:blob_pins:";
+/// Counter of the payload bytes the collector deleted.
+pub const RECLAIMED_BYTES_KEY: &[u8] = b"counter:blob_gc:reclaimed_bytes";
+/// Counter of the payload chunks the collector deleted.
+pub const RECLAIMED_CHUNKS_KEY: &[u8] = b"counter:blob_gc:reclaimed_chunks";
+/// Counter of the bytes the Blob partition shrank by in the compactions the
+/// collector ran.
+pub const RECLAIMED_DISK_BYTES_KEY: &[u8] = b"counter:blob_gc:reclaimed_disk_bytes";
 
 /// The payload key of `content`'s representation `generation`.
 pub fn payload_key(content: &ScopedContent, generation: u64) -> Vec<u8> {
@@ -440,21 +469,39 @@ pub fn catalog_key(content: &ScopedContent) -> Vec<u8> {
 
 /// The counter key of the owners referencing `content`.
 pub fn refs_counter_key(content: &ScopedContent) -> Vec<u8> {
-    counter_key("blob_refs", content)
+    counter_key(REFS_COUNTER_PREFIX, content)
 }
 
 /// The counter key of the uploads holding `content`.
 pub fn pins_counter_key(content: &ScopedContent) -> Vec<u8> {
-    counter_key("blob_pins", content)
+    counter_key(PINS_COUNTER_PREFIX, content)
 }
 
-fn counter_key(kind: &str, content: &ScopedContent) -> Vec<u8> {
-    alloc::format!(
-        "counter:{kind}:{}:{}",
-        content.scope.as_raw(),
-        content.content.to_hex()
-    )
-    .into_bytes()
+fn counter_key(prefix: &[u8], content: &ScopedContent) -> Vec<u8> {
+    let mut key = prefix.to_vec();
+    key.extend_from_slice(
+        alloc::format!("{}:{}", content.scope.as_raw(), content.content.to_hex()).as_bytes(),
+    );
+    key
+}
+
+/// The content a counter key under `prefix` ([`REFS_COUNTER_PREFIX`] or
+/// [`PINS_COUNTER_PREFIX`]) counts, or `None` for a key that is not one.
+pub fn decode_counter_key(prefix: &[u8], key: &[u8]) -> Option<ScopedContent> {
+    let rest = core::str::from_utf8(key.strip_prefix(prefix)?).ok()?;
+    let (scope, content) = rest.split_once(':')?;
+    let scope = scope.parse::<u64>().ok()?;
+    if content.len() != ContentId::ENCODED_LEN * 2 {
+        return None;
+    }
+    let mut raw = [0u8; ContentId::ENCODED_LEN];
+    for (byte, pair) in raw.iter_mut().zip(content.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(core::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(ScopedContent::new(
+        SharingScope(scope),
+        ContentId::decode(&raw)?,
+    ))
 }
 
 /// The key of the staged upload `staging_id`.
@@ -465,15 +512,95 @@ pub fn staging_key(staging_id: u64) -> Vec<u8> {
     key
 }
 
+/// The staging id a staging key names.
+pub fn decode_staging_key(key: &[u8]) -> Option<u64> {
+    let id = key.strip_prefix(STAGING_PREFIX)?;
+    Some(u64::from_be_bytes(id.try_into().ok()?))
+}
+
 /// The candidate key recording that `owner_key` at `incarnation` released
-/// `content`. One per release, so concurrent releases never write one key.
-pub fn candidate_key(content: &ScopedContent, owner_key: &[u8], incarnation: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(CANDIDATE_PREFIX.len() + ScopedContent::ENCODED_LEN + 40);
+/// `content` at `released_at_micros`. One per release, so concurrent releases
+/// never write one key; ordered by release time first, so a collector reads
+/// them oldest first and stops at the first one still in its grace.
+pub fn candidate_key(
+    released_at_micros: i64,
+    content: &ScopedContent,
+    owner_key: &[u8],
+    incarnation: u64,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CANDIDATE_PREFIX.len() + 8 + ScopedContent::ENCODED_LEN + 40);
     key.extend_from_slice(CANDIDATE_PREFIX);
+    key.extend_from_slice(&micros_key(released_at_micros));
     content.encode_into(&mut key);
     key.extend_from_slice(&Sha256::digest(owner_key));
     key.extend_from_slice(&incarnation.to_be_bytes());
     key
+}
+
+/// A release candidate as its key records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Candidate {
+    /// When the owner released the content, in microseconds since the epoch.
+    pub released_at_micros: i64,
+    /// The content released.
+    pub content: ScopedContent,
+}
+
+/// The candidate a candidate key records.
+pub fn decode_candidate_key(key: &[u8]) -> Option<Candidate> {
+    let rest = key.strip_prefix(CANDIDATE_PREFIX)?;
+    let released = u64::from_be_bytes(rest.get(..8)?.try_into().ok()?);
+    Some(Candidate {
+        // `micros_key` wrote a non-negative time, so it fits back.
+        released_at_micros: i64::try_from(released).ok()?,
+        content: ScopedContent::decode(rest.get(8..)?)?,
+    })
+}
+
+/// The smallest candidate key released after `micros`: a scan of candidates
+/// whose grace has passed stops here.
+pub fn candidates_released_after(micros: i64) -> Vec<u8> {
+    let mut key = CANDIDATE_PREFIX.to_vec();
+    // Nothing is released after the last representable time: the bound
+    // stays there.
+    key.extend_from_slice(&micros_key(micros.saturating_add(1)));
+    key
+}
+
+/// A time in the order keys sort by. Times are taken from a clock that reads
+/// the epoch when set before it, so they are never negative; one that is
+/// sorts as the epoch.
+fn micros_key(micros: i64) -> [u8; 8] {
+    u64::try_from(micros).unwrap_or(0).to_be_bytes()
+}
+
+/// The key recording that `content`'s representation `generation` is
+/// retired and its payload awaits cleanup.
+pub fn retired_key(content: &ScopedContent, generation: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(RETIRED_PREFIX.len() + ScopedContent::ENCODED_LEN + 8);
+    key.extend_from_slice(RETIRED_PREFIX);
+    content.encode_into(&mut key);
+    key.extend_from_slice(&generation.to_be_bytes());
+    key
+}
+
+/// The content and generation a retired key names.
+pub fn decode_retired_key(key: &[u8]) -> Option<(ScopedContent, u64)> {
+    decode_content_generation(key.strip_prefix(RETIRED_PREFIX)?)
+}
+
+/// The content and generation a payload key names.
+pub fn decode_payload_key(key: &[u8]) -> Option<(ScopedContent, u64)> {
+    decode_content_generation(key.strip_prefix(PAYLOAD_PREFIX)?)
+}
+
+fn decode_content_generation(rest: &[u8]) -> Option<(ScopedContent, u64)> {
+    if rest.len() != ScopedContent::ENCODED_LEN + 8 {
+        return None;
+    }
+    let content = ScopedContent::decode(rest)?;
+    let generation = u64::from_be_bytes(rest.get(ScopedContent::ENCODED_LEN..)?.try_into().ok()?);
+    Some((content, generation))
 }
 
 /// The owner key of the direct blob `owner_id`.
