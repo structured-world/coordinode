@@ -3162,6 +3162,145 @@ async fn a_member_that_lost_committed_entries_votes_again_only_once_caught_up() 
     );
 }
 
+/// A member whose Raft tree was lost comes back with the vote it had given,
+/// read from the second copy, never the consensus engine's initial one: its
+/// promise does not move back. With every copy of its vote gone it does not
+/// start at all, with a typed refusal, and its directory is left as it was:
+/// no campaign, no vote and no append from a member that may have forgotten
+/// a promise.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+        ];
+        let e1 = open_engine_at(dirs[0].path());
+        let e2 = open_engine_at(dirs[1].path());
+        let e3 = open_engine_at(dirs[2].path());
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+            conn(1),
+        )
+        .await
+        .expect("n1");
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n2");
+        let n3 = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n3");
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
+            .await
+            .expect("add 2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
+            .await
+            .expect("add 3");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+        // Member 3 follows the leader's term: the vote it holds names it.
+        let mut given = None;
+        for _ in 0..100 {
+            let vote = n3.raft().metrics().borrow_watched().vote;
+            if vote.leader_id().term > 0 {
+                given = Some(vote);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let given = given.expect("member 3 took the leader's vote");
+
+        for node in [n3, n2, n1] {
+            node.shutdown().await.expect("stop");
+        }
+        drop((e1, e2, e3));
+
+        // Member 3's Raft tree is lost, and with it every record its local
+        // journal no longer holds: the state after a fold and purge.
+        let lose_tree = || {
+            std::fs::remove_dir_all(dirs[2].path().join(Partition::Raft.name()))
+                .expect("lose the tree");
+            std::fs::remove_dir_all(dirs[2].path().join("local-journal"))
+                .expect("lose the local journal");
+        };
+        lose_tree();
+        let e3 = open_engine_at(dirs[2].path());
+        let n3 = reopen_member(3, &e3, p3).await;
+        let restored = n3.raft().metrics().borrow_watched().vote;
+        assert!(
+            restored >= given,
+            "the vote went back from {given} to {restored}"
+        );
+        n3.shutdown().await.expect("stop 3");
+        drop(n3);
+        for _ in 0..100 {
+            if Arc::strong_count(&e3) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&e3),
+            1,
+            "a stopped node still holds its engine: {:?}",
+            coordinode_raft::engine_hold::engine_holders(&e3)
+        );
+        drop(e3);
+
+        // Both copies lost: the member does not start.
+        lose_tree();
+        let copy = dirs[2]
+            .path()
+            .join(coordinode_storage::engine::promise::PROMISE_FILE);
+        std::fs::remove_file(&copy).expect("lose the second copy");
+        let e3 = open_engine_at(dirs[2].path());
+        let refused = RaftNode::open_cluster(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+            format!("http://127.0.0.1:{p3}"),
+            conn(3),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(RaftNodeError::PromiseUnqualified(_))),
+            "a member without its promise must not start: {:?}",
+            refused.err()
+        );
+        assert!(!copy.exists(), "the refusal wrote no promise of its own");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_member_that_lost_its_raft_tree_keeps_its_promise"
+    );
+}
+
 /// Graceful leader transfer — leader transfers to specific peer,
 /// new leader serves writes, old leader becomes follower.
 #[tokio::test(flavor = "multi_thread")]

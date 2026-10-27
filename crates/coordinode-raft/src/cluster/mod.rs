@@ -791,8 +791,7 @@ impl RaftNode {
             deployment: forming_in,
         } = options;
         let config = Arc::new(snap_config.raft_config(timing, preference));
-        let log_store =
-            LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        let log_store = LogStore::open(Arc::clone(&engine)).map_err(RaftNodeError::log_open)?;
         // Clone the oplog handle before openraft consumes the LogStore, so
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
@@ -1044,8 +1043,8 @@ impl RaftNode {
         } else {
             LostCommitted::Refuse
         };
-        let (log_store, lost_through) = LogStore::open_with(Arc::clone(&engine), lost)
-            .map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        let (log_store, lost_through) =
+            LogStore::open_with(Arc::clone(&engine), lost).map_err(RaftNodeError::log_open)?;
         let catch_up = CatchUp::new(lost_through.map(|id| id.index));
         let elect = config.enable_elect;
         if catch_up.pending() {
@@ -3429,6 +3428,33 @@ pub enum RaftNodeError {
     /// A member cannot be bound to this identity.
     #[error("{0}")]
     Identity(String),
+
+    /// An existing member whose vote no copy can prove. It takes no part in
+    /// its group: no campaign, no vote, no append acknowledged, since a vote
+    /// it forgot could be granted twice in one term. Its store is left as it
+    /// was. With a quorum, the group replaces it under a new identity in a
+    /// separate directory through its membership; without one it stays
+    /// unavailable.
+    #[error("{0}")]
+    PromiseUnqualified(crate::storage::PromiseUnqualified),
+}
+
+impl RaftNodeError {
+    /// What opening the log of a member leads to: a promise no copy proves
+    /// keeps its own variant, so a host can tell it from a failed open.
+    fn log_open(err: std::io::Error) -> Self {
+        if crate::storage::PromiseUnqualified::of(&err).is_none() {
+            return Self::Init(err.to_string());
+        }
+        match err
+            .into_inner()
+            .map(|inner| inner.downcast::<crate::storage::PromiseUnqualified>())
+        {
+            Some(Ok(unqualified)) => Self::PromiseUnqualified(*unqualified),
+            Some(Err(other)) => Self::Init(other.to_string()),
+            None => Self::Init("the log could not be opened".to_owned()),
+        }
+    }
 }
 
 /// Refuse to join a group while this store holds data of its own.

@@ -1561,10 +1561,82 @@ async fn a_member_that_lost_every_copy_of_its_vote_is_refused() {
     let err = LogStore::open(Arc::clone(&engine))
         .err()
         .expect("a member without its promise must not open");
+    assert!(PromiseUnqualified::of(&err).is_some(), "typed: {err}");
     assert!(
-        err.to_string().contains("vote"),
-        "names the lost vote: {err}"
+        !dir.path()
+            .join(coordinode_storage::engine::promise::PROMISE_FILE)
+            .exists(),
+        "the refusal wrote no promise of its own"
     );
+}
+
+/// Damage the Raft tree of the store at `dir` so the next open salvages it
+/// with loss: its manifest is gone, which makes the open rebuild the tree
+/// from its tables, and every table lost its second half, which that
+/// salvage cannot read.
+fn salvage_the_raft_tree_with_loss(dir: &std::path::Path) {
+    let tree = dir.join(Partition::Raft.name());
+    for entry in std::fs::read_dir(&tree).expect("read the tree") {
+        let path = entry.expect("entry").path();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let manifest = name
+            .strip_prefix('v')
+            .or_else(|| name.strip_prefix("edits-"))
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+        if manifest {
+            std::fs::remove_file(&path).expect("lose a manifest file");
+        }
+    }
+    let tables = tree.join("tables");
+    for entry in std::fs::read_dir(&tables).expect("read the tables") {
+        let path = entry.expect("entry").path();
+        let len = std::fs::metadata(&path).expect("stat").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open a table")
+            .set_len(len / 2)
+            .expect("lose its second half");
+    }
+}
+
+/// The open-time salvage of a damaged Raft tree reads back clean but
+/// incomplete: the vote's record is gone though nothing errs. That readable
+/// absence is not taken for a member that never voted; the second copy
+/// gives the vote back.
+#[tokio::test]
+async fn a_lossy_salvage_of_the_raft_tree_keeps_the_vote() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vote = Vote::new(8, 2);
+    let config = compacting_config(dir.path());
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        log.save_vote(&vote).await.expect("save");
+        engine
+            .persist_partition(Partition::Raft)
+            .expect("the vote in a table");
+    }
+    salvage_the_raft_tree_with_loss(dir.path());
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    assert!(
+        engine
+            .open_repairs()
+            .iter()
+            .any(|r| r.partition == Partition::Raft),
+        "the open salvaged the Raft tree: {:?}",
+        engine.open_repairs()
+    );
+    assert_eq!(
+        engine.get(Partition::Raft, KEY_VOTE).expect("readable"),
+        None,
+        "the salvaged tree lost the vote's record without an error"
+    );
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    assert_eq!(log.read_vote().await.expect("read"), Some(vote));
 }
 
 /// The second copy's file in the store at `dir`.

@@ -1536,6 +1536,87 @@ fn a_rebuild_of_the_index_partition_keeps_every_family() {
     }
 }
 
+/// The node's own record in `partition` at `key`, written as the member-local
+/// records are.
+fn local_put(engine: &StorageEngine, partition: Partition, key: &[u8], value: &[u8]) {
+    engine
+        .commit_local(
+            vec![coordinode_storage::engine::core::LocalWrite::Put {
+                partition,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+            coordinode_storage::engine::core::LocalSync::BeforeUse,
+        )
+        .expect("local record");
+}
+
+/// A checkpoint rebuild can never bring a consensus promise back older than
+/// the one given, because the two never meet: a store with a journal of its
+/// own, the only kind a checkpoint rebuild runs on, refuses a consensus
+/// record, and a member's store, which keeps its promise, refuses both
+/// rebuilds and is left as it was.
+#[test]
+fn a_checkpoint_rebuild_never_meets_a_consensus_promise() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = open(&dir);
+    let refused = engine.commit_local(
+        vec![coordinode_storage::engine::core::LocalWrite::Put {
+            partition: Partition::Raft,
+            key: b"raft:vote".to_vec(),
+            value: b"promise".to_vec(),
+        }],
+        coordinode_storage::engine::core::LocalSync::BeforeUse,
+    );
+    assert!(
+        matches!(
+            &refused,
+            Err(coordinode_storage::error::StorageError::InvalidConfig(why))
+                if why.contains("node-local record of raft")
+        ),
+        "a store with its own journal must refuse a consensus promise as such, got {refused:?}"
+    );
+    let root = checkpoint_root(dir.path());
+    let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
+    drop(engine);
+
+    // The same directory taken as a member's store: no journal of its own.
+    let member = Arc::new(
+        StorageEngine::open_with_oracle(&durable_cfg(&dir), Arc::new(TimestampOracle::new()))
+            .expect("open as a member's store"),
+    );
+    local_put(&member, Partition::Raft, b"raft:vote", b"promise");
+    for outcome in [
+        member
+            .repair_partition_from_checkpoint(&ckpt, &[], Partition::Raft)
+            .expect("full rebuild"),
+        member
+            .repair_partition_ranges_from_checkpoint(
+                &ckpt,
+                &[],
+                Partition::Raft,
+                &[(b"raft:vote".to_vec(), b"raft:vote".to_vec())],
+            )
+            .expect("range rebuild"),
+    ] {
+        assert!(
+            matches!(
+                outcome,
+                Rebuild::Refused(coordinode_storage::engine::rebuild::RebuildRefusal::NoJournal)
+            ),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(
+        member
+            .get(Partition::Raft, b"raft:vote")
+            .expect("get")
+            .as_deref(),
+        Some(&b"promise"[..]),
+        "the refused rebuilds left the promise as it was"
+    );
+}
+
 /// A commit that lands while a checkpoint is being taken can reach the
 /// checkpoint's journal copy without reaching its trees. The rebuild must
 /// replay what the checkpoint's tree lacks, not start after the last entry
