@@ -133,6 +133,11 @@ pub struct ColumnarTableRegistry {
     /// point at which tests let another caller in.
     #[cfg(test)]
     pause_after_drop_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run by the next drop once it has closed the table's tree, before it
+    /// waits for the tree to be left: the point from which no weak handle
+    /// raises the tree again.
+    #[cfg(test)]
+    after_close: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The tables the registry holds: the open ones, and the names whose drop
@@ -253,6 +258,8 @@ impl ColumnarTableRegistry {
             retired: Condvar::new(),
             #[cfg(test)]
             pause_after_drop_wait: Mutex::new(None),
+            #[cfg(test)]
+            after_close: Mutex::new(None),
         };
         let mut trees = HashMap::new();
         let mut repairs = Vec::new();
@@ -506,7 +513,19 @@ impl ColumnarTableRegistry {
             // holding it ends, its file pool and deleter are gone too, so
             // nothing writes the folder any more. A monitor pass that set
             // the series did so holding the tree, before it closed.
-            entry.tree.close().wait();
+            let closing = entry.tree.close();
+            #[cfg(test)]
+            {
+                let hook = self
+                    .after_close
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            closing.wait();
             self.settings.metrics.remove(table_id);
         }
         for root in &self.settings.roots {

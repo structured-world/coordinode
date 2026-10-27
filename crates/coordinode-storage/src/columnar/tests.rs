@@ -128,13 +128,16 @@ fn a_drop_waits_for_the_tree_to_close_and_turns_away_queued_work() {
     let reg = Arc::new(new_registry(dir.path()));
     let tree = reg.create_or_open("t").unwrap();
     let queued = reg.trees().pop().expect("the table").tree;
+    let (closed_tx, closed) = std::sync::mpsc::channel();
+    *reg.after_close.lock().unwrap() = Some(Box::new(move || closed_tx.send(()).unwrap()));
 
     let dropper = {
         let reg = Arc::clone(&reg);
         std::thread::spawn(move || reg.drop_table("t"))
     };
-    wait_for_state(&reg, "t", "the drop running", |running, _| running);
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // The drop has closed the tree and now waits for this test's handle,
+    // which it cannot get past.
+    closed.recv().unwrap();
     assert!(
         !dropper.is_finished(),
         "the drop did not wait for the held tree"
