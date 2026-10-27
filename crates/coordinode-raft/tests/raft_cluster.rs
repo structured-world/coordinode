@@ -6391,23 +6391,53 @@ fn propose_held(
     oracle: &coordinode_core::txn::timestamp::TimestampOracle,
     key: &[u8],
 ) -> u64 {
+    try_propose_held(node, engine, oracle, key).expect("propose")
+}
+
+/// [`propose_held`], with the proposal's error handed back.
+fn try_propose_held(
+    node: &RaftNode,
+    engine: &StorageEngine,
+    oracle: &coordinode_core::txn::timestamp::TimestampOracle,
+    key: &[u8],
+) -> Result<u64, ProposalError> {
     let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
     let ids = ProposalIdGenerator::new();
-    node.pipeline()
-        .propose_and_wait(&RaftProposal {
-            id: ids.next(),
-            mutations: vec![Mutation::Put {
-                partition: PartitionId::Node,
-                key: key.to_vec(),
-                value: b"v".to_vec(),
-            }],
-            commit_ts: Timestamp::from_raw(ts),
-            start_ts: Timestamp::from_raw(ts),
-            bypass_rate_limiter: false,
-        })
-        .expect("propose");
+    let written = node.pipeline().propose_and_wait(&RaftProposal {
+        id: ids.next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: key.to_vec(),
+            value: b"v".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts),
+        bypass_rate_limiter: false,
+    });
     drop(held);
-    ts
+    written.map(|_| ts)
+}
+
+/// Write `key` through the member that leads, again on another when the lead
+/// moved before the write was confirmed: a loaded host can elect another
+/// leader between the group's start and its first write. The leader's index
+/// and the write's timestamp.
+async fn propose_through_leader(members: &[Clocked], key: &[u8]) -> (usize, u64) {
+    for _ in 0..20 {
+        let at = await_ready_leader(members).await;
+        let m = &members[at];
+        match try_propose_held(&m.node, &m.engine, &m.oracle, key) {
+            Ok(ts) => return (at, ts),
+            Err(
+                ProposalError::LeadershipLost { .. }
+                | ProposalError::NotLeader { .. }
+                | ProposalError::LeaderNotReady { .. }
+                | ProposalError::ShuttingDown,
+            ) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(e) => unreachable!("the write failed for another reason: {e}"),
+        }
+    }
+    unreachable!("no leader confirmed the write")
 }
 
 /// A member whose store carries its own clock.
@@ -6674,12 +6704,7 @@ async fn a_write_whose_answer_is_lost_is_settled_the_same_everywhere() {
             .map(|_| tempfile::tempdir().expect("tempdir"))
             .collect();
         let mut members = clocked_group(&dirs).await;
-        let first = propose_held(
-            &members[0].node,
-            &members[0].engine,
-            &members[0].oracle,
-            b"node:settled",
-        );
+        let (at, first) = propose_through_leader(&members, b"node:settled").await;
         await_closed_past(&members, first, "every member closes past the first write").await;
 
         // The leader loses its quorum, takes a write into its log alone,
@@ -6687,16 +6712,21 @@ async fn a_write_whose_answer_is_lost_is_settled_the_same_everywhere() {
         // write lands while the leader still leads: stopping the followers
         // first takes long enough for its lease to lapse.
         let ports: Vec<u16> = members.iter().map(|m| m.port).collect();
-        coordinode_raft::cluster::nemesis::isolate(1, &[2, 3]);
-        let appended = members[0]
+        let others: Vec<u64> = members
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| *id != members[at].id)
+            .collect();
+        coordinode_raft::cluster::nemesis::isolate(members[at].id, &others);
+        let appended = members[at]
             .node
             .raft()
             .metrics()
             .borrow_watched()
             .last_log_index;
-        let lost = spawn_writes(&members[0], "lost", 1);
+        let lost = spawn_writes(&members[at], "lost", 1);
         await_condition(Duration::from_secs(5), "the write reaches the log", || {
-            members[0]
+            members[at]
                 .node
                 .raft()
                 .metrics()
@@ -6705,7 +6735,7 @@ async fn a_write_whose_answer_is_lost_is_settled_the_same_everywhere() {
                 > appended
         })
         .await;
-        let leader = members.remove(0);
+        let leader = members.remove(at);
         leader.node.shutdown().await.expect("stop the leader");
         let (key, ts, outcome) = lost
             .into_iter()
