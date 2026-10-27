@@ -150,51 +150,45 @@ fn written_bytes(payload: &[u8], sequence: u64) -> Vec<u8> {
 /// it, and for a slot created now, syncing its directory) leaves a whole
 /// record: the previous one, or the new one once it is synced. Never a torn
 /// record taken for a promise, and never none. Both when the write creates
-/// the second slot and when it overwrites the older one.
+/// a slot and when it writes over an older one.
 #[test]
 fn a_crash_at_any_step_of_a_write_leaves_a_whole_record() {
-    use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs};
-    let cases: [(&[&[u8]], FaultOp, bool); 7] = [
-        (&[b"previous"], FaultOp::Open, true),
-        (&[b"previous"], FaultOp::Write, true),
-        (&[b"previous"], FaultOp::SyncAll, true),
-        (&[b"previous"], FaultOp::SyncDirectory, false),
-        (&[b"oldest", b"previous"], FaultOp::Open, true),
-        (&[b"oldest", b"previous"], FaultOp::Write, true),
-        (&[b"oldest", b"previous"], FaultOp::SyncAll, true),
-    ];
-    for (before, op, previous_only) in cases {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let crash = std::sync::Arc::new(CrashFs::new(StdFs));
-        let faults = std::sync::Arc::new(FaultInjector::new());
-        let fs = FaultFs::with_injector(CrashFs::clone(&crash), std::sync::Arc::clone(&faults));
-        let mut writer = CopyWriter::default();
-        for payload in before {
-            put(&fs, dir.path(), &mut writer, payload).expect("before");
-        }
-        faults.arm(FaultRule::new(
-            op,
-            Fault::Error(lsm_tree::io::ErrorKind::Other),
-        ));
-        let cut = put(&fs, dir.path(), &mut writer, b"next");
-        assert!(
-            cut.is_err(),
-            "{op:?} after {}: the write reported success",
-            before.len()
-        );
-        faults.clear();
-        crash.crash();
-        let left = read_copy(&fs, dir.path()).expect("read after the crash");
-        if previous_only {
-            assert_eq!(left, held(b"previous"), "{op:?} after {}", before.len());
-        } else {
-            assert!(
-                left == held(b"previous") || left == held(b"next"),
-                "{op:?} after {}: {left:?}",
-                before.len()
-            );
+    let mut reached = BTreeSet::new();
+    for before in 1..=2usize {
+        for op in FAULT_OPS {
+            for skip in 0.. {
+                let bench = Bench::new();
+                let mut writer = Writer::default();
+                for n in 0..before {
+                    assert_eq!(bench.attempt(&mut writer, n, None), Outcome::Written);
+                }
+                let step = match bench.attempt(&mut writer, before, Some((op, skip))) {
+                    Outcome::Failed(step) => step,
+                    Outcome::Missed => break,
+                    Outcome::Written => unreachable!("an armed write is failed or missed"),
+                };
+                reached.insert(step);
+                bench.crash.crash();
+                let left = bench.index();
+                // Only a failed directory sync comes after the new record
+                // was synced: everything before leaves the previous one.
+                let allowed = if step == "sync directory" {
+                    before - 1..=before
+                } else {
+                    before - 1..=before - 1
+                };
+                assert!(
+                    left.is_some_and(|n| allowed.contains(&n)),
+                    "{before} written, {op:?} #{skip} failed {step}: the copy is p{left:?}"
+                );
+            }
         }
     }
+    assert_eq!(
+        reached,
+        BTreeSet::from(STEPS),
+        "every step of a write failed once"
+    );
 }
 
 type Writer = CopyWriter;
@@ -203,98 +197,320 @@ fn put(fs: &dyn Fs, dir: &Path, writer: &mut Writer, payload: &[u8]) -> StorageR
     write_copy(fs, dir, writer, &INC, payload, &Footprints::default())
 }
 
-/// Chains of a failed write, its retry (in the same process, or after a
-/// reopen without a power loss) and the next write (in the same process, or
-/// after one more such reopen), ending in a power cut:
-/// the copy is never older than the last write that reported success. A
-/// failed directory sync must not leave a later write trusting a slot name
-/// that may not be durable, and a retry after a failed sync must not write
-/// over the only durable record, whichever slots the earlier writes took.
+use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, MemFs};
+use std::collections::BTreeSet;
+
+/// The operations a write of the copy fails at, besides listing the
+/// directory (a failure there writes nothing) and removing spent slots (a
+/// failure there fails no write): see their own tests.
+const FAULT_OPS: [FaultOp; 5] = [
+    FaultOp::Open,
+    FaultOp::Read,
+    FaultOp::Write,
+    FaultOp::SyncAll,
+    FaultOp::SyncDirectory,
+];
+
+/// Every step a write of the copy can fail at, as its error names it.
+const STEPS: [&str; 6] = [
+    "open to read",
+    "read",
+    "create",
+    "write",
+    "sync",
+    "sync directory",
+];
+
+/// A fault: the operation, and how many operations of that kind pass first.
+type Point = (FaultOp, u64);
+
+/// What one attempt to write came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The write reported success with no fault armed.
+    Written,
+    /// The armed fault was reached, at this step.
+    Failed(&'static str),
+    /// The write reported success before reaching the armed fault: the
+    /// attempt failed nothing and is no case.
+    Missed,
+}
+
+/// An endpoint in memory under power-cut and fault injection: the cases run
+/// in seconds, not in the minutes real syncs take.
+struct Bench {
+    crash: std::sync::Arc<CrashFs>,
+    faults: std::sync::Arc<FaultInjector>,
+    fs: FaultFs<CrashFs>,
+}
+
+impl Bench {
+    const DIR: &'static str = "/endpoint";
+
+    fn new() -> Self {
+        let crash = std::sync::Arc::new(CrashFs::new(MemFs::new()));
+        let faults = std::sync::Arc::new(FaultInjector::new());
+        let fs = FaultFs::with_injector(CrashFs::clone(&crash), std::sync::Arc::clone(&faults));
+        fs.create_dir_all(Path::new(Self::DIR))
+            .expect("the endpoint");
+        fs.sync_directory(Path::new("/"))
+            .expect("the endpoint's name");
+        Self { crash, faults, fs }
+    }
+
+    /// Write `p<n>` through `writer`, failing the operation at `point`.
+    fn attempt(&self, writer: &mut Writer, n: usize, point: Option<Point>) -> Outcome {
+        if let Some((op, skip)) = point {
+            self.faults.arm(
+                FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other))
+                    .skip(skip)
+                    .once(),
+            );
+        }
+        let done = put(
+            &self.fs,
+            Path::new(Self::DIR),
+            writer,
+            format!("p{n}").as_bytes(),
+        );
+        self.faults.clear();
+        if point.is_none() {
+            done.expect("a write with no fault armed succeeds");
+            return Outcome::Written;
+        }
+        match done {
+            Ok(()) => Outcome::Missed,
+            Err(e) => Outcome::Failed(step_of(&e)),
+        }
+    }
+
+    /// The number of the record the copy holds, `None` for none.
+    fn index(&self) -> Option<usize> {
+        match read_copy(&self.fs, Path::new(Self::DIR)).expect("read the copy") {
+            PromiseCopy::Held { payload, .. } => std::str::from_utf8(&payload[1..])
+                .ok()
+                .and_then(|n| n.parse().ok()),
+            PromiseCopy::Absent | PromiseCopy::Damaged(_) => None,
+        }
+    }
+}
+
+/// The step a failed write stopped at, as its error names it.
+fn step_of(e: &StorageError) -> &'static str {
+    let message = match e {
+        StorageError::Io(message) => message.as_str(),
+        _ => "",
+    };
+    // Longest first: "sync directory" starts like "sync".
+    let mut steps = STEPS;
+    steps.sort_by_key(|step| std::cmp::Reverse(step.len()));
+    steps
+        .into_iter()
+        .find(|step| {
+            message
+                .strip_prefix(step)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+        .ok_or_else(|| e.to_string())
+        .expect("a failed write is an I/O error naming its step")
+}
+
+/// One chain: writes that succeed, a write failed at `first`, a retry of it
+/// (or none) after an optional reopen without a power loss, and a next write
+/// after another optional reopen, then a power cut.
+#[derive(Clone, Copy, Debug)]
+struct Chain {
+    before: usize,
+    first: Point,
+    reopen: bool,
+    retry: Option<Option<Point>>,
+    reopen_again: bool,
+    next: Option<Point>,
+}
+
+/// Run `chain`, recording which step each fault failed at; `false` when a
+/// fault it arms is never reached, so the chain is no case of its own.
+fn run(chain: Chain, reached: &mut BTreeSet<(&'static str, &'static str)>) -> bool {
+    let bench = Bench::new();
+    let mut writer = Writer::default();
+    let mut last_success = 0;
+    let mut step =
+        |writer: &mut Writer, n: usize, point: Option<Point>, at: &'static str| match bench
+            .attempt(writer, n, point)
+        {
+            Outcome::Written => {
+                last_success = n;
+                true
+            }
+            Outcome::Failed(step) => {
+                reached.insert((at, step));
+                true
+            }
+            Outcome::Missed => false,
+        };
+    for n in 0..chain.before {
+        assert!(step(&mut writer, n, None, "before"));
+    }
+    if !step(&mut writer, chain.before, Some(chain.first), "first") {
+        return false;
+    }
+    if chain.reopen {
+        writer = Writer::default();
+    }
+    if let Some(point) = chain.retry {
+        if !step(&mut writer, chain.before, point, "retry") {
+            return false;
+        }
+    }
+    if chain.reopen_again {
+        writer = Writer::default();
+    }
+    if !step(&mut writer, chain.before + 1, chain.next, "next") {
+        return false;
+    }
+    bench.crash.crash();
+    let left = bench.index();
+    assert!(
+        left.is_some_and(|n| n >= last_success),
+        "{chain:?}: the last success was p{last_success}, the copy is p{left:?}"
+    );
+    true
+}
+
+/// Every chain of a write failed at any reachable operation, its retry (in
+/// the same process, after a reopen without a power loss, or none) failed at
+/// any reachable operation or not at all, and the next write likewise,
+/// ending in a power cut: the copy is never older than the last write that
+/// reported success. A failure that leaves a slot name undurable must not let
+/// a later write trust it, and no write after a failure may go over the only
+/// durable record, whichever slots the earlier writes took. Every step of
+/// every write in the chain is shown failed at least once.
 #[test]
 fn a_crash_after_a_failed_write_and_its_retry_keeps_the_last_success() {
-    use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, MemFs};
-    let failing = [
-        FaultOp::Open,
-        FaultOp::Write,
-        FaultOp::SyncAll,
-        FaultOp::SyncDirectory,
-    ];
-    let any = [
-        None,
-        Some(FaultOp::Open),
-        Some(FaultOp::Write),
-        Some(FaultOp::SyncAll),
-        Some(FaultOp::SyncDirectory),
-    ];
-    let index = |copy: &PromiseCopy| match copy {
-        PromiseCopy::Held { payload, .. } => std::str::from_utf8(&payload[1..])
-            .ok()
-            .and_then(|n| n.parse::<usize>().ok()),
-        PromiseCopy::Absent | PromiseCopy::Damaged(_) => None,
-    };
+    let mut reached = BTreeSet::new();
     for before in 1..=3usize {
-        for first in failing {
-            for reopen in [false, true] {
-                for retry in any.iter().map(|op| Some(*op)).chain([None]) {
-                    for (next, reopen_again) in
-                        any.iter().flat_map(|op| [(*op, false), (*op, true)])
-                    {
-                        let case = format!(
-                            "{before} written, {first:?} fails, reopen {reopen}, retry \
-                             {retry:?}, reopen again {reopen_again}, next {next:?}"
-                        );
-                        // In memory: the cases run in a second, not in the
-                        // minute real syncs take.
-                        let dir = Path::new("/endpoint");
-                        let crash = std::sync::Arc::new(CrashFs::new(MemFs::new()));
-                        let faults = std::sync::Arc::new(FaultInjector::new());
-                        let fs = FaultFs::with_injector(
-                            CrashFs::clone(&crash),
-                            std::sync::Arc::clone(&faults),
-                        );
-                        fs.create_dir_all(dir).expect("the endpoint");
-                        fs.sync_directory(Path::new("/"))
-                            .expect("the endpoint's name");
-                        let mut writer = Writer::default();
-                        let mut last_success = 0;
-                        let mut attempt = |writer: &mut Writer, n: usize, op: Option<FaultOp>| {
-                            if let Some(op) = op {
-                                faults.arm(FaultRule::new(
-                                    op,
-                                    Fault::Error(lsm_tree::io::ErrorKind::Other),
-                                ));
-                            }
-                            let done = put(&fs, dir, writer, format!("p{n}").as_bytes());
-                            faults.clear();
-                            if done.is_ok() {
-                                last_success = n;
-                            }
+        for reopen in [false, true] {
+            for reopen_again in [false, true] {
+                for op1 in FAULT_OPS {
+                    for k1 in 0.. {
+                        let base = Chain {
+                            before,
+                            first: (op1, k1),
+                            reopen,
+                            retry: None,
+                            reopen_again,
+                            next: None,
                         };
-                        for n in 0..before {
-                            attempt(&mut writer, n, None);
+                        if !run(base, &mut reached) {
+                            break;
                         }
-                        attempt(&mut writer, before, Some(first));
-                        if reopen {
-                            writer = Writer::default();
+                        let mut retries = vec![None, Some(None)];
+                        for op2 in FAULT_OPS {
+                            for k2 in 0.. {
+                                let retry = Some(Some((op2, k2)));
+                                if !run(Chain { retry, ..base }, &mut reached) {
+                                    break;
+                                }
+                                retries.push(retry);
+                            }
                         }
-                        if let Some(op) = retry {
-                            attempt(&mut writer, before, op);
+                        for retry in retries {
+                            assert!(run(Chain { retry, ..base }, &mut reached));
+                            for op3 in FAULT_OPS {
+                                for k3 in 0.. {
+                                    let next = Some((op3, k3));
+                                    if !run(
+                                        Chain {
+                                            retry,
+                                            next,
+                                            ..base
+                                        },
+                                        &mut reached,
+                                    ) {
+                                        break;
+                                    }
+                                }
+                            }
                         }
-                        if reopen_again {
-                            writer = Writer::default();
-                        }
-                        attempt(&mut writer, before + 1, next);
-                        crash.crash();
-                        let left = read_copy(&fs, dir).expect("read after the crash");
-                        assert!(
-                            index(&left).is_some_and(|n| n >= last_success),
-                            "{case}: the last success was p{last_success}, the copy is {left:?}"
-                        );
                     }
                 }
             }
         }
     }
+    for at in ["first", "retry", "next"] {
+        let seen: BTreeSet<&str> = reached
+            .iter()
+            .filter(|(position, _)| *position == at)
+            .map(|(_, step)| *step)
+            .collect();
+        assert_eq!(
+            seen,
+            BTreeSet::from(STEPS),
+            "the {at} write failed at every step"
+        );
+    }
+}
+
+/// A directory that cannot be listed fails the write before anything is
+/// written: no slot is read or written blind.
+#[test]
+fn a_copy_that_cannot_be_listed_is_not_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A file where the endpoint's directory should be: listing it fails.
+    let not_a_directory = dir.path().join("endpoint");
+    std::fs::write(&not_a_directory, b"a file").expect("a file in the way");
+    let refused = write_copy(
+        &STD,
+        &not_a_directory,
+        &mut CopyWriter::default(),
+        &INC,
+        b"vote",
+        &Footprints::default(),
+    );
+    assert!(
+        matches!(&refused, Err(StorageError::Io(message)) if message.starts_with("list ")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::read(&not_a_directory).expect("the file"),
+        b"a file",
+        "nothing was written"
+    );
+}
+
+/// A spent slot that cannot be removed after a write stays: the write still
+/// succeeds, the copy is the record it wrote, a power cut keeps it, and a
+/// later write of the same process removes the slot.
+#[test]
+fn a_spent_slot_that_cannot_be_removed_stays_until_a_later_write() {
+    let bench = Bench::new();
+    let dir = Path::new(Bench::DIR);
+    let files = || copy_files(&bench.fs, dir).expect("list").len();
+    // Three slots: one process's record, a second process's write that
+    // failed after creating its slot, and a third process's first write.
+    assert_eq!(
+        bench.attempt(&mut Writer::default(), 0, None),
+        Outcome::Written
+    );
+    assert_eq!(
+        bench.attempt(&mut Writer::default(), 1, Some((FaultOp::SyncAll, 0))),
+        Outcome::Failed("sync")
+    );
+    assert_eq!(files(), 2);
+    let mut writer = Writer::default();
+    bench.faults.arm(FaultRule::new(
+        FaultOp::RemoveFile,
+        Fault::Error(lsm_tree::io::ErrorKind::Other),
+    ));
+    let written = put(&bench.fs, dir, &mut writer, b"p2");
+    bench.faults.clear();
+    written.expect("a failed removal fails no write");
+    assert_eq!(files(), 3, "the removal was refused and the slot stayed");
+    assert_eq!(bench.index(), Some(2));
+    assert_eq!(bench.attempt(&mut writer, 3, None), Outcome::Written);
+    assert_eq!(files(), 2, "the next write removed the spent slot");
+    bench.crash.crash();
+    assert_eq!(bench.index(), Some(3));
 }
 
 /// A write the endpoint has no room for is refused before anything is

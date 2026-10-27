@@ -221,7 +221,7 @@ pub(crate) fn read_file(fs: &dyn Fs, path: &Path) -> StorageResult<Option<Vec<u8
     let mut file = match fs.open(path, &FsOpenOptions::new().read(true)) {
         Ok(file) => file,
         Err(e) if e.kind() == lsm_tree::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io_at("open", path, e.into())),
+        Err(e) => return Err(io_at("open to read", path, e.into())),
     };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
@@ -314,7 +314,7 @@ pub fn write_copy(
             path,
             &FsOpenOptions::new().write(true).create(true).truncate(true),
         )
-        .map_err(|e| io_at("open", path, e.into()))?;
+        .map_err(|e| io_at("create", path, e.into()))?;
     file.write_all(&bytes)
         .map_err(|e| io_at("write", path, e))?;
     file.sync_all().map_err(|e| io_at("sync", path, e.into()))?;
@@ -323,7 +323,7 @@ pub fn write_copy(
     // not sync may be one an earlier, failed write created.
     if !writer.named.contains(&target) {
         fs.sync_directory(dir)
-            .map_err(|e| io_at("sync", dir, e.into()))?;
+            .map_err(|e| io_at("sync directory", dir, e.into()))?;
         writer.named = slots.iter().map(|(slot, _)| *slot).collect();
         writer.named.push(target);
     }
@@ -408,7 +408,7 @@ pub(crate) fn replace_file(
         .renamed(&staged, &path)
         .map_err(|e| io_at("charge", &path, e))?;
     fs.sync_directory(dir)
-        .map_err(|e| io_at("sync", dir, e.into()))
+        .map_err(|e| io_at("sync directory", dir, e.into()))
 }
 
 /// A fresh incarnation for a store first bound to a consensus log.
