@@ -168,7 +168,7 @@ fn a_crash_at_any_step_of_a_write_leaves_a_whole_record() {
                     Outcome::Written => unreachable!("an armed write is failed or missed"),
                 };
                 reached.insert(step);
-                bench.crash.crash();
+                bench.power_cut();
                 let left = bench.index();
                 // Only a failed directory sync comes after the new record
                 // was synced: everything before leaves the previous one.
@@ -236,26 +236,245 @@ enum Outcome {
     Missed,
 }
 
+/// What a failed file sync leaves behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncFailure {
+    /// The bytes stay dirty: a later sync of the file makes them durable.
+    Dirty,
+    /// The pages are marked clean without reaching the disk, as ext4 and XFS
+    /// do after a failed writeback: reads still return the new bytes, and a
+    /// later sync of the file reports success and makes nothing durable
+    /// until the file is written again (Rebello et al., "Can Applications
+    /// Recover from fsync Failures?", USENIX ATC 2020, sections 3.3-3.4).
+    CleanStale,
+}
+
+/// Files whose last sync failed under [`SyncFailure::CleanStale`] and that
+/// were not written since.
+type StalePaths = std::sync::Arc<std::sync::Mutex<BTreeSet<PathBuf>>>;
+
+/// The filesystem of a [`Bench`]: fault injection over a power-cut model,
+/// with failed file syncs treated as `failure` says, and files changed since
+/// their last effective sync torn by a power cut (see [`Bench::crash`]).
+struct ModelFs {
+    inner: FaultFs<CrashFs>,
+    failure: SyncFailure,
+    stale: StalePaths,
+    /// Files changed since their last effective sync.
+    unsynced: StalePaths,
+}
+
+/// A file opened through a [`ModelFs`].
+struct ModelFile {
+    inner: Box<dyn lsm_tree::fs::FsFile>,
+    path: PathBuf,
+    failure: SyncFailure,
+    stale: StalePaths,
+    unsynced: StalePaths,
+}
+
+impl ModelFile {
+    fn written(&self) {
+        self.stale.lock().expect("stale paths").remove(&self.path);
+        self.unsynced
+            .lock()
+            .expect("unsynced paths")
+            .insert(self.path.clone());
+    }
+}
+
+impl std::io::Read for ModelFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for ModelFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            self.written();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for ModelFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl lsm_tree::fs::FsFile for ModelFile {
+    fn sync_all(&self) -> lsm_tree::io::Result<()> {
+        if self.stale.lock().expect("stale paths").contains(&self.path) {
+            // Clean pages: nothing to write back, and no error to report.
+            return Ok(());
+        }
+        let synced = self.inner.sync_all();
+        if synced.is_ok() {
+            self.unsynced
+                .lock()
+                .expect("unsynced paths")
+                .remove(&self.path);
+        } else if self.failure == SyncFailure::CleanStale {
+            self.stale
+                .lock()
+                .expect("stale paths")
+                .insert(self.path.clone());
+        }
+        synced
+    }
+
+    fn sync_data(&self) -> lsm_tree::io::Result<()> {
+        self.sync_all()
+    }
+
+    fn metadata(&self) -> lsm_tree::io::Result<lsm_tree::fs::FsMetadata> {
+        self.inner.metadata()
+    }
+
+    fn set_len(&self, size: u64) -> lsm_tree::io::Result<()> {
+        self.inner.set_len(size)?;
+        self.written();
+        Ok(())
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> lsm_tree::io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+
+    fn lock_exclusive(&self) -> lsm_tree::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+}
+
+impl Fs for ModelFs {
+    fn open(
+        &self,
+        path: &Path,
+        opts: &FsOpenOptions,
+    ) -> lsm_tree::io::Result<Box<dyn lsm_tree::fs::FsFile>> {
+        let inner = self.inner.open(path, opts)?;
+        let file = ModelFile {
+            inner,
+            path: path.to_path_buf(),
+            failure: self.failure,
+            stale: std::sync::Arc::clone(&self.stale),
+            unsynced: std::sync::Arc::clone(&self.unsynced),
+        };
+        // A truncation changes the file as a write does.
+        if opts.truncate {
+            file.written();
+        }
+        Ok(Box::new(file))
+    }
+
+    fn create_dir_all(&self, path: &Path) -> lsm_tree::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> lsm_tree::io::Result<Vec<lsm_tree::fs::FsDirEntry>> {
+        self.inner.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> lsm_tree::io::Result<()> {
+        self.inner.remove_file(path)?;
+        self.stale.lock().expect("stale paths").remove(path);
+        self.unsynced.lock().expect("unsynced paths").remove(path);
+        Ok(())
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> lsm_tree::io::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> lsm_tree::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> lsm_tree::io::Result<lsm_tree::fs::FsMetadata> {
+        self.inner.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> lsm_tree::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> lsm_tree::io::Result<bool> {
+        self.inner.exists(path)
+    }
+}
+
 /// An endpoint in memory under power-cut and fault injection: the cases run
 /// in seconds, not in the minutes real syncs take.
 struct Bench {
     crash: std::sync::Arc<CrashFs>,
     faults: std::sync::Arc<FaultInjector>,
-    fs: FaultFs<CrashFs>,
+    fs: ModelFs,
 }
 
 impl Bench {
     const DIR: &'static str = "/endpoint";
 
     fn new() -> Self {
+        Self::with(SyncFailure::Dirty)
+    }
+
+    fn with(failure: SyncFailure) -> Self {
         let crash = std::sync::Arc::new(CrashFs::new(MemFs::new()));
         let faults = std::sync::Arc::new(FaultInjector::new());
-        let fs = FaultFs::with_injector(CrashFs::clone(&crash), std::sync::Arc::clone(&faults));
+        let fs = ModelFs {
+            inner: FaultFs::with_injector(CrashFs::clone(&crash), std::sync::Arc::clone(&faults)),
+            failure,
+            stale: StalePaths::default(),
+            unsynced: StalePaths::default(),
+        };
         fs.create_dir_all(Path::new(Self::DIR))
             .expect("the endpoint");
         fs.sync_directory(Path::new("/"))
             .expect("the endpoint's name");
         Self { crash, faults, fs }
+    }
+
+    /// Cut the power. Every file changed since its last effective sync and
+    /// still named on the disk keeps only the first half of what it read
+    /// before: some of its pages were written back, some were not. That is
+    /// the worst a write in place can leave, worse than losing it whole.
+    fn power_cut(&self) {
+        let changed: Vec<PathBuf> = self
+            .fs
+            .unsynced
+            .lock()
+            .expect("unsynced paths")
+            .iter()
+            .cloned()
+            .collect();
+        let mut torn = Vec::new();
+        for path in changed {
+            if let Some(bytes) = read_file(&self.fs, &path).expect("read before the cut") {
+                torn.push((path, bytes));
+            }
+        }
+        self.crash.crash();
+        self.fs.stale.lock().expect("stale paths").clear();
+        self.fs.unsynced.lock().expect("unsynced paths").clear();
+        for (path, bytes) in torn {
+            if !self.fs.inner.exists(&path).expect("exists") {
+                continue;
+            }
+            let mut file = self
+                .fs
+                .inner
+                .open(&path, &FsOpenOptions::new().write(true).truncate(true))
+                .expect("tear");
+            file.write_all(&bytes[..bytes.len() / 2]).expect("tear");
+            file.sync_all().expect("tear");
+        }
     }
 
     /// Write `p<n>` through `writer`, failing the operation at `point`.
@@ -320,6 +539,7 @@ fn step_of(e: &StorageError) -> &'static str {
 /// after another optional reopen, then a power cut.
 #[derive(Clone, Copy, Debug)]
 struct Chain {
+    failure: SyncFailure,
     before: usize,
     first: Point,
     reopen: bool,
@@ -331,7 +551,7 @@ struct Chain {
 /// Run `chain`, recording which step each fault failed at; `false` when a
 /// fault it arms is never reached, so the chain is no case of its own.
 fn run(chain: Chain, reached: &mut BTreeSet<(&'static str, &'static str)>) -> bool {
-    let bench = Bench::new();
+    let bench = Bench::with(chain.failure);
     let mut writer = Writer::default();
     let mut last_success = 0;
     let mut step =
@@ -368,7 +588,7 @@ fn run(chain: Chain, reached: &mut BTreeSet<(&'static str, &'static str)>) -> bo
     if !step(&mut writer, chain.before + 1, chain.next, "next") {
         return false;
     }
-    bench.crash.crash();
+    bench.power_cut();
     let left = bench.index();
     assert!(
         left.is_some_and(|n| n >= last_success),
@@ -384,16 +604,22 @@ fn run(chain: Chain, reached: &mut BTreeSet<(&'static str, &'static str)>) -> bo
 /// reported success. A failure that leaves a slot name undurable must not let
 /// a later write trust it, and no write after a failure may go over the only
 /// durable record, whichever slots the earlier writes took. Every step of
-/// every write in the chain is shown failed at least once.
+/// every write in the chain is shown failed at least once. Both with a failed
+/// sync leaving its bytes dirty and with it leaving them clean but not on
+/// disk, where no later sync without a new write makes them durable.
 #[test]
 fn a_crash_after_a_failed_write_and_its_retry_keeps_the_last_success() {
     let mut reached = BTreeSet::new();
-    for before in 1..=3usize {
+    for (failure, before) in [SyncFailure::Dirty, SyncFailure::CleanStale]
+        .into_iter()
+        .flat_map(|failure| (1..=3usize).map(move |before| (failure, before)))
+    {
         for reopen in [false, true] {
             for reopen_again in [false, true] {
                 for op1 in FAULT_OPS {
                     for k1 in 0.. {
                         let base = Chain {
+                            failure,
                             before,
                             first: (op1, k1),
                             reopen,
@@ -509,7 +735,7 @@ fn a_spent_slot_that_cannot_be_removed_stays_until_a_later_write() {
     assert_eq!(bench.index(), Some(2));
     assert_eq!(bench.attempt(&mut writer, 3, None), Outcome::Written);
     assert_eq!(files(), 2, "the next write removed the spent slot");
-    bench.crash.crash();
+    bench.power_cut();
     assert_eq!(bench.index(), Some(3));
 }
 
