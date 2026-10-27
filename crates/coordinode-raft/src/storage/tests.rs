@@ -1552,22 +1552,47 @@ async fn a_vote_survives_the_loss_of_the_raft_tree() {
 async fn a_member_that_lost_every_copy_of_its_vote_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = member_whose_raft_tree_was_lost(dir.path(), Vote::new(7, 3)).await;
-    std::fs::remove_file(
-        dir.path()
-            .join(coordinode_storage::engine::promise::PROMISE_FILE),
-    )
-    .expect("lose the second copy");
+    lose_the_copy(dir.path());
     let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
     let err = LogStore::open(Arc::clone(&engine))
         .err()
         .expect("a member without its promise must not open");
     assert!(PromiseUnqualified::of(&err).is_some(), "typed: {err}");
     assert!(
-        !dir.path()
-            .join(coordinode_storage::engine::promise::PROMISE_FILE)
-            .exists(),
+        !copy_exists(dir.path()),
         "the refusal wrote no promise of its own"
     );
+}
+
+/// The slot files of the second copy of the store at `dir`.
+fn copy_slots(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    coordinode_storage::engine::promise::copy_files(&lsm_tree::fs::StdFs, dir)
+        .expect("list the copy")
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Lose every slot of the second copy of the store at `dir`.
+fn lose_the_copy(dir: &std::path::Path) {
+    for slot in copy_slots(dir) {
+        std::fs::remove_file(slot).expect("lose a slot of the copy");
+    }
+}
+
+/// Whether any slot of the second copy of the store at `dir` exists.
+fn copy_exists(dir: &std::path::Path) -> bool {
+    !copy_slots(dir).is_empty()
+}
+
+/// Damage the last byte of every slot of the second copy at `dir`.
+fn damage_the_copy(dir: &std::path::Path) {
+    for slot in copy_slots(dir) {
+        let mut bytes = std::fs::read(&slot).expect("read a slot");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&slot, &bytes).expect("damage a slot");
+    }
 }
 
 /// Damage the Raft tree of the store at `dir` so the next open salvages it
@@ -1714,15 +1739,11 @@ async fn a_recorded_loss_survives_the_loss_of_the_raft_tree() {
     );
 }
 
-/// The second copy's file in the store at `dir`.
-fn promise_file(dir: &std::path::Path) -> std::path::PathBuf {
-    dir.join(coordinode_storage::engine::promise::PROMISE_FILE)
-}
-
 /// The second copy's payload for a member that holds `vote` and has neither
 /// purged its log nor lost committed entries.
 fn promises_of(vote: Option<Vote>) -> Vec<u8> {
     rmp_serde::to_vec(&Promises {
+        member: None,
         vote,
         purged: None,
         catch_up: None,
@@ -1783,11 +1804,7 @@ async fn a_damaged_copy_is_restored_from_the_other() {
         let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
         log.save_vote(&vote).await.expect("save");
     }
-    let file = promise_file(dir.path());
-    let mut bytes = std::fs::read(&file).expect("read copy");
-    let last = bytes.len() - 1;
-    bytes[last] ^= 0xff;
-    std::fs::write(&file, &bytes).expect("damage the copy");
+    damage_the_copy(dir.path());
     {
         let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
         let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
@@ -1913,7 +1930,7 @@ async fn a_store_bound_before_incarnations_is_converted_or_refused() {
     }
     // The layout an earlier build left: an empty marker and no second copy.
     std::fs::write(dir.path().join("consensus-log"), b"").expect("empty marker");
-    std::fs::remove_file(promise_file(dir.path())).expect("no copy");
+    lose_the_copy(dir.path());
     {
         let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
         let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
@@ -1929,7 +1946,7 @@ async fn a_store_bound_before_incarnations_is_converted_or_refused() {
     }
     // The same layout with the tree's record lost as well.
     std::fs::write(dir.path().join("consensus-log"), b"").expect("empty marker");
-    std::fs::remove_file(promise_file(dir.path())).expect("no copy");
+    lose_the_copy(dir.path());
     std::fs::remove_dir_all(dir.path().join(Partition::Raft.name())).expect("lose the tree");
     let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
     let err = LogStore::open(Arc::clone(&engine))
@@ -1948,17 +1965,16 @@ async fn saving_the_same_vote_again_writes_nothing() {
     let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
     let vote = Vote::new(2, 1);
     log.save_vote(&vote).await.expect("save");
-    let file = promise_file(dir.path());
-    std::fs::remove_file(&file).expect("remove the copy to see a rewrite");
+    lose_the_copy(dir.path());
     log.save_vote(&vote).await.expect("save the same");
     assert!(
-        !file.exists(),
+        !copy_exists(dir.path()),
         "an unchanged vote must not be written again"
     );
     log.save_vote(&Vote::new(3, 1))
         .await
         .expect("save a change");
-    assert!(file.exists(), "a changed vote is written");
+    assert!(copy_exists(dir.path()), "a changed vote is written");
 }
 
 /// Append `entries` and wait until the log reports them durable, as openraft

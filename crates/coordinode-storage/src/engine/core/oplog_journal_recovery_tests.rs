@@ -1674,6 +1674,73 @@ fn a_segment_lost_from_the_middle_of_the_member_local_journal_is_refused() {
     );
 }
 
+/// A write of the second copy of the consensus records whose sync failed is
+/// not taken as done: the bytes may read back and still never reach the
+/// disk. The next refresh with the same records writes them again, and they
+/// survive a power cut; a refresh after a write that did complete writes
+/// nothing.
+#[test]
+fn a_promise_copy_whose_sync_failed_is_written_again() {
+    use crate::engine::promise::PromiseCopy;
+    use lsm_tree::fs::{Fault, FaultOp, FaultRule};
+    let rig = PowerRig::new();
+    let config = rig.config();
+    let engine = rig.open_group(&config).expect("open");
+    let incarnation = [5u8; 16];
+    engine
+        .write_promise_copy(&incarnation, b"given")
+        .expect("first write");
+    rig.faults.arm(
+        FaultRule::new(
+            FaultOp::SyncAll,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .times(1),
+    );
+    assert!(
+        engine.write_promise_copy(&incarnation, b"next").is_err(),
+        "the failed sync must fail the write"
+    );
+    rig.faults.clear();
+    engine
+        .refresh_promise_copy(&incarnation, || Ok(b"next".to_vec()))
+        .expect("refresh");
+    rig.cut(engine);
+    let engine = rig.open_group(&config).expect("reopen");
+    assert_eq!(
+        engine.read_promise_copy().expect("read"),
+        PromiseCopy::Held {
+            incarnation,
+            payload: b"next".to_vec()
+        },
+        "the records survive the cut"
+    );
+    rig.cut(engine);
+}
+
+/// Records this process already wrote durably are not written again: an
+/// unchanged vote costs no file access at all.
+#[test]
+fn a_promise_copy_already_durable_is_not_written_again() {
+    let rig = PowerRig::new();
+    let config = rig.config();
+    let engine = rig.open_group(&config).expect("open");
+    let incarnation = [5u8; 16];
+    engine
+        .refresh_promise_copy(&incarnation, || Ok(b"given".to_vec()))
+        .expect("write");
+    let opened = rig.faults.open_count();
+    engine
+        .refresh_promise_copy(&incarnation, || Ok(b"given".to_vec()))
+        .expect("refresh what is already durable");
+    assert_eq!(
+        rig.faults.open_count(),
+        opened,
+        "records already written durably are not touched again"
+    );
+    rig.cut(engine);
+}
+
 /// A store that ran in a group is refused when opened with a journal of its
 /// own, as a store outside any group is: it would write outside the group's
 /// log. The refusal changes nothing, and the store opens as a member again

@@ -2962,6 +2962,22 @@ async fn cluster_follower_restart_reconnection() {
     );
 }
 
+/// The slot files of the second copy of a member's records at `dir`.
+fn copy_slots(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    coordinode_storage::engine::promise::copy_files(&lsm_tree::fs::StdFs, dir)
+        .expect("list the second copy")
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Lose every slot of the second copy of a member's records at `dir`.
+fn lose_the_copy(dir: &std::path::Path) {
+    for slot in copy_slots(dir) {
+        std::fs::remove_file(slot).expect("lose a slot of the second copy");
+    }
+}
+
 fn open_engine_at(path: &std::path::Path) -> Arc<StorageEngine> {
     Arc::new(
         StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -3250,7 +3266,18 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
         lose_tree();
         let e3 = open_engine_at(dirs[2].path());
         let n3 = reopen_member(3, &e3, p3).await;
-        let restored = n3.raft().metrics().borrow_watched().vote;
+        // The metrics start at the default vote and report the loaded one
+        // once the engine runs. A campaign the member starts alone moves
+        // past the restored vote, never back: from the default it would name
+        // term 1 for itself, which is not at least the leader's term-1 vote.
+        let mut restored = n3.raft().metrics().borrow_watched().vote;
+        for _ in 0..100 {
+            if restored.leader_id().term > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            restored = n3.raft().metrics().borrow_watched().vote;
+        }
         assert!(
             restored >= given,
             "the vote went back from {given} to {restored}"
@@ -3273,10 +3300,7 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
 
         // Both copies lost: the member does not start.
         lose_tree();
-        let copy = dirs[2]
-            .path()
-            .join(coordinode_storage::engine::promise::PROMISE_FILE);
-        std::fs::remove_file(&copy).expect("lose the second copy");
+        lose_the_copy(dirs[2].path());
         let e3 = open_engine_at(dirs[2].path());
         let refused = RaftNode::open_cluster(
             3,
@@ -3291,7 +3315,10 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
             "a member without its promise must not start: {:?}",
             refused.err()
         );
-        assert!(!copy.exists(), "the refusal wrote no promise of its own");
+        assert!(
+            copy_slots(dirs[2].path()).is_empty(),
+            "the refusal wrote no promise of its own"
+        );
     })
     .await;
 
@@ -3394,12 +3421,7 @@ async fn a_member_without_its_promise_is_replaced_under_a_new_identity() {
         std::fs::remove_dir_all(dirs[2].path().join(Partition::Raft.name()))
             .expect("lose the tree");
         std::fs::remove_dir_all(dirs[2].path().join("local-journal")).expect("lose the journal");
-        std::fs::remove_file(
-            dirs[2]
-                .path()
-                .join(coordinode_storage::engine::promise::PROMISE_FILE),
-        )
-        .expect("lose the second copy");
+        lose_the_copy(dirs[2].path());
         let listing = |dir: &std::path::Path| {
             let mut all = Vec::new();
             let mut stack = vec![dir.to_path_buf()];
@@ -3450,6 +3472,32 @@ async fn a_member_without_its_promise_is_replaced_under_a_new_identity() {
             .await
             .expect("first step");
         let (progress, _) = tokio::sync::broadcast::channel(64);
+        let membership = || -> (Vec<u64>, Vec<u64>) {
+            let rx = n1.raft().metrics();
+            let metrics = rx.borrow_watched();
+            let config = metrics.membership_config.membership();
+            (
+                config.nodes().map(|(id, _)| *id).collect(),
+                config.voter_ids().collect(),
+            )
+        };
+        // Resuming under an identity member 4 was not added with is refused,
+        // and nothing moves.
+        let before = membership();
+        let other = n1
+            .replace_member(
+                3,
+                4,
+                format!("http://127.0.0.1:{p4}"),
+                ident(5),
+                progress.clone(),
+            )
+            .await;
+        assert!(
+            matches!(other, Err(RaftNodeError::Identity(_))),
+            "a resume under another identity: {other:?}"
+        );
+        assert_eq!(membership(), before, "the refused resume changed nothing");
         n1.replace_member(
             3,
             4,
@@ -3459,20 +3507,32 @@ async fn a_member_without_its_promise_is_replaced_under_a_new_identity() {
         )
         .await
         .expect("the replacement resumes");
-        n1.replace_member(3, 4, format!("http://127.0.0.1:{p4}"), ident(4), progress)
-            .await
-            .expect("a repeated replacement changes nothing");
-        let (nodes, voters): (Vec<u64>, Vec<u64>) = {
-            let rx = n1.raft().metrics();
-            let metrics = rx.borrow_watched();
-            let config = metrics.membership_config.membership();
-            (
-                config.nodes().map(|(id, _)| *id).collect(),
-                config.voter_ids().collect(),
-            )
-        };
+        n1.replace_member(
+            3,
+            4,
+            format!("http://127.0.0.1:{p4}"),
+            ident(4),
+            progress.clone(),
+        )
+        .await
+        .expect("a repeated replacement changes nothing");
+        let (nodes, voters) = membership();
         assert_eq!(voters, vec![1, 2, 4], "member 4 votes where 3 did");
         assert_eq!(nodes, vec![1, 2, 4], "member 3 left the group");
+        // A completed replacement repeated under another identity is refused
+        // as well: it is not the replacement that was made.
+        let other = n1
+            .replace_member(3, 4, format!("http://127.0.0.1:{p4}"), ident(5), progress)
+            .await;
+        assert!(
+            matches!(other, Err(RaftNodeError::Identity(_))),
+            "a repeat under another identity: {other:?}"
+        );
+        assert_eq!(
+            membership(),
+            (vec![1, 2, 4], vec![1, 2, 4]),
+            "the refused repeat changed nothing"
+        );
         assert!(
             await_replicated(&e4, &key, b"v").await,
             "member 4 holds the history"
@@ -3577,8 +3637,7 @@ async fn a_group_that_lost_a_quorum_of_promises_stays_unavailable() {
             let dir = dirs[at].path();
             std::fs::remove_dir_all(dir.join(Partition::Raft.name())).expect("lose the tree");
             std::fs::remove_dir_all(dir.join("local-journal")).expect("lose the journal");
-            std::fs::remove_file(dir.join(coordinode_storage::engine::promise::PROMISE_FILE))
-                .expect("lose the second copy");
+            lose_the_copy(dir);
         }
         for (at, id) in [(1usize, 2u64), (2, 3)] {
             let engine = open_engine_at(dirs[at].path());

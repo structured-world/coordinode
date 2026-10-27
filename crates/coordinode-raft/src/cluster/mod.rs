@@ -791,7 +791,16 @@ impl RaftNode {
             deployment: forming_in,
         } = options;
         let config = Arc::new(snap_config.raft_config(timing, preference));
+        let member = crate::storage::MemberBinding {
+            group: group.0,
+            node: node_id,
+        };
+        crate::storage::check_member(&engine, member)
+            .map_err(|e| RaftNodeError::Identity(e.to_string()))?;
         let log_store = LogStore::open(Arc::clone(&engine)).map_err(RaftNodeError::log_open)?;
+        log_store
+            .bind_member(member)
+            .map_err(|e| RaftNodeError::Identity(e.to_string()))?;
         // Clone the oplog handle before openraft consumes the LogStore, so
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
@@ -1033,6 +1042,12 @@ impl RaftNode {
             // A node forming its group is enrolled in nothing.
             (Founding::Form { .. }, _) => None,
         };
+        let member = crate::storage::MemberBinding {
+            group: group.0,
+            node: node_id,
+        };
+        crate::storage::check_member(&engine, member)
+            .map_err(|e| RaftNodeError::Identity(e.to_string()))?;
         let mut config = snap_config.raft_config(timing, preference);
         // Committed entries the disk lost are sent again by a leader when the
         // group has another voter to hold them; alone, nothing could.
@@ -1045,6 +1060,9 @@ impl RaftNode {
         };
         let (log_store, lost_through) =
             LogStore::open_with(Arc::clone(&engine), lost).map_err(RaftNodeError::log_open)?;
+        log_store
+            .bind_member(member)
+            .map_err(|e| RaftNodeError::Identity(e.to_string()))?;
         let catch_up = CatchUp::new(lost_through.map(|id| id.index));
         let elect = config.enable_elect;
         if catch_up.pending() {
@@ -3094,16 +3112,32 @@ impl RaftNode {
             let rx = raft.metrics();
             let metrics = rx.borrow_watched();
             let config = metrics.membership_config.membership();
-            let nodes: std::collections::BTreeSet<u64> =
-                config.nodes().map(|(id, _)| *id).collect();
+            let nodes: std::collections::BTreeMap<u64, Option<MemberIdentity>> = config
+                .nodes()
+                .map(|(id, node)| (*id, node.identity.clone()))
+                .collect();
             let voters: std::collections::BTreeSet<u64> = config.voter_ids().collect();
             (nodes, voters)
         };
         let (nodes, voters) = membership(&self.raft);
-        if voters.contains(&new) && !nodes.contains(&old) {
+        // A replacement is resumed or repeated only as the one it is: a
+        // member `new` already holds must be bound to `identity`, as
+        // `add_node` binds it, or the call is another replacement.
+        let asked = MemberIdentity::from(&identity);
+        if let Some(bound) = nodes.get(&new) {
+            if bound.as_ref() != Some(&asked) {
+                return Err(RaftNodeError::Identity(format!(
+                    "node {new} is a member bound to {}, not to {asked}",
+                    bound
+                        .as_ref()
+                        .map_or_else(|| "no identity".to_owned(), ToString::to_string)
+                )));
+            }
+        }
+        if voters.contains(&new) && !nodes.contains_key(&old) {
             return Ok(());
         }
-        if !nodes.contains(&new) {
+        if !nodes.contains_key(&new) {
             self.add_node(new, addr, identity).await?;
         }
         if !voters.contains(&new) {
@@ -3117,7 +3151,7 @@ impl RaftNode {
             .collect();
         self.change_membership(target).await?;
         let (nodes, _) = membership(&self.raft);
-        if nodes.contains(&old) {
+        if nodes.contains_key(&old) {
             self.remove_node(old).await?;
         }
         let report = JoinProgressEvent {

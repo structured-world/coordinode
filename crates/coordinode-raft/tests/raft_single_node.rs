@@ -644,8 +644,11 @@ async fn a_sole_voter_recovers_from_one_copy_and_refuses_with_none() {
         node.shutdown().await.expect("shutdown");
     }
     lose_tree();
-    std::fs::remove_file(path.join(coordinode_storage::engine::promise::PROMISE_FILE))
-        .expect("lose the second copy");
+    for (_, slot) in coordinode_storage::engine::promise::copy_files(&lsm_tree::fs::StdFs, &path)
+        .expect("list the second copy")
+    {
+        std::fs::remove_file(slot).expect("lose the second copy");
+    }
     let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
     let refused = RaftNode::open(1, engine).await;
     assert!(
@@ -658,6 +661,103 @@ async fn a_sole_voter_recovers_from_one_copy_and_refuses_with_none() {
         "a sole voter without its vote must not start: {:?}",
         refused.err()
     );
+}
+
+/// A store keeps the promises of the member it was opened as. Opened again
+/// under another node id it is refused before the consensus engine starts:
+/// the vote it holds was given by the other member, and taking it as this
+/// one's would let either vote twice. The store is left as it was and opens
+/// again as its own member.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_opened_as_another_member_is_refused() {
+    init_test_tracing();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let node = RaftNode::open(1, engine).await.expect("member 1");
+        node.shutdown().await.expect("shutdown");
+    }
+    // The member's records, both copies, byte for byte.
+    let records = || {
+        let engine = StorageEngine::open(&config).expect("read the store");
+        let tree: Vec<Option<Vec<u8>>> = [
+            b"raft:vote".as_slice(),
+            b"raft:member",
+            b"raft:purged",
+            b"raft:catch-up",
+        ]
+        .iter()
+        .map(|key| {
+            engine
+                .get(Partition::Raft, key)
+                .expect("read a record")
+                .map(|v| v.to_vec())
+        })
+        .collect();
+        let copy: Vec<(std::path::PathBuf, Vec<u8>)> =
+            coordinode_storage::engine::promise::copy_files(&lsm_tree::fs::StdFs, dir.path())
+                .expect("list the second copy")
+                .into_iter()
+                .map(|(_, path)| {
+                    let bytes = std::fs::read(&path).expect("read a slot");
+                    (path, bytes)
+                })
+                .collect();
+        (tree, copy)
+    };
+    let before = records();
+    assert!(
+        before.0[1].is_some() && !before.1.is_empty(),
+        "member 1's store holds its binding and a second copy"
+    );
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        let refused = RaftNode::open(2, engine).await;
+        assert!(
+            matches!(
+                refused,
+                Err(coordinode_raft::cluster::RaftNodeError::Identity(_))
+            ),
+            "the store of member 1 opened as member 2: {:?}",
+            refused.err()
+        );
+    }
+    {
+        // The same node id in another group is another member.
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        let refused = RaftNode::open_with_oracle_and_options(
+            1,
+            engine,
+            None,
+            coordinode_raft::cluster::NodeOptions {
+                group: coordinode_raft::cluster::GroupId(7),
+                ..coordinode_raft::cluster::NodeOptions::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(coordinode_raft::cluster::RaftNodeError::Identity(_))
+            ),
+            "the store of group 0 opened in group 7: {:?}",
+            refused.err()
+        );
+    }
+    assert!(
+        records() == before,
+        "the refusals left member 1's records and their second copy as they were"
+    );
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let node = RaftNode::open(1, engine).await.expect("member 1 again");
+    node.shutdown().await.expect("shutdown");
 }
 
 /// CRASH RECOVERY: write data → shutdown → reopen from same storage → verify data survives.

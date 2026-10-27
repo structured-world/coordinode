@@ -168,6 +168,8 @@ const KEY_PURGED: &[u8] = b"raft:purged";
 /// The committed entry a member's disk lost and its peers still hold; present
 /// until the member has caught up past it.
 const KEY_CATCH_UP: &[u8] = b"raft:catch-up";
+/// The member and group the store's consensus records belong to.
+const KEY_MEMBER: &[u8] = b"raft:member";
 
 /// An existing member whose promise (its vote) neither copy can prove: the
 /// Raft tree lost it and the second copy is gone, damaged or another
@@ -198,12 +200,32 @@ impl PromiseUnqualified {
 /// was is learnt again from the leader.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 struct Promises {
+    /// The member these records are of; `None` until the store is first
+    /// opened as one.
+    member: Option<MemberBinding>,
     /// The vote; `None` only before the member first voted.
     vote: Option<Vote>,
     /// The last log entry purged; the segments up to it are gone.
     purged: Option<LogId>,
     /// The highest committed entry the disk lost, until caught up.
     catch_up: Option<LogId>,
+}
+
+/// The group and the member a store's consensus records belong to: a vote is
+/// a promise of one member in one group, never of another opening the same
+/// store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberBinding {
+    /// The group's id.
+    pub group: u64,
+    /// The member's node id in it.
+    pub node: u64,
+}
+
+impl std::fmt::Display for MemberBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "member {} of group {}", self.node, self.group)
+    }
 }
 
 /// One record as a copy holds it.
@@ -255,7 +277,10 @@ fn live_promises(engine: &StorageEngine) -> StorageResult<Vec<u8>> {
     };
     let vote: Option<Vote> = load_stored(engine, Partition::Raft, KEY_VOTE)
         .map_err(|e| StorageError::Io(e.to_string()))?;
+    let member: Option<MemberBinding> = load_stored(engine, Partition::Raft, KEY_MEMBER)
+        .map_err(|e| StorageError::Io(e.to_string()))?;
     let promises = Promises {
+        member,
         vote,
         purged: read(KEY_PURGED)?,
         catch_up: read(KEY_CATCH_UP)?,
@@ -343,6 +368,7 @@ fn settle_promises(
     let tree_vote: Read<Vote> = tree_record(engine, KEY_VOTE)?;
     let tree_purged: Read<LogId> = tree_record(engine, KEY_PURGED)?;
     let tree_catch_up: Read<LogId> = tree_record(engine, KEY_CATCH_UP)?;
+    let tree_member: Read<MemberBinding> = tree_record(engine, KEY_MEMBER)?;
     let second = copy_promises(&copy, named);
     let held_copy = match &second {
         Read::Holds(promises) => Some(*promises),
@@ -371,7 +397,19 @@ fn settle_promises(
     }
     let purged = later_record(&tree_purged, held_copy.map(|p| p.purged), "purge point")?;
     let catch_up = later_record(&tree_catch_up, held_copy.map(|p| p.catch_up), "loss record")?;
-    let history = history || purged.is_some() || catch_up.is_some();
+    // The member is never chosen between: two records that name different
+    // members mean the copies are of two stores.
+    let copy_member = held_copy.and_then(|p| p.member);
+    let member = match (&tree_member, copy_member) {
+        (Read::Holds(tree), Some(copy)) if *tree != copy => {
+            return Err(io::Error::other(format!(
+                "the Raft tree holds the records of {tree} and the second copy those of {copy}"
+            )));
+        }
+        (Read::Holds(tree), _) => Some(*tree),
+        (Read::Absent | Read::Damaged(_), copy) => copy,
+    };
+    let history = history || purged.is_some() || catch_up.is_some() || member.is_some();
     let vote = match vote {
         Some(vote) => vote,
         None if !history && !matches!(binding, ConsensusBinding::Bound(_)) => None,
@@ -386,6 +424,7 @@ fn settle_promises(
         }
     };
     let promises = Promises {
+        member,
         vote,
         purged,
         catch_up,
@@ -410,6 +449,9 @@ fn settle_promises(
     if let Some(c) = catch_up.filter(|c| !matches!(tree_catch_up, Read::Holds(t) if t == *c)) {
         restore(KEY_CATCH_UP, rmp_serde::to_vec(&c).map_err(encoded)?);
     }
+    if let Some(m) = member.filter(|m| !matches!(tree_member, Read::Holds(t) if t == *m)) {
+        restore(KEY_MEMBER, rmp_serde::to_vec(&m).map_err(encoded)?);
+    }
     if !writes.is_empty() {
         engine
             .commit_local(writes, LocalSync::BeforeUse)
@@ -419,12 +461,13 @@ fn settle_promises(
             "raft: the Raft tree took back the member's records"
         );
     }
-    if held_copy != Some(promises) {
-        let bytes = rmp_serde::to_vec(&promises).map_err(|e| io::Error::other(e.to_string()))?;
-        engine
-            .write_promise_copy(&incarnation, &bytes)
-            .map_err(|e| io::Error::other(format!("write the second copy: {e}")))?;
-    }
+    // Written even when the copy reads the same: bytes read back are not
+    // proof they reached the disk, after a sync that failed in an earlier
+    // process. One write per open; while the records stay, none after.
+    let bytes = rmp_serde::to_vec(&promises).map_err(|e| io::Error::other(e.to_string()))?;
+    engine
+        .write_promise_copy(&incarnation, &bytes)
+        .map_err(|e| io::Error::other(format!("write the second copy: {e}")))?;
     engine.bind_consensus_log(&incarnation).map_err(storage)?;
     Ok((incarnation, promises))
 }
@@ -723,6 +766,8 @@ pub struct LogStore {
     incarnation: Incarnation,
     /// The vote both copies hold durably, so an unchanged one costs no sync.
     saved_vote: Arc<Mutex<Option<Vote>>>,
+    /// The member the store's records belong to, once bound.
+    member: Arc<Mutex<Option<MemberBinding>>>,
 }
 
 /// Where a shard's Raft log lives on disk.
@@ -782,7 +827,83 @@ pub(crate) fn raft_log_bytes(engine: &StorageEngine) -> Result<u64, io::Error> {
     Ok(bytes)
 }
 
+/// Refuse a store whose consensus records belong to a member other than
+/// `member`, before anything opens on it: reads only, so a refused store is
+/// left exactly as it was. A record that cannot be read is left to the log's
+/// open, which settles both copies.
+///
+/// # Errors
+///
+/// The Raft tree or the second copy names another member or group, or the
+/// store cannot be read.
+pub fn check_member(engine: &StorageEngine, member: MemberBinding) -> Result<(), io::Error> {
+    let storage = |e: StorageError| io::Error::other(e.to_string());
+    let named = match engine.consensus_binding().map_err(storage)? {
+        ConsensusBinding::Bound(bound) => Some(bound),
+        ConsensusBinding::Unbound | ConsensusBinding::Unnamed => None,
+    };
+    let copy = engine.read_promise_copy().map_err(storage)?;
+    let in_copy = match copy_promises(&copy, named.as_ref()) {
+        Read::Holds(promises) => promises.member,
+        Read::Absent | Read::Damaged(_) => None,
+    };
+    let in_tree = match tree_record::<MemberBinding>(engine, KEY_MEMBER)? {
+        Read::Holds(held) => Some(held),
+        Read::Absent | Read::Damaged(_) => None,
+    };
+    match in_tree
+        .into_iter()
+        .chain(in_copy)
+        .find(|held| *held != member)
+    {
+        Some(held) => Err(io::Error::other(format!(
+            "this store keeps the consensus records of {held}; it cannot be opened as {member}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 impl LogStore {
+    /// Bind the store's consensus records to `member`, before the consensus
+    /// engine reads them: recorded in both copies the first time, checked
+    /// every time after. Durable when this returns. [`check_member`] refuses
+    /// another member's store before the log's open writes to it.
+    ///
+    /// # Errors
+    ///
+    /// The records belong to another member or group (the vote they hold was
+    /// given by that one), or the binding cannot be written.
+    pub fn bind_member(&self, member: MemberBinding) -> Result<(), io::Error> {
+        let mut bound = self
+            .member
+            .lock()
+            .map_err(|_| io::Error::other("member mutex poisoned"))?;
+        match *bound {
+            Some(held) if held == member => return Ok(()),
+            Some(held) => {
+                return Err(io::Error::other(format!(
+                    "this store keeps the consensus records of {held}; it cannot be opened as \
+                     {member}"
+                )));
+            }
+            None => {}
+        }
+        let bytes = rmp_serde::to_vec(&member).map_err(|e| io::Error::other(e.to_string()))?;
+        self.engine
+            .commit_local(
+                vec![LocalWrite::Put {
+                    partition: Partition::Raft,
+                    key: KEY_MEMBER.to_vec(),
+                    value: bytes,
+                }],
+                LocalSync::BeforeUse,
+            )
+            .map_err(|e| io::Error::other(format!("persist the member binding: {e}")))?;
+        refresh_promises(&self.engine, &self.incarnation)?;
+        *bound = Some(member);
+        Ok(())
+    }
+
     /// A shared handle to the Raft oplog manager. Cloned out before the
     /// `LogStore` is moved into `openraft::Raft` so a subsystem (e.g. WAL-replay
     /// repair) can read committed entries since a checkpoint without going
@@ -970,6 +1091,7 @@ impl LogStore {
             hold: EngineWork::default().start(),
             incarnation,
             saved_vote: Arc::new(Mutex::new(saved_vote)),
+            member: Arc::new(Mutex::new(promises.member)),
         };
         Ok((store, catch_up))
     }
@@ -1282,6 +1404,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             hold: self.hold.another(),
             incarnation: self.incarnation,
             saved_vote: Arc::clone(&self.saved_vote),
+            member: Arc::clone(&self.member),
         }
     }
 

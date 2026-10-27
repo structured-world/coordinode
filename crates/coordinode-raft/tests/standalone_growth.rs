@@ -392,7 +392,9 @@ async fn first_node_of_a_grown_directory_rejoins_after_failover() {
 /// own would be replaced, and a silent replacement is how a single-machine
 /// deployment loses everything it had. Growing that same directory into a
 /// group, where it is the first member, stays the supported path (the tests
-/// above), and an empty node joins as before.
+/// above), and an empty node joins as before. Opened under another node id,
+/// the store is refused earlier still, as the records of the member that
+/// wrote it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_holding_data_is_refused_when_it_joins() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
@@ -415,11 +417,12 @@ async fn a_node_holding_data_is_refused_when_it_joins() {
             engine.holds_user_data().expect("read the store"),
             "the standalone run must have left data behind for this test to mean anything"
         );
+        // Joining as the member that wrote the data: refused for the data.
         let refused = RaftNode::open_joining(
-            2,
+            1,
             Arc::clone(&engine),
             format!("127.0.0.1:{}", alloc_port()).parse().expect("addr"),
-            PKI.connections(2),
+            PKI.connections(1),
             enroll_nowhere(),
         )
         .await;
@@ -431,13 +434,31 @@ async fn a_node_holding_data_is_refused_when_it_joins() {
             "a node holding data must be refused when it joins, got {:?}",
             refused.map(|_| "a running joining node")
         );
+        // Joining as another node: the store keeps member 1's records, which
+        // no other member may take as its own.
+        let refused = RaftNode::open_joining(
+            2,
+            Arc::clone(&engine),
+            format!("127.0.0.1:{}", alloc_port()).parse().expect("addr"),
+            PKI.connections(2),
+            enroll_nowhere(),
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(coordinode_raft::cluster::RaftNodeError::Identity(_))
+            ),
+            "another member's store must be refused, got {:?}",
+            refused.map(|_| "a running joining node")
+        );
         assert_eq!(
             engine
                 .get(Partition::Node, b"node:1:mine")
                 .expect("read")
                 .map(|v| v.to_vec()),
             Some(b"mine".to_vec()),
-            "the refusal must leave the data where it was"
+            "the refusals must leave the data where it was"
         );
 
         // An empty directory is what a joining node is supposed to have.

@@ -273,9 +273,11 @@ pub struct StorageEngine {
     /// Partition captures taken for copies to other nodes, naming each
     /// one's directory.
     partition_captures: AtomicU64,
-    /// Serializes refreshes of the second copy of the consensus records, so
-    /// a refresh that read older records never lands after a newer one.
-    promise_copy: parking_lot::Mutex<()>,
+    /// Serializes writes of the second copy of the consensus records, so a
+    /// refresh that read older records never lands after a newer one, and
+    /// holds what this process proved about the copy: only what it wrote
+    /// durably is known to survive a power cut, not bytes merely read back.
+    promise_copy: parking_lot::Mutex<crate::engine::promise::CopyWriter>,
     /// Which local installation holds each index generation in the index
     /// tree; every read and write of a generation key goes through it.
     pub(crate) installations: crate::engine::installation::Installations,
@@ -1515,7 +1517,7 @@ impl StorageEngine {
             raft_fence: parking_lot::RwLock::new(None),
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
-            promise_copy: parking_lot::Mutex::new(()),
+            promise_copy: parking_lot::Mutex::new(crate::engine::promise::CopyWriter::default()),
             installations,
             index_copy_qualifier: parking_lot::RwLock::new(None),
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
@@ -3634,6 +3636,7 @@ impl StorageEngine {
             )),
             ConsensusBinding::Unbound | ConsensusBinding::Unnamed => {
                 crate::engine::promise::replace_file(
+                    &*self.fs,
                     &self.select_oplog_endpoint(0)?.path,
                     CONSENSUS_LOG_MARKER,
                     crate::engine::promise::format_incarnation(incarnation).as_bytes(),
@@ -3655,19 +3658,15 @@ impl StorageEngine {
             .select_oplog_endpoint(0)?
             .path
             .join(CONSENSUS_LOG_MARKER);
-        let text = match std::fs::read_to_string(&marker) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ConsensusBinding::Unbound);
-            }
-            Err(e) => {
-                return Err(StorageError::Io(format!("read {}: {e}", marker.display())));
-            }
+        let Some(bytes) = crate::engine::promise::read_file(&*self.fs, &marker)? else {
+            return Ok(ConsensusBinding::Unbound);
         };
-        Ok(match crate::engine::promise::parse_incarnation(&text)? {
-            Some(incarnation) => ConsensusBinding::Bound(incarnation),
-            None => ConsensusBinding::Unnamed,
-        })
+        Ok(
+            match crate::engine::promise::parse_incarnation(&String::from_utf8_lossy(&bytes))? {
+                Some(incarnation) => ConsensusBinding::Bound(incarnation),
+                None => ConsensusBinding::Unnamed,
+            },
+        )
     }
 
     /// The second copy of this member's consensus promise, kept beside the
@@ -3677,25 +3676,30 @@ impl StorageEngine {
     ///
     /// No endpoint can hold the log, or the file exists and cannot be read.
     pub fn read_promise_copy(&self) -> StorageResult<crate::engine::promise::PromiseCopy> {
-        crate::engine::promise::read_copy(&self.select_oplog_endpoint(0)?.path)
+        crate::engine::promise::read_copy(&*self.fs, &self.select_oplog_endpoint(0)?.path)
     }
 
-    /// Replace the second copy of this member's consensus promise with
-    /// `payload`, for the store incarnation `incarnation`. Durable when this
-    /// returns; on an error the previous copy is still in place.
+    /// Write `payload`, for the store incarnation `incarnation`, as the
+    /// newest record of the second copy of this member's consensus records:
+    /// durable when this returns. Written even when the copy already reads
+    /// the same: what an earlier process left may never have reached the
+    /// disk.
     ///
     /// # Errors
     ///
     /// No endpoint can hold the log, the endpoint has no room for the file,
-    /// or a write, sync or rename fails.
+    /// or a write or sync fails. Nothing is promised then: the next write
+    /// makes the copy durable again.
     pub fn write_promise_copy(
         &self,
         incarnation: &crate::engine::promise::Incarnation,
         payload: &[u8],
     ) -> StorageResult<()> {
-        let _serialized = self.promise_copy.lock();
+        let mut writer = self.promise_copy.lock();
         crate::engine::promise::write_copy(
+            &*self.fs,
             &self.select_oplog_endpoint(0)?.path,
+            &mut writer,
             incarnation,
             payload,
             &self.footprints,
@@ -3704,32 +3708,32 @@ impl StorageEngine {
 
     /// Bring the second copy of the consensus records up to date with
     /// `current`, which reads them from where they are kept live: `current`
-    /// runs under the same lock as every other refresh, so the copy never
-    /// goes back to records older than what an earlier refresh wrote. A copy
-    /// that already holds them is not written again.
+    /// runs under the same lock as every other write, so the copy never goes
+    /// back to records older than what an earlier write left. Records this
+    /// process already wrote durably are not written again; anything else,
+    /// a copy that only reads the same included, is.
     ///
     /// # Errors
     ///
-    /// The errors of `current`, or of reading or writing the copy.
+    /// The errors of `current`, or of writing the copy.
     pub fn refresh_promise_copy(
         &self,
         incarnation: &crate::engine::promise::Incarnation,
         current: impl FnOnce() -> StorageResult<Vec<u8>>,
     ) -> StorageResult<()> {
-        use crate::engine::promise::PromiseCopy;
-        let _serialized = self.promise_copy.lock();
+        let mut writer = self.promise_copy.lock();
         let payload = current()?;
-        let dir = &self.select_oplog_endpoint(0)?.path;
-        if let PromiseCopy::Held {
-            incarnation: held,
-            payload: copy,
-        } = crate::engine::promise::read_copy(dir)?
-        {
-            if held == *incarnation && copy == payload {
-                return Ok(());
-            }
+        if writer.holds(incarnation, &payload) {
+            return Ok(());
         }
-        crate::engine::promise::write_copy(dir, incarnation, &payload, &self.footprints)
+        crate::engine::promise::write_copy(
+            &*self.fs,
+            &self.select_oplog_endpoint(0)?.path,
+            &mut writer,
+            incarnation,
+            &payload,
+            &self.footprints,
+        )
     }
 
     /// Fold the journal's applied prefix into every tree, including the ones
