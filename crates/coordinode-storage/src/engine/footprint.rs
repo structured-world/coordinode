@@ -47,6 +47,20 @@ pub enum Admit {
     Recovery,
 }
 
+impl Admit {
+    /// The class a write asked for as `self` is admitted as on this thread: a
+    /// client write made inside a [`ReclaimScope`] is the store's own work
+    /// that gives room back, admitted as a recovery record.
+    #[must_use]
+    pub fn on_this_thread(self) -> Self {
+        if RECLAIMING.get() {
+            Self::Recovery
+        } else {
+            self
+        }
+    }
+}
+
 /// What the memtables owe the footprint: the bytes their flushes will write.
 pub type FlushDebt = Box<dyn Fn() -> u64 + Send + Sync>;
 
@@ -102,6 +116,35 @@ pub const OVER_LIMIT_ALLOWANCE: u64 = 1024 * 1024;
 std::thread_local! {
     /// Whether this thread runs maintenance ([`MaintenanceScope`]).
     static MAINTENANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread runs work that gives room back ([`ReclaimScope`]).
+    static RECLAIMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Held while the thread runs work whose commits give room back, the orphan
+/// blob collector's: they are admitted as the store's own recovery records
+/// ([`Admit::on_this_thread`]), so a disk below its free-space reserve or an
+/// endpoint at its limit, which refuse client writes, still lets the
+/// collection that frees them finish. They take the upper half of the reserve
+/// only, as every recovery record does; the lower half stays for the flushes
+/// and compactions that complete them.
+#[must_use = "the scope lasts until it drops"]
+pub struct ReclaimScope {
+    was: bool,
+}
+
+impl ReclaimScope {
+    /// Enter reclamation on this thread until the scope drops.
+    pub fn enter() -> Self {
+        Self {
+            was: RECLAIMING.replace(true),
+        }
+    }
+}
+
+impl Drop for ReclaimScope {
+    fn drop(&mut self) {
+        RECLAIMING.set(self.was);
+    }
 }
 
 /// Held while the thread runs a compaction: the files it grows may take only

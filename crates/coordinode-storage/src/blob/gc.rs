@@ -53,7 +53,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use super::{BlobError, BlobResult, BlobStore, CleanedUp, Retirement, decode, encode};
-use crate::engine::footprint::MaintenanceScope;
+use crate::engine::footprint::{MaintenanceScope, ReclaimScope};
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, printable_key};
 
@@ -506,14 +506,16 @@ impl BlobCollector {
             );
             return Ok((pass, None));
         }
-        // Deleting and compacting under a full disk draws on the room kept
-        // for maintenance: collection is how that room comes back.
         // A store that never held a blob has nothing to collect and no reason
         // to write: a database that stores no blobs commits nothing for them,
         // and the worker sleeps until its first release wakes it.
         if !self.holds_blob_records()? {
             return Ok((pass, None));
         }
+        // Collection is how the room a full disk refuses client writes for
+        // comes back, so its commits are admitted as the store's own work, and
+        // its compaction keeps to the room flushes were promised.
+        let _reclaiming = ReclaimScope::enter();
         let _maintenance = MaintenanceScope::enter();
         let policy = self.policy();
         let mut next = Deadline::default();

@@ -131,6 +131,7 @@ impl SpaceGuard {
     /// As [`Self::admit`], and [`StorageError::CapacityExhausted`] when the
     /// write does not fit.
     pub fn reserve(&self, bytes: u64, class: Admit) -> StorageResult<Admitted> {
+        let class = class.on_this_thread();
         match class {
             Admit::Client => self.admit()?,
             Admit::Recovery => self.admit_recovery()?,

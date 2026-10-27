@@ -162,6 +162,51 @@ fn blob_disk_bytes(gc: &BlobCollector) -> u64 {
         .disk_space()
 }
 
+/// Below the free-space reserve, where client writes are refused, the
+/// collector still goes the whole way: it retires the released content,
+/// deletes its payload and compacts, drawing on the room kept for
+/// maintenance, since collecting is how that room comes back.
+#[test]
+fn collection_runs_to_the_end_below_the_free_space_reserve() {
+    let (gc, _dir) = open();
+    let bytes = data(1, 8);
+    put(&gc, 1, &bytes);
+    gc.run(true).expect("enrolment pass");
+    let full = blob_disk_bytes(&gc);
+    delete(&gc, 1);
+    advance(HOUR + Duration::from_secs(1));
+
+    // Free space below the reserve, as a disk that refuses client writes, and
+    // above half of it, the part the store's own work may still use.
+    let space = gc.store().engine().space();
+    let reserve = space.available_bytes() / 2 * 3;
+    space.set_reserve(reserve, reserve);
+    let refused = gc.store().put(
+        &owner(2),
+        SharingScope::STORE,
+        &data(2, 1),
+        OwnerWrite::Replace,
+        None,
+    );
+    assert!(
+        refused.is_err(),
+        "a client write is refused below the reserve: {refused:?}"
+    );
+
+    let pass = gc.run(false).expect("collection below the reserve");
+    assert_eq!(pass.retired, 8);
+    assert_eq!(pass.cleaned.bytes, bytes.len() as u64);
+    assert!(pass.compaction.is_some(), "the deletion was compacted");
+    let status = gc.status().expect("status");
+    assert_eq!((status.candidates, status.retired_pending), (0, 0));
+    assert_eq!(status.stale_blob_bytes, 0);
+    assert!(
+        status.blob_disk_bytes < full / 2,
+        "{} of {full} bytes still on disk",
+        status.blob_disk_bytes
+    );
+}
+
 /// The whole path on a real filesystem: a deleted blob's content is kept
 /// through its grace, then retired, its payload deleted by exact generation,
 /// and the Blob partition compacted until the space is actually back, in

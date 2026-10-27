@@ -182,7 +182,11 @@ never touched. A chunk nothing holds is kept through its grace
 (`blob_gc_grace_secs`, at least the retention window) and for as long as a
 reader, retained history, a lagging change-stream consumer or an upload in
 progress needs it; then it is retired, its bytes deleted, and the blob
-partition compacted, which frees the files it empties. Uploads never published are
+partition compacted, which frees the files it empties. Collection is the
+store's own work: on a disk below its free-space reserve, or an endpoint at its
+hard limit, where client writes are refused, it still runs, from the part of the
+reserve kept for the store's recovery records, since it is how that room comes
+back. Uploads never published are
 collected after `blob_gc_upload_expiry_secs`. Collection is checked against
 the blob records periodically (`blob_gc_reconcile_interval_secs`) and before
 it first deletes anything; a record that does not decode makes ownership

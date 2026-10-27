@@ -1740,6 +1740,7 @@ impl StorageEngine {
         mutations: &[Mutation],
         class: crate::engine::footprint::Admit,
     ) -> StorageResult<crate::engine::footprint::Admitted> {
+        let class = class.on_this_thread();
         match class {
             crate::engine::footprint::Admit::Client => self.space.admit_free_space()?,
             crate::engine::footprint::Admit::Recovery => {
@@ -1776,7 +1777,7 @@ impl StorageEngine {
         {
             Admit::Recovery
         } else {
-            Admit::Client
+            Admit::Client.on_this_thread()
         };
         self.admit_footprint(bytes, class)
     }
