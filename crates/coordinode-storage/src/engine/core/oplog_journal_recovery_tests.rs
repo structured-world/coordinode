@@ -1683,7 +1683,9 @@ fn a_member_store_is_refused_an_own_journal_and_left_as_it_was() {
     let rig = PowerRig::new();
     let config = rig.config();
     let engine = rig.open_group(&config).expect("open");
-    engine.bind_consensus_log().expect("bind the consensus log");
+    engine
+        .bind_consensus_log(&[3u8; 16])
+        .expect("bind the consensus log");
     engine
         .commit_local(vec![member_put(b"vote", b"v3")], LocalSync::BeforeUse)
         .expect("commit");

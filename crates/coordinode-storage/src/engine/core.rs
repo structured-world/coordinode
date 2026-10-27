@@ -3602,33 +3602,99 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Record, durably, that this store's log is a consensus log: from here
-    /// on the store opens only as a member of its group, never with a
-    /// journal of its own. Called before the log's first entry is written;
-    /// recording it again does nothing.
+    /// Record, durably, that this store's log is a consensus log of the store
+    /// incarnation `incarnation`: from here on the store opens only as a
+    /// member of its group, never with a journal of its own. Called before
+    /// the log's first entry is written, and again to give a marker written
+    /// before markers carried an incarnation its one; recording the same
+    /// incarnation again does nothing.
     ///
     /// # Errors
     ///
     /// The engine was opened with a journal of its own, which a consensus
     /// log cannot share the store with; no endpoint can hold the log; the
-    /// record cannot be written.
-    pub fn bind_consensus_log(&self) -> StorageResult<()> {
+    /// marker names another incarnation; the record cannot be written.
+    pub fn bind_consensus_log(
+        &self,
+        incarnation: &crate::engine::promise::Incarnation,
+    ) -> StorageResult<()> {
         if self.oplog.is_some() {
             return Err(StorageError::InvalidConfig(
                 "a consensus log cannot start on a store opened with a journal of its own".into(),
             ));
         }
-        let endpoint = self.select_oplog_endpoint(0)?;
-        let marker = endpoint.path.join(CONSENSUS_LOG_MARKER);
-        if marker.exists() {
-            return Ok(());
+        match self.consensus_binding()? {
+            ConsensusBinding::Bound(bound) if bound == *incarnation => Ok(()),
+            ConsensusBinding::Bound(_) => Err(StorageError::InvalidConfig(
+                "the consensus log is bound to another store incarnation".into(),
+            )),
+            ConsensusBinding::Unbound | ConsensusBinding::Unnamed => {
+                crate::engine::promise::replace_file(
+                    &self.select_oplog_endpoint(0)?.path,
+                    CONSENSUS_LOG_MARKER,
+                    crate::engine::promise::format_incarnation(incarnation).as_bytes(),
+                    &self.footprints,
+                )
+            }
         }
-        let io = |what: &str, e: std::io::Error| {
-            StorageError::Io(format!("{what} {}: {e}", marker.display()))
+    }
+
+    /// Whether this store's log is bound to a consensus group, and the store
+    /// incarnation the binding names.
+    ///
+    /// # Errors
+    ///
+    /// No endpoint can hold the log, or the marker cannot be read or names
+    /// no incarnation.
+    pub fn consensus_binding(&self) -> StorageResult<ConsensusBinding> {
+        let marker = self
+            .select_oplog_endpoint(0)?
+            .path
+            .join(CONSENSUS_LOG_MARKER);
+        let text = match std::fs::read_to_string(&marker) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ConsensusBinding::Unbound);
+            }
+            Err(e) => {
+                return Err(StorageError::Io(format!("read {}: {e}", marker.display())));
+            }
         };
-        let file = std::fs::File::create(&marker).map_err(|e| io("create", e))?;
-        file.sync_all().map_err(|e| io("sync", e))?;
-        sync_dir(&endpoint.path)
+        Ok(match crate::engine::promise::parse_incarnation(&text)? {
+            Some(incarnation) => ConsensusBinding::Bound(incarnation),
+            None => ConsensusBinding::Unnamed,
+        })
+    }
+
+    /// The second copy of this member's consensus promise, kept beside the
+    /// consensus log out of reach of every tree repair.
+    ///
+    /// # Errors
+    ///
+    /// No endpoint can hold the log, or the file exists and cannot be read.
+    pub fn read_promise_copy(&self) -> StorageResult<crate::engine::promise::PromiseCopy> {
+        crate::engine::promise::read_copy(&self.select_oplog_endpoint(0)?.path)
+    }
+
+    /// Replace the second copy of this member's consensus promise with
+    /// `payload`, for the store incarnation `incarnation`. Durable when this
+    /// returns; on an error the previous copy is still in place.
+    ///
+    /// # Errors
+    ///
+    /// No endpoint can hold the log, the endpoint has no room for the file,
+    /// or a write, sync or rename fails.
+    pub fn write_promise_copy(
+        &self,
+        incarnation: &crate::engine::promise::Incarnation,
+        payload: &[u8],
+    ) -> StorageResult<()> {
+        crate::engine::promise::write_copy(
+            &self.select_oplog_endpoint(0)?.path,
+            incarnation,
+            payload,
+            &self.footprints,
+        )
     }
 
     /// Fold the journal's applied prefix into every tree, including the ones
@@ -6650,8 +6716,19 @@ fn remove_capture_with(fs: &dyn lsm_tree::fs::Fs, dir: &Path) -> StorageResult<(
 }
 
 /// The file that marks a store whose log is a consensus log, in the root of
-/// the endpoint that holds the log.
+/// the endpoint that holds the log. It holds the store incarnation in hex.
 const CONSENSUS_LOG_MARKER: &str = "consensus-log";
+
+/// What the consensus log marker of a store says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusBinding {
+    /// No marker: the store's log was never bound to a group.
+    Unbound,
+    /// A marker written before markers carried an incarnation.
+    Unnamed,
+    /// Bound, by the store incarnation the marker names.
+    Bound(crate::engine::promise::Incarnation),
+}
 
 /// What shows that the store at `endpoint`, with `trees`, keeps a replicated
 /// group's history, or `None` when nothing does. The consensus log is bound

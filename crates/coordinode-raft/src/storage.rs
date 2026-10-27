@@ -44,9 +44,11 @@ use serde::{Deserialize, Serialize};
 use coordinode_core::txn::frame::{DecodeLimits, decode_proposal, encode_proposal};
 use coordinode_core::txn::proposal::{MetadataCommand, Mutation, RaftProposal};
 use coordinode_storage::engine::core::{
-    LocalSync, LocalWrite, RaftApplyFence, RaftApplyState, RaftCoverage, StorageEngine,
+    ConsensusBinding, LocalSync, LocalWrite, RaftApplyFence, RaftApplyState, RaftCoverage,
+    StorageEngine,
 };
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::promise::{Incarnation, PromiseCopy};
 use coordinode_storage::error::{StorageError, StorageResult};
 
 use crate::snapshot::SnapshotData;
@@ -166,6 +168,162 @@ const KEY_PURGED: &[u8] = b"raft:purged";
 /// The committed entry a member's disk lost and its peers still hold; present
 /// until the member has caught up past it.
 const KEY_CATCH_UP: &[u8] = b"raft:catch-up";
+
+/// An existing member whose promise (its vote) neither copy can prove: the
+/// Raft tree lost it and the second copy is gone, damaged or another
+/// store's. Opening it as a fresh member would let it vote again in a term
+/// it already voted in, so it takes no part in its group; its store is left
+/// as it was. Carried inside the [`io::Error`] the log's open returns.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "this member's vote cannot be proved ({reason}); it takes no part in its group until it \
+     is replaced under a new identity through the group's membership"
+)]
+pub struct PromiseUnqualified {
+    /// What each copy showed.
+    pub reason: String,
+}
+
+impl PromiseUnqualified {
+    /// The refusal inside `err`, if `err` is one.
+    pub fn of(err: &io::Error) -> Option<&Self> {
+        err.get_ref().and_then(|inner| inner.downcast_ref::<Self>())
+    }
+}
+
+/// One copy of the promise, as read.
+enum PromiseRead {
+    /// The copy holds this promise; `None` is the explicit record of a member
+    /// that has not voted yet, which only the second copy writes.
+    Holds(Option<Vote>),
+    /// No record: never written, or lost.
+    Absent,
+    /// A record that cannot be this member's promise.
+    Damaged(String),
+}
+
+/// The Raft tree's copy. Absence there proves nothing on its own: a lost
+/// tree reads empty.
+fn tree_promise(engine: &StorageEngine) -> Result<PromiseRead, io::Error> {
+    match engine.get(Partition::Raft, KEY_VOTE) {
+        Ok(Some(bytes)) => Ok(match rmp_serde::from_slice::<Vote>(&bytes) {
+            Ok(vote) => PromiseRead::Holds(Some(vote)),
+            Err(e) => PromiseRead::Damaged(format!("the Raft tree's record does not decode: {e}")),
+        }),
+        Ok(None) => Ok(PromiseRead::Absent),
+        Err(e) if e.is_data_damage() => Ok(PromiseRead::Damaged(format!(
+            "the Raft tree's record is unreadable: {e}"
+        ))),
+        Err(e) => Err(io::Error::other(e.to_string())),
+    }
+}
+
+/// The second copy, if it belongs to `incarnation` (or, with none named yet,
+/// to whichever incarnation it names).
+fn copy_promise(copy: &PromiseCopy, incarnation: Option<&Incarnation>) -> PromiseRead {
+    match copy {
+        PromiseCopy::Absent => PromiseRead::Absent,
+        PromiseCopy::Damaged(why) => PromiseRead::Damaged(format!("the second copy is {why}")),
+        PromiseCopy::Held {
+            incarnation: held, ..
+        } if incarnation.is_some_and(|bound| bound != held) => {
+            PromiseRead::Damaged("the second copy belongs to another store".into())
+        }
+        PromiseCopy::Held { payload, .. } => match rmp_serde::from_slice::<Option<Vote>>(payload) {
+            Ok(vote) => PromiseRead::Holds(vote),
+            Err(e) => PromiseRead::Damaged(format!("the second copy does not decode: {e}")),
+        },
+    }
+}
+
+/// This member's promise, read from both copies and made whole before the
+/// consensus engine sees it: the greater of the copies that hold one, by the
+/// engine's own vote order, written back to the copy that lags, and the
+/// store's consensus log bound to its incarnation. `history` says whether the
+/// store already keeps a group's history (log, commit or purge point, applied
+/// membership): with no copy holding a promise, only a store without one, and
+/// never bound under an incarnation, is a new member.
+///
+/// # Errors
+///
+/// A copy cannot be read or written; the copies hold promises the vote order
+/// cannot rank; an existing member's promise cannot be proved
+/// ([`PromiseUnqualified`]).
+fn settle_promise(engine: &StorageEngine, history: bool) -> Result<Incarnation, io::Error> {
+    let storage = |e: StorageError| io::Error::other(e.to_string());
+    let binding = engine.consensus_binding().map_err(storage)?;
+    let copy = engine.read_promise_copy().map_err(storage)?;
+    let incarnation = match (&binding, &copy) {
+        (ConsensusBinding::Bound(bound), _) => *bound,
+        // A copy written before its marker (a crash in between, or a marker
+        // that predates incarnations) names the store's incarnation.
+        (_, PromiseCopy::Held { incarnation, .. }) => *incarnation,
+        _ => coordinode_storage::engine::promise::new_incarnation(),
+    };
+    let named = matches!(binding, ConsensusBinding::Bound(_)).then_some(&incarnation);
+    let tree = tree_promise(engine)?;
+    let second = copy_promise(&copy, named);
+    let mut held: Option<Option<Vote>> = None;
+    for read in [&tree, &second] {
+        if let PromiseRead::Holds(vote) = read {
+            held = Some(match held {
+                None => *vote,
+                Some(other) => match vote.partial_cmp(&other) {
+                    Some(std::cmp::Ordering::Greater) => *vote,
+                    Some(_) => other,
+                    None => {
+                        return Err(io::Error::other(format!(
+                            "the copies of this member's vote cannot be ranked: {other:?} and \
+                             {vote:?}"
+                        )));
+                    }
+                },
+            });
+        }
+    }
+    let vote = match held {
+        Some(vote) => vote,
+        None if !history && !matches!(binding, ConsensusBinding::Bound(_)) => None,
+        None => {
+            let show = |read: &PromiseRead| match read {
+                PromiseRead::Holds(_) => "holds it".to_string(),
+                PromiseRead::Absent => "has none".to_string(),
+                PromiseRead::Damaged(why) => why.clone(),
+            };
+            return Err(io::Error::other(PromiseUnqualified {
+                reason: format!(
+                    "the Raft tree {}; the second copy {}",
+                    show(&tree),
+                    show(&second)
+                ),
+            }));
+        }
+    };
+    if let Some(vote) = vote {
+        if !matches!(tree, PromiseRead::Holds(Some(v)) if v == vote) {
+            let bytes = rmp_serde::to_vec(&vote).map_err(|e| io::Error::other(e.to_string()))?;
+            engine
+                .commit_local(
+                    vec![LocalWrite::Put {
+                        partition: Partition::Raft,
+                        key: KEY_VOTE.to_vec(),
+                        value: bytes,
+                    }],
+                    LocalSync::BeforeUse,
+                )
+                .map_err(|e| io::Error::other(format!("restore the vote: {e}")))?;
+            tracing::warn!(?vote, "raft: the Raft tree's copy of the vote restored");
+        }
+    }
+    if !matches!(second, PromiseRead::Holds(v) if v == vote) {
+        let bytes = rmp_serde::to_vec(&vote).map_err(|e| io::Error::other(e.to_string()))?;
+        engine
+            .write_promise_copy(&incarnation, &bytes)
+            .map_err(|e| io::Error::other(format!("write the vote's second copy: {e}")))?;
+    }
+    engine.bind_consensus_log(&incarnation).map_err(storage)?;
+    Ok(incarnation)
+}
 
 /// What opening the log does when the disk lost entries already committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,6 +583,10 @@ pub struct LogStore {
     /// This store's (or reader's) share of [`EngineWork`], since it holds
     /// the engine for as long as it lives.
     hold: EngineWorkGuard,
+    /// The store incarnation the second copy of the vote is written for.
+    incarnation: Incarnation,
+    /// The vote both copies hold durably, so an unchanged one costs no sync.
+    saved_vote: Arc<Mutex<Option<Vote>>>,
 }
 
 /// Where a shard's Raft log lives on disk.
@@ -550,11 +712,11 @@ impl LogStore {
         // open one LogStore per shard, each routing to its own
         // select_oplog_endpoint(shard_id).
         let shard_id: u32 = 0;
-        // Before the log's first entry: from here the store opens only as a
-        // member, never with a journal of its own beside this log.
-        engine
-            .bind_consensus_log()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        if engine.has_journal() {
+            return Err(io::Error::other(
+                "a consensus log cannot start on a store opened with a journal of its own",
+            ));
+        }
         let RaftOplogDirs {
             active: active_dir,
             all: recovery_dirs,
@@ -611,6 +773,20 @@ impl LogStore {
         };
         let last_log_id = recovered.max(last_purged);
 
+        // The promise is made whole, and the store bound to its group, before
+        // the log's first entry and before the consensus engine reads it.
+        let history = committed.is_some()
+            || recorded.is_some()
+            || last_purged.is_some()
+            || recovered.is_some()
+            || load_stored::<StoredMembership>(&engine, Partition::Schema, KEY_SM_MEMBERSHIP)?
+                .is_some();
+        let incarnation = settle_promise(&engine, history)?;
+        let saved_vote = tree_promise(&engine).map(|read| match read {
+            PromiseRead::Holds(vote) => vote,
+            PromiseRead::Absent | PromiseRead::Damaged(_) => None,
+        })?;
+
         // Committed entries the log no longer holds: the leader sends them
         // again. Until then the replay openraft starts from must stop where
         // the log does, and the loss stays recorded across restarts.
@@ -660,6 +836,8 @@ impl LogStore {
             last_log_id: Arc::new(Mutex::new(last_log_id)),
             last_purged: Arc::new(Mutex::new(last_purged)),
             hold: EngineWork::default().start(),
+            incarnation,
+            saved_vote: Arc::new(Mutex::new(saved_vote)),
         };
         Ok((store, catch_up))
     }
@@ -980,15 +1158,27 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             append_notifier: Arc::clone(&self.append_notifier),
             sync: Arc::clone(&self.sync),
             hold: self.hold.another(),
+            incarnation: self.incarnation,
+            saved_vote: Arc::clone(&self.saved_vote),
         }
     }
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
+        let mut saved = self
+            .saved_vote
+            .lock()
+            .map_err(|_| io::Error::other("saved vote mutex poisoned"))?;
+        // Both copies already hold it durably.
+        if saved.as_ref() == Some(vote) {
+            return Ok(());
+        }
         let bytes = rmp_serde::to_vec(vote).map_err(|e| io::Error::other(e.to_string()))?;
         // openraft answers the candidate once this returns; a vote lost in a
         // crash would let this node grant a second one in the same term. One
-        // synced append to the member-local journal makes it durable, in place
-        // of a flush of the whole Raft tree.
+        // synced append to the member-local journal makes the tree's copy
+        // durable, in place of a flush of the whole Raft tree; the second
+        // copy outlives a damaged tree. A failure of either answers nothing,
+        // and the next open settles on the greater copy.
         self.engine
             .commit_local(
                 vec![LocalWrite::Put {
@@ -998,7 +1188,13 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                 }],
                 LocalSync::BeforeUse,
             )
-            .map_err(|e| io::Error::other(format!("persist the vote: {e}")))
+            .map_err(|e| io::Error::other(format!("persist the vote: {e}")))?;
+        let copy = rmp_serde::to_vec(&Some(*vote)).map_err(|e| io::Error::other(e.to_string()))?;
+        self.engine
+            .write_promise_copy(&self.incarnation, &copy)
+            .map_err(|e| io::Error::other(format!("persist the vote's second copy: {e}")))?;
+        *saved = Some(*vote);
+        Ok(())
     }
 
     async fn save_committed(

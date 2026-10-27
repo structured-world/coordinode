@@ -25,6 +25,7 @@ pub mod oplog_journal;
 pub mod owned_metrics;
 pub mod partition;
 pub mod pending;
+pub mod promise;
 pub mod rebuild;
 pub mod retention_stats;
 pub mod routing;

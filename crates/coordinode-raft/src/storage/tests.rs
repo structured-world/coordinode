@@ -1499,6 +1499,319 @@ async fn a_saved_vote_survives_a_crash() {
     assert_eq!(log.read_vote().await.expect("read vote"), Some(vote));
 }
 
+/// A store whose member-local journal compacts after every entry, so a saved
+/// vote lives in the Raft tree alone once `save_vote` returns.
+fn compacting_config(dir: &std::path::Path) -> StorageConfig {
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    config.local_journal_compact_entries = 1;
+    config
+}
+
+/// Save `vote` on a fresh member at `dir`, then lose the Raft tree the way a
+/// damaged disk does: the tree's directory is gone and the engine opens it
+/// empty.
+async fn member_whose_raft_tree_was_lost(dir: &std::path::Path, vote: Vote) -> StorageConfig {
+    let config = compacting_config(dir);
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        log.save_vote(&vote).await.expect("save vote");
+    }
+    std::fs::remove_dir_all(dir.join(Partition::Raft.name())).expect("lose the Raft tree");
+    config
+}
+
+/// A member that lost its Raft tree still holds its promise: the separate copy
+/// of the vote survives the tree, and the reopened member reads the vote it
+/// granted, never the engine's initial one, which would let it vote again in
+/// the same term.
+#[tokio::test]
+async fn a_vote_survives_the_loss_of_the_raft_tree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vote = Vote::new(7, 3);
+    let config = member_whose_raft_tree_was_lost(dir.path(), vote).await;
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    assert_eq!(
+        log.read_vote().await.expect("read vote"),
+        Some(vote),
+        "the promise survives the tree"
+    );
+}
+
+/// With both copies of its vote gone, an existing member does not open as a
+/// fresh one: its log is bound to a group, so an absent vote is a lost one,
+/// and the open is refused with the store left as it was.
+#[tokio::test]
+async fn a_member_that_lost_every_copy_of_its_vote_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = member_whose_raft_tree_was_lost(dir.path(), Vote::new(7, 3)).await;
+    std::fs::remove_file(
+        dir.path()
+            .join(coordinode_storage::engine::promise::PROMISE_FILE),
+    )
+    .expect("lose the second copy");
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let err = LogStore::open(Arc::clone(&engine))
+        .err()
+        .expect("a member without its promise must not open");
+    assert!(
+        err.to_string().contains("vote"),
+        "names the lost vote: {err}"
+    );
+}
+
+/// The second copy's file in the store at `dir`.
+fn promise_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(coordinode_storage::engine::promise::PROMISE_FILE)
+}
+
+/// The store incarnation `engine`'s consensus log marker names.
+fn bound_incarnation(engine: &StorageEngine) -> Incarnation {
+    match engine.consensus_binding().expect("binding") {
+        ConsensusBinding::Bound(incarnation) => Some(incarnation),
+        ConsensusBinding::Unbound | ConsensusBinding::Unnamed => None,
+    }
+    .expect("the marker names an incarnation")
+}
+
+/// A member opened for the first time records that it has not voted in both
+/// places that matter: the second copy holds the explicit "no vote yet", and
+/// the consensus log marker names the store's incarnation. Opened again it
+/// is the same member, not a lost one.
+#[tokio::test]
+async fn a_new_member_records_its_promise_before_it_starts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = compacting_config(dir.path());
+    let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+    assert_eq!(log.read_vote().await.expect("read"), None);
+    let incarnation = bound_incarnation(&engine);
+    assert_eq!(
+        engine.read_promise_copy().expect("copy"),
+        PromiseCopy::Held {
+            incarnation,
+            payload: rmp_serde::to_vec(&None::<Vote>).expect("encode"),
+        }
+    );
+    drop(log);
+    drop(engine);
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    assert_eq!(log.read_vote().await.expect("read"), None);
+    assert_eq!(
+        engine.consensus_binding().expect("binding"),
+        ConsensusBinding::Bound(incarnation),
+        "the incarnation is drawn once"
+    );
+}
+
+/// A damaged second copy is rewritten from the tree, and a tree that lost its
+/// record takes it back from the copy: after one open both hold the vote
+/// again, so the next loss of either still leaves one.
+#[tokio::test]
+async fn a_damaged_copy_is_restored_from_the_other() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vote = Vote::new(4, 2);
+    let config = compacting_config(dir.path());
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        log.save_vote(&vote).await.expect("save");
+    }
+    let file = promise_file(dir.path());
+    let mut bytes = std::fs::read(&file).expect("read copy");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&file, &bytes).expect("damage the copy");
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+        assert_eq!(log.read_vote().await.expect("read"), Some(vote));
+    }
+    // The copy was rewritten: now the tree may go too.
+    std::fs::remove_dir_all(dir.path().join(Partition::Raft.name())).expect("lose the tree");
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    assert_eq!(log.read_vote().await.expect("read"), Some(vote));
+    assert_eq!(
+        engine
+            .get(Partition::Raft, KEY_VOTE)
+            .expect("tree")
+            .map(|b| b.to_vec()),
+        Some(rmp_serde::to_vec(&vote).expect("encode")),
+        "the tree took the vote back from the copy"
+    );
+}
+
+/// Of two copies that disagree, the greater by the consensus engine's vote
+/// order is the promise: a copy can lag the other only by an update that did
+/// not finish, and the newer promise is kept, never the older.
+#[tokio::test]
+async fn the_greater_of_two_copies_is_the_promise() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let older = Vote::new(4, 2);
+    let newer = Vote::new_committed(5, 1);
+    let config = compacting_config(dir.path());
+    let incarnation = {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        log.save_vote(&older).await.expect("save");
+        let incarnation = bound_incarnation(&engine);
+        // An update the tree took and the copy did not.
+        engine
+            .commit_local(
+                vec![LocalWrite::Put {
+                    partition: Partition::Raft,
+                    key: KEY_VOTE.to_vec(),
+                    value: rmp_serde::to_vec(&newer).expect("encode"),
+                }],
+                LocalSync::BeforeUse,
+            )
+            .expect("tree only");
+        incarnation
+    };
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+        assert_eq!(log.read_vote().await.expect("read"), Some(newer));
+        assert_eq!(
+            engine.read_promise_copy().expect("copy"),
+            PromiseCopy::Held {
+                incarnation,
+                payload: rmp_serde::to_vec(&Some(newer)).expect("encode"),
+            },
+            "the lagging copy caught up"
+        );
+    }
+    // The other way round: the copy ahead of a tree that lost its newest
+    // record to a damaged block.
+    let ahead = Vote::new(9, 3);
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        engine
+            .write_promise_copy(
+                &incarnation,
+                &rmp_serde::to_vec(&Some(ahead)).expect("encode"),
+            )
+            .expect("copy only");
+    }
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    assert_eq!(log.read_vote().await.expect("read"), Some(ahead));
+}
+
+/// A second copy that belongs to another store (a file carried over from
+/// another member's directory) is no promise of this one: it never outranks
+/// the tree, it is replaced, and with the tree gone the member is refused
+/// rather than opened on someone else's vote.
+#[tokio::test]
+async fn another_stores_copy_is_never_taken_for_the_promise() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mine = Vote::new(3, 1);
+    let config = compacting_config(dir.path());
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        log.save_vote(&mine).await.expect("save");
+        engine
+            .write_promise_copy(
+                &[0xee; 16],
+                &rmp_serde::to_vec(&Some(Vote::new(50, 9))).expect("encode"),
+            )
+            .expect("foreign copy");
+    }
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+        assert_eq!(log.read_vote().await.expect("read"), Some(mine));
+        engine
+            .write_promise_copy(
+                &[0xee; 16],
+                &rmp_serde::to_vec(&Some(Vote::new(50, 9))).expect("encode"),
+            )
+            .expect("foreign copy again");
+    }
+    std::fs::remove_dir_all(dir.path().join(Partition::Raft.name())).expect("lose the tree");
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let err = LogStore::open(Arc::clone(&engine))
+        .err()
+        .expect("another store's copy must not open this member");
+    assert!(PromiseUnqualified::of(&err).is_some(), "typed: {err}");
+    assert!(err.to_string().contains("another store"), "{err}");
+}
+
+/// A store bound to its group before the marker carried an incarnation
+/// keeps its vote: the tree's record becomes the second copy and the marker
+/// gets an incarnation. One that already holds a group's history and has no
+/// vote anywhere has lost it, and is refused.
+#[tokio::test]
+async fn a_store_bound_before_incarnations_is_converted_or_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vote = Vote::new(6, 1);
+    let config = compacting_config(dir.path());
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        log.save_vote(&vote).await.expect("save");
+        append_durable(&mut log, vec![make_entry(1, 6, "x")]).await;
+    }
+    // The layout an earlier build left: an empty marker and no second copy.
+    std::fs::write(dir.path().join("consensus-log"), b"").expect("empty marker");
+    std::fs::remove_file(promise_file(dir.path())).expect("no copy");
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+        assert_eq!(log.read_vote().await.expect("read"), Some(vote));
+        assert!(matches!(
+            engine.consensus_binding().expect("binding"),
+            ConsensusBinding::Bound(_)
+        ));
+        assert!(matches!(
+            engine.read_promise_copy().expect("copy"),
+            PromiseCopy::Held { .. }
+        ));
+    }
+    // The same layout with the tree's record lost as well.
+    std::fs::write(dir.path().join("consensus-log"), b"").expect("empty marker");
+    std::fs::remove_file(promise_file(dir.path())).expect("no copy");
+    std::fs::remove_dir_all(dir.path().join(Partition::Raft.name())).expect("lose the tree");
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let err = LogStore::open(Arc::clone(&engine))
+        .err()
+        .expect("a member with a log and no vote anywhere lost it");
+    assert!(PromiseUnqualified::of(&err).is_some(), "typed: {err}");
+}
+
+/// An unchanged vote costs no write: openraft may save the vote it already
+/// holds, and only a change needs a sync.
+#[tokio::test]
+async fn saving_the_same_vote_again_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = compacting_config(dir.path());
+    let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+    let vote = Vote::new(2, 1);
+    log.save_vote(&vote).await.expect("save");
+    let file = promise_file(dir.path());
+    std::fs::remove_file(&file).expect("remove the copy to see a rewrite");
+    log.save_vote(&vote).await.expect("save the same");
+    assert!(
+        !file.exists(),
+        "an unchanged vote must not be written again"
+    );
+    log.save_vote(&Vote::new(3, 1))
+        .await
+        .expect("save a change");
+    assert!(file.exists(), "a changed vote is written");
+}
+
 /// Append `entries` and wait until the log reports them durable, as openraft
 /// does before it counts on them.
 async fn append_durable(log: &mut LogStore, entries: Vec<Entry>) {
