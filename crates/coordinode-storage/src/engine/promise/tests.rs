@@ -739,6 +739,86 @@ fn a_spent_slot_that_cannot_be_removed_stays_until_a_later_write() {
     assert_eq!(bench.index(), Some(3));
 }
 
+/// An endpoint of 64 KiB whose recovery reserve is a quarter of it, the copy
+/// already written once, so its first slot is charged.
+fn capped_endpoint() -> (tempfile::TempDir, Footprints) {
+    use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_fresh(dir.path(), b"given").expect("first copy");
+    let endpoint = EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(64 * 1024)
+    .with_recovery_reserve_bytes(16 * 1024);
+    let footprints = Footprints::open(&[endpoint]).expect("footprints");
+    (dir, footprints)
+}
+
+/// Client writes that fill an endpoint to what they may take leave the
+/// recovery reserve, and a new slot of the copy lands in it: a store full of
+/// data still restarts and keeps its promise.
+#[test]
+fn a_copy_write_takes_the_room_client_writes_leave() {
+    use crate::engine::footprint::Admit;
+    let (dir, footprints) = capped_endpoint();
+    let footprint = footprints.for_path(dir.path()).expect("capped");
+    let client_room = footprint.client_ceiling() - footprint.committed();
+    let _clients = footprint
+        .admit(client_room, Admit::Client)
+        .expect("client writes fill what they may");
+    assert!(
+        footprint.admit(1, Admit::Client).is_err(),
+        "clients are full"
+    );
+    write_copy(
+        &STD,
+        dir.path(),
+        &mut CopyWriter::default(),
+        &INC,
+        b"next",
+        &footprints,
+    )
+    .expect("the copy lands in the recovery reserve");
+    assert_eq!(read_copy(&STD, dir.path()).expect("read"), held(b"next"));
+}
+
+/// Room already promised (to admitted writes, and to the memtables'
+/// flushes) is not the copy's: a write that would take it is refused before
+/// anything is written, as every recovery record is, and the previous record
+/// stays the copy.
+#[test]
+fn a_copy_write_never_takes_promised_room() {
+    use crate::engine::footprint::Admit;
+    let (dir, footprints) = capped_endpoint();
+    let footprint = footprints.for_path(dir.path()).expect("capped");
+    let all_room = footprint.limit() - footprint.committed();
+    let _promised = footprint
+        .admit(all_room, Admit::Recovery)
+        .expect("the whole limit promised");
+    let refused = write_copy(
+        &STD,
+        dir.path(),
+        &mut CopyWriter::default(),
+        &INC,
+        b"next",
+        &footprints,
+    );
+    assert!(
+        matches!(refused, Err(StorageError::CapacityExhausted { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(read_copy(&STD, dir.path()).expect("read"), held(b"given"));
+    assert_eq!(
+        copy_files(&STD, dir.path()).expect("list").len(),
+        1,
+        "no slot was created"
+    );
+}
+
 /// A write the endpoint has no room for is refused before anything is
 /// written, and the copy stays whole: a full disk never costs a promise
 /// already given.

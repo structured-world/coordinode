@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use lsm_tree::fs::{Fs, FsOpenOptions};
 
-use crate::engine::footprint::Footprints;
+use crate::engine::footprint::{Admit, Footprints};
 use crate::error::{StorageError, StorageResult};
 
 /// The name the second copy's slots share, in the root of the endpoint that
@@ -305,9 +305,7 @@ pub fn write_copy(
     bytes.extend_from_slice(&sum.to_le_bytes());
 
     let path = &slot_path(dir, target);
-    if let Some(charge) = footprints.file(path) {
-        charge.charge_to(bytes.len() as u64)?;
-    }
+    charge_record(footprints, path, bytes.len() as u64)?;
     writer.failed = Some(target);
     let mut file = fs
         .open(
@@ -331,6 +329,24 @@ pub fn write_copy(
     writer.durable = Some((target, *incarnation, payload.to_vec()));
     remove_spent_slots(fs, dir, writer, target, &slots, footprints);
     Ok(())
+}
+
+/// Charge the file at `path` for `len` bytes before it is written. A record
+/// of the store's own is admitted as recovery work against the whole limit
+/// beside what is already promised, so it takes the reserve client writes
+/// leave and never the room of an admitted write or a flush. Only the growth
+/// of the file is new.
+fn charge_record(footprints: &Footprints, path: &Path, len: u64) -> StorageResult<()> {
+    let (Some(footprint), Some(charge)) = (footprints.for_path(path), footprints.file(path)) else {
+        return Ok(());
+    };
+    let want = footprint.allocation(len);
+    let _admitted = if want > charge.bytes() {
+        Some(footprint.admit(want - charge.bytes(), Admit::Recovery)?)
+    } else {
+        None
+    };
+    charge.charge_to(len)
 }
 
 /// Remove the slots beyond the durable record's and one to write next: every
@@ -387,9 +403,7 @@ pub(crate) fn replace_file(
 ) -> StorageResult<()> {
     let path = dir.join(name);
     let staged = dir.join(format!("{name}.tmp"));
-    if let Some(charge) = footprints.file(&staged) {
-        charge.charge_to(bytes.len() as u64)?;
-    }
+    charge_record(footprints, &staged, bytes.len() as u64)?;
     let mut file = fs
         .open(
             &staged,
