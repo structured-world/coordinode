@@ -174,12 +174,11 @@ fn a_compaction_that_did_work_is_counted_for_its_partition() {
     for _ in 0..2 {
         sender
             .send(CompactionRequest {
-                tree: tree.clone(),
+                tree: TreeRef::Partition(tree.clone()),
                 source: CompactionSource::Partition(Partition::Node),
                 strategy: CompactionStrategyKind::Leveled.for_tree(),
                 priority: CompactionPriority::Urgent,
                 gc_watermark: seqno.get(),
-                life: None,
             })
             .expect("queue");
     }
@@ -361,20 +360,29 @@ fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
             let lock = tree.get_flush_lock();
             tree.flush(&lock, 0).expect("flush");
         }
-        TableTree {
+        let listed = TableTree {
             id: name.to_string(),
-            tree,
+            tree: tree.downgrade(),
             pressure: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-            alive: Arc::new(parking_lot::RwLock::new(alive)),
             metrics: Arc::clone(&table_metrics),
-        }
+        };
+        // The registry's own handle; a dropped table's is closed.
+        let held = if alive {
+            Some(tree)
+        } else {
+            let _closing = tree.close();
+            None
+        };
+        (listed, held)
     };
-    // `dropped` was listed before its drop took its life.
-    let tables = vec![
+    // `dropped` was listed before its drop closed it.
+    let (tables, _held): (Vec<TableTree>, Vec<_>) = [
         table("behind", 3, true),
         table("idle", 0, true),
         table("dropped", 3, false),
-    ];
+    ]
+    .into_iter()
+    .unzip();
     let (behind, idle) = (
         Arc::clone(&tables[0].pressure),
         Arc::clone(&tables[1].pressure),
@@ -390,7 +398,7 @@ fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
         let monitored = trees
             .iter()
             .map(|(&p, t)| MonitoredTree {
-                tree: t.clone(),
+                tree: TreeRef::Partition(t.clone()),
                 source: CompactionSource::Partition(p),
                 strategy: CompactionStrategyKind::Leveled.for_tree(),
                 table: None,

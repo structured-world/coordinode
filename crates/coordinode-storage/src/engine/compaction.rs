@@ -31,7 +31,7 @@ use std::sync::{
 use lsm_tree::AbstractTree;
 
 use crate::engine::coordinator::GcWatermarks;
-use crate::engine::flush::{TableLife, TableSource, TableTree, while_alive};
+use crate::engine::flush::{TableSource, TableTree, TreeRef};
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 use coordinode_core::txn::wake::Wake;
@@ -92,13 +92,11 @@ impl CompactionSource {
 
 /// Request to compact a single tree.
 struct CompactionRequest {
-    tree: lsm_tree::AnyTree,
+    tree: TreeRef,
     source: CompactionSource,
     strategy: Arc<dyn lsm_tree::compaction::CompactionStrategy>,
     priority: CompactionPriority,
     gc_watermark: u64,
-    /// A table's life: its compaction runs only while it lives.
-    life: Option<TableLife>,
 }
 
 /// Background priority-based LSM compaction worker pool.
@@ -166,7 +164,7 @@ impl CompactionScheduler {
         let monitored: Vec<MonitoredTree> = trees
             .iter()
             .map(|(&p, t)| MonitoredTree {
-                tree: t.clone(),
+                tree: TreeRef::Partition(t.clone()),
                 source: CompactionSource::Partition(p),
                 strategy: strategy.for_tree(),
                 table: None,
@@ -249,11 +247,13 @@ pub(crate) fn compaction_priority(
 
 /// A tree the monitor watches, with the strategy it compacts under.
 struct MonitoredTree {
-    tree: lsm_tree::AnyTree,
+    /// Weak for a table, which the monitor must not hold open between
+    /// passes, while it sleeps.
+    tree: TreeRef,
     source: CompactionSource,
     strategy: Arc<dyn lsm_tree::compaction::CompactionStrategy>,
-    /// A table's id, where its own verdict is latched and its life; `None`
-    /// for a partition, whose verdict joins the partitions' one.
+    /// A table's id and where its own verdict is latched; `None` for a
+    /// partition, whose verdict joins the partitions' one.
     table: Option<MonitoredTable>,
 }
 
@@ -261,7 +261,6 @@ struct MonitoredTree {
 struct MonitoredTable {
     id: String,
     pressure: Arc<std::sync::atomic::AtomicU8>,
-    life: TableLife,
     metrics: Arc<crate::engine::owned_metrics::TableMetrics>,
 }
 
@@ -293,26 +292,24 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                 id,
                 tree,
                 pressure,
-                alive,
                 metrics,
             } in listed
             {
                 // A table dropped and created again under its id since the
-                // last pass is a new tree with a new life.
+                // last pass is a new tree with a verdict of its own.
                 let known = tables.get(&id).and_then(|m| m.table.as_ref());
-                if known.is_some_and(|t| Arc::ptr_eq(&t.life, &alive)) {
+                if known.is_some_and(|t| Arc::ptr_eq(&t.pressure, &pressure)) {
                     continue;
                 }
                 tables.insert(
                     id.clone(),
                     MonitoredTree {
-                        tree,
+                        tree: TreeRef::Table(tree),
                         source: CompactionSource::Table,
                         strategy: cfg.strategy.for_tree(),
                         table: Some(MonitoredTable {
                             id,
                             pressure,
-                            life: alive,
                             metrics,
                         }),
                     },
@@ -330,15 +327,29 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
         let mut requests: Vec<CompactionRequest> = trees
             .iter()
             .chain(tables.values())
-            .map(|monitored| {
+            .filter_map(|monitored| {
                 let MonitoredTree {
-                    tree,
+                    tree: handle,
                     source,
                     strategy,
                     table,
                 } = monitored;
-                let l0 = tree.l0_run_count();
-                let debt = tree.compaction_debt(strategy.as_ref());
+                // A table being dropped is judged no more. Its series is set
+                // while the tree is held, and its drop removes the series
+                // once the tree has closed, so none outlives the table.
+                let (l0, debt, tier) = handle.with_live(|tree| {
+                    let l0 = tree.l0_run_count();
+                    let debt = tree.compaction_debt(strategy.as_ref());
+                    let tier = match tree.write_backpressure(strategy.as_ref()) {
+                        lsm_tree::Backpressure::None => 0u8,
+                        lsm_tree::Backpressure::Slowdown { .. } => 1,
+                        lsm_tree::Backpressure::Stop => 2,
+                    };
+                    if let Some(MonitoredTable { id, metrics, .. }) = table {
+                        metrics.set(id, tier, debt);
+                    }
+                    (l0, debt, tier)
+                })?;
                 // The tables are node rows kept apart: they keep the
                 // versions the node partition keeps.
                 let partition = match source {
@@ -352,11 +363,6 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                     debt,
                     cfg.debt_urgent_bytes,
                 );
-                let tier = match tree.write_backpressure(strategy.as_ref()) {
-                    lsm_tree::Backpressure::None => 0u8,
-                    lsm_tree::Backpressure::Slowdown { .. } => 1,
-                    lsm_tree::Backpressure::Stop => 2,
-                };
                 if tier == 2 {
                     // An operator seeing WRITE_BACKPRESSURE rejections needs
                     // to know which tree tripped it and on which axis.
@@ -370,17 +376,8 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                     );
                 }
                 match table {
-                    Some(MonitoredTable {
-                        id,
-                        pressure,
-                        life,
-                        metrics,
-                    }) => {
+                    Some(MonitoredTable { pressure, .. }) => {
                         pressure.store(tier, Ordering::Relaxed);
-                        // Only while the table lives: its drop removes the
-                        // series under the same life, so a dropped table, or
-                        // the one it was before a re-create, sets none.
-                        while_alive(Some(life), || metrics.set(id, tier, debt));
                         tables_tier = tables_tier.max(tier);
                         // Bytes on the endpoints' disks: far below u64::MAX.
                         tables_debt += debt;
@@ -390,14 +387,13 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                         record_pressure(source.name(), tier, debt);
                     }
                 }
-                CompactionRequest {
-                    tree: tree.clone(),
+                Some(CompactionRequest {
+                    tree: handle.clone(),
                     source: source.clone(),
                     strategy: Arc::clone(strategy),
                     priority,
                     gc_watermark: cfg.gc_watermarks.for_partition(partition),
-                    life: table.as_ref().map(|t| Arc::clone(&t.life)),
-                }
+                })
             })
             .collect();
         cfg.write_pressure.store(worst_tier, Ordering::Relaxed);
@@ -441,13 +437,11 @@ fn compaction_worker_loop(receiver: flume::Receiver<CompactionRequest>, compacte
         strategy,
         priority,
         gc_watermark,
-        life,
     }) = receiver.recv()
     {
         let started = std::time::Instant::now();
         // A table dropped since the request was queued has nothing to compact.
-        let Some(result) = while_alive(life.as_ref(), || tree.compact(strategy, gc_watermark))
-        else {
+        let Some(result) = tree.with_live(|tree| tree.compact(strategy, gc_watermark)) else {
             continue;
         };
         match result {

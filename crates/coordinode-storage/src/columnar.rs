@@ -23,7 +23,7 @@ use lsm_tree::rate_limiter::RateLimiter;
 use lsm_tree::table::columnar::{ColumnBatch, column_batch_to_entries, entries_to_column_batch};
 use lsm_tree::{AnyTree, Cache, CapacityPool, Config, InternalValue, ValueType, WriteBufferBudget};
 
-use crate::engine::flush::{TableLife, TableTree};
+use crate::engine::flush::TableTree;
 use crate::error::{StorageError, StorageResult};
 
 /// A single row to write into a columnar tree: its key and its opaque value
@@ -157,11 +157,10 @@ enum Retirement {
     Unfinished,
 }
 
-/// An open table: its tree, its write-pressure verdict and its life.
+/// An open table: its tree and its write-pressure verdict.
 struct TableEntry {
     tree: AnyTree,
     pressure: Arc<AtomicU8>,
-    alive: TableLife,
 }
 
 /// A table tree repaired while the registry opened it: its open failed
@@ -336,12 +335,6 @@ impl ColumnarTableRegistry {
             .write_buffer_budget(Arc::clone(&settings.write_buffer))
             .compaction_capacity(Arc::clone(&settings.capacity))
             .column_encoding_policy(settings.column_encoding.clone())
-            // The empty files a table's folder keeps ready for the next
-            // tables are made by the flush or compaction that claims one,
-            // under the table's life, not by a thread of their own: one made
-            // after the life ends would land in a folder its drop is
-            // removing.
-            .table_file_refill_inline(true)
             .open_or_repair(lsm_tree::RepairPolicy::default().salvage(true))?;
         enable_columnar(&tree)?;
         if let AnyTree::Standard(t) = &tree {
@@ -416,20 +409,14 @@ impl ColumnarTableRegistry {
 
     /// Run `work` on the tree of `table_id` while the table lives, as its
     /// scheduled flushes and compactions run: a drop waits for it, and
-    /// `None` when there is no such table or its drop has taken it. Whatever
-    /// writes the table's folder goes through here, so nothing is written
-    /// into a folder a drop is removing.
+    /// `None` when there is no such table or its drop has taken it.
     pub(crate) fn with_live<T>(
         &self,
         table_id: &str,
         work: impl FnOnce(&AnyTree) -> T,
     ) -> Option<T> {
-        let (tree, life) = {
-            let tables = self.lock();
-            let entry = tables.live.get(table_id)?;
-            (entry.tree.clone(), Arc::clone(&entry.alive))
-        };
-        crate::engine::flush::while_alive(Some(&life), || work(&tree))
+        let tree = self.get(table_id)?;
+        Some(work(&tree))
     }
 
     /// Return the open columnar tree for `table_id`, or `None` if no such table
@@ -450,10 +437,12 @@ impl ColumnarTableRegistry {
             .map_or(0, |entry| entry.pressure.load(Ordering::Relaxed))
     }
 
-    /// Drop a table: release the tree handle and delete its directory under
-    /// every endpoint. A flush or compaction of its tree that is running is
-    /// waited for, and one still queued finds the table gone and does
-    /// nothing, so none writes into a directory the drop removed. Until the
+    /// Drop a table: close its tree and delete its directory under every
+    /// endpoint once nothing of the tree is left. Whatever holds the tree (a
+    /// running flush, compaction or statement) is waited for, and a request
+    /// still queued finds the table gone and does nothing, so nothing writes
+    /// into a directory the drop removed. The caller must hold no handle of
+    /// the table's tree itself: the drop would wait for it. Until the
     /// drop is done no table of the name can be opened or created, so its
     /// removal by name never reaches a table created again under it; a drop
     /// that fails leaves the name refused until a drop of it finishes.
@@ -508,14 +497,16 @@ impl ColumnarTableRegistry {
         outcome
     }
 
-    /// End the life of a dropped table `entry`, if it was open, and remove
-    /// its series and directories. The caller holds the name retiring.
+    /// Close the tree of a dropped table `entry`, if it was open, and remove
+    /// its series and directories once it has closed. The caller holds the
+    /// name retiring.
     fn retire(&self, table_id: &str, entry: Option<TableEntry>) -> StorageResult<()> {
         if let Some(entry) = entry {
-            let mut alive = entry.alive.write();
-            *alive = false;
-            // Under the life it ends: a monitor pass of this table that was
-            // about to set its series has done so or never will.
+            // From here no weak handle raises the tree again; once the work
+            // holding it ends, its file pool and deleter are gone too, so
+            // nothing writes the folder any more. A monitor pass that set
+            // the series did so holding the tree, before it closed.
+            entry.tree.close().wait();
             self.settings.metrics.remove(table_id);
         }
         for root in &self.settings.roots {
@@ -549,9 +540,8 @@ impl ColumnarTableRegistry {
             .iter()
             .map(|(id, entry)| TableTree {
                 id: id.clone(),
-                tree: entry.tree.clone(),
+                tree: entry.tree.downgrade(),
                 pressure: Arc::clone(&entry.pressure),
-                alive: Arc::clone(&entry.alive),
                 metrics: Arc::clone(&self.settings.metrics),
             })
             .collect()
@@ -571,7 +561,6 @@ impl TableEntry {
         Self {
             tree,
             pressure: Arc::new(AtomicU8::new(0)),
-            alive: Arc::new(parking_lot::RwLock::new(true)),
         }
     }
 }
