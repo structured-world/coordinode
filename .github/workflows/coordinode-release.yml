@@ -114,7 +114,7 @@ jobs:
         run: |
           python3 -B scripts/release/registry.py verify --checkout "$GITHUB_WORKSPACE"
           python3 -B scripts/release/check_packages.py --checkout "$GITHUB_WORKSPACE" \
-            --source crates-io --consumer-toolchain 1.92.0 --consumer-toolchain 1.99.0
+            --source crates-io --consumer-toolchain stable
       # The SBOM and license inventory of the graph a consumer installs from
       # crates.io, per toolchain, feature set and target, ship with the release.
       - name: Attach dependency and license evidence to the release
@@ -163,7 +163,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
-          toolchain: 1.99.0
+          toolchain: stable
           components: rustfmt,clippy
       - name: Install source and release-configuration tools
         run: |

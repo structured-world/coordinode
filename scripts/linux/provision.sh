@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prepare a Linux machine for scripts/linux/check.sh: the packages the build
-# needs, rustup with the toolchain this repository pins, cargo-nextest and a
+# needs, rustup with the channel rust-toolchain.toml names, cargo-nextest and a
 # compilation cache. Safe to run again: whatever is already there is kept.
 #
 # Usage: COORDINODE_LINUX_HOST=<ssh target> [COORDINODE_SCCACHE_DIR=<dir>] \

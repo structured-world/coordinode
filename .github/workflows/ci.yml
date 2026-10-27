@@ -125,7 +125,7 @@ jobs:
           # The runner's $CARGO_HOME/bin is its own and outlives the job:
           # caching it lets the save step prune what `cargo install` did not
           # put there, rustup included, and the next job builds with the
-          # system cargo instead of the pinned toolchain.
+          # system cargo instead of the toolchain rust-toolchain.toml names.
           cache-bin: "false"
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -296,7 +296,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Add the target to the pinned toolchain
+      - name: Add the target to the toolchain
         run: rustup target add ${{ matrix.target }}
       - name: Install protobuf, and Rosetta for the Intel build
         run: |
@@ -403,17 +403,16 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   crypto-alloc:
-    name: TLS provider allocation-only and MSRV
+    name: TLS provider allocation-only
     runs-on: ubuntu-latest
     env:
       CARGO_TARGET_DIR: target/crypto-provider
-      RUSTUP_TOOLCHAIN: 1.92.0
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7em-none-eabihf
-      - name: Check the provider MSRV
+      - name: Check the provider with std
         run: cargo check --manifest-path tests/fixtures/crypto-provider/Cargo.toml --features std,tls12
       - name: Check allocation-only on a bare-metal target
         env:

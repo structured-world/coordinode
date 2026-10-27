@@ -25,10 +25,11 @@ coordinode-core = "0.9"
 coordinode-storage = "0.9"
 ```
 
-- **Compiler and targets.** The packages declare Rust 1.92 as their minimum.
-  Every release is installed from the registry and run on Linux with Rust
-  1.92.0 and 1.99.0 before it is called ready; the workspace itself builds and
-  tests on Linux, macOS and Windows.
+- **Compiler and targets.** Build with current stable Rust. Every release is
+  installed from the registry and run on Linux with stable Rust before it is
+  called ready; the workspace itself builds and tests on Linux, macOS and
+  Windows with stable Rust. The declared minimum moves up when the code needs
+  a newer compiler; older compilers are not tested.
 - **Features.** The default build is a standalone database (see
   [Build features](#build-features)). `replication` adds membership in a
   replicated group; `io-uring` adds the io_uring storage backend on Linux.
@@ -48,8 +49,8 @@ Other artifacts are separate: the Python package `coordinode-embedded`
 the server binary runs it as a network service. A source build from the
 [public repository](https://github.com/structured-world/coordinode) is a
 different artifact from the registry packages: pin an exact reviewed
-revision, never follow `main`, and qualify it separately. The workspace pins
-Rust 1.99.0; a source build with `replication` also uses the pinned proto
+revision, never follow `main`, and qualify it separately. The workspace builds
+with stable Rust; a source build with `replication` also uses the pinned proto
 submodule and its generation tooling, which the registry packages carry
 already generated.
 

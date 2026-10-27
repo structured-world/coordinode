@@ -100,9 +100,8 @@ jobs:
       # The target's std is installed per toolchain and cargo takes the
       # toolchain from rust-toolchain.toml, so the musl std must go into that
       # toolchain, not one named here. Run from the checkout, both commands
-      # resolve the pinned toolchain from the file, so a pin bump can never
-      # leave the target behind.
-      - name: Install the pinned toolchain + musl target
+      # resolve the toolchain the file names.
+      - name: Install the toolchain + musl target
         run: |
           rustup toolchain install
           rustup target add ${{ matrix.target }}

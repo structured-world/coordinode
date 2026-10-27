@@ -33,7 +33,7 @@ COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 cargo nextest run -P cluster --workspac
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Requires Rust 1.90+ (see `rust-toolchain.toml` for the pinned toolchain) and
+Requires stable Rust (`rust-toolchain.toml` selects the stable channel) and
 [cargo-nextest](https://nexte.st).
 
 **After adding, removing or changing a dependency**, regenerate the

@@ -30,9 +30,8 @@ bindings; they do not require protoc, a submodule or network generation.
 
 `check_packages.py` inspects every archive and installs them into an independent
 disk-backed Rust consumer. Cargo's local registry contains the unpublished
-archives and their registry dependencies; there are no path patches. Both the
-minimum toolchain and the source toolchain exercise the default and replication
-feature configurations. The fixture checks transactions, schema publication,
+archives and their registry dependencies; there are no path patches. Stable Rust
+exercises the default and replication feature configurations. The fixture checks transactions, schema publication,
 uniqueness under concurrent writers, CAS and lease-epoch fencing, rollback,
 reopen, a non-idempotent increment retried after a process exits without closing
 the database and again across a checkpoint and repair, a logical backup restored

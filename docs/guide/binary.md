@@ -30,8 +30,8 @@ coordinode --version
 
 ## Build from Source
 
-Requirements: [rustup](https://rustup.rs/) with the toolchain pinned in
-`rust-toolchain.toml` (currently Rust 1.98.1), and protoc 3.21+.
+Requirements: [rustup](https://rustup.rs/) with stable Rust (the channel
+`rust-toolchain.toml` selects), and protoc 3.21+.
 
 ```bash
 git clone --recurse-submodules https://github.com/structured-world/coordinode.git
