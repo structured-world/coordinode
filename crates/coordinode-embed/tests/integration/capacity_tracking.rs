@@ -329,15 +329,19 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
         .set_hard_limit("ep-hot", MIN_HARD_LIMIT_BYTES + reserve, Some(reserve))
         .expect("lower the hot limit");
 
-    // The refresh sees the endpoint at Emergency or Full and cascades.
+    // The refresh sees the endpoint at Emergency or Full and cascades. The
+    // engine's own scanner runs the same refresh every few seconds, and on a
+    // loaded host its pass can come first: then the cascade has already moved
+    // the data and this refresh finds the endpoint back to Normal.
     engine.refresh_capacity();
     let usage = engine.capacity().get("ep-hot").expect("tracked");
     assert!(
         matches!(
             usage.severity(),
             CapacitySeverity::Emergency | CapacitySeverity::Full
-        ),
-        "a filled endpoint must be at Emergency or Full, got {:?} (used={})",
+        ) || tables_in(&cold_tables) > 0,
+        "a filled endpoint must be at Emergency or Full, or cascaded already; got {:?} \
+         (used={}) and nothing on the cold endpoint",
         usage.severity(),
         usage.used()
     );
