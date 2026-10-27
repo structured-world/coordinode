@@ -182,10 +182,7 @@ never touched. A chunk nothing holds is kept through its grace
 (`blob_gc_grace_secs`, at least the retention window) and for as long as a
 reader, retained history, a lagging change-stream consumer or an upload in
 progress needs it; then it is retired, its bytes deleted, and the blob
-partition compacted. A value file a compaction leaves with nothing live in it
-is freed by the next compaction, not by that one: on a node that writes no
-more blobs, the last batch's files stay on disk, reported as
-`stale_blob_bytes`, until something is deleted again. Uploads never published are
+partition compacted, which frees the files it empties. Uploads never published are
 collected after `blob_gc_upload_expiry_secs`. Collection is checked against
 the blob records periodically (`blob_gc_reconcile_interval_secs`) and before
 it first deletes anything; a record that does not decode makes ownership

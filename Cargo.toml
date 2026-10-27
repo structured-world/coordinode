@@ -45,10 +45,10 @@ publish = false
 # Storage: coordinode-lsm-tree from crates.io, the sole LSM engine.
 # 6.0 and later read and write only the 6.0 on-disk format (7.0 keeps it), so a
 # store written through 5.x is refused at open (the engine format marker names
-# it first). The floor is the oldest release the code actually needs: 7.2,
-# whose `lower_retention_floor` lets a tree rebuilt from a checkpoint serve
-# the history it reinstalled.
-lsm-tree = { package = "coordinode-lsm-tree", version = "7.2.0", default-features = false }
+# it first). The floor is the oldest release the code actually needs: 7.3,
+# whose compaction drops a value file in the same install that empties it, so
+# the blob collector returns deleted space with one compaction.
+lsm-tree = { package = "coordinode-lsm-tree", version = "7.3.0", default-features = false }
 
 # Consensus
 openraft = { version = "0.10.0-alpha.36", features = ["serde"] }

@@ -751,9 +751,7 @@ impl BlobCollector {
         }
         let tree = engine.tree(Partition::Blob)?;
         let before = tree.disk_space();
-        // A value file this compaction empties is dropped by the next install,
-        // not by this one (coordinode-lsm-tree #1000); until then its bytes
-        // show as stale and return with the next compaction.
+        // A value file the compaction empties goes with its own install.
         engine.force_compaction(Partition::Blob)?;
         let after = tree.disk_space();
         pass.compaction = Some(CompactionReport {

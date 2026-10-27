@@ -136,14 +136,6 @@ fn a_deleted_blob_is_collected_and_its_space_returns() {
     let status = db.blob_gc_status().expect("status");
     assert_eq!(status.reclaimed_bytes, data.len() as u64);
     assert_eq!((status.candidates, status.retired_pending), (0, 0));
-    // The emptied value file goes with the next compaction, here the one
-    // for another deleted blob.
-    let other = db
-        .upload_blob(&incompressible(9, DEFAULT_CHUNK_SIZE), None)
-        .expect("upload");
-    db.delete_blob(&other.id).expect("delete");
-    db.run_blob_gc(false).expect("pass");
-    let status = db.blob_gc_status().expect("status");
     assert!(
         status.blob_disk_bytes < full / 2,
         "{} of {full} bytes still on disk",

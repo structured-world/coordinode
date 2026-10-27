@@ -306,9 +306,7 @@ Deleting a blob ends its hold on its chunks. The database collects the chunks
 nothing holds any more on its own thread, woken by the deletion: after a grace
 period (24 hours by default, never less than the retention window), and once
 no reader, retained history or upload in progress needs them, their bytes are
-deleted and the storage compacted; the files of the most recent batch are
-freed by the compaction after that, so a database that deletes nothing more
-keeps them (`stale_blob_bytes` in the status) until it does. A chunk another
+deleted and the storage compacted, which frees their space. A chunk another
 blob shares stays. An upload never published, such as one interrupted by a
 crash, is collected an hour after it began. Nothing has to be called for any
 of this; the same collector also answers on demand:

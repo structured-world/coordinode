@@ -125,9 +125,7 @@ restart. A chunk another blob still holds stays. One nothing holds any more is
 kept for a grace period (24 hours by default, never less than the MVCC
 retention window) and for as long as a reader, retained history or an upload
 in progress still needs it; then its bytes are deleted and the storage
-compacted. The files of the most recent batch are freed by the compaction
-after that one, so a node that deletes nothing more keeps them until it
-does. `DeleteBlobResponse.chunks_deleted`
+compacted, which frees their space. `DeleteBlobResponse.chunks_deleted`
 is therefore `0`: the delete itself frees nothing, and a delete is not space
 released. An upload that was never published, such as one cut off by a crash,
 is collected the same way once it is an hour old. Where collection stands,

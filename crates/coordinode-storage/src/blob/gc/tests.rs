@@ -163,11 +163,10 @@ fn blob_disk_bytes(gc: &BlobCollector) -> u64 {
 }
 
 /// The whole path on a real filesystem: a deleted blob's content is kept
-/// through its grace, then retired, its payload deleted by exact generation
-/// and the Blob partition compacted, with every stage counted. The value
-/// file that compaction empties shows as stale and its space returns with
-/// the next compaction (coordinode-lsm-tree #1000). A pass inside the grace,
-/// manual or not, takes nothing.
+/// through its grace, then retired, its payload deleted by exact generation,
+/// and the Blob partition compacted until the space is actually back, in
+/// that one pass and with nothing written after it, with every stage
+/// counted. A pass inside the grace, manual or not, takes nothing.
 #[test]
 fn a_released_blob_is_kept_through_its_grace_then_its_space_returns() {
     let (gc, _dir) = open();
@@ -213,17 +212,7 @@ fn a_released_blob_is_kept_through_its_grace_then_its_space_returns() {
     assert!(!status.compaction_pending);
     assert_eq!(status.reclaimed_chunks, 8);
     assert_eq!(status.reclaimed_bytes, bytes.len() as u64);
-    assert!(
-        status.stale_blob_bytes >= bytes.len() as u64,
-        "the emptied file's bytes are accounted as garbage: {status:?}"
-    );
-
-    // The next compaction, here for another deleted blob, drops the file.
-    put(&gc, 2, &data(2, 1));
-    delete(&gc, 2);
-    advance(HOUR + Duration::from_secs(1));
-    assert!(gc.run(false).expect("next pass").compaction.is_some());
-    let status = gc.status().expect("status");
+    assert_eq!(status.stale_blob_bytes, 0, "no emptied file is left behind");
     assert!(status.reclaimed_disk_bytes > 0);
     assert!(
         status.blob_disk_bytes < full / 2,

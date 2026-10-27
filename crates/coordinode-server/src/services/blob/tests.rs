@@ -229,16 +229,16 @@ async fn a_download_survives_deletion_and_cleanup_of_its_blob() {
             .code(),
         tonic::Code::NotFound
     );
-    // Once the download has let go, the compaction runs and the deleted
-    // payload is garbage awaiting the next one. Its reader is dropped by the
-    // task that streamed it, a moment after the last chunk.
+    // Once the download has let go, the space comes back. Its reader is
+    // dropped by the task that streamed it, a moment after the last chunk.
     drop(stream);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         database.read().run_blob_gc(false).expect("collect");
         let status = database.read().blob_gc_status().expect("status");
         if !status.compaction_pending {
-            assert!(status.stale_blob_bytes > 0, "{status:?}");
+            assert!(status.reclaimed_disk_bytes > 0, "{status:?}");
+            assert_eq!(status.stale_blob_bytes, 0, "{status:?}");
             break;
         }
         assert!(
