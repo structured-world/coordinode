@@ -63,6 +63,10 @@ rcgen = "0.14"
 name = "index_profiles_replicated"
 harness = false
 
+[[bench]]
+name = "promise_costs"
+harness = false
+
 [build-dependencies]
 tonic-prost-build = "0.14"
 
