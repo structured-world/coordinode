@@ -262,7 +262,13 @@ struct ModelFs {
     stale: StalePaths,
     /// Files changed since their last effective sync.
     unsynced: StalePaths,
+    /// Called before each removal: a point where a test can look at what a
+    /// write holds before it lets go of its spent slots.
+    before_remove: Option<Probe>,
 }
+
+/// What a test runs at a point inside a write.
+type Probe = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// A file opened through a [`ModelFs`].
 struct ModelFile {
@@ -383,6 +389,9 @@ impl Fs for ModelFs {
     }
 
     fn remove_file(&self, path: &Path) -> lsm_tree::io::Result<()> {
+        if let Some(probe) = &self.before_remove {
+            probe();
+        }
         self.inner.remove_file(path)?;
         self.stale.lock().expect("stale paths").remove(path);
         self.unsynced.lock().expect("unsynced paths").remove(path);
@@ -433,6 +442,7 @@ impl Bench {
             failure,
             stale: StalePaths::default(),
             unsynced: StalePaths::default(),
+            before_remove: None,
         };
         fs.create_dir_all(Path::new(Self::DIR))
             .expect("the endpoint");
@@ -737,6 +747,103 @@ fn a_spent_slot_that_cannot_be_removed_stays_until_a_later_write() {
     assert_eq!(files(), 2, "the next write removed the spent slot");
     bench.power_cut();
     assert_eq!(bench.index(), Some(3));
+}
+
+/// The copy's high water: its slot files and the bytes charged for them,
+/// sampled inside each write at the last point before spent slots go, and
+/// after every write. A process that has proved nothing writes a new slot,
+/// so each reopen whose first write fails leaves one more slot, and the
+/// first success removes all but two. The peak is two slots more than the
+/// opens that failed in a row, charged in whole allocation units; a removal
+/// that fails holds the peak until a later write of the same process.
+#[test]
+fn the_copy_peaks_two_slots_above_the_opens_that_failed() {
+    use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
+    for (failed_opens, removal_fails) in [(0, false), (1, false), (3, false), (3, true)] {
+        let case = format!("{failed_opens} failed opens, removal fails {removal_fails}");
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().to_path_buf();
+        let footprints = Footprints::open(&[EndpointConfig::new(
+            "default",
+            &dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(1 << 20)])
+        .expect("footprints");
+        let footprint = std::sync::Arc::clone(footprints.for_path(&dir).expect("capped"));
+        let unit = footprint.allocation(1);
+        let crash = std::sync::Arc::new(CrashFs::new(MemFs::new()));
+        let faults = std::sync::Arc::new(FaultInjector::new());
+        let high = std::sync::Arc::new(std::sync::Mutex::new((0usize, 0u64)));
+        let observe: Probe = {
+            let crash = CrashFs::clone(&crash);
+            let footprint = std::sync::Arc::clone(&footprint);
+            let high = std::sync::Arc::clone(&high);
+            let dir = dir.clone();
+            std::sync::Arc::new(move || {
+                let files = copy_files(&crash, &dir).expect("list the slots").len();
+                let mut high = high.lock().expect("high water");
+                high.0 = high.0.max(files);
+                high.1 = high.1.max(footprint.charged());
+            })
+        };
+        let fs = ModelFs {
+            inner: FaultFs::with_injector(CrashFs::clone(&crash), std::sync::Arc::clone(&faults)),
+            failure: SyncFailure::Dirty,
+            stale: StalePaths::default(),
+            unsynced: StalePaths::default(),
+            before_remove: Some(std::sync::Arc::clone(&observe)),
+        };
+        fs.create_dir_all(&dir).expect("the endpoint");
+        let write = |writer: &mut CopyWriter, payload: &[u8]| {
+            let written = write_copy(&fs, &dir, writer, &INC, payload, &footprints);
+            observe();
+            written
+        };
+        write(&mut CopyWriter::default(), b"p0").expect("the first copy");
+        for _ in 0..failed_opens {
+            faults.arm(
+                FaultRule::new(
+                    FaultOp::SyncAll,
+                    Fault::Error(lsm_tree::io::ErrorKind::Other),
+                )
+                .once(),
+            );
+            let failed = write(&mut CopyWriter::default(), b"failed");
+            faults.clear();
+            assert!(failed.is_err(), "{case}: the open's write failed");
+        }
+        let mut writer = CopyWriter::default();
+        if removal_fails {
+            faults.arm(FaultRule::new(
+                FaultOp::RemoveFile,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            ));
+        }
+        write(&mut writer, b"p1").expect("the first success");
+        faults.clear();
+        let peak = failed_opens + 2;
+        assert_eq!(
+            *high.lock().expect("high water"),
+            (peak, peak as u64 * unit),
+            "{case}: the high water"
+        );
+        let held = copy_files(&fs, &dir).expect("list").len();
+        assert_eq!(
+            held,
+            if removal_fails { peak } else { 2 },
+            "{case}: slots after the first success"
+        );
+        write(&mut writer, b"p2").expect("a later write");
+        assert_eq!(
+            copy_files(&fs, &dir).expect("list").len(),
+            2,
+            "{case}: settled"
+        );
+        assert_eq!(footprint.charged(), 2 * unit, "{case}: settled charge");
+    }
 }
 
 /// An endpoint of 64 KiB whose recovery reserve is a quarter of it, the copy

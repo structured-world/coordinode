@@ -7,7 +7,8 @@
 //! - `restart`: a single-member group from open to leadership, and its
 //!   shutdown, separately;
 //! - `failover`: a three-member group, from the leader's stop to a new
-//!   leader, and the stopped member's reopen until it has caught up.
+//!   leader as its metrics show it and as a read of its lease confirms it,
+//!   and the stopped member's reopen until it has caught up.
 //!
 //! Latencies are distributions; a P99 is printed only from 100 samples or
 //! more, below that the median, the maximum and the samples themselves.
@@ -18,8 +19,10 @@
 //! at N and 2N, the difference over N being the syncs per operation without
 //! the section's setup.
 //!
-//! The copy's slot files are counted and sized at each restart and reopen:
-//! the peak over the run and what is left once it settles.
+//! The copy's slot files are counted, with their logical length, between
+//! writes at each restart and reopen. Their high water inside a write and
+//! the bytes allocated to them are not observable from here; the copy's
+//! tests measure them.
 //!
 //! Run: cargo bench -p coordinode-raft --bench promise_costs
 
@@ -32,7 +35,7 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::{Enrollment, RaftNode, RaftNodeError};
+use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_raft::storage::{LogStore, Vote};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
@@ -98,44 +101,44 @@ impl Store {
         (syncs.len() - directories, directories)
     }
 
-    /// The slot files of the second copy of the consensus records, and the
-    /// bytes they hold.
+    /// The slot files of the second copy of the consensus records and their
+    /// logical length, as they stand between writes. Not the peak: a write
+    /// holds one more slot until it removes the spent ones, and the
+    /// allocated bytes are the footprint's to count.
     fn copy_slots(&self) -> (usize, u64) {
-        std::fs::read_dir(self.dir.path())
-            .expect("list the store")
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("consensus-vote")
-            })
-            .fold((0, 0), |(files, bytes), entry| {
-                (
-                    files + 1,
-                    bytes + entry.metadata().map_or(0, |meta| meta.len()),
-                )
-            })
+        let mut slots = (0, 0);
+        for entry in std::fs::read_dir(self.dir.path()).expect("list the store") {
+            let entry = entry.expect("a store entry");
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("consensus-vote")
+            {
+                slots.0 += 1;
+                slots.1 += entry.metadata().expect("a slot's metadata").len();
+            }
+        }
+        slots
     }
 }
 
-/// The peak and the settled count of the copy's slots and bytes.
+/// The copy's slots as observed between writes: the most seen, and the last.
 #[derive(Default)]
 struct Slots {
-    peak: (usize, u64),
-    settled: (usize, u64),
+    most: (usize, u64),
+    last: (usize, u64),
 }
 
 impl Slots {
     fn observe(&mut self, now: (usize, u64)) {
-        self.peak = (self.peak.0.max(now.0), self.peak.1.max(now.1));
-        self.settled = now;
+        self.most = (self.most.0.max(now.0), self.most.1.max(now.1));
+        self.last = now;
     }
 
     fn report(&self, label: &str) {
         println!(
-            "{label:<30} copy slots peak={} ({} bytes)  settled={} ({} bytes)",
-            self.peak.0, self.peak.1, self.settled.0, self.settled.1
+            "{label:<30} copy slots between writes: most={} ({} logical bytes)  last={} ({} logical bytes)",
+            self.most.0, self.most.1, self.last.0, self.last.1
         );
     }
 }
@@ -328,34 +331,30 @@ impl Member {
     }
 }
 
-/// Open member `id` of a formed group on `engine`. Retried only while its
-/// port is still bound by its previous life; every other failure, a refusal
+/// Open member `id` of a formed group on `engine`, once: its previous life
+/// has released the store, and with it its listener; any failure, a refusal
 /// to prove its promise included, ends the run with its cause.
-async fn reopen(
-    id: u64,
-    port: u16,
-    engine: &Arc<StorageEngine>,
-    pki: &TestPki,
-    retries: &mut usize,
-) -> RaftNode {
-    loop {
-        let opened = RaftNode::open_cluster(
-            id,
-            Arc::clone(engine),
-            format!("127.0.0.1:{port}").parse().expect("addr"),
-            format!("http://127.0.0.1:{port}"),
-            pki.connections(id),
-        )
-        .await;
-        if let Err(RaftNodeError::Init(why)) = &opened {
-            if why.starts_with("bind ") && *retries < 40 {
-                *retries += 1;
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                continue;
-            }
-        }
-        return opened.expect("the stopped member reopens");
-    }
+async fn reopen(id: u64, port: u16, engine: &Arc<StorageEngine>, pki: &TestPki) -> RaftNode {
+    RaftNode::open_cluster(
+        id,
+        Arc::clone(engine),
+        format!("127.0.0.1:{port}").parse().expect("addr"),
+        format!("http://127.0.0.1:{port}"),
+        pki.connections(id),
+    )
+    .await
+    .expect("the stopped member reopens")
+}
+
+/// The member the metrics of the running members name leader of a term
+/// they are in, as the leader itself reports it, and the term.
+fn leader_in_metrics(members: &[Member]) -> Option<(usize, u64)> {
+    members.iter().enumerate().find_map(|(at, member)| {
+        let node = member.node.as_ref()?;
+        let metrics = node.raft().metrics().borrow_watched().clone();
+        (metrics.state.is_leader() && metrics.current_leader == Some(member.id))
+            .then_some((at, metrics.current_term))
+    })
 }
 
 async fn failovers() {
@@ -414,21 +413,20 @@ async fn failovers() {
         .await
         .expect("membership");
 
-    let mut elections = Vec::new();
-    let mut reopens = Vec::new();
-    let mut catch_ups = Vec::new();
+    let mut in_metrics = Vec::new();
+    let mut confirmed = Vec::new();
+    let mut terms = Vec::new();
+    let mut opens = Vec::new();
+    let mut caught_up = Vec::new();
     let (mut election_syncs, mut reopen_syncs) = ((0, 0), (0, 0));
     let mut slots = Slots::default();
-    let mut bind_retries = 0;
     for _ in 0..FAILOVERS {
-        let mut leader = None;
-        for (at, member) in members.iter().enumerate() {
-            if member.node().is_leader().await {
-                leader = Some(at);
-            }
-        }
-        let leader = leader.expect("a leader");
-        // Counted from here: the stop, the election, the reopen.
+        let (leader, _) = leader_in_metrics(&members).expect("a leader");
+        assert!(
+            members[leader].node().is_leader().await,
+            "a confirmed leader"
+        );
+        // Counted from here: the stop and the election.
         for member in &members {
             member.store.take_syncs();
         }
@@ -436,20 +434,22 @@ async fn failovers() {
         let t = Instant::now();
         stopped.shutdown().await.expect("stop the leader");
         drop(stopped);
-        let mut elected = None;
-        while elected.is_none() {
-            for (at, member) in members.iter().enumerate() {
-                if let Some(node) = &member.node {
-                    if node.is_leader().await {
-                        elected = Some(at);
-                    }
-                }
+        // The new leader as its own metrics show it, polled without a
+        // probe of the group, then confirmed once by a read of its lease.
+        let (elected, term) = loop {
+            if let Some(found) = leader_in_metrics(&members) {
+                break found;
             }
             assert!(t.elapsed() < Duration::from_secs(30), "no new leader");
             tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let elected = elected.expect("elected");
-        elections.push(t.elapsed());
+        };
+        in_metrics.push(t.elapsed());
+        terms.push(term);
+        assert!(
+            members[elected].node().is_leader().await,
+            "the leader its metrics name confirms its lease"
+        );
+        confirmed.push(t.elapsed());
         for member in &members {
             let (files, dirs) = member.store.take_syncs();
             election_syncs = (election_syncs.0 + files, election_syncs.1 + dirs);
@@ -457,22 +457,17 @@ async fn failovers() {
 
         let engine = members[leader].engine.take().expect("an engine");
         released(engine).await;
+        // Counted from here: the reopen until caught up, nothing of the stop.
+        members[leader].store.take_syncs();
         let t = Instant::now();
         let engine = members[leader].store.open();
-        let node = reopen(
-            members[leader].id,
-            members[leader].port,
-            &engine,
-            &pki,
-            &mut bind_retries,
-        )
-        .await;
-        reopens.push(t.elapsed());
+        let node = reopen(members[leader].id, members[leader].port, &engine, &pki).await;
+        opens.push(t.elapsed());
         members[leader].engine = Some(engine);
         members[leader].node = Some(node);
-        // Caught up: it has applied what the new leader had when it opened.
+        // Caught up: it has applied what the new leader had applied when the
+        // member reopened.
         let target = members[elected].applied();
-        let t = Instant::now();
         while members[leader].applied() < target {
             assert!(
                 t.elapsed() < Duration::from_secs(30),
@@ -480,23 +475,23 @@ async fn failovers() {
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        catch_ups.push(t.elapsed());
+        caught_up.push(t.elapsed());
         let (files, dirs) = members[leader].store.take_syncs();
         reopen_syncs = (reopen_syncs.0 + files, reopen_syncs.1 + dirs);
         slots.observe(members[leader].store.copy_slots());
     }
+    report("failover: stop to leader in metrics", in_metrics, None);
     report(
-        "failover: stop to new leader",
-        elections,
+        "failover: stop to confirmed leader",
+        confirmed,
         Some(election_syncs),
     );
-    report("failover: reopen", reopens, None);
-    report("failover: reopen to caught up", catch_ups, None);
-    println!(
-        "{:<30} fs file syncs/op={:>7.2}  fs dir syncs/op={:>6.2}  bind retries={bind_retries}",
-        "failover: reopen + catch-up",
-        reopen_syncs.0 as f64 / FAILOVERS as f64,
-        reopen_syncs.1 as f64 / FAILOVERS as f64,
+    println!("{:<30} terms: {terms:?}", "");
+    report("failover: reopen, open only", opens, None);
+    report(
+        "failover: reopen to caught up",
+        caught_up,
+        Some(reopen_syncs),
     );
     slots.report("failover");
     for member in &mut members {
