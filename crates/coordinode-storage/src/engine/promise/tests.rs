@@ -753,14 +753,30 @@ fn a_spent_slot_that_cannot_be_removed_stays_until_a_later_write() {
 /// sampled inside each write at the last point before spent slots go, and
 /// after every write. A process that has proved nothing writes a new slot,
 /// so each reopen whose first write fails leaves one more slot, and the
-/// first success removes all but two. The peak is two slots more than the
-/// opens that failed in a row, charged in whole allocation units; a removal
-/// that fails holds the peak until a later write of the same process.
+/// first success writes one more still before it removes all but two. The
+/// peak is the slots the store held, plus the opens that failed in a row,
+/// plus one: three on a plain restart of a store in its steady two. The
+/// charge is the footprint's account in whole allocation units, not what a
+/// native file system reports. A removal that fails holds the peak until a
+/// later write of the same process.
 #[test]
-fn the_copy_peaks_two_slots_above_the_opens_that_failed() {
+fn the_copy_peaks_one_slot_above_what_it_held_and_the_opens_that_failed() {
     use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
-    for (failed_opens, removal_fails) in [(0, false), (1, false), (3, false), (3, true)] {
-        let case = format!("{failed_opens} failed opens, removal fails {removal_fails}");
+    for (initial_slots, failed_opens, removal_fails) in [
+        (1, 0, false),
+        (1, 1, false),
+        (1, 3, false),
+        (1, 3, true),
+        (2, 0, false),
+        (2, 0, true),
+        (2, 1, false),
+        (2, 3, false),
+        (2, 3, true),
+    ] {
+        let case = format!(
+            "{initial_slots} slots held, {failed_opens} failed opens, removal fails \
+             {removal_fails}"
+        );
         let root = tempfile::tempdir().expect("tempdir");
         let dir = root.path().to_path_buf();
         let footprints = Footprints::open(&[EndpointConfig::new(
@@ -802,7 +818,16 @@ fn the_copy_peaks_two_slots_above_the_opens_that_failed() {
             observe();
             written
         };
-        write(&mut CopyWriter::default(), b"p0").expect("the first copy");
+        // One process writes the slots the store holds.
+        let mut first = CopyWriter::default();
+        for _ in 0..initial_slots {
+            write(&mut first, b"p0").expect("an earlier copy");
+        }
+        assert_eq!(
+            copy_files(&fs, &dir).expect("list").len(),
+            initial_slots,
+            "{case}: the slots held"
+        );
         for _ in 0..failed_opens {
             faults.arm(
                 FaultRule::new(
@@ -824,7 +849,7 @@ fn the_copy_peaks_two_slots_above_the_opens_that_failed() {
         }
         write(&mut writer, b"p1").expect("the first success");
         faults.clear();
-        let peak = failed_opens + 2;
+        let peak = initial_slots + failed_opens + 1;
         assert_eq!(
             *high.lock().expect("high water"),
             (peak, peak as u64 * unit),
@@ -833,7 +858,7 @@ fn the_copy_peaks_two_slots_above_the_opens_that_failed() {
         let held = copy_files(&fs, &dir).expect("list").len();
         assert_eq!(
             held,
-            if removal_fails { peak } else { 2 },
+            if removal_fails { peak } else { peak.min(2) },
             "{case}: slots after the first success"
         );
         write(&mut writer, b"p2").expect("a later write");
