@@ -11811,7 +11811,11 @@ fn read_consistency_snapshot_unblocks_on_watermark_advance() {
     let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(500);
     ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
-    ctx.read_timeout = std::time::Duration::from_millis(500);
+    // Far longer than the advance takes: a read woken by the advance returns
+    // long before it, one that only gives up at the timeout does not. The
+    // margin is wide so a slow or loaded host cannot read as either.
+    let timeout = std::time::Duration::from_secs(10);
+    ctx.read_timeout = timeout;
 
     let before = std::time::Instant::now();
     start_tx.send(()).expect("the advancer waits");
@@ -11825,8 +11829,8 @@ fn read_consistency_snapshot_unblocks_on_watermark_advance() {
         "must actually wait for advance (~30ms), elapsed={elapsed:?}"
     );
     assert!(
-        elapsed < std::time::Duration::from_millis(200),
-        "must unblock promptly after advance, elapsed={elapsed:?}"
+        elapsed < timeout / 2,
+        "must be woken by the advance, not by the timeout, elapsed={elapsed:?}"
     );
 }
 
