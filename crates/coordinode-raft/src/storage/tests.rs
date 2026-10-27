@@ -1639,9 +1639,95 @@ async fn a_lossy_salvage_of_the_raft_tree_keeps_the_vote() {
     assert_eq!(log.read_vote().await.expect("read"), Some(vote));
 }
 
+/// Lose the Raft tree of the store at `dir` and its member-local journal:
+/// every record the journal no longer holds is gone with the tree, as after
+/// a fold and a purge.
+fn lose_the_tree_and_its_journal(dir: &std::path::Path) {
+    std::fs::remove_dir_all(dir.join(Partition::Raft.name())).expect("lose the tree");
+    std::fs::remove_dir_all(dir.join("local-journal")).expect("lose the local journal");
+}
+
+/// The purge point goes back to the tree with the vote: a member that lost
+/// its Raft tree does not read entries its log no longer holds as if
+/// nothing were purged.
+#[tokio::test]
+async fn the_purge_point_survives_the_loss_of_the_raft_tree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = compacting_config(dir.path());
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let mut store = LogStore::open(Arc::clone(&engine)).expect("open log");
+        store.save_vote(&Vote::new(1, 1)).await.expect("vote");
+        store
+            .append(
+                vec![
+                    make_entry(1, 1, "a"),
+                    make_entry(2, 1, "b"),
+                    make_entry(3, 1, "c"),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .expect("append");
+        engine.reset_raft_coverage(3, &[]).expect("coverage");
+        store.purge(log_id(1, 2)).await.expect("purge");
+    }
+    lose_the_tree_and_its_journal(dir.path());
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let mut store = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    let state = store.get_log_state().await.expect("state");
+    assert_eq!(
+        state.last_purged_log_id,
+        Some(log_id(1, 2)),
+        "the purge point came back from the second copy"
+    );
+    assert_eq!(
+        store.read_vote().await.expect("vote"),
+        Some(Vote::new(1, 1))
+    );
+}
+
+/// A recorded loss of committed entries goes back to the tree with the
+/// vote: a member that lost its Raft tree while catching up stays out of
+/// elections until it holds the lost entries again.
+#[tokio::test]
+async fn a_recorded_loss_survives_the_loss_of_the_raft_tree() {
+    let (dir, config) = log_with_a_hole_at_3(5).await;
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen engine"));
+        let (_, through) =
+            LogStore::open_with(Arc::clone(&engine), LostCommitted::CatchUp).expect("open");
+        assert_eq!(through, Some(log_id(1, 5)));
+    }
+    lose_the_tree_and_its_journal(dir.path());
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen engine"));
+    let err = LogStore::open(Arc::clone(&engine))
+        .err()
+        .expect("alone, the recorded loss still refuses the member");
+    assert!(err.to_string().contains("index 5"), "{err}");
+    let (_, through) =
+        LogStore::open_with(Arc::clone(&engine), LostCommitted::CatchUp).expect("open");
+    assert_eq!(
+        through,
+        Some(log_id(1, 5)),
+        "the loss came back from the copy"
+    );
+}
+
 /// The second copy's file in the store at `dir`.
 fn promise_file(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join(coordinode_storage::engine::promise::PROMISE_FILE)
+}
+
+/// The second copy's payload for a member that holds `vote` and has neither
+/// purged its log nor lost committed entries.
+fn promises_of(vote: Option<Vote>) -> Vec<u8> {
+    rmp_serde::to_vec(&Promises {
+        vote,
+        purged: None,
+        catch_up: None,
+    })
+    .expect("encode")
 }
 
 /// The store incarnation `engine`'s consensus log marker names.
@@ -1669,7 +1755,7 @@ async fn a_new_member_records_its_promise_before_it_starts() {
         engine.read_promise_copy().expect("copy"),
         PromiseCopy::Held {
             incarnation,
-            payload: rmp_serde::to_vec(&None::<Vote>).expect("encode"),
+            payload: promises_of(None),
         }
     );
     drop(log);
@@ -1757,7 +1843,7 @@ async fn the_greater_of_two_copies_is_the_promise() {
             engine.read_promise_copy().expect("copy"),
             PromiseCopy::Held {
                 incarnation,
-                payload: rmp_serde::to_vec(&Some(newer)).expect("encode"),
+                payload: promises_of(Some(newer)),
             },
             "the lagging copy caught up"
         );
@@ -1768,10 +1854,7 @@ async fn the_greater_of_two_copies_is_the_promise() {
     {
         let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
         engine
-            .write_promise_copy(
-                &incarnation,
-                &rmp_serde::to_vec(&Some(ahead)).expect("encode"),
-            )
+            .write_promise_copy(&incarnation, &promises_of(Some(ahead)))
             .expect("copy only");
     }
     let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
@@ -1793,10 +1876,7 @@ async fn another_stores_copy_is_never_taken_for_the_promise() {
         let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
         log.save_vote(&mine).await.expect("save");
         engine
-            .write_promise_copy(
-                &[0xee; 16],
-                &rmp_serde::to_vec(&Some(Vote::new(50, 9))).expect("encode"),
-            )
+            .write_promise_copy(&[0xee; 16], &promises_of(Some(Vote::new(50, 9))))
             .expect("foreign copy");
     }
     {
@@ -1804,10 +1884,7 @@ async fn another_stores_copy_is_never_taken_for_the_promise() {
         let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
         assert_eq!(log.read_vote().await.expect("read"), Some(mine));
         engine
-            .write_promise_copy(
-                &[0xee; 16],
-                &rmp_serde::to_vec(&Some(Vote::new(50, 9))).expect("encode"),
-            )
+            .write_promise_copy(&[0xee; 16], &promises_of(Some(Vote::new(50, 9))))
             .expect("foreign copy again");
     }
     std::fs::remove_dir_all(dir.path().join(Partition::Raft.name())).expect("lose the tree");

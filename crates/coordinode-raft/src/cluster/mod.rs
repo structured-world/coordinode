@@ -3048,6 +3048,105 @@ impl RaftNode {
         node_id: u64,
         progress_tx: tokio::sync::broadcast::Sender<JoinProgressEvent>,
     ) -> Result<(), RaftNodeError> {
+        self.await_caught_up(node_id, &progress_tx).await?;
+        self.promote_caught_up(node_id, &progress_tx).await
+    }
+
+    /// Replace member `old` with a new member `new` under `identity` at
+    /// `addr` (leader-only): the way back for a member that can no longer
+    /// take part, such as one whose vote no copy proves
+    /// ([`RaftNodeError::PromiseUnqualified`]). The new member is a node
+    /// with its own, separate store; the old one's store is left as it was.
+    ///
+    /// Each step looks at the membership first, so a call that failed or was
+    /// cut short is resumed by calling again with the same arguments, and a
+    /// repeated call adds no second member:
+    ///
+    /// 1. `new` joins as a learner, unless it already has;
+    /// 2. once it has caught up, one membership change puts `new` among the
+    ///    voters and `old` out of the group, its identity retired, so its
+    ///    messages are no longer admitted;
+    /// 3. a call after both is done changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// `new` equals `old` (a lost member is never let back under the identity
+    /// it may have broken a promise under); the errors of [`Self::add_node`];
+    /// [`RaftNodeError::Membership`] when this node does not lead, `new` does
+    /// not catch up within [`Self::join_timeout`], or the change is refused.
+    pub async fn replace_member(
+        &self,
+        old: u64,
+        new: u64,
+        addr: String,
+        identity: coordinode_wire::peer::PeerIdentity,
+        progress_tx: tokio::sync::broadcast::Sender<JoinProgressEvent>,
+    ) -> Result<(), RaftNodeError> {
+        use openraft::rt::watch::WatchReceiver;
+
+        if old == new {
+            return Err(RaftNodeError::Membership(format!(
+                "member {old} is replaced under a new node id, never its own"
+            )));
+        }
+        self.membership_settled().await?;
+        let membership = |raft: &RaftInstance| {
+            let rx = raft.metrics();
+            let metrics = rx.borrow_watched();
+            let config = metrics.membership_config.membership();
+            let nodes: std::collections::BTreeSet<u64> =
+                config.nodes().map(|(id, _)| *id).collect();
+            let voters: std::collections::BTreeSet<u64> = config.voter_ids().collect();
+            (nodes, voters)
+        };
+        let (nodes, voters) = membership(&self.raft);
+        if voters.contains(&new) && !nodes.contains(&old) {
+            return Ok(());
+        }
+        if !nodes.contains(&new) {
+            self.add_node(new, addr, identity).await?;
+        }
+        if !voters.contains(&new) {
+            self.await_caught_up(new, &progress_tx).await?;
+        }
+        let (_, voters) = membership(&self.raft);
+        let target: Vec<u64> = voters
+            .into_iter()
+            .filter(|&id| id != old)
+            .chain(std::iter::once(new))
+            .collect();
+        self.change_membership(target).await?;
+        let (nodes, _) = membership(&self.raft);
+        if nodes.contains(&old) {
+            self.remove_node(old).await?;
+        }
+        let report = JoinProgressEvent {
+            node_id: new,
+            phase: JoinPhase::Complete,
+            lag_entries: 0,
+            percent: 100,
+            message: format!("member {new} replaced member {old}"),
+        };
+        if progress_tx.send(report).is_err() {
+            tracing::trace!(old, new, "no one follows the replacement's progress");
+        }
+        tracing::info!(old, new, "replaced a member");
+        Ok(())
+    }
+
+    /// Wait until learner `node_id` has answered and lags at most
+    /// [`Self::join_readiness_lag`] entries, reporting progress on
+    /// `progress_tx`.
+    ///
+    /// # Errors
+    ///
+    /// [`RaftNodeError::Membership`] once [`Self::join_timeout`] passes, or
+    /// when the consensus engine stops.
+    async fn await_caught_up(
+        &self,
+        node_id: u64,
+        progress_tx: &tokio::sync::broadcast::Sender<JoinProgressEvent>,
+    ) -> Result<(), RaftNodeError> {
         // Shortest gap between two looks at the replication metrics, so a
         // fast catch-up reports progress at a readable rate.
         const REPORT_GAP: std::time::Duration = std::time::Duration::from_secs(1);
@@ -3136,7 +3235,16 @@ impl RaftNode {
                 message: format!("Catching up: {lag} entries behind leader"),
             });
         }
+        Ok(())
+    }
 
+    /// Add the caught-up learner `node_id` to the voters, removing it from
+    /// the membership again when the change fails.
+    async fn promote_caught_up(
+        &self,
+        node_id: u64,
+        progress_tx: &tokio::sync::broadcast::Sender<JoinProgressEvent>,
+    ) -> Result<(), RaftNodeError> {
         // Step 2: promote to Voter.
         let _ = progress_tx.send(JoinProgressEvent {
             node_id,

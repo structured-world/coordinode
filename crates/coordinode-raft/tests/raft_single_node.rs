@@ -585,6 +585,81 @@ async fn e2e_propose_after_shutdown_returns_error() {
     );
 }
 
+/// A sole voter that lost its Raft tree still holds its vote in the second
+/// copy, opens as usual, leads its group again and serves what it held.
+/// With every copy of its vote gone it does not open, with a typed refusal,
+/// rather than starting a group again under its old identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sole_voter_recovers_from_one_copy_and_refuses_with_none() {
+    init_test_tracing();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        &path,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let write = |node: &RaftNode, i: u64| {
+        node.pipeline()
+            .propose_and_wait(&RaftProposal {
+                id: ProposalIdGenerator::with_base(i << 40).next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: format!("node:1:{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(100 + i),
+                start_ts: Timestamp::from_raw(99 + i),
+                bypass_rate_limiter: false,
+            })
+            .expect("propose");
+    };
+    let lose_tree = || {
+        std::fs::remove_dir_all(path.join(Partition::Raft.name())).expect("lose the tree");
+        std::fs::remove_dir_all(path.join("local-journal")).expect("lose the journal");
+    };
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let node = RaftNode::single_node(engine).await.expect("bootstrap");
+        write(&node, 1);
+        node.shutdown().await.expect("shutdown");
+    }
+    lose_tree();
+    {
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        let read = Arc::clone(&engine);
+        let node = RaftNode::open(1, engine).await.expect("one copy is enough");
+        write(&node, 2);
+        for i in [1u64, 2] {
+            assert_eq!(
+                read.get(Partition::Node, format!("node:1:{i}").as_bytes())
+                    .expect("read")
+                    .as_deref(),
+                Some(b"v".as_slice()),
+                "write {i}"
+            );
+        }
+        node.shutdown().await.expect("shutdown");
+    }
+    lose_tree();
+    std::fs::remove_file(path.join(coordinode_storage::engine::promise::PROMISE_FILE))
+        .expect("lose the second copy");
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+    let refused = RaftNode::open(1, engine).await;
+    assert!(
+        matches!(
+            refused,
+            Err(coordinode_raft::cluster::RaftNodeError::PromiseUnqualified(
+                _
+            ))
+        ),
+        "a sole voter without its vote must not start: {:?}",
+        refused.err()
+    );
+}
+
 /// CRASH RECOVERY: write data → shutdown → reopen from same storage → verify data survives.
 /// This is THE most important test for a consensus engine. If data doesn't survive
 /// restart, the entire Raft implementation is broken.

@@ -273,6 +273,9 @@ pub struct StorageEngine {
     /// Partition captures taken for copies to other nodes, naming each
     /// one's directory.
     partition_captures: AtomicU64,
+    /// Serializes refreshes of the second copy of the consensus records, so
+    /// a refresh that read older records never lands after a newer one.
+    promise_copy: parking_lot::Mutex<()>,
     /// Which local installation holds each index generation in the index
     /// tree; every read and write of a generation key goes through it.
     pub(crate) installations: crate::engine::installation::Installations,
@@ -1512,6 +1515,7 @@ impl StorageEngine {
             raft_fence: parking_lot::RwLock::new(None),
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
+            promise_copy: parking_lot::Mutex::new(()),
             installations,
             index_copy_qualifier: parking_lot::RwLock::new(None),
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
@@ -3689,12 +3693,43 @@ impl StorageEngine {
         incarnation: &crate::engine::promise::Incarnation,
         payload: &[u8],
     ) -> StorageResult<()> {
+        let _serialized = self.promise_copy.lock();
         crate::engine::promise::write_copy(
             &self.select_oplog_endpoint(0)?.path,
             incarnation,
             payload,
             &self.footprints,
         )
+    }
+
+    /// Bring the second copy of the consensus records up to date with
+    /// `current`, which reads them from where they are kept live: `current`
+    /// runs under the same lock as every other refresh, so the copy never
+    /// goes back to records older than what an earlier refresh wrote. A copy
+    /// that already holds them is not written again.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `current`, or of reading or writing the copy.
+    pub fn refresh_promise_copy(
+        &self,
+        incarnation: &crate::engine::promise::Incarnation,
+        current: impl FnOnce() -> StorageResult<Vec<u8>>,
+    ) -> StorageResult<()> {
+        use crate::engine::promise::PromiseCopy;
+        let _serialized = self.promise_copy.lock();
+        let payload = current()?;
+        let dir = &self.select_oplog_endpoint(0)?.path;
+        if let PromiseCopy::Held {
+            incarnation: held,
+            payload: copy,
+        } = crate::engine::promise::read_copy(dir)?
+        {
+            if held == *incarnation && copy == payload {
+                return Ok(());
+            }
+        }
+        crate::engine::promise::write_copy(dir, incarnation, &payload, &self.footprints)
     }
 
     /// Fold the journal's applied prefix into every tree, including the ones

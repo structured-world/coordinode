@@ -3301,6 +3301,350 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
     );
 }
 
+/// A member that cannot prove its vote is replaced through the group's
+/// membership: a new member under a new identity, in its own directory,
+/// joins, catches up and takes the old one's vote in one change, and the old
+/// identity is retired. A replacement cut short after its first step resumes
+/// from where it stands, a repeated call changes nothing, and the old
+/// member's directory is left exactly as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_without_its_promise_is_replaced_under_a_new_identity() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(180), async {
+        let (p1, p2, p3, p4) = (alloc_port(), alloc_port(), alloc_port(), alloc_port());
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+            tempfile::tempdir().expect("d4"),
+        ];
+        let e1 = open_engine_at(dirs[0].path());
+        let e2 = open_engine_at(dirs[1].path());
+        let e3 = open_engine_at(dirs[2].path());
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+            conn(1),
+        )
+        .await
+        .expect("n1");
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n2");
+        let n3 = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n3");
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
+            .await
+            .expect("add 2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
+            .await
+            .expect("add 3");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+        let key = b"node:1:before-the-loss".to_vec();
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        let pipeline = n1.pipeline();
+        pipeline
+            .propose_and_wait(&RaftProposal {
+                id: id_gen.next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: key.clone(),
+                    value: b"v".to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(100),
+                start_ts: Timestamp::from_raw(99),
+                bypass_rate_limiter: false,
+            })
+            .expect("propose");
+        drop(pipeline);
+        assert!(await_replicated(&e3, &key, b"v").await, "n3 has the write");
+
+        // Member 3 stops and loses every copy of its vote.
+        n3.shutdown().await.expect("stop 3");
+        drop(n3);
+        for _ in 0..100 {
+            if Arc::strong_count(&e3) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(e3);
+        std::fs::remove_dir_all(dirs[2].path().join(Partition::Raft.name()))
+            .expect("lose the tree");
+        std::fs::remove_dir_all(dirs[2].path().join("local-journal")).expect("lose the journal");
+        std::fs::remove_file(
+            dirs[2]
+                .path()
+                .join(coordinode_storage::engine::promise::PROMISE_FILE),
+        )
+        .expect("lose the second copy");
+        let listing = |dir: &std::path::Path| {
+            let mut all = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(at) = stack.pop() {
+                for entry in std::fs::read_dir(&at).expect("list") {
+                    let path = entry.expect("entry").path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        let bytes = std::fs::read(&path).expect("read");
+                        all.push((path, bytes));
+                    }
+                }
+            }
+            all.sort();
+            all
+        };
+        let e3 = open_engine_at(dirs[2].path());
+        let refused = RaftNode::open_cluster(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+            format!("http://127.0.0.1:{p3}"),
+            conn(3),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(RaftNodeError::PromiseUnqualified(_))),
+            "{:?}",
+            refused.err()
+        );
+        drop(e3);
+        let damaged = listing(dirs[2].path());
+
+        // Its replacement: a new node, a new identity, its own directory.
+        let e4 = open_engine_at(dirs[3].path());
+        let n4 = RaftNode::open_joining(
+            4,
+            Arc::clone(&e4),
+            format!("127.0.0.1:{p4}").parse().expect("a"),
+            conn(4),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n4");
+        // A replacement cut short after its first step.
+        n1.add_node(4, format!("http://127.0.0.1:{p4}"), ident(4))
+            .await
+            .expect("first step");
+        let (progress, _) = tokio::sync::broadcast::channel(64);
+        n1.replace_member(
+            3,
+            4,
+            format!("http://127.0.0.1:{p4}"),
+            ident(4),
+            progress.clone(),
+        )
+        .await
+        .expect("the replacement resumes");
+        n1.replace_member(3, 4, format!("http://127.0.0.1:{p4}"), ident(4), progress)
+            .await
+            .expect("a repeated replacement changes nothing");
+        let (nodes, voters): (Vec<u64>, Vec<u64>) = {
+            let rx = n1.raft().metrics();
+            let metrics = rx.borrow_watched();
+            let config = metrics.membership_config.membership();
+            (
+                config.nodes().map(|(id, _)| *id).collect(),
+                config.voter_ids().collect(),
+            )
+        };
+        assert_eq!(voters, vec![1, 2, 4], "member 4 votes where 3 did");
+        assert_eq!(nodes, vec![1, 2, 4], "member 3 left the group");
+        assert!(
+            await_replicated(&e4, &key, b"v").await,
+            "member 4 holds the history"
+        );
+        let back = n1
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
+            .await;
+        assert!(
+            matches!(back, Err(RaftNodeError::Identity(_))),
+            "the old identity is retired: {back:?}"
+        );
+        assert!(
+            listing(dirs[2].path()) == damaged,
+            "the replacement left the old member's directory as it was"
+        );
+
+        n4.shutdown().await.expect("s4");
+        n2.shutdown().await.expect("s2");
+        n1.shutdown().await.expect("s1");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_member_without_its_promise_is_replaced_under_a_new_identity"
+    );
+}
+
+/// Two members of three lose every copy of their votes at once: neither
+/// starts, each with the typed refusal and its directory as it was, and the
+/// one left cannot replace them, since a membership change needs the quorum
+/// that is gone. The group is unavailable, not continued on forgotten votes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_that_lost_a_quorum_of_promises_stays_unavailable() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(180), async {
+        let ports = [alloc_port(), alloc_port(), alloc_port(), alloc_port()];
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+            tempfile::tempdir().expect("d4"),
+        ];
+        let engines: Vec<_> = dirs[..3].iter().map(|d| open_engine_at(d.path())).collect();
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&engines[0]),
+            format!("127.0.0.1:{}", ports[0]).parse().expect("a"),
+            format!("http://127.0.0.1:{}", ports[0]),
+            conn(1),
+        )
+        .await
+        .expect("n1");
+        let mut followers = Vec::new();
+        for id in [2u64, 3] {
+            let at = usize::try_from(id - 1).expect("index");
+            followers.push(
+                RaftNode::open_joining(
+                    id,
+                    Arc::clone(&engines[at]),
+                    format!("127.0.0.1:{}", ports[at]).parse().expect("a"),
+                    conn(id),
+                    enroll(&n1, format!("127.0.0.1:{}", ports[0])),
+                )
+                .await
+                .expect("follower"),
+            );
+        }
+        await_leadership(&n1).await;
+        for id in [2u64, 3] {
+            let at = usize::try_from(id - 1).expect("index");
+            n1.add_node(id, format!("http://127.0.0.1:{}", ports[at]), ident(id))
+                .await
+                .expect("add");
+        }
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+
+        for node in followers {
+            node.shutdown().await.expect("stop");
+        }
+        let mut engines = engines.into_iter();
+        let (Some(e1), Some(e2), Some(e3)) = (engines.next(), engines.next(), engines.next())
+        else {
+            unreachable!("three engines were opened");
+        };
+        for engine in [&e2, &e3] {
+            for _ in 0..100 {
+                if Arc::strong_count(engine) == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        drop((e2, e3));
+        for at in [1usize, 2] {
+            let dir = dirs[at].path();
+            std::fs::remove_dir_all(dir.join(Partition::Raft.name())).expect("lose the tree");
+            std::fs::remove_dir_all(dir.join("local-journal")).expect("lose the journal");
+            std::fs::remove_file(dir.join(coordinode_storage::engine::promise::PROMISE_FILE))
+                .expect("lose the second copy");
+        }
+        for (at, id) in [(1usize, 2u64), (2, 3)] {
+            let engine = open_engine_at(dirs[at].path());
+            let refused = RaftNode::open_cluster(
+                id,
+                Arc::clone(&engine),
+                format!("127.0.0.1:{}", ports[at]).parse().expect("a"),
+                format!("http://127.0.0.1:{}", ports[at]),
+                conn(id),
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(RaftNodeError::PromiseUnqualified(_))),
+                "member {id}: {:?}",
+                refused.err()
+            );
+        }
+
+        // Member 1 alone has no quorum to change the membership with.
+        let e4 = open_engine_at(dirs[3].path());
+        let n4 = RaftNode::open_joining(
+            4,
+            Arc::clone(&e4),
+            format!("127.0.0.1:{}", ports[3]).parse().expect("a"),
+            conn(4),
+            enroll(&n1, format!("127.0.0.1:{}", ports[0])),
+        )
+        .await
+        .expect("n4");
+        let (progress, _) = tokio::sync::broadcast::channel(16);
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(10),
+            n1.replace_member(
+                3,
+                4,
+                format!("http://127.0.0.1:{}", ports[3]),
+                ident(4),
+                progress,
+            ),
+        )
+        .await;
+        assert!(
+            !matches!(attempt, Ok(Ok(()))),
+            "a replacement without a quorum must not succeed"
+        );
+        let voters: Vec<u64> = n1
+            .raft()
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect();
+        assert_eq!(voters, vec![1, 2, 3], "the voters did not change");
+        n4.shutdown().await.expect("s4");
+        n1.shutdown().await.expect("s1");
+        drop(e1);
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_group_that_lost_a_quorum_of_promises_stays_unavailable"
+    );
+}
+
 /// Graceful leader transfer — leader transfers to specific peer,
 /// new leader serves writes, old leader becomes follower.
 #[tokio::test(flavor = "multi_thread")]

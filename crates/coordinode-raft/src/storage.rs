@@ -191,65 +191,144 @@ impl PromiseUnqualified {
     }
 }
 
-/// One copy of the promise, as read.
-enum PromiseRead {
-    /// The copy holds this promise; `None` is the explicit record of a member
-    /// that has not voted yet, which only the second copy writes.
-    Holds(Option<Vote>),
+/// What a member keeps twice, in its Raft tree and in the second copy: the
+/// records it cannot lose without breaking a promise (its vote, a loss of
+/// committed entries it has to catch up on) or reading entries that are gone
+/// (its purge point). The commit point is not among them: one lower than it
+/// was is learnt again from the leader.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+struct Promises {
+    /// The vote; `None` only before the member first voted.
+    vote: Option<Vote>,
+    /// The last log entry purged; the segments up to it are gone.
+    purged: Option<LogId>,
+    /// The highest committed entry the disk lost, until caught up.
+    catch_up: Option<LogId>,
+}
+
+/// One record as a copy holds it.
+enum Read<T> {
+    /// The copy holds this value.
+    Holds(T),
     /// No record: never written, or lost.
     Absent,
-    /// A record that cannot be this member's promise.
+    /// A record that cannot be this member's.
     Damaged(String),
 }
 
-/// The Raft tree's copy. Absence there proves nothing on its own: a lost
-/// tree reads empty.
-fn tree_promise(engine: &StorageEngine) -> Result<PromiseRead, io::Error> {
-    match engine.get(Partition::Raft, KEY_VOTE) {
-        Ok(Some(bytes)) => Ok(match rmp_serde::from_slice::<Vote>(&bytes) {
-            Ok(vote) => PromiseRead::Holds(Some(vote)),
-            Err(e) => PromiseRead::Damaged(format!("the Raft tree's record does not decode: {e}")),
+impl<T> Read<T> {
+    fn describe(&self) -> String {
+        match self {
+            Read::Holds(_) => "holds it".to_string(),
+            Read::Absent => "has none".to_string(),
+            Read::Damaged(why) => why.clone(),
+        }
+    }
+}
+
+/// The record at `key` in the Raft tree.
+fn tree_record<T: serde::de::DeserializeOwned>(
+    engine: &StorageEngine,
+    key: &[u8],
+) -> Result<Read<T>, io::Error> {
+    match engine.get(Partition::Raft, key) {
+        Ok(Some(bytes)) => Ok(match rmp_serde::from_slice::<T>(&bytes) {
+            Ok(value) => Read::Holds(value),
+            Err(e) => Read::Damaged(format!(
+                "the Raft tree's {} does not decode: {e}",
+                String::from_utf8_lossy(key)
+            )),
         }),
-        Ok(None) => Ok(PromiseRead::Absent),
-        Err(e) if e.is_data_damage() => Ok(PromiseRead::Damaged(format!(
-            "the Raft tree's record is unreadable: {e}"
+        Ok(None) => Ok(Read::Absent),
+        Err(e) if e.is_data_damage() => Ok(Read::Damaged(format!(
+            "the Raft tree's {} is unreadable: {e}",
+            String::from_utf8_lossy(key)
         ))),
         Err(e) => Err(io::Error::other(e.to_string())),
     }
 }
 
+/// The records as the Raft tree holds them now, for the second copy.
+fn live_promises(engine: &StorageEngine) -> StorageResult<Vec<u8>> {
+    let read = |key: &[u8]| -> StorageResult<Option<LogId>> {
+        load_stored(engine, Partition::Raft, key).map_err(|e| StorageError::Io(e.to_string()))
+    };
+    let vote: Option<Vote> = load_stored(engine, Partition::Raft, KEY_VOTE)
+        .map_err(|e| StorageError::Io(e.to_string()))?;
+    let promises = Promises {
+        vote,
+        purged: read(KEY_PURGED)?,
+        catch_up: read(KEY_CATCH_UP)?,
+    };
+    rmp_serde::to_vec(&promises).map_err(|e| StorageError::Io(e.to_string()))
+}
+
+/// Bring the second copy up to what the Raft tree holds now, after a write
+/// to one of the records it keeps. Durable when this returns.
+fn refresh_promises(engine: &StorageEngine, incarnation: &Incarnation) -> Result<(), io::Error> {
+    engine
+        .refresh_promise_copy(incarnation, || live_promises(engine))
+        .map_err(|e| io::Error::other(format!("persist the second copy of the vote: {e}")))
+}
+
 /// The second copy, if it belongs to `incarnation` (or, with none named yet,
 /// to whichever incarnation it names).
-fn copy_promise(copy: &PromiseCopy, incarnation: Option<&Incarnation>) -> PromiseRead {
+fn copy_promises(copy: &PromiseCopy, incarnation: Option<&Incarnation>) -> Read<Promises> {
     match copy {
-        PromiseCopy::Absent => PromiseRead::Absent,
-        PromiseCopy::Damaged(why) => PromiseRead::Damaged(format!("the second copy is {why}")),
+        PromiseCopy::Absent => Read::Absent,
+        PromiseCopy::Damaged(why) => Read::Damaged(format!("the second copy is {why}")),
         PromiseCopy::Held {
             incarnation: held, ..
         } if incarnation.is_some_and(|bound| bound != held) => {
-            PromiseRead::Damaged("the second copy belongs to another store".into())
+            Read::Damaged("the second copy belongs to another store".into())
         }
-        PromiseCopy::Held { payload, .. } => match rmp_serde::from_slice::<Option<Vote>>(payload) {
-            Ok(vote) => PromiseRead::Holds(vote),
-            Err(e) => PromiseRead::Damaged(format!("the second copy does not decode: {e}")),
+        PromiseCopy::Held { payload, .. } => match rmp_serde::from_slice::<Promises>(payload) {
+            Ok(promises) => Read::Holds(promises),
+            Err(e) => Read::Damaged(format!("the second copy does not decode: {e}")),
         },
     }
 }
 
-/// This member's promise, read from both copies and made whole before the
-/// consensus engine sees it: the greater of the copies that hold one, by the
-/// engine's own vote order, written back to the copy that lags, and the
-/// store's consensus log bound to its incarnation. `history` says whether the
-/// store already keeps a group's history (log, commit or purge point, applied
-/// membership): with no copy holding a promise, only a store without one, and
-/// never bound under an incarnation, is a new member.
+/// The later of a log record the tree and the second copy hold: a purge
+/// point or a loss only moves forward, so the one ahead is the one written
+/// last. With the tree's record damaged and no second copy, nothing proves
+/// it.
+fn later_record(
+    tree: &Read<LogId>,
+    copy: Option<Option<LogId>>,
+    what: &str,
+) -> Result<Option<LogId>, io::Error> {
+    let tree = match tree {
+        Read::Holds(id) => Some(*id),
+        Read::Absent => None,
+        Read::Damaged(why) if copy.is_none() => {
+            return Err(io::Error::other(format!(
+                "this member's {what} cannot be read and has no second copy: {why}"
+            )));
+        }
+        Read::Damaged(_) => None,
+    };
+    Ok(tree.max(copy.flatten()))
+}
+
+/// This member's records, read from both copies and made whole before the
+/// consensus engine sees them: the greater vote of the copies that hold one,
+/// by the engine's own vote order, the later purge point and loss, each
+/// written back to the copy that lags, and the store's consensus log bound
+/// to its incarnation. `history` says whether the store already keeps a
+/// group's history (log, commit point, applied membership): with no copy
+/// holding a vote, only a store without one, and never bound under an
+/// incarnation, is a new member.
 ///
 /// # Errors
 ///
-/// A copy cannot be read or written; the copies hold promises the vote order
-/// cannot rank; an existing member's promise cannot be proved
-/// ([`PromiseUnqualified`]).
-fn settle_promise(engine: &StorageEngine, history: bool) -> Result<Incarnation, io::Error> {
+/// A copy cannot be read or written; the copies hold votes the vote order
+/// cannot rank; a purge point or loss is damaged in the tree with no second
+/// copy; an existing member's vote cannot be proved ([`PromiseUnqualified`]).
+fn settle_promises(
+    engine: &StorageEngine,
+    history: bool,
+) -> Result<(Incarnation, Promises), io::Error> {
     let storage = |e: StorageError| io::Error::other(e.to_string());
     let binding = engine.consensus_binding().map_err(storage)?;
     let copy = engine.read_promise_copy().map_err(storage)?;
@@ -261,68 +340,114 @@ fn settle_promise(engine: &StorageEngine, history: bool) -> Result<Incarnation, 
         _ => coordinode_storage::engine::promise::new_incarnation(),
     };
     let named = matches!(binding, ConsensusBinding::Bound(_)).then_some(&incarnation);
-    let tree = tree_promise(engine)?;
-    let second = copy_promise(&copy, named);
-    let mut held: Option<Option<Vote>> = None;
-    for read in [&tree, &second] {
-        if let PromiseRead::Holds(vote) = read {
-            held = Some(match held {
-                None => *vote,
-                Some(other) => match vote.partial_cmp(&other) {
-                    Some(std::cmp::Ordering::Greater) => *vote,
-                    Some(_) => other,
-                    None => {
-                        return Err(io::Error::other(format!(
-                            "the copies of this member's vote cannot be ranked: {other:?} and \
-                             {vote:?}"
-                        )));
-                    }
-                },
-            });
-        }
+    let tree_vote: Read<Vote> = tree_record(engine, KEY_VOTE)?;
+    let tree_purged: Read<LogId> = tree_record(engine, KEY_PURGED)?;
+    let tree_catch_up: Read<LogId> = tree_record(engine, KEY_CATCH_UP)?;
+    let second = copy_promises(&copy, named);
+    let held_copy = match &second {
+        Read::Holds(promises) => Some(*promises),
+        Read::Absent | Read::Damaged(_) => None,
+    };
+
+    let mut vote: Option<Option<Vote>> = None;
+    let tree_held = match &tree_vote {
+        Read::Holds(v) => Some(Some(*v)),
+        Read::Absent | Read::Damaged(_) => None,
+    };
+    for held in [tree_held, held_copy.map(|p| p.vote)].into_iter().flatten() {
+        vote = Some(match vote {
+            None => held,
+            Some(other) => match held.partial_cmp(&other) {
+                Some(std::cmp::Ordering::Greater) => held,
+                Some(_) => other,
+                None => {
+                    return Err(io::Error::other(format!(
+                        "the copies of this member's vote cannot be ranked: {other:?} and \
+                         {held:?}"
+                    )));
+                }
+            },
+        });
     }
-    let vote = match held {
+    let purged = later_record(&tree_purged, held_copy.map(|p| p.purged), "purge point")?;
+    let catch_up = later_record(&tree_catch_up, held_copy.map(|p| p.catch_up), "loss record")?;
+    let history = history || purged.is_some() || catch_up.is_some();
+    let vote = match vote {
         Some(vote) => vote,
         None if !history && !matches!(binding, ConsensusBinding::Bound(_)) => None,
         None => {
-            let show = |read: &PromiseRead| match read {
-                PromiseRead::Holds(_) => "holds it".to_string(),
-                PromiseRead::Absent => "has none".to_string(),
-                PromiseRead::Damaged(why) => why.clone(),
-            };
             return Err(io::Error::other(PromiseUnqualified {
                 reason: format!(
                     "the Raft tree {}; the second copy {}",
-                    show(&tree),
-                    show(&second)
+                    tree_vote.describe(),
+                    second.describe()
                 ),
             }));
         }
     };
-    if let Some(vote) = vote {
-        if !matches!(tree, PromiseRead::Holds(Some(v)) if v == vote) {
-            let bytes = rmp_serde::to_vec(&vote).map_err(|e| io::Error::other(e.to_string()))?;
-            engine
-                .commit_local(
-                    vec![LocalWrite::Put {
-                        partition: Partition::Raft,
-                        key: KEY_VOTE.to_vec(),
-                        value: bytes,
-                    }],
-                    LocalSync::BeforeUse,
-                )
-                .map_err(|e| io::Error::other(format!("restore the vote: {e}")))?;
-            tracing::warn!(?vote, "raft: the Raft tree's copy of the vote restored");
-        }
+    let promises = Promises {
+        vote,
+        purged,
+        catch_up,
+    };
+
+    // The tree takes back what it lags, in one synced append.
+    let mut writes = Vec::new();
+    let mut restore = |key: &[u8], bytes: Vec<u8>| {
+        writes.push(LocalWrite::Put {
+            partition: Partition::Raft,
+            key: key.to_vec(),
+            value: bytes,
+        });
+    };
+    let encoded = |e: rmp_serde::encode::Error| io::Error::other(e.to_string());
+    if let Some(v) = vote.filter(|v| !matches!(tree_vote, Read::Holds(t) if t == *v)) {
+        restore(KEY_VOTE, rmp_serde::to_vec(&v).map_err(encoded)?);
     }
-    if !matches!(second, PromiseRead::Holds(v) if v == vote) {
-        let bytes = rmp_serde::to_vec(&vote).map_err(|e| io::Error::other(e.to_string()))?;
+    if let Some(p) = purged.filter(|p| !matches!(tree_purged, Read::Holds(t) if t == *p)) {
+        restore(KEY_PURGED, rmp_serde::to_vec(&p).map_err(encoded)?);
+    }
+    if let Some(c) = catch_up.filter(|c| !matches!(tree_catch_up, Read::Holds(t) if t == *c)) {
+        restore(KEY_CATCH_UP, rmp_serde::to_vec(&c).map_err(encoded)?);
+    }
+    if !writes.is_empty() {
+        engine
+            .commit_local(writes, LocalSync::BeforeUse)
+            .map_err(|e| io::Error::other(format!("restore the member's records: {e}")))?;
+        tracing::warn!(
+            ?promises,
+            "raft: the Raft tree took back the member's records"
+        );
+    }
+    if held_copy != Some(promises) {
+        let bytes = rmp_serde::to_vec(&promises).map_err(|e| io::Error::other(e.to_string()))?;
         engine
             .write_promise_copy(&incarnation, &bytes)
-            .map_err(|e| io::Error::other(format!("write the vote's second copy: {e}")))?;
+            .map_err(|e| io::Error::other(format!("write the second copy: {e}")))?;
     }
     engine.bind_consensus_log(&incarnation).map_err(storage)?;
-    Ok(incarnation)
+    Ok((incarnation, promises))
+}
+
+/// Whether any of `dirs` holds a segment of the log: a store that ever wrote
+/// one belongs to a group's history. A directory that does not exist holds
+/// none.
+fn holds_segments(dirs: &[std::path::PathBuf]) -> Result<bool, io::Error> {
+    for dir in dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("oplog-") && name.ends_with(".bin") {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// What opening the log does when the disk lost entries already committed.
@@ -364,7 +489,18 @@ pub fn clear_catch_up(engine: &StorageEngine) -> Result<(), io::Error> {
             }],
             LocalSync::BeforeUse,
         )
-        .map_err(|e| io::Error::other(format!("persist the caught-up member: {e}")))
+        .map_err(|e| io::Error::other(format!("persist the caught-up member: {e}")))?;
+    // The second copy forgets the loss as well; a crash before it keeps the
+    // member out of elections once more, never in them too early.
+    match engine
+        .consensus_binding()
+        .map_err(|e| io::Error::other(e.to_string()))?
+    {
+        ConsensusBinding::Bound(incarnation) => refresh_promises(engine, &incarnation),
+        ConsensusBinding::Unbound | ConsensusBinding::Unnamed => Err(io::Error::other(
+            "a member's store whose consensus log is not bound",
+        )),
+    }
 }
 
 /// Rebuild `partition` from the checkpoint at `checkpoint_dir` and this
@@ -723,7 +859,15 @@ impl LogStore {
         } = raft_oplog_dirs(&engine, shard_id)?;
         let settings = engine.oplog_config();
         let committed: Option<LogId> = load_stored(&engine, Partition::Raft, KEY_COMMITTED)?;
-        let recorded: Option<LogId> = load_stored(&engine, Partition::Raft, KEY_CATCH_UP)?;
+        // The member's records are made whole, and the store bound to its
+        // group, before the log opens on them and before the consensus engine
+        // reads them.
+        let history = committed.is_some()
+            || load_stored::<StoredMembership>(&engine, Partition::Schema, KEY_SM_MEMBERSHIP)?
+                .is_some()
+            || holds_segments(&recovery_dirs)?;
+        let (incarnation, promises) = settle_promises(&engine, history)?;
+        let recorded = promises.catch_up;
         // Recovering the segments must not end the log below an entry
         // already committed (those were acknowledged) unless peers hold it.
         let must_hold = match lost {
@@ -761,7 +905,7 @@ impl LogStore {
         .with_footprints(footprints)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let last_purged = Self::load_log_id_from_partition(&engine, KEY_PURGED)?;
+        let last_purged = promises.purged;
         // The last entry in the segments; its recovery reads the last segment
         // (which a crash may have left without a footer). A log whose entries
         // are all purged ends where it was purged, as openraft expects of an
@@ -772,20 +916,7 @@ impl LogStore {
             None
         };
         let last_log_id = recovered.max(last_purged);
-
-        // The promise is made whole, and the store bound to its group, before
-        // the log's first entry and before the consensus engine reads it.
-        let history = committed.is_some()
-            || recorded.is_some()
-            || last_purged.is_some()
-            || recovered.is_some()
-            || load_stored::<StoredMembership>(&engine, Partition::Schema, KEY_SM_MEMBERSHIP)?
-                .is_some();
-        let incarnation = settle_promise(&engine, history)?;
-        let saved_vote = tree_promise(&engine).map(|read| match read {
-            PromiseRead::Holds(vote) => vote,
-            PromiseRead::Absent | PromiseRead::Damaged(_) => None,
-        })?;
+        let saved_vote = promises.vote;
 
         // Committed entries the log no longer holds: the leader sends them
         // again. Until then the replay openraft starts from must stop where
@@ -816,6 +947,7 @@ impl LogStore {
             engine
                 .commit_local(writes, LocalSync::BeforeUse)
                 .map_err(|e| io::Error::other(format!("persist the lost entries: {e}")))?;
+            refresh_promises(&engine, &incarnation)?;
             tracing::error!(
                 lost_through = lost.index,
                 log_ends_at = last_log_id.map(|id| id.index),
@@ -862,16 +994,6 @@ impl LogStore {
             }
             None => Ok(None),
         }
-    }
-
-    /// The log id stored at `key`, `None` when nothing is. A value that cannot
-    /// be read or decoded fails the open: taken as absent, a lost purge point
-    /// would let the log be read from entries that are gone.
-    fn load_log_id_from_partition(
-        engine: &StorageEngine,
-        key: &[u8],
-    ) -> Result<Option<LogId>, io::Error> {
-        load_stored(engine, Partition::Raft, key)
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, io::Error> {
@@ -1189,10 +1311,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                 LocalSync::BeforeUse,
             )
             .map_err(|e| io::Error::other(format!("persist the vote: {e}")))?;
-        let copy = rmp_serde::to_vec(&Some(*vote)).map_err(|e| io::Error::other(e.to_string()))?;
-        self.engine
-            .write_promise_copy(&self.incarnation, &copy)
-            .map_err(|e| io::Error::other(format!("persist the vote's second copy: {e}")))?;
+        refresh_promises(&self.engine, &self.incarnation)?;
         *saved = Some(*vote);
         Ok(())
     }
@@ -1374,6 +1493,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                 LocalSync::BeforeUse,
             )
             .map_err(|e| io::Error::other(format!("persist the purge point: {e}")))?;
+        // The second copy holds it before any segment goes, as the tree does.
+        refresh_promises(&self.engine, &self.incarnation)?;
         *self
             .last_purged
             .lock()
