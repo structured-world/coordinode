@@ -163,6 +163,32 @@ fn installation_ranges(installation: u64) -> [(Vec<u8>, Vec<u8>); GENERATION_TAG
     GENERATION_TAGS.map(|tag| (prefix(tag, installation), prefix_end(tag, installation)))
 }
 
+/// The entries of every stretch, each already in seqno order, as one list in
+/// seqno order; entries of one seqno keep their stretch order.
+fn merge_by_seqno(stretches: Vec<Vec<HistoryEntry>>) -> Vec<HistoryEntry> {
+    let total = stretches.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(total);
+    let mut heads: Vec<_> = stretches
+        .into_iter()
+        .map(|entries| entries.into_iter().peekable())
+        .collect();
+    loop {
+        let mut next: Option<(usize, SeqNo)> = None;
+        for (i, head) in heads.iter_mut().enumerate() {
+            let Some(seqno) = head.peek().map(HistoryEntry::seqno) else {
+                continue;
+            };
+            if next.is_none_or(|(_, best)| seqno < best) {
+                next = Some((i, seqno));
+            }
+        }
+        let Some((i, _)) = next else {
+            return out;
+        };
+        out.extend(heads[i].next());
+    }
+}
+
 /// Delete every entry of `installation` with range tombstones at `seqno`,
 /// when any is left.
 fn clear_installation(tree: &AnyTree, installation: u64, seqno: SeqNo) {
@@ -510,53 +536,56 @@ impl Installations {
             position(tree)?
         };
         let ranges = installation_ranges(installation);
-        let inside = |key: &[u8]| {
-            ranges
-                .iter()
-                .any(|(s, e)| key >= s.as_slice() && key < e.as_slice())
-        };
         let logical = |key: &[u8]| {
             let mut out = Vec::with_capacity(key.len());
             with_slot(key, generation, &mut out);
             out
         };
-        let events: Vec<ScanSinceEvent> = match tree {
-            AnyTree::Standard(t) => t.scan_since_seqno(0)?.collect(),
-            AnyTree::Blob(t) => t.scan_since_seqno(0)?.collect(),
-        };
-        let mut out = Vec::new();
-        for event in events {
-            match event {
-                ScanSinceEvent::Insert { key, value, seqno } if inside(&key) => {
-                    out.push(HistoryEntry::Put {
-                        key: logical(&key),
-                        value: value.to_vec(),
+        // One scan per stretch of the installation: tables outside it are
+        // skipped by their key range, so the cost follows the generation,
+        // not the whole index partition. Each scan is complete below
+        // `covers_through`, having started after it was read.
+        let mut stretches = Vec::with_capacity(ranges.len());
+        for (s, e) in &ranges {
+            let events: Vec<ScanSinceEvent> = match tree {
+                AnyTree::Standard(t) => t
+                    .scan_since_seqno_in_range(0, s.as_slice()..e.as_slice())?
+                    .collect(),
+                AnyTree::Blob(t) => t
+                    .scan_since_seqno_in_range(0, s.as_slice()..e.as_slice())?
+                    .collect(),
+            };
+            // Point events come only from inside the stretch.
+            let mut out = Vec::with_capacity(events.len());
+            for event in events {
+                match event {
+                    ScanSinceEvent::Insert { key, value, seqno } => {
+                        out.push(HistoryEntry::Put {
+                            key: logical(&key),
+                            value: value.to_vec(),
+                            seqno,
+                        });
+                    }
+                    ScanSinceEvent::PointTombstone { key, seqno } => {
+                        out.push(HistoryEntry::Delete {
+                            key: logical(&key),
+                            seqno,
+                        });
+                    }
+                    ScanSinceEvent::MergeOperand { .. } | ScanSinceEvent::WeakTombstone { .. } => {
+                        return Err(StorageError::InstallationCatalog(format!(
+                            "generation {generation} holds a merge operand or single delete, \
+                             which its history cannot carry"
+                        )));
+                    }
+                    ScanSinceEvent::RangeTombstone {
+                        start_key,
+                        end_key,
                         seqno,
-                    });
-                }
-                ScanSinceEvent::PointTombstone { key, seqno } if inside(&key) => {
-                    out.push(HistoryEntry::Delete {
-                        key: logical(&key),
-                        seqno,
-                    });
-                }
-                ScanSinceEvent::MergeOperand { key, .. }
-                | ScanSinceEvent::WeakTombstone { key, .. }
-                    if inside(&key) =>
-                {
-                    return Err(StorageError::InstallationCatalog(format!(
-                        "generation {generation} holds a merge operand or single delete, which \
-                         its history cannot carry"
-                    )));
-                }
-                ScanSinceEvent::RangeTombstone {
-                    start_key,
-                    end_key,
-                    seqno,
-                } => {
-                    // The part of the range inside each of the installation's
-                    // stretches, as a logical range of the generation.
-                    for (s, e) in &ranges {
+                    } => {
+                        // The part of the range inside this stretch only: a
+                        // range spanning several stretches is delivered by the
+                        // scan of each, and each contributes its own part.
                         let start = start_key.as_ref().max(s.as_slice());
                         let end = end_key.as_ref().min(e.as_slice());
                         if start < end {
@@ -579,13 +608,13 @@ impl Installations {
                         }
                     }
                 }
-                _ => {}
             }
+            stretches.push(out);
         }
         Ok(GenerationHistory {
             covers_through,
             history_from,
-            entries: out,
+            entries: merge_by_seqno(stretches),
         })
     }
 }

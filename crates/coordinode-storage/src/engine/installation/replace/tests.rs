@@ -677,6 +677,92 @@ fn replace_after_stage(engine: &StorageEngine) {
     engine.publish_generation(GENERATION).expect("publish");
 }
 
+/// The history is read stretch by stretch, yet comes out as one list in seqno
+/// order: versions written alternately under the generation's two tags keep
+/// their order, a range delete spanning both stretches gives exactly one
+/// logical range per stretch, and nothing of another generation gets in.
+#[test]
+fn the_history_of_both_stretches_comes_out_once_in_seqno_order() {
+    use lsm_tree::AbstractTree as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = StorageEngine::open(&config(dir.path())).expect("open");
+    let tagged = |tag: u8, rest: &[u8]| {
+        let mut out = prefix(tag, GENERATION.as_raw());
+        out.extend_from_slice(rest);
+        out
+    };
+    let [first, second] = [GENERATION_TAGS[0], GENERATION_TAGS[1]];
+    for i in 0u8..6 {
+        let tag = if i % 2 == 0 { first } else { second };
+        engine
+            .put(Partition::Idx, &tagged(tag, &[i]), &[i])
+            .expect("put");
+    }
+    let installations = stored_installations(&engine);
+    assert_eq!(installations.len(), 1, "one copy before another generation");
+    let installation = installations[0];
+    engine
+        .put(Partition::Idx, &entry_of(41, b"x"), b"other")
+        .expect("put another generation");
+    // One tombstone over the generation's first two stretches, as a clear of
+    // the installation written in one piece would leave.
+    let tree = engine.tree(Partition::Idx).expect("idx");
+    let removed_at = engine.snapshot() + 10;
+    tree.remove_range(
+        prefix(first, installation),
+        super::super::prefix_end(second, installation),
+        removed_at,
+    );
+    tree.flush_active_memtable(0).expect("flush");
+
+    engine.stage_generation(GENERATION).expect("stage");
+    let history = engine
+        .export_generation_history(GENERATION)
+        .expect("export");
+    let seqnos: Vec<u64> = history.entries.iter().map(HistoryEntry::seqno).collect();
+    assert!(
+        seqnos.windows(2).all(|w| w[0] <= w[1]),
+        "the history is in seqno order: {seqnos:?}"
+    );
+    let ranges: Vec<_> = history
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            HistoryEntry::RemoveRange { start, end, seqno } => Some((start, end, *seqno)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![
+            (
+                &prefix(first, GENERATION.as_raw()),
+                &super::super::prefix_end(first, GENERATION.as_raw()),
+                removed_at
+            ),
+            (
+                &prefix(second, GENERATION.as_raw()),
+                &super::super::prefix_end(second, GENERATION.as_raw()),
+                removed_at
+            ),
+        ],
+        "one logical range per stretch"
+    );
+    let puts: Vec<&[u8]> = history
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            HistoryEntry::Put { value, .. } => Some(value.as_slice()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        puts,
+        vec![&[0u8][..], &[1], &[2], &[3], &[4], &[5]],
+        "every version of both stretches and none of another generation"
+    );
+}
+
 /// An imported entry outside the generation is refused, so a history meant
 /// for one generation cannot write into another.
 #[test]
