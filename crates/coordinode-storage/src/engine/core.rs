@@ -4569,19 +4569,23 @@ impl StorageEngine {
         if writes.is_empty() {
             return Ok(());
         }
-        // Past the admission of client writes, but not past the part of the
-        // reserve that retiring these records needs.
-        self.space.admit_free_space_recovery()?;
-        // Inside the footprint's recovery reserve, never past its limit. The
-        // consensus state (vote, commit and purge points) is not admitted:
-        // a refusal would stop the group, and the records are a few bytes
-        // each, kept for entries already admitted; the journal growth they
-        // cause is still held to the limit.
+        // The consensus state (vote, commit and purge points) is admitted
+        // neither against free space nor against the footprint: a refusal is
+        // a storage error the consensus engine stops the group on, and the
+        // records are a few fixed keys rewritten in place, kept for entries
+        // already admitted; the journal growth they cause is still held to
+        // the footprint's limit.
         let consensus = writes.iter().all(|write| match write {
             LocalWrite::Put { partition, .. } | LocalWrite::Delete { partition, .. } => {
                 *partition == Partition::Raft
             }
         });
+        // Any other record goes past the admission of client writes, but not
+        // past the part of the reserve that retiring it needs.
+        if !consensus {
+            self.space.admit_free_space_recovery()?;
+        }
+        // Inside the footprint's recovery reserve, never past its limit.
         let _admitted = if self.footprints.is_empty() || consensus {
             crate::engine::footprint::Admitted::default()
         } else {

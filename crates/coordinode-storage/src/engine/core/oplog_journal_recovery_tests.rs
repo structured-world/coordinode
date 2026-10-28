@@ -1961,15 +1961,27 @@ fn member_records_use_the_upper_half_of_the_space_reserve() {
     engine
         .commit_local(vec![member_put(b"vote", b"v")], LocalSync::BeforeUse)
         .expect("a record within the recovery half");
-    // Free space under half the reserve: the rest is the flushes' to use.
+    // Free space under half the reserve: the rest is the flushes' to use, so
+    // a recovery record of another partition is refused.
     space.set_reserve(free.checked_mul(3).expect("a measured disk"), u64::MAX);
+    let guard = LocalWrite::Put {
+        partition: Partition::Schema,
+        key: b"guard".to_vec(),
+        value: b"g".to_vec(),
+    };
     assert!(
         matches!(
-            engine.commit_local(vec![member_put(b"vote", b"w")], LocalSync::BeforeUse),
+            engine.commit_local(vec![guard], LocalSync::BeforeUse),
             Err(StorageError::OutOfSpace { .. })
         ),
         "a record took the space its retirement needs"
     );
+    // The consensus state still goes on: a vote, commit or purge point the
+    // consensus engine cannot save stops the group, and the records are a
+    // few fixed keys rewritten in place.
+    engine
+        .commit_local(vec![member_put(b"vote", b"w")], LocalSync::BeforeUse)
+        .expect("the consensus state is saved below half the reserve");
     space.set_reserve(0, 0);
     rig.cut(engine);
 }
