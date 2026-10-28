@@ -19,6 +19,10 @@
 //! at N and 2N, the difference over N being the syncs per operation without
 //! the section's setup.
 //!
+//! With `PROMISE_COSTS_TRACE` set, the commit section also prints each
+//! commit's wall-clock start and duration, and runs `iostat -t -x 1` beside
+//! itself when the host has it.
+//!
 //! The copy's slot files are counted, with their logical length, between
 //! writes at each restart and reopen. Their high water inside a write and
 //! the bytes allocated to them are not observable from here; the copy's
@@ -245,6 +249,50 @@ fn put(id_gen: &ProposalIdGenerator, n: u64) -> RaftProposal {
     }
 }
 
+/// Whether `PROMISE_COSTS_TRACE` asks for every commit's wall-clock start and
+/// duration, and for `iostat -t -x 1` beside the section, so a slow commit can
+/// be placed against the device's queue and wait at that second.
+fn traced() -> bool {
+    std::env::var_os("PROMISE_COSTS_TRACE").is_some()
+}
+
+/// `iostat` printing to this process's stdout until the guard drops.
+struct Iostat(Option<std::process::Child>);
+
+impl Iostat {
+    fn start() -> Self {
+        match std::process::Command::new("iostat")
+            .args(["-t", "-x", "1"])
+            .spawn()
+        {
+            Ok(child) => Self(Some(child)),
+            Err(error) => {
+                println!("iostat not started: {error}");
+                Self(None)
+            }
+        }
+    }
+}
+
+impl Drop for Iostat {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            // The sampler only prints; a failed kill or wait leaves nothing to
+            // undo, and the trace says where its output ends.
+            if let Err(error) = child.kill().and_then(|()| child.wait().map(drop)) {
+                println!("iostat not stopped: {error}");
+            }
+        }
+    }
+}
+
+fn unix_micros() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past the epoch")
+        .as_micros()
+}
+
 async fn commits() {
     let store = Store::new();
     let engine = store.open();
@@ -252,15 +300,28 @@ async fn commits() {
     await_leadership(&node).await;
     let pipeline = node.pipeline();
     let id_gen = ProposalIdGenerator::with_base(1 << 40);
+    let trace = traced();
+    let iostat = trace.then(Iostat::start);
     store.take_syncs();
     let mut samples = Vec::new();
+    let mut starts = Vec::new();
     for n in 0..ops(1_000) {
         let proposal = put(&id_gen, n);
+        let wall = unix_micros();
         let t = Instant::now();
         tokio::task::block_in_place(|| pipeline.propose_and_wait(&proposal)).expect("commit");
         samples.push(t.elapsed());
+        starts.push(wall);
     }
-    report("commit (one member)", samples, Some(store.take_syncs()));
+    let syncs = store.take_syncs();
+    drop(iostat);
+    if trace {
+        println!("commit trace: n,start_unix_us,duration_us");
+        for (n, (start, took)) in starts.iter().zip(&samples).enumerate() {
+            println!("commit trace: {n},{start},{}", took.as_micros());
+        }
+    }
+    report("commit (one member)", samples, Some(syncs));
     drop(pipeline);
     node.shutdown().await.expect("shutdown");
     drop(node);
