@@ -1955,21 +1955,47 @@ async fn a_store_bound_before_incarnations_is_converted_or_refused() {
     assert!(PromiseUnqualified::of(&err).is_some(), "typed: {err}");
 }
 
-/// An unchanged vote costs no write: openraft may save the vote it already
-/// holds, and only a change needs a sync.
+/// An unchanged vote costs no write in either copy: openraft may save the
+/// vote it already holds, and only a change needs a sync. The tree's copy
+/// is written through the member-local journal, so a rewrite shows as
+/// journal bytes even where the second copy is left alone.
 #[tokio::test]
 async fn saving_the_same_vote_again_writes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = compacting_config(dir.path());
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+    let journal_bytes = || -> u64 {
+        let mut total = 0;
+        let mut stack = vec![dir.path().join("local-journal")];
+        while let Some(at) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&at) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    total += std::fs::metadata(&path).expect("metadata").len();
+                }
+            }
+        }
+        total
+    };
     let vote = Vote::new(2, 1);
     log.save_vote(&vote).await.expect("save");
+    let before = journal_bytes();
     lose_the_copy(dir.path());
     log.save_vote(&vote).await.expect("save the same");
     assert!(
         !copy_exists(dir.path()),
         "an unchanged vote must not be written again"
+    );
+    assert_eq!(
+        journal_bytes(),
+        before,
+        "an unchanged vote must not be appended to the local journal again"
     );
     log.save_vote(&Vote::new(3, 1))
         .await
