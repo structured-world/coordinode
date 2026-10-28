@@ -2073,12 +2073,13 @@ impl<'a> Transaction<'a> {
         let (commit_ts_raw, admission) = admitted.map_err(|refusal| match refusal {
             crate::engine::pending::Refusal::Overlap {
                 partition,
+                key,
                 holder_ts,
-                ..
             } => CommitError::Conflict(format!(
-                "write conflict: a key in the {partition:?} partition is already \
+                "write conflict: a key in the {partition:?} partition ({}) is already \
                      being written by a transaction committing at {holder_ts}. \
-                     Nothing was applied; retry the whole transaction."
+                     Nothing was applied; retry the whole transaction.",
+                crate::error::printable_key(&key)
             )),
             crate::engine::pending::Refusal::Reserved { partition, .. } => {
                 CommitError::Conflict(format!(
