@@ -1840,14 +1840,24 @@ impl Database {
     pub const DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Default runs of an auto-commit statement refused at commit for
-    /// contention: with [`Self::DEFAULT_AUTOCOMMIT_BACKOFF`] they wait about
-    /// 60 ms together, past a slow disk's flush.
+    /// contention. Each run after the first waits for the commits that were in
+    /// flight at the refusal, then for [`Self::DEFAULT_AUTOCOMMIT_BACKOFF`]
+    /// doubled per run.
     pub const DEFAULT_AUTOCOMMIT_ATTEMPTS: core::num::NonZeroU32 =
         core::num::NonZeroU32::new(6).expect("six is not zero");
 
     /// Default wait before the second run of a refused auto-commit statement.
     pub const DEFAULT_AUTOCOMMIT_BACKOFF: Duration = Duration::from_millis(2);
+}
 
+/// Longest a refused auto-commit statement waits for the commits in flight
+/// when it was refused before it runs again. A commit holds its keys until
+/// its writes are local state, normally milliseconds; a catalog change synced
+/// through a slow disk can take far longer than the doubling backoff adds up
+/// to.
+const AUTOCOMMIT_SETTLE_WAIT: Duration = Duration::from_secs(5);
+
+impl Database {
     /// Default admission window of a new incarnation: 65 536 operations above
     /// its retired prefix, about 6 MiB of records at most per incarnation.
     pub const DEFAULT_OPERATION_ADMISSION_WINDOW: core::num::NonZeroU64 =
@@ -1974,10 +1984,11 @@ impl Database {
     }
 
     /// How an auto-commit statement refused at commit for contention is run
-    /// again: at most `attempts` runs in all, the second after `backoff` and
-    /// each later one after twice the wait before it. A refused run applied
-    /// nothing, so running it again is safe. One attempt returns the first
-    /// refusal. Statements of an explicit transaction, ones pinned to a named
+    /// again: at most `attempts` runs in all. Before each run after the first
+    /// it waits (up to five seconds) for the commits that were in flight when
+    /// it was refused to land, then for `backoff`, doubled for each later run.
+    /// A refused run applied nothing, so running it again is safe. One attempt
+    /// returns the first refusal. Statements of an explicit transaction, ones pinned to a named
     /// timestamp and cursor pages always run once.
     pub fn set_autocommit_retry(&mut self, attempts: core::num::NonZeroU32, backoff: Duration) {
         self.autocommit_attempts = attempts;
@@ -2772,6 +2783,18 @@ impl Database {
                     message: reason,
                 }) if reexecutable && attempt < self.autocommit_attempts.get() => {
                     tracing::debug!(attempt, %reason, "auto-commit statement refused at commit; running it again");
+                    // The holder was admitted before this refusal, so its
+                    // timestamp is at or below the clock now: run again once
+                    // it has landed, or the next run meets it too, however
+                    // long the backoff has grown. A holder still in flight
+                    // at the bound is left to the remaining attempts.
+                    if let Err(holder) = self
+                        .engine
+                        .pending_commits()
+                        .await_complete_at(self.oracle.current().as_raw(), AUTOCOMMIT_SETTLE_WAIT)
+                    {
+                        tracing::debug!(attempt, holder, "a commit in flight outlasted the wait");
+                    }
                     std::thread::sleep(backoff);
                     backoff *= 2;
                     attempt += 1;

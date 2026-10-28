@@ -18,6 +18,55 @@ fn an_auto_commit_statement_refused_by_a_commit_in_flight_runs_again() {
     assert_eq!(rows[0].get("n"), Some(&Value::Int(2)));
 }
 
+/// A commit in flight that lands later than the retries' own backoff adds up
+/// to (a catalog change synced through a slow disk) still lets the refused
+/// statement through: each retry waits for the commits that were in flight
+/// when it was refused, instead of meeting the same holder every time.
+#[test]
+fn an_auto_commit_statement_outwaits_a_slow_commit_in_flight() {
+    use coordinode_core::graph::node::{NodeId, encode_node_key};
+    use coordinode_core::graph::types::Value;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("CREATE (:U {name: 'a', n: 1})")
+        .expect("create");
+    let id = match db
+        .execute_cypher("MATCH (u:U) RETURN id(u) AS id")
+        .expect("id")[0]
+        .get("id")
+    {
+        Some(Value::Int(id)) => u64::try_from(*id).expect("id"),
+        other => panic!("expected an id, got {other:?}"),
+    };
+    let node = encode_node_key(db.shard_id, NodeId::from_raw(id));
+    let pending = Arc::clone(db.engine().pending_commits());
+    let oracle = Arc::clone(&db.oracle);
+    let (held, holding) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let (_ts, admission) = pending
+                .admit_allocated(
+                    || oracle.next().as_raw(),
+                    Vec::new(),
+                    vec![(Partition::Node, node)],
+                )
+                .expect("admit the holder");
+            held.send(()).expect("signal");
+            // Several times what six doubling retries from 2 ms wait.
+            std::thread::sleep(Duration::from_millis(300));
+            drop(admission);
+        });
+        holding.recv_timeout(Duration::from_secs(10)).expect("held");
+        db.execute_cypher("MATCH (u:U {name: 'a'}) SET u.n = u.n + 1")
+            .expect("the statement lands once the slow holder has");
+    });
+    let rows = db
+        .execute_cypher("MATCH (u:U) RETURN u.n AS n")
+        .expect("read");
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(2)));
+}
+
 /// With a single attempt configured, the same statement returns the first
 /// refusal instead of running again.
 #[test]
