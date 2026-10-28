@@ -452,34 +452,48 @@ impl Loss {
 
 /// Recovery after each [`Loss`], timed from the engine open to leadership or
 /// to the refusal, on a copy of one closed image: the member committed
-/// `RECOVERY_KEYS` entries and was restarted until its term passed 1, so a
-/// group started afresh under its identity shows as a lower term. A reopen
-/// that leads without the term it had promised, or without its data, is an
+/// `RECOVERY_KEYS` entries and promised a vote of a term above 1, so a group
+/// started afresh under its identity shows as a lower term. A reopen that
+/// leads below the term it had promised, or without its data, is an
 /// incorrect recovery, never a fast one.
 async fn recoveries() {
     const RECOVERY_KEYS: u64 = 50;
+    const RECOVERY_TERM: u64 = 5;
     let image = Store::new();
     let promised = {
         let id_gen = ProposalIdGenerator::with_base(1 << 41);
-        let mut term = 0;
-        for round in 0..3 {
-            let engine = image.open();
-            let node = RaftNode::open(1, Arc::clone(&engine))
-                .await
-                .expect("open the image");
-            await_leadership(&node).await;
-            if round == 0 {
-                let pipeline = node.pipeline();
-                for n in 0..RECOVERY_KEYS {
-                    tokio::task::block_in_place(|| pipeline.propose_and_wait(&put(&id_gen, n)))
-                        .expect("commit");
-                }
-            }
-            term = term_of(&node);
-            node.shutdown().await.expect("shutdown");
-            drop(node);
-            released(engine).await;
+        let engine = image.open();
+        let node = RaftNode::open(1, Arc::clone(&engine))
+            .await
+            .expect("open the image");
+        await_leadership(&node).await;
+        let pipeline = node.pipeline();
+        for n in 0..RECOVERY_KEYS {
+            tokio::task::block_in_place(|| pipeline.propose_and_wait(&put(&id_gen, n)))
+                .expect("commit");
         }
+        drop(pipeline);
+        node.shutdown().await.expect("shutdown");
+        drop(node);
+        released(engine).await;
+        // A sole member keeps its term across restarts, so the image is
+        // given a vote of a later term: a group started afresh under its
+        // identity then shows as a lower term than the one it promised.
+        {
+            let mut log = LogStore::open(image.open()).expect("log");
+            log.save_vote(&Vote::new(RECOVERY_TERM, 1))
+                .await
+                .expect("promise a later term");
+        }
+        let engine = image.open();
+        let node = RaftNode::open(1, Arc::clone(&engine))
+            .await
+            .expect("reopen the image");
+        await_leadership(&node).await;
+        let term = term_of(&node);
+        node.shutdown().await.expect("shutdown");
+        drop(node);
+        released(engine).await;
         term
     };
     println!(
@@ -533,7 +547,7 @@ async fn recoveries() {
                             });
                             let outcome = if !led {
                                 "no leadership within 10 s".to_string()
-                            } else if term <= promised || !data {
+                            } else if term < promised || !data {
                                 format!(
                                     "incorrect recovery (term {term} against promised {promised}, data kept {data})"
                                 )
