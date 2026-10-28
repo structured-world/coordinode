@@ -495,6 +495,43 @@ pub(crate) async fn admin_node_decommission(
     Ok(())
 }
 
+/// Execute `coordinode admin node replace`: put a new node, running on its
+/// own empty data directory, in place of a member that can no longer take
+/// part. Returns once the replacement is complete; run it again with the
+/// same arguments to resume one that was cut short.
+pub(crate) async fn admin_node_replace(
+    cluster_addr: String,
+    old_node_id: u64,
+    new_node_id: u64,
+    node_addr: String,
+    node_identity: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use proto::admin::cluster::{ReplaceNodeRequest, cluster_service_client::ClusterServiceClient};
+
+    let endpoint = client_uri(&cluster_addr);
+    eprintln!("Connecting to cluster at {endpoint} ...");
+    let mut client = ClusterServiceClient::connect(endpoint)
+        .await
+        .map_err(|e| format!("failed to connect to cluster: {e}"))?;
+    eprintln!("Replacing node {old_node_id} with node {new_node_id} at {node_addr} ...");
+    let resp = client
+        .replace_node(ReplaceNodeRequest {
+            old_node_id,
+            new_node_id,
+            address: node_addr,
+            node_identity,
+        })
+        .await
+        .map_err(|e| format!("ReplaceNode failed: {e}"))?
+        .into_inner();
+    eprintln!(
+        "Replacement complete: node {} is a voter, node {} left the group.\n\
+         The old node's data directory was left as it was.",
+        resp.new_node_id, resp.old_node_id
+    );
+    Ok(())
+}
+
 /// Execute `coordinode admin node join` — connect to a running cluster and initiate
 /// the full join lifecycle for a new node.
 ///

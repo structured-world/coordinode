@@ -23,6 +23,7 @@
 //! | `a_transaction_runs_through_any_member` | ExecuteCypher, CommitTransaction | A transaction started on a follower under the client's ID opens at the leader, takes statements through two members and commits through a follower; follower answers name the leader |
 //! | `a_write_through_a_follower_runs_at_the_leader` | ExecuteCypher | An autonomous write on a follower runs at the leader, one hop, naming the leader; the leader adds no hint |
 //! | `a_session_on_a_follower_works_on_the_leaders_transaction` | Session | A session on a follower fills the leader's transaction, and a session on another member continues and commits it |
+//! | `a_member_without_its_vote_is_refused_and_replaced` | serve, ReplaceNode | A member that lost every copy of its vote does not start; the leader replaces it with a new node, a repeated request changes nothing |
 //!
 //! ## Running
 //!
@@ -1137,6 +1138,98 @@ async fn three_member_group() -> (CoordinodeProcess, CoordinodeProcess, Coordino
         .await;
     }
     (n1, n2, n3)
+}
+
+/// A member that lost every copy of its vote does not start again: the
+/// process exits naming the refusal. The leader replaces it through
+/// ReplaceNode with a new node on its own directory; the same request sent
+/// again changes nothing, a request naming the old node id as the new one is
+/// refused, and the group keeps three voters with the new member in place
+/// of the old.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_without_its_vote_is_refused_and_replaced() {
+    use coordinode_integration::proto::admin::ReplaceNodeRequest;
+
+    let (n1, n2, n3) = three_member_group().await;
+    cypher_on(&n1, "CREATE (:Kept {v: 1})")
+        .await
+        .expect("the leader writes");
+    let (p1, p2, p3) = (n1.port, n2.port, n3.port);
+    let data_dir = n3.stop_keeping_data().await;
+    let dir = data_dir.path();
+    std::fs::remove_dir_all(dir.join("raft")).expect("lose the Raft tree");
+    std::fs::remove_dir_all(dir.join("local-journal")).expect("lose the journal");
+    for entry in std::fs::read_dir(dir).expect("list the store") {
+        let path = entry.expect("an entry").path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("consensus-vote"))
+        {
+            std::fs::remove_file(path).expect("lose a copy slot");
+        }
+    }
+    let (status, printed) = start_cluster_member_expecting_refusal(3, p3, &[p1, p2], dir).await;
+    assert!(
+        !status.success(),
+        "a member whose vote no copy proves must not start"
+    );
+    assert!(
+        printed.contains("vote cannot be proved"),
+        "the refusal must say what happened, got: {printed}"
+    );
+
+    let p4 = free_port();
+    let n4 = CoordinodeProcess::start_cluster_member(4, p4, &[p1, p2]).await;
+    let mut leader = n1.cluster_client().await;
+    let request = ReplaceNodeRequest {
+        old_node_id: 3,
+        new_node_id: 4,
+        address: n4.member_addr(),
+        node_identity: n4.member_identity(),
+    };
+    let own = leader
+        .replace_node(ReplaceNodeRequest {
+            new_node_id: 3,
+            ..request.clone()
+        })
+        .await
+        .expect_err("a member is never replaced by itself");
+    assert_eq!(own.code(), tonic::Code::InvalidArgument, "{own:?}");
+    let done = leader
+        .replace_node(request.clone())
+        .await
+        .expect("the replacement completes")
+        .into_inner();
+    assert_eq!((done.old_node_id, done.new_node_id), (3, 4));
+    leader
+        .replace_node(request)
+        .await
+        .expect("the same request again changes nothing");
+    wait_for_voters(&mut leader, 3, Duration::from_secs(40)).await;
+    let members: Vec<String> = leader
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await
+        .expect("status")
+        .into_inner()
+        .nodes
+        .into_iter()
+        .map(|n| n.node_id)
+        .collect();
+    assert!(
+        members.contains(&"4".to_string()) && !members.contains(&"3".to_string()),
+        "member 4 stands where 3 did: {members:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while local_read(&n4, "MATCH (n:Kept) RETURN n.v")
+        .await
+        .map_or(true, |rows| rows.len() != 1)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "member 4 never received the history"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 }
 
 /// A transaction ID as a client draws it: a random UUID.

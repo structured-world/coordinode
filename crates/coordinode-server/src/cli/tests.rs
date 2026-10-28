@@ -601,3 +601,28 @@ fn admin_node_decommission_force_requires_skip_confirmation() {
         _ => panic!("expected AdminNodeDecommission"),
     }
 }
+
+/// The replace command reads the old member, the new node id, its address
+/// and its identity, each from its own flag.
+#[test]
+fn admin_node_replace_reads_every_flag() {
+    let cmd = parse_args_from(&args(
+        "coordinode admin node replace --node http://n1:7080 --old 3 --id 4 --addr n4:7080 \
+         --identity spiffe://prod.example/db/node4",
+    ));
+    match cmd {
+        Command::AdminNodeReplace {
+            cluster_addr,
+            old_node_id,
+            new_node_id,
+            node_addr,
+            node_identity,
+        } => {
+            assert_eq!(cluster_addr, "http://n1:7080");
+            assert_eq!((old_node_id, new_node_id), (3, 4));
+            assert_eq!(node_addr, "n4:7080");
+            assert_eq!(node_identity, "spiffe://prod.example/db/node4");
+        }
+        _ => panic!("expected AdminNodeReplace"),
+    }
+}

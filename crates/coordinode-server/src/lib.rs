@@ -277,6 +277,22 @@ pub(crate) async fn run_with(
             admin_node_decommission(cluster_addr, node_id, pruning, force, skip_confirmation)
                 .await?;
         }
+        cli::Command::AdminNodeReplace {
+            cluster_addr,
+            old_node_id,
+            new_node_id,
+            node_addr,
+            node_identity,
+        } => {
+            admin::admin_node_replace(
+                cluster_addr,
+                old_node_id,
+                new_node_id,
+                node_addr,
+                node_identity,
+            )
+            .await?;
+        }
     }
 
     Ok(())

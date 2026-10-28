@@ -651,6 +651,140 @@ async fn a_group_fails_over_and_its_members_rejoin() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// Every file under `dir` with its bytes, sorted by path.
+fn listing(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut all = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        for entry in std::fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                all.push((path, bytes));
+            }
+        }
+    }
+    all.sort();
+    all
+}
+
+/// A member that lost every copy of its vote does not open through the host
+/// entry point: the open fails with the typed refusal.
+/// The leader replaces it through the handle with a new member under a new
+/// node id on its own directory; a repeated call changes nothing, the old
+/// identity cannot come back, and the old member's directory stays as it
+/// was for whoever inspects it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_without_its_vote_is_refused_and_replaced_through_the_handle() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (mut members, ports) = group(&dirs, None).await;
+        members[0]
+            .database()
+            .write()
+            .execute_cypher("CREATE (:Before {k: 1})")
+            .unwrap();
+        wait_until("member 3 holds the write", || {
+            count(&members[2], "Before") == 1
+        })
+        .await;
+
+        let lost = members.remove(2);
+        lost.shutdown().await.unwrap();
+        let dir = dirs[2].path();
+        std::fs::remove_dir_all(dir.join(Partition::Raft.name())).unwrap();
+        std::fs::remove_dir_all(dir.join("local-journal")).unwrap();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("consensus-vote"))
+            {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let leader = &members[0];
+        let refused = open(
+            3,
+            dir,
+            ports[2],
+            Founding::Join(leader.enrollment(addr(ports[0])).unwrap()),
+            ElectionPreference::Ordinary,
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(ReplicationError::Consensus(
+                    coordinode_raft::cluster::RaftNodeError::PromiseUnqualified(_)
+                ))
+            ),
+            "a member whose vote no copy proves must not open: {:?}",
+            refused.err()
+        );
+        // The store as the refusal left it (its trees opened, so their
+        // manifests were rewritten): nothing after this may touch it.
+        let damaged = listing(dir);
+
+        let new_dir = tempfile::tempdir().unwrap();
+        let new_port = alloc_port();
+        let replacement = open(
+            4,
+            new_dir.path(),
+            new_port,
+            Founding::Join(leader.enrollment(addr(ports[0])).unwrap()),
+            ElectionPreference::Ordinary,
+        )
+        .await
+        .unwrap();
+        // The same identity is never let back.
+        let same = leader.replace(3, 3, addr(ports[2]), PKI.identity(3)).await;
+        assert!(
+            matches!(same, Err(ReplicationError::Consensus(_))),
+            "a member is not replaced by itself: {same:?}"
+        );
+        leader
+            .replace(3, 4, addr(new_port), PKI.identity(4))
+            .await
+            .expect("the replacement completes");
+        leader
+            .replace(3, 4, addr(new_port), PKI.identity(4))
+            .await
+            .expect("a repeated replacement changes nothing");
+        wait_until("member 4 holds the history", || {
+            count(&replacement, "Before") == 1
+        })
+        .await;
+        leader
+            .database()
+            .write()
+            .execute_cypher("CREATE (:After {k: 1})")
+            .unwrap();
+        wait_until("member 4 takes new writes", || {
+            count(&replacement, "After") == 1
+        })
+        .await;
+        let back = leader.add_learner(3, addr(ports[2]), PKI.identity(3)).await;
+        assert!(
+            matches!(back, Err(ReplicationError::Consensus(_))),
+            "the old identity is retired: {back:?}"
+        );
+        assert!(
+            listing(dir) == damaged,
+            "the replacement left the old directory as it was"
+        );
+
+        replacement.shutdown().await.unwrap();
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A dump in `format` of a database holding two `:U` nodes under a unique
 /// index and an edge with a property between them.
 fn dump(format: BackupFormat) -> Vec<u8> {

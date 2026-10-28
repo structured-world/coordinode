@@ -6,6 +6,8 @@
 //! - [`ClusterServiceImpl::get_cluster_status`]: current node roles + replication lag
 //! - [`ClusterServiceImpl::add_node`]: low-level learner-only add (no auto-promotion)
 //! - [`ClusterServiceImpl::remove_node`]: membership remove
+//! - [`ClusterServiceImpl::replace_node`]: a new member in place of one that
+//!   can no longer take part, resumable by repeating the request
 //!
 //! ## Join Lifecycle
 //!
@@ -43,7 +45,7 @@ use crate::proto::admin::cluster::{
     AddNodeRequest, ClusterNode, ClusterStatus, DecommissionNodeRequest, DecommissionNodeResponse,
     GetClusterStatusRequest, JoinNodeRequest, JoinNodeResponse, JoinProgressRequest, JoinStatus,
     NodeRole as ProtoNodeRole, NodeState as ProtoNodeState, RemoveNodeRequest, RemoveNodeResponse,
-    cluster_service_server::ClusterService,
+    ReplaceNodeRequest, ReplaceNodeResponse, cluster_service_server::ClusterService,
 };
 
 // ── Join state registry ────────────────────────────────────────────────────────
@@ -428,6 +430,48 @@ impl ClusterService for ClusterServiceImpl {
             node_id: result.node_id,
             message: result.message,
             operator_cleanup_required: result.operator_cleanup_required,
+        }))
+    }
+
+    // ── Replacement ─────────────────────────────────────────────────────────
+
+    async fn replace_node(
+        &self,
+        req: Request<ReplaceNodeRequest>,
+    ) -> Result<Response<ReplaceNodeResponse>, Status> {
+        let r = req.into_inner();
+        if r.old_node_id == r.new_node_id {
+            return Err(Status::invalid_argument(format!(
+                "member {} is replaced under a new node id, never its own",
+                r.old_node_id
+            )));
+        }
+        let identity = node_identity(&r.node_identity)?;
+        tracing::info!(
+            old = r.old_node_id,
+            new = r.new_node_id,
+            addr = r.address,
+            identity = %identity,
+            "ReplaceNode: replacing a member"
+        );
+        // Nothing streams this call's progress; it returns when it is done.
+        let (progress, _) = broadcast::channel::<JoinProgressEvent>(1);
+        self.raft_node
+            .replace_member(r.old_node_id, r.new_node_id, r.address, identity, progress)
+            .await
+            .map_err(|e| match e {
+                // The request names an identity or a state the group does
+                // not allow: a leader elsewhere, a node bound to another
+                // identity, a retired identity, no quorum, no catch-up.
+                coordinode_raft::cluster::RaftNodeError::Identity(reason)
+                | coordinode_raft::cluster::RaftNodeError::Membership(reason) => {
+                    Status::failed_precondition(reason)
+                }
+                e => Status::internal(format!("replace_member failed: {e}")),
+            })?;
+        Ok(Response::new(ReplaceNodeResponse {
+            old_node_id: r.old_node_id,
+            new_node_id: r.new_node_id,
         }))
     }
 }

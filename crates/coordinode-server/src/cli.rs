@@ -152,6 +152,20 @@ pub enum Command {
         /// Required when --force is set. Confirms awareness of potential data loss.
         skip_confirmation: bool,
     },
+    /// Replace a member that can no longer take part with a new node.
+    AdminNodeReplace {
+        /// gRPC address of any cluster member (usually the leader).
+        cluster_addr: String,
+        /// Numeric node ID of the member being replaced.
+        old_node_id: u64,
+        /// Numeric node ID of the replacement; never the old one.
+        new_node_id: u64,
+        /// gRPC address of the replacement (host:port). It must be running
+        /// on its own, empty data directory.
+        node_addr: String,
+        /// The SPIFFE ID the replacement proves on the inter-node channel.
+        node_identity: String,
+    },
 }
 
 /// Parse command line arguments.
@@ -333,7 +347,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode healthcheck [--config FILE] [--ops-addr HOST:PORT] [--timeout-ms N]\n  \
                  coordinode version\n  \
                  coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR --identity SPIFFE_ID [--pre-seeded] [--follow]\n  \
-                 coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n",
+                 coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n  \
+                 coordinode admin node replace --node CLUSTER_ADDR --old NODE_ID --id NEW_NODE_ID --addr NODE_ADDR --identity SPIFFE_ID\n",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(1);
@@ -346,6 +361,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
 /// Supports:
 /// - `coordinode admin node join --node ADDR --id ID --addr ADDR --identity SPIFFE_ID [--pre-seeded] [--follow]`
 /// - `coordinode admin node decommission --node ADDR --id ID [--pruning] [--force] [--skip-confirmation]`
+/// - `coordinode admin node replace --node ADDR --old ID --id NEW_ID --addr ADDR --identity SPIFFE_ID`
 fn parse_admin_args(args: &[String]) -> Command {
     // args[1] = "admin", args[2] should be the admin object
     let object = args.get(2).map(|s| s.as_str()).unwrap_or("");
@@ -435,12 +451,39 @@ fn parse_admin_args(args: &[String]) -> Command {
                 skip_confirmation,
             }
         }
+        ("node", "replace") => {
+            let required = |flag: &str, what: &str| match find_flag(args, flag) {
+                Some(value) => value,
+                None => {
+                    eprintln!("error: {flag} {what} is required for admin node replace");
+                    std::process::exit(1);
+                }
+            };
+            let id = |flag: &str| {
+                let value = required(flag, "NODE_ID");
+                match value.parse::<u64>() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        eprintln!("error: {flag} must be a positive integer, got '{value}'");
+                        std::process::exit(1);
+                    }
+                }
+            };
+            Command::AdminNodeReplace {
+                cluster_addr: required("--node", "CLUSTER_ADDR"),
+                old_node_id: id("--old"),
+                new_node_id: id("--id"),
+                node_addr: required("--addr", "NODE_ADDR"),
+                node_identity: required("--identity", "SPIFFE_ID"),
+            }
+        }
         _ => {
             eprintln!(
                 "coordinode admin: unknown subcommand '{object} {subcommand}'\n\n\
                  Admin commands:\n  \
                  coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR --identity SPIFFE_ID [--pre-seeded] [--follow]\n  \
-                 coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n"
+                 coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n  \
+                 coordinode admin node replace --node CLUSTER_ADDR --old NODE_ID --id NEW_NODE_ID --addr NODE_ADDR --identity SPIFFE_ID\n"
             );
             std::process::exit(1);
         }

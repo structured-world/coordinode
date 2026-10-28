@@ -707,6 +707,15 @@ them is dropped, a Raft vote, a checkpoint) flushes the device caches under
 each endpoint once; `fsync` syncs tables the plain way and never flushes the
 device.
 
+A memtable flush that runs in the background, because a memtable filled or
+aged, does not sync the table it writes: the journal already holds every
+write in it, so the table only needs to be durable by the time the journal
+lets those entries go. Each of those points (an oplog or Raft log purge, a
+Raft vote, a checkpoint or backup, an explicit flush) first makes every
+earlier flush durable at once. After a power cut a tree opens at the last of
+those points, and its entries after it are replayed from the journal. A store
+kept in memory has no journal, and its flushes stay synced.
+
 Segments rotate at whichever size limit is reached first. In the journal of
 an embedded database, `retention_secs` is a floor, not a promise to delete: a
 segment is kept while a checkpoint still needs it or any table still lacks one
@@ -1087,6 +1096,7 @@ ignored. `healthcheck` opens nothing: it asks a running server.
 | `coordinode healthcheck` | (none) | Exit 0 when a running server answers `/ready` with 200, 1 otherwise. Probes the server's `ops_addr`: the built-in default (`[::]:7084`), else the one in `--config FILE`, else `--ops-addr HOST:PORT`, which overrides both. A wildcard address (`[::]`, `0.0.0.0`) is probed on this host's loopback, IPv6 and IPv4. `--timeout-ms N` (default 2000) bounds the connect and the answer. Opens no storage; meant for container health checks |
 | `coordinode admin node join` | `--node ADDR --id ID --addr ADDR --identity SPIFFE_ID` | `--pre-seeded`, `--follow` |
 | `coordinode admin node decommission` | `--node ADDR --id ID` | `--pruning`, `--force`, `--skip-confirmation` |
+| `coordinode admin node replace` | `--node ADDR --old ID --id NEW_ID --addr ADDR --identity SPIFFE_ID` | Puts a new member in place of one that can no longer take part; see [Replacing a member](#replacing-a-member) |
 
 Run `coordinode` with no recognized subcommand to print the full usage summary.
 
@@ -1168,3 +1178,52 @@ it, up to `membership_change_timeout_secs` (default 30), and is refused
 naming the change in progress when that runs out. When no leader is known,
 because the cluster has lost the quorum to elect one, the command is refused
 saying so; nothing is changed.
+
+### A member's vote and its second copy
+
+A member promises its vote before it answers a vote request, and that promise
+must survive anything short of losing the whole data directory: a member that
+forgot a vote could vote twice in one term and let two leaders commit
+different histories. Each member keeps its vote twice, in its consensus log
+store and in a second copy beside it (`consensus-vote.N` files at the root of
+the data directory, about a hundred bytes in two files between writes). Both
+copies are written and synced before the vote is answered.
+
+| What was lost | What the member does at start |
+|---------------|-------------------------------|
+| One copy (a lost log store, a lost or damaged `consensus-vote.N`) | Opens normally from the other copy and writes the lost one again before it takes part |
+| Every copy | Does not start. The process exits naming the cause: `this member's vote cannot be proved (...); it takes no part in its group until it is replaced under a new identity through the group's membership`. Its data stays in its directory: nothing is erased, and nothing after the refusal writes there |
+| Every copy, on the only voter of its group | Does not start either: a group whose only voter forgot its vote is not started again under the same identity |
+
+A store opened under another node id than the one its vote was given as is
+refused the same way, before the consensus engine starts. The copy is counted
+against the endpoint's hard limit like any other file; when the limit is
+reached it is written from the reserve kept for the store's own recovery, so a
+full disk does not stop a member from keeping its promise.
+
+### Replacing a member
+
+A member whose vote no copy proves comes back only as a new member: a new node
+id, its own node identity and an **empty** data directory. Its old directory is
+never erased by CoordiNode; keep it for inspection and delete it yourself once
+the replacement is done.
+
+1. Start the new node as a joiner, exactly as for a join:
+   `coordinode serve --config ... --node-id 4 --peers node1:7080,node2:7080
+   --data /var/lib/coordinode-new`.
+2. Replace the old member from any member that can reach the leader:
+   `coordinode admin node replace --node node1:7080 --old 3 --id 4 --addr
+   node4:7080 --identity spiffe://prod.example/db/node4`.
+
+The new node joins as a learner and receives the group's state; once it has
+caught up, one membership change makes it a voter and removes the old member,
+whose node identity is retired and never admitted again. The command returns
+when that is done. If it fails or is cut short (a lost connection, a leader
+change), run the same command again: each step looks at the membership first,
+so it continues where it stopped and never adds a second member. A command
+naming the old node id as the new one is refused.
+
+A replacement is a membership change and needs the quorum. When too many
+members lost their votes at once to leave a quorum, the group stays
+unavailable: it is not continued on forgotten votes, and no replacement can be
+committed. Recover it from a backup.

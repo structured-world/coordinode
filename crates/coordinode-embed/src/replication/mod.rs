@@ -791,6 +791,38 @@ impl ReplicatedDatabase {
         Ok(())
     }
 
+    /// Replace member `old` with member `new`, reachable at `addr` and bound
+    /// to `identity`: the way back for a member that can no longer take part,
+    /// such as one whose vote no copy proves
+    /// ([`RaftNodeError::PromiseUnqualified`]). `new` runs on its own, empty
+    /// store; `old`'s store is left as it was. `new` joins as a learner, and
+    /// once it has caught up one membership change makes it a voter and
+    /// retires `old`. A call that failed or was cut short is resumed by
+    /// calling again with the same arguments; a repeated call adds no second
+    /// member.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicationError::Consensus`]: `new` equals `old` (a member is never
+    /// let back under the identity it may have broken a promise under), not
+    /// the leader, `new` already bound to another identity or not caught up
+    /// within the join timeout, no quorum to commit the change.
+    pub async fn replace(
+        &self,
+        old: u64,
+        new: u64,
+        addr: impl Into<String>,
+        identity: PeerIdentity,
+    ) -> Result<(), ReplicationError> {
+        // No one here follows the catch-up; the call returns when it is done.
+        let (progress, _) = tokio::sync::broadcast::channel(1);
+        self.member
+            .node
+            .replace_member(old, new, addr.into(), identity, progress)
+            .await?;
+        Ok(())
+    }
+
     /// This member's version report: its version pair, its group's, whether
     /// it serves writes and why not.
     pub fn version_report(&self) -> VersionReport {
