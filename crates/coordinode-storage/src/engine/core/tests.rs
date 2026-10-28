@@ -1008,13 +1008,17 @@ fn a_torn_manifest_tail_opens_without_a_repair() {
         engine
             .put(Partition::Node, b"node:torn-tail", b"survives")
             .expect("put");
+        // A store with a journal leaves its flushes' durability to a
+        // barrier: each barrier writes one manifest record.
         tree.flush_active_memtable(0).expect("flush");
+        tree.persist_flushes().expect("barrier");
         let before = logs();
-        // A second flush appends one record: the one the power cut tears.
+        // A second barrier appends one record: the one the power cut tears.
         engine
             .put(Partition::Node, b"node:torn-away", b"unacknowledged")
             .expect("put");
         tree.flush_active_memtable(0).expect("flush");
+        tree.persist_flushes().expect("barrier");
         logs()
             .into_iter()
             .find_map(|(path, len)| {

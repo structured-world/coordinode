@@ -970,11 +970,11 @@ fn an_entry_flushed_in_one_partition_is_replayed_only_into_the_other() {
     {
         let (engine, oracle) = rig.open();
         write_batch(&engine, &oracle, &entry);
-        engine
-            .tree(Partition::Adj)
-            .expect("adj tree")
-            .flush_active_memtable(0)
-            .expect("flush adj alone");
+        let adj = engine.tree(Partition::Adj).expect("adj tree");
+        adj.flush_active_memtable(0).expect("flush adj alone");
+        // On disk before the cut: the barrier a journaled store's flushes
+        // wait for.
+        adj.persist_flushes().expect("persist adj alone");
         rig.cut(engine);
     }
 
@@ -2239,8 +2239,15 @@ fn run_campaign(engine: &StorageEngine, oracle: &TimestampOracle) -> Vec<u64> {
         acked.push(i);
         let step = match i {
             7 => engine.persist(),
-            11 => engine
-                .tree(Partition::Adj)
+            // One tree's flush made durable alone.
+            11 => engine.tree(Partition::Adj).and_then(|t| {
+                t.flush_active_memtable(0)?;
+                Ok(t.persist_flushes()?)
+            }),
+            // One tree's flush left to the next barrier, as the flush
+            // workers leave it: the purge below is that barrier.
+            13 => engine
+                .tree(Partition::Node)
                 .and_then(|t| Ok(t.flush_active_memtable(0)?)),
             15 => engine.oplog_purge_expired(0, u64::MAX).map(|_| ()),
             _ => Ok(()),
@@ -2816,11 +2823,11 @@ mod derived {
         {
             let (engine, oracle) = rig.open();
             write_batch(&engine, &oracle, &unit(7, "late@x", None));
-            engine
-                .tree(Partition::Node)
-                .expect("node tree")
-                .flush_active_memtable(0)
+            let node = engine.tree(Partition::Node).expect("node tree");
+            node.flush_active_memtable(0)
                 .expect("flush the node partition alone");
+            node.persist_flushes()
+                .expect("persist the node partition alone");
             rig.cut(engine);
         }
         for attempt in 0..2 {

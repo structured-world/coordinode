@@ -1143,6 +1143,23 @@ impl StorageConfig {
             .ok_or(EndpointSelectionError::NoWalEligible)
     }
 
+    /// When a tree's flushes become durable. A store on an endpoint that can
+    /// hold a journal keeps one (its own oplog, or the member-local journal
+    /// beside a consensus log that covers the rest), and every write reaches
+    /// that journal before a tree: a flush then needs no syncs of its own,
+    /// and every point that drops part of a journal or promises a write
+    /// first makes the flushes durable at a barrier (the engine's
+    /// `flush_memtables` and everything built on it).
+    /// A store with no such endpoint has no journal, so its flushes stay
+    /// synced.
+    pub(crate) fn tree_flush_durability(&self) -> lsm_tree::config::FlushDurability {
+        if self.select_oplog_endpoint(0).is_ok() {
+            lsm_tree::config::FlushDurability::Deferred
+        } else {
+            lsm_tree::config::FlushDurability::Synced
+        }
+    }
+
     /// Select the endpoint that hosts oplog segments for `shard_id`
     /// (a non-volatile endpoint, so the log survives a restart).
     ///
@@ -1448,6 +1465,7 @@ impl StorageConfig {
         )
         .data_block_compression_policy(compression_policy)
         .sync_mode(self.oplog_sync_method.tree_sync_mode())
+        .flush_durability(self.tree_flush_durability())
         // A power cut mid-append tears the manifest edit log's last record,
         // which was never acknowledged: roll it back and open at the durable
         // prefix, rather than rebuild the manifest from the tables (which

@@ -1436,6 +1436,7 @@ impl StorageEngine {
             for table_id in &touched {
                 if let Some(tree) = columnar_tables.get(table_id) {
                     tree.flush_active_memtable(0)?;
+                    tree.persist_flushes()?;
                 }
             }
             if replayed > 0 {
@@ -1894,6 +1895,7 @@ impl StorageEngine {
                 self.next_seqno(),
             );
             tree.flush_active_memtable(0)?;
+            tree.persist_flushes()?;
             Ok(())
         })
     }
@@ -5169,6 +5171,11 @@ impl StorageEngine {
             // A new table may need compacting.
             self.compaction_wake.notify();
         }
+        // The barrier: this flush and every one the flush workers left
+        // unsynced reach the manifest before a caller drops the journal they
+        // hold or promises a write. A tree whose flushes are synced has
+        // nothing pending.
+        tree.persist_flushes()?;
         Ok(())
     }
 

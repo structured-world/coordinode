@@ -571,6 +571,30 @@ fn oplog_eligibility_matrix() {
     assert!(!ram.is_oplog_eligible());
 }
 
+/// A store with an endpoint that can hold a journal keeps one, so its trees
+/// leave a flush's durability to the engine's barriers; a store kept in
+/// memory has no journal and its trees sync every flush.
+#[test]
+fn trees_defer_flush_syncs_only_where_a_journal_covers_them() {
+    use lsm_tree::config::FlushDurability;
+    let durable = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "a",
+        "/a",
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    assert_eq!(durable.tree_flush_durability(), FlushDurability::Deferred);
+    let memory = StorageConfig::with_endpoints_no_persistence(vec![EndpointConfig::new(
+        "m",
+        "memory",
+        Media::Ram,
+        Durability::Volatile,
+        Tier::Memory,
+    )]);
+    assert_eq!(memory.tree_flush_durability(), FlushDurability::Synced);
+}
+
 #[test]
 fn select_wal_endpoint_picks_first_eligible() {
     // Two endpoints: first is NOT WAL-eligible (HDD Warm), second is.

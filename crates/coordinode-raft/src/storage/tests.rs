@@ -2088,11 +2088,9 @@ async fn an_entry_one_tree_flushed_is_replayed_only_into_the_other() {
             .expect("open");
         ts = oracle.current().as_raw() + 1_000;
         apply_entries(&mut sm, vec![two_tree_merge_entry(1, ts)]).await;
-        engine
-            .tree(Partition::Adj)
-            .unwrap()
-            .flush_active_memtable(0)
-            .unwrap();
+        let adj = engine.tree(Partition::Adj).unwrap();
+        adj.flush_active_memtable(0).unwrap();
+        adj.persist_flushes().unwrap();
         drop(sm);
         rig.cut(engine);
     }
@@ -2155,11 +2153,9 @@ async fn a_registration_lost_before_flush_replays_to_the_same_ids() {
         ts2 = ts1 + 1;
         apply_entries(&mut sm, vec![register(1, ts1, &["b", "a"])]).await;
         // Entry 1 reaches disk; entry 2 stays in the memtable the cut loses.
-        engine
-            .tree(Partition::Schema)
-            .unwrap()
-            .flush_active_memtable(0)
-            .unwrap();
+        let schema = engine.tree(Partition::Schema).unwrap();
+        schema.flush_active_memtable(0).unwrap();
+        schema.persist_flushes().unwrap();
         apply_entries(&mut sm, vec![register(2, ts2, &["a", "c", "d"])]).await;
         let before = bindings(&engine);
         drop(sm);
@@ -2255,8 +2251,18 @@ async fn run_raft_campaign(
         applied.push(i);
         let step = match i {
             7 => engine.persist().map_err(|e| e.to_string()),
-            11 => engine
+            // One tree's flush made durable alone.
+            9 => engine
                 .tree(Partition::Adj)
+                .map_err(|e| e.to_string())
+                .and_then(|t| {
+                    t.flush_active_memtable(0).map_err(|e| e.to_string())?;
+                    t.persist_flushes().map_err(|e| e.to_string())
+                }),
+            // One tree's flush left to the next barrier, as the flush workers
+            // leave it: the log purge below must not pass it.
+            11 => engine
+                .tree(Partition::Node)
                 .map_err(|e| e.to_string())
                 .and_then(|t| {
                     t.flush_active_memtable(0)
