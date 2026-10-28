@@ -7181,6 +7181,8 @@ async fn a_timestamp_below_the_closed_bound_is_refused() {
         let closed = engine.closure_frontier();
         assert!(closed > ts, "the bound passed the commit");
 
+        // An idle group keeps closing, so the bound the refusal names may
+        // already lie above the one read here, never below it.
         let refused = node.pipeline().propose_and_wait(&RaftProposal {
             id: ProposalIdGenerator::new().next(),
             mutations: vec![Mutation::Put {
@@ -7194,7 +7196,7 @@ async fn a_timestamp_below_the_closed_bound_is_refused() {
         });
         assert!(
             matches!(refused, Err(ProposalError::BelowClosedBound { commit_ts, closed_below })
-                if commit_ts == ts && closed_below == closed),
+                if commit_ts == ts && closed_below >= closed),
             "{refused:?}"
         );
         assert!(
