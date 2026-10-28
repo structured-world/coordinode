@@ -1688,7 +1688,17 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
             let key = b"meta:probe";
             engine.put(partition, key, b"v").expect("put");
 
-            faults.arm(FaultRule::new(failed, refuse).skip(k).once());
+            // Only the partition's own files: the rule fires once, and a
+            // background sync of any other file the fresh store touches would
+            // otherwise take it and leave the persist unfailed. The persist
+            // syncs no journal here (`put` writes none), so nothing it does
+            // lies outside the partition.
+            faults.arm(
+                FaultRule::new(failed, refuse)
+                    .on_path(partition.name())
+                    .skip(k)
+                    .once(),
+            );
             let first = engine.persist_partition(partition);
             if first.is_ok() {
                 // The operation to fail lies past the last one a persist makes.
