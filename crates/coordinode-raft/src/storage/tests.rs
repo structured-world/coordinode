@@ -1955,6 +1955,62 @@ async fn a_store_bound_before_incarnations_is_converted_or_refused() {
     assert!(PromiseUnqualified::of(&err).is_some(), "typed: {err}");
 }
 
+/// A conversion cut short after the second copy was written and before the
+/// marker took its incarnation is finished by the next open under the
+/// copy's incarnation, not a newly drawn one; the copy alone still proves
+/// the vote when the tree's record is lost as well.
+#[tokio::test]
+async fn a_conversion_cut_short_before_the_marker_is_finished_by_the_next_open() {
+    let incarnation = [0x5a; 16];
+    let vote = Vote::new(6, 1);
+    for lose_the_tree in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = compacting_config(dir.path());
+        {
+            let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+            let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+            log.save_vote(&vote).await.expect("save");
+            append_durable(&mut log, vec![make_entry(1, 6, "x")]).await;
+        }
+        // The earlier layout, then the conversion's copy write and nothing
+        // after it: the marker is still empty.
+        std::fs::write(dir.path().join("consensus-log"), b"").expect("empty marker");
+        lose_the_copy(dir.path());
+        {
+            let engine = StorageEngine::open(&config).expect("reopen");
+            engine
+                .write_promise_copy(&incarnation, &promises_of(Some(vote)))
+                .expect("the conversion's copy");
+        }
+        if lose_the_tree {
+            std::fs::remove_dir_all(dir.path().join(Partition::Raft.name()))
+                .expect("lose the tree");
+        }
+
+        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+        assert_eq!(
+            log.read_vote().await.expect("read"),
+            Some(vote),
+            "tree lost: {lose_the_tree}"
+        );
+        assert!(
+            matches!(
+                engine.consensus_binding().expect("binding"),
+                ConsensusBinding::Bound(bound) if bound == incarnation
+            ),
+            "tree lost: {lose_the_tree}: the marker must take the copy's incarnation"
+        );
+        assert!(
+            matches!(
+                engine.read_promise_copy().expect("copy"),
+                PromiseCopy::Held { incarnation: held, .. } if held == incarnation
+            ),
+            "tree lost: {lose_the_tree}"
+        );
+    }
+}
+
 /// An unchanged vote costs no write in either copy: openraft may save the
 /// vote it already holds, and only a change needs a sync. The tree's copy
 /// is made durable by a member-local journal sync, so a rewrite shows in
