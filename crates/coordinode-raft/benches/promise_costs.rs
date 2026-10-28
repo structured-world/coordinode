@@ -43,8 +43,9 @@ use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_raft::storage::{LogStore, Vote};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::partition::Partition;
 use coordinode_test_fixtures::{TestPki, alloc_port};
-use lsm_tree::fs::{FaultFs, FaultInjector, StdFs, SyncKind};
+use lsm_tree::fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs, SyncKind};
 use openraft::async_runtime::watch::WatchReceiver as _;
 use openraft::storage::RaftLogStorage;
 
@@ -61,9 +62,20 @@ fn ops(default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Whether `section` runs: all of them unless `PROMISE_COSTS_SECTION` names one.
+/// Whether `section` runs: all of them unless `PROMISE_COSTS_SECTION` names
+/// it, alone or in a comma-separated list.
 fn runs(section: &str) -> bool {
-    std::env::var("PROMISE_COSTS_SECTION").map_or(true, |only| only == section)
+    std::env::var("PROMISE_COSTS_SECTION").map_or(true, |only| {
+        only.split(',').any(|name| name.trim() == section)
+    })
+}
+
+/// A repetition count from `var`, or `default`.
+fn count(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .map(|n| n.parse().expect("a repetition count"))
+        .unwrap_or(default)
 }
 
 /// A store whose filesystem counts the syncs it is asked for.
@@ -328,6 +340,401 @@ async fn commits() {
     released(engine).await;
 }
 
+/// Keys of the committed data a recovery image holds and a read reads.
+fn data_key(n: u64) -> Vec<u8> {
+    format!("node:1:{n}").into_bytes()
+}
+
+/// The value [`put`] writes.
+const DATA_VALUE: [u8; 64] = [7; 64];
+
+/// Leadership within `limit`, polled.
+async fn leads_within(node: &RaftNode, limit: Duration) -> bool {
+    let t = Instant::now();
+    while t.elapsed() < limit {
+        if node.is_leader().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    false
+}
+
+fn term_of(node: &RaftNode) -> u64 {
+    node.raft().metrics().borrow_watched().current_term
+}
+
+/// Copy the closed store at `from` to `to`, files and directories alike.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create the image directory");
+    for entry in std::fs::read_dir(from).expect("list the image") {
+        let entry = entry.expect("an image entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("an entry type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy an image file");
+        }
+    }
+}
+
+/// The second copy's slot files in `dir`, whatever their state.
+fn copy_slot_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("list the store")
+        .map(|entry| entry.expect("a store entry"))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("consensus-vote")
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// What a store loses before the measured reopen.
+#[derive(Clone, Copy)]
+enum Loss {
+    /// The Raft tree and the member-local journal; the second copy, where
+    /// the build has one, stays.
+    RaftTree,
+    /// Every slot of the second copy damaged in its middle byte; the Raft
+    /// tree stays.
+    SecondCopy,
+    /// The Raft tree, the member-local journal and every slot of the copy.
+    Everything,
+}
+
+impl Loss {
+    fn name(self) -> &'static str {
+        match self {
+            Loss::RaftTree => "Raft tree lost",
+            Loss::SecondCopy => "second copy damaged",
+            Loss::Everything => "Raft tree and every copy lost",
+        }
+    }
+
+    /// Inflict the loss on the closed store at `dir`. `false`: the loss does
+    /// not apply to this build (it keeps no second copy to damage).
+    fn inflict(self, dir: &std::path::Path) -> bool {
+        let slots = copy_slot_paths(dir);
+        let lose_tree = || {
+            std::fs::remove_dir_all(dir.join(Partition::Raft.name())).expect("lose the Raft tree");
+            let journal = dir.join("local-journal");
+            if journal.exists() {
+                std::fs::remove_dir_all(journal).expect("lose the member-local journal");
+            }
+        };
+        match self {
+            Loss::RaftTree => lose_tree(),
+            Loss::SecondCopy => {
+                if slots.is_empty() {
+                    return false;
+                }
+                for slot in &slots {
+                    let mut bytes = std::fs::read(slot).expect("read a slot");
+                    let middle = bytes.len() / 2;
+                    bytes[middle] ^= 0xFF;
+                    std::fs::write(slot, &bytes).expect("damage a slot");
+                }
+            }
+            Loss::Everything => {
+                lose_tree();
+                for slot in &slots {
+                    std::fs::remove_file(slot).expect("lose a slot");
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Recovery after each [`Loss`], timed from the engine open to leadership or
+/// to the refusal, on a copy of one closed image: the member committed
+/// `RECOVERY_KEYS` entries and was restarted until its term passed 1, so a
+/// group started afresh under its identity shows as a lower term. A reopen
+/// that leads without the term it had promised, or without its data, is an
+/// incorrect recovery, never a fast one.
+async fn recoveries() {
+    const RECOVERY_KEYS: u64 = 50;
+    let image = Store::new();
+    let promised = {
+        let id_gen = ProposalIdGenerator::with_base(1 << 41);
+        let mut term = 0;
+        for round in 0..3 {
+            let engine = image.open();
+            let node = RaftNode::open(1, Arc::clone(&engine))
+                .await
+                .expect("open the image");
+            await_leadership(&node).await;
+            if round == 0 {
+                let pipeline = node.pipeline();
+                for n in 0..RECOVERY_KEYS {
+                    tokio::task::block_in_place(|| pipeline.propose_and_wait(&put(&id_gen, n)))
+                        .expect("commit");
+                }
+            }
+            term = term_of(&node);
+            node.shutdown().await.expect("shutdown");
+            drop(node);
+            released(engine).await;
+        }
+        term
+    };
+    println!(
+        "recovery image: term {promised}, {RECOVERY_KEYS} committed keys, copy slots {}",
+        copy_slot_paths(image.dir.path()).len()
+    );
+    let repeats = count("PROMISE_COSTS_RECOVERIES", 100);
+    for loss in [Loss::RaftTree, Loss::SecondCopy, Loss::Everything] {
+        let mut outcomes: std::collections::BTreeMap<String, Vec<Duration>> =
+            std::collections::BTreeMap::new();
+        let mut applies = true;
+        for _ in 0..repeats {
+            let dir = tempfile::tempdir().expect("dir");
+            copy_tree(image.dir.path(), dir.path());
+            if !loss.inflict(dir.path()) {
+                applies = false;
+                break;
+            }
+            let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )])
+            .with_fs(Arc::new(FaultFs::with_injector(
+                StdFs,
+                Arc::new(FaultInjector::new()),
+            )));
+            let t = Instant::now();
+            let (outcome, took) = match StorageEngine::open(&config) {
+                Err(e) => (format!("refused at engine open: {e}"), t.elapsed()),
+                Ok(engine) => {
+                    let engine = Arc::new(engine);
+                    match RaftNode::open(1, Arc::clone(&engine)).await {
+                        Err(e) => {
+                            let took = t.elapsed();
+                            drop(engine);
+                            (format!("refused: {e}"), took)
+                        }
+                        Ok(node) => {
+                            let led = leads_within(&node, Duration::from_secs(10)).await;
+                            let took = t.elapsed();
+                            let term = term_of(&node);
+                            let data = (0..RECOVERY_KEYS).all(|n| {
+                                engine
+                                    .get(Partition::Node, &data_key(n))
+                                    .expect("read the data")
+                                    .as_deref()
+                                    == Some(DATA_VALUE.as_slice())
+                            });
+                            let outcome = if !led {
+                                "no leadership within 10 s".to_string()
+                            } else if term <= promised || !data {
+                                format!(
+                                    "incorrect recovery (term {term} against promised {promised}, data kept {data})"
+                                )
+                            } else {
+                                "recovered".to_string()
+                            };
+                            node.shutdown().await.expect("shutdown");
+                            drop(node);
+                            released(engine).await;
+                            (outcome, took)
+                        }
+                    }
+                }
+            };
+            outcomes.entry(outcome).or_default().push(took);
+        }
+        if !applies {
+            println!(
+                "recovery: {}: not applicable, this build keeps no second copy",
+                loss.name()
+            );
+            continue;
+        }
+        for (outcome, samples) in outcomes {
+            report(
+                &format!("recovery: {}: {outcome}", loss.name()),
+                samples,
+                None,
+            );
+        }
+    }
+}
+
+/// The second copy's files in `dir`: count, logical bytes and allocated bytes
+/// (512-byte blocks the filesystem reports). Allocated bytes leave out what
+/// the filesystem spends on metadata and copy-on-write outside the files.
+fn copy_footprint(dir: &std::path::Path) -> (usize, u64, u64) {
+    let mut footprint = (0, 0, 0);
+    for path in copy_slot_paths(dir) {
+        let meta = std::fs::metadata(&path).expect("a slot's metadata");
+        footprint.0 += 1;
+        footprint.1 += meta.len();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            footprint.2 += meta.blocks() * 512;
+        }
+    }
+    footprint
+}
+
+/// The most of each footprint field seen, and how often the file count fell
+/// between two observations (a removal the observations straddled).
+#[derive(Default)]
+struct Peak {
+    most: (usize, u64, u64),
+    last_files: usize,
+    falls: usize,
+}
+
+impl Peak {
+    fn observe(&mut self, dir: &std::path::Path) {
+        let now = copy_footprint(dir);
+        self.most = (
+            self.most.0.max(now.0),
+            self.most.1.max(now.1),
+            self.most.2.max(now.2),
+        );
+        if now.0 < self.last_files {
+            self.falls += 1;
+        }
+        self.last_files = now.0;
+    }
+
+    fn report(&self, label: &str) {
+        println!(
+            "{label:<30} copy peak: files={} logical bytes={} allocated bytes={}  file-count falls between observations={}",
+            self.most.0, self.most.1, self.most.2, self.falls
+        );
+    }
+}
+
+/// The second copy's peak footprint, observed after every write and before
+/// a removal it would make: a normal cycle of vote changes and restarts, then
+/// a chain of opens whose copy write fails at its sync (each leaves a slot it
+/// does not know of) and a write whose removal of the spent slots fails, so
+/// the state just before a removal stays to be observed.
+async fn footprints() {
+    let store = Store::new();
+    let dir = store.dir.path().to_path_buf();
+    let mut normal = Peak::default();
+    {
+        let mut log = LogStore::open(store.open()).expect("log");
+        for term in 1..=ops(300) {
+            log.save_vote(&Vote::new(term, 1)).await.expect("vote");
+            normal.observe(&dir);
+        }
+    }
+    for round in 0..20u64 {
+        let mut log = LogStore::open(store.open()).expect("reopen");
+        normal.observe(&dir);
+        log.save_vote(&Vote::new(1_000 + round, 1))
+            .await
+            .expect("vote");
+        normal.observe(&dir);
+    }
+    normal.report("copy footprint: normal cycle");
+
+    let mut chain = Peak::default();
+    let mut failed = 0;
+    chain.observe(&dir);
+    for attempt in 0..3u64 {
+        let mut log = LogStore::open(store.open()).expect("reopen");
+        store.syncs.arm(
+            FaultRule::new(
+                FaultOp::SyncAll,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            )
+            .on_path("consensus-vote")
+            .once(),
+        );
+        if log.save_vote(&Vote::new(2_000 + attempt, 1)).await.is_err() {
+            failed += 1;
+        }
+        store.syncs.clear();
+        chain.observe(&dir);
+    }
+    {
+        let mut log = LogStore::open(store.open()).expect("reopen after the failed writes");
+        chain.observe(&dir);
+        store.syncs.arm(
+            FaultRule::new(
+                FaultOp::RemoveFile,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            )
+            .on_path("consensus-vote"),
+        );
+        log.save_vote(&Vote::new(3_000, 1))
+            .await
+            .expect("vote, removal refused");
+        chain.observe(&dir);
+        store.syncs.clear();
+        log.save_vote(&Vote::new(3_001, 1))
+            .await
+            .expect("vote, removal allowed");
+        chain.observe(&dir);
+    }
+    chain.report("copy footprint: failed chain");
+    println!(
+        "{:<30} copy writes failed at sync: {failed} of 3; files after: {}",
+        "",
+        copy_footprint(&dir).0
+    );
+}
+
+/// Point reads through the engine of a single member that committed
+/// `READ_KEYS` entries: the latest committed value, read locally (not a
+/// linearizable read through the leader's lease), one at a time. Every key is
+/// read once before the measured phase and every value is checked.
+async fn reads() {
+    const READ_KEYS: u64 = 1_000;
+    const PASSES: u64 = 5;
+    let store = Store::new();
+    let engine = store.open();
+    let node = RaftNode::open(1, Arc::clone(&engine)).await.expect("open");
+    await_leadership(&node).await;
+    let pipeline = node.pipeline();
+    let id_gen = ProposalIdGenerator::with_base(1 << 42);
+    for n in 0..READ_KEYS {
+        tokio::task::block_in_place(|| pipeline.propose_and_wait(&put(&id_gen, n)))
+            .expect("commit");
+    }
+    let read = |n: u64| {
+        let value = engine.get(Partition::Node, &data_key(n)).expect("read");
+        assert_eq!(value.as_deref(), Some(DATA_VALUE.as_slice()), "key {n}");
+    };
+    for n in 0..READ_KEYS {
+        read(n);
+    }
+    let mut samples = Vec::with_capacity((READ_KEYS * PASSES) as usize);
+    let phase = Instant::now();
+    for _ in 0..PASSES {
+        for n in 0..READ_KEYS {
+            let t = Instant::now();
+            read(n);
+            samples.push(t.elapsed());
+        }
+    }
+    let wall = phase.elapsed();
+    println!(
+        "read (engine point read, latest, local, concurrency 1): {} reads in {wall:?}, {:.0} reads/s",
+        samples.len(),
+        samples.len() as f64 / wall.as_secs_f64()
+    );
+    report("read (engine point read)", samples, None);
+    drop(pipeline);
+    node.shutdown().await.expect("shutdown");
+    drop(node);
+    released(engine).await;
+}
+
 async fn restarts() {
     let store = Store::new();
     {
@@ -481,7 +888,7 @@ async fn failovers() {
     let mut caught_up = Vec::new();
     let (mut election_syncs, mut reopen_syncs) = ((0, 0), (0, 0));
     let mut slots = Slots::default();
-    for _ in 0..FAILOVERS {
+    for _ in 0..count("PROMISE_COSTS_FAILOVERS", FAILOVERS) {
         let (leader, _) = leader_in_metrics(&members).expect("a leader");
         assert!(
             members[leader].node().is_leader().await,
@@ -541,6 +948,18 @@ async fn failovers() {
         reopen_syncs = (reopen_syncs.0 + files, reopen_syncs.1 + dirs);
         slots.observe(members[leader].store.copy_slots());
     }
+    if traced() {
+        println!("failover trace: n,term,stop_to_leader_in_metrics_us,stop_to_confirmed_leader_us");
+        for (n, ((metrics, confirmed), term)) in
+            in_metrics.iter().zip(&confirmed).zip(&terms).enumerate()
+        {
+            println!(
+                "failover trace: {n},{term},{},{}",
+                metrics.as_micros(),
+                confirmed.as_micros()
+            );
+        }
+    }
     report("failover: stop to leader in metrics", in_metrics, None);
     report(
         "failover: stop to confirmed leader",
@@ -583,6 +1002,15 @@ fn main() {
         }
         if runs("failover") {
             failovers().await;
+        }
+        if runs("recovery") {
+            recoveries().await;
+        }
+        if runs("footprint") {
+            footprints().await;
+        }
+        if runs("read") {
+            reads().await;
         }
     });
 }
