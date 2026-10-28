@@ -1195,8 +1195,10 @@ copies are written and synced before the vote is answered.
 | Every copy | Does not start. The process exits naming the cause: `this member's vote cannot be proved (...); it takes no part in its group until it is replaced under a new identity through the group's membership`. Its data stays in its directory: nothing is erased, and nothing after the refusal writes there |
 | Every copy, on the only voter of its group | Does not start either: a group whose only voter forgot its vote is not started again under the same identity |
 
-A store opened under another node id than the one its vote was given as is
-refused the same way, before the consensus engine starts. The copy is counted
+A store opened under another node id or group than the one its vote was given
+as is refused before the consensus engine starts, and left as it was. A node
+started to join a group with such a store gets the join refusal: a joining node
+needs an empty data directory. The copy is counted
 against the endpoint's hard limit like any other file; when the limit is
 reached it is written from the reserve kept for the store's own recovery, so a
 full disk does not stop a member from keeping its promise.

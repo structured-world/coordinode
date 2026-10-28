@@ -392,9 +392,9 @@ async fn first_node_of_a_grown_directory_rejoins_after_failover() {
 /// own would be replaced, and a silent replacement is how a single-machine
 /// deployment loses everything it had. Growing that same directory into a
 /// group, where it is the first member, stays the supported path (the tests
-/// above), and an empty node joins as before. Opened under another node id,
-/// the store is refused earlier still, as the records of the member that
-/// wrote it.
+/// above), and an empty node joins as before. Opened to join under another
+/// node id, the store keeps another member's records, so it is not empty
+/// either: refused the same way, before anything opens on it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_holding_data_is_refused_when_it_joins() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
@@ -435,7 +435,8 @@ async fn a_node_holding_data_is_refused_when_it_joins() {
             refused.map(|_| "a running joining node")
         );
         // Joining as another node: the store keeps member 1's records, which
-        // no other member may take as its own.
+        // no other member may take as its own, and a joining node needs an
+        // empty store; the refusal is the one that names that fix.
         let refused = RaftNode::open_joining(
             2,
             Arc::clone(&engine),
@@ -447,9 +448,9 @@ async fn a_node_holding_data_is_refused_when_it_joins() {
         assert!(
             matches!(
                 refused,
-                Err(coordinode_raft::cluster::RaftNodeError::Identity(_))
+                Err(coordinode_raft::cluster::RaftNodeError::JoinWithLocalData)
             ),
-            "another member's store must be refused, got {:?}",
+            "another member's store must be refused as a joiner's, got {:?}",
             refused.map(|_| "a running joining node")
         );
         assert_eq!(

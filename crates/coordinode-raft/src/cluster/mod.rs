@@ -795,8 +795,7 @@ impl RaftNode {
             group: group.0,
             node: node_id,
         };
-        crate::storage::check_member(&engine, member)
-            .map_err(|e| RaftNodeError::Identity(e.to_string()))?;
+        crate::storage::check_member(&engine, member).map_err(member_refused)?;
         let log_store = LogStore::open(Arc::clone(&engine)).map_err(RaftNodeError::log_open)?;
         log_store
             .bind_member(member)
@@ -1046,8 +1045,16 @@ impl RaftNode {
             group: group.0,
             node: node_id,
         };
-        crate::storage::check_member(&engine, member)
-            .map_err(|e| RaftNodeError::Identity(e.to_string()))?;
+        crate::storage::check_member(&engine, member).map_err(|e| match (&founding, e) {
+            // A joining node needs an empty store, and one that keeps another
+            // member's records is not: the join refusal names the fix (an
+            // empty data directory), which a new node id alone would not.
+            (Founding::Join, crate::storage::MemberCheckError::Another { held, member }) => {
+                tracing::warn!(%held, %member, "a joining node opened another member's store");
+                RaftNodeError::JoinWithLocalData
+            }
+            (_, e) => member_refused(e),
+        })?;
         let mut config = snap_config.raft_config(timing, preference);
         // Committed entries the disk lost are sent again by a leader when the
         // group has another voter to hold them; alone, nothing could.
@@ -3596,6 +3603,15 @@ impl RaftNodeError {
             Some(Err(other)) => Self::Init(other.to_string()),
             None => Self::Init("the log could not be opened".to_owned()),
         }
+    }
+}
+
+/// The refusal for a store whose consensus records are not this member's, or
+/// cannot be read.
+fn member_refused(e: crate::storage::MemberCheckError) -> RaftNodeError {
+    match e {
+        crate::storage::MemberCheckError::Another { .. } => RaftNodeError::Identity(e.to_string()),
+        crate::storage::MemberCheckError::Read(_) => RaftNodeError::Init(e.to_string()),
     }
 }
 

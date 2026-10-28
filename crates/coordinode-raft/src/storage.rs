@@ -827,6 +827,22 @@ pub(crate) fn raft_log_bytes(engine: &StorageEngine) -> Result<u64, io::Error> {
     Ok(bytes)
 }
 
+/// Why [`check_member`] refused a store.
+#[derive(Debug, thiserror::Error)]
+pub enum MemberCheckError {
+    /// The store's consensus records belong to another member or group.
+    #[error("this store keeps the consensus records of {held}; it cannot be opened as {member}")]
+    Another {
+        /// The member the records belong to.
+        held: MemberBinding,
+        /// The member the store was opened as.
+        member: MemberBinding,
+    },
+    /// The records could not be read.
+    #[error("read the consensus records: {0}")]
+    Read(#[from] io::Error),
+}
+
 /// Refuse a store whose consensus records belong to a member other than
 /// `member`, before anything opens on it: reads only, so a refused store is
 /// left exactly as it was. A record that cannot be read is left to the log's
@@ -834,9 +850,10 @@ pub(crate) fn raft_log_bytes(engine: &StorageEngine) -> Result<u64, io::Error> {
 ///
 /// # Errors
 ///
-/// The Raft tree or the second copy names another member or group, or the
-/// store cannot be read.
-pub fn check_member(engine: &StorageEngine, member: MemberBinding) -> Result<(), io::Error> {
+/// [`MemberCheckError::Another`]: the Raft tree or the second copy names
+/// another member or group. [`MemberCheckError::Read`]: the store cannot be
+/// read.
+pub fn check_member(engine: &StorageEngine, member: MemberBinding) -> Result<(), MemberCheckError> {
     let storage = |e: StorageError| io::Error::other(e.to_string());
     let named = match engine.consensus_binding().map_err(storage)? {
         ConsensusBinding::Bound(bound) => Some(bound),
@@ -856,9 +873,7 @@ pub fn check_member(engine: &StorageEngine, member: MemberBinding) -> Result<(),
         .chain(in_copy)
         .find(|held| *held != member)
     {
-        Some(held) => Err(io::Error::other(format!(
-            "this store keeps the consensus records of {held}; it cannot be opened as {member}"
-        ))),
+        Some(held) => Err(MemberCheckError::Another { held, member }),
         None => Ok(()),
     }
 }
@@ -881,10 +896,7 @@ impl LogStore {
         match *bound {
             Some(held) if held == member => return Ok(()),
             Some(held) => {
-                return Err(io::Error::other(format!(
-                    "this store keeps the consensus records of {held}; it cannot be opened as \
-                     {member}"
-                )));
+                return Err(io::Error::other(MemberCheckError::Another { held, member }));
             }
             None => {}
         }
