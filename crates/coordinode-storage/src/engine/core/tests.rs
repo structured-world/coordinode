@@ -1688,16 +1688,15 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
             let key = b"meta:probe";
             engine.put(partition, key, b"v").expect("put");
 
-            // Only the partition's own files: the rule fires once, and a
-            // background sync of any other file the fresh store touches would
-            // otherwise take it and leave the persist unfailed. The persist
-            // syncs no journal here (`put` writes none), so nothing it does
-            // lies outside the partition.
+            // Every matching operation on the partition's files from the k-th
+            // on fails, not just one: a one-shot rule could be taken by a
+            // background thread's operation on the same files, leaving the
+            // persist unfailed. Background work failing too only leaves more
+            // for the retry to write.
             faults.arm(
                 FaultRule::new(failed, refuse)
                     .on_path(partition.name())
-                    .skip(k)
-                    .once(),
+                    .skip(k),
             );
             let first = engine.persist_partition(partition);
             if first.is_ok() {
