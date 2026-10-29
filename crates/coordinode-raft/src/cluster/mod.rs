@@ -1478,28 +1478,24 @@ impl RaftNode {
     }
 
     /// This node's turn to change the membership, held until the change is
-    /// done: membership changes made here run one at a time, and each starts
-    /// from a settled, single configuration.
+    /// done, so membership changes made here run one at a time; taken once
+    /// the entry that installed the membership in effect is committed.
     ///
-    /// Settled: the entry that installed the membership in effect is
-    /// committed. The membership in effect is visible before it commits, so
-    /// status can already show a new voter while the change that added it is
-    /// still being replicated, and openraft refuses a second change until the
-    /// first one commits. An operator acts on the status; every membership
-    /// change here starts by waiting for the previous one rather than failing
-    /// with it.
+    /// The membership in effect is visible before it commits, so status can
+    /// already show a new voter while the change that added it is still being
+    /// replicated, and openraft refuses a second change until the first one
+    /// commits. An operator acts on the status; every membership change here
+    /// starts by waiting for the previous one rather than failing with it.
     ///
-    /// Single: with the turn held, no change of this node is between its two
-    /// steps, so a committed joint configuration is one a lost leader or a call
-    /// cut short left behind, and nothing else moves it on. It is completed
-    /// first, to the configuration it was heading for, with the voters it
-    /// drops kept as learners: the change that wanted one of them gone removes
-    /// it itself, and none is lost that another change meant to keep. A change
-    /// is then computed from the voters that stand, not from those a half-done
-    /// change was leaving.
+    /// With the turn held, no change of this node is between its two steps,
+    /// so a committed joint configuration is one a lost leader or a call cut
+    /// short left behind, and nothing else moves it on. It is not completed on
+    /// its own: which voters it dropped were to leave the group and which to
+    /// stay as learners was the cut-short change's to say. Each change applies
+    /// itself to it instead, from the voters it was heading for
+    /// ([`Self::voter_sets`]) and with its own retention, and openraft takes the
+    /// group from the joint configuration to that change's target.
     async fn membership_turn(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, RaftNodeError> {
-        use openraft::rt::watch::WatchReceiver;
-
         let timeout = self.membership_settle_timeout();
         let turn = tokio::time::timeout(timeout, self.membership_changes.lock())
             .await
@@ -1510,38 +1506,31 @@ impl RaftNode {
                 ))
             })?;
         self.membership_committed().await?;
-        let joint = {
-            let rx = self.raft.metrics();
-            let metrics = rx.borrow_watched();
-            metrics
-                .membership_config
-                .membership()
-                .get_joint_config()
-                .len()
-                > 1
-        };
-        if joint {
-            let written = self
-                .raft
-                .change_membership(
-                    openraft::ChangeMembers::AddVoterIds(std::collections::BTreeSet::new()),
-                    true,
-                )
-                .await
-                .map_err(|e| {
-                    RaftNodeError::Membership(format!(
-                        "complete the joint configuration left behind: {}",
-                        Self::describe_membership_refusal(&e)
-                    ))
-                })?;
-            self.membership_published(written.log_id.index).await?;
-            self.membership_committed().await?;
-            tracing::info!(
-                node_id = self.node_id,
-                "completed a joint configuration left behind"
-            );
-        }
         Ok(turn)
+    }
+
+    /// The voters a membership change starts from: those of the
+    /// configuration in effect, or of the one a joint configuration is
+    /// heading for; every voter of any of its configurations, all of whom
+    /// still vote; and whether it is joint.
+    fn voter_sets(
+        &self,
+    ) -> (
+        std::collections::BTreeSet<u64>,
+        std::collections::BTreeSet<u64>,
+        bool,
+    ) {
+        use openraft::rt::watch::WatchReceiver;
+
+        let rx = self.raft.metrics();
+        let metrics = rx.borrow_watched();
+        let config = metrics.membership_config.membership();
+        let configs = config.get_joint_config();
+        let target = configs
+            .last()
+            .map(|voters| voters.iter().copied().collect())
+            .unwrap_or_default();
+        (target, config.voter_ids().collect(), configs.len() > 1)
     }
 
     /// Wait until the entry that installed the membership in effect is
@@ -1805,25 +1794,28 @@ impl RaftNode {
         use openraft::rt::watch::WatchReceiver;
 
         self.membership_committed().await?;
-        // Get current voter set from raft metrics.
-        // Must collect inside borrow scope — voter_ids() borrows from the ref guard.
-        let (current_members, learner): (std::collections::BTreeSet<u64>, bool) = {
+        let (target, voting, _) = self.voter_sets();
+        let member = {
             let rx = self.raft.metrics();
-            let metrics_ref = rx.borrow_watched();
-            let membership = metrics_ref.membership_config.membership();
-            let ids: Vec<u64> = membership.voter_ids().collect();
-            let learner = membership.learner_ids().any(|id| id == node_id);
-            (ids.into_iter().collect(), learner)
+            let metrics = rx.borrow_watched();
+            let known = metrics
+                .membership_config
+                .membership()
+                .get_node(&node_id)
+                .is_some();
+            known
         };
+        let learner = member && !voting.contains(&node_id);
 
-        // A learner is not among the voters; it leaves the nodes instead.
+        // A learner is not among the voters; it leaves the nodes instead. A
+        // voter leaves the voters being reached, and with retention off the
+        // nodes too, even when it votes only in the configuration a joint one
+        // is leaving.
         let change = if learner {
             openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([node_id]))
         } else {
-            let new_members: std::collections::BTreeSet<u64> = current_members
-                .into_iter()
-                .filter(|&id| id != node_id)
-                .collect();
+            let new_members: std::collections::BTreeSet<u64> =
+                target.into_iter().filter(|&id| id != node_id).collect();
             if new_members.is_empty() {
                 return Err(RaftNodeError::Membership(
                     "cannot remove last voting member".to_string(),
@@ -1855,29 +1847,23 @@ impl RaftNode {
     /// - `Membership(…)` if this node is not the leader, the target is not a
     ///   known learner, or openraft rejects the membership change.
     pub async fn promote_to_voter(&self, node_id: u64) -> Result<(), RaftNodeError> {
-        use openraft::async_runtime::watch::WatchReceiver;
-
         let _turn = self.membership_turn().await?;
-        let current_voters: std::collections::BTreeSet<u64> = {
-            let metrics = self.raft.metrics().borrow_watched().clone();
-            let joint = metrics.membership_config.membership().get_joint_config();
-            joint
-                .first()
-                .map(|voters| voters.iter().copied().collect())
-                .unwrap_or_default()
-        };
+        let (target, _, joint) = self.voter_sets();
 
-        // Idempotent: already a voter → nothing to do.
-        if current_voters.contains(&node_id) {
+        // Idempotent: already a voter → nothing to do. A joint configuration
+        // left behind is taken to this promotion's target even then.
+        if target.contains(&node_id) && !joint {
             return Ok(());
         }
 
-        let mut new_members = current_voters;
+        let mut new_members = target;
         new_members.insert(node_id);
 
+        // retain = true: a promotion removes no member, even a voter the
+        // joint configuration it starts from was dropping.
         let written = self
             .raft
-            .change_membership(new_members, false)
+            .change_membership(new_members, true)
             .await
             .map_err(|e| {
                 RaftNodeError::Membership(format!(
@@ -1913,21 +1899,20 @@ impl RaftNode {
 
         let _turn = self.membership_turn().await?;
         let metrics = self.raft.metrics().borrow_watched().clone();
-        let current_voters: std::collections::BTreeSet<u64> = {
-            let joint = metrics.membership_config.membership().get_joint_config();
-            joint
-                .first()
-                .map(|voters| voters.iter().copied().collect())
-                .unwrap_or_default()
-        };
+        let (target, voting, _) = self.voter_sets();
 
-        // Idempotent: not a voter → already a learner (or unknown), nothing to do.
-        if !current_voters.contains(&node_id) {
+        // Idempotent: not a voter → already a learner (or unknown), nothing to
+        // do. A node voting only in the configuration a joint one is leaving
+        // still votes, so it is demoted.
+        if !voting.contains(&node_id) {
             return Ok(());
         }
 
+        let new_members: std::collections::BTreeSet<u64> =
+            target.into_iter().filter(|&id| id != node_id).collect();
+
         // Quorum gate — CE requires ≥ 2 voters after demotion.
-        let remaining = current_voters.len().saturating_sub(1);
+        let remaining = new_members.len();
         if remaining < 2 {
             return Err(RaftNodeError::Membership(format!(
                 "cannot demote node {node_id}: would leave {remaining} voter(s), \
@@ -1942,11 +1927,6 @@ impl RaftNode {
                 "node {node_id} is the current Raft leader — transfer leadership before demoting"
             )));
         }
-
-        let new_members: std::collections::BTreeSet<u64> = current_voters
-            .into_iter()
-            .filter(|&id| id != node_id)
-            .collect();
 
         // retain = true: the removed voter stays as a learner (keeps replicating).
         let written = self
@@ -2634,11 +2614,11 @@ impl RaftNode {
         let heartbeat = metrics.heartbeat.as_ref()?;
         let replication = metrics.replication.as_ref()?;
         let live_within = std::time::Duration::from_millis(self.raft.config().election_timeout_max);
-        let joint = metrics.membership_config.membership().get_joint_config();
-        let voters = joint.first()?;
-        voters
-            .iter()
-            .copied()
+        // Every voter of the configuration in effect, both of a joint one.
+        metrics
+            .membership_config
+            .membership()
+            .voter_ids()
             .filter(|&id| id != self.node_id)
             .filter(|id| {
                 heartbeat
@@ -2707,10 +2687,12 @@ impl RaftNode {
         use openraft::async_runtime::watch::WatchReceiver;
 
         let metrics = self.raft.metrics().borrow_watched().clone();
-        let joint = metrics.membership_config.membership().get_joint_config();
-        joint
-            .first()
-            .is_some_and(|voters| voters.iter().any(|&id| id != self.node_id))
+        let peers = metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|id| id != self.node_id);
+        peers
     }
 
     /// Stop the node. A member of a group with other voters shuts down
@@ -2844,12 +2826,12 @@ impl RaftNode {
                 })
             });
 
-            // Determine role from membership config
-            let joint = metrics.membership_config.membership().get_joint_config();
-            let is_voter = joint
-                .first()
-                .map(|voters| voters.contains(&node_id))
-                .unwrap_or(false);
+            // A voter of any configuration in effect, both of a joint one.
+            let is_voter = metrics
+                .membership_config
+                .membership()
+                .voter_ids()
+                .any(|id| id == node_id);
 
             statuses.push(NodeReplicationStatus {
                 node_id,
@@ -2969,18 +2951,16 @@ impl RaftNode {
         let _turn = self.membership_turn().await?;
         let metrics = self.raft.metrics().borrow_watched().clone();
 
-        // Snapshot current voter set from openraft membership config.
-        let current_voters: std::collections::BTreeSet<u64> = {
-            let joint = metrics.membership_config.membership().get_joint_config();
-            joint
-                .first()
-                .map(|voters| voters.iter().copied().collect())
-                .unwrap_or_default()
-        };
+        // The voters to keep are those being reached; the node is a voter if
+        // it votes in any configuration in effect, the one a joint
+        // configuration is leaving included.
+        let (target, voting, _) = self.voter_sets();
+        let new_members: std::collections::BTreeSet<u64> =
+            target.into_iter().filter(|&id| id != node_id).collect();
 
         if !force {
             // Step 1a: node must be a current voter.
-            if !current_voters.contains(&node_id) {
+            if !voting.contains(&node_id) {
                 return Err(RaftNodeError::Membership(format!(
                     "node {node_id} is not in the current voter set — cannot decommission"
                 )));
@@ -2989,8 +2969,7 @@ impl RaftNode {
             // Step 1b: quorum gate — CE requires ≥ 2 voters after removal.
             // Quorum = majority of voters; for 2 voters: majority = 2 (no fault tolerance).
             // For 1 voter: cluster cannot reach consensus.
-            // Step 1a proved `node_id` is in the set, so it holds at least one.
-            let remaining = current_voters.len() - 1;
+            let remaining = new_members.len();
             if remaining < 2 {
                 return Err(RaftNodeError::Membership(format!(
                     "cannot decommission node {node_id}: would leave {remaining} voter(s), \
@@ -3019,13 +2998,9 @@ impl RaftNode {
             // This is enforced in ClusterServiceImpl::decommission_node().
         }
 
-        // Step 3: membership remove.
-        // Compute new voter set (current minus node_id).
-        let new_members: std::collections::BTreeSet<u64> = current_voters
-            .into_iter()
-            .filter(|&id| id != node_id)
-            .collect();
-
+        // Step 3: membership remove, to the voters computed above. Retention
+        // off: the node leaves the group even when it votes only in the
+        // configuration a joint one is leaving.
         if new_members.is_empty() {
             return Err(RaftNodeError::Membership(
                 "cannot remove last voting member — cluster would be empty".to_string(),
@@ -3201,18 +3176,18 @@ impl RaftNode {
             )));
         }
         let _turn = self.membership_turn().await?;
-        let membership = |raft: &RaftInstance| {
+        let members = |raft: &RaftInstance| {
             let rx = raft.metrics();
             let metrics = rx.borrow_watched();
-            let config = metrics.membership_config.membership();
-            let nodes: std::collections::BTreeMap<u64, Option<MemberIdentity>> = config
+            metrics
+                .membership_config
+                .membership()
                 .nodes()
                 .map(|(id, node)| (*id, node.identity.clone()))
-                .collect();
-            let voters: std::collections::BTreeSet<u64> = config.voter_ids().collect();
-            (nodes, voters)
+                .collect::<std::collections::BTreeMap<u64, Option<MemberIdentity>>>()
         };
-        let (nodes, voters) = membership(&self.raft);
+        let nodes = members(&self.raft);
+        let (voters, _, joint) = self.voter_sets();
         // A replacement is resumed or repeated only as the one it is: a
         // member `new` already holds must be bound to `identity`, as
         // `add_node` binds it, or the call is another replacement.
@@ -3227,7 +3202,7 @@ impl RaftNode {
                 )));
             }
         }
-        if voters.contains(&new) && !nodes.contains_key(&old) {
+        if voters.contains(&new) && !nodes.contains_key(&old) && !joint {
             return Ok(());
         }
         if !nodes.contains_key(&new) {
@@ -3236,20 +3211,20 @@ impl RaftNode {
         if !voters.contains(&new) {
             self.await_caught_up(new, &progress_tx).await?;
         }
-        let (_, voters) = membership(&self.raft);
+        let (voters, _, joint) = self.voter_sets();
         let target: std::collections::BTreeSet<u64> = voters
             .iter()
             .copied()
             .filter(|&id| id != old)
             .chain(std::iter::once(new))
             .collect();
-        // Already the voters when a joint configuration this replacement left
-        // behind was completed on taking the turn.
-        if target != voters {
+        // A joint configuration left behind is taken to the target even when
+        // the voters it heads for are already the target's.
+        if joint || target != voters {
             self.change_membership_in_turn(target.into_iter().collect())
                 .await?;
         }
-        let (nodes, _) = membership(&self.raft);
+        let nodes = members(&self.raft);
         if nodes.contains_key(&old) {
             self.remove_node_in_turn(old).await?;
         }

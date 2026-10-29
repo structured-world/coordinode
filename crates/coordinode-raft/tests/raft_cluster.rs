@@ -3976,20 +3976,18 @@ async fn a_replacement_cut_short_in_its_joint_configuration_is_completed_by_the_
     );
 }
 
-/// A membership change made while a joint configuration left behind stands
-/// is judged by the configuration that joint one was heading for, never by
-/// the one it was leaving: the joint configuration is completed first, its
-/// removed voter kept as a learner, so demoting a member of the new voters
-/// demotes it, and promoting the voter the joint configuration dropped
-/// brings it back. Every change ends in a single configuration.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_change_after_a_joint_configuration_left_behind_starts_from_its_target() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("coordinode_raft=info,openraft=off")
-        .with_test_writer()
-        .try_init();
+/// Four live members, 1 leading, left in the committed joint configuration
+/// {1,2,3}+{1,2,4}: a change from {1,2,3} to {1,2,4} that stopped after its
+/// joint step, as a lost leader or a call cut short leaves it.
+struct LeftInJoint {
+    n1: RaftNode,
+    others: Vec<RaftNode>,
+    ports: [u16; 4],
+    _dirs: [tempfile::TempDir; 4],
+}
 
-    let result = tokio::time::timeout(Duration::from_secs(180), async {
+impl LeftInJoint {
+    async fn open() -> Self {
         let ports = [alloc_port(), alloc_port(), alloc_port(), alloc_port()];
         let dirs = [
             tempfile::tempdir().expect("d1"),
@@ -4033,7 +4031,6 @@ async fn a_change_after_a_joint_configuration_left_behind_starts_from_its_target
             .await
             .expect("membership");
 
-        // A change from {1,2,3} to {1,2,4} stops after its joint step.
         let joint = {
             let rx = n1.raft().metrics();
             let metrics = rx.borrow_watched();
@@ -4056,47 +4053,152 @@ async fn a_change_after_a_joint_configuration_left_behind_starts_from_its_target
             .append_membership(joint, openraft::EntryPayload::Blank, std::iter::empty())
             .await
             .expect("the joint configuration commits");
-        let membership = |node: &RaftNode| -> (Vec<Vec<u64>>, Vec<u64>) {
-            let rx = node.raft().metrics();
-            let metrics = rx.borrow_watched();
-            let config = metrics.membership_config.membership();
-            (
-                config
-                    .get_joint_config()
-                    .iter()
-                    .map(|voters| voters.iter().copied().collect())
-                    .collect(),
-                config.learner_ids().collect(),
-            )
+        let left = Self {
+            n1,
+            others,
+            ports,
+            _dirs: dirs,
         };
-
-        // Member 4 votes in the configuration being reached: demoting it
-        // demotes it, it does not pass for a learner already.
-        n1.demote_to_learner(4).await.expect("demote 4");
         assert_eq!(
-            membership(&n1),
-            (vec![vec![1, 2]], vec![3, 4]),
-            "4 and the dropped 3 are learners, 1 and 2 vote"
+            left.membership(),
+            (vec![vec![1, 2, 3], vec![1, 2, 4]], vec![1, 2, 3, 4]),
+            "left in the joint configuration"
         );
-        // Member 3 was dropped by the joint configuration: promoting it
-        // brings it back.
-        n1.promote_to_voter(3).await.expect("promote 3");
-        assert_eq!(
-            membership(&n1),
-            (vec![vec![1, 2, 3]], vec![4]),
-            "3 votes again"
-        );
+        left
+    }
 
-        for node in others.into_iter().rev() {
+    /// The voter configurations and every member, as the leader sees them.
+    fn membership(&self) -> (Vec<Vec<u64>>, Vec<u64>) {
+        let rx = self.n1.raft().metrics();
+        let metrics = rx.borrow_watched();
+        let config = metrics.membership_config.membership();
+        (
+            config
+                .get_joint_config()
+                .iter()
+                .map(|voters| voters.iter().copied().collect())
+                .collect(),
+            config.nodes().map(|(id, _)| *id).collect(),
+        )
+    }
+
+    /// Whether member 3's identity is refused on its way back, as a retired
+    /// one is: re-adding a removed member under it fails.
+    async fn three_is_retired(&self) -> bool {
+        let back = self
+            .n1
+            .add_node(3, format!("http://127.0.0.1:{}", self.ports[2]), ident(3))
+            .await;
+        matches!(back, Err(RaftNodeError::Identity(_)))
+    }
+
+    async fn shutdown(self) {
+        for node in self.others.into_iter().rev() {
             node.shutdown().await.expect("stop");
         }
-        n1.shutdown().await.expect("s1");
+        self.n1.shutdown().await.expect("s1");
+    }
+}
+
+/// Promoting and demoting from a joint configuration left behind take the
+/// group to their own target and drop no member: demoting 4, which votes in
+/// the configuration being reached, makes it a learner (it does not pass for
+/// one already), the 3 the joint configuration was leaving stays as a
+/// learner, and promoting 3 makes it vote again.
+#[tokio::test(flavor = "multi_thread")]
+async fn promoting_and_demoting_from_a_joint_configuration_left_behind_keep_every_member() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(180), async {
+        let left = LeftInJoint::open().await;
+        left.n1.demote_to_learner(4).await.expect("demote 4");
+        assert_eq!(
+            left.membership(),
+            (vec![vec![1, 2]], vec![1, 2, 3, 4]),
+            "1 and 2 vote, 3 and 4 stay as learners"
+        );
+        left.n1.promote_to_voter(3).await.expect("promote 3");
+        assert_eq!(
+            left.membership(),
+            (vec![vec![1, 2, 3]], vec![1, 2, 3, 4]),
+            "3 votes again"
+        );
+        left.shutdown().await;
     })
     .await;
 
     assert!(
         result.is_ok(),
-        "TIMED OUT: a_change_after_a_joint_configuration_left_behind_starts_from_its_target"
+        "TIMED OUT: promoting_and_demoting_from_a_joint_configuration_left_behind_keep_every_member"
+    );
+}
+
+/// The change a joint configuration was left from, made again, takes the
+/// group to its target and removes what it drops: changing the voters to
+/// {1,2,4} ends with 3 out of the group and its identity retired, as the
+/// first, cut-short call would have.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_repeated_from_its_joint_configuration_removes_what_it_drops() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(180), async {
+        let left = LeftInJoint::open().await;
+        left.n1
+            .change_membership(vec![1, 2, 4])
+            .await
+            .expect("the change made again");
+        assert_eq!(
+            left.membership(),
+            (vec![vec![1, 2, 4]], vec![1, 2, 4]),
+            "3 left the group"
+        );
+        assert!(left.three_is_retired().await, "3's identity is retired");
+        left.shutdown().await;
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_change_repeated_from_its_joint_configuration_removes_what_it_drops"
+    );
+}
+
+/// Decommissioning the member a joint configuration left behind was
+/// dropping removes it: it still votes in the configuration being left, so
+/// it passes the voter gate, and it leaves the group with its identity
+/// retired.
+#[tokio::test(flavor = "multi_thread")]
+async fn decommissioning_the_member_a_joint_configuration_drops_removes_it() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(180), async {
+        let left = LeftInJoint::open().await;
+        left.n1
+            .decommission_node(3, false, false)
+            .await
+            .expect("decommission 3");
+        assert_eq!(
+            left.membership(),
+            (vec![vec![1, 2, 4]], vec![1, 2, 4]),
+            "3 left the group"
+        );
+        assert!(left.three_is_retired().await, "3's identity is retired");
+        left.shutdown().await;
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: decommissioning_the_member_a_joint_configuration_drops_removes_it"
     );
 }
 
