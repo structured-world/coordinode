@@ -1722,9 +1722,8 @@ impl<'a> ExecutionContext<'a> {
                 )));
             }
         }
-        // The type decides the node's schema, its type-keyed index entries
-        // and its placement, none of which a label change moves: a node keeps
-        // the type it was created with.
+        // The type decides the node's schema and placement; SET or REMOVE of
+        // a label adds or drops membership only and never changes the type.
         if let Some(before) = labels_before.first() {
             if before != resolved.primary() {
                 return Err(ExecutionError::SchemaViolation(format!(
