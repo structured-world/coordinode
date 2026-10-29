@@ -72,7 +72,8 @@ pub struct BuildTarget<'a> {
 impl BuildTarget<'_> {
     /// The vector `record` contributes to this index, if it is a member.
     fn member(&self, record: &NodeRecord) -> Option<Vec<f32>> {
-        if record.primary_label() != self.label {
+        // The index covers every node carrying its label.
+        if !record.has_label(self.label) {
             return None;
         }
         record

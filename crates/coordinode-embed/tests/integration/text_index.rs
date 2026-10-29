@@ -198,33 +198,31 @@ fn a_property_set_to_a_non_text_value_leaves_the_index() {
     );
 }
 
-/// A node that loses the indexed label leaves that label's index, and one
-/// that gains it is added, as the committed record says.
+/// The index is keyed on a node's type, which a label change cannot move:
+/// taking the indexed type away is refused, and the node stays indexed under
+/// it, while an auxiliary label added beside it changes nothing.
 #[test]
-fn a_relabelled_node_follows_its_label_in_the_index() {
+fn a_node_keeps_its_indexed_type() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
         .expect("create text index");
+    db.execute_cypher("CREATE LABEL Pinned AUXILIARY")
+        .expect("auxiliary label");
     db.execute_cypher("CREATE (:Article {title: 'a', body: 'wandering words'})")
         .expect("create");
-    db.execute_cypher("MATCH (n:Article {title: 'a'}) REMOVE n:Article SET n:Note")
-        .expect("relabel");
+    let err = db
+        .execute_cypher("MATCH (n:Article {title: 'a'}) REMOVE n:Article SET n:Note")
+        .expect_err("the node's type cannot change");
+    assert!(err.to_string().contains("type"), "{err}");
+    db.execute_cypher("MATCH (n:Article {title: 'a'}) SET n:Pinned")
+        .expect("auxiliary label added");
 
     let rows = db
         .execute_cypher(
             "MATCH (n:Article) WHERE text_match(n.body, 'wandering') RETURN n.title AS t",
         )
         .expect("search");
-    assert!(rows.is_empty(), "a node without the label is still indexed");
-
-    db.execute_cypher("MATCH (n:Note {title: 'a'}) REMOVE n:Note SET n:Article")
-        .expect("relabel back");
-    let rows = db
-        .execute_cypher(
-            "MATCH (n:Article) WHERE text_match(n.body, 'wandering') RETURN n.title AS t",
-        )
-        .expect("search");
-    assert_eq!(rows.len(), 1, "a node that gained the label is not indexed");
+    assert_eq!(rows.len(), 1, "the node is indexed under its type");
 }
 
 /// A transaction searches its own uncommitted text: its SET is found by the

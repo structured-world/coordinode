@@ -1500,6 +1500,8 @@ fn explain_suggest_partial_coverage() {
 #[test]
 fn statistics_counters_follow_writes_end_to_end() {
     let mut db = Database::open_in_memory().expect("open");
+    // A role beside a node's type is an auxiliary label.
+    db.execute_cypher("CREATE LABEL Admin AUXILIARY").unwrap();
     db.execute_cypher("CREATE (a:User {name: 'a'})").unwrap();
     db.execute_cypher("CREATE (b:User {name: 'b'})").unwrap();
     db.execute_cypher("CREATE (p:Post {t: 1})").unwrap();

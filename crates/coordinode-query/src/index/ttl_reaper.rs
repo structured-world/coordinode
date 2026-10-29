@@ -163,7 +163,7 @@ impl BtreeIndexes {
     /// indexes needs the values they index, which a pass without the field
     /// dictionary cannot read.
     fn can_remove(&self, record: &NodeRecord) -> bool {
-        self.readable || !self.registry.has_btree_for(record.primary_label())
+        self.readable || !record.labels.iter().any(|l| self.registry.has_btree_for(l))
     }
 
     /// Stage the removal of a reaped node's entries in `txn`, the same way a
@@ -176,10 +176,6 @@ impl BtreeIndexes {
         node_id: NodeId,
         record: &NodeRecord,
     ) -> Result<(), coordinode_modality::StoreError> {
-        let label = record.primary_label();
-        if !self.registry.has_btree_for(label) {
-            return Ok(());
-        }
         let lookup = |name: &str| {
             self.fields
                 .get(name)
@@ -187,14 +183,24 @@ impl BtreeIndexes {
                 .or_else(|| record.get_extra(name).cloned())
         };
         let field_of = |name: &str| self.fields.get(name).copied();
-        // The reaper reads only node keys that are not temporal versions.
-        let node = super::registry::NodeState {
-            node_id,
-            valid_from: None,
-            label,
-            value_of: &lookup,
-        };
-        self.registry.on_node_deleted(engine, txn, &node, &field_of)
+        // A reaped node leaves the index of every label it carries; the
+        // expiry policy stays its type's. The reaper reads only node keys
+        // that are not temporal versions.
+        for label in record
+            .labels
+            .iter()
+            .filter(|l| self.registry.has_btree_for(l))
+        {
+            let node = super::registry::NodeState {
+                node_id,
+                valid_from: None,
+                label,
+                value_of: &lookup,
+            };
+            self.registry
+                .on_node_deleted(engine, txn, &node, &field_of)?;
+        }
+        Ok(())
     }
 }
 
@@ -1018,10 +1024,10 @@ fn property_is_indexed(
         RowKeyRelease::Unresolved => true,
     };
     let indexed = key_column
-        || target
-            .indexes
-            .registry
-            .reads_property(record.primary_label(), property);
+        || record
+            .labels
+            .iter()
+            .any(|l| target.indexes.registry.reads_property(l, property));
     if indexed {
         result.errors.push(format!(
             "label {}: TTL would remove indexed property '{property}'; kept",

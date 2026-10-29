@@ -40,6 +40,8 @@ fn label(
         computed_properties: vec![],
         schema_mode: mode as i32,
         temporal: false,
+        kind: schema::LabelKind::Type as i32,
+        implies: vec![],
     }
 }
 
@@ -110,6 +112,87 @@ async fn list_labels_returns_existing_labels() {
             .unwrap_or_else(|| panic!("{name} missing from {labels:?}"));
         assert!(!found.declared, "{name} has no definition");
     }
+}
+
+/// A label's kind and the labels a type implies travel through CreateLabel
+/// and ListLabels, and a node of the type is written with what it implies:
+/// an auxiliary label alone is refused, and so is a definition implying an
+/// auxiliary label.
+#[tokio::test]
+async fn label_kinds_travel_through_the_catalog() {
+    let (svc, _dir) = test_service();
+    let mut scope = label("Scope", vec![], schema::SchemaMode::Strict);
+    scope.kind = schema::LabelKind::Auxiliary as i32;
+    let created = svc
+        .create_label(Request::new(scope))
+        .await
+        .expect("auxiliary label")
+        .into_inner();
+    assert_eq!(created.kind, schema::LabelKind::Auxiliary as i32);
+
+    let mut goal = label(
+        "Goal",
+        vec![prop("title", schema::ScalarType::String, false)],
+        schema::SchemaMode::Strict,
+    );
+    goal.implies = vec!["Thing".into(), "Entity".into(), "Thing".into()];
+    let created = svc
+        .create_label(Request::new(goal))
+        .await
+        .expect("implying type")
+        .into_inner();
+    assert_eq!(created.kind, schema::LabelKind::Type as i32);
+    assert_eq!(created.implies, ["Entity", "Thing"], "sorted, once each");
+
+    let mut wrong = label("Task", vec![], schema::SchemaMode::Strict);
+    wrong.implies = vec!["Scope".into()];
+    let status = svc
+        .create_label(Request::new(wrong))
+        .await
+        .expect_err("a type implying an auxiliary label");
+    assert!(status.message().contains("auxiliary"), "{status:?}");
+
+    {
+        let mut db = svc.database.write();
+        db.execute_cypher("CREATE (:Scope:Goal {title: 'g'})")
+            .expect("goal");
+        let err = db
+            .execute_cypher("CREATE (:Scope)")
+            .expect_err("an auxiliary label alone");
+        assert!(err.to_string().contains("no type label"), "{err}");
+        let rows = db
+            .execute_cypher("MATCH (n:Thing) RETURN labels(n) AS l")
+            .expect("implied label");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("l"),
+            Some(&Value::Array(
+                ["Goal", "Entity", "Scope", "Thing"]
+                    .into_iter()
+                    .map(|l| Value::String(l.into()))
+                    .collect()
+            ))
+        );
+    }
+
+    let labels = svc
+        .list_labels(Request::new(schema::ListLabelsRequest {}))
+        .await
+        .expect("list")
+        .into_inner()
+        .labels;
+    let listed = |name: &str| {
+        labels
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from {labels:?}"))
+    };
+    assert_eq!(listed("Scope").kind, schema::LabelKind::Auxiliary as i32);
+    assert_eq!(listed("Goal").implies, ["Entity", "Thing"]);
+    assert!(
+        !listed("Thing").declared,
+        "an implied label needs no definition"
+    );
 }
 
 /// Listing labels only reads: it answers while another reader holds the
@@ -270,6 +353,24 @@ async fn unknown_enum_values_are_refused_not_defaulted() {
             .await
             .expect_err("an unknown schema mode must be refused"),
         "schema_mode",
+    );
+
+    let mut unknown_label_kind = label("Unknown", vec![], schema::SchemaMode::Strict);
+    unknown_label_kind.kind = 42;
+    invalid(
+        svc.create_label(Request::new(unknown_label_kind))
+            .await
+            .expect_err("an unknown label kind must be refused"),
+        "kind",
+    );
+
+    let mut unnamed_implied = label("Unknown", vec![], schema::SchemaMode::Strict);
+    unnamed_implied.implies = vec!["Thing".into(), String::new()];
+    invalid(
+        svc.create_label(Request::new(unnamed_implied))
+            .await
+            .expect_err("an implied label without a name must be refused"),
+        "implies[1]",
     );
 
     invalid(

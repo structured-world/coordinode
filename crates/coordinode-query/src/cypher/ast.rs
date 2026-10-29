@@ -540,6 +540,10 @@ pub struct CreateNodeTypeClause {
     /// Reuses `EdgePropertyDecl` — the property-declaration grammar is the
     /// same for nodes and edges.
     pub properties: Vec<EdgePropertyDecl>,
+    /// Labels named in `IMPLIES (...)`, as written.
+    pub implies: Vec<String>,
+    /// `CREATE LABEL <name> AUXILIARY`: a label that only classifies nodes.
+    pub auxiliary: bool,
 }
 
 /// Single edge-type property declaration: `name : TYPE [NOT NULL]`.

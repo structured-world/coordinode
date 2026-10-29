@@ -105,6 +105,8 @@ async fn set_updates_hnsw_graph_position() {
         computed_properties: vec![],
         schema_mode: SchemaMode::Flexible as i32,
         temporal: false,
+        kind: 0,
+        implies: vec![],
     })
     .await
     .expect("create_label");

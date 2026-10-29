@@ -51,7 +51,9 @@ pub fn evaluate_against(
     field_lookup: &dyn Fn(&str) -> Option<u32>,
 ) -> bool {
     match predicate {
-        VectorPredicate::LabelEq(label) => record.primary_label() == label,
+        // A node carries a label as its type, implied by its type or
+        // auxiliary; MATCH on the label finds it in each case.
+        VectorPredicate::LabelEq(label) => record.has_label(label),
         VectorPredicate::PropertyEq { property, value } => {
             let Some(fid) = field_lookup(property) else {
                 return false;

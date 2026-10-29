@@ -65,6 +65,8 @@ async fn create_label(
             computed_properties: vec![],
             schema_mode: mode as i32,
             temporal: false,
+            kind: 0,
+            implies: vec![],
         })
         .await
         .expect("create_label");

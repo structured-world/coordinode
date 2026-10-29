@@ -60,15 +60,20 @@ fn the_plan_reads_the_counter() {
 }
 
 /// The counted answer follows creates, deletes, label changes and nodes
-/// with several labels, and always equals counting the nodes.
+/// with several labels, and always equals counting the nodes. A node keeps
+/// its type, so the labels added and removed are auxiliary.
 #[test]
 fn the_count_follows_every_change() {
     let (mut db, _dir) = open_db();
+    for label in ["Project", "Archived"] {
+        db.execute_cypher(&format!("CREATE LABEL {label} AUXILIARY"))
+            .expect("auxiliary label");
+    }
     assert_eq!(count(&mut db, "MATCH (n:Project) RETURN count(n) AS n"), 0);
 
-    db.execute_cypher("UNWIND range(1, 7) AS i CREATE (:Project {i: i})")
+    db.execute_cypher("UNWIND range(1, 7) AS i CREATE (:Task:Project {i: i})")
         .expect("projects");
-    db.execute_cypher("CREATE (:Project:Archived {i: 100}), (:Other)")
+    db.execute_cypher("CREATE (:Task:Project:Archived {i: 100}), (:Other)")
         .expect("others");
     db.execute_cypher("MATCH (n:Project) WHERE n.i <= 2 DELETE n")
         .expect("delete two");
@@ -77,7 +82,7 @@ fn the_count_follows_every_change() {
     db.execute_cypher("MATCH (n:Project) WHERE n.i = 3 REMOVE n:Project")
         .expect("label removed");
 
-    for label in ["Project", "Archived", "Other"] {
+    for label in ["Project", "Archived", "Other", "Task"] {
         let counted = count(&mut db, &format!("MATCH (n:{label}) RETURN count(n) AS n"));
         assert_eq!(counted, scanned(&mut db, label), "{label}");
     }
@@ -146,8 +151,10 @@ fn a_cached_plan_rechecks_the_catalog() {
     db.execute_cypher("CREATE (:Project)").expect("plain node");
     assert_eq!(count(&mut db, query), 1);
 
-    db.execute_cypher("CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT)")
-        .expect("temporal label");
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL IMPLIES (Project) WITH (name: STRING, valid_from: INT)",
+    )
+    .expect("temporal label");
     db.execute_cypher("CREATE (:Emp:Project {name: 'a', valid_from: 0})")
         .expect("temporal node also labelled Project");
     db.execute_cypher("MATCH (n:Emp) SET n.name = 'b'")
@@ -198,8 +205,10 @@ fn a_node_deleted_earlier_in_the_transaction_is_gone_for_it() {
 #[test]
 fn a_temporal_label_keeps_the_scan_answer() {
     let (mut db, _dir) = open_db();
-    db.execute_cypher("CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT)")
-        .expect("temporal label");
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL IMPLIES (Project) WITH (name: STRING, valid_from: INT)",
+    )
+    .expect("temporal label");
     db.execute_cypher("CREATE (:Emp:Project {name: 'a', valid_from: 0})")
         .expect("temporal node also labelled Project");
     db.execute_cypher("MATCH (n:Emp) SET n.name = 'b'")

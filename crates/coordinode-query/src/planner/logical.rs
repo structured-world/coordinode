@@ -625,6 +625,10 @@ pub enum LogicalOp {
         name: String,
         temporal: bool,
         properties: Vec<crate::plan::PropertyDecl>,
+        /// Labels every node of the type carries with it.
+        implies: Vec<String>,
+        /// An auxiliary label: it classifies nodes and declares nothing.
+        auxiliary: bool,
     },
 
     /// CREATE TABLE: declare a relational TABLE label with a declared primary
@@ -2945,10 +2949,19 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             name,
             temporal,
             properties,
+            implies,
+            auxiliary,
         } => {
             let temporal_marker = if *temporal { " TEMPORAL" } else { "" };
+            let kind = if *auxiliary {
+                " AUXILIARY".to_string()
+            } else if implies.is_empty() {
+                String::new()
+            } else {
+                format!(" IMPLIES ({})", implies.join(", "))
+            };
             output.push_str(&format!(
-                "{prefix}CreateNodeType({name}{temporal_marker}, props={})\n",
+                "{prefix}CreateNodeType({name}{temporal_marker}{kind}, props={})\n",
                 properties.len()
             ));
         }

@@ -114,7 +114,8 @@ impl<'a> TextSource<'a> {
     }
 
     fn text(&self, record: &NodeRecord) -> Option<String> {
-        if record.primary_label() != self.label {
+        // The index covers every node carrying its label.
+        if !record.has_label(self.label) {
             return None;
         }
         record
@@ -140,10 +141,11 @@ impl<'a> TextSource<'a> {
                     at,
                     self.timeline,
                 );
-                // A timeline of another label never enters this index.
+                // A timeline none of whose versions carries the label never
+                // enters this index.
                 let ours = versions
-                    .first()
-                    .is_some_and(|(_, record)| record.primary_label() == self.label);
+                    .iter()
+                    .any(|(_, record)| record.has_label(self.label));
                 NodeText {
                     node_id,
                     text: span.state.positive().and_then(|(_, r)| self.text(r)),

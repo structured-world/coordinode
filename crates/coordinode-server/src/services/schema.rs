@@ -17,8 +17,8 @@ use tonic::{Request, Response, Status};
 use coordinode_core::graph::types::VectorMetric;
 use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
 use coordinode_core::schema::definition::{
-    ConstraintKind, ConstraintState, EdgeTypeSchema, LabelSchema, MAX_ARRAY_NESTING, PropertyDef,
-    PropertyType, SchemaMode,
+    ConstraintKind, ConstraintState, EdgeTypeSchema, LabelKind, LabelSchema, MAX_ARRAY_NESTING,
+    PropertyDef, PropertyType, SchemaMode,
 };
 use coordinode_embed::{
     CatalogObject, ConstraintDeclaration, Database, Disposition, EdgeTypeDeclaration, Intent,
@@ -364,17 +364,31 @@ fn path(at: &str, field: &str) -> String {
     }
 }
 
+/// The fields a label declaration carries, in CreateLabelRequest and in a
+/// PublishSchema label alike.
+struct LabelFields<'a> {
+    name: &'a str,
+    properties: &'a [schema::PropertyDefinition],
+    computed_properties: &'a [schema::ComputedPropertyDefinition],
+    schema_mode: i32,
+    temporal: bool,
+    kind: i32,
+    implies: &'a [String],
+}
+
 /// The label definition a message declares: the shared reading of
 /// CreateLabelRequest and of a PublishSchema label. `at` is the message's
 /// request path.
-fn label_from_proto(
-    at: &str,
-    name: &str,
-    properties: &[schema::PropertyDefinition],
-    computed_properties: &[schema::ComputedPropertyDefinition],
-    schema_mode: i32,
-    temporal: bool,
-) -> Result<LabelSchema, Status> {
+fn label_from_proto(at: &str, fields: LabelFields<'_>) -> Result<LabelSchema, Status> {
+    let LabelFields {
+        name,
+        properties,
+        computed_properties,
+        schema_mode,
+        temporal,
+        kind,
+        implies,
+    } = fields;
     if name.is_empty() {
         return Err(invalid_field(path(at, "name"), "a label name is required"));
     }
@@ -384,6 +398,23 @@ fn label_from_proto(
         schema_mode,
     )?);
     definition.set_temporal(temporal);
+    match schema::LabelKind::try_from(kind) {
+        Ok(schema::LabelKind::Unspecified | schema::LabelKind::Type) => {}
+        Ok(schema::LabelKind::Auxiliary) => definition.set_auxiliary(),
+        Err(_) => {
+            return Err(invalid_field(
+                path(at, "kind"),
+                format!("unknown label kind {kind}"),
+            ));
+        }
+    }
+    if let Some(at_empty) = implies.iter().position(String::is_empty) {
+        return Err(invalid_field(
+            path(at, &format!("implies[{at_empty}]")),
+            "a label name is required",
+        ));
+    }
+    definition.set_implies(implies.to_vec());
     let mut names = HashSet::new();
     for p in properties_from_proto(&path(at, "properties"), properties, &mut names)? {
         definition.add_property(p);
@@ -479,7 +510,17 @@ fn label_to_proto(s: &LabelSchema) -> schema::Label {
                 operation: c.operation.as_raw(),
             }
         }),
+        kind: label_kind_to_proto(s.kind()),
+        implies: s.implies().to_vec(),
     }
+}
+
+fn label_kind_to_proto(kind: LabelKind) -> i32 {
+    let wire = match kind {
+        LabelKind::Type => schema::LabelKind::Type,
+        LabelKind::Auxiliary => schema::LabelKind::Auxiliary,
+    };
+    wire as i32
 }
 
 fn edge_type_to_proto(s: &EdgeTypeSchema) -> schema::EdgeType {
@@ -783,11 +824,15 @@ fn package_from_proto(req: schema::PublishSchemaRequest) -> Result<SchemaPackage
         package.labels.push(LabelDeclaration {
             schema: label_from_proto(
                 &at,
-                &l.name,
-                &l.properties,
-                &l.computed_properties,
-                l.schema_mode,
-                l.temporal,
+                LabelFields {
+                    name: &l.name,
+                    properties: &l.properties,
+                    computed_properties: &l.computed_properties,
+                    schema_mode: l.schema_mode,
+                    temporal: l.temporal,
+                    kind: l.kind,
+                    implies: &l.implies,
+                },
             )?,
             intent: intent(l.expected_revision),
         });
@@ -871,11 +916,15 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         let req = request.into_inner();
         let definition = label_from_proto(
             "",
-            &req.name,
-            &req.properties,
-            &req.computed_properties,
-            req.schema_mode,
-            req.temporal,
+            LabelFields {
+                name: &req.name,
+                properties: &req.properties,
+                computed_properties: &req.computed_properties,
+                schema_mode: req.schema_mode,
+                temporal: req.temporal,
+                kind: req.kind,
+                implies: &req.implies,
+            },
         )?;
 
         let name = req.name;

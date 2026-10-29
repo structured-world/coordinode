@@ -241,7 +241,7 @@ impl Worker {
             for (node_id, record) in ids.iter().copied().zip(&records) {
                 let vector = record
                     .as_ref()
-                    .filter(|r| r.primary_label() == def.label)
+                    .filter(|r| r.has_label(&def.label))
                     .and_then(|r| r.props.get(&interner.lookup(property)?))
                     .and_then(crate::db::try_extract_vector);
                 match vector {

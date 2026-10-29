@@ -532,16 +532,23 @@ pub(super) fn verify(
         // never decoded, however large it is.
         let labels = NodeRecord::labels_from_msgpack(&value)
             .map_err(|e| VerifyError::Decode(e.to_string()))?;
-        let primary = labels.first().map_or("", String::as_str);
-        let Some(projection) = projections.iter().find(|p| p.label == primary) else {
+        // An index on a label covers every node carrying it, as its type,
+        // implied or auxiliary.
+        let carries = |p: &&Projection<'_>| labels.iter().any(|l| l == p.label);
+        let mut carried = projections.iter().filter(carries);
+        let Some(first) = carried.next() else {
             continue;
         };
-        let record =
-            NodeRecord::project_from_msgpack(&value, &projection.fields, &projection.names)
-                .map_err(|e| VerifyError::Decode(e.to_string()))?;
+        // One checked label reads its projection; several read the record
+        // whole rather than merging their projections per row.
+        let record = match carried.next() {
+            None => NodeRecord::project_from_msgpack(&value, &first.fields, &first.names),
+            Some(_) => NodeRecord::from_msgpack(&value),
+        }
+        .map_err(|e| VerifyError::Decode(e.to_string()))?;
         stats.decoded_rows += 1;
         stats.decoded_bytes += value.len() as u64;
-        for &i in &projection.slots {
+        for &i in projections.iter().filter(carries).flat_map(|p| &p.slots) {
             let slot = &mut slots[i];
             slot.findings.checked += 1;
             let Some(values) = slot.target.interpretation.record_membership(&record) else {

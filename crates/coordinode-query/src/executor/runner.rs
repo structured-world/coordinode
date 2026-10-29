@@ -17,6 +17,7 @@ use coordinode_core::graph::types::{Value, VectorConsistencyMode, VectorMvccStat
 use coordinode_core::schema::definition::{
     EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType, SchemaMode,
 };
+use coordinode_core::schema::labels::{LabelFacts, NodeLabels, resolve_node_labels};
 use coordinode_core::schema::validation::validate_one;
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
@@ -603,30 +604,32 @@ pub fn check_post_state(
         let Some(record) = LocalNodeStore::post_state(txn, &key)? else {
             continue;
         };
-        let label = record.primary_label();
-        if label.is_empty() {
-            continue;
-        }
         if let Some(vectors) = vectors {
             check_vectors(vectors, &record, interner, || node_of(&key))?;
         }
-        if !schemas.contains_key(label) {
-            let schema = store.load_label_txn(txn, label)?;
-            schemas.insert(label.to_string(), schema);
-        }
-        let Some(Some(schema)) = schemas.get(label) else {
-            continue;
-        };
+        // The constraints declared on every label the node carries hold
+        // together: its type's, those of the labels its type implies and
+        // those of its auxiliary labels.
         let lookup = crate::index::registry::record_lookup(&record, interner);
-        if let Err(e) = coordinode_core::schema::validation::check_node_constraints(schema, &lookup)
-        {
-            return Err(constraint_violation(e, label, node_of(&key)?));
+        for label in &record.labels {
+            if !schemas.contains_key(label.as_str()) {
+                let schema = store.load_label_txn(txn, label)?;
+                schemas.insert(label.clone(), schema);
+            }
+            let Some(Some(schema)) = schemas.get(label.as_str()) else {
+                continue;
+            };
+            if let Err(e) =
+                coordinode_core::schema::validation::check_node_constraints(schema, &lookup)
+            {
+                return Err(constraint_violation(e, label, node_of(&key)?));
+            }
         }
     }
     Ok(())
 }
 
-/// Refuse `record` when one of the vector indexes of its primary label cannot
+/// Refuse `record` when one of the vector indexes of a label it carries cannot
 /// take the vector it holds: the vector the index's maintenance would extract,
 /// checked as the index would check it, so every committed vector of an
 /// indexed property is one its index takes. `node` names the node, read only
@@ -635,12 +638,22 @@ fn check_vectors(
     vectors: &crate::index::VectorIndexRegistry,
     record: &NodeRecord,
     interner: &FieldInterner,
-    node: impl FnOnce() -> Result<NodeId, ExecutionError>,
+    node: impl Fn() -> Result<NodeId, ExecutionError>,
 ) -> Result<(), ExecutionError> {
-    let label = record.primary_label();
-    if !vectors.indexes_label(label) {
-        return Ok(());
+    for label in record.labels.iter().filter(|l| vectors.indexes_label(l)) {
+        check_label_vectors(vectors, label, record, interner, &node)?;
     }
+    Ok(())
+}
+
+/// [`check_vectors`] for the vector indexes of one `label`.
+fn check_label_vectors(
+    vectors: &crate::index::VectorIndexRegistry,
+    label: &str,
+    record: &NodeRecord,
+    interner: &FieldInterner,
+    node: &dyn Fn() -> Result<NodeId, ExecutionError>,
+) -> Result<(), ExecutionError> {
     for property in vectors.indexed_properties(label) {
         let Some(vector) = interner
             .lookup(&property)
@@ -1640,6 +1653,87 @@ impl<'a> ExecutionContext<'a> {
         Ok(LocalSchemaStore::new(self.engine).load_label_txn(&mut self.txn, name)?)
     }
 
+    /// The labels a node written with `labels` stores: its single type label
+    /// first, then the labels that type implies and the auxiliary ones. Each
+    /// label's definition is read in the statement's transaction, so a
+    /// concurrent change of what a label is refuses the commit.
+    ///
+    /// # Errors
+    ///
+    /// `SchemaViolation` when the labels name no type label or two unrelated
+    /// ones; a catalog read failure as it comes.
+    pub fn node_labels(&mut self, labels: &[String]) -> Result<NodeLabels, ExecutionError> {
+        resolve_node_labels(labels, |label| {
+            Ok::<_, ExecutionError>(
+                self.cached_label_schema(label)?
+                    .map(LabelFacts::of)
+                    .unwrap_or_default(),
+            )
+        })?
+        .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))
+    }
+
+    /// The current schema of `label`, read once per statement in its
+    /// transaction; `None` for a label without a definition.
+    fn cached_label_schema(&mut self, label: &str) -> Result<Option<&LabelSchema>, ExecutionError> {
+        if !self.label_schema_cache.contains_key(label) {
+            let schema = self.load_current_label_schema(label)?;
+            self.label_schema_cache.insert(label.to_string(), schema);
+        }
+        Ok(self.label_schema_cache.get(label).and_then(Option::as_ref))
+    }
+
+    /// Give `record` the labels it stores after a write added or removed
+    /// some (`labels_before` are the ones it stored): its type label first,
+    /// the labels that type implies added. `removed` is a label the write
+    /// removed: one the type still implies cannot be removed.
+    ///
+    /// # Errors
+    ///
+    /// `SchemaViolation` when the labels cannot type the node, the removed
+    /// label is implied, or the node's type would change.
+    pub fn relabel(
+        &mut self,
+        record: &mut NodeRecord,
+        labels_before: &[String],
+        removed: Option<&str>,
+    ) -> Result<(), ExecutionError> {
+        let resolved = self.node_labels(&record.labels)?;
+        if let Some(removed) = removed {
+            if resolved.labels.iter().any(|l| l == removed) {
+                return Err(ExecutionError::SchemaViolation(format!(
+                    "label :{removed} is implied by :{} and cannot be removed",
+                    resolved.primary()
+                )));
+            }
+        }
+        // The type decides the node's schema, its type-keyed index entries
+        // and its placement, none of which a label change moves: a node keeps
+        // the type it was created with.
+        if let Some(before) = labels_before.first() {
+            if before != resolved.primary() {
+                return Err(ExecutionError::SchemaViolation(format!(
+                    "node's type :{before} cannot change to :{}",
+                    resolved.primary()
+                )));
+            }
+        }
+        record.labels = resolved.labels;
+        Ok(())
+    }
+
+    /// Move the per-label statistics of a node whose labels went from
+    /// `before` to `after`: every label it gained or lost, implied ones too.
+    pub fn stat_labels_changed(&mut self, before: &[String], after: &[String]) {
+        use coordinode_modality::{LocalStatsStore, StatsStore as _};
+        for label in after.iter().filter(|l| !before.contains(l)) {
+            LocalStatsStore.label_added(&mut self.txn, label);
+        }
+        for label in before.iter().filter(|l| !after.contains(l)) {
+            LocalStatsStore.label_removed(&mut self.txn, label);
+        }
+    }
+
     /// Read the label schema a DDL statement writes the next revision of,
     /// conditioning the statement's commit on it still being the current
     /// one: two statements changing one label's schema cannot both build on
@@ -1810,8 +1904,22 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        let label = record.primary_label();
-        if label.is_empty() || !registry.has_btree_for(label) {
+        self.index_labels_gained(registry, node_id, valid_from, record, &record.labels)
+    }
+
+    /// Stage the B-tree entries `record` holds in the indexes of `labels`,
+    /// labels it carries: an index covers every node carrying its label,
+    /// whether the label is the node's type, one its type implies or an
+    /// auxiliary one. A unique value another node holds refuses the write.
+    fn index_labels_gained(
+        &mut self,
+        registry: &crate::index::IndexRegistry,
+        node_id: NodeId,
+        valid_from: Option<i64>,
+        record: &NodeRecord,
+        labels: &[String],
+    ) -> Result<(), ExecutionError> {
+        if !labels.iter().any(|l| registry.has_btree_for(l)) {
             return Ok(());
         }
         self.sync_txn_state();
@@ -1820,24 +1928,89 @@ impl<'a> ExecutionContext<'a> {
             let interner: &FieldInterner = self.interner;
             let lookup = crate::index::registry::record_lookup(record, interner);
             let field_of = |name: &str| interner.lookup(name);
-            registry
-                .on_node_created(
-                    self.engine,
-                    &mut self.txn,
-                    self.shard_id,
-                    &crate::index::registry::NodeState {
-                        node_id,
-                        valid_from,
-                        label,
-                        value_of: &lookup,
-                    },
-                    &field_of,
-                    &mut self.key_claims.indexes,
-                )
-                .map_err(index_write_error)?;
+            for label in labels.iter().filter(|l| registry.has_btree_for(l)) {
+                registry
+                    .on_node_created(
+                        self.engine,
+                        &mut self.txn,
+                        self.shard_id,
+                        &crate::index::registry::NodeState {
+                            node_id,
+                            valid_from,
+                            label,
+                            value_of: &lookup,
+                        },
+                        &field_of,
+                        &mut self.key_claims.indexes,
+                    )
+                    .map_err(index_write_error)?;
+            }
         }
         self.claim_building_uniques(from);
         Ok(())
+    }
+
+    /// Stage the removal of the B-tree entries `record` holds in the indexes
+    /// of `labels`, labels it carried.
+    fn index_labels_lost(
+        &mut self,
+        registry: &crate::index::IndexRegistry,
+        node_id: NodeId,
+        valid_from: Option<i64>,
+        record: &NodeRecord,
+        labels: &[String],
+    ) -> Result<(), ExecutionError> {
+        if !labels.iter().any(|l| registry.has_btree_for(l)) {
+            return Ok(());
+        }
+        self.sync_txn_state();
+        let interner: &FieldInterner = self.interner;
+        let lookup = crate::index::registry::record_lookup(record, interner);
+        let field_of = |name: &str| interner.lookup(name);
+        for label in labels.iter().filter(|l| registry.has_btree_for(l)) {
+            registry.on_node_deleted(
+                self.engine,
+                &mut self.txn,
+                &crate::index::registry::NodeState {
+                    node_id,
+                    valid_from,
+                    label,
+                    value_of: &lookup,
+                },
+                &field_of,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Move the B-tree entries of a node whose labels go from `before` to
+    /// `after.labels`, its properties unchanged: it joins the indexes of each
+    /// label it gains and leaves those of each label it loses. The version
+    /// starting at `valid_from`, for a temporal node.
+    pub fn index_labels_changed(
+        &mut self,
+        node_id: NodeId,
+        valid_from: Option<i64>,
+        before: &NodeRecord,
+        after: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(());
+        };
+        let gained: Vec<String> = after
+            .labels
+            .iter()
+            .filter(|l| !before.labels.contains(l))
+            .cloned()
+            .collect();
+        let lost: Vec<String> = before
+            .labels
+            .iter()
+            .filter(|l| !after.labels.contains(l))
+            .cloned()
+            .collect();
+        self.index_labels_lost(registry, node_id, valid_from, before, &lost)?;
+        self.index_labels_gained(registry, node_id, valid_from, after, &gained)
     }
 
     /// Move the B-tree index entries of the version of temporal node
@@ -1854,8 +2027,7 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        let label = before.primary_label();
-        if !registry.has_btree_for(label) {
+        if !before.labels.iter().any(|l| registry.has_btree_for(l)) {
             return Ok(());
         }
         self.sync_txn_state();
@@ -1875,23 +2047,25 @@ impl<'a> ExecutionContext<'a> {
             let before_of = crate::index::registry::record_lookup(before, interner);
             let after_of = crate::index::registry::record_lookup(after, interner);
             let field_of = |name: &str| interner.lookup(name);
-            registry
-                .on_property_changed(
-                    self.engine,
-                    &mut self.txn,
-                    self.shard_id,
-                    &crate::index::PropertyChange {
-                        node_id,
-                        valid_from: Some(valid_from),
-                        label,
-                        properties: &changed,
-                        before: &before_of,
-                        after: &after_of,
-                    },
-                    &field_of,
-                    &mut self.key_claims.indexes,
-                )
-                .map_err(index_write_error)?;
+            for label in before.labels.iter().filter(|l| registry.has_btree_for(l)) {
+                registry
+                    .on_property_changed(
+                        self.engine,
+                        &mut self.txn,
+                        self.shard_id,
+                        &crate::index::PropertyChange {
+                            node_id,
+                            valid_from: Some(valid_from),
+                            label,
+                            properties: &changed,
+                            before: &before_of,
+                            after: &after_of,
+                        },
+                        &field_of,
+                        &mut self.key_claims.indexes,
+                    )
+                    .map_err(index_write_error)?;
+            }
         }
         self.claim_building_uniques(from);
         Ok(())
@@ -1910,8 +2084,7 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        let label = record.primary_label();
-        if !registry.has_btree_for(label) {
+        if !record.labels.iter().any(|l| registry.has_btree_for(l)) {
             return Ok(());
         }
         self.sync_txn_state();
@@ -1927,23 +2100,25 @@ impl<'a> ExecutionContext<'a> {
                 }
             };
             let field_of = |name: &str| interner.lookup(name);
-            registry
-                .on_property_changed(
-                    self.engine,
-                    &mut self.txn,
-                    self.shard_id,
-                    &crate::index::PropertyChange {
-                        node_id,
-                        valid_from: None,
-                        label,
-                        properties: &[property],
-                        before: &before,
-                        after: &after,
-                    },
-                    &field_of,
-                    &mut self.key_claims.indexes,
-                )
-                .map_err(index_write_error)?;
+            for label in record.labels.iter().filter(|l| registry.has_btree_for(l)) {
+                registry
+                    .on_property_changed(
+                        self.engine,
+                        &mut self.txn,
+                        self.shard_id,
+                        &crate::index::PropertyChange {
+                            node_id,
+                            valid_from: None,
+                            label,
+                            properties: &[property],
+                            before: &before,
+                            after: &after,
+                        },
+                        &field_of,
+                        &mut self.key_claims.indexes,
+                    )
+                    .map_err(index_write_error)?;
+            }
         }
         self.claim_building_uniques(from);
         Ok(())
@@ -1954,6 +2129,12 @@ impl<'a> ExecutionContext<'a> {
     pub fn indexes_label(&self, label: &str) -> bool {
         self.btree_index_registry
             .is_some_and(|registry| registry.has_btree_for(label))
+    }
+
+    /// Whether `record` has B-tree index entries to keep under any label it
+    /// carries.
+    pub fn indexes_record(&self, record: &NodeRecord) -> bool {
+        record.labels.iter().any(|l| self.indexes_label(l))
     }
 
     /// Move the B-tree index entries of a node whose `properties` go from
@@ -1970,8 +2151,7 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        let label = before.primary_label();
-        if properties.is_empty() || !registry.has_btree_for(label) {
+        if properties.is_empty() || !before.labels.iter().any(|l| registry.has_btree_for(l)) {
             return Ok(());
         }
         self.sync_txn_state();
@@ -1981,42 +2161,45 @@ impl<'a> ExecutionContext<'a> {
             let before_of = crate::index::registry::record_lookup(before, interner);
             let after_of = crate::index::registry::record_lookup(after, interner);
             let field_of = |name: &str| interner.lookup(name);
-            registry
-                .on_property_changed(
-                    self.engine,
-                    &mut self.txn,
-                    self.shard_id,
-                    &crate::index::PropertyChange {
-                        node_id,
-                        valid_from: None,
-                        label,
-                        properties,
-                        before: &before_of,
-                        after: &after_of,
-                    },
-                    &field_of,
-                    &mut self.key_claims.indexes,
-                )
-                .map_err(index_write_error)?;
+            for label in before.labels.iter().filter(|l| registry.has_btree_for(l)) {
+                registry
+                    .on_property_changed(
+                        self.engine,
+                        &mut self.txn,
+                        self.shard_id,
+                        &crate::index::PropertyChange {
+                            node_id,
+                            valid_from: None,
+                            label,
+                            properties,
+                            before: &before_of,
+                            after: &after_of,
+                        },
+                        &field_of,
+                        &mut self.key_claims.indexes,
+                    )
+                    .map_err(index_write_error)?;
+            }
         }
         self.claim_building_uniques(from);
         Ok(())
     }
 
-    /// Move the B-tree index entries of a node whose declared properties go
-    /// from `old` to `new` (keyed by field id), as a node merge rewrites its
-    /// target. A unique value another node holds refuses the write.
+    /// Move the B-tree index entries of a node carrying `labels` whose
+    /// declared properties go from `old` to `new` (keyed by field id), as a
+    /// node merge rewrites its target. A unique value another node holds
+    /// refuses the write.
     pub fn index_fields_changed(
         &mut self,
         node_id: NodeId,
-        label: &str,
+        labels: &[String],
         old: &HashMap<u32, Value>,
         new: &HashMap<u32, Value>,
     ) -> Result<(), ExecutionError> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        if !registry.has_btree_for(label) {
+        if !labels.iter().any(|l| registry.has_btree_for(l)) {
             return Ok(());
         }
         self.sync_txn_state();
@@ -2034,23 +2217,25 @@ impl<'a> ExecutionContext<'a> {
         let after = |name: &str| interner.lookup(name).and_then(|f| new.get(&f).cloned());
         let field_of = |name: &str| interner.lookup(name);
         let from = self.key_claims.indexes.len();
-        registry
-            .on_property_changed(
-                self.engine,
-                &mut self.txn,
-                self.shard_id,
-                &crate::index::PropertyChange {
-                    node_id,
-                    valid_from: None,
-                    label,
-                    properties: &changed,
-                    before: &before,
-                    after: &after,
-                },
-                &field_of,
-                &mut self.key_claims.indexes,
-            )
-            .map_err(index_write_error)?;
+        for label in labels.iter().filter(|l| registry.has_btree_for(l)) {
+            registry
+                .on_property_changed(
+                    self.engine,
+                    &mut self.txn,
+                    self.shard_id,
+                    &crate::index::PropertyChange {
+                        node_id,
+                        valid_from: None,
+                        label,
+                        properties: &changed,
+                        before: &before,
+                        after: &after,
+                    },
+                    &field_of,
+                    &mut self.key_claims.indexes,
+                )
+                .map_err(index_write_error)?;
+        }
         self.claim_building_uniques(from);
         Ok(())
     }
@@ -2176,7 +2361,7 @@ impl<'a> ExecutionContext<'a> {
         let field_of = |name: &str| interner.lookup(name);
         let interpretation = index.interpretation(&field_of);
         let holds = |record: &NodeRecord| {
-            record.primary_label() == index.label
+            record.has_label(&index.label)
                 && interpretation
                     .record_membership(record)
                     .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t)))
@@ -2227,25 +2412,7 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        let label = record.primary_label();
-        if !registry.has_btree_for(label) {
-            return Ok(());
-        }
-        self.sync_txn_state();
-        let interner: &FieldInterner = self.interner;
-        let lookup = crate::index::registry::record_lookup(record, interner);
-        let field_of = |name: &str| interner.lookup(name);
-        Ok(registry.on_node_deleted(
-            self.engine,
-            &mut self.txn,
-            &crate::index::registry::NodeState {
-                node_id,
-                valid_from: None,
-                label,
-                value_of: &lookup,
-            },
-            &field_of,
-        )?)
+        self.index_labels_lost(registry, node_id, None, record, &record.labels)
     }
 
     /// Stage and commit one catalog change in a transaction of its own,
@@ -2639,7 +2806,7 @@ impl<'a> ExecutionContext<'a> {
         // Delegate to Layer-4 LocalNodeStore (owns key encoding + msgpack);
         // the put buffers on the transaction for atomic flush.
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        if self.label_checks_writes(record.primary_label())? {
+        if self.record_checks_writes(record)? {
             self.txn
                 .note_post_state_check(&coordinode_core::graph::node::encode_node_key(
                     shard_id, node_id,
@@ -2648,6 +2815,17 @@ impl<'a> ExecutionContext<'a> {
         self.sync_txn_state();
         self.stage_label_membership(shard_id, node_id, Some(&record.labels))?;
         Ok(LocalNodeStore.put(&mut self.txn, shard_id, node_id, record)?)
+    }
+
+    /// Whether `record` is checked before the commit under any label it
+    /// carries ([`Self::label_checks_writes`]).
+    fn record_checks_writes(&mut self, record: &NodeRecord) -> Result<bool, ExecutionError> {
+        for label in &record.labels {
+            if self.label_checks_writes(label)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Stage the label lookup postings of node `node_id` moving from the
@@ -2729,7 +2907,7 @@ impl<'a> ExecutionContext<'a> {
 
     /// Refuse `record`, the state node `node_id` is stored in by a write that
     /// lands at once, outside the transaction, when it breaks a presence or
-    /// type constraint of its primary label or carries a vector one of the
+    /// type constraint of a label it carries or carries a vector one of the
     /// label's vector indexes cannot take.
     fn check_constraints_now(
         &mut self,
@@ -2739,16 +2917,18 @@ impl<'a> ExecutionContext<'a> {
         if let Some(vectors) = &self.vector_indexes {
             check_vectors(vectors.registry, record, self.interner, || Ok(node_id))?;
         }
-        let label = record.primary_label();
-        if !self.label_checks_nodes(label)? {
-            return Ok(());
+        for label in &record.labels {
+            if !self.label_checks_nodes(label)? {
+                continue;
+            }
+            let Some(Some(schema)) = self.label_schema_cache.get(label.as_str()) else {
+                continue;
+            };
+            let lookup = crate::index::registry::record_lookup(record, self.interner);
+            coordinode_core::schema::validation::check_node_constraints(schema, &lookup)
+                .map_err(|e| constraint_violation(e, label, node_id))?;
         }
-        let Some(Some(schema)) = self.label_schema_cache.get(label) else {
-            return Ok(());
-        };
-        let lookup = crate::index::registry::record_lookup(record, self.interner);
-        coordinode_core::schema::validation::check_node_constraints(schema, &lookup)
-            .map_err(|e| constraint_violation(e, label, node_id))
+        Ok(())
     }
 
     /// Write a node record into a `STORAGE COLUMNAR` table's own tree.
@@ -2876,7 +3056,7 @@ impl<'a> ExecutionContext<'a> {
         record: &NodeRecord,
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        if self.label_checks_writes(record.primary_label())? {
+        if self.record_checks_writes(record)? {
             self.txn.note_post_state_check(
                 &coordinode_core::graph::node::encode_temporal_node_key(
                     shard_id,
@@ -2908,7 +3088,7 @@ impl<'a> ExecutionContext<'a> {
     ) -> Result<(), ExecutionError> {
         let vt_fid = self.field_id("valid_to")?;
         // The record before the close, kept only when an index may read it.
-        let open = if self.indexes_label(record.primary_label()) {
+        let open = if self.indexes_record(record) {
             Some(record.clone())
         } else {
             None
@@ -5554,7 +5734,9 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             name,
             temporal,
             properties,
-        } => execute_create_node_type(name, *temporal, properties, ctx),
+            implies,
+            auxiliary,
+        } => execute_create_node_type(name, *temporal, properties, implies, *auxiliary, ctx),
 
         LogicalOp::CreateTable {
             name,
@@ -7644,9 +7826,8 @@ fn written_vector_nodes(
         // No node has ever carried the property.
         return Ok(Vec::new());
     };
-    let indexed = |record: &NodeRecord| {
-        record.primary_label() == label && record_vector(record, field).is_some()
-    };
+    let indexed =
+        |record: &NodeRecord| record.has_label(label) && record_vector(record, field).is_some();
     let nodes = coordinode_modality::LocalNodeStore;
     let mut written = Vec::new();
     // Every record read is a unit of work; the ones kept are held for the
@@ -13257,13 +13438,14 @@ fn execute_create_node(
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
 
-    // Load schema for the primary label (if any) to determine property routing.
-    // In VALIDATED mode, undeclared properties go to `extra` (string keys).
-    let schema = if let Some(primary) = labels.first() {
-        ctx.load_current_label_schema(primary).ok().flatten()
-    } else {
-        None
-    };
+    // The node's single type label is its primary label wherever the write
+    // named it; the labels it implies are stored with it.
+    let node_labels = ctx.node_labels(labels)?;
+    let labels: &[String] = &node_labels.labels;
+
+    // The primary label's schema routes and checks the properties. In
+    // VALIDATED mode, undeclared properties go to `extra` (string keys).
+    let schema = ctx.load_current_label_schema(node_labels.primary())?;
 
     // Effective mode: use schema mode when a schema is declared, otherwise FLEXIBLE
     // (no schema = no enforcement, preserving backward-compatible behaviour for
@@ -14001,7 +14183,11 @@ fn execute_update(
                             store_node_property(&mut new_record, property, val, by_name, ctx)?;
                         }
                         crate::plan::SetItem::AddLabel { label, .. } => {
+                            // The new version stores the labels its type
+                            // implies and keeps exactly one type.
+                            let before = new_record.labels.clone();
                             new_record.add_label(label.clone());
+                            ctx.relabel(&mut new_record, &before, None)?;
                         }
                         crate::plan::SetItem::ReplaceProperties { expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?;
@@ -14453,9 +14639,7 @@ fn execute_update(
                                 // `valid_to` field entirely so the version
                                 // becomes open again.
                                 let field_id = ctx.field_id("valid_to")?;
-                                let closed = ctx
-                                    .indexes_label(record.primary_label())
-                                    .then(|| record.clone());
+                                let closed = ctx.indexes_record(&record).then(|| record.clone());
                                 record.props.remove(&field_id);
                                 ctx.mvcc_put_node_temporal(
                                     ctx.shard_id,
@@ -14720,9 +14904,7 @@ fn execute_update(
 
                         // Every property goes, the overflow ones too; the
                         // map's are stored where the schema keeps each.
-                        let before = ctx
-                            .indexes_label(record.primary_label())
-                            .then(|| record.clone());
+                        let before = ctx.indexes_record(&record).then(|| record.clone());
                         record.props.clear();
                         record.extra = None;
                         if let Value::Map(ref map) = map_val {
@@ -14805,7 +14987,7 @@ fn execute_update(
                         // does not name are left as they are.
                         if let Value::Map(ref map) = map_val {
                             register_stored_ids(label_schema.as_ref(), map, ctx)?;
-                            if ctx.indexes_label(record.primary_label()) {
+                            if ctx.indexes_record(&record) {
                                 let mut after = record.clone();
                                 for (name, v) in map {
                                     let by_name = stored_by_name(label_schema.as_ref(), name);
@@ -14843,15 +15025,14 @@ fn execute_update(
                     };
 
                     if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-                        let newly_added = !record.has_label(label);
+                        let before = record.clone();
                         record.add_label(label.clone());
+                        // The labels the node then stores, the ones its type
+                        // implies included, and the indexes it joins.
+                        ctx.relabel(&mut record, &before.labels, None)?;
+                        ctx.stat_labels_changed(&before.labels, &record.labels);
+                        ctx.index_labels_changed(node_id, None, &before, &record)?;
                         ctx.write_stats.labels_added += 1;
-                        // Statistics counters: only a label the node did not
-                        // already carry changes its cardinality.
-                        if newly_added {
-                            use coordinode_modality::{LocalStatsStore, StatsStore as _};
-                            LocalStatsStore.label_added(&mut ctx.txn, label);
-                        }
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
@@ -15086,7 +15267,9 @@ fn execute_remove(
                             ctx.write_stats.properties_removed += 1;
                         }
                         crate::plan::RemoveItem::Label { label, .. } => {
+                            let before = new_record.labels.clone();
                             new_record.remove_label(label);
+                            ctx.relabel(&mut new_record, &before, Some(label))?;
                             ctx.write_stats.labels_removed += 1;
                         }
                         crate::plan::RemoveItem::PropertyPath { path, .. } => {
@@ -15240,14 +15423,15 @@ fn execute_remove(
                     };
 
                     if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-                        let was_present = record.remove_label(label);
+                        let before = record.clone();
+                        record.remove_label(label);
+                        // A type label cannot be removed from under its node,
+                        // nor a label the type implies; the node leaves the
+                        // removed label's indexes.
+                        ctx.relabel(&mut record, &before.labels, Some(label))?;
+                        ctx.stat_labels_changed(&before.labels, &record.labels);
+                        ctx.index_labels_changed(node_id, None, &before, &record)?;
                         ctx.write_stats.labels_removed += 1;
-                        // Statistics counters: only an actually-removed label
-                        // changes its cardinality.
-                        if was_present {
-                            use coordinode_modality::{LocalStatsStore, StatsStore as _};
-                            LocalStatsStore.label_removed(&mut ctx.txn, label);
-                        }
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
@@ -15812,8 +15996,15 @@ fn execute_merge_nodes(
         let target_extra_before: HashMap<String, Value> =
             target_rec.extra.clone().unwrap_or_default();
         let target_label = target_rec.primary_label().to_string();
+        let target_labels_before = target_rec.labels.clone();
 
         merge_node_properties(&mut target_rec, &source_rec, conflict, row, ctx)?;
+        // An ON CONFLICT SET of a label leaves the survivor one type label
+        // and the labels it implies.
+        if target_rec.labels != target_labels_before {
+            ctx.relabel(&mut target_rec, &target_labels_before, None)?;
+            ctx.stat_labels_changed(&target_labels_before, &target_rec.labels);
+        }
 
         // STRICT / VALIDATED schema enforcement: a merged record may carry
         // properties that the target's label doesn't accept (source-only
@@ -15904,11 +16095,18 @@ fn execute_merge_nodes(
         // index registries — any colliding source entries are gone.
         notify_indexes_for_target_change(
             target_id,
-            &target_label,
+            &target_labels_before,
             &target_props_before,
             &target_rec.props,
             ctx,
         )?;
+        // A label the merge added or removed moves the survivor into or out
+        // of that label's indexes, at its merged values.
+        if target_rec.labels != target_labels_before {
+            let mut before = target_rec.clone();
+            before.labels.clone_from(&target_labels_before);
+            ctx.index_labels_changed(target_id, None, &before, &target_rec)?;
+        }
 
         // Persist merged target record.
         ctx.mvcc_put_node(ctx.shard_id, target_id, &target_rec)?;
@@ -16546,7 +16744,7 @@ fn apply_merge_nodes_set_item(
 /// stay in sync.
 fn notify_indexes_for_target_change(
     target_id: NodeId,
-    label: &str,
+    labels: &[String],
     old: &HashMap<u32, Value>,
     new: &HashMap<u32, Value>,
     ctx: &mut ExecutionContext<'_>,
@@ -16554,7 +16752,7 @@ fn notify_indexes_for_target_change(
     // B-tree entries move from the old values to the new ones in one pass;
     // a unique value another node holds refuses the merge. Vector and text
     // indexes follow the committed record on their own.
-    ctx.index_fields_changed(target_id, label, old, new)
+    ctx.index_fields_changed(target_id, labels, old, new)
 }
 
 /// Transfer every edge of `source_id` onto `target_id`.
@@ -18853,8 +19051,9 @@ fn execute_alter_label(
     Ok(vec![row])
 }
 
-/// Execute `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]`. Mirror of
-/// `execute_create_edge_type` for node labels.
+/// Execute `CREATE NODE TYPE <name> [TEMPORAL] [IMPLIES (...)] [WITH (...)]`
+/// and `CREATE LABEL <name> AUXILIARY`. Mirror of `execute_create_edge_type`
+/// for node labels.
 ///
 /// Persists a new `LabelSchema` with the bitemporal flag set as declared and
 /// the user-supplied property declarations. Rejects:
@@ -18871,6 +19070,8 @@ fn execute_create_node_type(
     name: &str,
     temporal: bool,
     properties: &[crate::plan::PropertyDecl],
+    implies: &[String],
+    auxiliary: bool,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     use coordinode_core::schema::definition::{
@@ -18935,6 +19136,18 @@ fn execute_create_node_type(
         }
         schema.add_property(prop);
     }
+    if auxiliary {
+        schema.set_auxiliary();
+    }
+    schema.set_implies(implies.to_vec());
+    ctx.sync_txn_state();
+    crate::executor::label_kinds::admit_label_kind(
+        ctx.engine,
+        &mut ctx.txn,
+        &schema,
+        true,
+        &|_| None,
+    )?;
 
     // Persist new schema + current-revision pointer atomically.
     ctx.save_current_label_schema(&schema)?;
@@ -18942,6 +19155,7 @@ fn execute_create_node_type(
     let mut row = Row::new();
     row.insert("name".to_string(), Value::String(name.to_string()));
     row.insert("temporal".to_string(), Value::Bool(temporal));
+    row.insert("auxiliary".to_string(), Value::Bool(auxiliary));
     row.insert(
         "revision".to_string(),
         Value::Int(schema.schema_revision as i64),

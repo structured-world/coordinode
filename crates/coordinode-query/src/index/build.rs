@@ -373,7 +373,8 @@ impl<'a> Backfill<'a> {
                     continue;
                 };
                 let record = decode_record(bytes)?;
-                if record.primary_label() != index.label {
+                // An index covers every node carrying its label.
+                if !record.has_label(&index.label) {
                     continue;
                 }
                 let lookup = record_lookup(&record, self.interner);

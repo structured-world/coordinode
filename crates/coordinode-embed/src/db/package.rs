@@ -434,6 +434,19 @@ impl Database {
             objects.push(object);
         }
 
+        // What each created or changed label is to its nodes, judged with
+        // every label the package declares in place.
+        for label in staged.values().filter(|l| l.dirty) {
+            let declared = |name: &str| staged.get(name).map(|l| l.schema.clone());
+            coordinode_query::executor::label_kinds::admit_label_kind(
+                &self.engine,
+                txn,
+                &label.schema,
+                label.read_revision.is_none(),
+                &declared,
+            )?;
+        }
+
         let changes = staged.values().any(|l| l.dirty) || !edge_writes.is_empty();
         if !changes {
             return Ok(StagedPackage {
@@ -1032,6 +1045,18 @@ fn stage_label(
     if current.temporal != schema.temporal {
         return Err(refused(format!(
             "whether :{name} is temporal is fixed when it is created"
+        )));
+    }
+    // Stored nodes carry what the label was when they were written: its
+    // kind and the labels it implies stay as created.
+    if current.kind() != schema.kind() {
+        return Err(refused(format!(
+            "whether :{name} is a type or an auxiliary label is fixed when it is created"
+        )));
+    }
+    if current.implies() != schema.implies() {
+        return Err(refused(format!(
+            "the labels :{name} implies are fixed when it is created"
         )));
     }
     if let Some(candidate) = current.candidate() {

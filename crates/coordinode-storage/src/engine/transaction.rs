@@ -1255,8 +1255,13 @@ impl<'a> Transaction<'a> {
         // snapshot is the legacy direct path, which has no view to protect and
         // applies as it goes.
         let view = self.snapshot.unwrap_or_else(|| self.engine.snapshot());
+        // What the attempt could not have seen starts below its snapshot when
+        // commits were still in flight under it, as for the write set: those
+        // land beneath the snapshot after the reads were made.
+        let unseen_from = self.validate_from.unwrap_or(view);
         let evaluation =
             Evaluation::new(self.engine, &self.merge_adj_ops, &self.write_buffer, view)
+                .with_unseen_from(unseen_from)
                 .with_node_deltas(&self.merge_node_deltas)
                 .with_kept_counts(&self.kept_counts);
         for claim in self

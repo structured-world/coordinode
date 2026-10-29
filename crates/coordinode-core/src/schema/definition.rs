@@ -398,6 +398,30 @@ pub struct LabelSchema {
     /// satisfy both. Read through [`LabelSchema::candidate`].
     #[serde(default)]
     candidate: Option<LabelCandidate>,
+
+    /// Whether this label is a node's type or only classifies it. Read
+    /// through [`LabelSchema::kind`].
+    #[serde(default)]
+    kind: LabelKind,
+
+    /// The labels a node of this type carries with it, as declared (the
+    /// engine writes their transitive closure). Sorted, without duplicates;
+    /// empty for an auxiliary label. Read through [`LabelSchema::implies`].
+    #[serde(default)]
+    implies: Vec<String>,
+}
+
+/// What a label is to the nodes carrying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LabelKind {
+    /// Carries the schema, mode and placement. A node carries exactly one
+    /// type label as its primary label, besides the labels that one implies.
+    /// A label used without a declaration is a FLEXIBLE type label.
+    #[default]
+    Type,
+    /// Declares no properties and only classifies (scope, role, tag); never
+    /// a node's only label.
+    Auxiliary,
 }
 
 /// Type facts of a label published as a candidate, with the operation that
@@ -547,7 +571,41 @@ impl LabelSchema {
             keyed_by_row_id: false,
             constraints: Vec::new(),
             candidate: None,
+            kind: LabelKind::Type,
+            implies: Vec::new(),
         }
+    }
+
+    /// Whether this label is a type or an auxiliary label.
+    pub fn kind(&self) -> LabelKind {
+        self.kind
+    }
+
+    /// Whether this label only classifies nodes and never types one.
+    pub fn is_auxiliary(&self) -> bool {
+        self.kind == LabelKind::Auxiliary
+    }
+
+    /// Make this label auxiliary. Only for a definition being created; what
+    /// it may then declare is checked by [`crate::schema::labels`]. It never
+    /// types a node, so it validates nothing: its mode is FLEXIBLE.
+    pub fn set_auxiliary(&mut self) {
+        self.kind = LabelKind::Auxiliary;
+        self.mode = SchemaMode::Flexible;
+    }
+
+    /// The labels this type names in `IMPLIES`, sorted.
+    pub fn implies(&self) -> &[String] {
+        &self.implies
+    }
+
+    /// Declare the labels this type implies. Order and repeats do not
+    /// matter: the list is kept sorted and without duplicates, so equal
+    /// declarations encode to equal bytes.
+    pub fn set_implies(&mut self, mut labels: Vec<String>) {
+        labels.sort_unstable();
+        labels.dedup();
+        self.implies = labels;
     }
 
     /// The type facts published but not yet in force, if any.

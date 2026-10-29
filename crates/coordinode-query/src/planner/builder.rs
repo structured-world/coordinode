@@ -897,6 +897,8 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             name: c.name.clone(),
             temporal: c.temporal,
             properties: lower_property_decls(&c.properties),
+            implies: c.implies.clone(),
+            auxiliary: c.auxiliary,
         }),
         Clause::CreateTable(c) => {
             let columns = c

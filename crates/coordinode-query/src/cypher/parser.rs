@@ -335,6 +335,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_create_node_type_clause(pair)?;
             clauses.push(Clause::CreateNodeType(c));
         }
+        Rule::create_auxiliary_label_clause => {
+            let c = build_create_auxiliary_label_clause(pair)?;
+            clauses.push(Clause::CreateNodeType(c));
+        }
         Rule::create_table_clause => {
             let c = build_create_table_clause(pair)?;
             clauses.push(Clause::CreateTable(c));
@@ -1312,6 +1316,7 @@ fn build_create_node_type_clause(
     let mut name = String::new();
     let mut temporal = false;
     let mut properties: Vec<EdgePropertyDecl> = Vec::new();
+    let mut implies: Vec<String> = Vec::new();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -1319,6 +1324,14 @@ fn build_create_node_type_clause(
                 name = inner.as_str().to_string();
             }
             Rule::kw_temporal => temporal = true,
+            Rule::node_type_implies => {
+                implies.extend(
+                    inner
+                        .into_inner()
+                        .filter(|p| p.as_rule() == Rule::identifier)
+                        .map(|p| p.as_str().to_string()),
+                );
+            }
             Rule::property_decl_list => {
                 for decl in inner.into_inner() {
                     if decl.as_rule() == Rule::property_decl {
@@ -1363,6 +1376,27 @@ fn build_create_node_type_clause(
         name,
         temporal,
         properties,
+        implies,
+        auxiliary: false,
+    })
+}
+
+/// Build a `CREATE LABEL <name> AUXILIARY` clause: a node type declaration
+/// of an auxiliary label, which declares nothing else.
+fn build_create_auxiliary_label_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<crate::cypher::ast::CreateNodeTypeClause, ParseError> {
+    let name = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| p.as_str().to_string())
+        .ok_or_else(|| ParseError::Invalid("CREATE LABEL requires a label name".into()))?;
+    Ok(crate::cypher::ast::CreateNodeTypeClause {
+        name,
+        temporal: false,
+        properties: Vec::new(),
+        implies: Vec::new(),
+        auxiliary: true,
     })
 }
 

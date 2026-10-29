@@ -731,7 +731,18 @@ fn a_schema_record_without_constraints_decodes_with_none() {
         .as_array()
         .cloned()
         .expect("a label schema is stored as an array of its fields");
-    // The trailing fields: the candidate, then the constraints.
+    // The trailing fields: the implied labels and the kind, which default to
+    // a type label implying nothing.
+    fields.pop();
+    fields.pop();
+    let mut without_kind = Vec::new();
+    rmpv::encode::write_value(&mut without_kind, &rmpv::Value::Array(fields.clone()))
+        .expect("re-encode");
+    let restored = LabelSchema::from_msgpack(&without_kind).expect("decode");
+    assert_eq!(restored.kind(), LabelKind::Type);
+    assert!(restored.implies().is_empty());
+    assert_eq!(restored.constraints(), schema.constraints());
+    // Then the candidate, then the constraints.
     fields.pop();
     let mut without_candidate = Vec::new();
     rmpv::encode::write_value(&mut without_candidate, &rmpv::Value::Array(fields.clone()))

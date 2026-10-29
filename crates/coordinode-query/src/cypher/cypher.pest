@@ -38,6 +38,7 @@ clause = {
   | create_constraint_clause
   | create_edge_type_clause
   | create_node_type_clause
+  | create_auxiliary_label_clause
   | create_table_clause
   | drop_table_clause
   | create_trigger_clause
@@ -324,19 +325,27 @@ edge_discriminated_by = { kw_discriminated ~ kw_by ~ "(" ~ identifier ~ ")" }
 
 // --- CREATE NODE TYPE ---
 //
-// CREATE NODE TYPE <name> [TEMPORAL] [WITH ( <property_decl_list> )]
+// CREATE NODE TYPE <name> [TEMPORAL] [IMPLIES ( <label>, ... )]
+//                  [WITH ( <property_decl_list> )]
 //
 // TEMPORAL marks the node label as bitemporal: every node record carries
 // (valid_from, valid_to) fields and multiple versions can coexist per node_id.
 // The valid-time axis (user-supplied) composes with the system-time axis
 // (MVCC commit-timestamp + auto `__ingestion_ts__`) for full two-axis AS-OF
-// queries. WITH (...) declares user-defined node properties. The TEMPORAL
-// flag is immutable per label — toggling on an existing label is rejected
-// at DDL time; re-creation via a new label is required.
+// queries. IMPLIES names the labels every node of the type carries with it.
+// WITH (...) declares user-defined node properties. The TEMPORAL flag is
+// immutable per label: toggling it on an existing label is rejected at DDL
+// time; re-creation via a new label is required.
 create_node_type_clause = {
     kw_create ~ kw_node ~ kw_type ~ identifier ~ kw_temporal?
+    ~ node_type_implies?
     ~ (kw_with ~ "(" ~ property_decl_list ~ ")")?
 }
+node_type_implies = { kw_implies ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
+
+// CREATE LABEL <name> AUXILIARY: a label that only classifies a node and
+// declares no properties; a node always carries a type label beside it.
+create_auxiliary_label_clause = { kw_create ~ kw_label ~ identifier ~ kw_auxiliary }
 
 property_decl_list = { property_decl ~ ("," ~ property_decl)* ~ ","? }
 property_decl      = { identifier ~ ":" ~ property_type_name ~ property_decl_modifier* }
@@ -994,6 +1003,9 @@ kw_edge       = @{ ^"edge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_type       = @{ ^"type" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_temporal   = @{ ^"temporal" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_discriminated = @{ ^"discriminated" ~ !(ASCII_ALPHANUMERIC | "_") }
+// Label kinds: context keywords, valid identifiers elsewhere.
+kw_implies    = @{ ^"implies" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_auxiliary  = @{ ^"auxiliary" ~ !(ASCII_ALPHANUMERIC | "_") }
 // CREATE NODE TYPE — bitemporal node-label DDL.
 // Context keyword: `node` remains a valid identifier elsewhere.
 kw_node       = @{ ^"node" ~ !(ASCII_ALPHANUMERIC | "_") }

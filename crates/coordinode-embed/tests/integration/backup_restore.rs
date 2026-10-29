@@ -74,6 +74,7 @@ fn dump_restore_cypher(db1: &Database) -> (Database, tempfile::TempDir) {
 fn node_and_edge_props_survive_cypher_roundtrip() {
     let dir1 = tempfile::tempdir().unwrap();
     let mut db1 = Database::open(dir1.path()).unwrap();
+    db1.execute_cypher("CREATE LABEL Admin AUXILIARY").unwrap();
     db1.execute_cypher("CREATE (a:User:Admin {name: 'Alice', age: 30, vip: true, score: 1.5})")
         .unwrap();
     db1.execute_cypher("CREATE (b:User {name: 'Bob'})").unwrap();
@@ -189,7 +190,9 @@ fn edge_endpoints_and_props_survive_binary_roundtrip() {
 fn multi_label_node_survives_binary_roundtrip() {
     let dir1 = tempfile::tempdir().unwrap();
     let mut db1 = Database::open(dir1.path()).unwrap();
-    // Two labels on one node — User AND Admin.
+    // Two labels on one node: the User type and the auxiliary Admin, whose
+    // declaration travels in the dump with the node.
+    db1.execute_cypher("CREATE LABEL Admin AUXILIARY").unwrap();
     db1.execute_cypher("CREATE (n:User:Admin {name: 'root'})")
         .unwrap();
 

@@ -34,6 +34,7 @@ mod integration {
     mod index_repair;
     mod interactive_txn;
     mod label_count;
+    mod label_kinds;
     mod label_lookup;
     mod merge_stress;
     mod multi_endpoint;

@@ -21,10 +21,20 @@ fn strings(names: &[&str]) -> Value {
     Value::Array(names.iter().map(|n| Value::String((*n).into())).collect())
 }
 
+/// Declare each of `labels` auxiliary: a node carries one type label, and
+/// its other labels classify it.
+fn auxiliary(db: &mut Database, labels: &[&str]) {
+    for label in labels {
+        db.execute_cypher(&format!("CREATE LABEL {label} AUXILIARY"))
+            .expect("auxiliary label");
+    }
+}
+
 /// MERGE creates the node with every label of its pattern, as CREATE does.
 #[test]
 fn merge_creates_every_label_of_its_pattern() {
     let mut db = Database::open_in_memory().expect("open");
+    auxiliary(&mut db, &["B", "D", "F"]);
     db.execute_cypher("MERGE (c:A:B {k: 1}) ON CREATE SET c.v = 1")
         .expect("merge A:B");
     db.execute_cypher("MERGE (c:C:D {k: 1})")
@@ -60,6 +70,7 @@ fn merge_creates_every_label_of_its_pattern() {
 #[test]
 fn merge_matches_on_every_label() {
     let mut db = Database::open_in_memory().expect("open");
+    auxiliary(&mut db, &["B", "Z"]);
     db.execute_cypher("MERGE (c:A:B {k: 1})").expect("first");
     db.execute_cypher("MERGE (c:A:B {k: 1})").expect("again");
     assert_eq!(

@@ -143,17 +143,34 @@ fn create_chain_of_anonymous_nodes_wires_each_edge_to_its_neighbours() {
     );
 }
 
-/// An anonymous path node with no labels or properties cannot refer to
-/// anything bound, so it is a new, empty node and the edge reaches it.
+/// An anonymous path node with no properties cannot refer to anything
+/// bound, so it is a new, empty node and the edge reaches it.
 #[test]
 fn create_path_to_an_empty_anonymous_node_creates_it() {
     let mut db = open_db();
-    db.execute_cypher("CREATE (a:Anon {id: 1})-[:TO_EMPTY]->()")
+    db.execute_cypher("CREATE (a:Anon {id: 1})-[:TO_EMPTY]->(:Anon)")
         .expect("create");
     assert_eq!(
         edge_endpoints(&mut db, "TO_EMPTY"),
         vec![(Some(Value::Int(1)), Some(Value::Null))],
         "one edge, from the labelled node to a node without an id property"
+    );
+}
+
+/// Every node has a type label, so a path node with no label at all is
+/// refused, and nothing of the statement is written.
+#[test]
+fn create_path_to_a_node_without_a_label_is_refused() {
+    let mut db = open_db();
+    let err = db
+        .execute_cypher("CREATE (a:Anon {id: 1})-[:TO_NONE]->()")
+        .expect_err("a node without a type label");
+    assert!(err.to_string().contains("no type label"), "{err}");
+    assert!(
+        db.execute_cypher("MATCH (n:Anon) RETURN n")
+            .expect("match")
+            .is_empty(),
+        "the refused statement wrote nothing"
     );
 }
 
@@ -4308,6 +4325,7 @@ fn trigger_before_commit_multi_label_fires_each_label_trigger() {
     use coordinode_core::graph::types::Value;
     let mut db = open_db();
 
+    db.execute_cypher("CREATE LABEL Admin AUXILIARY").unwrap();
     db.execute_cypher(
         "CREATE TRIGGER on_user ON :User CREATE BEFORE COMMIT \
          EXECUTE CREATE (l:UserLog {action: $event})",
@@ -5277,6 +5295,7 @@ fn trigger_before_commit_remove_label_fires_update() {
     use coordinode_core::graph::types::Value;
     let mut db = open_db();
 
+    db.execute_cypher("CREATE LABEL Admin AUXILIARY").unwrap();
     db.execute_cypher(
         "CREATE TRIGGER on_user_update ON :User UPDATE BEFORE COMMIT \
          EXECUTE CREATE (e:ChangeLog {action: $event})",
@@ -6059,19 +6078,17 @@ fn create_node_on_undeclared_label_does_not_require_valid_from() {
         .expect("undeclared label without TEMPORAL: no valid_from required");
 }
 
-/// Multi-label CREATE `(n:Foo:Bar)` where ANY label is TEMPORAL requires
-/// `valid_from`. The write-time guard scans every declared label rather
-/// than only the primary — a temporal label in any position locks the
-/// bitemporal contract for the whole node.
+/// Multi-label CREATE `(n:Foo:Bar)` with a TEMPORAL type requires
+/// `valid_from` whichever position the type is written in: the type is
+/// found by kind, so a temporal label in any position locks the bitemporal
+/// contract for the whole node.
 ///
-/// `Foo` here is left undeclared (implicit FLEXIBLE) so STRICT schema-mode
-/// noise doesn't bleed into the test — we isolate the multi-label TEMPORAL
-/// guard semantics, not schema-mode property filtering.
+/// `Foo` here is auxiliary, so the node carries one type, `Bar`.
 #[test]
 fn create_node_multi_label_with_any_temporal_requires_valid_from() {
     let mut db = open_db();
-    // Bar is TEMPORAL; Foo is left undeclared (implicit FLEXIBLE) so the
-    // STRICT mode default does not reject undeclared `valid_from`.
+    db.execute_cypher("CREATE LABEL Foo AUXILIARY")
+        .expect("CREATE LABEL Foo AUXILIARY");
     db.execute_cypher("CREATE NODE TYPE Bar TEMPORAL WITH (valid_from: INT)")
         .expect("CREATE NODE TYPE Bar TEMPORAL");
 
@@ -6098,13 +6115,14 @@ fn create_node_multi_label_with_any_temporal_requires_valid_from() {
 
 /// Multi-label CREATE where ALL labels are TEMPORAL still requires
 /// `valid_from`. The guard short-circuits on the first temporal label
-/// found; both-temporal must behave consistently with one-temporal.
+/// found; both-temporal must behave consistently with one-temporal. The
+/// second temporal label is the one the type implies.
 #[test]
 fn create_node_multi_label_both_temporal_requires_valid_from() {
     let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE TempA TEMPORAL WITH (valid_from: INT)")
         .expect("CREATE TempA");
-    db.execute_cypher("CREATE NODE TYPE TempB TEMPORAL WITH (valid_from: INT)")
+    db.execute_cypher("CREATE NODE TYPE TempB TEMPORAL IMPLIES (TempA) WITH (valid_from: INT)")
         .expect("CREATE TempB");
 
     let err = db

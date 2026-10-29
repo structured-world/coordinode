@@ -244,9 +244,11 @@ SET n.name = 'Alice'
 SET n.config.network.ssid = 'home'        -- nested document property
 SET n += {name: 'Alice', age: 30}         -- merge (add/update, no delete)
 SET n = {name: 'Alice'}                   -- replace all properties
-SET n:Premium                             -- add label
+SET n:Premium                             -- add an auxiliary label
 SET n.updated = now() ON VIOLATION SKIP   -- skip nodes that violate schema
 ```
+
+A label added with `SET` must be auxiliary or implied by the node's type: a node keeps one type label ([label kinds](#label-kinds-type-implied-and-auxiliary-labels--)).
 
 #### REMOVE ✅
 
@@ -255,8 +257,10 @@ Removes properties and labels.
 ```cypher
 REMOVE n.temp_flag
 REMOVE n.config.old_key                   -- nested document key
-REMOVE n:Pending                          -- remove label
+REMOVE n:Pending                          -- remove an auxiliary label
 ```
+
+The type label and the labels it implies cannot be removed.
 
 ---
 
@@ -320,6 +324,31 @@ CREATE EDGE TYPE ASSERTS TEMPORAL DISCRIMINATED BY (assertion_key) WITH (
 - Reads (`MATCH (n:Temp)`, index lookups, traversal `MATCH (a)-[:E]->(b:Temp)`, pattern predicate `WHERE (a)-[:E]->(:Temp)`) see each node's state valid at the statement's `NOW`: at most one row per node, none for a deleted, ended or not-yet-valid node. `WHERE temporal_active_at(n, t)` reads the state at `t` instead. See [Temporal Edges → Reading temporal nodes](./temporal-edges.md#reading-temporal-nodes).
 - B-tree indexes on temporal labels hold an entry per version; a `UNIQUE` index there reserves a value for a node once any of its versions held it, so it is not uniqueness at each instant of valid time.
 - Not yet supported on temporal labels: `MERGE`, `UPSERT ON CREATE`, enumerating every version in one `MATCH`, the `AS OF VALID_TIME` clause.
+
+#### Label kinds: type, implied and auxiliary labels ✅ 🔷
+
+A node may carry several labels, but exactly one of them is its **type label**: its definition gives the node's schema, mode and placement. Which label is the type is decided by what each label is, not by the order a statement writes them in.
+
+```cypher
+CREATE NODE TYPE Thing WITH (title: STRING NOT NULL)
+CREATE NODE TYPE Goal IMPLIES (Thing) WITH (title: STRING NOT NULL, due: TIMESTAMP)
+CREATE LABEL Activity AUXILIARY
+
+CREATE (:Activity:Goal {title: 'Ship'})   -- OK: type Goal, the node also gets :Thing
+CREATE (:Extra:Goal {title: 'x'})         -- ERROR: two type labels (Extra is undeclared)
+CREATE (:Activity)                        -- ERROR: no type label
+CREATE (:Goal {title: 'x', note: 1})      -- ERROR: note is not in Goal's schema
+```
+
+- **Type label.** Any label declared with `CREATE NODE TYPE`, and any label used without a declaration (an undeclared label is a `FLEXIBLE` type label). A node carries exactly one; a node with none, or with two that do not imply each other, is refused.
+- **Implied labels.** `IMPLIES (L, ...)` names the labels every node of the type carries with it, transitively. The engine writes them on the node, so `MATCH (n:Thing)` finds every `Goal`. They do not count as a second type. Every property an implied label declares must be declared by the implying type with the same type, so the type's schema is the node's complete property list. A type cannot imply itself or an auxiliary label.
+- **Auxiliary labels.** `CREATE LABEL <name> AUXILIARY` declares a label that only classifies (a scope, a role, a tag). It declares no properties, is not `TEMPORAL`, and is never a node's only label.
+- The rule holds on every write that sets a node's labels or opens a new temporal version: `CREATE`, `MERGE`, `SET n:L`, `REMOVE n:L`, `MERGE NODES`.
+- A node keeps the type it was created with: `SET` of another type label, or `REMOVE` of the type label, is refused. A label the type implies cannot be removed. Auxiliary labels are added and removed freely.
+- `labels(n)` returns the type label first, then the implied and auxiliary labels in name order.
+- An index or a constraint declared on a label covers every node carrying it, whether the label is the node's type, implied by it or auxiliary: an index on `:Thing(title)` finds `Goal` nodes too, and a `UNIQUE` on `:Thing(title)` holds across `Thing` and `Goal`. A node joins a label's indexes when it gains the label and leaves them when it loses it. The constraints of every label a node carries hold together; the type's schema, mode and placement stay the type's alone, and a label's own property declarations are not inherited by the nodes that carry it implied.
+- Whether a label is a type or auxiliary, and the labels a type implies, are fixed when the label is created. Declaring a label auxiliary when stored nodes carry it as their type is refused, and so is declaring `IMPLIES` for a type whose stored nodes lack one of the implied labels.
+- The schema API carries the same declarations: `Label.kind` and `Label.implies`, and the `kind` and `implies` fields of `CreateLabelRequest` and of a `PublishSchema` label.
 
 #### CREATE INDEX / DROP INDEX ✅
 

@@ -107,6 +107,11 @@ fn postings_follow_every_label_change() {
         .expect("provisioned at open");
     assert_eq!(lookup.state, IndexState::Ready, "nothing stored to fill");
 
+    // The labels a node gains and loses beside its type are auxiliary.
+    for label in ["Admin", "Draft"] {
+        db.execute_cypher(&format!("CREATE LABEL {label} AUXILIARY"))
+            .expect("auxiliary label");
+    }
     db.execute_cypher("CREATE (:User {name: 'a'}), (:User:Admin {name: 'b'}), (:Post {name: 'p'})")
         .expect("create");
     db.execute_cypher("MERGE (:User {name: 'c'})")
@@ -210,6 +215,8 @@ fn a_store_without_a_lookup_has_it_built_from_its_nodes() {
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE LABEL Hot AUXILIARY")
+            .expect("auxiliary label");
         db.execute_cypher("UNWIND range(1, 300) AS i CREATE (:Item {name: 'i' + i})")
             .expect("items");
         db.execute_cypher("CREATE (:Item:Hot {name: 'h'}), (:Other {name: 'o'})")
@@ -261,8 +268,10 @@ fn names(db: &mut Database, query: &str) -> Vec<String> {
 /// hold, beside a few small labelled ones.
 fn store_with_a_large_unrelated_node() -> (Database, tempfile::TempDir) {
     let (mut db, dir) = open_db();
+    db.execute_cypher("CREATE LABEL Tagged AUXILIARY")
+        .expect("auxiliary label");
     db.execute_cypher(
-        "CREATE (:Small {name: 's1'}), (:Small:Tagged {name: 's2'}), (:Tagged {name: 't'})",
+        "CREATE (:Small {name: 's1'}), (:Small:Tagged {name: 's2'}), (:Note:Tagged {name: 't'})",
     )
     .expect("small nodes");
     let blob = "x".repeat(4 << 20);
@@ -425,13 +434,14 @@ fn a_temporal_labels_scan_returns_each_members_current_state() {
 }
 
 /// A node of a temporal label is found by a scan of an ordinary label it
-/// also holds: the ordinary label's members include it, read through its
-/// versions.
+/// also holds, one its type implies: the ordinary label's members include
+/// it, read through its versions.
 #[test]
 fn an_ordinary_label_scan_finds_its_temporal_holders() {
     let (mut db, _dir) = open_db();
     db.execute_cypher(
-        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+        "CREATE NODE TYPE Emp TEMPORAL IMPLIES (Person) \
+         WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
     .expect("temporal label");
     let since = std::time::SystemTime::now()
@@ -475,9 +485,12 @@ fn a_scan_at_an_older_snapshot_sees_the_members_of_then() {
 #[test]
 fn a_transaction_scans_its_own_label_changes() {
     let (mut db, _dir) = open_db();
-    db.execute_cypher("CREATE (:Y {name: 'old'})").expect("old");
+    db.execute_cypher("CREATE LABEL Y AUXILIARY")
+        .expect("auxiliary label");
+    db.execute_cypher("CREATE (:Item:Y {name: 'old'})")
+        .expect("old");
     let tx = db.begin_transaction().expect("begin");
-    db.execute_in_transaction(tx, "CREATE (:Y {name: 'new'})", None)
+    db.execute_in_transaction(tx, "CREATE (:Item:Y {name: 'new'})", None)
         .expect("create");
     db.execute_in_transaction(tx, "MATCH (n:Y {name: 'old'}) REMOVE n:Y", None)
         .expect("remove");
@@ -605,9 +618,11 @@ fn a_mount_lookup_beside_large_segments_reads_only_mounts() {
 #[test]
 fn explain_names_the_label_lookup() {
     let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE LABEL Narrow AUXILIARY")
+        .expect("auxiliary label");
     db.execute_cypher("UNWIND range(1, 30) AS i CREATE (:Wide {i: i})")
         .expect("wide");
-    db.execute_cypher("CREATE (:Narrow:Wide {i: 0}), (:Narrow {i: 1})")
+    db.execute_cypher("CREATE (:Narrow:Wide {i: 0}), (:Other:Narrow {i: 1})")
         .expect("narrow");
     let plan = db
         .explain_cypher("MATCH (n:Small) RETURN n")
@@ -638,7 +653,11 @@ fn crash_child_changes_labels_then_aborts() {
         return;
     };
     let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
-    db.execute_cypher("UNWIND range(1, 50) AS i CREATE (:K {name: 'k' + toString(i)})")
+    for label in ["K", "J"] {
+        db.execute_cypher(&format!("CREATE LABEL {label} AUXILIARY"))
+            .expect("auxiliary label");
+    }
+    db.execute_cypher("UNWIND range(1, 50) AS i CREATE (:Item:K {name: 'k' + toString(i)})")
         .expect("create");
     db.execute_cypher("MATCH (n:K) WHERE n.name IN ['k1', 'k2', 'k3'] SET n:J")
         .expect("label added");
@@ -790,6 +809,9 @@ fn a_restored_store_has_every_label_in_its_lookup() {
 
     let (mut source, _source_dir) = open_db();
     source
+        .execute_cypher("CREATE LABEL Admin AUXILIARY")
+        .expect("auxiliary label");
+    source
         .execute_cypher(
             "CREATE (:User {name: 'a'}), (:User:Admin {name: 'b'}), (:Post {name: 'p'})",
         )
@@ -841,13 +863,19 @@ fn idx_keys(db: &Database) -> Vec<Vec<u8>> {
 
 /// The lookup costs a write one index entry per label the write moves and
 /// nothing else: every statement below adds or removes exactly the
-/// postings of the labels it changes, and a write that changes no label
-/// leaves the index partition as it was.
+/// postings of the labels it changes, an implied label included, and a
+/// write that changes no label leaves the index partition as it was.
 #[test]
 fn a_write_moves_one_index_entry_per_label_changed() {
     let (mut db, _dir) = open_db();
+    for label in ["B", "C", "Tagged"] {
+        db.execute_cypher(&format!("CREATE LABEL {label} AUXILIARY"))
+            .expect("auxiliary label");
+    }
+    db.execute_cypher("CREATE NODE TYPE Leaf IMPLIES (Root)")
+        .expect("implying type");
     let cases: [(&str, usize, usize); 7] = [
-        ("CREATE ({name: 'bare'})", 0, 0),
+        ("CREATE (:Leaf)", 2, 0),
         ("CREATE (:Fresh {name: 'f'})", 1, 0),
         ("CREATE (:A:B:C {name: 'abc'})", 3, 0),
         ("CREATE (:D {name: 'd1'}), (:D {name: 'd2'})", 2, 0),

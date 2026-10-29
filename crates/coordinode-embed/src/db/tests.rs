@@ -203,16 +203,21 @@ fn set_while_a_commit_holds_the_node(
 }
 
 /// The per-label counts agree with counting the nodes, follow creates,
-/// deletes and label changes, and leave out a label with no nodes left.
+/// deletes and label changes, and leave out a label with no nodes left. A
+/// node keeps its type, so the change moves an auxiliary label.
 #[test]
 fn label_counts_match_the_stored_nodes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
     assert!(db.label_counts().expect("counts").is_empty());
 
+    for label in ["Moved", "Arrived"] {
+        db.execute_cypher(&format!("CREATE LABEL {label} AUXILIARY"))
+            .expect("auxiliary label");
+    }
     db.execute_cypher("UNWIND range(1, 5) AS i CREATE (:Project {i: i})")
         .expect("projects");
-    db.execute_cypher("CREATE (:Gone), (:Moved)")
+    db.execute_cypher("CREATE (:Gone), (:Parcel:Moved)")
         .expect("others");
     db.execute_cypher("MATCH (n:Project) WHERE n.i <= 2 DELETE n")
         .expect("delete two projects");
@@ -231,7 +236,11 @@ fn label_counts_match_the_stored_nodes() {
     );
     assert_eq!(
         counts,
-        std::collections::HashMap::from([("Project".to_string(), 3), ("Arrived".to_string(), 1)])
+        std::collections::HashMap::from([
+            ("Project".to_string(), 3),
+            ("Parcel".to_string(), 1),
+            ("Arrived".to_string(), 1),
+        ])
     );
 }
 

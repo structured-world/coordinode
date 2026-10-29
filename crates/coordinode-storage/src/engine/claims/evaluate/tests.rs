@@ -706,6 +706,76 @@ fn a_schema_read_of_an_undeclared_label_is_broken_by_its_declaration() {
     );
 }
 
+/// A declaration that lands below the attempt's view after its read (a
+/// commit in flight when the view was taken) is a change the read missed:
+/// asked from the first number the attempt could not have seen, it breaks
+/// the read; asked from the view alone, it would not.
+#[test]
+fn a_schema_read_is_asked_from_the_first_unseen_number() {
+    use coordinode_core::schema::definition::LabelSchema;
+
+    let (engine, _d) = engine();
+    let read = schema_claim("Doc", ClaimPredicate::SchemaRead { revision: 0 });
+    let no_points = HashMap::new();
+    let unseen_from = engine.snapshot();
+    store_label_schema(&engine, &LabelSchema::new_node_id("Doc"));
+    let view = engine.snapshot();
+    let decide = |unseen: u64| {
+        Evaluation::new(&engine, &[], &no_points, view)
+            .with_unseen_from(unseen)
+            .decide(&read)
+            .expect("decide")
+    };
+    assert_eq!(decide(view), Verdict::Holds, "the view alone misses it");
+    assert_eq!(decide(unseen_from), Verdict::Broken);
+}
+
+/// An activation of a type implying labels answers for its stored nodes'
+/// labels too: a node of the type lacking a label the type implies,
+/// directly or through another type, refuses it.
+#[test]
+fn an_activation_of_implied_labels_is_decided_by_the_stored_nodes() {
+    use coordinode_core::graph::node::{NodeRecord, encode_node_key};
+    use coordinode_core::schema::definition::{LabelSchema, encode_label_schema_key};
+
+    let (engine, _d) = engine();
+    let mut middle = LabelSchema::new_node_id("Middle");
+    middle.set_implies(vec!["Base".to_string()]);
+    store_label_schema(&engine, &middle);
+    let mut top = LabelSchema::new_node_id("Top");
+    top.set_implies(vec!["Middle".to_string()]);
+    top.schema_revision = 1;
+    let mut points = HashMap::new();
+    points.insert(
+        (Partition::Schema, encode_label_schema_key("Top", 1)),
+        Some(top.to_msgpack().expect("encode")),
+    );
+    let activation = schema_claim("Top", ClaimPredicate::SchemaActivated { revision: 1 });
+    let view = engine.snapshot();
+    let put_node = |id: u64, labels: &[&str]| {
+        let record = NodeRecord::with_labels(labels.iter().map(|l| (*l).to_string()).collect());
+        engine
+            .put(
+                Partition::Node,
+                &encode_node_key(0, node(id)),
+                &record.to_msgpack().expect("encode"),
+            )
+            .expect("node");
+    };
+
+    put_node(1, &["Top", "Base", "Middle"]);
+    assert_eq!(
+        evaluate(&engine, &activation, &[], &points, view).expect("evaluate"),
+        Verdict::Holds
+    );
+    put_node(2, &["Top", "Middle"]);
+    assert_eq!(
+        evaluate(&engine, &activation, &[], &points, view).expect("evaluate"),
+        Verdict::Broken,
+        "node 2 lacks Base, which Top implies through Middle"
+    );
+}
+
 /// An activation answers for every stored node of its primary label: one that
 /// breaks the new schema refuses it, nodes of other labels do not count, and
 /// the schema it checks against is the one the attempt stages.

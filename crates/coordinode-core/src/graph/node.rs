@@ -652,12 +652,17 @@ impl NodeRecord {
         }
     }
 
-    /// The primary label (first in the list), or empty string if no labels.
+    /// The primary label, or empty string if no labels. The engine stores a
+    /// node's single type label first whatever order the write named its
+    /// labels in ([`crate::schema::labels::resolve_node_labels`]), so the
+    /// first stored label is the primary one.
     pub fn primary_label(&self) -> &str {
         self.labels.first().map(|s| s.as_str()).unwrap_or("")
     }
 
-    /// Check if the node has a specific label.
+    /// Check if the node has a specific label. An index or a constraint
+    /// declared on a label covers every node this answers `true` for: the
+    /// label may be the node's type, one its type implies or an auxiliary one.
     pub fn has_label(&self, label: &str) -> bool {
         self.labels.iter().any(|l| l == label)
     }

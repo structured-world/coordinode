@@ -143,6 +143,8 @@ async fn types_and_constraints_are_created_and_inspected_apart() {
             computed_properties: vec![],
             schema_mode: SchemaMode::Strict as i32,
             temporal: false,
+            kind: 0,
+            implies: vec![],
         })
         .await
         .expect("create label")

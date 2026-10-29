@@ -6,6 +6,7 @@
 pub mod constraint_plan;
 pub mod eval;
 pub mod eval_neutral;
+pub mod label_kinds;
 pub mod row;
 pub mod runner;
 pub(crate) mod temporal_read;

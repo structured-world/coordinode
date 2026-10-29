@@ -1019,7 +1019,7 @@ fn record_holds(
     record: &NodeRecord,
     tuple: &[u8],
 ) -> bool {
-    record.primary_label() == def.label
+    record.has_label(&def.label)
         && interpretation
             .record_membership(record)
             .is_some_and(|held| tuples(&held).iter().any(|t| t.as_slice() == tuple))

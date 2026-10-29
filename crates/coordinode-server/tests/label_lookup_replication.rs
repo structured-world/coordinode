@@ -130,8 +130,16 @@ async fn a_follower_scans_a_label_from_its_replicated_lookup() {
     // The leader provisions the lookup, as the server's resumer does.
     n1.db.resume_interrupted_index_builds().expect("provision");
 
+    // The labels the nodes gain and lose beside their type are auxiliary.
+    for label in ["A", "B"] {
+        n1.db
+            .execute_cypher(&format!("CREATE LABEL {label} AUXILIARY"))
+            .expect("auxiliary label");
+    }
     n1.db
-        .execute_cypher("CREATE (:A {name: 'a1'}), (:A:B {name: 'a2'}), (:B {name: 'b1'})")
+        .execute_cypher(
+            "CREATE (:Item:A {name: 'a1'}), (:Item:A:B {name: 'a2'}), (:Item:B {name: 'b1'})",
+        )
         .expect("create");
     n1.db
         .execute_cypher("MATCH (n {name: 'b1'}) SET n:A")

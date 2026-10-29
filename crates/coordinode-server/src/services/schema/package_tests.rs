@@ -34,6 +34,8 @@ fn request() -> schema::PublishSchemaRequest {
             schema_mode: schema::SchemaMode::Strict as i32,
             temporal: false,
             expected_revision: None,
+            kind: schema::LabelKind::Type as i32,
+            implies: vec![],
         }],
         edge_types: vec![schema::EdgeTypeDeclaration {
             name: "FOLLOWS".into(),

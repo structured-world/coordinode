@@ -1695,7 +1695,7 @@ pub fn holds_values(
     let wanted = tuples(values);
     let interpretation = index.interpretation(field_of);
     let holds = |record: &coordinode_core::graph::node::NodeRecord| {
-        record.primary_label() == index.label
+        record.has_label(&index.label)
             && interpretation
                 .record_membership(record)
                 .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t)))
