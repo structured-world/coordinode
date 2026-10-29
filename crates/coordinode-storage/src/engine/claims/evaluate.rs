@@ -580,10 +580,10 @@ fn label_schema_unchanged(
         return Ok(Verdict::Broken);
     }
     // The pointer names the same revision; a rewrite of it or of the body
-    // in place since the view is still a different schema.
+    // in place since the view is still a different schema. The body of the
+    // revision the pointer names is present, so neither probe reads history.
     let body = encode_label_schema_key(label, revision);
     if engine.written_since_snapshot(Partition::Schema, &pointer, unseen_from)?
-        || engine.get(Partition::Schema, &body)?.is_none()
         || engine.written_since_snapshot(Partition::Schema, &body, unseen_from)?
     {
         return Ok(Verdict::Broken);

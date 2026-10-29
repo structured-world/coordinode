@@ -17,9 +17,11 @@ impl Catalog {
         Ok(self.0.get(label).map(LabelFacts::of).unwrap_or_default())
     }
 
-    fn resolve(&self, labels: &[&str]) -> Result<NodeLabels, LabelKindError> {
+    fn resolve(&self, labels: &[&str]) -> Result<NodeLabels<'static>, LabelKindError> {
         let labels: Vec<String> = labels.iter().map(|l| (*l).to_string()).collect();
-        resolve_node_labels(&labels, |l| self.facts(l)).expect("catalog never fails")
+        resolve_node_labels(&labels, |l| self.facts(l))
+            .expect("catalog never fails")
+            .map(NodeLabels::into_owned)
     }
 
     fn check(&self, schema: &LabelSchema) -> Result<(), LabelDeclarationError> {
@@ -60,7 +62,7 @@ fn goals() -> Catalog {
         .with(auxiliary("Policy"))
 }
 
-fn names(labels: &NodeLabels) -> Vec<&str> {
+fn names<'a>(labels: &'a NodeLabels<'_>) -> Vec<&'a str> {
     labels.labels.iter().map(String::as_str).collect()
 }
 

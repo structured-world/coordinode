@@ -7,6 +7,8 @@
 //! primary label first, so a reader of a stored record takes the first label
 //! as the primary one without consulting the catalog.
 
+use alloc::borrow::Cow;
+
 use smallvec::SmallVec;
 
 use crate::schema::definition::{LabelKind, LabelSchema};
@@ -58,17 +60,25 @@ pub enum LabelKindError {
 
 /// A node's labels as the engine stores them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeLabels {
+pub struct NodeLabels<'a> {
     /// The primary label first, then every implied and auxiliary label in
-    /// byte order, each once.
-    pub labels: Vec<String>,
+    /// byte order, each once. Borrowed when the labels as written are
+    /// already the stored ones, the common single-label write.
+    pub labels: Cow<'a, [String]>,
 }
 
-impl NodeLabels {
+impl NodeLabels<'_> {
     /// The node's primary label.
     pub fn primary(&self) -> &str {
         // `resolve_node_labels` returns a value only with a primary label.
         &self.labels[0]
+    }
+
+    /// The same labels, owned.
+    pub fn into_owned(self) -> NodeLabels<'static> {
+        NodeLabels {
+            labels: Cow::Owned(self.labels.into_owned()),
+        }
     }
 }
 
@@ -81,16 +91,16 @@ impl NodeLabels {
 ///
 /// The outer error is `facts`' own. The inner one says why the labels cannot
 /// type a node.
-pub fn resolve_node_labels<E>(
-    labels: &[String],
+pub fn resolve_node_labels<'a, E>(
+    labels: &'a [String],
     mut facts: impl FnMut(&str) -> Result<LabelFacts, E>,
-) -> Result<Result<NodeLabels, LabelKindError>, E> {
+) -> Result<Result<NodeLabels<'a>, LabelKindError>, E> {
     // One undeclared or plain type label, the common case, is stored as is.
     if let [only] = labels {
         let only_facts = facts(only)?;
         if only_facts.kind == LabelKind::Type && only_facts.implies.is_empty() {
             return Ok(Ok(NodeLabels {
-                labels: labels.to_vec(),
+                labels: Cow::Borrowed(labels),
             }));
         }
     }
@@ -158,7 +168,9 @@ pub fn resolve_node_labels<E>(
     let mut stored = Vec::with_capacity(rest.len() + 1);
     stored.push((*primary).to_string());
     stored.extend(rest);
-    Ok(Ok(NodeLabels { labels: stored }))
+    Ok(Ok(NodeLabels {
+        labels: Cow::Owned(stored),
+    }))
 }
 
 /// The labels `label` implies, transitively, without itself.
