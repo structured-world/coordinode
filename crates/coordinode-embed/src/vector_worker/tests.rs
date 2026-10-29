@@ -302,6 +302,7 @@ fn every_entry_applied_across_a_build_reaches_the_index() {
                     hnsw: hnsw.as_ref(),
                     health: health.as_ref(),
                     label: "Item",
+                    implying: &[],
                     field_id: fx.field,
                 }],
             }

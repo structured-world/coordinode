@@ -264,8 +264,12 @@ impl Worker {
             .map_err(|e| format!("read the field dictionary: {e}"))?;
         let now = wall_clock_us();
         for def in &definitions {
+            // The index covers the nodes of every type implying its label.
+            let implying =
+                coordinode_query::index::membership::types_implying(&self.engine, &def.label)
+                    .map_err(|e| format!("read the types implying :{}: {e}", def.label))?;
             for property in &def.properties {
-                let source = TextSource::new(&interner, &def.label, property);
+                let source = TextSource::new(&interner, &def.label, property, &implying);
                 // A node without text is taken out only if the index holds
                 // it, so writes to other labels cost the index nothing.
                 let changes: Vec<NodeText> = nodes

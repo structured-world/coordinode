@@ -428,7 +428,8 @@ pub fn uncovered_holders(
     };
     use coordinode_core::index::derive::tuples;
 
-    let holder = |key: &[u8], bytes: &[u8]| -> StorageResult<Option<Verdict>> {
+    let mut closures = Closures::new(engine, staged_points);
+    let mut holder = |key: &[u8], bytes: &[u8]| -> StorageResult<Option<Verdict>> {
         // A temporal node holds the values of each of its versions.
         let Some((shard, holder)) = decode_node_key(key)
             .or_else(|| decode_temporal_node_key(key).map(|(shard, id, _)| (shard, id)))
@@ -440,8 +441,9 @@ pub fn uncovered_holders(
         }
         let record = NodeRecord::from_msgpack(bytes)
             .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
-        // The index covers every node carrying its label, in any role.
-        if !record.has_label(&source.label) {
+        // The index covers every node carrying its label, in any role: its
+        // type, implied by its type, or auxiliary.
+        if !closures.carries(&record.labels, &source.label)? {
             return Ok(None);
         }
         let Some(values) = source.interpretation.record_membership(&record) else {
@@ -667,6 +669,60 @@ fn implied_closure(
     Ok(closure)
 }
 
+/// What each type met implies, under the definitions an attempt leaves (its
+/// own staged schema writes over the stored ones), compiled once per type:
+/// a judgement over many records reads no definition per record.
+pub(crate) struct Closures<'e> {
+    engine: &'e StorageEngine,
+    staged_points: StagedPoints<'e>,
+    implied: coordinode_core::schema::labels::ImpliedCache,
+}
+
+impl<'e> Closures<'e> {
+    pub(crate) fn new(engine: &'e StorageEngine, staged_points: StagedPoints<'e>) -> Self {
+        Self {
+            engine,
+            staged_points,
+            implied: coordinode_core::schema::labels::ImpliedCache::default(),
+        }
+    }
+
+    /// What type `primary` implies, compiled on first use.
+    pub(crate) fn implied(
+        &mut self,
+        primary: &str,
+    ) -> StorageResult<&coordinode_core::schema::labels::ImpliedLabels> {
+        let (engine, staged_points) = (self.engine, self.staged_points);
+        self.implied
+            .compile(primary, |l| {
+                Ok::<_, crate::error::StorageError>(
+                    current_label_schema(engine, l, staged_points)?
+                        .as_ref()
+                        .map(coordinode_core::schema::labels::LabelFacts::of)
+                        .unwrap_or_default(),
+                )
+            })?
+            .map_err(|e| crate::error::StorageError::Serialization(e.to_string()))?;
+        self.implied.implied(primary).ok_or_else(|| {
+            crate::error::StorageError::Serialization(format!(
+                "what :{primary} implies was not compiled"
+            ))
+        })
+    }
+
+    /// Whether a node storing `stored` carries `label`: stored, or implied
+    /// by its type.
+    fn carries(&mut self, stored: &[String], label: &str) -> StorageResult<bool> {
+        if stored.iter().any(|l| l == label) {
+            return Ok(true);
+        }
+        match stored.first() {
+            Some(primary) => Ok(self.implied(primary)?.contains(label)),
+            None => Ok(false),
+        }
+    }
+}
+
 /// The current definition of `label` as the attempt leaves it: its own
 /// staged pointer and body over the stored ones. `None` for a label without
 /// a definition.
@@ -742,8 +798,9 @@ fn candidate_admits_written_nodes(
     };
 
     let mut names: Option<(std::collections::HashMap<u32, String>, u32)> = None;
+    let mut closures = Closures::new(engine, staged_points);
     let mut check = |key: &[u8], record: NodeRecord| -> StorageResult<Option<Verdict>> {
-        if !record.has_label(label) {
+        if !closures.carries(&record.labels, label)? {
             return Ok(None);
         }
         if names.is_none() {
@@ -762,7 +819,7 @@ fn candidate_admits_written_nodes(
         // A carrier answers to the candidate as the proof holds it: whole
         // as its type, by its explicit constraints otherwise.
         Ok(
-            carrier_violation(&candidate, record, names, *frontier).map(|reason| {
+            carrier_violation(&candidate, record, true, names, *frontier).map(|reason| {
                 Verdict::Violates(LabelSchemaViolation {
                     node: node_of_record_key(key),
                     reason,
@@ -849,16 +906,18 @@ pub fn first_label_schema_violation(
         .iter()
         .map(|(name, id)| (id, name.to_string()))
         .collect();
-    let check = |key: &[u8], bytes: &[u8]| -> StorageResult<Option<LabelSchemaViolation>> {
+    let mut closures = Closures::new(engine, staged_points);
+    let mut check = |key: &[u8], bytes: &[u8]| -> StorageResult<Option<LabelSchemaViolation>> {
         let record = NodeRecord::from_msgpack(bytes)
             .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
+        let carried = closures.carries(&record.labels, &schema.name)?;
         Ok(
-            carrier_violation(schema, record, &names, dictionary.frontier()).map(|reason| {
-                LabelSchemaViolation {
+            carrier_violation(schema, record, carried, &names, dictionary.frontier()).map(
+                |reason| LabelSchemaViolation {
                     node: node_of_record_key(key),
                     reason,
-                }
-            }),
+                },
+            ),
         )
     };
 
@@ -973,6 +1032,8 @@ pub fn label_schema_violations(
         .iter()
         .map(|(name, id)| (id, name.to_string()))
         .collect();
+    let nothing_staged = std::collections::HashMap::new();
+    let mut closures = Closures::new(engine, &nothing_staged);
     for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
         let (key, value) = guard.into_inner()?;
         if !is_node_record_key(&key) {
@@ -980,15 +1041,17 @@ pub fn label_schema_violations(
         }
         let record = NodeRecord::from_msgpack(&value)
             .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
-        // Each pending label the node carries judges it.
-        let carried: Vec<&coordinode_core::schema::definition::LabelSchema> = record
-            .labels
-            .iter()
-            .filter_map(|label| pending.get(label.as_str()).copied())
-            .collect();
+        // Each pending label the node carries, its type's implied ones
+        // included, judges it.
+        let mut carried: Vec<&coordinode_core::schema::definition::LabelSchema> = Vec::new();
+        for (name, schema) in &pending {
+            if closures.carries(&record.labels, name)? {
+                carried.push(schema);
+            }
+        }
         for schema in carried {
             let Some(reason) =
-                carrier_violation(schema, record.clone(), &names, dictionary.frontier())
+                carrier_violation(schema, record.clone(), true, &names, dictionary.frontier())
             else {
                 continue;
             };
@@ -1025,21 +1088,22 @@ fn is_node_record_key(key: &[u8]) -> bool {
     key.starts_with(NODE_KEY_PREFIX) && (key.len() == 16 || key.len() == 25)
 }
 
-/// What `record`, a node carrying `schema`'s label, breaks in it: the whole
-/// definition when the label is the node's type, only the explicit
-/// constraints declared on the label when the node carries it implied or
-/// auxiliary. `None` for a node that does not carry the label or breaks
-/// nothing.
+/// What `record` breaks in `schema`: the whole definition when the label is
+/// the node's type, only the explicit constraints declared on the label when
+/// the node carries it implied or auxiliary (`carried`, which the caller
+/// judges with what the type implies). `None` for a node that does not carry
+/// the label or breaks nothing.
 fn carrier_violation(
     schema: &coordinode_core::schema::definition::LabelSchema,
     record: coordinode_core::graph::node::NodeRecord,
+    carried: bool,
     names: &std::collections::HashMap<u32, String>,
     frontier: u32,
 ) -> Option<String> {
     if record.labels.first() == Some(&schema.name) {
         return record_violation(schema, record, names, frontier);
     }
-    if !record.has_label(&schema.name) {
+    if !carried {
         return None;
     }
     let value_of = |name: &str| {

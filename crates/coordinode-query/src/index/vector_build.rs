@@ -65,6 +65,9 @@ pub struct BuildTarget<'a> {
     pub health: &'a HealthSignal,
     /// The indexed label.
     pub label: &'a str,
+    /// The types that imply `label`
+    /// ([`crate::index::membership::types_implying`]).
+    pub implying: &'a [String],
     /// The interned id of the indexed property.
     pub field_id: u32,
 }
@@ -72,8 +75,9 @@ pub struct BuildTarget<'a> {
 impl BuildTarget<'_> {
     /// The vector `record` contributes to this index, if it is a member.
     fn member(&self, record: &NodeRecord) -> Option<Vec<f32>> {
-        // The index covers every node carrying its label.
-        if !record.has_label(self.label) {
+        // The index covers every node carrying its label, its type's
+        // implied ones included.
+        if !crate::index::membership::carries_label(&record.labels, self.label, self.implying) {
             return None;
         }
         record

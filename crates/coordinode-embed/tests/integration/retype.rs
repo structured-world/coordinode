@@ -335,6 +335,125 @@ fn a_retype_survives_a_restart() {
     assert_eq!(entry_count(&db, "thing_title"), 1);
 }
 
+/// A check of the B-tree index `name` against its records finds every entry
+/// the records call for and nothing else: it repairs nothing.
+fn assert_index_agrees(db: &Database, name: &str) {
+    use coordinode_query::index::{CheckOutcome, IndexSelector};
+    let operation = db
+        .check_index(&IndexSelector::Name(name.into()))
+        .expect("start the check");
+    let (_, outcome) = db
+        .index_check(operation, std::time::Duration::from_secs(30))
+        .expect("read the check")
+        .expect("the check exists");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { repaired: 0, .. })),
+        "{name}: {outcome:?}"
+    );
+}
+
+/// The type, labels, properties, edges and index entries of node `id`,
+/// read back to compare one state with another.
+fn state_of(db: &mut Database, id: i64) -> Vec<std::collections::HashMap<String, Value>> {
+    rows(
+        db,
+        &format!(
+            "MATCH (n) WHERE id(n) = {id} OPTIONAL MATCH (n)-[r]->(m) \
+             RETURN labels(n) AS l, n.title AS title, n.due AS due, n.name AS name, \
+             type(r) AS rel, id(m) AS other"
+        ),
+    )
+}
+
+/// The value a node holds when it is retyped may clash with a unique index
+/// of its new type as long as the same statement changes it: only the
+/// complete result answers to the index. The holder of the clashing value
+/// keeps it; the retyped node holds its final value under its own id, with
+/// its auxiliary label and its edge.
+#[test]
+fn a_retype_is_judged_by_its_final_values_not_by_its_steps() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT thing_title FOR (n:Thing) REQUIRE n.title IS UNIQUE")
+        .expect("unique on Thing");
+    db.execute_cypher("CREATE (:Thing {title: 'x'})")
+        .expect("holder");
+    db.execute_cypher("CREATE (:Note:Activity {title: 'x'})-[:REL]->(:Other {k: 1})")
+        .expect("note");
+    let holder = id_of(&mut db, "MATCH (n:Thing {title: 'x'}) RETURN id(n) AS id");
+    let note = id_of(&mut db, "MATCH (n:Note) RETURN id(n) AS id");
+
+    db.execute_cypher("MATCH (n:Note) RETYPE NODE n TO Goal SET n.title = 'y'")
+        .expect("the final value is free");
+
+    assert_eq!(
+        id_of(&mut db, "MATCH (n:Thing {title: 'x'}) RETURN id(n) AS id"),
+        holder,
+        "the holder keeps its value"
+    );
+    assert_eq!(
+        id_of(&mut db, "MATCH (n:Thing {title: 'y'}) RETURN id(n) AS id"),
+        note,
+        "the final value belongs to the retyped node"
+    );
+    assert_eq!(labels_of(&mut db, note), ["Goal", "Activity", "Thing"]);
+    assert_eq!(count(&mut db, "MATCH (n:Note) RETURN n"), 0);
+    assert_eq!(
+        count(&mut db, "MATCH (:Goal)-[:REL]->(:Other) RETURN 1 AS one"),
+        1
+    );
+    assert_eq!(entry_count(&db, "thing_title"), 2);
+    assert_index_agrees(&db, "thing_title");
+}
+
+/// A retype whose final value breaks a unique index of its new type is
+/// refused, and its transaction with it: the write made earlier in the same
+/// transaction is gone, and the node keeps its type, labels, properties,
+/// edge and index entries, before and after a reopen.
+#[test]
+fn a_retype_whose_result_breaks_a_unique_index_leaves_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let note;
+    let before;
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        kinds(&mut db);
+        db.execute_cypher("CREATE CONSTRAINT thing_title FOR (n:Thing) REQUIRE n.title IS UNIQUE")
+            .expect("unique on Thing");
+        db.execute_cypher("CREATE (:Thing {title: 'x'})")
+            .expect("holder");
+        db.execute_cypher("CREATE (:Note:Activity {title: 'z'})-[:REL]->(:Other {k: 1})")
+            .expect("note");
+        note = id_of(&mut db, "MATCH (n:Note) RETURN id(n) AS id");
+        before = state_of(&mut db, note);
+
+        let tx = db.begin_transaction().expect("begin");
+        db.execute_in_transaction(tx, "CREATE (:Witness {k: 1})", None)
+            .expect("the earlier write");
+        let refused = db.execute_in_transaction(
+            tx,
+            "MATCH (n:Note) RETYPE NODE n TO Goal SET n.title = 'x'",
+            None,
+        );
+        let err = refused.expect_err("the final value is held").to_string();
+        assert!(err.contains("unique"), "{err}");
+        assert!(
+            db.commit_transaction(tx).is_err(),
+            "the refused statement ends its transaction"
+        );
+
+        assert_eq!(count(&mut db, "MATCH (n:Witness) RETURN n"), 0);
+        assert_eq!(state_of(&mut db, note), before);
+        assert_eq!(count(&mut db, "MATCH (n:Goal) RETURN n"), 0);
+        assert_eq!(entry_count(&db, "thing_title"), 1);
+        assert_index_agrees(&db, "thing_title");
+    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    assert_eq!(count(&mut db, "MATCH (n:Witness) RETURN n"), 0);
+    assert_eq!(state_of(&mut db, note), before);
+    assert_eq!(entry_count(&db, "thing_title"), 1);
+    assert_index_agrees(&db, "thing_title");
+}
+
 /// A node of an undeclared type becomes another undeclared type with every
 /// property it had.
 #[test]

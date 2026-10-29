@@ -156,6 +156,7 @@ fn a_blocked_reader_is_served_once_the_build_hands_over() {
                     hnsw: hnsw.as_ref(),
                     health: health.as_ref(),
                     label: "Doc",
+                    implying: &[],
                     field_id: field,
                 }],
             }
@@ -417,6 +418,7 @@ fn make_ctx<'a>(
         feedback_cache: None,
         schema_label_cache: std::collections::HashMap::new(),
         label_schema_cache: std::collections::HashMap::new(),
+        implied: Default::default(),
         node_columns: None,
         applied_watermark: None,
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),

@@ -237,13 +237,22 @@ pub fn rebuild_node_counters(txn: &mut Transaction<'_>) -> StorageResult<()> {
 
     let mut total: i64 = 0;
     let mut label_counts: HashMap<String, i64> = HashMap::new();
+    let nothing_staged = HashMap::new();
+    let engine = txn.engine();
+    let mut closures = crate::engine::claims::evaluate::Closures::new(engine, &nothing_staged);
 
-    for guard in txn.engine().prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
+    for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
         let (key, value) = guard.into_inner()?;
         let record = decode_node_record(&value)
             .map_err(|_| corrupt(Partition::Node, &key, "not a node record"))?;
         total += 1;
-        for label in &record.labels {
+        // Every label the node carries counts it, its type's implied ones
+        // included.
+        let implied = match record.labels.first() {
+            Some(primary) => closures.implied(primary)?.as_slice(),
+            None => &[],
+        };
+        for label in record.labels.iter().chain(implied) {
             *label_counts.entry(label.clone()).or_insert(0) += 1;
         }
     }

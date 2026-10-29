@@ -3,9 +3,11 @@
 //!
 //! A node carries exactly one type label as its primary label, whatever the
 //! order its labels are written in. The labels that type implies (transitively)
-//! go with it, and any other label must be auxiliary. The engine stores the
-//! primary label first, so a reader of a stored record takes the first label
-//! as the primary one without consulting the catalog.
+//! go with it, and any other label must be auxiliary. A record stores the
+//! primary label first, then the node's own auxiliary labels; the implied ones
+//! belong to the type and are derived from its compiled [`ImpliedLabels`], so
+//! a change of what a type implies rewrites no record. [`Membership`] is the
+//! node's complete label set.
 
 use alloc::borrow::Cow;
 
@@ -61,9 +63,9 @@ pub enum LabelKindError {
 /// A node's labels as the engine stores them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeLabels<'a> {
-    /// The primary label first, then every implied and auxiliary label in
-    /// byte order, each once. Borrowed when the labels as written are
-    /// already the stored ones, the common single-label write.
+    /// The primary label first, then the node's auxiliary labels in byte
+    /// order, each once; the labels the type implies are not among them.
+    /// Borrowed when the labels as written are already the stored ones.
     pub labels: Cow<'a, [String]>,
 }
 
@@ -83,9 +85,9 @@ impl NodeLabels<'_> {
 }
 
 /// Resolve `labels`, written in any order, into the labels a node stores:
-/// its single type label first, then the labels it implies (added when not
-/// written) and the auxiliary ones. `facts` answers for each label the node
-/// carries or its type implies.
+/// its single type label first, then its auxiliary labels. A written label
+/// the type implies is the type's, not stored. `facts` answers for each
+/// label the node carries or its type implies.
 ///
 /// # Errors
 ///
@@ -95,10 +97,9 @@ pub fn resolve_node_labels<'a, E>(
     labels: &'a [String],
     mut facts: impl FnMut(&str) -> Result<LabelFacts, E>,
 ) -> Result<Result<NodeLabels<'a>, LabelKindError>, E> {
-    // One undeclared or plain type label, the common case, is stored as is.
+    // One type label, the common case, is stored as is.
     if let [only] = labels {
-        let only_facts = facts(only)?;
-        if only_facts.kind == LabelKind::Type && only_facts.implies.is_empty() {
+        if facts(only)?.kind == LabelKind::Type {
             return Ok(Ok(NodeLabels {
                 labels: Cow::Borrowed(labels),
             }));
@@ -153,24 +154,233 @@ pub fn resolve_node_labels<'a, E>(
             labels: types.iter().map(|(l, _)| (*l).to_string()).collect(),
         }));
     };
-    let (primary, closure) = &types[primary];
+    let (primary, _) = &types[primary];
 
     // Every other written type is implied by the primary one: with a single
-    // type no other implies, each is reached from it.
-    let mut rest: Vec<String> = closure.clone();
-    for (label, label_facts) in &written {
-        if *label != *primary && label_facts.kind == LabelKind::Auxiliary {
-            rest.push((*label).to_string());
-        }
+    // type no other implies, each is reached from it. Those belong to the
+    // type, not to the node, and are not stored; the auxiliary labels are
+    // the node's own.
+    let mut auxiliary: SmallVec<[&str; 4]> = written
+        .iter()
+        .filter(|(label, label_facts)| {
+            *label != *primary && label_facts.kind == LabelKind::Auxiliary
+        })
+        .map(|(label, _)| *label)
+        .collect();
+    auxiliary.sort_unstable();
+    let canonical = labels.len() == auxiliary.len() + 1
+        && labels[0] == *primary
+        && labels[1..].iter().zip(&auxiliary).all(|(l, a)| l == a);
+    if canonical {
+        return Ok(Ok(NodeLabels {
+            labels: Cow::Borrowed(labels),
+        }));
     }
-    rest.sort_unstable();
-    rest.dedup();
-    let mut stored = Vec::with_capacity(rest.len() + 1);
+    let mut stored = Vec::with_capacity(auxiliary.len() + 1);
     stored.push((*primary).to_string());
-    stored.extend(rest);
+    stored.extend(auxiliary.iter().map(|l| (*l).to_string()));
     Ok(Ok(NodeLabels {
         labels: Cow::Owned(stored),
     }))
+}
+
+/// The labels type label `label` implies, transitively, without itself, in
+/// byte order: what every node of the type carries besides its stored
+/// labels. `facts` answers for `label` and each label it reaches.
+///
+/// # Errors
+///
+/// The outer error is `facts`' own; the inner one names an implication
+/// cycle.
+pub fn compile_implied<E>(
+    label: &str,
+    mut facts: impl FnMut(&str) -> Result<LabelFacts, E>,
+) -> Result<Result<ImpliedLabels, LabelKindError>, E> {
+    let own = facts(label)?;
+    if own.implies.is_empty() {
+        return Ok(Ok(ImpliedLabels::default()));
+    }
+    Ok(
+        implied_closure(label, &own, &mut facts)?.map(|mut closure| {
+            closure.sort_unstable();
+            ImpliedLabels(closure.into_boxed_slice())
+        }),
+    )
+}
+
+/// The labels a type implies, transitively, in byte order: compiled once
+/// from a catalog view and shared by every node of the type read under it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImpliedLabels(Box<[String]>);
+
+impl ImpliedLabels {
+    /// The labels, in byte order.
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether `label` is among them.
+    pub fn contains(&self, label: &str) -> bool {
+        self.0.binary_search_by(|l| l.as_str().cmp(label)).is_ok()
+    }
+}
+
+/// The compiled [`ImpliedLabels`] of each type met under one catalog view,
+/// compiled once per type and shared by every node of it read under that
+/// view: a membership test after the first costs no catalog read and no
+/// walk of the implication graph.
+#[derive(Debug, Clone, Default)]
+pub struct ImpliedCache {
+    compiled: rustc_hash::FxHashMap<String, ImpliedLabels>,
+}
+
+impl ImpliedCache {
+    /// Compile what `primary` implies under `facts`, unless it was.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is `facts`' own; the inner one names an implication
+    /// cycle.
+    pub fn compile<E>(
+        &mut self,
+        primary: &str,
+        facts: impl FnMut(&str) -> Result<LabelFacts, E>,
+    ) -> Result<Result<(), LabelKindError>, E> {
+        if self.compiled.contains_key(primary) {
+            return Ok(Ok(()));
+        }
+        Ok(compile_implied(primary, facts)?.map(|implied| {
+            self.compiled.insert(primary.to_string(), implied);
+        }))
+    }
+
+    /// What `primary` implies, when compiled.
+    pub fn implied(&self, primary: &str) -> Option<&ImpliedLabels> {
+        self.compiled.get(primary)
+    }
+
+    /// The membership of a node storing `stored`, when its type was
+    /// compiled; a record without labels has the empty membership.
+    pub fn membership<'a>(&'a self, stored: &'a [String]) -> Option<Membership<'a>> {
+        match stored.first() {
+            None => Some(Membership::stored_only(stored)),
+            Some(primary) => self
+                .compiled
+                .get(primary.as_str())
+                .map(|implied| Membership::new(stored, implied)),
+        }
+    }
+
+    /// Forget every compiled type: the catalog view they were compiled
+    /// under no longer holds.
+    pub fn clear(&mut self) {
+        self.compiled.clear();
+    }
+}
+
+/// The labels a node carries: the ones its record stores (its type first,
+/// then its own auxiliary labels in byte order) and the ones its type
+/// implies, borrowed from both without building a list.
+#[derive(Debug, Clone, Copy)]
+pub struct Membership<'a> {
+    stored: &'a [String],
+    implied: &'a [String],
+}
+
+impl<'a> Membership<'a> {
+    /// The membership of a node storing `stored` whose type implies
+    /// `implied`.
+    pub fn new(stored: &'a [String], implied: &'a ImpliedLabels) -> Self {
+        Self {
+            stored,
+            implied: implied.as_slice(),
+        }
+    }
+
+    /// The membership of a node whose type implies nothing.
+    pub fn stored_only(stored: &'a [String]) -> Self {
+        Self {
+            stored,
+            implied: &[],
+        }
+    }
+
+    /// The node's type label; `None` for a record without labels.
+    pub fn primary(&self) -> Option<&'a str> {
+        self.stored.first().map(String::as_str)
+    }
+
+    /// Whether the node carries `label`.
+    pub fn contains(&self, label: &str) -> bool {
+        self.stored.iter().any(|l| l == label)
+            || self
+                .implied
+                .binary_search_by(|l| l.as_str().cmp(label))
+                .is_ok()
+    }
+
+    /// Every label the node carries, each once: its type first, then the
+    /// implied and auxiliary ones merged in byte order.
+    pub fn iter(&self) -> impl Iterator<Item = &'a str> + 'a {
+        let (primary, auxiliary) = self
+            .stored
+            .split_first()
+            .map_or((None, &[][..]), |(p, a)| (Some(p.as_str()), a));
+        primary.into_iter().chain(MergedLabels {
+            left: self.implied,
+            right: auxiliary,
+        })
+    }
+
+    /// How many labels the node carries.
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    /// Whether the node carries no label.
+    pub fn is_empty(&self) -> bool {
+        self.stored.is_empty()
+    }
+}
+
+/// Two byte-ordered label lists merged in byte order, a label in both
+/// yielded once.
+struct MergedLabels<'a> {
+    left: &'a [String],
+    right: &'a [String],
+}
+
+impl<'a> Iterator for MergedLabels<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        match (self.left.split_first(), self.right.split_first()) {
+            (Some((l, left)), Some((r, right))) => match l.cmp(r) {
+                core::cmp::Ordering::Less => {
+                    self.left = left;
+                    Some(l)
+                }
+                core::cmp::Ordering::Greater => {
+                    self.right = right;
+                    Some(r)
+                }
+                core::cmp::Ordering::Equal => {
+                    self.left = left;
+                    self.right = right;
+                    Some(l)
+                }
+            },
+            (Some((l, left)), None) => {
+                self.left = left;
+                Some(l)
+            }
+            (None, Some((r, right))) => {
+                self.right = right;
+                Some(r)
+            }
+            (None, None) => None,
+        }
+    }
 }
 
 /// The labels `label` implies, transitively, without itself.

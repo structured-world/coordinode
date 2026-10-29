@@ -19,6 +19,9 @@ use coordinode_storage::engine::core::StorageEngine;
 
 use crate::planner::logical::{NumericCmp, VectorPredicate};
 
+/// For each label a predicate tests, the declared types that imply it.
+pub type Implying = std::collections::HashMap<String, Vec<String>>;
+
 /// Evaluate `predicate` against the node identified by `node_id`.
 ///
 /// `field_lookup` resolves a property name to its interned `field_id`. The
@@ -33,27 +36,39 @@ pub fn evaluate_predicate(
     node_id: NodeId,
     predicate: &VectorPredicate,
     field_lookup: &dyn Fn(&str) -> Option<u32>,
+    implying: &Implying,
 ) -> bool {
     let Ok((_key, Some(record))) =
         LocalNodeStore.read_record_at_snapshot(engine, None, shard_id, node_id)
     else {
         return false;
     };
-    evaluate_against(&record, predicate, field_lookup)
+    evaluate_against(&record, predicate, field_lookup, implying)
 }
 
 /// Pure form: evaluate a predicate against an already-loaded `NodeRecord`.
 /// Useful when the caller has the record in hand (e.g. tests or paths that
-/// already paid the point-get cost).
+/// already paid the point-get cost). `implying` names, for a label of a
+/// `LabelEq` leaf, the types that imply it, resolved before the search.
 pub fn evaluate_against(
     record: &NodeRecord,
     predicate: &VectorPredicate,
     field_lookup: &dyn Fn(&str) -> Option<u32>,
+    implying: &Implying,
 ) -> bool {
     match predicate {
         // A node carries a label as its type, implied by its type or
-        // auxiliary; MATCH on the label finds it in each case.
-        VectorPredicate::LabelEq(label) => record.has_label(label),
+        // auxiliary; MATCH on the label finds it in each case. The record
+        // stores its type and auxiliary labels; a type implying the label
+        // carries it without storing it.
+        VectorPredicate::LabelEq(label) => {
+            record.labels.iter().any(|l| l == label)
+                || record.labels.first().is_some_and(|primary| {
+                    implying
+                        .get(label)
+                        .is_some_and(|types| types.iter().any(|t| t == primary))
+                })
+        }
         VectorPredicate::PropertyEq { property, value } => {
             let Some(fid) = field_lookup(property) else {
                 return false;
@@ -88,8 +103,8 @@ pub fn evaluate_against(
             }
         }
         VectorPredicate::And(left, right) => {
-            evaluate_against(record, left, field_lookup)
-                && evaluate_against(record, right, field_lookup)
+            evaluate_against(record, left, field_lookup, implying)
+                && evaluate_against(record, right, field_lookup, implying)
         }
     }
 }

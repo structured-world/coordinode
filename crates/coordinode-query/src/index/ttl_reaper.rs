@@ -99,8 +99,22 @@ struct TtlTarget {
     target_field_id: Option<u32>,
     /// How a deleted row frees its table key.
     key: RowKeyRelease,
+    /// The labels `label` implies, which every node of it carries without
+    /// storing them.
+    implied: Vec<String>,
     /// The B-tree indexes a reaped row's entries leave with it.
     indexes: Arc<BtreeIndexes>,
+}
+
+impl TtlTarget {
+    /// Every label `record`, a node of this target's type, carries.
+    fn carried<'r>(&'r self, record: &'r NodeRecord) -> impl Iterator<Item = &'r str> + 'r {
+        record
+            .labels
+            .iter()
+            .chain(&self.implied)
+            .map(String::as_str)
+    }
 }
 
 /// The B-tree indexes in force for a reap pass, and how to read the values
@@ -161,20 +175,21 @@ impl BtreeIndexes {
 
     /// Whether a reaped node's entries can be named: a label with B-tree
     /// indexes needs the values they index, which a pass without the field
-    /// dictionary cannot read.
-    fn can_remove(&self, record: &NodeRecord) -> bool {
-        self.readable || !record.labels.iter().any(|l| self.registry.has_btree_for(l))
+    /// dictionary cannot read. `carried` is every label the node carries.
+    fn can_remove<'l>(&self, mut carried: impl Iterator<Item = &'l str>) -> bool {
+        self.readable || !carried.any(|l| self.registry.has_btree_for(l))
     }
 
     /// Stage the removal of a reaped node's entries in `txn`, the same way a
-    /// statement deleting the node stages it. Call only when
-    /// [`Self::can_remove`] holds.
-    fn stage_delete(
+    /// statement deleting the node stages it, from the indexes of `carried`,
+    /// every label it carries. Call only when [`Self::can_remove`] holds.
+    fn stage_delete<'l>(
         &self,
         engine: &StorageEngine,
         txn: &mut Transaction<'_>,
         node_id: NodeId,
         record: &NodeRecord,
+        carried: impl Iterator<Item = &'l str>,
     ) -> Result<(), coordinode_modality::StoreError> {
         let lookup = |name: &str| {
             self.fields
@@ -186,11 +201,7 @@ impl BtreeIndexes {
         // A reaped node leaves the index of every label it carries; the
         // expiry policy stays its type's. The reaper reads only node keys
         // that are not temporal versions.
-        for label in record
-            .labels
-            .iter()
-            .filter(|l| self.registry.has_btree_for(l))
-        {
+        for label in carried.filter(|l| self.registry.has_btree_for(l)) {
             let node = super::registry::NodeState {
                 node_id,
                 valid_from: None,
@@ -394,10 +405,19 @@ fn discover_ttl_targets(
         return Ok(Vec::new());
     }
     let indexes = Arc::new(BtreeIndexes::load(engine, interner)?);
+    let mut catalog = super::membership::CatalogMembership::current(engine);
 
     let mut targets = Vec::new();
     for schema in schemas {
         let label_name = schema.name.clone();
+        let stored = [label_name.clone()];
+        let implied: Vec<String> = catalog
+            .of_stored(&stored)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .skip(1)
+            .map(str::to_string)
+            .collect();
         let key = match schema.key_columns() {
             [] => RowKeyRelease::None,
             columns => columns
@@ -435,6 +455,7 @@ fn discover_ttl_targets(
                         RowKeyRelease::Columns(c) => RowKeyRelease::Columns(c.clone()),
                         RowKeyRelease::Unresolved => RowKeyRelease::Unresolved,
                     },
+                    implied: implied.clone(),
                     indexes: Arc::clone(&indexes),
                 });
             }
@@ -895,7 +916,7 @@ fn stage_expired(
                     Some(values)
                 }
             };
-            if !target.indexes.can_remove(record) {
+            if !target.indexes.can_remove(target.carried(record)) {
                 result.errors.push(format!(
                     "label {}: indexed values unreadable without the field \
                      dictionary; row {nid_raw} kept so its index entries are not left",
@@ -911,7 +932,7 @@ fn stage_expired(
             }
             target
                 .indexes
-                .stage_delete(engine, txn, node_id, record)
+                .stage_delete(engine, txn, node_id, record, target.carried(record))
                 .map_err(|e| e.to_string())?;
             stage_detach(txn, node_id, edge_types)?;
             // Deleting through the node store states that the identity is
@@ -922,7 +943,7 @@ fn stage_expired(
                 .map_err(|e| e.to_string())?;
             use coordinode_modality::stats as stat_keys;
             txn.push_counter_delta(stat_keys::NODES_TOTAL_KEY, -1);
-            for label in &record.labels {
+            for label in target.carried(record) {
                 txn.push_counter_delta(&stat_keys::label_count_key(label), -1);
             }
             result.nodes_deleted += 1;
@@ -1024,9 +1045,8 @@ fn property_is_indexed(
         RowKeyRelease::Unresolved => true,
     };
     let indexed = key_column
-        || record
-            .labels
-            .iter()
+        || target
+            .carried(record)
             .any(|l| target.indexes.registry.reads_property(l, property));
     if indexed {
         result.errors.push(format!(

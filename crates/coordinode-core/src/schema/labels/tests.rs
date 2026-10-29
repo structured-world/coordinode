@@ -24,6 +24,20 @@ impl Catalog {
             .map(NodeLabels::into_owned)
     }
 
+    fn implied(&self, label: &str) -> Result<ImpliedLabels, LabelKindError> {
+        compile_implied(label, |l| self.facts(l)).expect("catalog never fails")
+    }
+
+    /// Every label a node written with `labels` carries.
+    fn membership(&self, labels: &[&str]) -> Vec<String> {
+        let stored = self.resolve(labels).expect("labels type a node");
+        let implied = self.implied(stored.primary()).expect("no cycle");
+        Membership::new(&stored.labels, &implied)
+            .iter()
+            .map(str::to_string)
+            .collect()
+    }
+
     fn check(&self, schema: &LabelSchema) -> Result<(), LabelDeclarationError> {
         check_label_declaration(schema, |l| Ok::<_, String>(self.0.get(l).cloned()))
             .expect("catalog never fails")
@@ -88,25 +102,31 @@ fn label_order_does_not_choose_the_primary_label() {
     let b = catalog.resolve(&["Goal", "Activity"]).expect("one type");
     assert_eq!(a, b);
     assert_eq!(a.primary(), "Goal");
-    assert_eq!(names(&a), ["Goal", "Activity", "Thing"]);
+    assert_eq!(names(&a), ["Goal", "Activity"]);
 }
 
-/// The engine writes the labels a type implies even when they are not
-/// written, so a match on the ancestor finds the node.
+/// A record stores its type and its own auxiliary labels; the labels the
+/// type implies are its type's, carried by the node without being stored,
+/// so a match on the ancestor finds it.
 #[test]
-fn implied_labels_are_added() {
-    let labels = goals().resolve(&["Goal"]).expect("one type");
-    assert_eq!(names(&labels), ["Goal", "Thing"]);
+fn implied_labels_are_carried_not_stored() {
+    let catalog = goals();
+    let labels = catalog.resolve(&["Goal"]).expect("one type");
+    assert_eq!(names(&labels), ["Goal"]);
+    assert_eq!(catalog.membership(&["Goal"]), ["Goal", "Thing"]);
 }
 
-/// An implied label written beside its implying type is not a second type.
+/// An implied label written beside its implying type is not a second type,
+/// and writing it does not make it the node's own.
 #[test]
 fn a_written_implied_label_is_not_a_second_type() {
-    let labels = goals()
+    let catalog = goals();
+    let labels = catalog
         .resolve(&["Thing", "Goal"])
         .expect("Thing is implied");
     assert_eq!(labels.primary(), "Goal");
-    assert_eq!(names(&labels), ["Goal", "Thing"]);
+    assert_eq!(names(&labels), ["Goal"]);
+    assert_eq!(catalog.membership(&["Thing", "Goal"]), ["Goal", "Thing"]);
 }
 
 /// Implication is transitive.
@@ -116,12 +136,33 @@ fn implied_labels_are_closed_transitively() {
         .with(type_label("Entity", &[], &[]))
         .with(type_label("Thing", &["Entity"], &[]))
         .with(type_label("Goal", &["Thing"], &[]));
-    let labels = catalog.resolve(&["Goal"]).expect("one type");
-    assert_eq!(names(&labels), ["Goal", "Entity", "Thing"]);
+    assert_eq!(
+        catalog.implied("Goal").expect("no cycle").as_slice(),
+        ["Entity", "Thing"]
+    );
+    assert_eq!(catalog.membership(&["Goal"]), ["Goal", "Entity", "Thing"]);
     let labels = catalog
         .resolve(&["Entity", "Goal"])
         .expect("Entity is implied");
     assert_eq!(labels.primary(), "Goal");
+}
+
+/// The node's own auxiliary labels and its type's implied ones merge in byte
+/// order, a label in both carried once; membership answers for each.
+#[test]
+fn membership_merges_implied_and_auxiliary_labels() {
+    let catalog = goals().with(auxiliary("Thingamajig"));
+    let members = catalog.membership(&["Goal", "Thingamajig", "Activity"]);
+    assert_eq!(members, ["Goal", "Activity", "Thing", "Thingamajig"]);
+    let stored = catalog.resolve(&["Goal", "Activity"]).expect("one type");
+    let implied = catalog.implied("Goal").expect("no cycle");
+    let membership = Membership::new(&stored.labels, &implied);
+    for label in ["Goal", "Activity", "Thing"] {
+        assert!(membership.contains(label), "{label}");
+    }
+    assert!(!membership.contains("Policy"));
+    assert_eq!(membership.primary(), Some("Goal"));
+    assert_eq!(membership.len(), 3);
 }
 
 /// The first escape: an undeclared label beside a STRICT type is a second
@@ -183,17 +224,23 @@ fn a_repeated_label_is_stored_once() {
     let labels = goals()
         .resolve(&["Goal", "Activity", "Goal", "Activity"])
         .expect("one type");
-    assert_eq!(names(&labels), ["Goal", "Activity", "Thing"]);
+    assert_eq!(names(&labels), ["Goal", "Activity"]);
 }
 
-/// A cycle the catalog somehow holds leaves no primary label; resolution
-/// says so instead of looping.
+/// A cycle the catalog somehow holds leaves no primary label among types
+/// written together, and compiling what a type implies says so instead of
+/// looping.
 #[test]
 fn an_implication_cycle_is_refused() {
     let catalog = Catalog::default()
         .with(type_label("A", &["B"], &[]))
         .with(type_label("B", &["A"], &[]));
-    let err = catalog.resolve(&["A"]).expect_err("cycle");
+    let err = catalog.resolve(&["A", "B"]).expect_err("cycle");
+    assert!(
+        matches!(err, LabelKindError::ImplicationCycle { .. }),
+        "{err:?}"
+    );
+    let err = catalog.implied("A").expect_err("cycle");
     assert!(
         matches!(err, LabelKindError::ImplicationCycle { .. }),
         "{err:?}"

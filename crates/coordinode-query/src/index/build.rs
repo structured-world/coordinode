@@ -224,6 +224,7 @@ impl<'a> Backfill<'a> {
         rows: &[(Vec<u8>, Vec<u8>)],
         maintained_after: u64,
         read: &mut Vec<Vec<u8>>,
+        membership: &mut crate::index::membership::CatalogMembership<'_>,
     ) -> Result<u64, BackfillError> {
         let resolve = self.labels.ok_or_else(|| {
             BackfillError::Store(StoreError::Invariant(
@@ -247,12 +248,19 @@ impl<'a> Backfill<'a> {
             {
                 continue;
             }
-            let labels =
+            let stored =
                 NodeRecord::labels_from_msgpack(bytes).map_err(|e| StoreError::Decode {
                     kind: "node labels",
                     message: format!("node {}: {e}", node.as_raw()),
                 })?;
-            members.push((node, labels));
+            // The lookup holds every label a node carries, its type's
+            // implied ones included.
+            let carried = membership
+                .of_stored(&stored)?
+                .iter()
+                .map(str::to_string)
+                .collect();
+            members.push((node, carried));
             read.push(key.clone());
         }
         let mut names: Vec<&str> = members
@@ -333,6 +341,8 @@ impl<'a> Backfill<'a> {
         let mut indexed = 0u64;
         let mut conflicts = 0u32;
         let mut page_repairs = 0usize;
+        // What each type implies, compiled once for the whole build.
+        let mut membership = crate::index::membership::CatalogMembership::current(self.engine);
         loop {
             self.check_stop()?;
             let mut txn = match self.oracle {
@@ -363,6 +373,7 @@ impl<'a> Backfill<'a> {
                     &page.rows,
                     maintained_after,
                     &mut read,
+                    &mut membership,
                 )?;
             }
             for (key, bytes) in &page.rows {
@@ -373,8 +384,9 @@ impl<'a> Backfill<'a> {
                     continue;
                 };
                 let record = decode_record(bytes)?;
-                // An index covers every node carrying its label.
-                if !record.has_label(&index.label) {
+                // An index covers every node carrying its label, its type's
+                // implied ones included.
+                if !membership.carries(&record, &index.label)? {
                     continue;
                 }
                 let lookup = record_lookup(&record, self.interner);

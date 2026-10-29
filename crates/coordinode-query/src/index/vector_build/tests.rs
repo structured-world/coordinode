@@ -150,6 +150,7 @@ impl Fixture {
                 hnsw,
                 health,
                 label: "Doc",
+                implying: &[],
                 field_id: self.field,
             }],
         }
@@ -254,6 +255,7 @@ impl Fixture {
                             hnsw: &hnsw,
                             health: &health,
                             label: "Doc",
+                            implying: &[],
                             field_id: self.field,
                         }],
                     }
@@ -279,6 +281,7 @@ impl Fixture {
                 hnsw: &hnsw,
                 health: &health,
                 label: "Doc",
+                implying: &[],
                 field_id: self.field,
             }],
             during,
@@ -495,6 +498,7 @@ fn a_scan_refused_for_released_history_starts_over_without_the_tap() {
             hnsw: &hnsw,
             health: &health,
             label: "Doc",
+            implying: &[],
             field_id: fx.field,
         }],
     }
@@ -849,12 +853,14 @@ fn one_build_fills_every_index_of_the_shard() {
                 hnsw: &docs,
                 health: &doc_health,
                 label: "Doc",
+                implying: &[],
                 field_id: fx.field,
             },
             BuildTarget {
                 hnsw: &imgs,
                 health: &img_health,
                 label: "Img",
+                implying: &[],
                 field_id: pixels,
             },
         ],

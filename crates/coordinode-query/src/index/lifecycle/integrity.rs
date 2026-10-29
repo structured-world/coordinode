@@ -40,6 +40,7 @@ use super::{
 use crate::index::definition::{
     BuildFailure, GenerationId, IndexBuildRecord, IndexDefinition, IndexId, IndexState, IndexType,
 };
+use crate::index::membership::CatalogMembership;
 use crate::index::registry::IntegrityReport;
 
 mod verify;
@@ -1018,11 +1019,27 @@ fn record_holds(
     interpretation: &IndexInterpretation,
     record: &NodeRecord,
     tuple: &[u8],
-) -> bool {
-    record.has_label(&def.label)
+    catalog: &mut CatalogMembership<'_>,
+) -> Result<bool, StoreError> {
+    Ok(catalog.carries(record, &def.label)?
         && interpretation
             .record_membership(record)
-            .is_some_and(|held| tuples(&held).iter().any(|t| t.as_slice() == tuple))
+            .is_some_and(|held| tuples(&held).iter().any(|t| t.as_slice() == tuple)))
+}
+
+/// [`record_holds`] for a record that may be absent: an absent one holds
+/// nothing.
+fn maybe_holds(
+    def: &IndexDefinition,
+    interpretation: &IndexInterpretation,
+    record: Option<&NodeRecord>,
+    tuple: &[u8],
+    catalog: &mut CatalogMembership<'_>,
+) -> Result<bool, StoreError> {
+    match record {
+        Some(record) => record_holds(def, interpretation, record, tuple, catalog),
+        None => Ok(false),
+    }
 }
 
 /// Whether node `node` holds `tuple` in `def`, as `txn` sees it: its own
@@ -1034,17 +1051,18 @@ fn node_holds(
     interpretation: &IndexInterpretation,
     node: NodeId,
     tuple: &[u8],
+    catalog: &mut CatalogMembership<'_>,
 ) -> Result<bool, StoreError> {
-    if LocalNodeStore
-        .get(txn, shard_id, node)?
-        .is_some_and(|r| record_holds(def, interpretation, &r, tuple))
-    {
+    let own = LocalNodeStore.get(txn, shard_id, node)?;
+    if maybe_holds(def, interpretation, own.as_ref(), tuple, catalog)? {
         return Ok(true);
     }
-    Ok(LocalNodeStore
-        .versions(txn, shard_id, node)?
-        .iter()
-        .any(|(_, r)| record_holds(def, interpretation, r, tuple)))
+    for (_, record) in LocalNodeStore.versions(txn, shard_id, node)? {
+        if record_holds(def, interpretation, &record, tuple, catalog)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The owner a mismatch names.
@@ -1068,6 +1086,7 @@ impl Shared {
         let engine = self.env.engine();
         let shard_id = self.env.shard_id();
         let store = LocalIndexStore::new(engine);
+        let mut catalog = CatalogMembership::current(engine);
         Ok(match mismatch {
             Mismatch::Missing {
                 node,
@@ -1075,10 +1094,17 @@ impl Shared {
                 tuple,
             } => {
                 let owner = owner_of(*node, *valid_from);
-                let holds = LocalNodeStore
+                let row = LocalNodeStore
                     .latest_row(engine, shard_id, owner)
-                    .map_err(text)?
-                    .is_some_and(|(r, _)| record_holds(def, interpretation, &r, tuple));
+                    .map_err(text)?;
+                let holds = maybe_holds(
+                    def,
+                    interpretation,
+                    row.as_ref().map(|(r, _)| r),
+                    tuple,
+                    &mut catalog,
+                )
+                .map_err(text)?;
                 holds
                     && match store.latest_entry(def, tuple, owner).map_err(text)? {
                         None => true,
@@ -1114,13 +1140,21 @@ impl Shared {
                                 interpretation,
                                 NodeId::from_raw(*node),
                                 tuple,
+                                &mut catalog,
                             )
                             .map_err(text)?
                         } else {
-                            LocalNodeStore
+                            let row = LocalNodeStore
                                 .latest_row(engine, shard_id, owner)
-                                .map_err(text)?
-                                .is_some_and(|(r, _)| record_holds(def, interpretation, &r, tuple))
+                                .map_err(text)?;
+                            maybe_holds(
+                                def,
+                                interpretation,
+                                row.as_ref().map(|(r, _)| r),
+                                tuple,
+                                &mut catalog,
+                            )
+                            .map_err(text)?
                         };
                         !holds
                     }
@@ -1797,6 +1831,7 @@ impl Shared {
             .expect_integrity_txn(&mut txn, def.generation, held_version)
             .map_err(text)?;
         let mut repaired = 0u64;
+        let mut catalog = CatalogMembership::current(engine);
         for mismatch in mismatches {
             match mismatch {
                 Mismatch::Missing {
@@ -1813,7 +1848,9 @@ impl Shared {
                     else {
                         continue;
                     };
-                    if !record_holds(def, interpretation, &record, tuple) {
+                    if !record_holds(def, interpretation, &record, tuple, &mut catalog)
+                        .map_err(text)?
+                    {
                         continue;
                     }
                     let current = store.latest_entry(def, tuple, owner).map_err(text)?;
@@ -1825,8 +1862,16 @@ impl Shared {
                         }) if h.as_raw() == *node => continue,
                         Some(LatestEntry {
                             holder: Some(h), ..
-                        }) if node_holds(&latest, shard_id, def, interpretation, h, tuple)
-                            .map_err(text)? =>
+                        }) if node_holds(
+                            &latest,
+                            shard_id,
+                            def,
+                            interpretation,
+                            h,
+                            tuple,
+                            &mut catalog,
+                        )
+                        .map_err(text)? =>
                         {
                             conflicts.push(Mismatch::SourceDuplicate {
                                 nodes: [h.as_raw().min(*node), h.as_raw().max(*node)],
@@ -1873,13 +1918,21 @@ impl Shared {
                             interpretation,
                             NodeId::from_raw(*node),
                             tuple,
+                            &mut catalog,
                         )
                         .map_err(text)?
                     } else {
-                        LocalNodeStore
+                        let row = LocalNodeStore
                             .latest_row(engine, shard_id, owner)
-                            .map_err(text)?
-                            .is_some_and(|(r, _)| record_holds(def, interpretation, &r, tuple))
+                            .map_err(text)?;
+                        maybe_holds(
+                            def,
+                            interpretation,
+                            row.as_ref().map(|(r, _)| r),
+                            tuple,
+                            &mut catalog,
+                        )
+                        .map_err(text)?
                     };
                     if holds {
                         continue;

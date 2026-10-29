@@ -31,6 +31,11 @@ fn lookup_category(name: &str) -> Option<u32> {
     if name == "category" { Some(2) } else { None }
 }
 
+/// No type implies any label.
+fn none() -> Implying {
+    Implying::new()
+}
+
 #[test]
 fn label_eq_matches_primary_label() {
     let r = make_record("Item", None);
@@ -38,12 +43,28 @@ fn label_eq_matches_primary_label() {
         &r,
         &VectorPredicate::LabelEq("Item".into()),
         &lookup_category,
+        &none(),
     ));
     assert!(!evaluate_against(
         &r,
         &VectorPredicate::LabelEq("Other".into()),
         &lookup_category,
+        &none(),
     ));
+}
+
+/// A node whose type implies the label carries it without storing it: the
+/// leaf matches through the types resolved before the search, and only
+/// through them.
+#[test]
+fn label_eq_matches_a_label_the_type_implies() {
+    let r = make_record("Goal", None);
+    let leaf = VectorPredicate::LabelEq("Thing".into());
+    assert!(!evaluate_against(&r, &leaf, &lookup_category, &none()));
+    let implying = Implying::from([("Thing".to_string(), vec!["Goal".to_string()])]);
+    assert!(evaluate_against(&r, &leaf, &lookup_category, &implying));
+    let other = Implying::from([("Thing".to_string(), vec!["Task".to_string()])]);
+    assert!(!evaluate_against(&r, &leaf, &lookup_category, &other));
 }
 
 #[test]
@@ -53,7 +74,7 @@ fn property_eq_matches_stored_value() {
         property: "category".into(),
         value: Value::String("electronics".into()),
     };
-    assert!(evaluate_against(&r, &pred, &lookup_category));
+    assert!(evaluate_against(&r, &pred, &lookup_category, &none()));
 }
 
 #[test]
@@ -63,7 +84,7 @@ fn property_eq_rejects_mismatched_value() {
         property: "category".into(),
         value: Value::String("electronics".into()),
     };
-    assert!(!evaluate_against(&r, &pred, &lookup_category));
+    assert!(!evaluate_against(&r, &pred, &lookup_category, &none()));
 }
 
 #[test]
@@ -73,7 +94,7 @@ fn property_eq_absent_property_returns_false() {
         property: "category".into(),
         value: Value::String("electronics".into()),
     };
-    assert!(!evaluate_against(&r, &pred, &lookup_category));
+    assert!(!evaluate_against(&r, &pred, &lookup_category, &none()));
 }
 
 #[test]
@@ -84,7 +105,7 @@ fn property_eq_unknown_property_returns_false() {
         value: Value::String("electronics".into()),
     };
     // `lookup_category` returns None for unknown names → false.
-    assert!(!evaluate_against(&r, &pred, &lookup_category));
+    assert!(!evaluate_against(&r, &pred, &lookup_category, &none()));
 }
 
 #[test]
@@ -108,9 +129,24 @@ fn property_cmp_numeric_branches() {
         op: NumericCmp::Lt,
         value: Value::Int(50),
     };
-    assert!(evaluate_against(&record, &pred_ge_10, &lookup_category));
-    assert!(!evaluate_against(&record, &pred_ge_50, &lookup_category));
-    assert!(evaluate_against(&record, &pred_lt_50, &lookup_category));
+    assert!(evaluate_against(
+        &record,
+        &pred_ge_10,
+        &lookup_category,
+        &none()
+    ));
+    assert!(!evaluate_against(
+        &record,
+        &pred_ge_50,
+        &lookup_category,
+        &none()
+    ));
+    assert!(evaluate_against(
+        &record,
+        &pred_lt_50,
+        &lookup_category,
+        &none()
+    ));
 }
 
 #[test]
@@ -123,7 +159,7 @@ fn property_cmp_int_float_widening() {
         op: NumericCmp::Gt,
         value: Value::Float(41.5),
     };
-    assert!(evaluate_against(&record, &pred, &lookup_category));
+    assert!(evaluate_against(&record, &pred, &lookup_category, &none()));
 }
 
 #[test]
@@ -136,7 +172,7 @@ fn property_cmp_non_numeric_value_rejects() {
         op: NumericCmp::Ge,
         value: Value::Int(0),
     };
-    assert!(!evaluate_against(&record, &pred, &lookup_category));
+    assert!(!evaluate_against(&record, &pred, &lookup_category, &none()));
 }
 
 #[test]
@@ -149,7 +185,7 @@ fn and_requires_both_branches() {
             value: Value::String("electronics".into()),
         }),
     );
-    assert!(evaluate_against(&r, &pred, &lookup_category));
+    assert!(evaluate_against(&r, &pred, &lookup_category, &none()));
 
     // Right branch fails:
     let pred_fail = VectorPredicate::And(
@@ -159,7 +195,7 @@ fn and_requires_both_branches() {
             value: Value::String("books".into()),
         }),
     );
-    assert!(!evaluate_against(&r, &pred_fail, &lookup_category));
+    assert!(!evaluate_against(&r, &pred_fail, &lookup_category, &none()));
 }
 
 #[test]
@@ -205,6 +241,7 @@ fn evaluate_predicate_via_engine_round_trip() {
         node_id,
         &pred,
         &lookup_category,
+        &none(),
     ));
 
     // Predicate that mismatches on the right branch.
@@ -218,6 +255,7 @@ fn evaluate_predicate_via_engine_round_trip() {
         node_id,
         &pred_fail,
         &lookup_category,
+        &none(),
     ));
 }
 
@@ -234,6 +272,7 @@ fn evaluate_predicate_missing_node_returns_false() {
         NodeId::from_raw(99),
         &pred,
         &lookup_category,
+        &none(),
     ));
 }
 
@@ -263,5 +302,6 @@ fn evaluate_predicate_corrupt_record_returns_false() {
         node_id,
         &pred,
         &lookup_category,
+        &none(),
     ));
 }

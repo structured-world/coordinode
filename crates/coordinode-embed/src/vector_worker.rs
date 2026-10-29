@@ -237,11 +237,19 @@ impl Worker {
         // a bulk load fills with every node of a statement.
         for def in &definitions {
             let property = def.property();
+            // The index covers the nodes of every type implying its label.
+            let implying =
+                coordinode_query::index::membership::types_implying(&self.engine, &def.label)
+                    .map_err(|e| format!("read the types implying :{}: {e}", def.label))?;
             let mut upserts: Vec<(NodeId, Vec<f32>)> = Vec::new();
             for (node_id, record) in ids.iter().copied().zip(&records) {
                 let vector = record
                     .as_ref()
-                    .filter(|r| r.has_label(&def.label))
+                    .filter(|r| {
+                        coordinode_query::index::membership::carries_label(
+                            &r.labels, &def.label, &implying,
+                        )
+                    })
                     .and_then(|r| r.props.get(&interner.lookup(property)?))
                     .and_then(crate::db::try_extract_vector);
                 match vector {
@@ -286,22 +294,33 @@ impl Worker {
             ) else {
                 continue;
             };
-            members.push((def, hnsw, health, field_id));
+            let implying = match coordinode_query::index::membership::types_implying(
+                &self.engine,
+                &def.label,
+            ) {
+                Ok(implying) => implying,
+                Err(e) => {
+                    tracing::error!(index = %def, error = %e, "vector index worker cannot read the types implying its label");
+                    return None;
+                }
+            };
+            members.push((def, hnsw, health, field_id, implying));
         }
         drop(interner);
         if members.is_empty() {
             return Some(covered);
         }
-        for (_, _, health, _) in &members {
+        for (_, _, health, _, _) in &members {
             // Incomplete until the build hands it over again.
             health.report_rebuild_progress(0.0, 0);
         }
         let targets: Vec<BuildTarget<'_>> = members
             .iter()
-            .map(|(def, hnsw, health, field_id)| BuildTarget {
+            .map(|(def, hnsw, health, field_id, implying)| BuildTarget {
                 hnsw: hnsw.as_ref(),
                 health: health.as_ref(),
                 label: &def.label,
+                implying,
                 field_id: *field_id,
             })
             .collect();
@@ -323,7 +342,7 @@ impl Worker {
             }
             Err(reason) => {
                 tracing::warn!(%reason, "vector index worker rebuild failed");
-                for (_, _, health, _) in &members {
+                for (_, _, health, _, _) in &members {
                     health.mark_offline(reason.clone());
                 }
                 None

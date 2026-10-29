@@ -516,6 +516,8 @@ pub(super) fn verify(
     // they read together: a record decodes only those, every other value
     // skipped unread however large.
     let projections = Projection::of(targets);
+    // What each type implies, as the pinned snapshot's catalog says.
+    let mut catalog = crate::index::membership::CatalogMembership::at(engine, snapshot);
 
     // The records, once.
     let scanning = Instant::now();
@@ -534,7 +536,10 @@ pub(super) fn verify(
             .map_err(|e| VerifyError::Decode(e.to_string()))?;
         // An index on a label covers every node carrying it, as its type,
         // implied or auxiliary.
-        let carries = |p: &&Projection<'_>| labels.iter().any(|l| l == p.label);
+        let membership = catalog
+            .of_stored(&labels)
+            .map_err(|e| VerifyError::Store(e.to_string()))?;
+        let carries = |p: &&Projection<'_>| membership.contains(p.label);
         let mut carried = projections.iter().filter(carries);
         let Some(first) = carried.next() else {
             continue;

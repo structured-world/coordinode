@@ -1606,6 +1606,7 @@ fn stage(
             });
             if let Some(holder) = store.unique_conflict(txn, index, values, node_id)? {
                 if holds_values(
+                    staging.engine,
                     txn,
                     staging.shard_id,
                     index,
@@ -1683,6 +1684,7 @@ fn held_tuples(
 ///
 /// A storage failure or an undecodable record.
 pub fn holds_values(
+    engine: &StorageEngine,
     txn: &Transaction,
     shard_id: u16,
     index: &IndexDefinition,
@@ -1694,22 +1696,26 @@ pub fn holds_values(
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let wanted = tuples(values);
     let interpretation = index.interpretation(field_of);
-    let holds = |record: &coordinode_core::graph::node::NodeRecord| {
-        record.has_label(&index.label)
-            && interpretation
-                .record_membership(record)
-                .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t)))
+    let mut membership = crate::index::membership::CatalogMembership::current(engine);
+    let mut holds = |record: &coordinode_core::graph::node::NodeRecord| {
+        Ok::<_, StoreError>(
+            membership.carries(record, &index.label)?
+                && interpretation
+                    .record_membership(record)
+                    .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t))),
+        )
     };
-    if LocalNodeStore
-        .get(txn, shard_id, holder)?
-        .is_some_and(|record| holds(&record))
-    {
-        return Ok(true);
+    if let Some(record) = LocalNodeStore.get(txn, shard_id, holder)? {
+        if holds(&record)? {
+            return Ok(true);
+        }
     }
-    Ok(LocalNodeStore
-        .versions(txn, shard_id, holder)?
-        .iter()
-        .any(|(_, record)| holds(record)))
+    for (_, record) in LocalNodeStore.versions(txn, shard_id, holder)? {
+        if holds(&record)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl Default for IndexRegistry {

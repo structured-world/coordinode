@@ -1335,21 +1335,32 @@ impl Database {
                 tracing::warn!(index = %def, "registered vector index has no graph to build");
                 continue;
             };
-            members.push((def, field_id, hnsw, health));
+            // The index covers the nodes of every type implying its label.
+            let implying =
+                match coordinode_query::index::membership::types_implying(engine, &def.label) {
+                    Ok(implying) => implying,
+                    Err(reason) => {
+                        tracing::warn!(index = %def, %reason, "HNSW rebuild on open failed");
+                        health.mark_offline(reason.to_string());
+                        continue;
+                    }
+                };
+            members.push((def, field_id, hnsw, health, implying));
         }
 
         match mode {
             PopulateMode::Blocking => {
                 let targets: Vec<coordinode_query::index::BuildTarget<'_>> = members
                     .iter()
-                    .map(
-                        |(def, field_id, hnsw, health)| coordinode_query::index::BuildTarget {
+                    .map(|(def, field_id, hnsw, health, implying)| {
+                        coordinode_query::index::BuildTarget {
                             hnsw: hnsw.as_ref(),
                             health: health.as_ref(),
                             label: &def.label,
+                            implying,
                             field_id: *field_id,
-                        },
-                    )
+                        }
+                    })
                     .collect();
                 let token = registry.new_build_token();
                 // On its own thread: the build may pause the Raft applies,
@@ -1374,13 +1385,13 @@ impl Database {
                         "rebuilt HNSW indexes on open"
                     ),
                     Ok(Err(reason)) => {
-                        for (def, _, _, health) in &members {
+                        for (def, _, _, health, _) in &members {
                             tracing::warn!(index = %def, %reason, "HNSW rebuild on open failed");
                             health.mark_offline(reason.clone());
                         }
                     }
                     Err(_) => {
-                        for (def, _, _, health) in &members {
+                        for (def, _, _, health, _) in &members {
                             tracing::warn!(index = %def, "HNSW rebuild on open panicked");
                             health.mark_offline("panic in the rebuild on open".to_string());
                         }
@@ -1388,9 +1399,9 @@ impl Database {
                 }
             }
             PopulateMode::Background => {
-                for (def, field_id, hnsw, health) in members {
+                for (def, field_id, hnsw, health, implying) in members {
                     Self::spawn_replica_build(
-                        registry, engine, shard_id, def, field_id, hnsw, health,
+                        registry, engine, shard_id, def, field_id, hnsw, health, implying,
                     );
                 }
             }
@@ -1400,6 +1411,7 @@ impl Database {
     /// Build `def` on a replica in the background, the way a `CREATE VECTOR
     /// INDEX` does on the member that ran it: the registry owns the thread,
     /// so dropping the index cancels and joins it.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_replica_build(
         registry: &coordinode_query::index::VectorIndexRegistry,
         engine: &Arc<StorageEngine>,
@@ -1408,6 +1420,7 @@ impl Database {
         field_id: u32,
         hnsw: Arc<std::sync::RwLock<coordinode_vector::hnsw::HnswIndex>>,
         health: Arc<coordinode_vector::health::HealthSignal>,
+        implying: Vec<String>,
     ) {
         let token = registry.new_build_token();
         let build_token = token.clone();
@@ -1429,6 +1442,7 @@ impl Database {
                             hnsw: hnsw.as_ref(),
                             health: health.as_ref(),
                             label: &label,
+                            implying: &implying,
                             field_id,
                         }],
                     }
@@ -2738,6 +2752,7 @@ impl Database {
                 feedback_cache: Some(self.feedback_cache.clone()),
                 schema_label_cache: std::collections::HashMap::new(),
                 label_schema_cache: std::collections::HashMap::new(),
+                implied: Default::default(),
                 node_columns: None,
                 applied_watermark: None,
                 read_consistency:
@@ -3452,9 +3467,12 @@ impl Database {
         use coordinode_query::index::text_registry::FindError;
         let budget = statement_budget(self.query_memory_limit, None, None);
         let mut search = coordinode_core::budget::BatchedWork::new(&budget);
+        let implying = coordinode_query::index::membership::types_implying(&self.engine, label)
+            .map_err(|e| DatabaseError::Other(e.to_string()))?;
         let found = self.text_index_registry.find(
             label,
             property,
+            &implying,
             &read,
             self.shard_id,
             &interner,
