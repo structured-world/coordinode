@@ -52,6 +52,7 @@ clause = {
   | merge_nodes_clause
   | clone_node_clause
   | redirect_edges_clause
+  | retype_node_clause
   | merge_clause
   | upsert_clause
   | detach_document_clause
@@ -626,6 +627,22 @@ redirect_type_filter = {
 
 redirect_direction = { kw_direction ~ (kw_outgoing | kw_incoming | kw_both) }
 
+// --- RETYPE NODE (change a node's type label, keeping its identity) ---
+//
+//   RETYPE NODE n TO Goal [SET n.due = ...] [REMOVE n.old]
+//
+// The node keeps its id, its edges and its auxiliary labels; it takes the
+// target type and the labels that type implies, and leaves the labels the
+// old type implied. The SET and REMOVE items supply the property changes the
+// target type needs, and the complete result is admitted once. Ordinary SET
+// and REMOVE of a label never change a node's type.
+retype_node_clause = {
+    kw_retype ~ kw_node ~ identifier ~ kw_to ~ identifier
+    ~ retype_node_set? ~ retype_node_remove?
+}
+retype_node_set    = { kw_set ~ set_items }
+retype_node_remove = { kw_remove ~ remove_items }
+
 // --- UPSERT MATCH (CoordiNode extension) ---
 
 upsert_clause = { kw_upsert ~ kw_match ~ pattern ~ upsert_action* }
@@ -952,6 +969,7 @@ kw_end        = @{ ^"end" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create     = @{ ^"create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_clone      = @{ ^"clone" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_redirect   = @{ ^"redirect" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_retype     = @{ ^"retype" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_direction  = @{ ^"direction" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_outgoing   = @{ ^"outgoing" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_incoming   = @{ ^"incoming" ~ !(ASCII_ALPHANUMERIC | "_") }

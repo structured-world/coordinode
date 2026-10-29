@@ -451,6 +451,17 @@ pub enum LogicalOp {
         direction: crate::plan::RedirectDirection,
     },
 
+    /// RETYPE NODE: give the node bound to `variable` the type `label`,
+    /// keeping its id, edges and auxiliary labels, with `set_items` and
+    /// `remove_items` applied and the result admitted once.
+    RetypeNode {
+        input: Box<LogicalOp>,
+        variable: String,
+        label: String,
+        set_items: Vec<crate::plan::SetItem>,
+        remove_items: Vec<crate::plan::RemoveItem>,
+    },
+
     /// MERGE / MERGE ALL: match-or-create with optional ON MATCH SET / ON CREATE SET.
     ///
     /// When `multi = false` (MERGE): unique match — errors if >1 src OR >1 tgt matches.
@@ -1062,6 +1073,7 @@ impl LogicalOp {
             Self::MergeNodes { .. } => "MergeNodes",
             Self::CloneNode { .. } => "CloneNode",
             Self::RedirectEdges { .. } => "RedirectEdges",
+            Self::RetypeNode { .. } => "RetypeNode",
             Self::Merge { .. } => "Merge",
             Self::Upsert { .. } => "Upsert",
             Self::AlterLabel { .. } => "AlterLabel",
@@ -1136,6 +1148,7 @@ impl LogicalOp {
             | LogicalOp::MergeNodes { input, .. }
             | LogicalOp::CloneNode { input, .. }
             | LogicalOp::RedirectEdges { input, .. }
+            | LogicalOp::RetypeNode { input, .. }
             | LogicalOp::Unwind { input, .. }
             | LogicalOp::VectorFilter { input, .. }
             | LogicalOp::EdgeVectorSearch { input, .. }
@@ -1487,6 +1500,14 @@ impl LogicalOp {
                 }
                 if let Some(e) = as_of {
                     f(e);
+                }
+            }
+            LogicalOp::RetypeNode {
+                input, set_items, ..
+            } => {
+                input.for_each_expr_mut(f);
+                for item in set_items {
+                    for_each_set_item_expr(item, f);
                 }
             }
             LogicalOp::AlterLabel { .. }
@@ -2192,6 +2213,12 @@ fn estimate_op_cost(
             let (in_cost, in_rows) = estimate_op_cost(input, defaults, stats, hints);
             let per_row = 2.0 * defaults.avg_fan_out;
             (in_cost + in_rows * per_row, in_rows)
+        }
+        LogicalOp::RetypeNode { input, .. } => {
+            // One node rewrite per row, with the index entries of the labels
+            // it gains and loses.
+            let (in_cost, in_rows) = estimate_op_cost(input, defaults, stats, hints);
+            (in_cost + in_rows, in_rows)
         }
         LogicalOp::Empty => (0.0, 1.0),
     }
@@ -3057,6 +3084,20 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             };
             output.push_str(&format!(
                 "{prefix}RedirectEdges({source} → {target}){dir_tag}{type_tag}\n"
+            ));
+            explain_op(input, indent + 1, output);
+        }
+        LogicalOp::RetypeNode {
+            input,
+            variable,
+            label,
+            set_items,
+            remove_items,
+        } => {
+            output.push_str(&format!(
+                "{prefix}RetypeNode({variable} TO :{label}) SET×{} REMOVE×{}\n",
+                set_items.len(),
+                remove_items.len()
             ));
             explain_op(input, indent + 1, output);
         }

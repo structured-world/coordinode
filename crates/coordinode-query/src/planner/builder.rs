@@ -394,6 +394,7 @@ fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::MergeNodes { input, .. }
         | LogicalOp::CloneNode { input, .. }
         | LogicalOp::RedirectEdges { input, .. }
+        | LogicalOp::RetypeNode { input, .. }
         | LogicalOp::ProcedureCall { input, .. }
         | LogicalOp::CreateEdge { input, .. } => vec![input],
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
@@ -683,6 +684,16 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 target: re.target.clone(),
                 edge_types: re.edge_types.clone(),
                 direction: lower_redirect_direction(re.direction),
+            })
+        }
+        Clause::RetypeNode(rn) => {
+            let input = current.unwrap_or(LogicalOp::Empty);
+            Ok(LogicalOp::RetypeNode {
+                input: Box::new(input),
+                variable: rn.variable.clone(),
+                label: rn.label.clone(),
+                set_items: lower_set_items(&rn.set_items)?,
+                remove_items: rn.remove_items.iter().map(lower_remove_item).collect(),
             })
         }
         Clause::Set(items, violation_mode) => {
@@ -5655,6 +5666,7 @@ fn validate_rrf_placement(op: &LogicalOp) -> Result<(), PlanError> {
         | LogicalOp::ShortestPath { input, .. }
         | LogicalOp::Update { input, .. }
         | LogicalOp::RemoveOp { input, .. }
+        | LogicalOp::RetypeNode { input, .. }
         | LogicalOp::Delete { input, .. }
         | LogicalOp::DetachDocument { input, .. }
         | LogicalOp::ProcedureCall { input, .. }
@@ -6073,6 +6085,7 @@ fn validate_doc_placement(op: &LogicalOp) -> Result<(), PlanError> {
         | LogicalOp::ShortestPath { input, .. }
         | LogicalOp::Update { input, .. }
         | LogicalOp::RemoveOp { input, .. }
+        | LogicalOp::RetypeNode { input, .. }
         | LogicalOp::Delete { input, .. }
         | LogicalOp::DetachDocument { input, .. }
         | LogicalOp::ProcedureCall { input, .. }

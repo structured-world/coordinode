@@ -50,6 +50,7 @@ mod integration {
     mod per_level_routing;
     mod procedures;
     mod retention;
+    mod retype;
     mod schema;
     mod schema_publication;
     mod shared_engine;

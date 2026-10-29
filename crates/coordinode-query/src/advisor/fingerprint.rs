@@ -254,6 +254,12 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 buf.push_str(" WITH EDGES");
             }
         }
+        Clause::RetypeNode(rn) => {
+            buf.push_str("RETYPE NODE ");
+            buf.push_str(&rn.variable);
+            buf.push_str(" TO ");
+            buf.push_str(&rn.label);
+        }
         Clause::RedirectEdges(re) => {
             buf.push_str("REDIRECT EDGES FROM ");
             buf.push_str(&re.source);

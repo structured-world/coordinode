@@ -400,6 +400,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let re = build_redirect_edges_clause(pair)?;
             clauses.push(Clause::RedirectEdges(re));
         }
+        Rule::retype_node_clause => {
+            let rn = build_retype_node_clause(pair)?;
+            clauses.push(Clause::RetypeNode(rn));
+        }
         Rule::upsert_clause => {
             let uc = build_upsert_clause(pair)?;
             clauses.push(Clause::Upsert(uc));
@@ -2340,6 +2344,44 @@ fn build_clone_node_clause(pair: Pair<'_, Rule>) -> Result<CloneNodeClause, Pars
         with_properties,
         set_items,
         as_of,
+    })
+}
+
+fn build_retype_node_clause(pair: Pair<'_, Rule>) -> Result<RetypeNodeClause, ParseError> {
+    let mut idents = Vec::with_capacity(2);
+    let mut set_items = Vec::new();
+    let mut remove_items = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => idents.push(inner.as_str().to_string()),
+            Rule::retype_node_set => {
+                for c in inner.into_inner() {
+                    if c.as_rule() == Rule::set_items {
+                        set_items = build_set_items(c)?;
+                    }
+                }
+            }
+            Rule::retype_node_remove => {
+                for c in inner.into_inner() {
+                    if c.as_rule() == Rule::remove_items {
+                        remove_items = build_remove_items(c)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let [variable, label]: [String; 2] = idents.try_into().map_err(|idents: Vec<String>| {
+        ParseError::Invalid(format!(
+            "RETYPE NODE expected `n TO <type>`, got {} identifiers",
+            idents.len()
+        ))
+    })?;
+    Ok(RetypeNodeClause {
+        variable,
+        label,
+        set_items,
+        remove_items,
     })
 }
 

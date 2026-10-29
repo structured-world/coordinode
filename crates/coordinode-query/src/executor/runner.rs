@@ -1739,6 +1739,143 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
+    /// Give `record` the labels it stores once RETYPE NODE makes `label` its
+    /// type: `label`, the labels `label` implies, and the auxiliary labels
+    /// it carried, which stay with the node; the labels its old type implied
+    /// go with that type.
+    ///
+    /// # Errors
+    ///
+    /// `SchemaViolation` when `label` is auxiliary or cannot type the node;
+    /// a catalog read failure as it comes.
+    pub fn retype_labels(
+        &mut self,
+        record: &mut NodeRecord,
+        label: &str,
+    ) -> Result<(), ExecutionError> {
+        if self
+            .cached_label_schema(label)?
+            .is_some_and(LabelSchema::is_auxiliary)
+        {
+            return Err(ExecutionError::SchemaViolation(format!(
+                "label :{label} is auxiliary and cannot be a node's type"
+            )));
+        }
+        let mut labels = Vec::with_capacity(record.labels.len());
+        labels.push(label.to_string());
+        for carried in record.labels.iter().skip(1) {
+            if self
+                .cached_label_schema(carried)?
+                .is_some_and(LabelSchema::is_auxiliary)
+            {
+                labels.push(carried.clone());
+            }
+        }
+        record.labels = self.node_labels(&labels)?.labels.into_owned();
+        Ok(())
+    }
+
+    /// Refuse a RETYPE NODE of a node of type `from` to `label` that would
+    /// move it in or out of temporal history: a node's history is not
+    /// converted, and none is invented for one that has none.
+    fn refuse_temporal_retype(&mut self, from: &str, label: &str) -> Result<(), ExecutionError> {
+        let temporal = |schema: Option<&LabelSchema>| schema.is_some_and(|s| s.temporal);
+        let moves_history =
+            temporal(self.cached_label_schema(from)?) || temporal(self.cached_label_schema(label)?);
+        if moves_history {
+            return Err(ExecutionError::SchemaViolation(format!(
+                "RETYPE NODE cannot move a node of :{from} to :{label}: a temporal type's \
+                 history is not converted"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Admit node `node_id` as RETYPE NODE left it under its new type
+    /// `label`: every property it holds is one the type admits, with the
+    /// declared type, every required property is present, and each is stored
+    /// where the type keeps it. Constraints of the labels it carries are
+    /// checked at the commit, as for any write.
+    fn admit_retyped(&mut self, node_id: NodeId, label: &str) -> Result<(), ExecutionError> {
+        let Some(schema) = self.shared_label_schema(label)?.cloned() else {
+            // An undeclared type is FLEXIBLE: any property, stored by id.
+            return self.store_properties_by_id(node_id);
+        };
+        let Some(mut record) = self.mvcc_get_node(self.shard_id, node_id)? else {
+            return Ok(());
+        };
+        let held: Vec<(String, Value, bool)> = record
+            .props
+            .iter()
+            .filter_map(|(id, v)| {
+                self.interner
+                    .resolve(*id)
+                    .map(|name| (name.to_string(), v.clone(), false))
+            })
+            .chain(
+                record
+                    .extra
+                    .iter()
+                    .flatten()
+                    .map(|(name, v)| (name.clone(), v.clone(), true)),
+            )
+            .collect();
+        for (name, def) in &schema.properties {
+            let present = held
+                .iter()
+                .any(|(n, v, _)| n == name && !matches!(v, Value::Null));
+            if def.not_null && def.default.is_none() && !present {
+                return Err(ExecutionError::SchemaViolation(format!(
+                    "required property '{name}' of :{label} is missing on node {}",
+                    node_id.as_raw()
+                )));
+            }
+        }
+        let mut moved = false;
+        for (name, value, by_name) in held {
+            match (&schema.mode, schema.get_property(&name)) {
+                (SchemaMode::Strict, None) => {
+                    return Err(ExecutionError::SchemaViolation(format!(
+                        "unknown property '{name}' for strict label '{label}': \
+                         remove it in the RETYPE NODE"
+                    )));
+                }
+                (_, Some(def)) if def.is_computed() => {
+                    return Err(ExecutionError::SchemaViolation(format!(
+                        "property '{name}' is computed on :{label} and cannot be stored"
+                    )));
+                }
+                (_, Some(def)) => validate_one(&name, &value, def)
+                    .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?,
+                (_, None) => {}
+            }
+            let stored_by_name = stored_by_name(Some(&schema), &name);
+            if stored_by_name != by_name {
+                store_node_property(&mut record, &name, value, stored_by_name, self)?;
+                moved = true;
+            }
+        }
+        if moved {
+            self.mvcc_put_node(self.shard_id, node_id, &record)?;
+        }
+        Ok(())
+    }
+
+    /// Store every property of node `node_id` kept by name under its field
+    /// id instead, as a FLEXIBLE type keeps them.
+    fn store_properties_by_id(&mut self, node_id: NodeId) -> Result<(), ExecutionError> {
+        let Some(mut record) = self.mvcc_get_node(self.shard_id, node_id)? else {
+            return Ok(());
+        };
+        let Some(extra) = record.extra.take().filter(|e| !e.is_empty()) else {
+            return Ok(());
+        };
+        for (name, value) in extra {
+            store_node_property(&mut record, &name, value, false, self)?;
+        }
+        self.mvcc_put_node(self.shard_id, node_id, &record)
+    }
+
     /// Move the per-label statistics of a node whose labels went from
     /// `before` to `after`: every label it gained or lost, implied ones too.
     pub fn stat_labels_changed(&mut self, before: &[String], after: &[String]) {
@@ -4416,6 +4553,9 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         | LogicalOp::RedirectEdges { input, .. } => first_unaccounted_operator(input),
         LogicalOp::CloneNode {
             input, set_items, ..
+        }
+        | LogicalOp::RetypeNode {
+            input, set_items, ..
         } => set_items_unaccounted(set_items).or_else(|| first_unaccounted_operator(input)),
         LogicalOp::MergeNodes {
             input, conflict, ..
@@ -6101,6 +6241,19 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 *direction,
                 ctx,
             )?;
+            charge_returned(ctx, input_rows.len(), rows)
+        }
+
+        LogicalOp::RetypeNode {
+            input,
+            variable,
+            label,
+            set_items,
+            remove_items,
+        } => {
+            let input_rows = execute_op(input, ctx)?;
+            let rows =
+                execute_retype_node(&input_rows, variable, label, set_items, remove_items, ctx)?;
             charge_returned(ctx, input_rows.len(), rows)
         }
 
@@ -15173,6 +15326,68 @@ fn execute_update(
     }
 
     Ok(results)
+}
+
+/// RETYPE NODE: give each node bound to `variable` the type `label`, keeping
+/// its id, edges and auxiliary labels, then apply `set_items` and
+/// `remove_items`, and admit the result under the new type once all of them
+/// are applied: the type may need a property the old one lacked, or refuse
+/// one it had, and only the complete result answers for that.
+fn execute_retype_node(
+    input_rows: &[Row],
+    variable: &str,
+    label: &str,
+    set_items: &[crate::plan::SetItem],
+    remove_items: &[crate::plan::RemoveItem],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let mut rows = Vec::with_capacity(input_rows.len());
+    let mut retyped = Vec::with_capacity(input_rows.len());
+    for row in input_rows {
+        let mut row = row.clone();
+        let node_id = match row.get(variable) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            // Unbound, as an OPTIONAL MATCH leaves it: nothing to retype.
+            _ => {
+                rows.push(row);
+                continue;
+            }
+        };
+        // The bound type, as the row has it: a temporal node is stored per
+        // version and has no current record for the read below to find.
+        if let Some(Value::String(from)) = row.get(&format!("{variable}.__label__")) {
+            let from = from.clone();
+            ctx.refuse_temporal_retype(&from, label)?;
+        }
+        // A bound node without a current record is a temporal one, or one an
+        // earlier clause deleted: its property changes are not made without
+        // the type change they were written for.
+        let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? else {
+            return Err(ExecutionError::SchemaViolation(format!(
+                "RETYPE NODE: node {} has no current record to retype",
+                node_id.as_raw()
+            )));
+        };
+        ctx.refuse_temporal_retype(record.primary_label(), label)?;
+        let labels_before = record.labels.clone();
+        ctx.retype_labels(&mut record, label)?;
+        ctx.stat_labels_changed(&labels_before, &record.labels);
+        ctx.index_labels_changed(node_id, None, &labels_before, &record)?;
+        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
+        refresh_label_columns(&mut row, variable, &record);
+        retyped.push(node_id);
+        rows.push(row);
+    }
+    if !set_items.is_empty() {
+        rows = execute_update(&rows, set_items, &ViolationMode::Fail, ctx)?;
+    }
+    if !remove_items.is_empty() {
+        rows = execute_remove(&rows, remove_items, ctx)?;
+    }
+    for node_id in retyped {
+        ctx.admit_retyped(node_id, label)?;
+    }
+    Ok(rows)
 }
 
 /// REMOVE: remove properties/labels from existing nodes.

@@ -392,6 +392,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::MergeNodes { input, .. }
         | LogicalOp::CloneNode { input, .. }
         | LogicalOp::RedirectEdges { input, .. }
+        | LogicalOp::RetypeNode { input, .. }
         | LogicalOp::Unwind { input, .. }
         | LogicalOp::VectorFilter { input, .. }
         | LogicalOp::VectorTopK { input, .. }

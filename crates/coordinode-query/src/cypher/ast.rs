@@ -58,6 +58,7 @@ impl Query {
                 | Clause::AttachDocument(_)
                 | Clause::CloneNode(_)
                 | Clause::RedirectEdges(_)
+                | Clause::RetypeNode(_)
                 | Clause::AlterLabel(_)
                 | Clause::CreateTextIndex(_)
                 | Clause::DropTextIndex(_)
@@ -211,6 +212,11 @@ pub enum Clause {
     /// single MVCC transaction. A graph-refactoring building block; replaces
     /// hand-rolled posting-list rewrites.
     RedirectEdges(RedirectEdgesClause),
+    /// `RETYPE NODE n TO <type> [SET ...] [REMOVE ...]`
+    ///
+    /// Gives a bound node another type label, keeping its id, edges and
+    /// auxiliary labels; the only write that changes a node's type.
+    RetypeNode(RetypeNodeClause),
     /// SET clause with optional ON VIOLATION SKIP modifier.
     ///
     /// Syntax: `SET n.prop = val [ON VIOLATION SKIP]`
@@ -1420,6 +1426,19 @@ pub struct RedirectEdgesClause {
     pub edge_types: Option<Vec<String>>,
     /// Direction filter (`DIRECTION ...`); defaults to `Both`.
     pub direction: RedirectDirection,
+}
+
+/// RETYPE NODE clause: `RETYPE NODE n TO <type> [SET ...] [REMOVE ...]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetypeNodeClause {
+    /// The node variable; must be bound by a preceding clause.
+    pub variable: String,
+    /// The type label the node takes.
+    pub label: String,
+    /// Property changes made with the type change, admitted together.
+    pub set_items: Vec<SetItem>,
+    /// Properties removed with the type change, admitted together.
+    pub remove_items: Vec<RemoveItem>,
 }
 
 /// Property conflict resolution strategy for `MERGE NODES`.

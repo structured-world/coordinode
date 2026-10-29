@@ -331,6 +331,23 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
+            Clause::RetypeNode(rn) => {
+                // The node must be bound; from here on it carries the new type.
+                if self.scope.contains_key(&rn.variable) {
+                    self.scope
+                        .insert(rn.variable.clone(), vec![rn.label.clone()]);
+                } else {
+                    self.errors.push(SemanticError::UndefinedVariable {
+                        name: rn.variable.clone(),
+                    });
+                }
+                for item in &rn.set_items {
+                    self.check_set_item(item);
+                }
+                for item in &rn.remove_items {
+                    self.check_remove_item(item);
+                }
+            }
             Clause::Set(items, _violation_mode) => {
                 for item in items {
                     self.check_set_item(item);

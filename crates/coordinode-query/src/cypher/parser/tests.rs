@@ -1038,6 +1038,28 @@ fn merge_nodes_rejects_duplicate_without_transfer() {
     );
 }
 
+// -- RETYPE NODE --
+
+/// RETYPE NODE names the node and its new type, with optional SET and REMOVE
+/// items in that order; a bare form carries none.
+#[test]
+fn retype_node_parses_its_type_and_property_changes() {
+    let q = parse_ok("MATCH (n:Thing) RETYPE NODE n TO Goal SET n.due = 1, n.p = 2 REMOVE n.old");
+    let Clause::RetypeNode(rn) = &q.clauses[1] else {
+        panic!("expected RetypeNode, got {:?}", q.clauses[1]);
+    };
+    assert_eq!(rn.variable, "n");
+    assert_eq!(rn.label, "Goal");
+    assert_eq!(rn.set_items.len(), 2);
+    assert_eq!(rn.remove_items.len(), 1);
+
+    let q = parse_ok("MATCH (n) RETYPE NODE n TO Goal");
+    let Clause::RetypeNode(rn) = &q.clauses[1] else {
+        panic!("expected RetypeNode");
+    };
+    assert!(rn.set_items.is_empty() && rn.remove_items.is_empty());
+}
+
 // -- CLONE NODE --
 
 #[test]

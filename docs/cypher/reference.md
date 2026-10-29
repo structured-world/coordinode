@@ -188,6 +188,32 @@ CLONE NODE a AS b
   SET b.name = 'Clone of ' + a.name
 ```
 
+#### RETYPE NODE ✅ 🔷
+
+CoordiNode extension. Gives a bound node another type label, keeping its id,
+its edges and its auxiliary labels. The node takes the new type and the labels
+that type implies, and leaves the labels its old type implied. The `SET` and
+`REMOVE` items make the property changes the new type needs; the complete
+result is checked against the new type once all of them are applied, together
+with the constraints and unique indexes of every label the node then carries.
+Readers see the node under its old type or its new one, never a mix.
+
+```cypher
+MATCH (n:Thing {title: 'Ship'})
+RETYPE NODE n TO Goal SET n.due = now()
+
+MATCH (n:Goal {title: 'Ship'})
+RETYPE NODE n TO Person SET n.name = 'Ship' REMOVE n.title, n.due
+```
+
+- The target must be a type label: an auxiliary label is refused.
+- A node of a `TEMPORAL` type is not retyped, and no node is retyped into one:
+  a node's history is not converted.
+- A property the new type does not declare is refused under `STRICT`; remove
+  it in the same statement. A required property of the new type must be set.
+- `SET n:L` and `REMOVE n:L` never change a node's type; `RETYPE NODE` is the
+  only write that does.
+
 #### REDIRECT EDGES ✅ 🔷
 
 CoordiNode extension. Moves a bound node's edges onto another bound node in a
@@ -344,7 +370,7 @@ CREATE (:Goal {title: 'x', note: 1})      -- ERROR: note is not in Goal's schema
 - **Implied labels.** `IMPLIES (L, ...)` names the labels every node of the type carries with it, transitively. The engine writes them on the node, so `MATCH (n:Thing)` finds every `Goal`. They do not count as a second type. Every property an implied label declares must be declared by the implying type with the same type, so the type's schema is the node's complete property list. A type cannot imply itself or an auxiliary label.
 - **Auxiliary labels.** `CREATE LABEL <name> AUXILIARY` declares a label that only classifies (a scope, a role, a tag). It declares no properties, is not `TEMPORAL`, and is never a node's only label.
 - The rule holds on every write that sets a node's labels or opens a new temporal version: `CREATE`, `MERGE`, `SET n:L`, `REMOVE n:L`, `MERGE NODES`.
-- A node keeps the type it was created with: `SET` of another type label, or `REMOVE` of the type label, is refused. A label the type implies cannot be removed. Auxiliary labels are added and removed freely.
+- `SET` of another type label, or `REMOVE` of the type label, is refused: a node's type changes only through [RETYPE NODE](#retype-node--). A label the type implies cannot be removed. Auxiliary labels are added and removed freely.
 - `labels(n)` returns the type label first, then the implied and auxiliary labels in name order.
 - An index or a constraint declared on a label covers every node carrying it, whether the label is the node's type, implied by it or auxiliary: an index on `:Thing(title)` finds `Goal` nodes too, and a `UNIQUE` on `:Thing(title)` holds across `Thing` and `Goal`. A node joins a label's indexes when it gains the label and leaves them when it loses it. The constraints of every label a node carries hold together; the type's schema, mode, placement and expiry stay the type's alone, and a label's own property declarations, defaults and expiry are not inherited by the nodes that carry it implied. A node its type expires leaves the indexes of every label it carries.
 
