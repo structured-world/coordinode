@@ -146,6 +146,9 @@ fn main() {
     writes(&mut db, "property edit, labels kept", WRITES, |i| {
         format!("MATCH (n:Edit {{i: {i}}}) SET n.v = {i}")
     });
+    // A label added beside a node's type classifies it: it is auxiliary.
+    db.execute_cypher("CREATE LABEL Tagged AUXILIARY")
+        .expect("auxiliary label");
     writes(&mut db, "label added", WRITES, |i| {
         format!("MATCH (n:Edit {{i: {i}}}) SET n:Tagged")
     });
