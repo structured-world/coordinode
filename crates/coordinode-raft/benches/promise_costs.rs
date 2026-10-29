@@ -917,20 +917,23 @@ async fn failovers() {
         stopped.shutdown().await.expect("stop the leader");
         drop(stopped);
         // The new leader as its own metrics show it, polled without a
-        // probe of the group, then confirmed once by a read of its lease.
-        let (elected, term) = loop {
-            if let Some(found) = leader_in_metrics(&members) {
-                break found;
-            }
+        // probe of the group, then confirmed by a read of its lease. A
+        // leader that cannot confirm (the other member timed out and the
+        // group elects again) is not the end of the election: polling goes
+        // on, and the time to the leader in metrics is the last one seen.
+        let (elected, term, seen) = loop {
             assert!(t.elapsed() < Duration::from_secs(30), "no new leader");
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            let Some((elected, term)) = leader_in_metrics(&members) else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                continue;
+            };
+            let seen = t.elapsed();
+            if members[elected].node().is_leader().await {
+                break (elected, term, seen);
+            }
         };
-        in_metrics.push(t.elapsed());
+        in_metrics.push(seen);
         terms.push(term);
-        assert!(
-            members[elected].node().is_leader().await,
-            "the leader its metrics name confirms its lease"
-        );
         confirmed.push(t.elapsed());
         for member in &members {
             let (files, dirs) = member.store.take_syncs();
