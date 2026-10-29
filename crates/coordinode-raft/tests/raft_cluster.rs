@@ -4149,6 +4149,200 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_promote_another_memb
     );
 }
 
+/// A replacement left waiting for its new member to catch up does not
+/// remove another member under the old node id: while leader 1 waits for
+/// 4 under identity A to replace 3 under identity C, leader 2 removes 3/C
+/// and adds and promotes 3 under identity D; when 4/A has caught up and 1
+/// leads again, the old call refuses rather than remove 3/D as the 3/C it
+/// was asked to replace, and 3/D keeps voting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_waiting_out_a_leader_change_does_not_remove_another_member() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(180), async {
+        let (p1, p2, p3, p3d, p4) = (
+            alloc_port(),
+            alloc_port(),
+            alloc_port(),
+            alloc_port(),
+            alloc_port(),
+        );
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+            tempfile::tempdir().expect("d3d"),
+            tempfile::tempdir().expect("d4"),
+        ];
+        let e1 = open_engine_at(dirs[0].path());
+        let e2 = open_engine_at(dirs[1].path());
+        let e3 = open_engine_at(dirs[2].path());
+        let n1 = Arc::new(
+            RaftNode::open_cluster(
+                1,
+                Arc::clone(&e1),
+                format!("127.0.0.1:{p1}").parse().expect("a"),
+                format!("http://127.0.0.1:{p1}"),
+                conn(1),
+            )
+            .await
+            .expect("n1"),
+        );
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n2");
+        let n3c = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n3 under C");
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
+            .await
+            .expect("add 2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
+            .await
+            .expect("add 3 under C");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+
+        // 4 joins under identity A, then stops and falls behind.
+        let e4 = open_engine_at(dirs[4].path());
+        let n4a = RaftNode::open_joining(
+            4,
+            Arc::clone(&e4),
+            format!("127.0.0.1:{p4}").parse().expect("a"),
+            conn(4),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n4 under A");
+        n1.add_node(4, format!("http://127.0.0.1:{p4}"), ident(4))
+            .await
+            .expect("add 4 under A");
+        n4a.shutdown().await.expect("stop 4/A");
+        drop(n4a);
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        let write = |node: &RaftNode, i: u64| {
+            node.pipeline()
+                .propose_and_wait(&RaftProposal {
+                    id: id_gen.next(),
+                    mutations: vec![Mutation::Put {
+                        partition: PartitionId::Node,
+                        key: format!("node:1:old-side-{i}").into_bytes(),
+                        value: b"v".to_vec(),
+                    }],
+                    commit_ts: Timestamp::from_raw(100 + 2 * i),
+                    start_ts: Timestamp::from_raw(99 + 2 * i),
+                    bypass_rate_limiter: false,
+                })
+                .expect("propose");
+        };
+        for i in 0..40u64 {
+            write(&n1, i);
+        }
+
+        // Leader 1 starts replacing 3/C by 4/A and waits for 4 to catch up.
+        n1.set_join_readiness_lag(5);
+        n1.set_join_timeout(Duration::from_secs(90));
+        let (progress, _) = tokio::sync::broadcast::channel(64);
+        let replacing = {
+            let n1 = Arc::clone(&n1);
+            tokio::spawn(async move {
+                n1.replace_member(3, 4, format!("http://127.0.0.1:{p4}"), ident(4), progress)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Leader 2 replaces 3/C by 3 under identity D, which votes.
+        n1.transfer_leadership_to(2).await.expect("transfer to n2");
+        await_leadership(&n2).await;
+        n2.remove_node(3).await.expect("remove 3/C");
+        n3c.shutdown().await.expect("stop 3/C");
+        drop(n3c);
+        let uri_d = format!("{}-d", PKI.spiffe_id(3));
+        n2.add_node(
+            3,
+            format!("http://127.0.0.1:{p3d}"),
+            TestPki::identity_of(&uri_d),
+        )
+        .await
+        .expect("add 3 under D");
+        let e3d = open_engine_at(dirs[3].path());
+        let n3d = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3d),
+            format!("127.0.0.1:{p3d}").parse().expect("a"),
+            PKI.connections_of(&uri_d),
+            enroll(&n2, format!("127.0.0.1:{p2}")),
+        )
+        .await
+        .expect("n3 under D");
+        assert!(
+            await_replicated(&e3d, b"node:1:old-side-39", b"v").await,
+            "3/D caught up"
+        );
+        n2.promote_to_voter(3).await.expect("promote 3/D");
+
+        // 4/A is back and catches up; 1 leads again.
+        let n4a = reopen_member(4, &e4, p4).await;
+        assert!(
+            await_replicated(&e4, b"node:1:old-side-39", b"v").await,
+            "4/A caught up"
+        );
+        n2.transfer_leadership_to(1)
+            .await
+            .expect("transfer back to n1");
+        let outcome = replacing.await.expect("the replacement task");
+        assert!(
+            matches!(outcome, Err(RaftNodeError::Identity(_))),
+            "the old replacement refuses 3 under another identity: {outcome:?}"
+        );
+        let (voters, three) = {
+            let rx = n1.raft().metrics();
+            let metrics = rx.borrow_watched();
+            let config = metrics.membership_config.membership();
+            (
+                config.voter_ids().collect::<Vec<u64>>(),
+                config.get_node(&3).and_then(|node| node.identity.clone()),
+            )
+        };
+        assert_eq!(voters, vec![1, 2, 3], "3/D keeps voting");
+        assert_eq!(
+            three.map(|id| id.to_string()),
+            Some(TestPki::identity_of(&uri_d))
+                .map(|id| coordinode_raft::member::MemberIdentity::from(&id).to_string()),
+            "3 is still 3/D"
+        );
+
+        n4a.shutdown().await.expect("s4");
+        n3d.shutdown().await.expect("s3d");
+        n2.shutdown().await.expect("s2");
+        n1.shutdown().await.expect("s1");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_replacement_waiting_out_a_leader_change_does_not_remove_another_member"
+    );
+}
+
 /// Four live members, 1 leading, left in the committed joint configuration
 /// {1,2,3}+{1,2,4}: a change from {1,2,3} to {1,2,4} that stopped after its
 /// joint step, as a lost leader or a call cut short leaves it.

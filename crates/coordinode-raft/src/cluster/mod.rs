@@ -683,6 +683,19 @@ const DEFAULT_JOIN_READINESS_LAG: u64 = 1_000;
 /// Default for [`RaftNode::join_timeout`].
 const DEFAULT_JOIN_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 
+/// One reading of the membership in effect (see [`RaftNode::membership_view`]).
+struct MembershipView {
+    /// Every member, voter or learner, with the identity it is bound to.
+    nodes: std::collections::BTreeMap<u64, Option<MemberIdentity>>,
+    /// The voters of the configuration in effect, or of the one a joint
+    /// configuration is heading for.
+    target: std::collections::BTreeSet<u64>,
+    /// Whether the configuration is joint.
+    joint: bool,
+    /// The entry that installed this membership.
+    log_id: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
+}
+
 /// The join settings an operator may retune while the node runs.
 struct JoinTuning {
     readiness_lag: core::sync::atomic::AtomicU64,
@@ -1531,6 +1544,31 @@ impl RaftNode {
             .map(|voters| voters.iter().copied().collect())
             .unwrap_or_default();
         (target, config.voter_ids().collect(), configs.len() > 1)
+    }
+
+    /// The membership in effect, read once: its members with their
+    /// identities, its voter sets as [`Self::voter_sets`] gives them, and the
+    /// entry that installed it, so a change computed and checked from this
+    /// view can be conditioned on exactly that entry.
+    fn membership_view(&self) -> MembershipView {
+        use openraft::rt::watch::WatchReceiver;
+
+        let rx = self.raft.metrics();
+        let metrics = rx.borrow_watched();
+        let config = metrics.membership_config.membership();
+        let configs = config.get_joint_config();
+        MembershipView {
+            nodes: config
+                .nodes()
+                .map(|(id, node)| (*id, node.identity.clone()))
+                .collect(),
+            target: configs
+                .last()
+                .map(|voters| voters.iter().copied().collect())
+                .unwrap_or_default(),
+            joint: configs.len() > 1,
+            log_id: *metrics.membership_config.log_id(),
+        }
     }
 
     /// Wait until the entry that installed the membership in effect is
@@ -3158,8 +3196,11 @@ impl RaftNode {
     ///
     /// `new` equals `old` (a lost member is never let back under the identity
     /// it may have broken a promise under); the errors of [`Self::add_node`];
-    /// [`RaftNodeError::Membership`] when this node does not lead, `new` does
-    /// not catch up within [`Self::join_timeout`], or the change is refused.
+    /// [`RaftNodeError::Identity`] when `new` is a member bound to another
+    /// identity, or node id `old` was given to another member since the call
+    /// began; [`RaftNodeError::Membership`] when this node does not lead,
+    /// `new` does not catch up within [`Self::join_timeout`], or the
+    /// membership changed under the call (calling again resumes it).
     pub async fn replace_member(
         &self,
         old: u64,
@@ -3168,115 +3209,106 @@ impl RaftNode {
         identity: coordinode_wire::peer::PeerIdentity,
         progress_tx: tokio::sync::broadcast::Sender<JoinProgressEvent>,
     ) -> Result<(), RaftNodeError> {
-        use openraft::rt::watch::WatchReceiver;
-
         if old == new {
             return Err(RaftNodeError::Membership(format!(
                 "member {old} is replaced under a new node id, never its own"
             )));
         }
         let _turn = self.membership_turn().await?;
-        // The members with their identities, and the entry that installed
-        // them, read at once: a change conditioned on that entry applies only
-        // to the membership read.
-        let members = |raft: &RaftInstance| {
-            let rx = raft.metrics();
-            let metrics = rx.borrow_watched();
-            let nodes = metrics
-                .membership_config
-                .membership()
-                .nodes()
-                .map(|(id, node)| (*id, node.identity.clone()))
-                .collect::<std::collections::BTreeMap<u64, Option<MemberIdentity>>>();
-            (nodes, *metrics.membership_config.log_id())
-        };
-        // A replacement is resumed or repeated only as the one it is: a
-        // member `new` already holds must be bound to `identity`, as
-        // `add_node` binds it, or the call is another replacement.
+        let view = self.membership_view();
+        // The old member as the call found it, or its absence: only that
+        // member is removed.
+        let old_identity = view.nodes.get(&old).cloned();
         let asked = MemberIdentity::from(&identity);
-        let bound_to_asked =
-            |nodes: &std::collections::BTreeMap<u64, Option<MemberIdentity>>| match nodes.get(&new)
-            {
+        // Both sides as this call means them, checked in the view a change
+        // is computed from: a member `new` holds is bound to `identity`, as
+        // `add_node` binds it, and a member `old` holds is still the one the
+        // call found. Anything else is another replacement made meanwhile,
+        // possibly by another leader while this call waited.
+        let as_asked = |view: &MembershipView| -> Result<(), RaftNodeError> {
+            match view.nodes.get(&new) {
                 Some(bound) if bound.as_ref() != Some(&asked) => {
-                    Err(RaftNodeError::Identity(format!(
+                    return Err(RaftNodeError::Identity(format!(
                         "node {new} is a member bound to {}, not to {asked}",
                         bound
                             .as_ref()
                             .map_or_else(|| "no identity".to_owned(), ToString::to_string)
+                    )));
+                }
+                _ => {}
+            }
+            match view.nodes.get(&old) {
+                Some(found) if Some(found) != old_identity.as_ref() => {
+                    Err(RaftNodeError::Identity(format!(
+                        "node {old} is no longer the member this replacement was asked to remove"
                     )))
                 }
                 _ => Ok(()),
-            };
-        let (nodes, _) = members(&self.raft);
-        bound_to_asked(&nodes)?;
-        // The old member as the call found it: only that member is removed.
-        let old_identity = nodes.get(&old).cloned();
-        let (voters, _, joint) = self.voter_sets();
-        if voters.contains(&new) && !nodes.contains_key(&old) && !joint {
+            }
+        };
+        // A change conditioned on the entry the view was read at applies only
+        // to that membership; one made in between is refused, not overwritten.
+        let fenced = |view: &MembershipView| {
+            [openraft::raft::Precondition::LastMembershipLogId {
+                last_membership_log_id: view.log_id,
+            }]
+        };
+        as_asked(&view)?;
+        if view.target.contains(&new) && !view.nodes.contains_key(&old) && !view.joint {
             return Ok(());
         }
-        if !nodes.contains_key(&new) {
+        if !view.nodes.contains_key(&new) {
             self.add_node_in_turn(new, addr, identity).await?;
         }
-        if !voters.contains(&new) {
+        if !view.target.contains(&new) {
             self.await_caught_up(new, &progress_tx).await?;
         }
 
-        // The wait above may outlast a leader change: another leader may have
-        // removed `new` and added it under another identity, or changed the
-        // voters. The membership is read again once committed, `new` checked
-        // in it, and the change made only if that membership is still the
-        // one in effect when it is proposed.
+        // `new` among the voters, `old` out of them, from the committed
+        // membership read again: the wait above may outlast a leader change.
         self.membership_committed().await?;
-        let (nodes, observed) = members(&self.raft);
-        if !nodes.contains_key(&new) {
+        let view = self.membership_view();
+        if !view.nodes.contains_key(&new) {
             return Err(RaftNodeError::Membership(format!(
                 "node {new} left the group while it caught up"
             )));
         }
-        bound_to_asked(&nodes)?;
-        let (voters, _, joint) = self.voter_sets();
-        let target: std::collections::BTreeSet<u64> = voters
+        as_asked(&view)?;
+        let target: std::collections::BTreeSet<u64> = view
+            .target
             .iter()
             .copied()
             .filter(|&id| id != old)
-            .chain(std::iter::once(new))
+            .chain(core::iter::once(new))
             .collect();
         // A joint configuration left behind is taken to the target even when
         // the voters it heads for are already the target's.
-        if joint || target != voters {
+        if view.joint || target != view.target {
             let written = self
                 .raft
-                .change_membership_if(
-                    target,
-                    false,
-                    [openraft::raft::Precondition::LastMembershipLogId {
-                        last_membership_log_id: observed,
-                    }],
-                )
+                .change_membership_if(target, false, fenced(&view))
                 .await
                 .map_err(|e| RaftNodeError::Membership(Self::describe_membership_refusal(&e)))?;
             self.membership_published(written.log_id.index).await?;
         }
 
         // An old member still in the group (a learner, which the change above
-        // does not drop) leaves it, if it is still the member the call found.
+        // does not drop) leaves it, under the same checks.
         self.membership_committed().await?;
-        let (nodes, observed) = members(&self.raft);
-        if let Some(found) = nodes.get(&old) {
-            if Some(found) != old_identity.as_ref() {
-                return Err(RaftNodeError::Identity(format!(
-                    "node {old} is no longer the member this replacement was asked to remove"
-                )));
-            }
+        let view = self.membership_view();
+        as_asked(&view)?;
+        if view.joint || !view.target.contains(&new) {
+            return Err(RaftNodeError::Membership(format!(
+                "the voters changed while member {new} replaced member {old}; call again to resume"
+            )));
+        }
+        if view.nodes.contains_key(&old) {
             let written = self
                 .raft
                 .change_membership_if(
                     openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([old])),
                     false,
-                    [openraft::raft::Precondition::LastMembershipLogId {
-                        last_membership_log_id: observed,
-                    }],
+                    fenced(&view),
                 )
                 .await
                 .map_err(|e| RaftNodeError::Membership(Self::describe_membership_refusal(&e)))?;
