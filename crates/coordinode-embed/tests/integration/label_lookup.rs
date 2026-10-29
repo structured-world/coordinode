@@ -324,6 +324,7 @@ fn a_limit_reads_only_the_members_it_keeps() {
             .expect("member");
     }
     // Room for the three rows the SKIP and LIMIT below keep, not for eight.
+    // Each query reads the payload, so every row its scan keeps is wide.
     db.set_query_memory_limit(3 << 20).expect("limit");
     let first = |db: &mut Database, query: &str| -> Vec<i64> {
         db.execute_cypher(query)
@@ -336,23 +337,52 @@ fn a_limit_reads_only_the_members_it_keeps() {
             .collect()
     };
     assert_eq!(
-        first(&mut db, "MATCH (n:Wide) RETURN n.i AS i LIMIT 2"),
+        first(
+            &mut db,
+            "MATCH (n:Wide) RETURN n.i AS i, size(n.payload) AS s LIMIT 2"
+        ),
         [0, 1]
     );
     assert_eq!(
-        first(&mut db, "MATCH (n:Wide) RETURN n.i AS i SKIP 1 LIMIT 2"),
+        first(
+            &mut db,
+            "MATCH (n:Wide) RETURN n.i AS i, size(n.payload) AS s SKIP 1 LIMIT 2"
+        ),
         [1, 2]
     );
     assert_eq!(
         first(
             &mut db,
-            "MATCH (n:Wide) WHERE n.i >= 1 RETURN n.i AS i LIMIT 1"
+            "MATCH (n:Wide) WHERE n.i >= 1 RETURN n.i AS i, size(n.payload) AS s LIMIT 1"
         ),
         [1]
     );
     assert!(
-        db.execute_cypher("MATCH (n:Wide) RETURN n.i AS i").is_err(),
+        db.execute_cypher("MATCH (n:Wide) RETURN n.i AS i, size(n.payload) AS s")
+            .is_err(),
         "all members do not fit the limit"
+    );
+}
+
+/// A scan holds only the properties its statement reads: every wide member's
+/// small property fits a memory limit their payloads would break, while a
+/// statement returning the nodes whole still holds all of each.
+#[test]
+fn a_scan_holds_only_the_properties_read() {
+    let (mut db, _dir) = open_db();
+    let blob = "x".repeat(512 << 10);
+    for i in 0..8 {
+        db.execute_cypher(&format!("CREATE (:Wide {{i: {i}, payload: '{blob}'}})"))
+            .expect("member");
+    }
+    db.set_query_memory_limit(3 << 20).expect("limit");
+    let rows = db
+        .execute_cypher("MATCH (n:Wide) WHERE n.i >= 0 RETURN n.i AS i ORDER BY i")
+        .expect("the small property of every member");
+    assert_eq!(rows.len(), 8);
+    assert!(
+        db.execute_cypher("MATCH (n:Wide) RETURN n").is_err(),
+        "whole nodes carry their payloads"
     );
 }
 

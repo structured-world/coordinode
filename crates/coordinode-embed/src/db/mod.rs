@@ -2738,6 +2738,7 @@ impl Database {
                 feedback_cache: Some(self.feedback_cache.clone()),
                 schema_label_cache: std::collections::HashMap::new(),
                 label_schema_cache: std::collections::HashMap::new(),
+                node_columns: None,
                 applied_watermark: None,
                 read_consistency:
                     coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),

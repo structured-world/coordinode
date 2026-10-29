@@ -1254,6 +1254,9 @@ pub struct ExecutionContext<'a> {
     /// schema the statement changes. Shared, so a write can hold its type's
     /// schema while it stages through the context, without reading it again.
     pub label_schema_cache: HashMap<String, Option<Arc<LabelSchema>>>,
+    /// The properties the running statement reads of each node its scans
+    /// bind; `None` keeps every property of every node. Set per statement.
+    pub node_columns: Option<crate::executor::columns::NodeColumns>,
     /// Named query parameters bound to this statement.
     ///
     /// Populated before `execute()` is called. Accessible inside aggregate
@@ -4256,6 +4259,8 @@ pub fn execute_no_commit(
     // applied auto-promotion and the narrower `vector_consistency` override.
     ctx.read_consistency = plan.read_consistency;
     ctx.vector_consistency = plan.vector_consistency;
+    // Scans build only the node properties the statement reads.
+    ctx.node_columns = crate::executor::columns::NodeColumns::for_plan(&plan.root);
 
     // Cross-modality snapshot wait. When `read_consistency` is
     // `Snapshot` or `Exact`, every modality on this shard must observe the
@@ -6924,6 +6929,7 @@ struct NodeRowEnv<'e> {
     schemas: &'e HashMap<String, Option<Arc<LabelSchema>>>,
     valid_now: i64,
     correlated_row: Option<&'e Row>,
+    columns: Option<&'e crate::executor::columns::NodeColumns>,
 }
 
 impl<'e> NodeRowEnv<'e> {
@@ -6933,6 +6939,7 @@ impl<'e> NodeRowEnv<'e> {
             schemas: &ctx.label_schema_cache,
             valid_now: ctx.valid_now,
             correlated_row: ctx.correlated_row.as_ref(),
+            columns: ctx.node_columns.as_ref(),
         }
     }
 
@@ -6954,19 +6961,45 @@ fn node_row_from(
 ) -> Result<Option<Row>, ExecutionError> {
     let mut row = Row::new();
     row.insert(variable.to_string(), Value::Int(node_id as i64));
-    for (field_id, value) in &record.props {
-        if let Some(field_name) = env.interner.resolve(*field_id) {
-            row.insert(format!("{variable}.{field_name}"), value.clone());
+    let schema = match env.schemas.get(record.primary_label()) {
+        Some(Some(schema)) => Some(schema),
+        _ => None,
+    };
+    // Only the properties the statement reads, unless a computed property,
+    // whose expression may read any other, is declared.
+    let wanted = env
+        .columns
+        .and_then(|c| c.of(variable))
+        .filter(|_| !schema.is_some_and(|s| s.properties.values().any(|p| p.is_computed())));
+    match wanted {
+        Some(wanted) => {
+            for name in wanted {
+                let value = env
+                    .interner
+                    .lookup(name)
+                    .and_then(|id| record.props.get(&id))
+                    .or_else(|| record.get_extra(name));
+                if let Some(value) = value {
+                    row.insert(format!("{variable}.{name}"), value.clone());
+                }
+            }
+        }
+        None => {
+            for (field_id, value) in &record.props {
+                if let Some(field_name) = env.interner.resolve(*field_id) {
+                    row.insert(format!("{variable}.{field_name}"), value.clone());
+                }
+            }
+            // Overflow properties (undeclared properties of a VALIDATED label).
+            if let Some(extra) = &record.extra {
+                for (name, value) in extra {
+                    row.insert(format!("{variable}.{name}"), value.clone());
+                }
+            }
         }
     }
-    // Overflow properties (undeclared properties of a VALIDATED label).
-    if let Some(extra) = &record.extra {
-        for (name, value) in extra {
-            row.insert(format!("{variable}.{name}"), value.clone());
-        }
-    }
-    let primary_label = insert_label_columns(&mut row, variable, record);
-    if let Some(Some(schema)) = env.schemas.get(&primary_label) {
+    insert_label_columns(&mut row, variable, record);
+    if let Some(schema) = schema {
         inject_computed_from_schema(&mut row, variable, schema, env.valid_now);
     }
 
