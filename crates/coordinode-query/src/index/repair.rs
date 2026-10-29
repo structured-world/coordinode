@@ -231,6 +231,7 @@ fn attempt(
         schema_label_cache: HashMap::new(),
         label_schema_cache: HashMap::new(),
         implied: Default::default(),
+        index_deferred: Default::default(),
         node_columns: None,
         applied_watermark: None,
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),

@@ -1283,6 +1283,10 @@ pub struct ExecutionContext<'a> {
     /// Per-statement cache: what each type met implies, compiled from the
     /// schemas in `label_schema_cache` and dropped with any of them.
     pub implied: coordinode_core::schema::labels::ImpliedCache,
+    /// The nodes a RETYPE NODE is changing, whose B-tree entries move once,
+    /// from the record before it to the record it leaves, rather than with
+    /// each of its steps. Empty outside a RETYPE.
+    pub index_deferred: rustc_hash::FxHashSet<NodeId>,
     /// The properties the running statement reads of each node its scans
     /// bind; `None` keeps every property of every node. Set per statement.
     pub node_columns: Option<crate::executor::columns::NodeColumns>,
@@ -2318,6 +2322,9 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
+        if self.index_deferred.contains(&node_id) {
+            return Ok(());
+        }
         let carried_before = self.carried_beyond_stored(labels_before)?;
         let carried_after = self.carried_beyond_stored(&record.labels)?;
         let before = carried_before.as_deref().unwrap_or(labels_before);
@@ -2415,7 +2422,7 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        if !self.indexes_record(record)? {
+        if self.index_deferred.contains(&node_id) || !self.indexes_record(record)? {
             return Ok(());
         }
         self.sync_txn_state();
@@ -2494,7 +2501,10 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        if properties.is_empty() || !self.indexes_record(before)? {
+        if properties.is_empty()
+            || self.index_deferred.contains(&node_id)
+            || !self.indexes_record(before)?
+        {
             return Ok(());
         }
         self.sync_txn_state();
@@ -15810,11 +15820,13 @@ fn execute_retype_node(
         retyped.push((node_id, before));
         rows.push(row);
     }
-    // The property changes stage no B-tree entry of their own: the entries
-    // follow the final record below.
-    let indexes = ctx.btree_index_registry.take();
+    // The retyped nodes' property changes stage no B-tree entry of their
+    // own: their entries follow the final record below. Any other node the
+    // items change moves its entries as any SET does.
+    ctx.index_deferred
+        .extend(retyped.iter().map(|(node_id, _)| *node_id));
     let changed = retype_properties(rows, set_items, remove_items, ctx);
-    ctx.btree_index_registry = indexes;
+    ctx.index_deferred.clear();
     let rows = changed?;
     for (node_id, before) in retyped {
         ctx.admit_retyped(node_id, label)?;

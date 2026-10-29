@@ -434,11 +434,23 @@ fn a_retype_whose_result_breaks_a_unique_index_leaves_nothing() {
             "MATCH (n:Note) RETYPE NODE n TO Goal SET n.title = 'x'",
             None,
         );
-        let err = refused.expect_err("the final value is held").to_string();
-        assert!(err.contains("unique"), "{err}");
+        let err = refused.expect_err("the final value is held");
         assert!(
-            db.commit_transaction(tx).is_err(),
-            "the refused statement ends its transaction"
+            matches!(&err, coordinode_embed::DatabaseError::UniqueViolation { index, .. } if index == "thing_title"),
+            "{err:?}"
+        );
+        let ended = db
+            .commit_transaction(tx)
+            .expect_err("the transaction ended");
+        assert!(
+            matches!(
+                ended,
+                coordinode_embed::DatabaseError::TransactionAborted {
+                    end: coordinode_embed::TransactionEnd::StatementFailed,
+                    ..
+                }
+            ),
+            "{ended:?}"
         );
 
         assert_eq!(count(&mut db, "MATCH (n:Witness) RETURN n"), 0);
@@ -452,6 +464,52 @@ fn a_retype_whose_result_breaks_a_unique_index_leaves_nothing() {
     assert_eq!(state_of(&mut db, note), before);
     assert_eq!(entry_count(&db, "thing_title"), 1);
     assert_index_agrees(&db, "thing_title");
+}
+
+/// The SET and REMOVE items of a RETYPE may change another node the
+/// statement binds: that node's index entries move with its values like any
+/// SET's, before and after a reopen. Only the retyped node's entries wait
+/// for its final record.
+#[test]
+fn a_retype_moves_the_index_entries_of_another_node_it_changes() {
+    for (change, kept) in [
+        ("SET n.title = 'y', m.k = 2", 2),
+        ("SET n.title = 'y' REMOVE m.k", -1),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let mut db = Database::open(dir.path()).expect("open");
+            kinds(&mut db);
+            db.execute_cypher("CREATE INDEX other_k ON :Other(k)")
+                .expect("index");
+            db.execute_cypher("CREATE (:Note {title: 'x'})-[:REL]->(:Other {k: 1})")
+                .expect("nodes");
+            db.execute_cypher(&format!(
+                "MATCH (n:Note)-[:REL]->(m:Other) RETYPE NODE n TO Goal {change}"
+            ))
+            .unwrap_or_else(|e| panic!("{change}: {e}"));
+            assert_eq!(
+                count(&mut db, "MATCH (m:Other {k: 1}) RETURN m"),
+                0,
+                "{change}: the old value left the index"
+            );
+            if kept > 0 {
+                assert_eq!(
+                    count(&mut db, &format!("MATCH (m:Other {{k: {kept}}}) RETURN m")),
+                    1,
+                    "{change}: the new value is found through the index"
+                );
+            }
+            assert_index_agrees(&db, "other_k");
+        }
+        let mut db = Database::open(dir.path()).expect("reopen");
+        assert_eq!(
+            count(&mut db, "MATCH (m:Other {k: 1}) RETURN m"),
+            0,
+            "{change}"
+        );
+        assert_index_agrees(&db, "other_k");
+    }
 }
 
 /// A node of an undeclared type becomes another undeclared type with every

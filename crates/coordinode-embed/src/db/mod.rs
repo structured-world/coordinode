@@ -2753,6 +2753,7 @@ impl Database {
                 schema_label_cache: std::collections::HashMap::new(),
                 label_schema_cache: std::collections::HashMap::new(),
                 implied: Default::default(),
+                index_deferred: Default::default(),
                 node_columns: None,
                 applied_watermark: None,
                 read_consistency:
