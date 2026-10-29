@@ -1225,6 +1225,14 @@ change), run the same command again: each step looks at the membership first,
 so it continues where it stopped and never adds a second member. A command
 naming the old node id as the new one is refused.
 
+While the new node catches up, another leader may change the group. The
+command then refuses rather than act on members it was not asked about: when
+the new node id is a member under another identity, or the old node id now
+belongs to another member than the one it found, it fails with an identity
+error and changes nothing; when the voters changed under it, it fails and the
+same command run again continues. It reports the replacement done only once
+the membership that shows it is committed.
+
 A replacement is a membership change and needs the quorum. When too many
 members lost their votes at once to leave a quorum, the group stays
 unavailable: it is not continued on forgotten votes, and no replacement can be

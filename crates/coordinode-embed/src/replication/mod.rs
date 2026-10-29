@@ -806,7 +806,9 @@ impl ReplicatedDatabase {
     /// [`ReplicationError::Consensus`]: `new` equals `old` (a member is never
     /// let back under the identity it may have broken a promise under), not
     /// the leader, `new` already bound to another identity or not caught up
-    /// within the join timeout, no quorum to commit the change.
+    /// within the join timeout, `old` now another member than the one the
+    /// call found, the voters changed under the call (calling again resumes
+    /// it), no quorum to commit the change.
     pub async fn replace(
         &self,
         old: u64,
