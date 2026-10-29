@@ -20,6 +20,13 @@ its registry baseline and semantic-version checks. Registry failures stop the
 calculation. Upload always uses the checked-in `.release-plz.toml`, never this
 derived configuration; the server tag does not establish a library upload.
 
+`examples/embedded-quickstart` builds from registry packages, as an application
+does, so it is not a workspace member and release-plz leaves its manifest alone.
+After release-plz prepares the PR, `example_requirements.py` sets the example's
+requirement on every registry package to the release's caret requirement
+(`0.10` for `0.10.0`) and pushes that commit to the release PR's branch. The
+package check refuses a release the example's requirements do not admit.
+
 ## Preparation and qualification
 
 Run `prepare.py` only in a disposable, clean checkout. It removes the workspace

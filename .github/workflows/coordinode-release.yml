@@ -199,7 +199,18 @@ jobs:
         env:
           GIT_TOKEN: ${{ steps.app.outputs.token }}
           CARGO_PROFILE_DEV_DEBUG: "0"
-        run: release-plz release-pr --forge github --config target/release-pr-config.toml
+        run: |
+          release-plz release-pr --forge github --config target/release-pr-config.toml \
+            --output json > target/release-pr.json
+          cat target/release-pr.json
+      # The example builds from registry packages, outside the workspace that
+      # release-plz versions, so the release PR brings its requirements along.
+      - name: Bring the example's requirements to the release
+        env:
+          GIT_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          python3 -B scripts/release/example_requirements.py --checkout "$GITHUB_WORKSPACE" \
+            --pr-json target/release-pr.json
       - name: Clean build outputs
         if: always()
         run: cargo clean
