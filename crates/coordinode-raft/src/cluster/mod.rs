@@ -1472,25 +1472,27 @@ impl RaftNode {
         }
     }
 
-    /// Wait until no membership change is in flight: the membership in effect
-    /// is a single configuration, not a joint one, and the log entry that
-    /// installed it is committed.
+    /// Wait until no membership change is in flight: the log entry that
+    /// installed the membership in effect is committed.
     ///
     /// The membership in effect is visible before it commits, so status can
     /// already show a new voter while the change that added it is still being
     /// replicated, and openraft refuses a second change until the first one
-    /// settles. An operator acts on the status; every membership change here
+    /// commits. An operator acts on the status; every membership change here
     /// starts by waiting for the previous one rather than failing with it.
+    ///
+    /// A committed joint configuration counts as settled. Nothing moves it on
+    /// by itself: a leader lost between the two steps of a change, or a call
+    /// cut short between them, leaves it in place for good, and openraft takes
+    /// the next change from it to its target. Waiting for it to become a
+    /// single configuration would wait for nothing.
     async fn membership_settled(&self) -> Result<(), RaftNodeError> {
         use openraft::LogIdOptionExt;
 
         self.raft
             .wait(Some(self.membership_settle_timeout()))
             .metrics(
-                |m| {
-                    m.membership_config.membership().get_joint_config().len() == 1
-                        && m.membership_config.log_id().index() <= m.local_committed.index()
-                },
+                |m| m.membership_config.log_id().index() <= m.local_committed.index(),
                 "the previous membership change settles",
             )
             .await

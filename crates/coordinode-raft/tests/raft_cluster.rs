@@ -3777,6 +3777,205 @@ async fn a_replacement_cut_short_in_its_catch_up_is_resumed_by_the_next_leader()
     );
 }
 
+/// A replacement cut short inside its membership change, after the joint
+/// configuration of the old and the new voters committed and before the
+/// change to the new voters alone, is completed by the next leader: the
+/// group stands in the joint configuration a leader lost between the two
+/// steps leaves, the member that leads next calls the same replacement, and
+/// the joint configuration ends with member 4 voting where 3 did and 3 out
+/// of the group, its identity retired. A repeat changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_cut_short_in_its_joint_configuration_is_completed_by_the_next_leader() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(180), async {
+        let (p1, p2, p3, p4) = (alloc_port(), alloc_port(), alloc_port(), alloc_port());
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+            tempfile::tempdir().expect("d4"),
+        ];
+        let e1 = open_engine_at(dirs[0].path());
+        let e2 = open_engine_at(dirs[1].path());
+        let e3 = open_engine_at(dirs[2].path());
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+            conn(1),
+        )
+        .await
+        .expect("n1");
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n2");
+        let n3 = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n3");
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
+            .await
+            .expect("add 2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
+            .await
+            .expect("add 3");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+        let key = b"node:1:before-the-joint".to_vec();
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        n1.pipeline()
+            .propose_and_wait(&RaftProposal {
+                id: id_gen.next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: key.clone(),
+                    value: b"v".to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(100),
+                start_ts: Timestamp::from_raw(99),
+                bypass_rate_limiter: false,
+            })
+            .expect("propose");
+
+        // Member 3 stops and loses every copy of its vote.
+        n3.shutdown().await.expect("stop 3");
+        drop(n3);
+        for _ in 0..100 {
+            if Arc::strong_count(&e3) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(e3);
+        std::fs::remove_dir_all(dirs[2].path().join(Partition::Raft.name()))
+            .expect("lose the tree");
+        std::fs::remove_dir_all(dirs[2].path().join("local-journal")).expect("lose the journal");
+        lose_the_copy(dirs[2].path());
+
+        // Member 4 joins as a learner and catches up.
+        let e4 = open_engine_at(dirs[3].path());
+        let n4 = RaftNode::open_joining(
+            4,
+            Arc::clone(&e4),
+            format!("127.0.0.1:{p4}").parse().expect("a"),
+            conn(4),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n4");
+        n1.add_node(4, format!("http://127.0.0.1:{p4}"), ident(4))
+            .await
+            .expect("first step");
+        assert!(
+            await_replicated(&e4, &key, b"v").await,
+            "member 4 caught up"
+        );
+
+        // The replacement's change stops after its joint configuration: the
+        // state a leader lost between the two steps leaves behind.
+        let joint = {
+            let rx = n1.raft().metrics();
+            let metrics = rx.borrow_watched();
+            let config = metrics.membership_config.membership();
+            let nodes: std::collections::BTreeMap<_, _> = config
+                .nodes()
+                .map(|(id, node)| (*id, node.clone()))
+                .collect();
+            openraft::Membership::new(
+                vec![
+                    std::collections::BTreeSet::from([1, 2, 3]),
+                    std::collections::BTreeSet::from([1, 2, 4]),
+                ],
+                nodes,
+            )
+            .expect("the joint configuration")
+        };
+        n1.raft()
+            .append_membership(joint, openraft::EntryPayload::Blank, std::iter::empty())
+            .await
+            .expect("the joint configuration commits");
+        let membership = |node: &RaftNode| -> (Vec<Vec<u64>>, Vec<u64>) {
+            let rx = node.raft().metrics();
+            let metrics = rx.borrow_watched();
+            let config = metrics.membership_config.membership();
+            (
+                config
+                    .get_joint_config()
+                    .iter()
+                    .map(|voters| voters.iter().copied().collect())
+                    .collect(),
+                config.nodes().map(|(id, _)| *id).collect(),
+            )
+        };
+        assert_eq!(
+            membership(&n1),
+            (vec![vec![1, 2, 3], vec![1, 2, 4]], vec![1, 2, 3, 4]),
+            "the group stands in the joint configuration"
+        );
+
+        // Another member leads and resumes the same replacement.
+        n1.transfer_leadership_to(2).await.expect("transfer to n2");
+        await_leadership(&n2).await;
+        let (progress, _) = tokio::sync::broadcast::channel(64);
+        n2.replace_member(
+            3,
+            4,
+            format!("http://127.0.0.1:{p4}"),
+            ident(4),
+            progress.clone(),
+        )
+        .await
+        .expect("the next leader completes the replacement");
+        n2.replace_member(3, 4, format!("http://127.0.0.1:{p4}"), ident(4), progress)
+            .await
+            .expect("a repeat changes nothing");
+        assert_eq!(
+            membership(&n2),
+            (vec![vec![1, 2, 4]], vec![1, 2, 4]),
+            "member 4 votes where 3 did, and 3 left"
+        );
+        let back = n2
+            .add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
+            .await;
+        assert!(
+            matches!(back, Err(RaftNodeError::Identity(_))),
+            "the old identity is retired: {back:?}"
+        );
+        assert!(
+            await_replicated(&e4, &key, b"v").await,
+            "member 4 holds the history"
+        );
+
+        n4.shutdown().await.expect("s4");
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_replacement_cut_short_in_its_joint_configuration_is_completed_by_the_next_leader"
+    );
+}
+
 /// Two members of three lose every copy of their votes at once: neither
 /// starts, each with the typed refusal and its directory as it was, and the
 /// one left cannot replace them, since a membership change needs the quorum
