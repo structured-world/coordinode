@@ -292,11 +292,10 @@ fn an_implied_label_is_found_by_its_index() {
         2,
         "scanned"
     );
-    assert_eq!(
-        count(&mut db, "MATCH (n:Thing {title: 'x'}) RETURN n"),
-        2,
-        "through the index"
-    );
+    let lookup = "MATCH (n:Thing {title: 'x'}) RETURN n";
+    let plan = db.explain_cypher(lookup).expect("explain");
+    assert!(plan.contains("IndexScan"), "the index path:\n{plan}");
+    assert_eq!(count(&mut db, lookup), 2, "through the index");
 }
 
 /// An index built over nodes already stored covers the ones carrying its
@@ -326,6 +325,10 @@ fn an_auxiliary_label_index_follows_label_changes() {
     db.execute_cypher("CREATE (:Goal:Activity {title: 'a'}), (:Thing {title: 'a'})")
         .expect("nodes");
     let through_index = |db: &mut Database| count(db, "MATCH (n:Activity {title: 'a'}) RETURN n");
+    let plan = db
+        .explain_cypher("MATCH (n:Activity {title: 'a'}) RETURN n")
+        .expect("explain");
+    assert!(plan.contains("IndexScan"), "the index path:\n{plan}");
     assert_eq!(through_index(&mut db), 1);
     db.execute_cypher("MATCH (n:Thing {title: 'a'}) WHERE NOT 'Goal' IN labels(n) SET n:Activity")
         .expect("label added");
@@ -948,6 +951,260 @@ fn label_kinds_and_their_coverage_survive_a_restart() {
     );
     for name in ["thing_title", "policy_title"] {
         assert_index_agrees(&db, name);
+    }
+}
+
+/// MERGE creates a node of a type with the labels the type implies, and a
+/// MERGE on an implied label finds that node through its index instead of
+/// creating another.
+#[test]
+fn merge_creates_and_finds_a_node_by_its_implied_label() {
+    let mut db = goals();
+    db.execute_cypher("CREATE INDEX thing_title ON :Thing(title)")
+        .expect("index");
+    db.execute_cypher("MERGE (:Goal {title: 'm'})")
+        .expect("merge creates");
+    assert_eq!(
+        labels(&mut db, "MATCH (n:Goal {title: 'm'}) RETURN labels(n) AS l"),
+        ["Goal", "Thing"]
+    );
+    db.execute_cypher("MERGE (:Thing {title: 'm'})")
+        .expect("merge matches the goal");
+    assert_eq!(count(&mut db, "MATCH (n:Thing {title: 'm'}) RETURN n"), 1);
+    db.execute_cypher("MERGE (:Activity:Goal {title: 'n'})")
+        .expect("merge with an auxiliary label");
+    assert_eq!(
+        labels(&mut db, "MATCH (n:Goal {title: 'n'}) RETURN labels(n) AS l"),
+        ["Goal", "Activity", "Thing"]
+    );
+    let err = refused(&mut db, "MERGE (:Extra:Goal {title: 'o'})");
+    assert!(err.contains("two type labels"), "{err}");
+    assert_eq!(count(&mut db, "MATCH (n:Thing) RETURN n"), 2);
+}
+
+/// Thing, Goal implying it, Policy auxiliary, and an index on each of the
+/// two labels a Goal can carry besides its own, all FLEXIBLE so a type can
+/// add an expiry; `goal` is the Goal schema to declare.
+fn expiring_goals(db: &mut Database, goal: LabelSchema) {
+    use coordinode_core::schema::definition::SchemaMode;
+    let mut thing = LabelSchema::new_node_id("Thing");
+    thing.set_mode(SchemaMode::Flexible);
+    thing.add_property(PropertyDef::new("title", PropertyType::String));
+    db.create_label_schema(thing).expect("thing");
+    db.create_label_schema(goal).expect("goal with an expiry");
+    for ddl in [
+        "CREATE LABEL Policy AUXILIARY",
+        "CREATE INDEX thing_title ON :Thing(title)",
+        "CREATE INDEX policy_created ON :Policy(created_at)",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+}
+
+fn goal_expiring(scope: coordinode_core::schema::computed::TtlScope) -> LabelSchema {
+    use coordinode_core::schema::computed::ComputedSpec;
+    use coordinode_core::schema::definition::SchemaMode;
+    let mut goal = LabelSchema::new_node_id("Goal");
+    goal.set_mode(SchemaMode::Flexible);
+    goal.set_implies(vec!["Thing".to_string()]);
+    goal.add_property(PropertyDef::new("title", PropertyType::String));
+    goal.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
+    goal.add_property(PropertyDef::computed(
+        "_ttl",
+        ComputedSpec::Ttl {
+            duration_secs: 3600,
+            anchor_field: "created_at".into(),
+            scope,
+            target_field: None,
+        },
+    ));
+    goal
+}
+
+/// Now, and two hours ago, in epoch microseconds.
+fn now_and_expired() -> (i64, i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros() as i64;
+    (now, now - 2 * 3600 * 1_000_000)
+}
+
+/// A node its type expires leaves the index of every label it carries,
+/// implied and auxiliary, while an unexpired carrier stays in both.
+#[test]
+fn an_expired_node_leaves_the_index_of_every_label_it_carries() {
+    use coordinode_core::schema::computed::TtlScope;
+    let (mut db, _dir) = open_db();
+    expiring_goals(&mut db, goal_expiring(TtlScope::Node));
+    let (now, expired) = now_and_expired();
+    db.execute_cypher(&format!(
+        "CREATE (:Goal:Policy {{title: 'old', created_at: {expired}}}), \
+         (:Goal:Policy {{title: 'new', created_at: {now}}})"
+    ))
+    .expect("nodes");
+    assert_eq!(entry_count(&db, "thing_title"), 2);
+    assert_eq!(entry_count(&db, "policy_created"), 2);
+
+    let reaped = db.reap_expired().expect("reap");
+
+    assert_eq!(reaped.nodes_deleted, 1, "{reaped:?}");
+    assert_eq!(entry_count(&db, "thing_title"), 1, "implied label");
+    assert_eq!(entry_count(&db, "policy_created"), 1, "auxiliary label");
+    assert_eq!(count(&mut db, "MATCH (n:Thing {title: 'old'}) RETURN n"), 0);
+    assert_eq!(count(&mut db, "MATCH (n:Thing {title: 'new'}) RETURN n"), 1);
+    for name in ["thing_title", "policy_created"] {
+        assert_index_agrees(&db, name);
+    }
+}
+
+/// An expiry that takes a field away keeps it on a node where an index on
+/// one of the node's other labels holds it, so no entry is left pointing at
+/// a value the node no longer has; elsewhere it takes the field.
+#[test]
+fn an_expiry_keeps_a_field_an_auxiliary_label_indexes() {
+    use coordinode_core::schema::computed::TtlScope;
+    let (mut db, _dir) = open_db();
+    expiring_goals(&mut db, goal_expiring(TtlScope::Field));
+    let (_, expired) = now_and_expired();
+    db.execute_cypher(&format!(
+        "CREATE (:Goal:Policy {{title: 'kept', created_at: {expired}}}), \
+         (:Goal {{title: 'cut', created_at: {expired}}})"
+    ))
+    .expect("nodes");
+
+    let reaped = db.reap_expired().expect("reap");
+
+    assert_eq!(reaped.fields_removed, 1, "{reaped:?}");
+    assert!(
+        reaped
+            .errors
+            .iter()
+            .any(|e| e.contains("indexed property 'created_at'")),
+        "{reaped:?}"
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (n:Goal) WHERE n.created_at IS NULL RETURN n.title"
+        ),
+        1,
+        "the field left the unindexed node only"
+    );
+    assert_eq!(entry_count(&db, "policy_created"), 1);
+    assert_index_agrees(&db, "policy_created");
+}
+
+/// A declaration that fails leaves the guarantees in force as they were: a
+/// constraint refused over a stored carrier binds nobody, the constraint
+/// already active still holds, and a refused IMPLIES adds no label.
+#[test]
+fn a_failed_declaration_keeps_the_old_guarantees() {
+    let mut db = goals();
+    db.execute_cypher("CREATE CONSTRAINT thing_title FOR (n:Thing) REQUIRE n.title IS UNIQUE")
+        .expect("active constraint");
+    db.execute_cypher("CREATE (:Goal:Policy {title: 'p'}), (:Item {k: 1})")
+        .expect("nodes");
+
+    refused(
+        &mut db,
+        "CREATE CONSTRAINT policy_owner FOR (n:Policy) REQUIRE n.owner IS NOT NULL",
+    );
+    refused(&mut db, "CREATE NODE TYPE Item IMPLIES (Thing)");
+
+    db.execute_cypher("CREATE (:Goal:Policy {title: 'q'})")
+        .expect("the refused constraint binds nobody");
+    let err = refused(&mut db, "CREATE (:Thing {title: 'p'})");
+    assert!(err.contains("unique"), "the active one still holds: {err}");
+    db.execute_cypher("CREATE (:Item {k: 2})")
+        .expect("the item type is unchanged");
+    assert_eq!(count(&mut db, "MATCH (n:Thing) RETURN n"), 2);
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (n:Item) WHERE 'Thing' IN labels(n) RETURN n"
+        ),
+        0
+    );
+}
+
+/// Kinds, implied labels and their indexes survive a restore in every
+/// format: the restored database finds each carrier through its indexes and
+/// refuses what the source refused. A cypher dump carries data only, so its
+/// target declares the labels and indexes first.
+#[test]
+fn label_kinds_and_their_coverage_survive_a_restore_in_every_format() {
+    use coordinode_embed::backup::restore::RestoreOptions;
+    use coordinode_embed::backup::{BackupFormat, export};
+    const DDL: [&str; 5] = [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Goal IMPLIES (Thing) WITH (title: STRING)",
+        "CREATE LABEL Policy AUXILIARY",
+        "CREATE INDEX thing_title ON :Thing(title)",
+        "CREATE INDEX policy_title ON :Policy(title)",
+    ];
+    for format in [
+        BackupFormat::Json,
+        BackupFormat::Cypher,
+        BackupFormat::Binary,
+    ] {
+        let (mut db1, _dir1) = open_db();
+        for ddl in DDL {
+            db1.execute_cypher(ddl)
+                .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+        }
+        db1.execute_cypher("CREATE (:Goal:Policy {title: 'g'}), (:Thing {title: 'g'})")
+            .expect("nodes");
+        let interner = db1.interner().expect("dictionary");
+        let snapshot = db1.engine().snapshot();
+        let mut dump = Vec::new();
+        match format {
+            BackupFormat::Json => {
+                export::export_json(db1.engine(), &interner, 1, &snapshot, &mut dump)
+            }
+            BackupFormat::Cypher => {
+                export::export_cypher(db1.engine(), &interner, 1, &snapshot, &mut dump)
+            }
+            _ => export::export_binary(db1.engine(), &interner, 1, &snapshot, &mut dump),
+        }
+        .expect("export");
+
+        let (mut db2, _dir2) = open_db();
+        if format == BackupFormat::Cypher {
+            for ddl in DDL {
+                db2.execute_cypher(ddl)
+                    .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+            }
+        }
+        db2.restore(format, &dump, &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("{format:?}: restore: {e}"));
+
+        assert_eq!(
+            count(&mut db2, "MATCH (n:Thing {title: 'g'}) RETURN n"),
+            2,
+            "{format:?}"
+        );
+        assert_eq!(
+            count(&mut db2, "MATCH (n:Policy {title: 'g'}) RETURN n"),
+            1,
+            "{format:?}"
+        );
+        let err = refused(&mut db2, "CREATE (:Policy {title: 'p'})");
+        assert!(err.contains("no type label"), "{format:?}: {err}");
+        db2.execute_cypher("CREATE (:Goal {title: 'h'})")
+            .unwrap_or_else(|e| panic!("{format:?}: {e}"));
+        assert_eq!(
+            labels(
+                &mut db2,
+                "MATCH (n:Goal {title: 'h'}) RETURN labels(n) AS l"
+            ),
+            ["Goal", "Thing"],
+            "{format:?}"
+        );
+        for name in ["thing_title", "policy_title"] {
+            assert_index_agrees(&db2, name);
+        }
     }
 }
 
