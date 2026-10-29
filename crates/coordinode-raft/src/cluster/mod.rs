@@ -660,6 +660,9 @@ pub struct RaftNode {
     /// How long a membership change waits for the previous one to settle,
     /// in ms. See [`Self::set_membership_settle_timeout`].
     membership_settle_timeout_ms: core::sync::atomic::AtomicU64,
+    /// Held through every membership change this node makes, so they run one
+    /// at a time; see [`Self::membership_turn`].
+    membership_changes: tokio::sync::Mutex<()>,
     /// When a joining learner is promoted, and how long a join may take. See
     /// [`Self::set_join_readiness_lag`] and [`Self::set_join_timeout`].
     join: JoinTuning,
@@ -937,6 +940,7 @@ impl RaftNode {
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
+            membership_changes: tokio::sync::Mutex::new(()),
             join: JoinTuning::default(),
             admission: None,
             connections: None,
@@ -1304,6 +1308,7 @@ impl RaftNode {
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
+            membership_changes: tokio::sync::Mutex::new(()),
             join: JoinTuning::default(),
             admission: Some(admission),
             connections: Some(connections),
@@ -1472,21 +1477,76 @@ impl RaftNode {
         }
     }
 
-    /// Wait until no membership change is in flight: the log entry that
-    /// installed the membership in effect is committed.
+    /// This node's turn to change the membership, held until the change is
+    /// done: membership changes made here run one at a time, and each starts
+    /// from a settled, single configuration.
     ///
-    /// The membership in effect is visible before it commits, so status can
-    /// already show a new voter while the change that added it is still being
-    /// replicated, and openraft refuses a second change until the first one
-    /// commits. An operator acts on the status; every membership change here
-    /// starts by waiting for the previous one rather than failing with it.
+    /// Settled: the entry that installed the membership in effect is
+    /// committed. The membership in effect is visible before it commits, so
+    /// status can already show a new voter while the change that added it is
+    /// still being replicated, and openraft refuses a second change until the
+    /// first one commits. An operator acts on the status; every membership
+    /// change here starts by waiting for the previous one rather than failing
+    /// with it.
     ///
-    /// A committed joint configuration counts as settled. Nothing moves it on
-    /// by itself: a leader lost between the two steps of a change, or a call
-    /// cut short between them, leaves it in place for good, and openraft takes
-    /// the next change from it to its target. Waiting for it to become a
-    /// single configuration would wait for nothing.
-    async fn membership_settled(&self) -> Result<(), RaftNodeError> {
+    /// Single: with the turn held, no change of this node is between its two
+    /// steps, so a committed joint configuration is one a lost leader or a call
+    /// cut short left behind, and nothing else moves it on. It is completed
+    /// first, to the configuration it was heading for, with the voters it
+    /// drops kept as learners: the change that wanted one of them gone removes
+    /// it itself, and none is lost that another change meant to keep. A change
+    /// is then computed from the voters that stand, not from those a half-done
+    /// change was leaving.
+    async fn membership_turn(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, RaftNodeError> {
+        use openraft::rt::watch::WatchReceiver;
+
+        let timeout = self.membership_settle_timeout();
+        let turn = tokio::time::timeout(timeout, self.membership_changes.lock())
+            .await
+            .map_err(|_| {
+                RaftNodeError::Membership(format!(
+                    "a previous membership change is still in progress after {} s",
+                    timeout.as_secs()
+                ))
+            })?;
+        self.membership_committed().await?;
+        let joint = {
+            let rx = self.raft.metrics();
+            let metrics = rx.borrow_watched();
+            metrics
+                .membership_config
+                .membership()
+                .get_joint_config()
+                .len()
+                > 1
+        };
+        if joint {
+            let written = self
+                .raft
+                .change_membership(
+                    openraft::ChangeMembers::AddVoterIds(std::collections::BTreeSet::new()),
+                    true,
+                )
+                .await
+                .map_err(|e| {
+                    RaftNodeError::Membership(format!(
+                        "complete the joint configuration left behind: {}",
+                        Self::describe_membership_refusal(&e)
+                    ))
+                })?;
+            self.membership_published(written.log_id.index).await?;
+            self.membership_committed().await?;
+            tracing::info!(
+                node_id = self.node_id,
+                "completed a joint configuration left behind"
+            );
+        }
+        Ok(turn)
+    }
+
+    /// Wait until the entry that installed the membership in effect is
+    /// committed.
+    async fn membership_committed(&self) -> Result<(), RaftNodeError> {
         use openraft::LogIdOptionExt;
 
         self.raft
@@ -1559,10 +1619,21 @@ impl RaftNode {
         addr: String,
         identity: coordinode_wire::peer::PeerIdentity,
     ) -> Result<(), RaftNodeError> {
+        let _turn = self.membership_turn().await?;
+        self.add_node_in_turn(node_id, addr, identity).await
+    }
+
+    /// [`Self::add_node`] with this node's membership turn already held.
+    async fn add_node_in_turn(
+        &self,
+        node_id: u64,
+        addr: String,
+        identity: coordinode_wire::peer::PeerIdentity,
+    ) -> Result<(), RaftNodeError> {
         use openraft::rt::watch::WatchReceiver;
 
         self.publish_own_address().await?;
-        self.membership_settled().await?;
+        self.membership_committed().await?;
         self.await_deployment().await?;
 
         let member = MemberIdentity::from(&identity);
@@ -1697,7 +1768,14 @@ impl RaftNode {
     /// out of the set leaves the deployment: its identity is retired as the
     /// change applies.
     pub async fn change_membership(&self, member_ids: Vec<u64>) -> Result<(), RaftNodeError> {
-        self.membership_settled().await?;
+        let _turn = self.membership_turn().await?;
+        self.change_membership_in_turn(member_ids).await
+    }
+
+    /// [`Self::change_membership`] with this node's membership turn already
+    /// held.
+    async fn change_membership_in_turn(&self, member_ids: Vec<u64>) -> Result<(), RaftNodeError> {
+        self.membership_committed().await?;
         let members: std::collections::BTreeSet<u64> = member_ids.into_iter().collect();
 
         let written = self
@@ -1718,9 +1796,15 @@ impl RaftNode {
     /// The removed node will stop receiving log replication and can
     /// be shut down.
     pub async fn remove_node(&self, node_id: u64) -> Result<(), RaftNodeError> {
+        let _turn = self.membership_turn().await?;
+        self.remove_node_in_turn(node_id).await
+    }
+
+    /// [`Self::remove_node`] with this node's membership turn already held.
+    async fn remove_node_in_turn(&self, node_id: u64) -> Result<(), RaftNodeError> {
         use openraft::rt::watch::WatchReceiver;
 
-        self.membership_settled().await?;
+        self.membership_committed().await?;
         // Get current voter set from raft metrics.
         // Must collect inside borrow scope — voter_ids() borrows from the ref guard.
         let (current_members, learner): (std::collections::BTreeSet<u64>, bool) = {
@@ -1773,7 +1857,7 @@ impl RaftNode {
     pub async fn promote_to_voter(&self, node_id: u64) -> Result<(), RaftNodeError> {
         use openraft::async_runtime::watch::WatchReceiver;
 
-        self.membership_settled().await?;
+        let _turn = self.membership_turn().await?;
         let current_voters: std::collections::BTreeSet<u64> = {
             let metrics = self.raft.metrics().borrow_watched().clone();
             let joint = metrics.membership_config.membership().get_joint_config();
@@ -1827,7 +1911,7 @@ impl RaftNode {
     pub async fn demote_to_learner(&self, node_id: u64) -> Result<(), RaftNodeError> {
         use openraft::async_runtime::watch::WatchReceiver;
 
-        self.membership_settled().await?;
+        let _turn = self.membership_turn().await?;
         let metrics = self.raft.metrics().borrow_watched().clone();
         let current_voters: std::collections::BTreeSet<u64> = {
             let joint = metrics.membership_config.membership().get_joint_config();
@@ -2879,10 +2963,10 @@ impl RaftNode {
     ) -> Result<DecommissionResult, RaftNodeError> {
         use openraft::async_runtime::watch::WatchReceiver;
 
-        // The gates below read the voter set, which must be the committed one:
-        // a change still in flight would be judged by a membership that may
-        // not stand, and then refused by openraft anyway.
-        self.membership_settled().await?;
+        // The gates below read the voter set, which must be the committed,
+        // single one: a change still in flight would be judged by a
+        // membership that may not stand, and then refused by openraft anyway.
+        let _turn = self.membership_turn().await?;
         let metrics = self.raft.metrics().borrow_watched().clone();
 
         // Snapshot current voter set from openraft membership config.
@@ -3116,7 +3200,7 @@ impl RaftNode {
                 "member {old} is replaced under a new node id, never its own"
             )));
         }
-        self.membership_settled().await?;
+        let _turn = self.membership_turn().await?;
         let membership = |raft: &RaftInstance| {
             let rx = raft.metrics();
             let metrics = rx.borrow_watched();
@@ -3147,21 +3231,27 @@ impl RaftNode {
             return Ok(());
         }
         if !nodes.contains_key(&new) {
-            self.add_node(new, addr, identity).await?;
+            self.add_node_in_turn(new, addr, identity).await?;
         }
         if !voters.contains(&new) {
             self.await_caught_up(new, &progress_tx).await?;
         }
         let (_, voters) = membership(&self.raft);
-        let target: Vec<u64> = voters
-            .into_iter()
+        let target: std::collections::BTreeSet<u64> = voters
+            .iter()
+            .copied()
             .filter(|&id| id != old)
             .chain(std::iter::once(new))
             .collect();
-        self.change_membership(target).await?;
+        // Already the voters when a joint configuration this replacement left
+        // behind was completed on taking the turn.
+        if target != voters {
+            self.change_membership_in_turn(target.into_iter().collect())
+                .await?;
+        }
         let (nodes, _) = membership(&self.raft);
         if nodes.contains_key(&old) {
-            self.remove_node(old).await?;
+            self.remove_node_in_turn(old).await?;
         }
         let report = JoinProgressEvent {
             node_id: new,

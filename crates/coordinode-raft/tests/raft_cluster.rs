@@ -3976,6 +3976,130 @@ async fn a_replacement_cut_short_in_its_joint_configuration_is_completed_by_the_
     );
 }
 
+/// A membership change made while a joint configuration left behind stands
+/// is judged by the configuration that joint one was heading for, never by
+/// the one it was leaving: the joint configuration is completed first, its
+/// removed voter kept as a learner, so demoting a member of the new voters
+/// demotes it, and promoting the voter the joint configuration dropped
+/// brings it back. Every change ends in a single configuration.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_after_a_joint_configuration_left_behind_starts_from_its_target() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(180), async {
+        let ports = [alloc_port(), alloc_port(), alloc_port(), alloc_port()];
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+            tempfile::tempdir().expect("d4"),
+        ];
+        let engines: Vec<_> = dirs.iter().map(|d| open_engine_at(d.path())).collect();
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&engines[0]),
+            format!("127.0.0.1:{}", ports[0]).parse().expect("a"),
+            format!("http://127.0.0.1:{}", ports[0]),
+            conn(1),
+        )
+        .await
+        .expect("n1");
+        let mut others = Vec::new();
+        for id in [2u64, 3, 4] {
+            let at = usize::try_from(id - 1).expect("index");
+            others.push(
+                RaftNode::open_joining(
+                    id,
+                    Arc::clone(&engines[at]),
+                    format!("127.0.0.1:{}", ports[at]).parse().expect("a"),
+                    conn(id),
+                    enroll(&n1, format!("127.0.0.1:{}", ports[0])),
+                )
+                .await
+                .expect("joining member"),
+            );
+        }
+        await_leadership(&n1).await;
+        for id in [2u64, 3, 4] {
+            let at = usize::try_from(id - 1).expect("index");
+            n1.add_node(id, format!("http://127.0.0.1:{}", ports[at]), ident(id))
+                .await
+                .expect("add");
+        }
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+
+        // A change from {1,2,3} to {1,2,4} stops after its joint step.
+        let joint = {
+            let rx = n1.raft().metrics();
+            let metrics = rx.borrow_watched();
+            let nodes: std::collections::BTreeMap<_, _> = metrics
+                .membership_config
+                .membership()
+                .nodes()
+                .map(|(id, node)| (*id, node.clone()))
+                .collect();
+            openraft::Membership::new(
+                vec![
+                    std::collections::BTreeSet::from([1, 2, 3]),
+                    std::collections::BTreeSet::from([1, 2, 4]),
+                ],
+                nodes,
+            )
+            .expect("the joint configuration")
+        };
+        n1.raft()
+            .append_membership(joint, openraft::EntryPayload::Blank, std::iter::empty())
+            .await
+            .expect("the joint configuration commits");
+        let membership = |node: &RaftNode| -> (Vec<Vec<u64>>, Vec<u64>) {
+            let rx = node.raft().metrics();
+            let metrics = rx.borrow_watched();
+            let config = metrics.membership_config.membership();
+            (
+                config
+                    .get_joint_config()
+                    .iter()
+                    .map(|voters| voters.iter().copied().collect())
+                    .collect(),
+                config.learner_ids().collect(),
+            )
+        };
+
+        // Member 4 votes in the configuration being reached: demoting it
+        // demotes it, it does not pass for a learner already.
+        n1.demote_to_learner(4).await.expect("demote 4");
+        assert_eq!(
+            membership(&n1),
+            (vec![vec![1, 2]], vec![3, 4]),
+            "4 and the dropped 3 are learners, 1 and 2 vote"
+        );
+        // Member 3 was dropped by the joint configuration: promoting it
+        // brings it back.
+        n1.promote_to_voter(3).await.expect("promote 3");
+        assert_eq!(
+            membership(&n1),
+            (vec![vec![1, 2, 3]], vec![4]),
+            "3 votes again"
+        );
+
+        for node in others.into_iter().rev() {
+            node.shutdown().await.expect("stop");
+        }
+        n1.shutdown().await.expect("s1");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_change_after_a_joint_configuration_left_behind_starts_from_its_target"
+    );
+}
+
 /// Two members of three lose every copy of their votes at once: neither
 /// starts, each with the typed refusal and its directory as it was, and the
 /// one left cannot replace them, since a membership change needs the quorum
