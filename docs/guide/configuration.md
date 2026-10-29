@@ -1229,8 +1229,10 @@ While the new node catches up, another leader may change the group. The
 command then refuses rather than act on members it was not asked about: when
 the new node id is a member under another identity, or the old node id now
 belongs to another member than the one it found, it fails with an identity
-error and changes nothing; when the voters changed under it, it fails and the
-same command run again continues. It reports the replacement done only once
+error before its next membership change; when the voters changed under it, it
+fails and the same command run again continues. Steps it already committed
+(the new node added as a learner, the voters changed) stay as they are; a
+refusal does not undo them. It reports the replacement done only once
 the membership that shows it is committed.
 
 A replacement is a membership change and needs the quorum. When too many
