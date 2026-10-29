@@ -346,7 +346,18 @@ CREATE (:Goal {title: 'x', note: 1})      -- ERROR: note is not in Goal's schema
 - The rule holds on every write that sets a node's labels or opens a new temporal version: `CREATE`, `MERGE`, `SET n:L`, `REMOVE n:L`, `MERGE NODES`.
 - A node keeps the type it was created with: `SET` of another type label, or `REMOVE` of the type label, is refused. A label the type implies cannot be removed. Auxiliary labels are added and removed freely.
 - `labels(n)` returns the type label first, then the implied and auxiliary labels in name order.
-- An index or a constraint declared on a label covers every node carrying it, whether the label is the node's type, implied by it or auxiliary: an index on `:Thing(title)` finds `Goal` nodes too, and a `UNIQUE` on `:Thing(title)` holds across `Thing` and `Goal`. A node joins a label's indexes when it gains the label and leaves them when it loses it. The constraints of every label a node carries hold together; the type's schema, mode and placement stay the type's alone, and a label's own property declarations are not inherited by the nodes that carry it implied.
+- An index or a constraint declared on a label covers every node carrying it, whether the label is the node's type, implied by it or auxiliary: an index on `:Thing(title)` finds `Goal` nodes too, and a `UNIQUE` on `:Thing(title)` holds across `Thing` and `Goal`. A node joins a label's indexes when it gains the label and leaves them when it loses it. The constraints of every label a node carries hold together; the type's schema, mode, placement and expiry stay the type's alone, and a label's own property declarations, defaults and expiry are not inherited by the nodes that carry it implied. A node its type expires leaves the indexes of every label it carries.
+
+```cypher
+CREATE LABEL Policy AUXILIARY
+CREATE CONSTRAINT policy_owner FOR (n:Policy) REQUIRE n.owner IS NOT NULL
+CREATE INDEX thing_title ON :Thing(title)
+
+CREATE (:Rule:Policy {name: 'a'})                -- ERROR: owner is required on :Policy
+CREATE (:Rule:Policy {name: 'a', owner: 'ops'})  -- OK: Rule is an undeclared FLEXIBLE type
+CREATE (:Goal {title: 'b'})
+MATCH (n:Thing {title: 'b'}) RETURN n            -- finds the Goal through thing_title
+```
 - Whether a label is a type or auxiliary, and the labels a type implies, are fixed when the label is created. Declaring a label auxiliary when stored nodes carry it as their type is refused, and so is declaring `IMPLIES` for a type whose stored nodes lack one of the implied labels.
 - The schema API carries the same declarations: `Label.kind` and `Label.implies`, and the `kind` and `implies` fields of `CreateLabelRequest` and of a `PublishSchema` label.
 
