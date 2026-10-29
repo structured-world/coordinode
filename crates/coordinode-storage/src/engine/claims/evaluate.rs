@@ -825,7 +825,7 @@ pub struct LabelSchemaViolation {
 ///
 /// A node whose type the label is answers for the whole definition; one
 /// carrying it implied or auxiliary answers for its explicit constraints
-/// ([`carrier_violation`]). `staged_points` are writes of the attempt asking:
+/// (`carrier_violation`). `staged_points` are writes of the attempt asking:
 /// they are part of the state checked and replace what is stored under the
 /// same key. Overflow properties count under the names they were stored by.
 ///
