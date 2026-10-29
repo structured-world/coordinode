@@ -3976,6 +3976,179 @@ async fn a_replacement_cut_short_in_its_joint_configuration_is_completed_by_the_
     );
 }
 
+/// A replacement left waiting for its new member to catch up does not
+/// complete with another member under the same node id: while leader 1
+/// waits for 4 under identity A, leader 2 removes 4 and adds 4 under
+/// identity B, which catches up; when 1 leads again, the old call refuses
+/// rather than promote 4/B as the 4/A it was asked for, and the voters stay
+/// as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_waiting_out_a_leader_change_does_not_promote_another_member() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(180), async {
+        let (p1, p2, p3, p4, p4b) = (
+            alloc_port(),
+            alloc_port(),
+            alloc_port(),
+            alloc_port(),
+            alloc_port(),
+        );
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+            tempfile::tempdir().expect("d4"),
+            tempfile::tempdir().expect("d4b"),
+        ];
+        let e1 = open_engine_at(dirs[0].path());
+        let e2 = open_engine_at(dirs[1].path());
+        let e3 = open_engine_at(dirs[2].path());
+        let n1 = Arc::new(
+            RaftNode::open_cluster(
+                1,
+                Arc::clone(&e1),
+                format!("127.0.0.1:{p1}").parse().expect("a"),
+                format!("http://127.0.0.1:{p1}"),
+                conn(1),
+            )
+            .await
+            .expect("n1"),
+        );
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n2");
+        let n3 = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n3");
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
+            .await
+            .expect("add 2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
+            .await
+            .expect("add 3");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+
+        // 4 joins under identity A, then stops and falls behind.
+        let e4 = open_engine_at(dirs[3].path());
+        let n4a = RaftNode::open_joining(
+            4,
+            Arc::clone(&e4),
+            format!("127.0.0.1:{p4}").parse().expect("a"),
+            conn(4),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n4 under A");
+        n1.add_node(4, format!("http://127.0.0.1:{p4}"), ident(4))
+            .await
+            .expect("add 4 under A");
+        n4a.shutdown().await.expect("stop 4/A");
+        drop(n4a);
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        for i in 0..40u64 {
+            n1.pipeline()
+                .propose_and_wait(&RaftProposal {
+                    id: id_gen.next(),
+                    mutations: vec![Mutation::Put {
+                        partition: PartitionId::Node,
+                        key: format!("node:1:fence-{i}").into_bytes(),
+                        value: b"v".to_vec(),
+                    }],
+                    commit_ts: Timestamp::from_raw(100 + 2 * i),
+                    start_ts: Timestamp::from_raw(99 + 2 * i),
+                    bypass_rate_limiter: false,
+                })
+                .expect("propose");
+        }
+
+        // Leader 1 starts replacing 3 by 4/A and waits for 4 to catch up.
+        n1.set_join_readiness_lag(5);
+        n1.set_join_timeout(Duration::from_secs(90));
+        let (progress, _) = tokio::sync::broadcast::channel(64);
+        let replacing = {
+            let n1 = Arc::clone(&n1);
+            tokio::spawn(async move {
+                n1.replace_member(3, 4, format!("http://127.0.0.1:{p4}"), ident(4), progress)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Leader 2 takes 4/A out and adds 4 under identity B, which catches up.
+        n1.transfer_leadership_to(2).await.expect("transfer to n2");
+        await_leadership(&n2).await;
+        n2.remove_node(4).await.expect("remove 4/A");
+        let uri_b = format!("{}-b", PKI.spiffe_id(4));
+        n2.add_node(
+            4,
+            format!("http://127.0.0.1:{p4b}"),
+            TestPki::identity_of(&uri_b),
+        )
+        .await
+        .expect("add 4 under B");
+        let e4b = open_engine_at(dirs[4].path());
+        let n4b = RaftNode::open_joining(
+            4,
+            Arc::clone(&e4b),
+            format!("127.0.0.1:{p4b}").parse().expect("a"),
+            PKI.connections_of(&uri_b),
+            enroll(&n2, format!("127.0.0.1:{p2}")),
+        )
+        .await
+        .expect("n4 under B");
+        assert!(
+            await_replicated(&e4b, b"node:1:fence-39", b"v").await,
+            "4/B caught up"
+        );
+
+        // 1 leads again; the old call must not promote 4/B.
+        n2.transfer_leadership_to(1)
+            .await
+            .expect("transfer back to n1");
+        let outcome = replacing.await.expect("the replacement task");
+        assert!(
+            matches!(outcome, Err(RaftNodeError::Identity(_))),
+            "the old replacement refuses 4 under another identity: {outcome:?}"
+        );
+        let voters: Vec<u64> = {
+            let rx = n1.raft().metrics();
+            let metrics = rx.borrow_watched();
+            metrics.membership_config.membership().voter_ids().collect()
+        };
+        assert_eq!(voters, vec![1, 2, 3], "the voters stay as they were");
+
+        n4b.shutdown().await.expect("s4b");
+        n3.shutdown().await.expect("s3");
+        n2.shutdown().await.expect("s2");
+        n1.shutdown().await.expect("s1");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_replacement_waiting_out_a_leader_change_does_not_promote_another_member"
+    );
+}
+
 /// Four live members, 1 leading, left in the committed joint configuration
 /// {1,2,3}+{1,2,4}: a change from {1,2,3} to {1,2,4} that stopped after its
 /// joint step, as a lost leader or a call cut short leaves it.
