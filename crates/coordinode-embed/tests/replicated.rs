@@ -785,6 +785,138 @@ async fn a_member_without_its_vote_is_refused_and_replaced_through_the_handle() 
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A bound write's outcome survives the replacement of a member: after a
+/// member that lost its vote is replaced, the new member, holding only the
+/// history it received, leads, reports the commit made before the
+/// replacement, answers a retry without running it and excludes a number
+/// handed out but never used; every member left reports the same outcomes
+/// and the write took effect once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operation_keeps_its_outcome_across_a_replacement() {
+    use coordinode_embed::db::StatementOptions;
+    use coordinode_embed::operation::{IssuerId, OperationDescriptor, OperationOutcome, Resolve};
+
+    fn run(db: &Database, op: &OperationDescriptor) -> Result<(), DatabaseError> {
+        db.execute_cypher_shared_with(
+            "CREATE (:Bound {k: 1})",
+            None,
+            None,
+            &StatementOptions {
+                operation: Some(*op),
+                ..StatementOptions::default()
+            },
+        )
+        .map(drop)
+    }
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (mut members, ports) = group(&dirs, None).await;
+        let (done, unused) = {
+            let leader = members[0].database().write();
+            let issuer = leader.enroll_issuer(IssuerId([0x18; 16])).unwrap();
+            let done = issuer.next().unwrap();
+            let unused = issuer.next().unwrap();
+            run(&leader, &done).unwrap();
+            (done, unused)
+        };
+        wait_until("member 3 holds the write", || {
+            count(&members[2], "Bound") == 1
+        })
+        .await;
+
+        // Member 3 loses every copy of its vote and is replaced by member 4.
+        let lost = members.remove(2);
+        lost.shutdown().await.unwrap();
+        let dir = dirs[2].path();
+        std::fs::remove_dir_all(dir.join(Partition::Raft.name())).unwrap();
+        std::fs::remove_dir_all(dir.join("local-journal")).unwrap();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("consensus-vote"))
+            {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let new_dir = tempfile::tempdir().unwrap();
+        let new_port = alloc_port();
+        let replacement = open(
+            4,
+            new_dir.path(),
+            new_port,
+            Founding::Join(members[0].enrollment(addr(ports[0])).unwrap()),
+            ElectionPreference::Ordinary,
+        )
+        .await
+        .unwrap();
+        members[0]
+            .replace(3, 4, addr(new_port), PKI.identity(4))
+            .await
+            .expect("the replacement completes");
+        members.push(replacement);
+
+        // The new member leads and answers from the history it received.
+        members[0].transfer_leadership(4).await.unwrap();
+        assert!(members[2].is_leader().await, "member 4 leads");
+        {
+            let new_leader = members[2].database().write();
+            assert!(matches!(
+                new_leader
+                    .resolve_operation(&done, Resolve::Lookup)
+                    .unwrap(),
+                OperationOutcome::Committed { .. }
+            ));
+            assert!(matches!(
+                run(&new_leader, &done),
+                Err(DatabaseError::OperationSettled {
+                    outcome: OperationOutcome::Committed { .. },
+                    intent_differs: false,
+                    ..
+                })
+            ));
+            assert_eq!(
+                new_leader
+                    .resolve_operation(&unused, Resolve::Exclude)
+                    .unwrap(),
+                OperationOutcome::Aborted
+            );
+            assert!(matches!(
+                run(&new_leader, &unused),
+                Err(DatabaseError::OperationSettled {
+                    outcome: OperationOutcome::Aborted,
+                    ..
+                })
+            ));
+        }
+
+        for m in &members {
+            wait_until("every member holds the exclusion", || {
+                m.database()
+                    .write()
+                    .resolve_operation(&unused, Resolve::Lookup)
+                    .is_ok_and(|o| o == OperationOutcome::Aborted)
+            })
+            .await;
+            assert!(matches!(
+                m.database()
+                    .write()
+                    .resolve_operation(&done, Resolve::Lookup)
+                    .unwrap(),
+                OperationOutcome::Committed { .. }
+            ));
+            assert_eq!(count(m, "Bound"), 1, "the write took effect once");
+        }
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A dump in `format` of a database holding two `:U` nodes under a unique
 /// index and an edge with a property between them.
 fn dump(format: BackupFormat) -> Vec<u8> {
