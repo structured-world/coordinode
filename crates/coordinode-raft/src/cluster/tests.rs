@@ -387,3 +387,42 @@ async fn graceful_shutdown() {
     // Shutdown should succeed cleanly
     node.shutdown().await.expect("shutdown");
 }
+
+/// A membership is taken as a replacement's starting point, or as its
+/// result, only when the same metrics show it committed. Metrics holding a
+/// uniform configuration with 4 voting and 3 gone, installed at index 7
+/// while this node has committed only up to 6, look like a replacement of 3
+/// by 4 already done; that membership can still be lost with its leader,
+/// so it gives no view until index 7 is committed.
+#[test]
+fn an_uncommitted_membership_gives_no_view() {
+    let at = |index| {
+        openraft::LogId::new(
+            crate::storage::CommittedLeaderId {
+                term: 2,
+                node_id: 1,
+            },
+            index,
+        )
+    };
+    let member = |id: u64| MemberNode::new(format!("http://node-{id}"), None);
+    let membership = openraft::Membership::new(
+        vec![std::collections::BTreeSet::from([1, 2, 4])],
+        std::collections::BTreeMap::from([(1, member(1)), (2, member(2)), (4, member(4))]),
+    )
+    .expect("a uniform configuration");
+    let mut metrics = openraft::RaftMetrics::<TypeConfig>::new_initial(1);
+    metrics.membership_config = Arc::new(openraft::StoredMembership::new(Some(at(7)), membership));
+    metrics.local_committed = Some(at(6));
+    assert!(
+        MembershipView::committed(&metrics).is_none(),
+        "a membership above the committed index gives no view"
+    );
+
+    metrics.local_committed = Some(at(7));
+    let view = MembershipView::committed(&metrics).expect("the committed membership");
+    assert_eq!(view.target, std::collections::BTreeSet::from([1, 2, 4]));
+    assert!(!view.joint);
+    assert!(!view.nodes.contains_key(&3));
+    assert_eq!(view.log_id, Some(at(7)));
+}

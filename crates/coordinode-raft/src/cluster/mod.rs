@@ -683,7 +683,8 @@ const DEFAULT_JOIN_READINESS_LAG: u64 = 1_000;
 /// Default for [`RaftNode::join_timeout`].
 const DEFAULT_JOIN_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 
-/// One reading of the membership in effect (see [`RaftNode::membership_view`]).
+/// One reading of the membership in effect, taken only once the entry that
+/// installed it is committed (see [`RaftNode::committed_membership_view`]).
 struct MembershipView {
     /// Every member, voter or learner, with the identity it is bound to.
     nodes: std::collections::BTreeMap<u64, Option<MemberIdentity>>,
@@ -694,6 +695,33 @@ struct MembershipView {
     joint: bool,
     /// The entry that installed this membership.
     log_id: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
+}
+
+impl MembershipView {
+    /// The membership `metrics` show, if the same metrics show the entry that
+    /// installed it committed; `None` while it may still be lost with its
+    /// leader.
+    fn committed(metrics: &openraft::RaftMetrics<TypeConfig>) -> Option<Self> {
+        use openraft::LogIdOptionExt;
+
+        if metrics.membership_config.log_id().index() > metrics.local_committed.index() {
+            return None;
+        }
+        let config = metrics.membership_config.membership();
+        let configs = config.get_joint_config();
+        Some(Self {
+            nodes: config
+                .nodes()
+                .map(|(id, node)| (*id, node.identity.clone()))
+                .collect(),
+            target: configs
+                .last()
+                .map(|voters| voters.iter().copied().collect())
+                .unwrap_or_default(),
+            joint: configs.len() > 1,
+            log_id: *metrics.membership_config.log_id(),
+        })
+    }
 }
 
 /// The join settings an operator may retune while the node runs.
@@ -1546,28 +1574,18 @@ impl RaftNode {
         (target, config.voter_ids().collect(), configs.len() > 1)
     }
 
-    /// The membership in effect, read once: its members with their
-    /// identities, its voter sets as [`Self::voter_sets`] gives them, and the
-    /// entry that installed it, so a change computed and checked from this
-    /// view can be conditioned on exactly that entry.
-    fn membership_view(&self) -> MembershipView {
+    /// The membership in effect once the entry that installed it is
+    /// committed, read in the same look at the metrics as that commitment
+    /// (see [`MembershipView::committed`]): a membership received after a
+    /// wait for commitment is never taken for the committed one.
+    async fn committed_membership_view(&self) -> Result<MembershipView, RaftNodeError> {
         use openraft::rt::watch::WatchReceiver;
 
-        let rx = self.raft.metrics();
-        let metrics = rx.borrow_watched();
-        let config = metrics.membership_config.membership();
-        let configs = config.get_joint_config();
-        MembershipView {
-            nodes: config
-                .nodes()
-                .map(|(id, node)| (*id, node.identity.clone()))
-                .collect(),
-            target: configs
-                .last()
-                .map(|voters| voters.iter().copied().collect())
-                .unwrap_or_default(),
-            joint: configs.len() > 1,
-            log_id: *metrics.membership_config.log_id(),
+        loop {
+            if let Some(view) = MembershipView::committed(&self.raft.metrics().borrow_watched()) {
+                return Ok(view);
+            }
+            self.membership_committed().await?;
         }
     }
 
@@ -3215,7 +3233,7 @@ impl RaftNode {
             )));
         }
         let _turn = self.membership_turn().await?;
-        let view = self.membership_view();
+        let view = self.committed_membership_view().await?;
         // The old member as the call found it, or its absence: only that
         // member is removed.
         let old_identity = view.nodes.get(&old).cloned();
@@ -3266,8 +3284,7 @@ impl RaftNode {
 
         // `new` among the voters, `old` out of them, from the committed
         // membership read again: the wait above may outlast a leader change.
-        self.membership_committed().await?;
-        let view = self.membership_view();
+        let view = self.committed_membership_view().await?;
         if !view.nodes.contains_key(&new) {
             return Err(RaftNodeError::Membership(format!(
                 "node {new} left the group while it caught up"
@@ -3293,9 +3310,9 @@ impl RaftNode {
         }
 
         // An old member still in the group (a learner, which the change above
-        // does not drop) leaves it, under the same checks.
-        self.membership_committed().await?;
-        let view = self.membership_view();
+        // does not drop) leaves it, under the same checks. The view is also
+        // what the call reports done: only a committed membership counts.
+        let view = self.committed_membership_view().await?;
         as_asked(&view)?;
         if view.joint || !view.target.contains(&new) {
             return Err(RaftNodeError::Membership(format!(

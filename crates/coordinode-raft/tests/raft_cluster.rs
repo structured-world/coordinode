@@ -4083,7 +4083,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_promote_another_memb
         // Leader 1 starts replacing 3 by 4/A and waits for 4 to catch up.
         n1.set_join_readiness_lag(5);
         n1.set_join_timeout(Duration::from_secs(90));
-        let (progress, _) = tokio::sync::broadcast::channel(64);
+        let (progress, mut reports) = tokio::sync::broadcast::channel(64);
         let replacing = {
             let n1 = Arc::clone(&n1);
             tokio::spawn(async move {
@@ -4091,7 +4091,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_promote_another_memb
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        await_waiting_for_catch_up(&mut reports, 4, 5).await;
 
         // Leader 2 takes 4/A out and adds 4 under identity B, which catches up.
         n1.transfer_leadership_to(2).await.expect("transfer to n2");
@@ -4147,6 +4147,29 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_promote_another_memb
         result.is_ok(),
         "TIMED OUT: a_replacement_waiting_out_a_leader_change_does_not_promote_another_member"
     );
+}
+
+/// Wait until a replacement reports `node` as a learner lagging more than
+/// `readiness_lag` entries: it has passed its first look at the membership
+/// and waits for `node` to catch up.
+async fn await_waiting_for_catch_up(
+    reports: &mut tokio::sync::broadcast::Receiver<coordinode_raft::cluster::JoinProgressEvent>,
+    node: u64,
+    readiness_lag: u64,
+) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let report = reports.recv().await.expect("the replacement reports");
+            if report.node_id == node
+                && report.phase == coordinode_raft::cluster::JoinPhase::Learner
+                && report.lag_entries > readiness_lag
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the replacement waits for its new member to catch up");
 }
 
 /// A replacement left waiting for its new member to catch up does not
@@ -4259,7 +4282,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_remove_another_membe
         // Leader 1 starts replacing 3/C by 4/A and waits for 4 to catch up.
         n1.set_join_readiness_lag(5);
         n1.set_join_timeout(Duration::from_secs(90));
-        let (progress, _) = tokio::sync::broadcast::channel(64);
+        let (progress, mut reports) = tokio::sync::broadcast::channel(64);
         let replacing = {
             let n1 = Arc::clone(&n1);
             tokio::spawn(async move {
@@ -4267,7 +4290,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_remove_another_membe
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        await_waiting_for_catch_up(&mut reports, 4, 5).await;
 
         // Leader 2 replaces 3/C by 3 under identity D, which votes.
         n1.transfer_leadership_to(2).await.expect("transfer to n2");
