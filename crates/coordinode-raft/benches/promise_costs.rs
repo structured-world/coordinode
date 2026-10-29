@@ -24,9 +24,10 @@
 //! itself when the host has it.
 //!
 //! The copy's slot files are counted, with their logical length, between
-//! writes at each restart and reopen. Their high water inside a write and
-//! the bytes allocated to them are not observable from here; the copy's
-//! tests measure them.
+//! writes at each restart and reopen. The `footprint` section also observes
+//! the high water inside a write (its removal of the spent slots refused, so
+//! the write stops just before it) and through a chain of failed opens, with
+//! logical and allocated bytes apart.
 //!
 //! Run: cargo bench -p coordinode-raft --bench promise_costs
 
@@ -630,37 +631,66 @@ impl Peak {
     }
 }
 
-/// The second copy's peak footprint, observed after every write and before
-/// a removal it would make: a normal cycle of vote changes and restarts, then
-/// a chain of opens whose copy write fails at its sync (each leaves a slot it
-/// does not know of) and a write whose removal of the spent slots fails, so
-/// the state just before a removal stays to be observed.
+/// Refuse every removal of the copy's slots until cleared: the write that
+/// meets it completes (its new slot written and synced) and stops just
+/// before it would remove the spent ones, so the state then observed is the
+/// high water inside that write.
+fn refuse_removal(store: &Store) {
+    store.syncs.arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path("consensus-vote"),
+    );
+}
+
+/// The second copy's footprint inside a write and between writes. Inside a
+/// write is observed by refusing its removal of the spent slots (see
+/// [`refuse_removal`]); the next write, removal allowed, settles the copy
+/// again. A normal cycle observes every vote change and every reopen (whose
+/// open writes the copy itself); the failed chain makes the first copy write
+/// of each of three new processes fail at its sync, so each open fails and
+/// leaves a slot it does not know of, then a successful open with its removal
+/// refused, then a write that settles.
 async fn footprints() {
     let store = Store::new();
     let dir = store.dir.path().to_path_buf();
-    let mut normal = Peak::default();
+    let (mut inside, mut between) = (Peak::default(), Peak::default());
     {
         let mut log = LogStore::open(store.open()).expect("log");
+        between.observe(&dir);
         for term in 1..=ops(300) {
-            log.save_vote(&Vote::new(term, 1)).await.expect("vote");
-            normal.observe(&dir);
+            refuse_removal(&store);
+            log.save_vote(&Vote::new(2 * term, 1))
+                .await
+                .expect("vote, removal refused");
+            inside.observe(&dir);
+            store.syncs.clear();
+            log.save_vote(&Vote::new(2 * term + 1, 1))
+                .await
+                .expect("vote, removal allowed");
+            between.observe(&dir);
         }
     }
     for round in 0..20u64 {
-        let mut log = LogStore::open(store.open()).expect("reopen");
-        normal.observe(&dir);
+        refuse_removal(&store);
+        let mut log = LogStore::open(store.open()).expect("reopen, removal refused");
+        inside.observe(&dir);
+        store.syncs.clear();
         log.save_vote(&Vote::new(1_000 + round, 1))
             .await
-            .expect("vote");
-        normal.observe(&dir);
+            .expect("vote, removal allowed");
+        between.observe(&dir);
     }
-    normal.report("copy footprint: normal cycle");
+    inside.report("copy footprint: inside a write");
+    between.report("copy footprint: between writes");
 
     let mut chain = Peak::default();
-    let mut failed = 0;
+    let mut failed_opens = 0;
     chain.observe(&dir);
-    for attempt in 0..3u64 {
-        let mut log = LogStore::open(store.open()).expect("reopen");
+    let held = copy_footprint(&dir).0;
+    for _ in 0..3 {
         store.syncs.arm(
             FaultRule::new(
                 FaultOp::SyncAll,
@@ -669,35 +699,25 @@ async fn footprints() {
             .on_path("consensus-vote")
             .once(),
         );
-        if log.save_vote(&Vote::new(2_000 + attempt, 1)).await.is_err() {
-            failed += 1;
+        if LogStore::open(store.open()).is_err() {
+            failed_opens += 1;
         }
         store.syncs.clear();
         chain.observe(&dir);
     }
     {
-        let mut log = LogStore::open(store.open()).expect("reopen after the failed writes");
-        chain.observe(&dir);
-        store.syncs.arm(
-            FaultRule::new(
-                FaultOp::RemoveFile,
-                Fault::Error(lsm_tree::io::ErrorKind::Other),
-            )
-            .on_path("consensus-vote"),
-        );
-        log.save_vote(&Vote::new(3_000, 1))
-            .await
-            .expect("vote, removal refused");
+        refuse_removal(&store);
+        let mut log = LogStore::open(store.open()).expect("the open after the failed ones");
         chain.observe(&dir);
         store.syncs.clear();
-        log.save_vote(&Vote::new(3_001, 1))
+        log.save_vote(&Vote::new(3_000, 1))
             .await
             .expect("vote, removal allowed");
         chain.observe(&dir);
     }
     chain.report("copy footprint: failed chain");
     println!(
-        "{:<30} copy writes failed at sync: {failed} of 3; files after: {}",
+        "{:<30} slots held before: {held}; opens failed at the copy's sync: {failed_opens} of 3; files after: {}",
         "",
         copy_footprint(&dir).0
     );
