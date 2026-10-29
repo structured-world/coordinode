@@ -1,6 +1,24 @@
 use super::*;
 use coordinode_core::budget::QueryBudget;
 
+/// A property column is found by its variable and name, whether the joined
+/// name fits the stack buffer or is longer and takes the allocated path.
+#[test]
+fn a_property_column_is_found_by_variable_and_name() {
+    let long = "p".repeat(COLUMN_NAME_INLINE);
+    let mut row = Row::new();
+    row.insert("n.title".to_string(), Value::String("t".into()));
+    row.insert(format!("n.{long}"), Value::Int(7));
+    row.insert("n".to_string(), Value::Int(1));
+    assert_eq!(
+        property(&row, "n", "title"),
+        Some(&Value::String("t".into()))
+    );
+    assert_eq!(property(&row, "n", &long), Some(&Value::Int(7)));
+    assert_eq!(property(&row, "n", "missing"), None);
+    assert_eq!(property(&row, "m", "title"), None);
+}
+
 /// The index is charged before it allocates, so the charge must cover what
 /// the hash table and the link list actually hold for every size: a bound
 /// below the table's real buckets would let a statement keep memory its

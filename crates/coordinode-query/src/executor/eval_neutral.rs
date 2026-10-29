@@ -285,6 +285,20 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
 /// dot-notation path and try progressively-longer row-key prefixes, extracting
 /// from a Document/Map for any remaining path.
 fn eval_property(base: &Expr, key: &str, row: &Row) -> Result<Value, EvalError> {
+    // `var.key`, the common read, without building the path: the column
+    // `var.key` itself, or a map or document bound to `var` holding `key`.
+    if let Expr::Variable(var_name) = base {
+        if let Some(val) = super::row::property(row, var_name, key) {
+            return Ok(val.clone());
+        }
+        return Ok(match row.get(var_name.as_str()) {
+            Some(Value::Document(doc)) => rmpv_to_value(
+                &coordinode_core::graph::document::extract_at_path(doc, &[key]),
+            ),
+            Some(Value::Map(map)) => map.get(key).cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        });
+    }
     if let Some((var_name, full_path)) = collect_property_path(base, key) {
         for split in (0..=full_path.len()).rev() {
             let row_key = if split == 0 {

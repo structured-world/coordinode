@@ -9,6 +9,26 @@ use coordinode_core::graph::types::Value;
 /// Uses BTreeMap for deterministic column ordering in output.
 pub type Row = BTreeMap<String, Value>;
 
+/// The bytes a `var.property` column name is assembled in without the heap;
+/// longer names fall back to an allocated one.
+const COLUMN_NAME_INLINE: usize = 128;
+
+/// The value of column `var.property` in `row`. The name is assembled on the
+/// stack, so a property read per row allocates nothing.
+pub fn property<'r>(row: &'r Row, var: &str, property: &str) -> Option<&'r Value> {
+    let len = var.len() + 1 + property.len();
+    if len > COLUMN_NAME_INLINE {
+        return row.get(&format!("{var}.{property}"));
+    }
+    let mut name = [0u8; COLUMN_NAME_INLINE];
+    name[..var.len()].copy_from_slice(var.as_bytes());
+    name[var.len()] = b'.';
+    name[var.len() + 1..len].copy_from_slice(property.as_bytes());
+    // Two UTF-8 strings joined by an ASCII dot are UTF-8.
+    let name = core::str::from_utf8(&name[..len]).ok()?;
+    row.get(name)
+}
+
 /// Hash of `values` under which equal value lists hash alike (see
 /// [`Value::hash_equal`]).
 pub fn values_hash<'a>(values: impl IntoIterator<Item = &'a Value>) -> u64 {

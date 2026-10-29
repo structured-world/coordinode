@@ -6975,10 +6975,6 @@ fn node_row_from(
     // it is evaluated against the correlated row extended with this node's:
     // an inline `{p: e.x}` means the same as `WHERE a.p = e.x`.
     for (prop_name, filter_expr) in property_filters {
-        let actual = row
-            .get(&format!("{variable}.{prop_name}"))
-            .cloned()
-            .unwrap_or(Value::Null);
         let expected = match env.correlated_row {
             Some(corr) => {
                 let mut eval_row = corr.clone();
@@ -6987,7 +6983,8 @@ fn node_row_from(
             }
             None => eval_neutral(filter_expr, &row)?,
         };
-        if actual != expected {
+        let actual = super::row::property(&row, variable, prop_name).unwrap_or(&Value::Null);
+        if *actual != expected {
             return Ok(None);
         }
     }
