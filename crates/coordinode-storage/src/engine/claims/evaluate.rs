@@ -273,7 +273,7 @@ impl<'a> Evaluation<'a> {
             ) => pair_instances_unchanged(engine, *source, *target, edge_type, read_ts),
 
             (ClaimScope::Node(node), ClaimPredicate::EndpointAlive) => {
-                endpoint_alive(engine, *node, staged_points, unseen_from)
+                endpoint_alive(engine, *node, staged_points, read_ts)
             }
 
             // The registry excludes the reference rights still in flight; this
@@ -285,7 +285,7 @@ impl<'a> Evaluation<'a> {
                 *node,
                 staged,
                 staged_points,
-                unseen_from,
+                read_ts,
             ),
 
             // An enumeration is proved by what it enumerated over: the attempt
@@ -546,28 +546,47 @@ fn incident_set_unchanged(
     })
 }
 
-/// Whether `label`'s schema is still the one an attempt viewing the store at
-/// `read_ts` read at `revision`.
+/// Whether `label`'s schema is still the one an attempt read at `revision`,
+/// `unseen_from` being the first sequence number it could not have seen.
+///
+/// Decided from the current state: the pointer must name `revision` now
+/// (be absent for `0`), and neither it nor that revision's body may have been
+/// written since. Only keys present now are asked "written since", which
+/// reads no history, so a view below the retention horizon decides as well.
 fn label_schema_unchanged(
     engine: &StorageEngine,
     label: &str,
     revision: u64,
-    read_ts: u64,
+    unseen_from: u64,
 ) -> StorageResult<Verdict> {
     use coordinode_core::schema::definition::{
         encode_label_current_revision_key, encode_label_schema_key,
     };
 
     let pointer = encode_label_current_revision_key(label);
-    if engine.written_since_snapshot(Partition::Schema, &pointer, read_ts)? {
+    let now = engine.get(Partition::Schema, &pointer)?;
+    let Some(now) = now else {
+        // No schema now: the read stands only if it saw none either.
+        return Ok(if revision == 0 {
+            Verdict::Holds
+        } else {
+            Verdict::Broken
+        });
+    };
+    let named = <[u8; 8]>::try_from(now.as_ref())
+        .ok()
+        .map(u64::from_be_bytes);
+    if revision == 0 || named != Some(revision) {
         return Ok(Verdict::Broken);
     }
-    // A label with no schema has no body to have changed.
-    if revision != 0 {
-        let body = encode_label_schema_key(label, revision);
-        if engine.written_since_snapshot(Partition::Schema, &body, read_ts)? {
-            return Ok(Verdict::Broken);
-        }
+    // The pointer names the same revision; a rewrite of it or of the body
+    // in place since the view is still a different schema.
+    let body = encode_label_schema_key(label, revision);
+    if engine.written_since_snapshot(Partition::Schema, &pointer, unseen_from)?
+        || engine.get(Partition::Schema, &body)?.is_none()
+        || engine.written_since_snapshot(Partition::Schema, &body, unseen_from)?
+    {
+        return Ok(Verdict::Broken);
     }
     Ok(Verdict::Holds)
 }

@@ -706,19 +706,37 @@ fn a_schema_read_of_an_undeclared_label_is_broken_by_its_declaration() {
     );
 }
 
-/// A declaration that lands below the attempt's view after its read (a
+/// A schema change that lands below the attempt's view after its read (a
 /// commit in flight when the view was taken) is a change the read missed:
 /// asked from the first number the attempt could not have seen, it breaks
-/// the read; asked from the view alone, it would not.
+/// the read; asked from the view alone, it would not. A declaration of a
+/// label read without a schema breaks the read either way, decided from the
+/// current state.
 #[test]
 fn a_schema_read_is_asked_from_the_first_unseen_number() {
-    use coordinode_core::schema::definition::LabelSchema;
+    use coordinode_core::schema::definition::{
+        LabelSchema, PropertyDef, PropertyType, encode_label_schema_key,
+    };
 
     let (engine, _d) = engine();
-    let read = schema_claim("Doc", ClaimPredicate::SchemaRead { revision: 0 });
+    let mut schema = LabelSchema::new_node_id("Doc");
+    store_label_schema(&engine, &schema);
+    let read = schema_claim(
+        "Doc",
+        ClaimPredicate::SchemaRead {
+            revision: schema.schema_revision,
+        },
+    );
     let no_points = HashMap::new();
     let unseen_from = engine.snapshot();
-    store_label_schema(&engine, &LabelSchema::new_node_id("Doc"));
+    schema.add_property(PropertyDef::new("title", PropertyType::String));
+    engine
+        .put(
+            Partition::Schema,
+            &encode_label_schema_key("Doc", schema.schema_revision),
+            &schema.to_msgpack().expect("encode"),
+        )
+        .expect("edit in place");
     let view = engine.snapshot();
     let decide = |unseen: u64| {
         Evaluation::new(&engine, &[], &no_points, view)
@@ -728,6 +746,16 @@ fn a_schema_read_is_asked_from_the_first_unseen_number() {
     };
     assert_eq!(decide(view), Verdict::Holds, "the view alone misses it");
     assert_eq!(decide(unseen_from), Verdict::Broken);
+
+    let undeclared = schema_claim("Fresh", ClaimPredicate::SchemaRead { revision: 0 });
+    store_label_schema(&engine, &LabelSchema::new_node_id("Fresh"));
+    assert_eq!(
+        Evaluation::new(&engine, &[], &no_points, view)
+            .decide(&undeclared)
+            .expect("decide"),
+        Verdict::Broken,
+        "declared since it was read without a schema"
+    );
 }
 
 /// An activation of a type implying labels answers for its stored nodes'
