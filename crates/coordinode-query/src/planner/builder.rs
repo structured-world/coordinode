@@ -779,6 +779,10 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             label: ac.label.clone(),
             mode: ac.mode.clone(),
         }),
+        Clause::AlterNodeTypeImplies(c) => Ok(LogicalOp::AlterNodeTypeImplies {
+            label: c.label.clone(),
+            implies: c.implies.clone(),
+        }),
         Clause::CreateTextIndex(c) => Ok(LogicalOp::CreateTextIndex {
             name: c.name.clone(),
             label: c.label.clone(),

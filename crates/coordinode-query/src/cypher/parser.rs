@@ -251,6 +251,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let ac = build_alter_label_clause(pair)?;
             clauses.push(Clause::AlterLabel(ac));
         }
+        Rule::alter_node_type_implies_clause => {
+            let c = build_alter_node_type_implies_clause(pair)?;
+            clauses.push(Clause::AlterNodeTypeImplies(c));
+        }
         Rule::create_text_index_clause => {
             let c = build_create_text_index_clause(pair)?;
             clauses.push(Clause::CreateTextIndex(c));
@@ -974,6 +978,24 @@ fn build_alter_label_clause(pair: Pair<'_, Rule>) -> Result<AlterLabelClause, Pa
     }
 
     Ok(AlterLabelClause { label, mode })
+}
+
+/// `ALTER NODE TYPE <name> SET IMPLIES (<label>, ...)`: the first identifier
+/// names the type, the rest are the labels it is to imply.
+fn build_alter_node_type_implies_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<crate::cypher::ast::AlterNodeTypeImpliesClause, ParseError> {
+    let mut names = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::identifier)
+        .map(|p| p.as_str().to_string());
+    let label = names
+        .next()
+        .ok_or_else(|| ParseError::Invalid("ALTER NODE TYPE requires the type's name".into()))?;
+    Ok(crate::cypher::ast::AlterNodeTypeImpliesClause {
+        label,
+        implies: names.collect(),
+    })
 }
 
 fn build_create_text_index_clause(

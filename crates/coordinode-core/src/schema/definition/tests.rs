@@ -777,6 +777,7 @@ fn a_candidate_is_put_in_force_in_place_of_the_facts() {
     schema.set_candidate(super::LabelCandidate {
         properties: declared.clone(),
         mode: SchemaMode::Strict,
+        implies: None,
         operation: GenerationId::from_raw(3),
     });
     let bytes = schema.to_msgpack().expect("serialize");
@@ -794,6 +795,45 @@ fn a_candidate_is_put_in_force_in_place_of_the_facts() {
     assert_eq!(schema.mode, SchemaMode::Strict);
     assert!(schema.candidate().is_none());
     assert!(!schema.activate_candidate());
+}
+
+/// A candidate changing what a type implies keeps the implications in force
+/// until it is activated, then replaces them; one leaving them out changes
+/// none, and one naming the same set is no change.
+#[test]
+fn a_candidate_replaces_the_implications_only_when_activated() {
+    let mut schema = LabelSchema::new_node_id("Goal");
+    schema.set_implies(vec!["Thing".into()]);
+    let candidate = |implies: Option<Vec<String>>| super::LabelCandidate {
+        properties: std::collections::BTreeMap::new(),
+        mode: schema.mode,
+        implies,
+        operation: crate::index::identity::GenerationId::from_raw(4),
+    };
+
+    let mut unchanged = schema.clone();
+    unchanged.set_candidate(candidate(None));
+    assert!(!unchanged.candidate_changes_implies());
+    let mut same = schema.clone();
+    same.set_candidate(candidate(Some(vec!["Thing".into()])));
+    assert!(!same.candidate_changes_implies());
+
+    schema.set_candidate(candidate(Some(vec!["Work".into(), "Thing".into()])));
+    assert!(schema.candidate_changes_implies());
+    assert_eq!(schema.implies(), ["Thing"], "in force until activated");
+    let would = schema.candidate_schema().expect("a candidate");
+    assert_eq!(would.implies(), ["Thing", "Work"], "sorted, as declared");
+    let bytes = schema.to_msgpack().expect("serialize");
+    assert_eq!(LabelSchema::from_msgpack(&bytes).expect("decode"), schema);
+
+    assert!(schema.activate_candidate());
+    assert_eq!(schema.implies(), ["Thing", "Work"]);
+    unchanged.activate_candidate();
+    assert_eq!(
+        unchanged.implies(),
+        ["Thing"],
+        "a candidate without implies keeps them"
+    );
 }
 
 /// The kinds tell apart what each one checks: presence, per-node checking

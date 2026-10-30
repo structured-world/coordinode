@@ -62,6 +62,7 @@ pub enum Rule {
     r#yield_item,
     r#alter_label_clause,
     r#schema_mode,
+    r#alter_node_type_implies_clause,
     r#create_text_index_clause,
     r#text_index_single_field,
     r#text_index_language,
@@ -466,6 +467,7 @@ impl Rule {
             Rule::r#yield_item,
             Rule::r#alter_label_clause,
             Rule::r#schema_mode,
+            Rule::r#alter_node_type_implies_clause,
             Rule::r#create_text_index_clause,
             Rule::r#text_index_single_field,
             Rule::r#text_index_language,
@@ -1065,6 +1067,9 @@ impl ::pest::Parser<Rule> for CypherParser {
                                     .or_else(|state| { self::r#call_subquery_clause(state) })
                                     .or_else(|state| { self::r#call_clause(state) })
                                     .or_else(|state| { self::r#alter_label_clause(state) })
+                                    .or_else(|state| {
+                                        self::r#alter_node_type_implies_clause(state)
+                                    })
                                     .or_else(|state| { self::r#alter_index_clause(state) })
                                     .or_else(|state| { self::r#reindex_clause(state) })
                                     .or_else(|state| { self::r#alter_namespace_clause(state) })
@@ -2589,6 +2594,82 @@ impl ::pest::Parser<Rule> for CypherParser {
                                                 .or_else(|state| { state.match_insensitive("flexible") })
                                         },
                                     )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#alter_node_type_implies_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#alter_node_type_implies_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_alter(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_node(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_type(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#identifier(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_set(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_implies(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { state.match_string("(") })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state
+                                                    .optional(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#identifier(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| {
+                                                                        state
+                                                                            .sequence(|state| {
+                                                                                state
+                                                                                    .optional(|state| {
+                                                                                        state
+                                                                                            .sequence(|state| {
+                                                                                                state
+                                                                                                    .match_string(",")
+                                                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                                                    .and_then(|state| { self::r#identifier(state) })
+                                                                                            })
+                                                                                            .and_then(|state| {
+                                                                                                state
+                                                                                                    .repeat(|state| {
+                                                                                                        state
+                                                                                                            .sequence(|state| {
+                                                                                                                super::hidden::skip(state)
+                                                                                                                    .and_then(|state| {
+                                                                                                                        state
+                                                                                                                            .sequence(|state| {
+                                                                                                                                state
+                                                                                                                                    .match_string(",")
+                                                                                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                                                                                    .and_then(|state| { self::r#identifier(state) })
+                                                                                                                            })
+                                                                                                                    })
+                                                                                                            })
+                                                                                                    })
+                                                                                            })
+                                                                                    })
+                                                                            })
+                                                                    })
+                                                            })
+                                                    })
+                                            })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { state.match_string(")") })
+                                    })
                             },
                         )
                 }
@@ -14275,6 +14356,9 @@ impl ::pest::Parser<Rule> for CypherParser {
                     Rule::r#yield_item => rules::r#yield_item(state),
                     Rule::r#alter_label_clause => rules::r#alter_label_clause(state),
                     Rule::r#schema_mode => rules::r#schema_mode(state),
+                    Rule::r#alter_node_type_implies_clause => {
+                        rules::r#alter_node_type_implies_clause(state)
+                    }
                     Rule::r#create_text_index_clause => {
                         rules::r#create_text_index_clause(state)
                     }

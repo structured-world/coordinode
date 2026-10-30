@@ -325,6 +325,13 @@ fn write_clause(buf: &mut String, clause: &Clause) {
             buf.push_str(" SET SCHEMA ");
             buf.push_str(&ac.mode);
         }
+        Clause::AlterNodeTypeImplies(c) => {
+            buf.push_str("ALTER NODE TYPE ");
+            buf.push_str(&c.label);
+            buf.push_str(" SET IMPLIES (");
+            buf.push_str(&c.implies.join(", "));
+            buf.push(')');
+        }
         Clause::CreateTextIndex(c) => {
             buf.push_str("CREATE TEXT INDEX ");
             buf.push_str(&c.name);

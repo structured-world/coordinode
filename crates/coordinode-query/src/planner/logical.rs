@@ -492,6 +492,11 @@ pub enum LogicalOp {
     /// DDL operation — modifies schema metadata, not graph data.
     AlterLabel { label: String, mode: String },
 
+    /// ALTER NODE TYPE ... SET IMPLIES: publish the labels a type is to
+    /// imply as a candidate, reconciled into the label lookup and every
+    /// affected index before it is put in force.
+    AlterNodeTypeImplies { label: String, implies: Vec<String> },
+
     /// CREATE TEXT INDEX: create a full-text search index on label properties.
     CreateTextIndex {
         name: String,
@@ -1077,6 +1082,7 @@ impl LogicalOp {
             Self::Merge { .. } => "Merge",
             Self::Upsert { .. } => "Upsert",
             Self::AlterLabel { .. } => "AlterLabel",
+            Self::AlterNodeTypeImplies { .. } => "AlterNodeTypeImplies",
             Self::CreateTextIndex { .. } => "CreateTextIndex",
             Self::DropTextIndex { .. } => "DropTextIndex",
             Self::CreateEncryptedIndex { .. } => "CreateEncryptedIndex",
@@ -1186,6 +1192,7 @@ impl LogicalOp {
             | LogicalOp::TextIndexScan { .. }
             | LogicalOp::Empty
             | LogicalOp::AlterLabel { .. }
+            | LogicalOp::AlterNodeTypeImplies { .. }
             | LogicalOp::CreateTextIndex { .. }
             | LogicalOp::DropTextIndex { .. }
             | LogicalOp::CreateEncryptedIndex { .. }
@@ -1511,6 +1518,7 @@ impl LogicalOp {
                 }
             }
             LogicalOp::AlterLabel { .. }
+            | LogicalOp::AlterNodeTypeImplies { .. }
             | LogicalOp::CreateTextIndex { .. }
             | LogicalOp::DropTextIndex { .. }
             | LogicalOp::CreateEncryptedIndex { .. }
@@ -2163,6 +2171,7 @@ fn estimate_op_cost(
             (input_cost + input_rows, input_rows * 10.0)
         }
         LogicalOp::AlterLabel { .. }
+        | LogicalOp::AlterNodeTypeImplies { .. }
         | LogicalOp::CreateTextIndex { .. }
         | LogicalOp::DropTextIndex { .. }
         | LogicalOp::CreateEncryptedIndex { .. }
@@ -2839,6 +2848,12 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         }
         LogicalOp::AlterLabel { label, mode } => {
             output.push_str(&format!("{prefix}AlterLabel({label}, SET SCHEMA {mode})\n"));
+        }
+        LogicalOp::AlterNodeTypeImplies { label, implies } => {
+            output.push_str(&format!(
+                "{prefix}AlterNodeTypeImplies({label}, SET IMPLIES ({}))\n",
+                implies.join(", ")
+            ));
         }
         LogicalOp::CreateTextIndex {
             name,

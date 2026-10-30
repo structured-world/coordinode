@@ -6557,6 +6557,10 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::AlterLabel { label, mode } => execute_alter_label(label, mode, ctx),
 
+        LogicalOp::AlterNodeTypeImplies { label, implies } => {
+            execute_alter_node_type_implies(label, implies, ctx)
+        }
+
         LogicalOp::CreateTextIndex {
             name,
             label,
@@ -20361,6 +20365,158 @@ fn execute_alter_label(
     Ok(vec![row])
 }
 
+/// Execute `ALTER NODE TYPE <label> SET IMPLIES (...)`: the new implication
+/// is published as the label's candidate with a certification of the label
+/// admitted in the same commit, every write from then on is held to it, and
+/// it is put in force once the stored carriers are proved against what they
+/// come to carry. Returns the label, the implication in force when the
+/// statement answers and, while the proof runs past the wait, its operation.
+fn execute_alter_node_type_implies(
+    label: &str,
+    implies: &[String],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use crate::index::{BuildError, IndexBuildOutcome};
+    use coordinode_core::schema::definition::LabelCandidate;
+    use coordinode_modality::{
+        IndexStore as _, LabelCertificationRecord, LocalIndexStore, LocalSchemaStore,
+        SchemaStore as _, StoreError,
+    };
+    let builds = ctx.index_builds.ok_or_else(|| {
+        ExecutionError::Unsupported(
+            "changing what a type implies requires the engine's index builds".into(),
+        )
+    })?;
+    let mut wanted: Vec<String> = Vec::with_capacity(implies.len());
+    for implied in implies {
+        if !wanted.contains(implied) {
+            wanted.push(implied.clone());
+        }
+    }
+    // The labels it comes to imply are bound before the admission reads them.
+    for implied in &wanted {
+        ctx.bind_label(implied)?;
+    }
+    // Read, not held: the catalog commit below checks the revision read is
+    // still the one in force.
+    let Some(current) = ctx.load_current_label_schema(label)? else {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "label :{label} is not declared; CREATE NODE TYPE declares what it implies"
+        )));
+    };
+    if current.is_auxiliary() {
+        return Err(ExecutionError::CatalogRefused(format!(
+            ":{label} is an auxiliary label, which implies nothing"
+        )));
+    }
+    if current.candidate().is_some() {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "the definition of :{label} is still being certified; wait for it or cancel it \
+             before changing what it implies"
+        )));
+    }
+    let implies_row =
+        |labels: &[String]| Value::Array(labels.iter().cloned().map(Value::String).collect());
+    if current.implies() == wanted.as_slice() {
+        let mut row = Row::new();
+        row.insert("label".to_string(), Value::String(label.to_string()));
+        row.insert("implies".to_string(), implies_row(current.implies()));
+        row.insert("changed".to_string(), Value::Bool(false));
+        row.insert("operation".to_string(), Value::Null);
+        ctx.sync_for_answer()?;
+        return Ok(vec![row]);
+    }
+    // What the type would declare once in force: its properties must still
+    // cover every label it implies, and the implication may reach neither
+    // itself nor an auxiliary label.
+    let mut proposed = current.clone();
+    proposed.set_implies(wanted.clone());
+    ctx.sync_txn_state();
+    crate::executor::label_kinds::admit_label_kind(
+        ctx.engine,
+        &mut ctx.txn,
+        &proposed,
+        false,
+        &|_| None,
+    )?;
+
+    let read_revision = current.schema_revision;
+    let mut next = current;
+    next.schema_revision = next_revision(&next)?;
+    let engine = ctx.engine;
+    let mut operation = None;
+    let committed = ctx.commit_catalog_change_at(CatalogSync::AtAnswer, |txn| {
+        let store = LocalSchemaStore::new(engine);
+        let in_force = store.load_label_for_update_txn(txn, label)?;
+        if in_force.map(|s| s.schema_revision) != Some(read_revision) {
+            return Err(StoreError::Invariant(format!(
+                "the schema of :{label} changed while its implication was being changed; retry \
+                 the statement"
+            )));
+        }
+        let indexes = LocalIndexStore::new(engine);
+        let op = indexes.allocate_generation_txn(txn)?;
+        // The facts stay in force; the candidate is the implication.
+        next.set_candidate(LabelCandidate {
+            properties: next.properties.clone(),
+            mode: next.mode,
+            implies: Some(wanted.clone()),
+            operation: op,
+        });
+        store.publish_candidate_txn(txn, &next)?;
+        indexes.put_certification_txn(
+            txn,
+            &LabelCertificationRecord::accepted(op, vec![label.to_string()]),
+            None,
+        )?;
+        operation = Some(op);
+        Ok::<(), StoreError>(())
+    });
+    ctx.forget_label_schema(label);
+    committed?;
+    let operation = operation.ok_or_else(|| {
+        ExecutionError::Unsupported("the implication change staged no certification".into())
+    })?;
+    // The statement's own transaction is open while it waits; having staged
+    // nothing, it leaves the proof's wait for older transactions.
+    ctx.txn.release_from_schema_waits();
+    builds
+        .submit_certification(operation)
+        .map_err(ExecutionError::Unsupported)?;
+    let outcome = builds.wait(operation, Some(builds.config().statement_wait))?;
+    ctx.forget_label_schema(label);
+    let mut row = Row::new();
+    row.insert("label".to_string(), Value::String(label.to_string()));
+    row.insert("changed".to_string(), Value::Bool(true));
+    match outcome {
+        Some(IndexBuildOutcome::Published { .. }) => {
+            row.insert("implies".to_string(), implies_row(&wanted));
+            row.insert("operation".to_string(), Value::Null);
+        }
+        Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
+            return Err(ExecutionError::SchemaViolation(format!(
+                "cannot change what :{label} implies: {reason}"
+            )));
+        }
+        Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => return Err(v.into()),
+        Some(IndexBuildOutcome::Cancelled) => {
+            return Err(ExecutionError::CatalogRefused(format!(
+                "the change of what :{label} implies was cancelled"
+            )));
+        }
+        None => {
+            // Still being proved: the implication in force is the one before.
+            row.insert("implies".to_string(), implies_row(next.implies()));
+            row.insert(
+                "operation".to_string(),
+                Value::Int(operation_value(operation)),
+            );
+        }
+    }
+    ctx.sync_for_answer()?;
+    Ok(vec![row])
+}
+
 /// Execute `CREATE NODE TYPE <name> [TEMPORAL] [IMPLIES (...)] [WITH (...)]`
 /// and `CREATE LABEL <name> AUXILIARY`. Mirror of `execute_create_edge_type`
 /// for node labels.
@@ -22536,6 +22692,7 @@ fn create_proved_constraint(
         next.set_candidate(LabelCandidate {
             properties: next.properties.clone(),
             mode: next.mode,
+            implies: None,
             operation: op,
         });
         store.publish_candidate_txn(txn, &next)?;

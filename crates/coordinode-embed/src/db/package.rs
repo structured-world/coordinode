@@ -525,6 +525,7 @@ impl Database {
                 label.schema.set_candidate(LabelCandidate {
                     properties: declared,
                     mode: declared_mode,
+                    implies: None,
                     operation,
                 });
                 certifications.push((label.schema.name.clone(), operation));

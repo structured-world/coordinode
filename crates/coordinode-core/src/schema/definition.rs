@@ -432,6 +432,12 @@ pub struct LabelCandidate {
     pub properties: BTreeMap<String, PropertyDef>,
     /// The schema mode it declares.
     pub mode: SchemaMode,
+    /// The labels the type implies once the candidate is in force, sorted and
+    /// deduplicated; `None` when the candidate leaves them as they are. A
+    /// change is reconciled into the label lookup and every affected index
+    /// before the candidate is put in force.
+    #[serde(default)]
+    pub implies: Option<Vec<String>>,
     /// The certification operation proving it.
     pub operation: crate::index::identity::GenerationId,
 }
@@ -632,7 +638,18 @@ impl LabelSchema {
         };
         self.properties = candidate.properties;
         self.mode = candidate.mode;
+        if let Some(implies) = candidate.implies {
+            self.set_implies(implies);
+        }
         true
+    }
+
+    /// Whether the candidate changes what the type implies.
+    pub fn candidate_changes_implies(&self) -> bool {
+        self.candidate
+            .as_ref()
+            .and_then(|c| c.implies.as_deref())
+            .is_some_and(|implies| implies != self.implies.as_slice())
     }
 
     /// This definition as it would be with its candidate in force: what a

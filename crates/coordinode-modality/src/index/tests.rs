@@ -775,6 +775,103 @@ fn label_members_follow_staged_postings() {
     );
 }
 
+/// A label whose postings an implication change rebuilds keeps being served
+/// from where they were while its pending generation fills, writers keep
+/// both, and putting the rebuild in force serves the label from the new
+/// generation alone; other labels never move. Abandoning a rebuild leaves
+/// the label served from where it was.
+#[test]
+fn a_label_rebuild_serves_its_old_postings_until_finished() {
+    use crate::index_def::PendingGeneration;
+    use core::ops::ControlFlow;
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(engine);
+    let label = |raw| coordinode_core::schema::label_id::LabelId::new(raw).expect("nonzero");
+    let (thing, other) = (label(10), label(11));
+    let operation = GenerationId::from_raw(20);
+    let pending = PendingGeneration {
+        generation: GenerationId::from_raw(21),
+        operation,
+    };
+    let mut lookup =
+        IndexDescriptor::label_lookup().bind(IndexId::from_raw(1), GenerationId::from_raw(4));
+    let members = |txn: &Transaction, def: &IndexDefinition, label| {
+        let mut out = Vec::new();
+        store
+            .label_members(
+                txn,
+                LabelScope {
+                    lookup: def,
+                    shard: 0,
+                    label,
+                },
+                None,
+                &budget(),
+                |node| {
+                    out.push(node.as_raw());
+                    Ok::<_, StoreError>(ControlFlow::Continue(()))
+                },
+            )
+            .unwrap();
+        out
+    };
+
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    store
+        .stage_label_postings_txn(&mut t, &lookup, 0, id(1), &[], &[thing, other])
+        .unwrap();
+    commit(&mut t).unwrap();
+
+    lookup.begin_label_rebuild(thing, pending);
+    assert!(lookup.has_label_pending());
+    assert_eq!(lookup.label_generation(thing), GenerationId::from_raw(4));
+    // The rebuild holds what the candidate's interpretation gives: node 2
+    // carries Thing under it, node 1 does not.
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    store
+        .stage_pending_label_postings_txn(&mut t, &lookup, 0, id(2), &[], &[thing])
+        .unwrap();
+    store
+        .stage_pending_label_postings_txn(&mut t, &lookup, 0, id(3), &[], &[other])
+        .unwrap();
+    commit(&mut t).unwrap();
+    let t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    assert_eq!(members(&t, &lookup, thing), vec![1], "served as before");
+    assert_eq!(members(&t, &lookup, other), vec![1], "a label not rebuilt");
+
+    let mut abandoned = lookup.clone();
+    assert_eq!(
+        abandoned.abandon_label_rebuilds(operation),
+        vec![(thing, pending.generation)]
+    );
+    assert!(
+        abandoned.label_generations.is_empty(),
+        "nothing left to say"
+    );
+    assert_eq!(members(&t, &abandoned, thing), vec![1]);
+
+    assert_eq!(
+        lookup.finish_label_rebuilds(operation),
+        vec![(thing, GenerationId::from_raw(4))]
+    );
+    assert!(!lookup.has_label_pending());
+    assert_eq!(lookup.label_generation(thing), pending.generation);
+    assert_eq!(
+        members(&t, &lookup, thing),
+        vec![2],
+        "served from the rebuild"
+    );
+    assert_eq!(members(&t, &lookup, other), vec![1], "never moved");
+
+    let bytes = rmp_serde::to_vec(&lookup).unwrap();
+    assert_eq!(
+        rmp_serde::from_slice::<IndexDefinition>(&bytes).unwrap(),
+        lookup
+    );
+}
+
 /// A description is catalog metadata: editing it rewrites the definition
 /// record only, never the generation or an entry.
 #[test]

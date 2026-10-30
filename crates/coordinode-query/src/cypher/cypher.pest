@@ -28,6 +28,7 @@ clause = {
   | call_subquery_clause
   | call_clause
   | alter_label_clause
+  | alter_node_type_implies_clause
   | alter_index_clause
   | reindex_clause
   | alter_namespace_clause
@@ -177,6 +178,15 @@ yield_item = { symbolic_name ~ alias? }
 
 alter_label_clause = { kw_alter ~ kw_label ~ identifier ~ kw_set ~ kw_schema ~ schema_mode }
 schema_mode = @{ ^"strict" | ^"validated" | ^"flexible" }
+
+// ALTER NODE TYPE <name> SET IMPLIES (<label>, ...): change the labels every
+// node of the type carries with it. An empty list removes them all. The new
+// set is reconciled into the label lookup and every affected index in the
+// background before it is put in force.
+alter_node_type_implies_clause = {
+    kw_alter ~ kw_node ~ kw_type ~ identifier ~ kw_set ~ kw_implies
+    ~ "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")"
+}
 
 // --- CREATE/DROP TEXT INDEX ---
 

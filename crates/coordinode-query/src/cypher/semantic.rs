@@ -383,6 +383,7 @@ impl<'a> Analyzer<'a> {
                 }
             }
             Clause::AlterLabel(_)
+            | Clause::AlterNodeTypeImplies(_)
             | Clause::CreateTextIndex(_)
             | Clause::DropTextIndex(_)
             | Clause::CreateEncryptedIndex(_)

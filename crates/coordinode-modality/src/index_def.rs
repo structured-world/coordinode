@@ -95,6 +95,36 @@ pub struct IndexDefinition {
     pub generation: GenerationId,
     /// What the index is.
     pub descriptor: IndexDescriptor,
+    /// A representation being built beside [`Self::generation`] under a
+    /// label candidate's interpretation, maintained by every writer with
+    /// it and served from once the candidate is put in force.
+    pub replacement: Option<PendingGeneration>,
+    /// The label lookup's labels whose postings are kept in a generation of
+    /// their own, sorted by label: one an implication change rebuilt, or is
+    /// rebuilding. Every other label's postings are in
+    /// [`Self::generation`]. Empty for every other index.
+    pub label_generations: Vec<LabelGeneration>,
+}
+
+/// A representation of an index, or of one label of the label lookup,
+/// being built for a label candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingGeneration {
+    /// Where its entries are written.
+    pub generation: GenerationId,
+    /// The certification that builds it and puts it in force.
+    pub operation: GenerationId,
+}
+
+/// Where the label lookup keeps the postings of one label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelGeneration {
+    /// The label.
+    pub label: coordinode_core::schema::label_id::LabelId,
+    /// The generation its postings are served from.
+    pub serving: GenerationId,
+    /// The generation its postings are being rebuilt in, if they are.
+    pub pending: Option<PendingGeneration>,
 }
 
 impl core::ops::Deref for IndexDefinition {
@@ -451,6 +481,8 @@ impl IndexDescriptor {
             id,
             generation,
             descriptor: self,
+            replacement: None,
+            label_generations: Vec::new(),
         }
     }
 
@@ -502,6 +534,103 @@ impl IndexDescriptor {
 }
 
 impl IndexDefinition {
+    /// Where the label lookup serves the postings of `label` from: its own
+    /// generation when an implication change rebuilt it, the lookup's
+    /// otherwise. One search of a short sorted list.
+    pub fn label_generation(
+        &self,
+        label: coordinode_core::schema::label_id::LabelId,
+    ) -> GenerationId {
+        self.label_entry(label)
+            .map_or(self.generation, |entry| entry.serving)
+    }
+
+    /// The generation the postings of `label` are being rebuilt in, with
+    /// the certification building it; `None` when they are not.
+    pub fn label_pending(
+        &self,
+        label: coordinode_core::schema::label_id::LabelId,
+    ) -> Option<PendingGeneration> {
+        self.label_entry(label).and_then(|entry| entry.pending)
+    }
+
+    /// Whether some label's postings are being rebuilt: what a writer checks
+    /// once before it looks for the labels whose rebuild it maintains.
+    pub fn has_label_pending(&self) -> bool {
+        self.label_generations.iter().any(|e| e.pending.is_some())
+    }
+
+    fn label_entry(
+        &self,
+        label: coordinode_core::schema::label_id::LabelId,
+    ) -> Option<&LabelGeneration> {
+        self.label_generations
+            .binary_search_by_key(&label, |entry| entry.label)
+            .ok()
+            .map(|at| &self.label_generations[at])
+    }
+
+    /// Start rebuilding the postings of `label` in `pending`, keeping them
+    /// served from where they are.
+    pub fn begin_label_rebuild(
+        &mut self,
+        label: coordinode_core::schema::label_id::LabelId,
+        pending: PendingGeneration,
+    ) {
+        let serving = self.label_generation(label);
+        let entry = LabelGeneration {
+            label,
+            serving,
+            pending: Some(pending),
+        };
+        match self
+            .label_generations
+            .binary_search_by_key(&label, |entry| entry.label)
+        {
+            Ok(at) => self.label_generations[at] = entry,
+            Err(at) => self.label_generations.insert(at, entry),
+        }
+    }
+
+    /// Serve the postings of every label rebuilt by `operation` from their
+    /// rebuilt generation. Returns the generations they were served from,
+    /// whose postings are left to be removed.
+    pub fn finish_label_rebuilds(
+        &mut self,
+        operation: GenerationId,
+    ) -> Vec<(coordinode_core::schema::label_id::LabelId, GenerationId)> {
+        let mut retired = Vec::new();
+        for entry in &mut self.label_generations {
+            if let Some(pending) = entry.pending.filter(|p| p.operation == operation) {
+                retired.push((entry.label, entry.serving));
+                entry.serving = pending.generation;
+                entry.pending = None;
+            }
+        }
+        retired
+    }
+
+    /// Drop every rebuild `operation` started, the postings staying served
+    /// from where they were. Returns the generations dropped, whose postings
+    /// are left to be removed.
+    pub fn abandon_label_rebuilds(
+        &mut self,
+        operation: GenerationId,
+    ) -> Vec<(coordinode_core::schema::label_id::LabelId, GenerationId)> {
+        let mut dropped = Vec::new();
+        let generation = self.generation;
+        self.label_generations.retain_mut(|entry| {
+            let Some(pending) = entry.pending.filter(|p| p.operation == operation) else {
+                return true;
+            };
+            dropped.push((entry.label, pending.generation));
+            entry.pending = None;
+            // An entry serving from the lookup's own generation says nothing.
+            entry.serving != generation
+        });
+        dropped
+    }
+
     /// The interpretation that decides this B-tree index's entries, with
     /// each property resolved to the field id `field_of` binds it to now:
     /// what a DERIVED effect is sealed with, so no member consults the

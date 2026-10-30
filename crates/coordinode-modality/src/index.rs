@@ -384,6 +384,24 @@ pub trait IndexStore {
         added: &[LabelId],
     ) -> StoreResult<()>;
 
+    /// [`Self::stage_label_postings_txn`] in the generations the postings of
+    /// `removed` and `added` are being rebuilt in, for the labels being
+    /// rebuilt: what a writer maintains under a label candidate's
+    /// interpretation while the candidate is proved. Nothing for the others.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn stage_pending_label_postings_txn(
+        &self,
+        txn: &mut Transaction,
+        def: &IndexDefinition,
+        shard: u16,
+        node: NodeId,
+        removed: &[LabelId],
+        added: &[LabelId],
+    ) -> StoreResult<()>;
+
     /// Stage the postings of node `node` of shard `shard` for the labels
     /// `held` in the label lookup `def` that it does not
     /// have yet, as `txn` sees it: what a version of a temporal node adds,
@@ -1353,15 +1371,45 @@ impl IndexStore for LocalIndexStore<'_> {
         for &label in removed.iter().filter(|l| !added.contains(l)) {
             txn.delete(
                 Partition::Idx,
-                &encode_label_posting(def.generation, shard, label, node.as_raw()),
+                &encode_label_posting(def.label_generation(label), shard, label, node.as_raw()),
             )?;
         }
         for &label in added.iter().filter(|l| !removed.contains(l)) {
             txn.put(
                 Partition::Idx,
-                &encode_label_posting(def.generation, shard, label, node.as_raw()),
+                &encode_label_posting(def.label_generation(label), shard, label, node.as_raw()),
                 &[],
             )?;
+        }
+        Ok(())
+    }
+
+    fn stage_pending_label_postings_txn(
+        &self,
+        txn: &mut Transaction,
+        def: &IndexDefinition,
+        shard: u16,
+        node: NodeId,
+        removed: &[LabelId],
+        added: &[LabelId],
+    ) -> StoreResult<()> {
+        use coordinode_core::index::encoding::encode_label_posting;
+        for &label in removed.iter().filter(|l| !added.contains(l)) {
+            if let Some(pending) = def.label_pending(label) {
+                txn.delete(
+                    Partition::Idx,
+                    &encode_label_posting(pending.generation, shard, label, node.as_raw()),
+                )?;
+            }
+        }
+        for &label in added.iter().filter(|l| !removed.contains(l)) {
+            if let Some(pending) = def.label_pending(label) {
+                txn.put(
+                    Partition::Idx,
+                    &encode_label_posting(pending.generation, shard, label, node.as_raw()),
+                    &[],
+                )?;
+            }
         }
         Ok(())
     }
@@ -1376,7 +1424,8 @@ impl IndexStore for LocalIndexStore<'_> {
     ) -> StoreResult<()> {
         use coordinode_core::index::encoding::encode_label_posting;
         for &label in held {
-            let key = encode_label_posting(def.generation, shard, label, node.as_raw());
+            let key =
+                encode_label_posting(def.label_generation(label), shard, label, node.as_raw());
             if txn.get(Partition::Idx, &key)?.is_none() {
                 txn.put(Partition::Idx, &key, &[])?;
             }
@@ -1403,17 +1452,18 @@ impl IndexStore for LocalIndexStore<'_> {
         use coordinode_core::index::encoding::{
             decode_label_posting, encode_label_posting, label_range_prefix,
         };
-        let range = label_range_prefix(def.generation, shard, label);
+        let generation = def.label_generation(label);
+        let range = label_range_prefix(generation, shard, label);
         let start = match after.map(NodeId::as_raw) {
             // The first posting after `after`: a resume past the last NodeId
             // has nothing left to read.
             Some(u64::MAX) => return Ok(()),
-            Some(node) => encode_label_posting(def.generation, shard, label, node + 1).to_vec(),
+            Some(node) => encode_label_posting(generation, shard, label, node + 1).to_vec(),
             None => range.to_vec(),
         };
         let end = coordinode_core::index::encoding::prefix_end(&range);
         txn.range_for_each(Partition::Idx, &start, &end, budget, |key, _| {
-            match decode_label_posting(def.generation, key) {
+            match decode_label_posting(generation, key) {
                 Some((_, _, node)) => visit(NodeId::from_raw(node)),
                 // A key of another shape inside the range is no posting.
                 None => Ok(core::ops::ControlFlow::Continue(())),

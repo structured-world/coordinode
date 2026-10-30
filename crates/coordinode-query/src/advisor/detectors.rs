@@ -357,6 +357,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::TextIndexScan { .. }
         | LogicalOp::Empty
         | LogicalOp::AlterLabel { .. }
+        | LogicalOp::AlterNodeTypeImplies { .. }
         | LogicalOp::CreateTextIndex { .. }
         | LogicalOp::DropTextIndex { .. }
         | LogicalOp::CreateEncryptedIndex { .. }

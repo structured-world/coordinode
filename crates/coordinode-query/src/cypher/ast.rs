@@ -60,6 +60,7 @@ impl Query {
                 | Clause::RedirectEdges(_)
                 | Clause::RetypeNode(_)
                 | Clause::AlterLabel(_)
+                | Clause::AlterNodeTypeImplies(_)
                 | Clause::CreateTextIndex(_)
                 | Clause::DropTextIndex(_)
                 | Clause::CreateEncryptedIndex(_)
@@ -135,6 +136,7 @@ pub enum Clause {
 
     // DDL clauses
     AlterLabel(AlterLabelClause),
+    AlterNodeTypeImplies(AlterNodeTypeImpliesClause),
     CreateTextIndex(CreateTextIndexClause),
     DropTextIndex(DropTextIndexClause),
     CreateEncryptedIndex(CreateEncryptedIndexClause),
@@ -281,6 +283,19 @@ pub struct AlterLabelClause {
     pub label: String,
     /// New schema mode.
     pub mode: String,
+}
+
+/// ALTER NODE TYPE ... SET IMPLIES clause: change the labels every node of a
+/// type carries with it.
+///
+/// Syntax: `ALTER NODE TYPE Goal SET IMPLIES (Thing, Work)`; `()` removes
+/// them all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterNodeTypeImpliesClause {
+    /// The type whose implications change.
+    pub label: String,
+    /// The labels it implies once the change is in force, as written.
+    pub implies: Vec<String>,
 }
 
 /// Per-field configuration for text index DDL.

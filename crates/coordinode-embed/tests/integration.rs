@@ -6,6 +6,7 @@
 mod integration {
     mod adaptive;
     mod advisor;
+    mod alter_implies;
     mod alter_label;
     mod background_workers;
     mod backup_restore;

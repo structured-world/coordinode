@@ -154,19 +154,41 @@ impl Shared {
         let store = LocalSchemaStore::new(engine);
         let mut refused = Vec::new();
         let mut candidates = Vec::with_capacity(labels.len());
+        let mut published = Vec::with_capacity(labels.len());
         for label in labels {
-            let candidate = store
+            let schema = store
                 .load_label(label)
                 .map_err(text)?
-                .filter(|s| s.candidate().is_some_and(|c| c.operation == generation))
-                .and_then(|s| s.candidate_schema());
-            match candidate {
-                Some(candidate) => candidates.push(candidate),
+                .filter(|s| s.candidate().is_some_and(|c| c.operation == generation));
+            match schema.as_ref().and_then(|s| s.candidate_schema()) {
+                Some(candidate) => {
+                    candidates.push(candidate);
+                    published.extend(schema);
+                }
                 None => refused.push((
                     label.clone(),
                     format!("the candidate definition of :{label} is no longer published"),
                 )),
             }
+        }
+        // The carriers of a type whose candidate changes what it implies
+        // answer to the explicit constraints of the labels they come to carry.
+        match coordinode_storage::engine::claims::evaluate::implication_violations(
+            engine, &published,
+        ) {
+            Ok(violations) => refused.extend(violations.into_iter().map(|(label, v)| {
+                let why = format!(
+                    "the definition of :{label} is not put in force: node {} breaks it ({})",
+                    v.node.to_element_id(),
+                    v.reason
+                );
+                (label, why)
+            })),
+            Err(e) => refused.extend(
+                published
+                    .iter()
+                    .map(|s| (s.name.clone(), format!("certify :{}: {e}", s.name))),
+            ),
         }
         match coordinode_storage::engine::claims::evaluate::label_schema_violations(
             engine,

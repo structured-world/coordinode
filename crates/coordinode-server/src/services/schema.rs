@@ -508,6 +508,12 @@ fn label_to_proto(s: &LabelSchema) -> schema::Label {
                 computed_properties,
                 schema_mode: schema_mode_to_proto(c.mode),
                 operation: c.operation.as_raw(),
+                implies: c
+                    .implies
+                    .as_ref()
+                    .map(|labels| schema::LabelCandidateImplies {
+                        labels: labels.clone(),
+                    }),
             }
         }),
         kind: label_kind_to_proto(s.kind()),
