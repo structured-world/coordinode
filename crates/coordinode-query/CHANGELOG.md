@@ -2,6 +2,51 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-10-30
+
+### Added
+
+- *(query)* change a node's type with RETYPE NODE
+- *(schema)* declare type, implied and auxiliary labels
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(storage)* judge, repair and drop columnar tables as partitions
+- *(vector)* exact scores and domain errors end to end
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(query)* drop the type-keyed index reason from relabel
+
+### Fixed
+
+- *(query)* defer only the retyped nodes' index entries in RETYPE
+- *(query)* plan subqueries with the index access paths
+- *(query)* keep rows without a vector in a vector ordering
+- *(query)* order by variables the projection drops
+- *(query)* subqueries see the outer row; one index search per top-k
+- *(query)* keep each edge's orientation in undirected hops
+- *(query)* three-valued AND/OR, simple CASE, correlated keys
+- *(query)* charge exact dedup memory before allocating it
+
+### Performance
+
+- *(query)* build only the node properties a statement reads
+- *(query)* read a property column without allocating
+- *(query)* read a node's schemas once per write
+- *(query)* look the keys of a correlated index join up in batches
+- *(query)* look a correlated index key up once per distinct key
+- index partition trees by discriminant, share index definitions
+- *(query)* hashed exact DISTINCT, grouping and UNION
+
+### Refactored
+
+- *(schema)* store canonical labels and judge RETYPE by its result
+
+### Testing
+
+- *(query)* tell a woken snapshot read from a timed-out one by margin
+- *(query)* measure the distributed top-k merge
+
 ## v0.8.0 - 2026-10-23
 
 ### Added

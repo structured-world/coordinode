@@ -2,6 +2,51 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-10-30
+
+### Added
+
+- *(storage)* hold the database to a strict total footprint limit
+
+### Fixed
+
+- *(cluster)* take a replacement's membership only once committed
+- *(cluster)* check both members of a replacement in one view
+- *(cluster)* fence a replacement on the membership it checked
+- *(cluster)* apply each change to a joint config left behind
+- *(cluster)* start every membership change from a single config
+- *(cluster)* resume a change left in its joint configuration
+- *(cluster)* refuse a joiner on another member's store as a join
+- *(raft)* bind promises to a member, write copy durably
+- *(raft)* keep the purge point and a loss with the vote; replace a member
+- *(raft)* refuse a member without its vote with a typed error
+- *(raft)* keep a second copy of the member's vote
+- *(replication)* wait for the leader's address, not pauses
+
+### Performance
+
+- *(storage)* leave a journaled tree's flush syncs to a barrier
+
+### Testing
+
+- *(raft)* let the refused bound lie above the read one
+- *(raft)* finish a conversion cut short at the marker
+- *(raft)* count journal syncs for an unchanged vote
+- *(raft)* catch an unchanged vote appended to the journal
+- *(raft)* resume a replacement on another leader, refuse old votes
+- *(raft)* run the lost-answer case around the actual leader
+
+### Bench
+
+- *(raft)* observe the copy's footprint inside a write
+- *(raft)* wait for a leader that confirms its lease
+- *(raft)* give the recovery image a promised term above 1
+- *(raft)* measure recovery, the copy's peak footprint and reads
+- *(raft)* trace each commit against the device's I/O
+- *(raft)* separate leadership seen from confirmed
+- *(raft)* bound each promise cost to its own span
+- *(raft)* measure what keeping consensus promises costs
+
 ## v0.9.0 - 2026-10-24
 
 ### Fixed

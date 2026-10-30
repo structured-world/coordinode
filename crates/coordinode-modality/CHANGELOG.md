@@ -2,6 +2,19 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-10-30
+
+### Added
+
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(vector)* exact scores and domain errors end to end
+- *(storage)* hold the database to a strict total footprint limit
+
+### Performance
+
+- *(query)* look the keys of a correlated index join up in batches
+
 ## v0.8.0 - 2026-10-23
 
 ### Added

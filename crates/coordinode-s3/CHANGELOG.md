@@ -2,6 +2,13 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-10-30
+
+### Added
+
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+
 ## v0.9.0 - 2026-10-24
 
 ### Fixed

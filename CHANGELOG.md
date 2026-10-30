@@ -1,5 +1,161 @@
 # Changelog
 
+## v0.10.0 - 2026-10-30
+
+### Added
+
+- *(schema)* declare type, implied and auxiliary labels
+- *(cluster)* replace a member whose vote no copy proves
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(storage)* per-table pressure series that go with the table
+- *(vector)* exact scores and domain errors end to end
+- *(storage)* hold the database to a strict total footprint limit
+- *(query)* change a node's type with RETYPE NODE
+- *(storage)* judge, repair and drop columnar tables as partitions
+- *(embed)* physical backup of the whole database
+- *(vector)* score vectors exactly in binary64 with one reduction
+- *(operation)* apply each client write once
+- *(storage)* store index generations under local installations
+- *(migrate)* add the node sizes report module
+- *(migrate)* catalog record migrations, check and journal stats
+- *(migrate)* offline tool to bring a data directory current
+
+### Documentation
+
+- *(cluster)* describe a replacement refused by a changed group
+- *(query)* drop the type-keyed index reason from relabel
+- *(storage)* name a private helper without linking it
+
+### Fixed
+
+- *(query)* keep rows without a vector in a vector ordering
+- *(storage)* refuse a hard limit below the supported minimum
+- *(bench)* read git state without optional locks
+- *(query)* charge exact dedup memory before allocating it
+- *(query)* defer only the retyped nodes' index entries in RETYPE
+- *(embed)* outwait the commits in flight before re-running a statement
+- *(vector)* draw each HNSW level once and finite
+- *(raft)* refuse a member without its vote with a typed error
+- *(storage)* serve a rebuilt tree's history above its copy's floor
+- *(storage)* refuse a rebuild from a damaged checkpoint copy
+- *(storage)* rebuild a partition at its original seqnos
+- *(storage)* rebuild a table only from provable state
+- *(embed)* finish an interrupted table rebuild on open
+- *(query)* plan subqueries with the index access paths
+- *(query)* order by variables the projection drops
+- *(storage)* capture the journal tail after a checkpoint's trees
+- *(query)* subqueries see the outer row; one index search per top-k
+- *(query)* keep each edge's orientation in undirected hops
+- *(replication)* wait for the leader's address, not pauses
+- *(query)* three-valued AND/OR, simple CASE, correlated keys
+- *(cluster)* take a replacement's membership only once committed
+- *(cluster)* check both members of a replacement in one view
+- *(cluster)* fence a replacement on the membership it checked
+- *(cluster)* apply each change to a joint config left behind
+- *(cluster)* start every membership change from a single config
+- *(cluster)* resume a change left in its joint configuration
+- *(cluster)* refuse a joiner on another member's store as a join
+- *(raft)* bind promises to a member, write copy durably
+- *(raft)* keep the purge point and a loss with the vote; replace a member
+- *(raft)* keep a second copy of the member's vote
+- *(storage)* decide a schema read from the current state
+- *(storage)* save the consensus state below half the space reserve
+- *(storage)* name the key a pending-commit conflict is about
+- *(storage)* close a dropped table's tree before removing its folder
+- *(storage)* admit promise copy writes as recovery work
+- *(storage)* let blob collection run below the free-space reserve
+- *(storage)* flush and capture a table only while it lives
+- *(storage)* no table file is made in a folder being dropped
+- *(storage)* a second drop of a table drops the same table
+- *(storage)* hold a table name until its drop finishes
+- *(storage)* open a checkpoint on its clock, never compacted
+- *(storage)* roll back a torn manifest tail instead of repairing
+- *(storage)* sync a new journal segment's directory
+- *(vector)* keep every HNSW node reachable when lists fill
+- *(vector)* keep cosine exact for every finite vector
+- *(storage)* never copy a checkpoint over a file it holds
+- *(migrate)* find every marked store, Raft snapshot captures too
+
+### Performance
+
+- *(query)* read a node's schemas once per write
+- *(query)* hashed exact DISTINCT, grouping and UNION
+- *(query)* build only the node properties a statement reads
+- *(bench)* declare the label the label-scan bench adds
+- *(bench)* measure label kinds on the write path
+- *(query)* look the keys of a correlated index join up in batches
+- *(query)* look a correlated index key up once per distinct key
+- *(query)* read a property column without allocating
+- index partition trees by discriminant, share index definitions
+- *(storage)* leave a journaled tree's flush syncs to a barrier
+- *(storage)* export a generation's history by its own key range
+- *(storage)* bench flush and compaction of a table
+- *(vector)* reduce four AVX2 blocks vertically
+- *(vector)* score exactly only candidates that can rank
+- *(vector)* no per-evaluation clear of the reduction stack
+- *(vector)* SSE2 exact kernels and cached sums of squares
+- *(query)* bound property delta chains with whole writes
+
+### Refactored
+
+- *(schema)* store canonical labels and judge RETYPE by its result
+- *(storage)* keep the table repair record crate-private
+
+### Testing
+
+- *(embed)* cover expiry, merge, restore and failed declarations for label kinds
+- *(embed)* keep an operation's outcome across a replacement
+- *(embed)* accept a cascade the capacity scanner ran first
+- *(embed)* report a table rebuild the open cannot finish
+- *(embed)* refuse an unevaluable query vector in every top-k form
+- *(embed)* measure the index top-k with the vector not returned
+- *(embed)* measure the correlated join one row per key and as a search
+- *(embed)* wait for reports and rebuilds before index checks
+- *(embed)* cover the fallbacks of the batched correlated join
+- *(embed)* wait for the recorded suspicion before a failing check
+- *(embed)* measure a correlated join through a unique index
+- *(embed)* count allocations per vector statement
+- *(embed)* bench the index-served top-k shape, store beside the build
+- *(embed)* measure vector statements end to end
+- *(embed)* keep the cascade's data on hot until it moves it
+- *(embed)* lower a full group to the supported minimum
+- *(embed)* lower the limit below the data, not the transient charge
+- *(query)* tell a woken snapshot read from a timed-out one by margin
+- *(query)* measure the distributed top-k merge
+- *(raft)* let the refused bound lie above the read one
+- *(raft)* finish a conversion cut short at the marker
+- *(raft)* count journal syncs for an unchanged vote
+- *(raft)* catch an unchanged vote appended to the journal
+- *(raft)* resume a replacement on another leader, refuse old votes
+- *(raft)* run the lost-answer case around the actual leader
+- *(storage)* fail every matching op of a persist
+- *(storage)* fail only the persisting partition's files
+- *(storage)* wait for the drop to close the tree, not for a sleep
+- *(storage)* measure the copy's peak from a steady store
+- *(storage)* model clean-stale pages and torn files
+- *(storage)* fail each step of a promise copy write
+- *(storage)* compare table tree paths absolute, as the tree config does
+- *(storage)* compare table tree paths against the endpoints as configured
+- *(storage)* hold a slowed table's rows to the write rate
+- *(storage)* judge each table into its own verdict and one metrics series
+- *(storage)* check the tail-captured segment's bytes on every platform
+- *(vector)* choose the exact kernel set for a bench run
+- *(vector)* measure the production exhaustive scan, not the unused flat index
+- *(vector)* qualify exact vector evaluation before and after
+
+### Bench
+
+- *(raft)* observe the copy's footprint inside a write
+- *(raft)* wait for a leader that confirms its lease
+- *(raft)* give the recovery image a promised term above 1
+- *(raft)* measure recovery, the copy's peak footprint and reads
+- *(raft)* trace each commit against the device's I/O
+- *(raft)* separate leadership seen from confirmed
+- *(raft)* bound each promise cost to its own span
+- *(raft)* measure what keeping consensus promises costs
+- *(storage)* measure statement flushes on a fresh store per series
+
 ## v0.9.0 - 2026-10-24
 
 ### Added
