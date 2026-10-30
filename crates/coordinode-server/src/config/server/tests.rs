@@ -318,6 +318,41 @@ fn index_feed_capacity_reaches_the_storage_config() {
     );
 }
 
+/// The text index worker's step and retry interval are config-file settings
+/// carried into the storage configuration: unset they keep the engine
+/// defaults, and zero is refused, as a step of none or a retry without a
+/// pause would never advance or would spin.
+#[test]
+fn text_index_worker_settings_reach_the_storage_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let default = ServerConfig {
+        data_dir: dir.path().to_str().unwrap().into(),
+        ..ServerConfig::default()
+    };
+    let storage = default.resolve_storage_config().expect("valid topology");
+    assert_eq!(
+        (storage.text_index_batch, storage.text_index_retry_ms),
+        (256, 1_000)
+    );
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "text_index_batch: 32\ntext_index_retry_ms: 250\n").unwrap();
+    let mut c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    c.data_dir = dir.path().to_str().unwrap().into();
+    let storage = c.resolve_storage_config().expect("valid topology");
+    assert_eq!(
+        (storage.text_index_batch, storage.text_index_retry_ms),
+        (32, 250)
+    );
+
+    for zero in ["text_index_batch: 0\n", "text_index_retry_ms: 0\n"] {
+        std::fs::write(&path, zero).unwrap();
+        assert!(
+            ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
+            "{zero}"
+        );
+    }
+}
+
 /// The slow-statement bound is a config-file setting: unset it leaves the
 /// built-in 100 ms, set it carries the milliseconds given, 0 included.
 #[test]

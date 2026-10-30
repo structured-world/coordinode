@@ -295,6 +295,10 @@ pub struct StorageEngine {
     /// How many applied commits a derived-index worker's subscription holds
     /// ([`StorageConfig::index_feed_capacity`]).
     index_feed_capacity: usize,
+    /// [`StorageConfig::text_index_batch`], at least one.
+    text_index_batch: usize,
+    /// [`StorageConfig::text_index_retry_ms`], at least one.
+    text_index_retry: std::time::Duration,
     /// The transactions open here (see [`Self::await_transactions_through`]).
     open_transactions: Arc<crate::engine::open_txns::OpenTransactions>,
     /// Refuses new writes while the disk under a durable endpoint is below
@@ -1524,6 +1528,8 @@ impl StorageEngine {
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
             applied_feed: Arc::new(crate::engine::applied::AppliedFeed::default()),
             index_feed_capacity: config.index_feed_capacity.max(1),
+            text_index_batch: config.text_index_batch.max(1),
+            text_index_retry: std::time::Duration::from_millis(config.text_index_retry_ms.max(1)),
             open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
             space: Arc::new(
                 crate::engine::space::SpaceGuard::new(config).with_footprints(footprints.clone()),
@@ -5726,6 +5732,18 @@ impl StorageEngine {
     /// subscription holds ([`StorageConfig::index_feed_capacity`]).
     pub fn index_feed_capacity(&self) -> usize {
         self.index_feed_capacity
+    }
+
+    /// Applied commits the text index worker folds in one step, and rows one
+    /// step of its passes writes ([`StorageConfig::text_index_batch`]).
+    pub fn text_index_batch(&self) -> usize {
+        self.text_index_batch
+    }
+
+    /// How often the text index worker retries what it could not finish
+    /// ([`StorageConfig::text_index_retry_ms`]).
+    pub fn text_index_retry(&self) -> std::time::Duration {
+        self.text_index_retry
     }
 
     /// Run `hook` between each entry's store write and its publication to

@@ -36,14 +36,6 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
 use rustc_hash::FxHashSet;
 
-/// Most applied entries folded together, bounding how long one fold holds
-/// the indexes' write locks and how much one Tantivy commit carries.
-const BATCH: usize = 256;
-
-/// The least wait before refolding ended temporal states again after an
-/// attempt failed.
-const REFOLD_RETRY: Duration = Duration::from_secs(1);
-
 /// Background thread that keeps this process's text indexes current with the
 /// entries applied on this node.
 pub struct TextIndexWorker {
@@ -135,6 +127,11 @@ impl Worker {
         // rebuilds until one rebuild covers them.
         let mut behind = false;
         let mut refold_failed = false;
+        // How often what could not be finished is tried again.
+        let retry = self.engine.text_index_retry();
+        // Most applied entries folded together, bounding how long one fold
+        // holds the indexes' write locks and how much one commit carries.
+        let batch = self.engine.text_index_batch();
         self.sync_selections_logged();
         while !self.stop.load(Ordering::Acquire) {
             // Asleep until an entry applies, a temporal node's indexed state
@@ -142,13 +139,13 @@ impl Worker {
             // After a failed refold the ended states stay due: wait a while
             // before the next attempt instead of spinning on them.
             let wait = match self.until_next_end() {
-                Some(wait) if refold_failed => Some(wait.max(REFOLD_RETRY)),
+                Some(wait) if refold_failed => Some(wait.max(retry)),
                 wait => wait,
             };
             // A reader left behind its last commit refuses searches until it
             // is caught up: this worker, the indexes' owner, retries it.
             let wait = if self.registry.any_lagging() {
-                Some(wait.map_or(REFOLD_RETRY, |w| w.min(REFOLD_RETRY)))
+                Some(wait.map_or(retry, |w| w.min(retry)))
             } else {
                 wait
             };
@@ -178,7 +175,7 @@ impl Worker {
                     AppliedEvent::Replaced => replaced = true,
                 }
                 taken += 1;
-                event = if taken < BATCH {
+                event = if taken < batch {
                     self.applied.try_next()
                 } else {
                     None
@@ -449,7 +446,8 @@ impl Worker {
         };
         let mut interrupted = false;
         let now = wall_clock_us();
-        for_each_rows_batch(&self.engine, self.shard_id, BATCH, &mut |rows| {
+        let batch = self.engine.text_index_batch();
+        for_each_rows_batch(&self.engine, self.shard_id, batch, &mut |rows| {
             let wrote = self.registry.apply_rows(
                 (&def.label, property),
                 interner,

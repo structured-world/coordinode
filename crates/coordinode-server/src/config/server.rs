@@ -486,6 +486,12 @@ pub struct ServerConfig {
     /// folded them (`None` = 16384); past it the worker rebuilds from the
     /// store and searches read the whole label meanwhile.
     pub index_feed_capacity: Option<usize>,
+    /// Applied commits the text index worker folds in one step, and rows one
+    /// step of its passes writes (`None` = 256).
+    pub text_index_batch: Option<std::num::NonZeroUsize>,
+    /// How often, in ms, the text index worker retries bringing a lagging
+    /// text index in line and refolding failed states (`None` = 1000).
+    pub text_index_retry_ms: Option<std::num::NonZeroU64>,
     /// Free disk space, in bytes, needed before refused writes are admitted
     /// again (`None` = 2 GiB; at least `min_free_bytes`).
     pub resume_free_bytes: Option<u64>,
@@ -723,6 +729,8 @@ impl Default for ServerConfig {
             snapshot_wait_ms: None,
             min_free_bytes: None,
             index_feed_capacity: None,
+            text_index_batch: None,
+            text_index_retry_ms: None,
             resume_free_bytes: None,
             maintenance_mb_per_sec: None,
             maintenance_backoff_ms: None,
@@ -1137,6 +1145,12 @@ impl ServerConfig {
         }
         if let Some(capacity) = self.index_feed_capacity {
             cfg.index_feed_capacity = capacity;
+        }
+        if let Some(batch) = self.text_index_batch {
+            cfg.text_index_batch = batch.get();
+        }
+        if let Some(ms) = self.text_index_retry_ms {
+            cfg.text_index_retry_ms = ms.get();
         }
         if let Some(bytes) = self.min_free_bytes {
             cfg.min_free_bytes = bytes;

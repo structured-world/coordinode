@@ -184,6 +184,8 @@ pub(crate) async fn serve(
         snapshot_wait_ms: _,
         min_free_bytes: _,
         index_feed_capacity: _,
+        text_index_batch: _,
+        text_index_retry_ms: _,
         resume_free_bytes: _,
         maintenance_mb_per_sec: _,
         maintenance_backoff_ms: _,

@@ -698,6 +698,17 @@ pub struct StorageConfig {
     /// label from the store. Default: 16384.
     pub index_feed_capacity: usize,
 
+    /// Applied commits the text index worker folds in one step, and node
+    /// rows one step of its passes writes: what one step holds an index's
+    /// write lock for. Default: 256.
+    pub text_index_batch: usize,
+
+    /// How often the text index worker retries bringing a text index whose
+    /// reader is behind its last write in line, and refolding states whose
+    /// fold failed. Searches of such an index are refused meanwhile.
+    /// Default: 1000 ms.
+    pub text_index_retry_ms: u64,
+
     /// Maximum write buffer size in bytes. Default: 64MB.
     pub max_write_buffer_bytes: u64,
 
@@ -1062,6 +1073,8 @@ impl StorageConfig {
             compression: CompressionConfig::default(),
             block_cache_bytes: 64 * 1024 * 1024,
             index_feed_capacity: 16_384,
+            text_index_batch: 256,
+            text_index_retry_ms: 1_000,
             max_write_buffer_bytes: 64 * 1024 * 1024,
             partition_compression: None,
             cache: TieredCacheConfig::default(),
