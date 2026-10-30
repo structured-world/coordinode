@@ -702,6 +702,91 @@ fn an_interrupted_implication_change_finishes_after_a_restart() {
     }
 }
 
+/// Writes while a change of what a type implies is proved move the count
+/// the change brings with it: tasks created and deleted then are counted
+/// under Thing once it is put in force and folded, so the label's counter
+/// answers the count a scan gives, through every step.
+#[test]
+fn writes_during_an_implication_change_are_counted_once_it_is_in_force() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open();
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE (:Task {title: 'a'}), (:Task {title: 'b'}), (:Thing {title: 'c'})",
+    ] {
+        db.execute_cypher(ddl).expect(ddl);
+    }
+    let run = |db: &Database, query: &str| {
+        db.execute_cypher_shared(query, None, None, None, None)
+            .unwrap_or_else(|e| panic!("{query}: {e}"))
+    };
+    let counted = |db: &Database| {
+        let rows = run(db, "MATCH (n:Thing) RETURN count(n) AS c").rows;
+        let scanned = run(db, "MATCH (n:Thing) WHERE n.title + '' <> '' RETURN n")
+            .rows
+            .len();
+        (rows[0].get("c").cloned(), scanned)
+    };
+    let older = db.begin_catalog_txn();
+    occupy_the_only_seat(&db);
+    let mut task = user_named(&db, "Task");
+    let revision = task.schema_revision;
+    task.set_implies(vec!["Thing".into()]);
+    let published = db
+        .publish_schema(SchemaPackage {
+            labels: vec![LabelDeclaration {
+                schema: task,
+                intent: Intent::Change {
+                    expected_revision: revision,
+                },
+            }],
+            ..SchemaPackage::default()
+        })
+        .expect("publish");
+    for write in [
+        "CREATE (:Task {title: 'd'}), (:Task {title: 'e'})",
+        "MATCH (n:Task {title: 'a'}) DELETE n",
+        "MATCH (n:Task {title: 'e'}) DELETE n",
+    ] {
+        run(&db, write);
+    }
+    assert_eq!(
+        counted(&db),
+        (Some(Value::Int(1)), 1),
+        "the facts in force while proved"
+    );
+
+    drop(older);
+    let readiness = db.await_schema(&published, WAIT).expect("await");
+    assert!(readiness.all_ready(), "{readiness:?}");
+    // Thing, b and d.
+    assert_eq!(counted(&db), (Some(Value::Int(3)), 3), "in force");
+    let deadline = std::time::Instant::now() + WAIT;
+    {
+        use coordinode_modality::IndexStore as _;
+        while coordinode_modality::LocalIndexStore::new(db.engine())
+            .list_definitions()
+            .expect("definitions")
+            .iter()
+            .any(|def| !def.selection.is_empty())
+        {
+            assert!(std::time::Instant::now() < deadline, "parts left unfolded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert_eq!(counted(&db), (Some(Value::Int(3)), 3), "folded");
+}
+
+/// The schema of label `name` as the catalog holds it.
+fn user_named(db: &Database, name: &str) -> LabelSchema {
+    db.label_schemas()
+        .expect("schemas")
+        .into_iter()
+        .find(|s| s.name == name)
+        .expect("declared")
+}
+
 /// A publication under a client operation takes effect once: retrying it
 /// after a lost reply answers with the operation's outcome instead of a
 /// revision conflict, another package under the same number is told

@@ -30,8 +30,9 @@ use crate::error::{StoreError, StoreResult};
 // layer's statistics reader shares them; re-exported here for Layer-5
 // callers that already import this module.
 pub use coordinode_core::graph::stats::{
-    LABEL_KEY_PREFIX, NODES_TOTAL_KEY, counter_delta_operand, label_count_key,
+    LABEL_KEY_PREFIX, NODES_TOTAL_KEY, counter_delta_operand, label_count_key, pending_count_key,
 };
+use coordinode_core::schema::label_id::LabelId;
 
 /// Layer 4 statistics store: stages planner-statistics counter deltas on the
 /// transaction alongside the data writes they describe.
@@ -55,15 +56,41 @@ pub trait StatsStore {
     /// Record one label removed from an existing node row (`REMOVE n:Label`).
     fn label_removed(&self, txn: &mut Transaction, label: &str);
 
-    /// Stage the delta that brings the count of `label`, as `txn` reads it,
-    /// to `count`: what a recount of the label's members commits. The read
-    /// binds the commit to the counter it corrected.
+    /// Record that change `operation`, while it is certified, will add
+    /// `delta` to the count of label `label` once put in force: a carrier
+    /// it gains placed (+1) or taken out (-1), one it retires placed (-1)
+    /// or taken out (+1). The counter of the label itself keeps the facts in
+    /// force until then.
+    fn pending_moved(&self, txn: &mut Transaction, operation: u64, label: LabelId, delta: i64);
+
+    /// What change `operation` adds to the count of `label` once put in
+    /// force, as `txn` reads it.
     ///
     /// # Errors
     ///
-    /// A storage failure, or a stored counter that does not decode or
-    /// differs from `count` by more than an i64 holds.
-    fn set_label_count(&self, txn: &mut Transaction, label: &str, count: u64) -> StoreResult<()>;
+    /// A storage failure or a counter that does not decode.
+    fn pending_count(
+        &self,
+        txn: &mut Transaction,
+        operation: u64,
+        label: LabelId,
+    ) -> StoreResult<i64>;
+
+    /// Settle what change `operation` left pending for `label` (named
+    /// `name`) once it ended: added to the label's count when it was put in
+    /// force (`in_force`), dropped either way. Nothing adds to it after the
+    /// change ended, as every writer bound to the change while it was
+    /// certified is refused at its commit after.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pending_count`].
+    fn settle_pending(
+        &self,
+        txn: &mut Transaction,
+        change: (u64, LabelId, &str),
+        in_force: bool,
+    ) -> StoreResult<()>;
 }
 
 /// CE statistics store over the counter partition's merge operator.
@@ -93,28 +120,53 @@ impl StatsStore for LocalStatsStore {
         txn.push_counter_delta(&label_count_key(label), -1);
     }
 
-    fn set_label_count(&self, txn: &mut Transaction, label: &str, count: u64) -> StoreResult<()> {
-        let key = label_count_key(label);
-        let counted = match txn.get(Partition::Counter, &key)? {
+    fn pending_moved(&self, txn: &mut Transaction, operation: u64, label: LabelId, delta: i64) {
+        if delta != 0 {
+            txn.push_counter_delta(&pending_count_key(operation, label.get()), delta);
+        }
+    }
+
+    fn pending_count(
+        &self,
+        txn: &mut Transaction,
+        operation: u64,
+        label: LabelId,
+    ) -> StoreResult<i64> {
+        let key = pending_count_key(operation, label.get());
+        let stored = match txn.get(Partition::Counter, &key)? {
             Some(bytes) => {
                 coordinode_storage::engine::merge::decode_counter(&bytes).map_err(|e| {
                     StoreError::Decode {
-                        kind: "node counter",
-                        message: format!("label {label}: {e}"),
+                        kind: "pending count",
+                        message: format!("label {label} under change {operation}: {e}"),
                     }
                 })?
             }
             None => 0,
         };
-        let out_of_range =
-            || StoreError::Invariant(format!("the counter of :{label} is out of range"));
-        let delta = i64::try_from(count)
-            .map_err(|_| out_of_range())?
-            .checked_sub(counted)
-            .ok_or_else(out_of_range)?;
-        if delta != 0 {
-            txn.push_counter_delta(&key, delta);
+        stored
+            .checked_add(txn.pending_counter_delta(&key))
+            .ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "the pending count of label {label} under change {operation} is out of range"
+                ))
+            })
+    }
+
+    fn settle_pending(
+        &self,
+        txn: &mut Transaction,
+        (operation, label, name): (u64, LabelId, &str),
+        in_force: bool,
+    ) -> StoreResult<()> {
+        let pending = self.pending_count(txn, operation, label)?;
+        if in_force && pending != 0 {
+            txn.push_counter_delta(&label_count_key(name), pending);
         }
+        txn.delete(
+            Partition::Counter,
+            &pending_count_key(operation, label.get()),
+        )?;
         Ok(())
     }
 }

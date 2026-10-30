@@ -107,6 +107,43 @@ impl<'a> LabelMembership<'a> {
     }
 }
 
+/// Record what moving the posting of `node` for `label` in shard `shard`
+/// into scope `now` (`None`: out of every scope) does to the count of the
+/// label once the change being certified for it is put in force: a gained
+/// posting counts one more then, a retired one one fewer. Judged by the
+/// postings the parts actually hold, so a writer and a preparation step
+/// placing the same posting count it once.
+fn pending_shift(
+    txn: &mut Transaction,
+    def: &IndexDefinition,
+    (shard, node, label): (u16, NodeId, LabelId),
+    now: Option<GenerationId>,
+) -> StoreResult<()> {
+    use crate::index_def::{PartRole, PartState};
+    use crate::stats::{LocalStatsStore, StatsStore as _};
+    use coordinode_core::index::encoding::encode_label_posting;
+    let mut operation = None;
+    let mut delta = 0i64;
+    for part in def
+        .selection
+        .iter()
+        .filter(|p| p.label == label && p.state == PartState::Proposed)
+    {
+        operation = Some(part.operation);
+        let key = encode_label_posting(part.part, shard, label, node.as_raw());
+        let held = i64::from(txn.get(Partition::Idx, &key)?.is_some());
+        let will = i64::from(now == Some(part.part));
+        delta += match part.role {
+            PartRole::Gained => will - held,
+            PartRole::Retired => held - will,
+        };
+    }
+    if let Some(operation) = operation {
+        LocalStatsStore.pending_moved(txn, operation.as_raw(), label, delta);
+    }
+    Ok(())
+}
+
 const LABEL_LOOKUP_KEY: &[u8] = IndexDefinition::LABEL_LOOKUP_KEY;
 
 /// Prefix of the marks of generations this member found its own copy of
@@ -355,21 +392,6 @@ pub trait IndexStore {
         base: GenerationId,
         limit: usize,
     ) -> StoreResult<bool>;
-
-    /// The number of postings of `label` in the label lookup `lookup`'s own
-    /// scope in shard `shard`, read in `txn`: the range read binds the
-    /// commit, so a writer moving the label meanwhile conflicts with it.
-    ///
-    /// # Errors
-    ///
-    /// A storage failure.
-    fn count_label_postings_txn(
-        &self,
-        txn: &mut Transaction,
-        lookup: &IndexDefinition,
-        shard: u16,
-        label: LabelId,
-    ) -> StoreResult<u64>;
 
     /// Apply one unit of mutations straight to the engine as one batch, for a
     /// context that has no log to replicate them through.
@@ -1428,31 +1450,6 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(empty)
     }
 
-    fn count_label_postings_txn(
-        &self,
-        txn: &mut Transaction,
-        lookup: &IndexDefinition,
-        shard: u16,
-        label: LabelId,
-    ) -> StoreResult<u64> {
-        use coordinode_core::index::encoding::{label_range_prefix, prefix_end};
-        let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
-        let range = label_range_prefix(lookup.generation, shard, label);
-        let mut members: u64 = 0;
-        txn.range_for_each(
-            Partition::Idx,
-            &range,
-            &prefix_end(&range),
-            &budget,
-            |_, _| {
-                // One posting per key; a shard holds far fewer than u64::MAX.
-                members += 1;
-                Ok::<_, StoreError>(core::ops::ControlFlow::Continue(()))
-            },
-        )?;
-        Ok(members)
-    }
-
     fn apply_unreplicated(&self, mutations: &[Mutation]) -> StoreResult<()> {
         // One batch, as a proposal applies: commands decided, DERIVED work
         // derived, all effects visible together.
@@ -1565,6 +1562,7 @@ impl IndexStore for LocalIndexStore<'_> {
             if was == now {
                 return Ok(());
             }
+            pending_shift(txn, def, (shard, node, label), now)?;
             // The posting may sit in any scope of the label: a change being
             // certified or folded moves postings between them.
             for scope in def.scopes_of(label).into_iter().filter(|s| Some(*s) != now) {
@@ -1616,6 +1614,7 @@ impl IndexStore for LocalIndexStore<'_> {
                     continue 'labels;
                 }
             }
+            pending_shift(txn, def, (shard, node, label), Some(scope))?;
             txn.put(
                 Partition::Idx,
                 &encode_label_posting(scope, shard, label, node.as_raw()),

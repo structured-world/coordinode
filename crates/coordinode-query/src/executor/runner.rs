@@ -7405,30 +7405,42 @@ fn counted_nodes(
     if ctx.snapshot_ts.is_some() || !node_counter_answers_scan(ctx.engine, label)? {
         return Ok(None);
     }
-    // A label whose carriers a change of what a type implies moves has its
-    // members split across the lookup's scopes until the change is folded
-    // in; its counter follows the facts it was kept under, so the members
-    // are counted from the lookup instead.
+    // A change of what a type implies, put in force but not folded in yet,
+    // keeps what it adds to the label's count pending beside the counter,
+    // which still follows the facts it replaced until the fold settles it.
+    ctx.sync_txn_state();
+    let mut pending = 0i64;
     if let Some(registry) = ctx.btree_index_registry
         && let Some((lookup, _)) = registry.label_lookup_published()
         && let Some(id) = ctx.label_id(label)?
     {
-        use coordinode_modality::IndexStore as _;
+        use coordinode_modality::{IndexStore as _, PartState, StatsStore as _};
         let at_view = coordinode_modality::LocalIndexStore::new(ctx.engine)
             .definition_in(&mut ctx.txn, lookup.id)?;
-        if at_view.is_some_and(|def| def.scopes_of(id).len() > 1) {
-            return Ok(None);
+        let in_force = at_view.and_then(|def| {
+            def.selection
+                .iter()
+                .find(|p| p.label == id && p.state == PartState::InForce)
+                .map(|p| p.operation)
+        });
+        if let Some(operation) = in_force {
+            pending = coordinode_modality::LocalStatsStore.pending_count(
+                &mut ctx.txn,
+                operation.as_raw(),
+                id,
+            )?;
         }
     }
     let key = coordinode_core::graph::stats::label_count_key(label);
-    ctx.sync_txn_state();
     let stored = match ctx.txn.get(Partition::Counter, &key)? {
         Some(bytes) => coordinode_storage::engine::merge::decode_counter(&bytes).map_err(|e| {
             ExecutionError::Serialization(format!("node counter of label {label}: {e}"))
         })?,
         None => 0,
     };
-    let count = stored.checked_add(ctx.txn.pending_counter_delta(&key));
+    let count = stored
+        .checked_add(ctx.txn.pending_counter_delta(&key))
+        .and_then(|n| n.checked_add(pending));
     match count {
         Some(n) if n >= 0 => Ok(Some(n)),
         _ => {

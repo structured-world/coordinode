@@ -23,6 +23,22 @@ pub fn label_count_key(label: &str) -> Vec<u8> {
     k
 }
 
+/// The counter-key prefix for the counts a change of what a type implies
+/// leaves pending; the change's identity and the label's follow.
+pub const PENDING_KEY_PREFIX: &[u8] = b"stat:pending:";
+
+/// Build the counter key of what change `operation` adds to the count of
+/// label `label` once put in force: its carriers gained less those retired,
+/// counted as the change's preparation and writers place them.
+#[must_use]
+pub fn pending_count_key(operation: u64, label: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PENDING_KEY_PREFIX.len() + 12);
+    k.extend_from_slice(PENDING_KEY_PREFIX);
+    k.extend_from_slice(&operation.to_be_bytes());
+    k.extend_from_slice(&label.to_be_bytes());
+    k
+}
+
 /// Encode a signed counter delta as the counter partition's merge operand
 /// (i64 little-endian).
 #[must_use]

@@ -1065,6 +1065,120 @@ fn a_fold_never_brings_back_a_posting_a_writer_removed() {
     }
 }
 
+/// While a change is certified, every posting moved into or out of its parts
+/// leaves what the change adds to the label's count pending: each placed
+/// once however often a preparation step and a writer place it, each taken
+/// out once. Settled, it lands on the counter when put in force and is
+/// dropped when withdrawn, so the counter answers the count of the facts in
+/// force at every step without reading the label's postings.
+#[test]
+fn a_change_leaves_its_count_pending_until_it_is_settled() {
+    use crate::stats::{LocalStatsStore, StatsStore as _, label_count_key};
+    let label = |raw| coordinode_core::schema::label_id::LabelId::new(raw).expect("nonzero");
+    let thing = label(10);
+    let operation = GenerationId::from_raw(20);
+    let (gained, retired) = (GenerationId::from_raw(21), GenerationId::from_raw(22));
+    for put_in_force in [true, false] {
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let store = LocalIndexStore::new(engine);
+        let mut lookup =
+            IndexDescriptor::label_lookup().bind(IndexId::from_raw(1), GenerationId::from_raw(4));
+        // Four carriers in force, counted.
+        let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+        for n in 1..=4 {
+            store
+                .stage_label_postings_txn(
+                    &mut t,
+                    &lookup,
+                    0,
+                    id(n),
+                    settled(&[]),
+                    settled(&[thing]),
+                )
+                .unwrap();
+            LocalStatsStore.label_added(&mut t, "Thing");
+        }
+        commit(&mut t).unwrap();
+        lookup.propose_parts(thing, operation, gained, retired);
+        let pending = || {
+            let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+            LocalStatsStore
+                .pending_count(&mut t, operation.as_raw(), thing)
+                .unwrap()
+        };
+
+        // Nodes 1 and 2 lose Thing; 1 is moved twice, as a retried step would.
+        let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+        for n in [1, 2, 1] {
+            store
+                .stage_label_postings_txn(
+                    &mut t,
+                    &lookup,
+                    0,
+                    id(n),
+                    settled(&[thing]),
+                    both(&[thing], &[]),
+                )
+                .unwrap();
+        }
+        // Nodes 7 and 8 gain it; 7 is placed by a writer and by presence.
+        for n in [7, 8] {
+            store
+                .stage_label_postings_txn(
+                    &mut t,
+                    &lookup,
+                    0,
+                    id(n),
+                    settled(&[]),
+                    both(&[], &[thing]),
+                )
+                .unwrap();
+        }
+        store
+            .stage_label_presence_txn(&mut t, &lookup, 0, id(7), both(&[], &[thing]))
+            .unwrap();
+        // Node 9 gains it and is deleted before the change concludes.
+        store
+            .stage_label_postings_txn(&mut t, &lookup, 0, id(9), settled(&[]), both(&[], &[thing]))
+            .unwrap();
+        store
+            .stage_label_postings_txn(&mut t, &lookup, 0, id(9), both(&[], &[thing]), settled(&[]))
+            .unwrap();
+        // Node 2, retired, is deleted too: no longer counted by either.
+        store
+            .stage_label_postings_txn(&mut t, &lookup, 0, id(2), both(&[thing], &[]), settled(&[]))
+            .unwrap();
+        LocalStatsStore.label_removed(&mut t, "Thing");
+        commit(&mut t).unwrap();
+        // In force: 1, 3, 4 (2 deleted). Candidate: 3, 4, 7, 8.
+        assert_eq!(pending(), 1, "candidate 4 against 3 in force");
+
+        let state = if put_in_force {
+            PartState::InForce
+        } else {
+            PartState::Withdrawn
+        };
+        assert!(lookup.conclude_parts(operation, state));
+        let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+        LocalStatsStore
+            .settle_pending(&mut t, (operation.as_raw(), thing, "Thing"), put_in_force)
+            .unwrap();
+        commit(&mut t).unwrap();
+        assert_eq!(pending(), 0, "settled once");
+        let counted = engine
+            .get(Partition::Counter, &label_count_key("Thing"))
+            .unwrap()
+            .map(|b| coordinode_storage::engine::merge::decode_counter(&b).unwrap());
+        assert_eq!(
+            counted,
+            Some(if put_in_force { 4 } else { 3 }),
+            "in force: {put_in_force}"
+        );
+    }
+}
+
 /// A description is catalog metadata: editing it rewrites the definition
 /// record only, never the generation or an entry.
 #[test]

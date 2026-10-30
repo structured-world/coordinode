@@ -174,7 +174,6 @@ impl Shared {
         let folded = crate::index::reconcile::Fold {
             engine: env.engine(),
             oracle: env.oracle(),
-            shard_id: env.shard_id(),
             stop: Some(&self.stopping),
             registry: Some(env.registry()),
         }

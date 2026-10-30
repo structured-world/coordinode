@@ -226,16 +226,14 @@ impl Reconcile<'_> {
 /// Folding of the parts a concluded change left: put in force, the gained
 /// entries move into the index's own and the retired ones are removed;
 /// withdrawn, the retired entries move back and the gained ones are
-/// removed. Each part is dropped from its definition once empty, the label
-/// lookup's counter of the label recounted from its postings in that same
+/// removed. Each part is dropped from its definition once empty, what the
+/// change left pending for the label's counter settled in that same
 /// commit, so readers go back to one scope and the counter.
 pub(crate) struct Fold<'a> {
     /// The storage engine.
     pub engine: &'a StorageEngine,
     /// The timestamp oracle; `None` for a direct-mode engine.
     pub oracle: Option<&'a TimestampOracle>,
-    /// The shard whose postings are counted.
-    pub shard_id: u16,
     /// Set when the process is closing.
     pub stop: Option<&'a core::sync::atomic::AtomicBool>,
     /// The writers' registry, told each definition a step changed as soon
@@ -307,7 +305,7 @@ impl Fold<'_> {
                 let mut folded = def.clone();
                 folded.drop_part(part.part);
                 if def.index_type == IndexType::Labels && !folded.has_parts_for(part.label) {
-                    recount(self.engine, &mut txn, &folded, self.shard_id, part.label)?;
+                    settle_count(self.engine, &mut txn, part)?;
                 }
                 store.put_definition_txn(&mut txn, &folded)?;
                 next_def = Some(folded);
@@ -334,27 +332,26 @@ impl Fold<'_> {
     }
 }
 
-/// Set the counter of `label` to the number of its postings in the label
-/// lookup `lookup`'s own scope in shard `shard`, read in `txn`: the range
-/// read binds the commit, so a writer moving the label meanwhile conflicts
-/// with it, and the counter follows the facts in force again.
-fn recount(
+/// Settle what the change `part` belongs to left pending for the count of
+/// its label, in the commit dropping the label's last part: added to the
+/// counter when it was put in force, dropped when withdrawn. No step reads
+/// the label's postings, so the cost does not grow with the label.
+fn settle_count(
     engine: &StorageEngine,
     txn: &mut Transaction<'_>,
-    lookup: &IndexDefinition,
-    shard: u16,
-    label: LabelId,
+    part: coordinode_modality::SelectionPart,
 ) -> Result<(), StoreError> {
     use coordinode_modality::{
-        IndexStore as _, LocalIndexStore, LocalSchemaStore, LocalStatsStore, SchemaStore as _,
-        StatsStore as _,
+        LocalSchemaStore, LocalStatsStore, SchemaStore as _, StatsStore as _,
     };
-    let Some(name) = LocalSchemaStore::new(engine).label_name(label)? else {
+    let Some(name) = LocalSchemaStore::new(engine).label_name(part.label)? else {
         return Ok(());
     };
-    let members =
-        LocalIndexStore::new(engine).count_label_postings_txn(txn, lookup, shard, label)?;
-    LocalStatsStore.set_label_count(txn, &name, members)
+    LocalStatsStore.settle_pending(
+        txn,
+        (part.operation.as_raw(), part.label, &name),
+        part.state == PartState::InForce,
+    )
 }
 
 /// The owner of the entries of the stored node row under `key`: the node,
