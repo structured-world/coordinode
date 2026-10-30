@@ -384,8 +384,24 @@ CREATE (:Rule:Policy {name: 'a', owner: 'ops'})  -- OK: Rule is an undeclared FL
 CREATE (:Goal {title: 'b'})
 MATCH (n:Thing {title: 'b'}) RETURN n            -- finds the Goal through thing_title
 ```
-- Whether a label is a type or auxiliary, and the labels a type implies, are fixed when the label is created. Declaring a label auxiliary when stored nodes carry it as their type is refused, and so is declaring `IMPLIES` for a label that already types stored nodes: an implied label is itself a type, which those nodes cannot already carry.
-- The schema API carries the same declarations: `Label.kind` and `Label.implies`, and the `kind` and `implies` fields of `CreateLabelRequest` and of a `PublishSchema` label.
+- Whether a label is a type or auxiliary is fixed when the label is created: declaring a label auxiliary when stored nodes carry it as their type is refused. What a type implies changes with `ALTER NODE TYPE ... SET IMPLIES`, below; `CREATE NODE TYPE ... IMPLIES` over a label that already types stored nodes is refused, since those nodes would carry the new labels before the change reconciled them.
+- The schema API carries the same declarations: `Label.kind` and `Label.implies`, and the `kind` and `implies` fields of `CreateLabelRequest` and of a `PublishSchema` label. A label whose `implies` differs from the one in force is changed as `ALTER NODE TYPE ... SET IMPLIES` changes it; a package changing several types' implications puts them in force together. While the change is proved, `LabelCandidate.implies` holds the implication it proposes.
+
+#### ALTER NODE TYPE ... SET IMPLIES ✅ 🔷
+
+Changes the labels a type implies, over the nodes already stored.
+
+```cypher
+ALTER NODE TYPE Task SET IMPLIES (Thing)   -- tasks become things
+ALTER NODE TYPE Task SET IMPLIES ()        -- and stop being things
+```
+
+- The new implication is checked as a declaration is: every property of an implied label must be declared by the type with the same type, and the type can imply neither itself, an auxiliary label nor a label that implies it.
+- The change is published as the type's candidate and proved over the stored nodes of the type and of every type implying it before it is put in force: a node breaking an explicit constraint of a label it would come to carry, or a `UNIQUE` value it would share with another carrier of that label, refuses the change and is named in the error. A refused change leaves the implication, the label scans, the indexes and the constraints as they were. Writes made while the change is proved are held to both the implication in force and the proposed one.
+- Label scans, counts and B-tree indexes of the labels whose carriers move find exactly the nodes of the implication in force at each statement's snapshot, before, during and after the change: the stored nodes are reconciled in the background, without rewriting a node record, and the change takes effect in one commit. The statement answers with the implication in force and, while the proof runs past the statement wait, the operation proving it.
+- The result row has `label`, `implies`, `changed` (`false` when the implication was already the one asked for) and `operation`.
+- A full-text or vector index on a label whose carriers the change moves refuses it.
+- One change moving the carriers of a label at a time: a second one is refused until the first ends.
 
 #### CREATE INDEX / DROP INDEX ✅
 

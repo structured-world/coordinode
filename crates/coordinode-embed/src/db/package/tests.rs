@@ -628,6 +628,80 @@ fn an_interrupted_certification_finishes_after_a_restart() {
     );
 }
 
+/// A change of what a type implies interrupted before its proof ran keeps
+/// the implication in force while closed, and the next open reconciles the
+/// stored carriers, puts it in force and folds what it kept apart.
+#[test]
+fn an_interrupted_implication_change_finishes_after_a_restart() {
+    use coordinode_modality::IndexStore as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let members = |db: &mut Database| {
+        db.execute_cypher("MATCH (n:Thing) RETURN n")
+            .expect("scan")
+            .len()
+    };
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        for ddl in [
+            "CREATE NODE TYPE Thing WITH (title: STRING)",
+            "CREATE NODE TYPE Task WITH (title: STRING)",
+            "CREATE INDEX thing_title ON :Thing(title)",
+            "CREATE (:Task {title: 'a'}), (:Task {title: 'b'}), (:Thing {title: 'a'})",
+        ] {
+            db.execute_cypher(ddl).expect(ddl);
+        }
+        db.begin_transaction().expect("begin");
+        occupy_the_only_seat(&db);
+        let mut task = db
+            .label_schemas()
+            .expect("schemas")
+            .into_iter()
+            .find(|s| s.name == "Task")
+            .expect("task");
+        let revision = task.schema_revision;
+        task.set_implies(vec!["Thing".into()]);
+        let published = db
+            .publish_schema(SchemaPackage {
+                labels: vec![LabelDeclaration {
+                    schema: task,
+                    intent: Intent::Change {
+                        expected_revision: revision,
+                    },
+                }],
+                ..SchemaPackage::default()
+            })
+            .expect("publish");
+        let pending = db.await_schema(&published, Duration::ZERO).expect("look");
+        assert_eq!(
+            pending.of(CatalogObject::Label, "Task"),
+            Some(&Readiness::Pending)
+        );
+        assert_eq!(members(&mut db), 1, "the implication in force stays");
+    }
+
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let deadline = std::time::Instant::now() + WAIT;
+    while members(&mut db) != 3 {
+        assert!(std::time::Instant::now() < deadline, "not put in force");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        db.execute_cypher("MATCH (n:Thing {title: 'a'}) RETURN n")
+            .expect("through the index")
+            .len(),
+        2
+    );
+    while coordinode_modality::LocalIndexStore::new(db.engine())
+        .list_definitions()
+        .expect("definitions")
+        .iter()
+        .any(|def| !def.selection.is_empty())
+    {
+        assert!(std::time::Instant::now() < deadline, "parts left unfolded");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A publication under a client operation takes effect once: retrying it
 /// after a lost reply answers with the operation's outcome instead of a
 /// revision conflict, another package under the same number is told
