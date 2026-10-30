@@ -77,7 +77,7 @@ pub struct TextIndexRegistry {
     coverage: RwLock<Option<Arc<IndexCoverage>>>,
     /// The interpretations each index's documents hold, changed only under
     /// that index's write lock (see [`Self::with_index`]).
-    held: RwLock<HashMap<TextIndexKey, Held>>,
+    held: RwLock<HashMap<TextIndexKey, (Held, u64)>>,
     /// The owned footprints the index files are charged to.
     footprints: coordinode_storage::engine::footprint::Footprints,
 }
@@ -609,9 +609,10 @@ impl TextIndexRegistry {
         (label, property): (&str, &str),
         interner: &FieldInterner,
         (rows, at): (&[(NodeId, NodeRows)], i64),
+        guard: Option<u64>,
         choose: impl FnOnce(&Held) -> Option<Judged>,
     ) -> Result<bool, String> {
-        let wrote = self.with_index(label, property, |index, held| {
+        let wrote = self.with_index_at(label, property, guard, |index, held| {
             let Some((carriers, candidate)) = choose(held) else {
                 return Ok(false);
             };
@@ -630,12 +631,45 @@ impl TextIndexRegistry {
             }
             Ok(true)
         })?;
-        Ok(wrote.unwrap_or(false))
+        Ok(wrote.is_some_and(|(wrote, _)| wrote))
+    }
+
+    /// Bring the index of `(label, property)` back to one interpretation,
+    /// `settled`, in one step under its write lock while its
+    /// interpretations are at revision `guard`: the documents of `dropped`
+    /// go and the others count as shared (see
+    /// [`MultiLanguageTextIndex::settle`]). Returns whether it settled:
+    /// not when there is no such index or the revision moved.
+    ///
+    /// # Errors
+    ///
+    /// A failed write; the index is left as it was then.
+    pub fn settle(
+        &self,
+        (label, property): (&str, &str),
+        dropped: Scope,
+        guard: u64,
+        settled: Held,
+    ) -> Result<bool, String> {
+        let done =
+            self.with_index_revised(label, property, (Some(guard), true), |index, held| {
+                index.settle(dropped)?;
+                *held = settled;
+                Ok(())
+            })?;
+        Ok(done.is_some())
     }
 
     /// The interpretations the documents of the index of `(label, property)`
     /// hold; `None` when there is no such index.
     pub fn held(&self, label: &str, property: &str) -> Option<Held> {
+        self.held_at(label, property).map(|(held, _)| held)
+    }
+
+    /// [`Self::held`] with its revision, which moves whenever the
+    /// interpretations change: a step bound to one revision is refused once
+    /// another changed them, even back to equal ones.
+    pub fn held_at(&self, label: &str, property: &str) -> Option<(Held, u64)> {
         self.held
             .read()
             .ok()?
@@ -653,6 +687,36 @@ impl TextIndexRegistry {
         property: &str,
         step: impl FnOnce(&mut MultiLanguageTextIndex, &mut Held) -> Result<T, TextSearchError>,
     ) -> Result<Option<T>, String> {
+        Ok(self
+            .with_index_at(label, property, None, step)?
+            .map(|(outcome, _)| outcome))
+    }
+
+    /// [`Self::with_index`] only while the interpretations are at revision
+    /// `guard` when given, returning the step's outcome and the revision
+    /// after it; `Ok(None)` when there is no such index or the revision
+    /// moved.
+    pub fn with_index_at<T>(
+        &self,
+        label: &str,
+        property: &str,
+        guard: Option<u64>,
+        step: impl FnOnce(&mut MultiLanguageTextIndex, &mut Held) -> Result<T, TextSearchError>,
+    ) -> Result<Option<(T, u64)>, String> {
+        self.with_index_revised(label, property, (guard, false), step)
+    }
+
+    /// [`Self::with_index_at`], moving the revision on even when the
+    /// interpretations end equal when `rewrites` is set: a step that
+    /// replaces the documents wholesale, after which no step bound to the
+    /// documents before may run.
+    fn with_index_revised<T>(
+        &self,
+        label: &str,
+        property: &str,
+        (guard, rewrites): (Option<u64>, bool),
+        step: impl FnOnce(&mut MultiLanguageTextIndex, &mut Held) -> Result<T, TextSearchError>,
+    ) -> Result<Option<(T, u64)>, String> {
         let Some(handle) = self.get(label, property) else {
             return Ok(None);
         };
@@ -661,13 +725,26 @@ impl TextIndexRegistry {
         let mut index = handle.write().map_err(|_| failed(&"lock poisoned"))?;
         // Changed on a copy, and stored while the index is still locked: the
         // registry-wide map is held for the store alone, never for a step.
-        let mut interpretation = self.held(label, property).unwrap_or_default();
+        let (before, revision) = self.held_at(label, property).unwrap_or_default();
+        if guard.is_some_and(|guard| guard != revision) {
+            return Ok(None);
+        }
+        let mut interpretation = before.clone();
         let outcome = step(&mut index, &mut interpretation).map_err(|e| failed(&e))?;
+        let revision = if interpretation == before && !rewrites {
+            revision
+        } else {
+            // Never wraps: one change per step, far below u64::MAX.
+            revision + 1
+        };
         self.held
             .write()
             .map_err(|_| failed(&"lock poisoned"))?
-            .insert((label.to_string(), property.to_string()), interpretation);
-        Ok(Some(outcome))
+            .insert(
+                (label.to_string(), property.to_string()),
+                (interpretation, revision),
+            );
+        Ok(Some((outcome, revision)))
     }
 
     /// Rebuild the index of `(label, property)` from `scan`, the nodes'
@@ -684,7 +761,7 @@ impl TextIndexRegistry {
         property: &str,
         scan: impl FnOnce() -> Result<(Vec<NodeText>, Held), String>,
     ) -> Result<usize, String> {
-        let rebuilt = self.with_index(label, property, |idx, held| {
+        let rebuilt = self.with_index_revised(label, property, (None, true), |idx, held| {
             let (scanned, interpretation) = scan().map_err(TextSearchError::IndexCorrupted)?;
             let (documents, _) = split_changes(property, &scanned);
             idx.replace_all_scoped(&documents)?;
@@ -695,7 +772,7 @@ impl TextIndexRegistry {
             *held = interpretation;
             Ok(documents.len())
         })?;
-        Ok(rebuilt.unwrap_or(0))
+        Ok(rebuilt.map_or(0, |(documents, _)| documents))
     }
 
     /// Convert a `TextIndexConfig` to `MultiLangConfig`.
@@ -802,9 +879,13 @@ impl TextIndexRegistry {
             };
 
             let key = (def.label.clone(), prop.clone());
-            // A new index holds no interpretation until it is built.
+            // A new index holds no interpretation until it is built; its
+            // revision keeps growing, so a step bound to the old one is
+            // refused rather than mistaken for one on the new.
             if let Ok(mut held) = self.held.write() {
-                held.remove(&key);
+                let (interpretation, revision) = held.entry(key.clone()).or_default();
+                *interpretation = Held::default();
+                *revision += 1;
             }
             if let Ok(mut indexes) = self.indexes.write() {
                 indexes.insert(key, Arc::new(RwLock::new(text_index)));
@@ -835,9 +916,14 @@ impl TextIndexRegistry {
                 indexes.remove(&(label.to_string(), prop.clone()));
             }
         }
+        // Kept with a grown revision rather than forgotten, so a step bound
+        // to the dropped index never matches one registered after it.
         if let Ok(mut held) = self.held.write() {
             for prop in &all_properties {
-                held.remove(&(label.to_string(), prop.clone()));
+                let (interpretation, revision) =
+                    held.entry((label.to_string(), prop.clone())).or_default();
+                *interpretation = Held::default();
+                *revision += 1;
             }
         }
         if let Ok(mut defs) = self.definitions.write() {

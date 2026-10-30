@@ -1132,6 +1132,63 @@ fn a_superseded_node_of_the_left_out_scope_is_not_taken_out_twice() {
     }
 }
 
+/// Settling a change removes the dropped scope's documents in one commit
+/// and ranks as an index of the rest, without reading or rewriting the kept
+/// ones; those count as shared from then on, so the next change's scopes
+/// never take them in. Both ways: put in force and withdrawn.
+#[test]
+fn a_settled_change_ranks_as_the_interpretation_it_keeps() {
+    for (dropped, kept) in [
+        (
+            Scope::Retired,
+            &[(1, "rust graph rust"), (4, "graph graph store")][..],
+        ),
+        (
+            Scope::Gained,
+            &[(1, "rust graph rust"), (3, "rust graph")][..],
+        ),
+    ] {
+        let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut idx = MultiLanguageTextIndex::create_scratch(
+            dirs.0.path(),
+            15_000_000,
+            MultiLangConfig::with_default_language("english"),
+            Default::default(),
+        )
+        .unwrap();
+        idx.apply_scoped_changes(
+            &[
+                (1, props(&[("body", "rust graph rust")]), Scope::Shared),
+                (3, props(&[("body", "rust graph")]), Scope::Retired),
+                (4, props(&[("body", "graph graph store")]), Scope::Gained),
+            ],
+            &[],
+        )
+        .unwrap();
+        idx.settle(dropped).unwrap();
+        assert!(idx.all_shared(), "{dropped:?}");
+        let oracle = fresh(dirs.1.path(), kept);
+        for query in ["rust", "graph", "store"] {
+            assert_same_scores(
+                &scores(&idx, query, &PendingDocuments::none()),
+                &scores(&oracle, query, &PendingDocuments::none()),
+            );
+        }
+
+        // The next change keeps a new document apart; leaving it out leaves
+        // the documents the settled change kept in.
+        idx.apply_scoped_changes(&[(9, props(&[("body", "graph")]), Scope::Gained)], &[])
+            .unwrap();
+        let ids: Vec<u64> = scores_without(&idx, "graph", Scope::Gained)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let mut expected: Vec<u64> = kept.iter().map(|(id, _)| *id).collect();
+        expected.sort_unstable();
+        assert_eq!(ids, expected, "{dropped:?}");
+    }
+}
+
 /// A document rewritten into another scope leaves its old scope's
 /// statistics, so once every document is shared again the index says so,
 /// and the scopes' members are the nodes written there.

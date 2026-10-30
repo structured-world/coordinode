@@ -172,22 +172,31 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// The value of the document's scope field.
-    pub const fn as_u64(self) -> u64 {
+    /// The value of the scope field of a document written in this scope
+    /// while the index follows change `epoch`: shared documents carry 0, the
+    /// others their epoch with their role, so a later change's tags never
+    /// name a document an earlier one kept apart.
+    const fn tag(self, epoch: u64) -> u64 {
+        // An index counts its changes from zero, one per change it follows,
+        // far below u64::MAX / 2.
         match self {
             Self::Shared => 0,
-            Self::Retired => 1,
-            Self::Gained => 2,
+            Self::Retired => epoch * 2 + 1,
+            Self::Gained => epoch * 2 + 2,
         }
     }
 
-    /// The scope a stored scope field value names; an absent or unknown one
-    /// is shared, as a document written outside any change.
-    pub const fn from_u64(value: u64) -> Self {
-        match value {
-            1 => Self::Retired,
-            2 => Self::Gained,
-            _ => Self::Shared,
+    /// The scope a stored scope field value names under change `epoch`: a
+    /// document kept apart under an earlier change, which that change's
+    /// settling left in place, is shared now, as is one written without a
+    /// value.
+    const fn of_tag(tag: u64, epoch: u64) -> Self {
+        if tag == 0 || (tag - 1) / 2 != epoch {
+            Self::Shared
+        } else if tag % 2 == 1 {
+            Self::Retired
+        } else {
+            Self::Gained
         }
     }
 }
@@ -267,6 +276,9 @@ pub struct TextIndex {
     /// What the documents of the scopes other than the shared one add to
     /// `corpus`, kept in step with it.
     aside: Aside,
+    /// The change of what a type implies the index's scoped documents
+    /// belong to, counted from zero; a settled change moves it on.
+    epoch: u64,
 }
 
 /// The schema of a text index and the fields the index reads by handle.
@@ -464,7 +476,19 @@ impl TextIndex {
             registry: RwLock::new(SegmentRegistry::new()),
             corpus: None,
             aside: Aside::default(),
+            epoch: 0,
         })
+    }
+
+    /// The scope field value of a document written in `scope` now.
+    pub(crate) fn scope_tag(&self, scope: Scope) -> u64 {
+        scope.tag(self.epoch)
+    }
+
+    /// The term matching the documents written in `scope` under the change
+    /// the index follows now.
+    fn scope_term(&self, scope: Scope) -> tantivy::Term {
+        tantivy::Term::from_field_u64(self.scope_field, self.scope_tag(scope))
     }
 
     /// The tokens a stored document's body was indexed with, one per
@@ -475,10 +499,11 @@ impl TextIndex {
 
     /// The scope a stored document was written in.
     fn stored_scope(&self, doc: &TantivyDocument) -> Scope {
-        Scope::from_u64(
+        Scope::of_tag(
             doc.get_first(self.scope_field)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
+            self.epoch,
         )
     }
 
@@ -528,8 +553,7 @@ impl TextIndex {
     /// index holds them, ascending.
     fn scope_members(&self, scope: Scope) -> Result<Vec<u64>, TextSearchError> {
         let searcher = self.reader.searcher();
-        let term = tantivy::Term::from_field_u64(self.scope_field, scope.as_u64());
-        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let query = TermQuery::new(self.scope_term(scope), IndexRecordOption::Basic);
         let addresses = searcher.search(&query, &tantivy::collector::DocSetCollector)?;
         let mut members = Vec::with_capacity(addresses.len());
         for address in addresses {

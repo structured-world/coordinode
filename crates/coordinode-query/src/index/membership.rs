@@ -84,10 +84,16 @@ pub fn label_carriers_in(
 }
 
 /// The membership of the records one pass reads, under one view of the
-/// catalog: its latest state, or the state at a pinned snapshot.
+/// catalog, pinned for the whole pass: every fact it judges by is of one
+/// committed state, never a mix of several.
 pub struct CatalogMembership<'a> {
     engine: &'a StorageEngine,
-    snapshot: Option<StorageSnapshot>,
+    snapshot: StorageSnapshot,
+    /// Keeps the catalog of `snapshot` readable for the whole pass: no
+    /// compaction collects a version it still judges by. `None` when the
+    /// snapshot was already below the collection watermark, which the reads
+    /// then report.
+    _pin: Option<coordinode_storage::engine::coordinator::SnapshotPin>,
     implied: ImpliedCache,
     ids: rustc_hash::FxHashMap<String, Option<LabelId>>,
     /// Whether a label's published candidate answers for it instead of the
@@ -96,37 +102,56 @@ pub struct CatalogMembership<'a> {
 }
 
 impl<'a> CatalogMembership<'a> {
-    /// Membership under the latest catalog.
+    /// Membership under the catalog as it stands now.
     pub fn current(engine: &'a StorageEngine) -> Self {
+        let (snapshot, pin) = engine.pin_latest_snapshot();
+        Self::pinned(engine, snapshot, pin)
+    }
+
+    /// Membership under the catalog as it stands now with every published
+    /// candidate put in force: what a node carries once the changes being
+    /// proved are.
+    pub fn candidates(engine: &'a StorageEngine) -> Self {
+        let (snapshot, pin) = engine.pin_latest_snapshot();
+        Self {
+            candidates: true,
+            ..Self::pinned(engine, snapshot, pin)
+        }
+    }
+
+    /// Membership under the catalog as `snapshot` reads it.
+    pub fn at(engine: &'a StorageEngine, snapshot: StorageSnapshot) -> Self {
+        Self::pinned(engine, snapshot, engine.pin_snapshot_at(snapshot))
+    }
+
+    fn pinned(
+        engine: &'a StorageEngine,
+        snapshot: StorageSnapshot,
+        pin: Option<coordinode_storage::engine::coordinator::SnapshotPin>,
+    ) -> Self {
         Self {
             engine,
-            snapshot: None,
+            snapshot,
+            _pin: pin,
             implied: ImpliedCache::default(),
             ids: rustc_hash::FxHashMap::default(),
             candidates: false,
         }
     }
 
-    /// Membership under the latest catalog with every published candidate
-    /// put in force: what a node carries once the changes being proved are.
-    pub fn candidates(engine: &'a StorageEngine) -> Self {
+    /// [`Self::candidates`] as `snapshot` reads the catalog: with
+    /// [`Self::at`] on the same snapshot, the facts in force and the
+    /// candidates of one committed state.
+    pub fn candidates_at(engine: &'a StorageEngine, snapshot: StorageSnapshot) -> Self {
         Self {
             candidates: true,
-            ..Self::current(engine)
+            ..Self::at(engine, snapshot)
         }
     }
 
-    /// Membership under the catalog as `snapshot` reads it.
-    pub fn at(engine: &'a StorageEngine, snapshot: StorageSnapshot) -> Self {
-        Self {
-            snapshot: Some(snapshot),
-            ..Self::current(engine)
-        }
-    }
-
-    /// The snapshot the catalog is read at: the pinned one, or the latest.
+    /// The snapshot the catalog is read at.
     fn view(&self) -> StorageSnapshot {
-        self.snapshot.unwrap_or_else(|| self.engine.snapshot())
+        self.snapshot
     }
 
     /// The identity label `name` is bound to under the view; `None` when it
@@ -242,3 +267,7 @@ impl<'a> CatalogMembership<'a> {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests;

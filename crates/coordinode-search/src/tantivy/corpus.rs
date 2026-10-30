@@ -47,6 +47,28 @@ impl Corpus {
     }
 }
 
+impl Corpus {
+    /// Stop counting every document `part` counts, each of them counted
+    /// here too: a whole scope's documents removed at once.
+    pub(crate) fn subtract(&mut self, part: &Corpus) {
+        // `part` counts a subset of the documents counted here, so no count
+        // goes below zero; a violation is a bookkeeping bug.
+        debug_assert!(self.docs >= part.docs, "removing documents never counted");
+        self.docs -= part.docs;
+        self.tokens -= part.tokens;
+        for (term, n) in &part.df {
+            match self.df.get_mut(term) {
+                Some(have) if *have > *n => *have -= n,
+                Some(have) => {
+                    debug_assert!(*have == *n, "term {term} counted fewer times");
+                    self.df.remove(term);
+                }
+                None => debug_assert!(false, "term {term} never counted"),
+            }
+        }
+    }
+}
+
 /// The distinct texts among `tokens`.
 fn distinct(tokens: &[String]) -> impl Iterator<Item = &str> {
     let mut seen: Vec<&str> = tokens.iter().map(String::as_str).collect();

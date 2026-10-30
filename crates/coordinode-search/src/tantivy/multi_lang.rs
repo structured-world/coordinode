@@ -183,6 +183,37 @@ impl MultiLanguageTextIndex {
         self.inner.aside.retired.docs == 0 && self.inner.aside.gained.docs == 0
     }
 
+    /// Bring the documents back to one interpretation once the change they
+    /// are kept apart for ended, in one commit: those of `dropped` go, by
+    /// their scope's term, and their statistics, counted apart all along,
+    /// leave the corpus; the documents of the other scope stay as they are
+    /// and count as shared from then on, as the index moves on to the next
+    /// change, whose tags never name them. No document is read or rewritten.
+    ///
+    /// # Errors
+    ///
+    /// A failed write; the index is left as it was then.
+    pub fn settle(&mut self, dropped: Scope) -> Result<(), TextSearchError> {
+        if dropped == Scope::Shared {
+            return Ok(());
+        }
+        self.write(|index, _| {
+            let term = index.inner.scope_term(dropped);
+            index.inner.writer.delete_term(term);
+            if let (Some(corpus), Some(gone)) =
+                (index.inner.corpus.as_mut(), index.inner.aside.of(dropped))
+            {
+                corpus.subtract(gone);
+            }
+            index.inner.aside = super::Aside::default();
+            Ok(true)
+        })?;
+        // Only once the commit is visible: a failed one recounted the scopes
+        // under the change still followed.
+        self.inner.epoch += 1;
+        Ok(())
+    }
+
     /// The nodes whose live document is in `scope`, ascending.
     ///
     /// # Errors
@@ -557,7 +588,7 @@ impl MultiLanguageTextIndex {
         );
         doc.add_field_value(
             self.inner.scope_field,
-            &tantivy::schema::OwnedValue::U64(scope.as_u64()),
+            &tantivy::schema::OwnedValue::U64(self.inner.scope_tag(scope)),
         );
         Some((doc, token_texts))
     }

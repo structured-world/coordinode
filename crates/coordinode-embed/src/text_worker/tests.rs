@@ -370,3 +370,234 @@ fn a_late_fold_writes_under_the_interpretation_the_index_holds() {
         "the task's document is not in an index holding the interpretation without it"
     );
 }
+
+/// The text index definition on `:Thing(title)`.
+fn thing_title() -> coordinode_query::index::IndexDefinition {
+    coordinode_query::index::IndexDescriptor::text(
+        "thing_title",
+        "Thing",
+        vec!["title".into()],
+        coordinode_query::index::TextIndexConfig {
+            fields: Default::default(),
+            default_language: "english".into(),
+            language_override_property: "_language".into(),
+        },
+    )
+    .bind(
+        coordinode_query::index::IndexId::from_raw(1),
+        coordinode_query::index::GenerationId::from_raw(1),
+    )
+}
+
+/// A store holding a thing and a task, `Task` not implying `Thing`, a text
+/// index on `:Thing(title)` built over it, and a worker over both, not
+/// running: the test drives each step itself.
+struct Rig {
+    _dir: tempfile::TempDir,
+    engine: std::sync::Arc<StorageEngine>,
+    registry: std::sync::Arc<coordinode_query::index::TextIndexRegistry>,
+    worker: super::Worker,
+    /// `Thing`'s carriers before and after `Task` comes to imply it.
+    carriers: (
+        Option<coordinode_query::index::membership::LabelCarriers>,
+        Option<coordinode_query::index::membership::LabelCarriers>,
+    ),
+}
+
+impl Rig {
+    fn new() -> Self {
+        use coordinode_core::schema::definition::{LabelSchema, PlacementPolicy};
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        use coordinode_query::index::membership::{LabelCarriers, label_carriers};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = std::sync::Arc::new(engine(&dir));
+        let schemas = LocalSchemaStore::new(&engine);
+        for name in ["Thing", "Task"] {
+            schemas
+                .save_label(&LabelSchema::new(name, PlacementPolicy::NodeId))
+                .expect("declare");
+        }
+        let registry = std::sync::Arc::new(coordinode_query::index::TextIndexRegistry::new(
+            dir.path().join("text"),
+        ));
+        registry.register(thing_title()).expect("register");
+        let mut interner = coordinode_core::graph::intern::FieldInterner::new();
+        let title = interner.intern("title");
+        let sub = engine.subscribe_applied_retained(Partition::Node, 64);
+        apply_titled(&engine, 1, 1, ("Thing", title, "rust graph"));
+        apply_titled(&engine, 2, 7, ("Task", title, "rust tools"));
+        let before = label_carriers(&engine, "Thing").expect("carriers");
+        let task = schemas.label_id("Task").expect("id").expect("bound");
+        let after = before.clone().map(|c| LabelCarriers {
+            implying: vec![task],
+            ..c
+        });
+        registry
+            .rebuild_index("Thing", "title", || {
+                coordinode_query::index::text_registry::stored_texts(
+                    &engine, 1, &interner, "Thing", "title", 0,
+                )
+            })
+            .expect("build");
+        let worker = super::Worker {
+            engine: std::sync::Arc::clone(&engine),
+            position: sub.position(),
+            coverage: std::sync::Arc::new(IndexCoverage::new(sub.position())),
+            applied: sub,
+            registry: std::sync::Arc::clone(&registry),
+            fields: std::sync::Arc::new(FlakyFields {
+                fields: interner,
+                failing: std::sync::atomic::AtomicBool::new(false),
+                refused: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            shard_id: 1,
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        Self {
+            _dir: dir,
+            engine,
+            registry,
+            worker,
+            carriers: (before, after),
+        }
+    }
+
+    /// Rebuild the index from the store, as an index build on another
+    /// thread does.
+    fn rebuild_elsewhere(&self) {
+        let interner = self.worker.fields.view().expect("fields");
+        self.registry
+            .rebuild_index("Thing", "title", || {
+                coordinode_query::index::text_registry::stored_texts(
+                    &self.engine,
+                    1,
+                    &interner,
+                    "Thing",
+                    "title",
+                    0,
+                )
+            })
+            .expect("rebuild");
+    }
+
+    fn held(&self) -> (coordinode_query::index::selection::Held, u64) {
+        self.registry.held_at("Thing", "title").expect("registered")
+    }
+}
+
+/// The worker decides to settle a change put in force at one revision of
+/// the index's interpretations; before it settles, another thread rebuilds
+/// the index. The settling is refused: the rebuilt documents and what they
+/// hold stay, rather than a change decided against the documents before
+/// being applied to them.
+#[test]
+fn a_settle_decided_before_a_rebuild_changes_nothing() {
+    use coordinode_query::index::selection::Held;
+    let rig = Rig::new();
+    let (before, after) = rig.carriers.clone();
+    let interner = rig.worker.fields.view().expect("fields");
+    // The index follows the change: the task's document is kept as gained.
+    let ((), _) = rig
+        .registry
+        .with_index_at("Thing", "title", None, |_, held| {
+            *held = Held {
+                base: Some(before.clone()),
+                candidate: Some((after.clone(), true)),
+            };
+            Ok(())
+        })
+        .expect("follow")
+        .expect("registered");
+    let read = coordinode_storage::engine::transaction::Transaction::new(
+        &rig.engine,
+        None,
+        coordinode_core::txn::timestamp::Timestamp::ZERO,
+        None,
+    );
+    let nodes =
+        coordinode_query::index::text_registry::read_nodes(&read, 1, &[NodeId::from_raw(7)])
+            .expect("read");
+    assert!(
+        rig.registry
+            .apply_rows(("Thing", "title"), &interner, (&nodes, 0), None, |_| Some(
+                (before.clone(), Some(after.clone()))
+            ))
+            .expect("gain")
+    );
+    let (_, decided) = rig.held();
+
+    rig.rebuild_elsewhere();
+    let rebuilt = rig.held();
+    rig.worker
+        .settle(&thing_title(), "title", (true, &after), decided)
+        .expect("settle");
+
+    assert_eq!(rig.held(), rebuilt, "the rebuild's interpretation stands");
+    assert_eq!(rebuilt.0, Held::built(before));
+    let thing = rig
+        .registry
+        .with_index("Thing", "title", |index, _| index.contains(1))
+        .expect("read")
+        .expect("registered");
+    assert!(thing, "the rebuilt document of the thing stays");
+}
+
+/// A rebuild leaving the index holding the very interpretations it held
+/// before still moves their revision: a preparation decided before it is
+/// refused, so equal interpretations never pass for unchanged documents.
+#[test]
+fn a_rebuild_to_equal_interpretations_refuses_a_step_decided_before() {
+    let rig = Rig::new();
+    let (before, after) = rig.carriers.clone();
+    let interner = rig.worker.fields.view().expect("fields");
+    let (held, decided) = rig.held();
+
+    rig.rebuild_elsewhere();
+    let (rebuilt, revision) = rig.held();
+    assert_eq!(rebuilt, held, "the rebuild holds the same interpretation");
+    assert!(revision > decided);
+
+    rig.worker
+        .prepare(
+            &thing_title(),
+            "title",
+            (&before, &after),
+            decided,
+            &interner,
+        )
+        .expect("prepare");
+    assert_eq!(rig.held(), (rebuilt, revision), "nothing was begun");
+}
+
+/// The index is dropped and created again under the same label and
+/// property; a step decided against the dropped one is refused on the new
+/// one, whose interpretations start their own revision above it.
+#[test]
+fn a_recreated_index_refuses_a_step_decided_on_the_dropped_one() {
+    let rig = Rig::new();
+    let (before, after) = rig.carriers.clone();
+    let interner = rig.worker.fields.view().expect("fields");
+    let (_, decided) = rig.held();
+
+    rig.registry.unregister("Thing", "title");
+    rig.registry
+        .register(thing_title())
+        .expect("register again");
+    let (fresh, revision) = rig.held();
+    assert!(revision > decided);
+
+    rig.worker
+        .prepare(
+            &thing_title(),
+            "title",
+            (&before, &after),
+            decided,
+            &interner,
+        )
+        .expect("prepare");
+    rig.worker
+        .settle(&thing_title(), "title", (true, &after), decided)
+        .expect("settle");
+    assert_eq!(rig.held(), (fresh, revision), "the new index is untouched");
+}

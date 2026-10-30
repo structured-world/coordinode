@@ -196,7 +196,7 @@ impl TextIndex {
         };
         let mut left_out: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         if let Some(scope) = exclude.filter(|s| *s != Scope::Shared) {
-            let term = Term::from_field_u64(self.scope_field, scope.as_u64());
+            let term = self.scope_term(scope);
             left_out.push((
                 Occur::MustNot,
                 Box::new(tantivy::query::TermQuery::new(

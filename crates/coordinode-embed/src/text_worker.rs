@@ -25,7 +25,9 @@ use coordinode_core::graph::intern::FieldRegistrar;
 use coordinode_core::graph::node::{NodeId, decode_written_node};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_query::executor::runner::wall_clock_us;
-use coordinode_query::index::text_registry::{NodeText, read_nodes, stored_texts};
+use coordinode_query::index::membership::LabelCarriers;
+use coordinode_query::index::selection::Held;
+use coordinode_query::index::text_registry::{read_nodes, stored_texts};
 use coordinode_query::index::{IndexCoverage, TextIndexRegistry};
 use coordinode_storage::engine::applied::{
     AppliedEvent, AppliedPosition, AppliedStop, AppliedSubscription,
@@ -279,7 +281,8 @@ impl Worker {
                     (&def.label, property),
                     &interner,
                     (&nodes, now),
-                    |held| {
+                    None,
+                    |held: &Held| {
                         // An index not built yet is written by its build.
                         if held.base.is_none() && held.candidate.is_none() {
                             return None;
@@ -295,18 +298,29 @@ impl Worker {
         Ok(())
     }
 
-    /// The carriers of `label` with every published candidate put in force.
-    fn candidate_carriers(
+    /// The carriers of `label` in force and with every published candidate
+    /// put in force, both of the one catalog state `snapshot` reads.
+    fn interpretations(
         &self,
         label: &str,
-    ) -> Result<Option<coordinode_query::index::membership::LabelCarriers>, String> {
+        snapshot: coordinode_storage::engine::StorageSnapshot,
+    ) -> Result<(Option<LabelCarriers>, Option<LabelCarriers>), String> {
         use coordinode_query::index::membership::{CatalogMembership, label_carriers_in};
-        label_carriers_in(
+        let failed =
+            |e: coordinode_modality::StoreError| format!("read the carriers of :{label}: {e}");
+        let in_force = label_carriers_in(
             &self.engine,
             label,
-            &mut CatalogMembership::candidates(&self.engine),
+            &mut CatalogMembership::at(&self.engine, snapshot),
         )
-        .map_err(|e| format!("read the candidate carriers of :{label}: {e}"))
+        .map_err(failed)?;
+        let candidate = label_carriers_in(
+            &self.engine,
+            label,
+            &mut CatalogMembership::candidates_at(&self.engine, snapshot),
+        )
+        .map_err(failed)?;
+        Ok((in_force, candidate))
     }
 
     /// [`Self::sync_selections`], a failure logged: searches stay exact
@@ -331,13 +345,13 @@ impl Worker {
             .fields
             .view()
             .map_err(|e| format!("read the field dictionary: {e}"))?;
+        // One catalog state for every index: the facts in force and the
+        // candidates are never of two different commits.
+        let (snapshot, _pin) = self.engine.pin_latest_snapshot();
         for def in &definitions {
-            let in_force =
-                coordinode_query::index::membership::label_carriers(&self.engine, &def.label)
-                    .map_err(|e| e.to_string())?;
-            let candidate = self.candidate_carriers(&def.label)?;
+            let (in_force, candidate) = self.interpretations(&def.label, snapshot)?;
             for property in &def.properties {
-                let Some(held) = self.registry.held(&def.label, property) else {
+                let Some((held, revision)) = self.registry.held_at(&def.label, property) else {
                     continue;
                 };
                 let base_holds = held.base.as_ref() == Some(&in_force);
@@ -345,9 +359,10 @@ impl Worker {
                     // A change is certified: the index keeps both.
                     if !base_holds {
                         self.rebuild_plain(def, property, &interner)?;
+                        continue;
                     }
                     if held.candidate != Some((candidate.clone(), true)) {
-                        self.prepare(def, property, (&in_force, &candidate), &interner)?;
+                        self.prepare(def, property, (&in_force, &candidate), revision, &interner)?;
                     }
                     continue;
                 }
@@ -355,11 +370,11 @@ impl Worker {
                     None if base_holds => {}
                     // The change the index followed was put in force.
                     Some((followed, true)) if followed == in_force => {
-                        self.settle(def, property, (true, &in_force), &interner)?;
+                        self.settle(def, property, (true, &in_force), revision)?;
                     }
                     // It was withdrawn: the facts the index's base holds stay.
                     Some(_) if base_holds => {
-                        self.settle(def, property, (false, &in_force), &interner)?;
+                        self.settle(def, property, (false, &in_force), revision)?;
                     }
                     // The index holds neither: it is written afresh.
                     _ => self.rebuild_plain(def, property, &interner)?,
@@ -396,39 +411,34 @@ impl Worker {
     /// commit so searches are never held up, and record the index prepared
     /// for the candidate. Searches under the facts in force leave the gained
     /// documents out meanwhile, so they stay exact while it runs.
+    ///
+    /// Begun only while the index's interpretations are at `revision`, the
+    /// one the decision to prepare was read at, and each later step only
+    /// while they are at the revision the beginning set: a rebuild or
+    /// another change of them meanwhile ends the pass, however equal the
+    /// interpretations it leaves.
     fn prepare(
         &self,
         def: &coordinode_query::index::IndexDefinition,
         property: &str,
-        (in_force, candidate): (
-            &Option<coordinode_query::index::membership::LabelCarriers>,
-            &Option<coordinode_query::index::membership::LabelCarriers>,
-        ),
+        (in_force, candidate): (&Option<LabelCarriers>, &Option<LabelCarriers>),
+        revision: u64,
         interner: &coordinode_core::graph::intern::FieldInterner,
     ) -> Result<(), String> {
-        use coordinode_query::index::selection::Held;
         use coordinode_query::index::text_registry::for_each_rows_batch;
-        // Not prepared until the pass below wrote every node; begun only on
-        // an index holding the facts in force.
-        let preparing = Held {
-            base: Some(in_force.clone()),
-            candidate: Some((candidate.clone(), false)),
-        };
-        let begun = self
-            .registry
-            .with_index(&def.label, property, |_, held| {
-                if held.base != preparing.base {
-                    return Ok(false);
-                }
-                *held = preparing.clone();
-                Ok(true)
-            })?
-            .unwrap_or(false);
-        if !begun {
+        // Not prepared until the pass below wrote every node.
+        let begun =
+            self.registry
+                .with_index_at(&def.label, property, Some(revision), |_, held| {
+                    *held = Held {
+                        base: Some(in_force.clone()),
+                        candidate: Some((candidate.clone(), false)),
+                    };
+                    Ok(())
+                })?;
+        let Some(((), guard)) = begun else {
             return Ok(());
-        }
-        // Each batch is written only while the index still holds what the
-        // pass began with: a rebuild by another thread meanwhile ends it.
+        };
         let mut interrupted = false;
         let now = wall_clock_us();
         for_each_rows_batch(&self.engine, self.shard_id, BATCH, &mut |rows| {
@@ -436,7 +446,8 @@ impl Worker {
                 (&def.label, property),
                 interner,
                 (rows, now),
-                |held| (*held == preparing).then(|| (in_force.clone(), Some(candidate.clone()))),
+                Some(guard),
+                |_: &Held| Some((in_force.clone(), Some(candidate.clone()))),
             )?;
             if wrote {
                 Ok(())
@@ -452,101 +463,44 @@ impl Worker {
         // Writes applied while the pass ran are folded under both
         // interpretations by this worker after it, and searches read them
         // from the store until then.
-        self.registry.with_index(&def.label, property, |_, held| {
-            if *held == preparing {
+        self.registry
+            .with_index_at(&def.label, property, Some(guard), |_, held| {
                 held.candidate = Some((candidate.clone(), true));
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
         Ok(())
     }
 
     /// Bring the documents of `def`'s label back to one interpretation once
-    /// the change the index followed ended: put in force (`put_in_force`),
-    /// the retired documents go and the gained ones become shared;
-    /// withdrawn, the other way round. The index then holds `in_force`, the
-    /// facts now in force.
+    /// the change the index followed ended, in one step: put in force
+    /// (`put_in_force`), the retired documents go and the gained ones count
+    /// as shared; withdrawn, the other way round. The index then holds
+    /// `in_force`, the facts now in force.
     ///
-    /// While it runs, the documents that go are still there or partly gone,
-    /// so the interpretation they belong to is no longer answered from the
-    /// index: its readers read the store instead.
+    /// Only while the index's interpretations are at `revision`, the one the
+    /// decision to settle was read at: a rebuild, a re-registration or any
+    /// other change of them since refuses it.
     fn settle(
         &self,
         def: &coordinode_query::index::IndexDefinition,
         property: &str,
-        (put_in_force, in_force): (
-            bool,
-            &Option<coordinode_query::index::membership::LabelCarriers>,
-        ),
-        interner: &coordinode_core::graph::intern::FieldInterner,
+        (put_in_force, in_force): (bool, &Option<LabelCarriers>),
+        revision: u64,
     ) -> Result<(), String> {
-        use coordinode_query::index::selection::Held;
         use coordinode_search::tantivy::Scope;
-        let (dropped, kept) = if put_in_force {
-            (Scope::Retired, Scope::Gained)
+        let dropped = if put_in_force {
+            Scope::Retired
         } else {
-            (Scope::Gained, Scope::Retired)
+            Scope::Gained
         };
-        let settling = self.registry.with_index(&def.label, property, |_, held| {
-            if put_in_force {
-                // The base's retired documents go: its readers read the
-                // store; the candidate's readers leave them out.
-                held.base = None;
-            } else if let Some((_, prepared)) = held.candidate.as_mut() {
-                // The gained documents go: no reader is answered with the
-                // candidate; the base's readers leave them out.
-                *prepared = false;
-            }
-            Ok(held.clone())
-        })?;
-        let Some(settling) = settling else {
-            return Ok(());
-        };
-        let members = |scope| {
-            self.registry
-                .with_index(&def.label, property, |index, _| index.scope_members(scope))
-                .map(Option::unwrap_or_default)
-        };
-        let removals: Vec<NodeText> = members(dropped)?
-            .into_iter()
-            .map(|id| NodeText {
-                node_id: NodeId::from_raw(id),
-                text: None,
-                validity: coordinode_search::tantivy::validity::Validity::ALWAYS,
-                scope: Scope::Shared,
-            })
-            .collect();
-        for batch in removals.chunks(BATCH) {
-            self.registry.apply_changes(&def.label, property, batch)?;
-        }
-        // The kept documents are written again from the store as the facts
-        // now in force hold them, shared, while the index is still settling
-        // this change.
-        let kept: Vec<NodeId> = members(kept)?.into_iter().map(NodeId::from_raw).collect();
-        let now = wall_clock_us();
-        for batch in kept.chunks(BATCH) {
-            let read = Transaction::new(&self.engine, None, Timestamp::ZERO, None);
-            let nodes = read_nodes(&read, self.shard_id, batch)?;
-            let wrote = self.registry.apply_rows(
-                (&def.label, property),
-                interner,
-                (&nodes, now),
-                |held| (*held == settling).then(|| (in_force.clone(), None)),
-            )?;
-            if !wrote {
-                return Ok(());
-            }
-        }
-        // A write folded meanwhile under both interpretations may have kept
-        // a document apart: the next wake-up settles it.
         self.registry
-            .with_index(&def.label, property, |index, held| {
-                if *held == settling && index.all_shared() {
-                    *held = Held::built(in_force.clone());
-                }
-                Ok(())
-            })?;
-        Ok(())
+            .settle(
+                (&def.label, property),
+                dropped,
+                revision,
+                Held::built(in_force.clone()),
+            )
+            .map(drop)
     }
 
     /// Rebuild every index from the store, since what changed is not known;
