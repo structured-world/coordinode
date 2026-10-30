@@ -1248,6 +1248,68 @@ fn a_reopened_index_reads_a_settled_change_as_settled() {
     assert_eq!(ids, [1, 4]);
 }
 
+/// Settling commits durably, and then the reader cannot be moved to that
+/// commit at once. The commit stands: settling reports it done, reads
+/// answer the settled documents and statistics, the next change and its
+/// withdrawal never take in a document the settled one kept, and a reopen
+/// finds the same. Before, a failed move after the commit put the old epoch
+/// and the old statistics back over the committed documents.
+#[test]
+fn a_settled_commit_stands_when_the_reader_lags() {
+    use core::sync::atomic::Ordering::SeqCst;
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let open = || {
+        MultiLanguageTextIndex::open_or_create(
+            dirs.0.path(),
+            15_000_000,
+            MultiLangConfig::with_default_language("english"),
+        )
+        .unwrap()
+    };
+    let oracle = fresh(
+        dirs.1.path(),
+        &[(1, "rust graph rust"), (4, "graph graph store")],
+    );
+    let found = |idx: &MultiLanguageTextIndex| -> Vec<u64> {
+        scores(idx, "graph", &PendingDocuments::none())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    };
+    {
+        let mut idx = open();
+        idx.apply_scoped_changes(
+            &[
+                (1, props(&[("body", "rust graph rust")]), Scope::Shared),
+                (3, props(&[("body", "rust graph")]), Scope::Retired),
+                (4, props(&[("body", "graph graph store")]), Scope::Gained),
+            ],
+            &[],
+        )
+        .unwrap();
+        idx.inner_mut().fail_reload.store(true, SeqCst);
+        let settled = idx.settle(Scope::Retired);
+        for query in ["rust", "graph", "store"] {
+            assert_same_scores(
+                &scores(&idx, query, &PendingDocuments::none()),
+                &scores(&oracle, query, &PendingDocuments::none()),
+            );
+        }
+        assert!(idx.all_shared(), "the settled statistics");
+        assert!(idx.scope_members(Scope::Gained).unwrap().is_empty());
+        assert!(settled.is_ok(), "the commit stood: {settled:?}");
+
+        idx.apply_scoped_changes(&[(9, props(&[("body", "graph")]), Scope::Gained)], &[])
+            .unwrap();
+        assert_eq!(idx.scope_members(Scope::Gained).unwrap(), [9]);
+        idx.settle(Scope::Gained).unwrap();
+        assert_eq!(found(&idx), [1, 4]);
+    }
+    let idx = open();
+    assert!(idx.all_shared());
+    assert_eq!(found(&idx), [1, 4], "after a reopen");
+}
+
 /// A document rewritten into another scope leaves its old scope's
 /// statistics, so once every document is shared again the index says so,
 /// and the scopes' members are the nodes written there.

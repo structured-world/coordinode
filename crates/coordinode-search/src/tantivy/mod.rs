@@ -124,6 +124,11 @@ pub enum TextSearchError {
     #[error("index not found or corrupted: {0}")]
     IndexCorrupted(String),
 
+    /// A commit failed and whether it landed cannot be read back: the index
+    /// takes no more writes until it is opened again.
+    #[error("the outcome of a text index commit is unknown: {0}")]
+    CommitUnknown(String),
+
     /// The index holds documents written without a birth time, so a read
     /// filtered by birth time cannot tell which of them a snapshot sees.
     #[error(
@@ -279,6 +284,13 @@ pub struct TextIndex {
     /// The change of what a type implies the index's scoped documents
     /// belong to, counted from zero; a settled change moves it on.
     epoch: u64,
+    /// Set while the reader is behind the last commit: a commit stands once
+    /// it is durable, and a move of the reader that failed after it is
+    /// tried again before the next read, which never reads the commit before.
+    reader_behind: core::sync::atomic::AtomicBool,
+    /// Makes the next move of the reader fail, as a test asks.
+    #[cfg(test)]
+    pub(crate) fail_reload: core::sync::atomic::AtomicBool,
 }
 
 /// The schema of a text index and the fields the index reads by handle.
@@ -501,17 +513,81 @@ impl TextIndex {
             corpus: None,
             aside: Aside::default(),
             epoch,
+            reader_behind: core::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_reload: core::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Move the reader to the commit just made. The commit stands whatever
+    /// happens here: a failed move is left for the next read to retry.
+    fn follow_commit(&self) {
+        let moved = self
+            .reload_reader()
+            .and_then(|()| self.reconcile_registry());
+        if let Err(e) = moved {
+            self.reader_behind
+                .store(true, core::sync::atomic::Ordering::Release);
+            tracing::warn!(error = %e, "text index reader left behind its last commit; the next read moves it");
+        }
+    }
+
+    /// A searcher over the last commit, moving the reader there first when a
+    /// move after the commit failed.
+    ///
+    /// # Errors
+    ///
+    /// The reader still cannot be moved: nothing older is read instead.
+    fn searcher(&self) -> Result<tantivy::Searcher, TextSearchError> {
+        use core::sync::atomic::Ordering;
+        if self.reader_behind.load(Ordering::Acquire) {
+            self.reload_reader()?;
+            self.reconcile_registry()?;
+            self.reader_behind.store(false, Ordering::Release);
+        }
+        Ok(self.reader.searcher())
+    }
+
+    /// Move the reader to the last commit.
+    fn reload_reader(&self) -> Result<(), TextSearchError> {
+        #[cfg(test)]
+        if self
+            .fail_reload
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(TextSearchError::IndexCorrupted(
+                "the reader was not moved, as the test asked".into(),
+            ));
+        }
+        self.reader.reload()?;
+        Ok(())
     }
 
     /// Commit the staged changes with the change the index follows, so the
     /// documents' scope tags and the epoch they are read under are one
     /// commit: a reopen reads both or neither.
+    ///
+    /// # Errors
+    ///
+    /// The commit did not land, so nothing staged is visible; or
+    /// [`TextSearchError::CommitUnknown`] when whether it landed cannot be
+    /// read back.
     fn commit_staged(&mut self) -> Result<(), TextSearchError> {
         let mut prepared = self.writer.prepare_commit()?;
         prepared.set_payload(&encode_epoch(self.epoch));
-        prepared.commit()?;
-        Ok(())
+        let opstamp = prepared.opstamp();
+        let Err(failed) = prepared.commit() else {
+            return Ok(());
+        };
+        // A commit reporting a failure may still have published its meta:
+        // what the directory holds decides.
+        match self.index.load_metas() {
+            Ok(metas) if metas.opstamp == opstamp => Ok(()),
+            Ok(_) => Err(failed.into()),
+            Err(read) => Err(TextSearchError::CommitUnknown(format!(
+                "{failed}; reading back the last commit: {read}"
+            ))),
+        }
     }
 
     /// The scope field value of a document written in `scope` now.
@@ -562,7 +638,7 @@ impl TextIndex {
     /// Count every live document of the committed index, and those of the
     /// scopes apart from the shared one.
     fn recount(&self) -> Result<(corpus::Corpus, Aside), TextSearchError> {
-        let searcher = self.reader.searcher();
+        let searcher = self.searcher()?;
         let mut counted = corpus::Corpus::default();
         let mut aside = Aside::default();
         for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
@@ -586,7 +662,7 @@ impl TextIndex {
     /// The node ids of the live documents of `scope`, as the committed
     /// index holds them, ascending.
     fn scope_members(&self, scope: Scope) -> Result<Vec<u64>, TextSearchError> {
-        let searcher = self.reader.searcher();
+        let searcher = self.searcher()?;
         let query = TermQuery::new(self.scope_term(scope), IndexRecordOption::Basic);
         let addresses = searcher.search(&query, &tantivy::collector::DocSetCollector)?;
         let mut members = Vec::with_capacity(addresses.len());
@@ -695,8 +771,7 @@ impl TextIndex {
         }
 
         self.commit_staged()?;
-        self.reader.reload()?;
-        self.reconcile_registry()?;
+        self.follow_commit();
         Ok(())
     }
 
@@ -707,8 +782,7 @@ impl TextIndex {
         let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
         self.writer.delete_term(node_id_term);
         self.commit_staged()?;
-        self.reader.reload()?;
-        self.reconcile_registry()?;
+        self.follow_commit();
         Ok(())
     }
 
@@ -827,7 +901,7 @@ impl TextIndex {
         query_str: &str,
         limit: usize,
     ) -> Result<Vec<TextSearchResult>, TextSearchError> {
-        let searcher = self.reader.searcher();
+        let searcher = self.searcher()?;
         let query = self.build_query(query_str, None)?;
 
         let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit).order_by_score())?;
@@ -855,7 +929,7 @@ impl TextIndex {
         limit: usize,
         boost: f32,
     ) -> Result<Vec<TextSearchResult>, TextSearchError> {
-        let searcher = self.reader.searcher();
+        let searcher = self.searcher()?;
         let query = self.build_query(query_str, Some(boost))?;
 
         let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit).order_by_score())?;
@@ -904,7 +978,7 @@ impl TextIndex {
         query_str: &str,
         limit: usize,
     ) -> Result<Vec<HighlightedResult>, TextSearchError> {
-        let searcher = self.reader.searcher();
+        let searcher = self.searcher()?;
         let query = self.build_query(query_str, None)?;
 
         let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit).order_by_score())?;
@@ -930,7 +1004,11 @@ impl TextIndex {
 
     /// Return the number of documents in the index.
     pub fn num_docs(&self) -> u64 {
-        self.reader.searcher().num_docs()
+        // A reader still behind its commit answers its own count: every read
+        // of the documents themselves refuses until it catches up.
+        self.searcher()
+            .unwrap_or_else(|_| self.reader.searcher())
+            .num_docs()
     }
 
     /// Access the tantivy schema.
@@ -1095,8 +1173,7 @@ impl TextIndex {
         }
 
         self.commit_staged()?;
-        self.reader.reload()?;
-        self.reconcile_registry()?;
+        self.follow_commit();
         Ok(())
     }
 
@@ -1213,7 +1290,7 @@ impl TextIndex {
         limit: usize,
         snapshot_ts: u64,
     ) -> Result<Vec<TextSearchResult>, TextSearchError> {
-        let searcher = self.reader.searcher();
+        let searcher = self.searcher()?;
         // A column holding a value for every document of its segment is
         // full; anything less means some document has no birth time.
         for segment in searcher.segment_readers() {

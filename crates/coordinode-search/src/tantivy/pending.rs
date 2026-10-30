@@ -151,7 +151,7 @@ impl TextIndex {
     where
         TextSearchError: From<M::Stop>,
     {
-        let searcher = self.reader.searcher();
+        let searcher = self.searcher()?;
         // A scope is left out of statistics only the index counts exactly.
         let excluded = match exclude.and_then(|scope| self.aside.of(scope)) {
             Some(_) if self.corpus.is_none() => {

@@ -352,9 +352,12 @@ impl MultiLanguageTextIndex {
     }
 
     /// Run `work`, which stages changes and says whether it staged any, and
-    /// commit them. A failure discards everything staged and counts the
-    /// committed documents again, so the statistics never describe documents
-    /// a reader cannot see.
+    /// commit them. A commit that landed stands, even when the reader could
+    /// not follow it at once (see [`TextIndex`]'s reads). A failure before
+    /// the commit landed discards everything staged and counts the committed
+    /// documents again, so the statistics never describe documents a reader
+    /// cannot see. A commit whose outcome cannot be read back leaves the
+    /// index serving the last commit it knows and refusing every later write.
     fn write(
         &mut self,
         work: impl FnOnce(&mut Self, &mut Batch) -> Result<bool, TextSearchError>,
@@ -362,13 +365,16 @@ impl MultiLanguageTextIndex {
         if let Some(reason) = &self.writer_lost {
             return Err(TextSearchError::IndexCorrupted(reason.clone()));
         }
-        let mut batch = Batch::new(self.inner.reader.searcher());
+        let mut batch = Batch::new(self.inner.searcher()?);
         let epoch = self.inner.epoch;
         let outcome = match work(self, &mut batch) {
             Ok(true) => self.publish(),
             Ok(false) => Ok(()),
             Err(e) => Err(e),
         };
+        if let Err(TextSearchError::CommitUnknown(reason)) = &outcome {
+            self.writer_lost = Some(format!("a commit's outcome is unknown: {reason}"));
+        }
         if outcome.is_err() {
             // The committed documents are read under the change the last
             // commit recorded.
@@ -676,7 +682,7 @@ impl MultiLanguageTextIndex {
     fn publish(&mut self) -> Result<(), TextSearchError> {
         // No birth-time bounds to keep: the documents carry none.
         self.inner.commit_staged()?;
-        self.inner.reader.reload()?;
+        self.inner.follow_commit();
         Ok(())
     }
 
