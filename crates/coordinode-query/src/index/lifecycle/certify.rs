@@ -111,6 +111,8 @@ impl IndexBuildService {
                 resumed.push(record.generation);
             }
         }
+        // Parts a concluded change left before the last close.
+        self.shared.fold_parts();
         Ok(resumed)
     }
 }
@@ -157,7 +159,33 @@ impl Shared {
                 None => return Ok(Executed::Lost),
             }
         }
-        self.conclude_certification(generation, token, &labels, refused)
+        let concluded = self.conclude_certification(generation, token, &labels, refused)?;
+        // The outcome is recorded; what the change left apart is folded now,
+        // and again where the storage is opened if this stops first.
+        self.fold_parts();
+        Ok(concluded)
+    }
+
+    /// Fold every part a concluded change left, logging what stops it:
+    /// readers stay correct over unfolded parts, and the next open folds
+    /// them.
+    pub(super) fn fold_parts(&self) {
+        let env = self.env.as_ref();
+        let folded = crate::index::reconcile::Fold {
+            engine: env.engine(),
+            oracle: env.oracle(),
+            shard_id: env.shard_id(),
+            stop: Some(&self.stopping),
+            registry: Some(env.registry()),
+        }
+        .run(&mut |txn| env.commit_page(txn));
+        match folded {
+            Ok(_) | Err(crate::index::build::BackfillError::Stopped) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                "parts an implication change left are not folded yet; the next open folds them"
+            ),
+        }
     }
 
     /// Place the label lookup postings of the stored nodes whose labels a

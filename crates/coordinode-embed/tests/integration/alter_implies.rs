@@ -144,6 +144,97 @@ fn stored_carriers_follow_the_implication() {
     );
 }
 
+/// A uniqueness on a label a type comes to imply spans the type's stored
+/// nodes: one holding a value a carrier of the label holds refuses the
+/// change, which leaves the implication, the label's members and the
+/// uniqueness as they were; once the value is free the change goes through
+/// and the uniqueness binds the type's nodes.
+#[test]
+fn a_gained_uniqueness_over_a_held_value_refuses_the_change() {
+    let mut db = things();
+    db.execute_cypher("CREATE CONSTRAINT thing_title FOR (n:Thing) REQUIRE n.title IS UNIQUE")
+        .expect("constraint");
+    db.execute_cypher("CREATE (:Thing {title: 'x'}), (:Task {title: 'x'}), (:Task {title: 'y'})")
+        .expect("nodes");
+    let err = refused(&mut db, "ALTER NODE TYPE Task SET IMPLIES (Thing)");
+    assert!(err.contains('x') || err.contains("unique"), "{err}");
+    assert_eq!(count(&mut db, "MATCH (n:Thing) RETURN n"), 1, "unchanged");
+    db.execute_cypher("CREATE (:Thing {title: 'y'})")
+        .expect("the old guarantee covers things alone");
+    db.execute_cypher("MATCH (n:Task {title: 'x'}) SET n.title = 'z'")
+        .expect("free x");
+    db.execute_cypher("MATCH (n:Thing {title: 'y'}) DELETE n")
+        .expect("free y");
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("no value held twice now");
+    assert_eq!(count(&mut db, "MATCH (n:Thing) RETURN n"), 3);
+    let err = refused(&mut db, "CREATE (:Task {title: 'x'})");
+    assert!(err.contains('x') || err.contains("unique"), "{err}");
+    let err = refused(&mut db, "CREATE (:Thing {title: 'z'})");
+    assert!(err.contains('z') || err.contains("unique"), "{err}");
+}
+
+/// Whether no index keeps parts apart any more: every concluded change is
+/// folded into the indexes' own entries.
+fn folded(db: &Database) -> bool {
+    use coordinode_modality::IndexStore as _;
+    coordinode_modality::LocalIndexStore::new(db.engine())
+        .list_definitions()
+        .expect("definitions")
+        .iter()
+        .all(|def| def.selection.is_empty())
+}
+
+/// Wait up to five seconds for the parts of the changes made to be folded.
+fn await_folded(db: &Database) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !folded(db) {
+        assert!(std::time::Instant::now() < deadline, "parts left unfolded");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Once a change is put in force, what it kept apart is folded back into
+/// the lookup's and the index's own entries: each scope is one again, the
+/// label's counter answers the count and agrees with a scan, and an index
+/// lookup finds the same nodes; both ways.
+#[test]
+fn a_concluded_change_is_folded_into_one_scope() {
+    let mut db = things();
+    db.execute_cypher("CREATE INDEX thing_title ON :Thing(title)")
+        .expect("index");
+    db.execute_cypher("CREATE (:Task {title: 'x'}), (:Task {title: 'y'}), (:Thing {title: 'x'})")
+        .expect("nodes");
+    let counted = |db: &mut Database| {
+        let rows = db
+            .execute_cypher("MATCH (n:Thing) RETURN count(n) AS c")
+            .expect("count");
+        rows[0].get("c").cloned()
+    };
+    for (alter, members, through_index) in [
+        ("ALTER NODE TYPE Task SET IMPLIES (Thing)", 3, 2),
+        ("ALTER NODE TYPE Task SET IMPLIES ()", 1, 1),
+    ] {
+        db.execute_cypher(alter).expect(alter);
+        await_folded(&db);
+        assert_eq!(
+            counted(&mut db),
+            Some(Value::Int(members)),
+            "{alter}: counter"
+        );
+        assert_eq!(
+            count(&mut db, "MATCH (n:Thing) WHERE n.title + '' <> '' RETURN n"),
+            members as usize,
+            "{alter}: scan"
+        );
+        assert_eq!(
+            count(&mut db, "MATCH (n:Thing {title: 'x'}) RETURN n"),
+            through_index,
+            "{alter}: index"
+        );
+    }
+}
+
 /// Setting the implication a type already has changes nothing.
 #[test]
 fn the_implication_in_force_is_unchanged() {

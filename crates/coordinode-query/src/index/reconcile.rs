@@ -223,6 +223,204 @@ impl Reconcile<'_> {
     }
 }
 
+/// Folding of the parts a concluded change left: put in force, the gained
+/// entries move into the index's own and the retired ones are removed;
+/// withdrawn, the retired entries move back and the gained ones are
+/// removed. Each part is dropped from its definition once empty, the label
+/// lookup's counter of the label recounted from its postings in that same
+/// commit, so readers go back to one scope and the counter.
+pub(crate) struct Fold<'a> {
+    /// The storage engine.
+    pub engine: &'a StorageEngine,
+    /// The timestamp oracle; `None` for a direct-mode engine.
+    pub oracle: Option<&'a TimestampOracle>,
+    /// The shard whose postings are counted.
+    pub shard_id: u16,
+    /// Set when the process is closing.
+    pub stop: Option<&'a core::sync::atomic::AtomicBool>,
+    /// The writers' registry, told each definition a step changed as soon
+    /// as it commits: a writer still bound to the definition before the
+    /// step is refused at its commit.
+    pub registry: Option<&'a super::IndexRegistry>,
+}
+
+/// Entries one fold transaction moves.
+const FOLD_PAGE: usize = 512;
+
+impl Fold<'_> {
+    /// Fold every concluded part of every index, committing each step
+    /// through `commit`. Returns the parts dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`BackfillError::Stopped`] once the process is closing; a storage or
+    /// commit failure; [`BackfillError::Contended`] when writers kept moving
+    /// what a step read.
+    pub(crate) fn run(
+        &self,
+        commit: &mut dyn FnMut(&mut Transaction<'_>) -> Result<(), CommitError>,
+    ) -> Result<u64, BackfillError> {
+        let store = LocalIndexStore::new(self.engine);
+        let mut dropped = 0u64;
+        let mut conflicts = 0u32;
+        loop {
+            if self
+                .stop
+                .is_some_and(|s| s.load(core::sync::atomic::Ordering::Acquire))
+            {
+                return Err(BackfillError::Stopped);
+            }
+            let next = store.list_definitions()?.into_iter().find_map(|def| {
+                let part = *def
+                    .selection
+                    .iter()
+                    .find(|p| p.state != PartState::Proposed)?;
+                Some((def, part))
+            });
+            let Some((def, part)) = next else {
+                return Ok(dropped);
+            };
+            let Some(version) = store.definition_version_as(&def)? else {
+                continue;
+            };
+            let mut txn = match self.oracle {
+                Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
+                None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
+            };
+            txn.bind_index_definition(&def.schema_key(), Some(version))
+                .map_err(StoreError::from)?;
+            // Gained in force and retired withdrawn hold members: moved into
+            // the index's own entries. The others are read by nobody now.
+            let keep = matches!(
+                (part.state, part.role),
+                (PartState::InForce, coordinode_modality::PartRole::Gained)
+                    | (PartState::Withdrawn, coordinode_modality::PartRole::Retired)
+            );
+            let empty = if keep {
+                move_page(&mut txn, part.part, def.generation)?
+            } else {
+                store.clear_txn(&mut txn, part.part)?;
+                true
+            };
+            let mut next_def = None;
+            if empty {
+                let mut folded = def.clone();
+                folded.drop_part(part.part);
+                if def.index_type == IndexType::Labels && !folded.has_parts_for(part.label) {
+                    recount(self.engine, &mut txn, &folded, self.shard_id, part.label)?;
+                }
+                store.put_definition_txn(&mut txn, &folded)?;
+                next_def = Some(folded);
+            }
+            match commit(&mut txn) {
+                Ok(()) => {
+                    conflicts = 0;
+                    dropped += u64::from(empty);
+                    if let (Some(registry), Some(folded)) = (self.registry, next_def) {
+                        registry
+                            .register_published(self.engine, folded)
+                            .map_err(StoreError::from)?;
+                    }
+                }
+                Err(CommitError::Conflict(_) | CommitError::RevisionMismatch { .. }) => {
+                    conflicts += 1;
+                    if conflicts > MAX_PAGE_CONFLICTS {
+                        return Err(BackfillError::Contended);
+                    }
+                }
+                Err(e) => return Err(BackfillError::Commit(e)),
+            }
+        }
+    }
+}
+
+/// Move up to [`FOLD_PAGE`] entries of the scope `part` into `base`, keyed
+/// the same past the generation, as `txn` sees them. Returns whether the
+/// part had no more: then it is empty once `txn` commits.
+fn move_page(
+    txn: &mut Transaction<'_>,
+    part: GenerationId,
+    base: GenerationId,
+) -> Result<bool, StoreError> {
+    use coordinode_core::index::encoding::{GENERATION_PREFIX_LEN, generation_ranges};
+    use coordinode_storage::engine::partition::Partition;
+    let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
+    let mut page: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (start, end) in generation_ranges(part) {
+        txn.range_for_each(Partition::Idx, &start, &end, &budget, |key, value| {
+            page.push((key.to_vec(), value.to_vec()));
+            Ok::<_, StoreError>(if page.len() > FOLD_PAGE {
+                core::ops::ControlFlow::Break(())
+            } else {
+                core::ops::ControlFlow::Continue(())
+            })
+        })?;
+        if page.len() > FOLD_PAGE {
+            break;
+        }
+    }
+    let empty = page.len() <= FOLD_PAGE;
+    page.truncate(FOLD_PAGE);
+    let base = base.as_raw().to_be_bytes();
+    for (key, value) in page {
+        txn.delete(Partition::Idx, &key)?;
+        let mut moved = key;
+        // The shape tag, then the generation: the rest names the same entry.
+        moved[1..GENERATION_PREFIX_LEN].copy_from_slice(&base);
+        txn.put(Partition::Idx, &moved, &value)?;
+    }
+    Ok(empty)
+}
+
+/// Set the counter of `label` to the number of its postings in the label
+/// lookup `lookup`'s own scope in shard `shard`, read in `txn`: the range
+/// read binds the commit, so a writer moving the label meanwhile conflicts
+/// with it, and the counter follows the facts in force again.
+fn recount(
+    engine: &StorageEngine,
+    txn: &mut Transaction<'_>,
+    lookup: &IndexDefinition,
+    shard: u16,
+    label: LabelId,
+) -> Result<(), StoreError> {
+    use coordinode_core::index::encoding::{label_range_prefix, prefix_end};
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    use coordinode_storage::engine::partition::Partition;
+    let Some(name) = LocalSchemaStore::new(engine).label_name(label)? else {
+        return Ok(());
+    };
+    let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
+    let range = label_range_prefix(lookup.generation, shard, label);
+    let mut members: i64 = 0;
+    txn.range_for_each(
+        Partition::Idx,
+        &range,
+        &prefix_end(&range),
+        &budget,
+        |_, _| {
+            members += 1;
+            Ok::<_, StoreError>(core::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    let key = coordinode_core::graph::stats::label_count_key(&name);
+    let counted = match txn.get(Partition::Counter, &key)? {
+        Some(bytes) => coordinode_storage::engine::merge::decode_counter(&bytes).map_err(|e| {
+            StoreError::Decode {
+                kind: "node counter",
+                message: format!("label {name}: {e}"),
+            }
+        })?,
+        None => 0,
+    };
+    let delta = members
+        .checked_sub(counted)
+        .ok_or_else(|| StoreError::Invariant(format!("the counter of :{name} is out of range")))?;
+    if delta != 0 {
+        txn.push_counter_delta(&key, delta);
+    }
+    Ok(())
+}
+
 /// The owner of the entries of the stored node row under `key`: the node,
 /// or for a temporal node the version the key names. `None` for a key that
 /// is not a node row.
