@@ -367,7 +367,7 @@ CREATE (:Goal {title: 'x', note: 1})      -- ERROR: note is not in Goal's schema
 ```
 
 - **Type label.** Any label declared with `CREATE NODE TYPE`, and any label used without a declaration (an undeclared label is a `FLEXIBLE` type label). A node carries exactly one; a node with none, or with two that do not imply each other, is refused.
-- **Implied labels.** `IMPLIES (L, ...)` names the labels every node of the type carries with it, transitively. The engine writes them on the node, so `MATCH (n:Thing)` finds every `Goal`. They do not count as a second type. Every property an implied label declares must be declared by the implying type with the same type, so the type's schema is the node's complete property list. A type cannot imply itself or an auxiliary label.
+- **Implied labels.** `IMPLIES (L, ...)` names the labels every node of the type carries with it, transitively. The node stores only its type and auxiliary labels; the implied ones follow from the type, and label scans and indexes find the node under each of them, so `MATCH (n:Thing)` finds every `Goal`. They do not count as a second type. Every property an implied label declares must be declared by the implying type with the same type, so the type's schema is the node's complete property list. A type cannot imply itself or an auxiliary label.
 - **Auxiliary labels.** `CREATE LABEL <name> AUXILIARY` declares a label that only classifies (a scope, a role, a tag). It declares no properties, is not `TEMPORAL`, and is never a node's only label.
 - The rule holds on every write that sets a node's labels or opens a new temporal version: `CREATE`, `MERGE`, `SET n:L`, `REMOVE n:L`, `MERGE NODES`.
 - `SET` of another type label, or `REMOVE` of the type label, is refused: a node's type changes only through [RETYPE NODE](#retype-node--). A label the type implies cannot be removed. Auxiliary labels are added and removed freely.
@@ -384,7 +384,7 @@ CREATE (:Rule:Policy {name: 'a', owner: 'ops'})  -- OK: Rule is an undeclared FL
 CREATE (:Goal {title: 'b'})
 MATCH (n:Thing {title: 'b'}) RETURN n            -- finds the Goal through thing_title
 ```
-- Whether a label is a type or auxiliary, and the labels a type implies, are fixed when the label is created. Declaring a label auxiliary when stored nodes carry it as their type is refused, and so is declaring `IMPLIES` for a type whose stored nodes lack one of the implied labels.
+- Whether a label is a type or auxiliary, and the labels a type implies, are fixed when the label is created. Declaring a label auxiliary when stored nodes carry it as their type is refused, and so is declaring `IMPLIES` for a label that already types stored nodes: an implied label is itself a type, which those nodes cannot already carry.
 - The schema API carries the same declarations: `Label.kind` and `Label.implies`, and the `kind` and `implies` fields of `CreateLabelRequest` and of a `PublishSchema` label.
 
 #### CREATE INDEX / DROP INDEX ✅
