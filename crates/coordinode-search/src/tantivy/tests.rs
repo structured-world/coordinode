@@ -76,7 +76,7 @@ fn batch_add() {
     ])
     .unwrap();
 
-    assert_eq!(idx.num_docs(), 3);
+    assert_eq!(idx.num_docs().unwrap(), 3);
     assert_eq!(idx.search("document", 10).unwrap().len(), 3);
 }
 
@@ -868,7 +868,7 @@ fn batch_with_language() {
     ])
     .unwrap();
 
-    assert_eq!(idx.num_docs(), 3);
+    assert_eq!(idx.num_docs().unwrap(), 3);
 
     let en = idx.search_with_language("run", 10, "english").unwrap();
     assert!(!en.is_empty(), "English batch doc findable");

@@ -4255,6 +4255,51 @@ fn text_match_filters_by_fulltext() {
     assert_eq!(results.len(), 1, "only 1 article matches 'graph'");
 }
 
+/// `text_match` over a directly wired index is membership: every matching
+/// row is kept. The index's last commit landed and its reader could not
+/// follow at once, and a reader move fails once more after that. The
+/// statement keeps all three rust articles or refuses; it never keeps one
+/// of them. Before, the match limit was the reader's stale document count,
+/// taken before a later read moved the reader to the commit holding three.
+#[test]
+fn text_match_over_a_lagging_index_never_drops_matches() {
+    use core::sync::atomic::Ordering::SeqCst;
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    for (id, title) in [(1, "rust graph"), (2, "rust tools"), (3, "rust web")] {
+        insert_node(
+            engine,
+            1,
+            id,
+            "Article",
+            &[("title", Value::String(title.into()))],
+            &mut interner,
+        );
+    }
+    let text_dir = fx.scratch_path().join("text_idx");
+    let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, Some("english")).unwrap();
+    text_idx.add_document(1, "rust graph").unwrap();
+    text_idx.hooks.fail_reloads.store(2, SeqCst);
+    text_idx
+        .add_documents_batch(&[(2, "rust tools"), (3, "rust web")])
+        .unwrap();
+    let multi_idx =
+        MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::with_default_language("english"));
+
+    let ast = parse("MATCH (a:Article) WHERE text_match(a.title, \"rust\") RETURN a.title")
+        .unwrap_or_else(|e| panic!("parse error: {e}"));
+    let plan = build_logical_plan(&ast).unwrap_or_else(|e| panic!("plan error: {e}"));
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
+    ctx.text_index = Some(&multi_idx);
+    ctx.text_index_registry = None;
+    match execute(&plan, &mut ctx) {
+        Ok(rows) => assert_eq!(rows.len(), 3, "every match kept: {rows:?}"),
+        Err(refused) => assert!(refused.to_string().contains("not caught up"), "{refused}"),
+    }
+}
+
 #[test]
 fn text_match_planner_creates_text_filter() {
     let ast =
@@ -5006,7 +5051,7 @@ mod multi_lang_text_index {
             )
             .unwrap();
 
-        assert_eq!(ml_idx.num_docs(), 2);
+        assert_eq!(ml_idx.num_docs().unwrap(), 2);
 
         // English search finds English doc
         let en = ml_idx.search_with_language("graph", 10, "english").unwrap();
@@ -5238,11 +5283,11 @@ mod multi_lang_text_index {
             ])
             .unwrap();
 
-        assert_eq!(ml_idx.num_docs(), 2);
+        assert_eq!(ml_idx.num_docs().unwrap(), 2);
 
         // Delete one
         ml_idx.delete_document(1).unwrap();
-        assert_eq!(ml_idx.num_docs(), 1);
+        assert_eq!(ml_idx.num_docs().unwrap(), 1);
 
         // Remaining doc still searchable
         let results = ml_idx

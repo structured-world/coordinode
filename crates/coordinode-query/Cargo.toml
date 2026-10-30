@@ -50,6 +50,7 @@ metrics = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
+coordinode-search = { workspace = true, features = ["test-hooks"] }
 criterion = { workspace = true }
 coordinode-embed = { workspace = true }
 coordinode-test-fixtures = { workspace = true }

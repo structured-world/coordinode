@@ -248,6 +248,46 @@ fn indexes_for_label() {
     assert_eq!(reg.len(), 3);
 }
 
+/// A write lands and the index's reader cannot follow it. Searches refuse
+/// rather than answer from the older commit, and only the owner's repair
+/// moves the reader; the worker maintaining the indexes runs it.
+#[test]
+fn a_lagging_reader_is_caught_up_by_its_owner_alone() {
+    use core::sync::atomic::Ordering::SeqCst;
+    let dir = TempDir::new().unwrap();
+    let reg = TextIndexRegistry::new(dir.path());
+    reg.register(text(
+        1,
+        "article_body",
+        "Article",
+        vec!["body".into()],
+        test_config(),
+    ))
+    .unwrap();
+    reg.with_index("Article", "body", |index, _| {
+        index.inner().hooks.fail_reloads.store(1, SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    reg.on_text_written(
+        "Article",
+        NodeId::from_raw(1),
+        "body",
+        "Rust graph database engine",
+    );
+    assert!(reg.any_lagging());
+    assert!(
+        reg.search("Article", "body", "rust", 10).is_none(),
+        "a search refuses"
+    );
+    assert!(reg.any_lagging(), "and does not repair the reader");
+
+    assert!(reg.catch_up_lagging());
+    assert!(!reg.any_lagging());
+    let results = reg.search("Article", "body", "rust", 10).unwrap();
+    assert_eq!(results.len(), 1, "the landed write is answered");
+}
+
 /// A step on an index that is dropped and recreated while the step runs
 /// changes the dropped installation alone: the step holds the old index's
 /// lock, the drop and the new registration go through meanwhile, and once

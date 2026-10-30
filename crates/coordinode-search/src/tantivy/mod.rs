@@ -129,6 +129,12 @@ pub enum TextSearchError {
     #[error("the outcome of a text index commit is unknown: {0}")]
     CommitUnknown(String),
 
+    /// The index's reader is behind its last commit: the read is refused
+    /// rather than answered from an older one, until the index's owner
+    /// catches the reader up.
+    #[error("the text index reader has not caught up with its last commit")]
+    ReaderBehind,
+
     /// The index holds documents written without a birth time, so a read
     /// filtered by birth time cannot tell which of them a snapshot sees.
     #[error(
@@ -288,9 +294,24 @@ pub struct TextIndex {
     /// it is durable, and a move of the reader that failed after it is
     /// tried again before the next read, which never reads the commit before.
     reader_behind: core::sync::atomic::AtomicBool,
-    /// Makes the next move of the reader fail, as a test asks.
-    #[cfg(test)]
-    pub(crate) fail_reload: core::sync::atomic::AtomicBool,
+    /// Why the index takes no more writes: a commit's outcome is unknown,
+    /// or the writer could not discard what it staged.
+    lost: Option<String>,
+    /// Failures a test injects, and the reader moves it counts.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub hooks: TestHooks,
+}
+
+/// Failure injection a test drives through [`TextIndex::hooks`].
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Default)]
+pub struct TestHooks {
+    /// How many of the next moves of the reader fail.
+    pub fail_reloads: core::sync::atomic::AtomicU32,
+    /// Moves of the reader attempted so far.
+    pub reload_attempts: core::sync::atomic::AtomicU64,
+    /// The next commit lands, and then reads back as unknown.
+    pub lose_commit_readback: core::sync::atomic::AtomicBool,
 }
 
 /// The schema of a text index and the fields the index reads by handle.
@@ -514,13 +535,15 @@ impl TextIndex {
             aside: Aside::default(),
             epoch,
             reader_behind: core::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            fail_reload: core::sync::atomic::AtomicBool::new(false),
+            lost: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            hooks: TestHooks::default(),
         })
     }
 
     /// Move the reader to the commit just made. The commit stands whatever
-    /// happens here: a failed move is left for the next read to retry.
+    /// happens here: a failed move leaves reads refused until the owner
+    /// catches the reader up (see [`Self::catch_up`]).
     fn follow_commit(&self) {
         let moved = self
             .reload_reader()
@@ -528,36 +551,62 @@ impl TextIndex {
         if let Err(e) = moved {
             self.reader_behind
                 .store(true, core::sync::atomic::Ordering::Release);
-            tracing::warn!(error = %e, "text index reader left behind its last commit; the next read moves it");
+            tracing::warn!(error = %e, "text index reader left behind its last commit; reads refuse until it catches up");
         }
     }
 
-    /// A searcher over the last commit, moving the reader there first when a
-    /// move after the commit failed.
+    /// Whether the reader is behind the last commit, so reads refuse.
+    pub fn reader_behind(&self) -> bool {
+        self.reader_behind
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Move a reader left behind its last commit there: the owner's repair,
+    /// run by the index's writer path or its maintainer, never inside a
+    /// read. Nothing to do for a reader that follows.
     ///
     /// # Errors
     ///
-    /// The reader still cannot be moved: nothing older is read instead.
-    fn searcher(&self) -> Result<tantivy::Searcher, TextSearchError> {
-        use core::sync::atomic::Ordering;
-        if self.reader_behind.load(Ordering::Acquire) {
+    /// The reader still cannot be moved; reads keep refusing.
+    pub fn catch_up(&self) -> Result<(), TextSearchError> {
+        if self.reader_behind() {
             self.reload_reader()?;
             self.reconcile_registry()?;
-            self.reader_behind.store(false, Ordering::Release);
+            self.reader_behind
+                .store(false, core::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// A searcher over the last commit.
+    ///
+    /// # Errors
+    ///
+    /// [`TextSearchError::ReaderBehind`] while the reader is behind it:
+    /// nothing older is read, and the read does not repair it.
+    fn searcher(&self) -> Result<tantivy::Searcher, TextSearchError> {
+        if self.reader_behind() {
+            return Err(TextSearchError::ReaderBehind);
         }
         Ok(self.reader.searcher())
     }
 
     /// Move the reader to the last commit.
     fn reload_reader(&self) -> Result<(), TextSearchError> {
-        #[cfg(test)]
-        if self
-            .fail_reload
-            .swap(false, core::sync::atomic::Ordering::AcqRel)
+        #[cfg(any(test, feature = "test-hooks"))]
         {
-            return Err(TextSearchError::IndexCorrupted(
-                "the reader was not moved, as the test asked".into(),
-            ));
+            use core::sync::atomic::Ordering;
+            self.hooks.reload_attempts.fetch_add(1, Ordering::AcqRel);
+            if self
+                .hooks
+                .fail_reloads
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(TextSearchError::IndexCorrupted(
+                    "the reader was not moved, as the test asked".into(),
+                ));
+            }
         }
         self.reader.reload()?;
         Ok(())
@@ -576,7 +625,19 @@ impl TextIndex {
         let mut prepared = self.writer.prepare_commit()?;
         prepared.set_payload(&encode_epoch(self.epoch));
         let opstamp = prepared.opstamp();
-        let Err(failed) = prepared.commit() else {
+        let committed = prepared.commit();
+        #[cfg(any(test, feature = "test-hooks"))]
+        if committed.is_ok()
+            && self
+                .hooks
+                .lose_commit_readback
+                .swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(self.unknown(
+                "the commit landed and its read-back was lost, as the test asked".into(),
+            ));
+        }
+        let Err(failed) = committed else {
             return Ok(());
         };
         // A commit reporting a failure may still have published its meta:
@@ -584,10 +645,16 @@ impl TextIndex {
         match self.index.load_metas() {
             Ok(metas) if metas.opstamp == opstamp => Ok(()),
             Ok(_) => Err(failed.into()),
-            Err(read) => Err(TextSearchError::CommitUnknown(format!(
-                "{failed}; reading back the last commit: {read}"
-            ))),
+            Err(read) => {
+                Err(self.unknown(format!("{failed}; reading back the last commit: {read}")))
+            }
         }
+    }
+
+    /// A commit whose outcome is unknown: the index takes no more writes.
+    fn unknown(&mut self, reason: String) -> TextSearchError {
+        self.lost = Some(format!("a commit's outcome is unknown: {reason}"));
+        TextSearchError::CommitUnknown(reason)
     }
 
     /// The scope field value of a document written in `scope` now.
@@ -756,33 +823,72 @@ impl TextIndex {
         docs: &[(u64, &str)],
         commit_ts: Option<u64>,
     ) -> Result<(), TextSearchError> {
-        for &(node_id, text) in docs {
-            let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
-            self.writer.delete_term(node_id_term);
+        self.commit_writes(|index| {
+            for &(node_id, text) in docs {
+                let node_id_term = tantivy::Term::from_field_u64(index.node_id_field, node_id);
+                index.writer.delete_term(node_id_term);
 
-            let mut doc = doc!(
-                self.node_id_field => node_id,
-                self.body_field => text,
-            );
-            if let Some(commit_ts) = commit_ts {
-                doc.add_u64(self.commit_ts_field, commit_ts);
+                let mut doc = doc!(
+                    index.node_id_field => node_id,
+                    index.body_field => text,
+                );
+                if let Some(commit_ts) = commit_ts {
+                    doc.add_u64(index.commit_ts_field, commit_ts);
+                }
+                index.writer.add_document(doc)?;
             }
-            self.writer.add_document(doc)?;
-        }
-
-        self.commit_staged()?;
-        self.follow_commit();
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Delete a document by node ID.
     ///
     /// Commits synchronously.
     pub fn delete_document(&mut self, node_id: u64) -> Result<(), TextSearchError> {
-        let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
-        self.writer.delete_term(node_id_term);
-        self.commit_staged()?;
-        self.follow_commit();
+        self.commit_writes(|index| {
+            let node_id_term = tantivy::Term::from_field_u64(index.node_id_field, node_id);
+            index.writer.delete_term(node_id_term);
+            Ok(())
+        })
+    }
+
+    /// Stage changes with `stage` and commit them: the one path every write
+    /// of the index's own takes. Refused before anything is staged once a
+    /// commit's outcome is unknown; a failure before the commit landed
+    /// discards what was staged.
+    fn commit_writes(
+        &mut self,
+        stage: impl FnOnce(&mut Self) -> Result<(), TextSearchError>,
+    ) -> Result<(), TextSearchError> {
+        self.writable()?;
+        let outcome = stage(self).and_then(|()| self.commit_staged());
+        match &outcome {
+            Ok(()) => self.follow_commit(),
+            // Nothing is known to discard: the index stays refused.
+            Err(TextSearchError::CommitUnknown(_)) => {}
+            Err(_) => self.discard_staged()?,
+        }
+        outcome
+    }
+
+    /// Refuse a write once a commit's outcome is unknown or the writer is
+    /// gone: the documents in memory may then differ from the directory's,
+    /// which only reopening the index reads again.
+    pub(crate) fn writable(&self) -> Result<(), TextSearchError> {
+        match &self.lost {
+            Some(reason) => Err(TextSearchError::IndexCorrupted(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Discard every staged change; a writer that cannot do so refuses
+    /// every later write.
+    pub(crate) fn discard_staged(&mut self) -> Result<(), TextSearchError> {
+        if let Err(e) = self.writer.rollback() {
+            let reason = format!("the index writer is gone after a failed rollback: {e}");
+            self.lost = Some(reason.clone());
+            return Err(TextSearchError::IndexCorrupted(reason));
+        }
         Ok(())
     }
 
@@ -1003,12 +1109,13 @@ impl TextIndex {
     }
 
     /// Return the number of documents in the index.
-    pub fn num_docs(&self) -> u64 {
-        // A reader still behind its commit answers its own count: every read
-        // of the documents themselves refuses until it catches up.
-        self.searcher()
-            .unwrap_or_else(|_| self.reader.searcher())
-            .num_docs()
+    ///
+    /// # Errors
+    ///
+    /// [`TextSearchError::ReaderBehind`] while the reader is behind the
+    /// last commit.
+    pub fn num_docs(&self) -> Result<u64, TextSearchError> {
+        Ok(self.searcher()?.num_docs())
     }
 
     /// Access the tantivy schema.
@@ -1153,27 +1260,27 @@ impl TextIndex {
         docs: &[(u64, &str, &str)],
         commit_ts: Option<u64>,
     ) -> Result<(), TextSearchError> {
-        for &(node_id, text, language) in docs {
-            let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
-            self.writer.delete_term(node_id_term);
+        self.commit_writes(|index| {
+            for &(node_id, text, language) in docs {
+                let node_id_term = tantivy::Term::from_field_u64(index.node_id_field, node_id);
+                index.writer.delete_term(node_id_term);
 
-            let tokens = tokenize::tokenize_text(text, language);
-            let pretokenized = PreTokenizedString {
-                text: text.to_string(),
-                tokens,
-            };
+                let tokens = tokenize::tokenize_text(text, language);
+                let pretokenized = PreTokenizedString {
+                    text: text.to_string(),
+                    tokens,
+                };
 
-            let mut doc = TantivyDocument::new();
-            doc.add_field_value(self.node_id_field, &OwnedValue::U64(node_id));
-            doc.add_field_value(self.body_field, &OwnedValue::PreTokStr(pretokenized));
-            if let Some(commit_ts) = commit_ts {
-                doc.add_field_value(self.commit_ts_field, &OwnedValue::U64(commit_ts));
+                let mut doc = TantivyDocument::new();
+                doc.add_field_value(index.node_id_field, &OwnedValue::U64(node_id));
+                doc.add_field_value(index.body_field, &OwnedValue::PreTokStr(pretokenized));
+                if let Some(commit_ts) = commit_ts {
+                    doc.add_field_value(index.commit_ts_field, &OwnedValue::U64(commit_ts));
+                }
+                index.writer.add_document(doc)?;
             }
-            self.writer.add_document(doc)?;
-        }
-
-        self.commit_staged()?;
-        self.follow_commit();
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1199,6 +1306,38 @@ impl TextIndex {
             .collect(
                 &*query,
                 Matches::Top(limit),
+                &PendingDocuments::none(),
+                None,
+                pending::Highlight::Off,
+                &mut coordinode_core::budget::Unmetered,
+            )?
+            .into_iter()
+            .map(|hit| TextSearchResult {
+                node_id: hit.node_id,
+                score: hit.score,
+            })
+            .collect())
+    }
+
+    /// Every match of `query_str`, analyzed by `language`'s pipeline, with
+    /// its score, all from one commit: what a membership predicate needs,
+    /// which a top-k cut sized from another read could truncate.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::search_with_language`].
+    pub fn search_all_with_language(
+        &self,
+        query_str: &str,
+        language: &str,
+    ) -> Result<Vec<TextSearchResult>, TextSearchError> {
+        let Some(query) = self.language_query(query_str, language)? else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .collect(
+                &*query,
+                Matches::All,
                 &PendingDocuments::none(),
                 None,
                 pending::Highlight::Off,

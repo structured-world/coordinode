@@ -136,10 +136,6 @@ pub struct MultiLanguageTextIndex {
     config: MultiLangConfig,
     /// Where the held state of each node with a timeline holds.
     validities: Validities,
-    /// Why the writer is gone: a failed write's rollback could not recreate
-    /// it, and a writer left without its directory lock panics on the next
-    /// rollback. Every later write is refused with this reason instead.
-    writer_lost: Option<String>,
 }
 
 impl MultiLanguageTextIndex {
@@ -173,7 +169,6 @@ impl MultiLanguageTextIndex {
             inner,
             config,
             validities: Validities::default(),
-            writer_lost: None,
         }
     }
 
@@ -357,14 +352,17 @@ impl MultiLanguageTextIndex {
     /// the commit landed discards everything staged and counts the committed
     /// documents again, so the statistics never describe documents a reader
     /// cannot see. A commit whose outcome cannot be read back leaves the
-    /// index serving the last commit it knows and refusing every later write.
+    /// index refusing every later write, its own and the inner index's
+    /// alike, until it is opened again.
+    ///
+    /// As the writer, it first catches a reader left behind the last commit
+    /// up: the staging reads the committed documents.
     fn write(
         &mut self,
         work: impl FnOnce(&mut Self, &mut Batch) -> Result<bool, TextSearchError>,
     ) -> Result<(), TextSearchError> {
-        if let Some(reason) = &self.writer_lost {
-            return Err(TextSearchError::IndexCorrupted(reason.clone()));
-        }
+        self.inner.writable()?;
+        self.inner.catch_up()?;
         let mut batch = Batch::new(self.inner.searcher()?);
         let epoch = self.inner.epoch;
         let outcome = match work(self, &mut batch) {
@@ -372,14 +370,17 @@ impl MultiLanguageTextIndex {
             Ok(false) => Ok(()),
             Err(e) => Err(e),
         };
-        if let Err(TextSearchError::CommitUnknown(reason)) = &outcome {
-            self.writer_lost = Some(format!("a commit's outcome is unknown: {reason}"));
-        }
         if outcome.is_err() {
             // The committed documents are read under the change the last
-            // commit recorded.
+            // commit recorded. One whose outcome is unknown is not discarded:
+            // the index takes no more writes, and what it serves stays the
+            // last commit its reader holds, counted as that.
             self.inner.epoch = epoch;
-            let rollback = self.inner.writer.rollback();
+            let rollback = if matches!(outcome, Err(TextSearchError::CommitUnknown(_))) {
+                Ok(())
+            } else {
+                self.inner.discard_staged()
+            };
             // The staging counted documents no reader will see. Count the
             // committed ones again, whatever happened to the writer; if even
             // that read fails, drop the exact statistics so searches use
@@ -396,11 +397,7 @@ impl MultiLanguageTextIndex {
                     }
                 }
             }
-            if let Err(e) = rollback {
-                let reason = format!("the index writer is gone after a failed rollback: {e}");
-                self.writer_lost = Some(reason.clone());
-                return Err(TextSearchError::IndexCorrupted(reason));
-            }
+            rollback?;
         }
         outcome
     }
@@ -731,8 +728,39 @@ impl MultiLanguageTextIndex {
     }
 
     /// Number of documents in the index.
-    pub fn num_docs(&self) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// [`TextSearchError::ReaderBehind`] while the reader is behind the
+    /// last commit.
+    pub fn num_docs(&self) -> Result<u64, TextSearchError> {
         self.inner.num_docs()
+    }
+
+    /// Every match of `query_str` in `language` (the index's default when
+    /// `None`), with its score, all from one commit: what a membership
+    /// predicate needs.
+    ///
+    /// # Errors
+    ///
+    /// As [`TextIndex::search_all_with_language`].
+    pub fn search_all(
+        &self,
+        query_str: &str,
+        language: Option<&str>,
+    ) -> Result<Vec<TextSearchResult>, TextSearchError> {
+        self.inner
+            .search_all_with_language(query_str, language.unwrap_or(&self.config.default_language))
+    }
+
+    /// Move a reader left behind its last commit there (see
+    /// [`TextIndex::catch_up`]): the owner's repair, never a read's.
+    ///
+    /// # Errors
+    ///
+    /// The reader still cannot be moved.
+    pub fn catch_up(&self) -> Result<(), TextSearchError> {
+        self.inner.catch_up()
     }
 
     /// Access the underlying `TextIndex`.

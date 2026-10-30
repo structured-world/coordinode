@@ -16,6 +16,9 @@ cjk-ja = ["dep:lindera", "lindera/embed-ipadic"]     # Japanese (lindera IPAdic,
 cjk-ko = ["dep:lindera", "lindera/embed-ko-dic"]     # Korean (lindera KO-dic, +34MB)
 # Umbrella: all CJK languages (~70MB total)
 cjk = ["cjk-zh", "cjk-ja", "cjk-ko"]
+# Failure injection for tests of other crates: a text index's reader moves
+# and commit read-backs that fail on request, and a count of reader moves.
+test-hooks = []
 
 [dependencies]
 # The query budget a search reports its work and scratch to.

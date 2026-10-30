@@ -12238,7 +12238,9 @@ fn text_search_error(
     use crate::index::text_registry::FindError;
     match error {
         FindError::Budget(stop) => ExecutionError::Budget(stop),
-        FindError::Failed(reason) => ExecutionError::Unsupported(format!("{context}: {reason}")),
+        FindError::Failed(reason) | FindError::NotReady(reason) => {
+            ExecutionError::Unsupported(format!("{context}: {reason}"))
+        }
     }
 }
 
@@ -12262,14 +12264,8 @@ fn execute_text_filter(
     }
     // Try text_index_registry first (automatic mode), fallback to legacy text_index.
     // The registry is keyed by (label, property) — extract property from text_expr.
-    // A legacy index is asked for as many matches as it holds documents: the
-    // predicate is membership, which a top-K cutoff would truncate.
-    let limit = ctx
-        .text_index
-        .map_or(1, |index| {
-            usize::try_from(index.num_docs()).unwrap_or(usize::MAX)
-        })
-        .max(1);
+    // A directly wired index is asked for every match, from one commit:
+    // the predicate is membership, which a top-K cutoff would truncate.
     // Extract property name from text_expr (PropertyAccess { var, property }).
     let property = match text_expr {
         crate::plan::expr::Expr::Property { key, .. } => Some(key.as_str()),
@@ -12296,59 +12292,45 @@ fn execute_text_filter(
         _ => "",
     };
 
-    let search_results: Vec<coordinode_search::tantivy::TextSearchResult> = if let Some(registry) =
-        ctx.text_index_registry
-    {
-        if let (Some(l), Some(p)) = (label, property) {
-            // Every match, not a top-K: the predicate is membership.
-            match text_index_matches(registry, (variable, l, p), query_string, language, ctx)
-                .map_err(|e| text_search_error("text search error", e))?
-            {
-                Some(matches) => matches
-                    .into_iter()
-                    .map(
-                        |(node_id, score)| coordinode_search::tantivy::TextSearchResult {
-                            node_id,
-                            score,
-                        },
-                    )
-                    .collect(),
-                // Registry is wired but has no index for (label, property) —
-                // hard-fail, don't silently pass every row through.
-                None => return Err(text_match_missing_index_error(Some(l), Some(p))),
-            }
-        } else if let Some(text_index) = ctx.text_index {
-            // Registry present but we couldn't determine (label, property) from
-            // the text_expr shape — fall back to the legacy single text_index
-            // for back-compat with tests that wire one directly.
-            if let Some(lang) = language {
+    let search_results: Vec<coordinode_search::tantivy::TextSearchResult> =
+        if let Some(registry) = ctx.text_index_registry {
+            if let (Some(l), Some(p)) = (label, property) {
+                // Every match, not a top-K: the predicate is membership.
+                match text_index_matches(registry, (variable, l, p), query_string, language, ctx)
+                    .map_err(|e| text_search_error("text search error", e))?
+                {
+                    Some(matches) => matches
+                        .into_iter()
+                        .map(
+                            |(node_id, score)| coordinode_search::tantivy::TextSearchResult {
+                                node_id,
+                                score,
+                            },
+                        )
+                        .collect(),
+                    // Registry is wired but has no index for (label, property) —
+                    // hard-fail, don't silently pass every row through.
+                    None => return Err(text_match_missing_index_error(Some(l), Some(p))),
+                }
+            } else if let Some(text_index) = ctx.text_index {
+                // Registry present but we couldn't determine (label, property) from
+                // the text_expr shape: the directly wired index answers.
                 text_index
-                    .search_with_language(query_string, limit, lang)
+                    .search_all(query_string, language)
                     .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
             } else {
-                text_index
-                    .search(query_string, limit)
-                    .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
+                // Neither registry lookup worked nor legacy index present.
+                return Err(text_match_missing_index_error(label, property));
             }
+        } else if let Some(text_index) = ctx.text_index {
+            // A single text index wired directly.
+            text_index
+                .search_all(query_string, language)
+                .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
         } else {
-            // Neither registry lookup worked nor legacy index present.
+            // No registry and no legacy index — hard-fail.
             return Err(text_match_missing_index_error(label, property));
-        }
-    } else if let Some(text_index) = ctx.text_index {
-        // Legacy path: single text_index passed directly.
-        if let Some(lang) = language {
-            text_index
-                .search_with_language(query_string, limit, lang)
-                .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
-        } else {
-            text_index
-                .search(query_string, limit)
-                .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
-        }
-    } else {
-        // No registry and no legacy index — hard-fail.
-        return Err(text_match_missing_index_error(label, property));
-    };
+        };
 
     // Build a map of matching node IDs → BM25 scores
     let matching_scores: std::collections::HashMap<u64, f32> = search_results

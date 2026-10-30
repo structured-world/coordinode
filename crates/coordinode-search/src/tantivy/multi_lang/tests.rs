@@ -181,7 +181,7 @@ fn mixed_language_documents() {
     )
     .unwrap();
 
-    assert_eq!(idx.num_docs(), 2);
+    assert_eq!(idx.num_docs().unwrap(), 2);
 
     // Each doc searchable in its language
     let en = idx.search_with_language("run", 10, "english").unwrap();
@@ -215,7 +215,7 @@ fn batch_add_nodes() {
     ])
     .unwrap();
 
-    assert_eq!(idx.num_docs(), 2);
+    assert_eq!(idx.num_docs().unwrap(), 2);
 }
 
 #[test]
@@ -232,10 +232,10 @@ fn delete_from_multilang() {
         )]),
     )
     .unwrap();
-    assert_eq!(idx.num_docs(), 1);
+    assert_eq!(idx.num_docs().unwrap(), 1);
 
     idx.delete_document(1).unwrap();
-    assert_eq!(idx.num_docs(), 0);
+    assert_eq!(idx.num_docs().unwrap(), 0);
 }
 
 #[test]
@@ -417,7 +417,11 @@ fn empty_properties_skipped() {
 
     // Empty properties — should not crash, should not add doc
     idx.add_node(1, &props(&[])).unwrap();
-    assert_eq!(idx.num_docs(), 0, "empty node should not be indexed");
+    assert_eq!(
+        idx.num_docs().unwrap(),
+        0,
+        "empty node should not be indexed"
+    );
 }
 
 /// One batch replaces the upserted documents and takes out the removed ones
@@ -436,7 +440,7 @@ fn a_batch_upserts_and_removes_in_one_commit() {
     idx.apply_changes(&[(1, props(&[("body", "fresh words")]))], &[2, 99])
         .unwrap();
 
-    assert_eq!(idx.num_docs(), 1);
+    assert_eq!(idx.num_docs().unwrap(), 1);
     assert!(idx.contains(1).unwrap());
     assert!(!idx.contains(2).unwrap(), "the removed node is gone");
     assert!(
@@ -458,7 +462,7 @@ fn removing_nodes_the_index_does_not_hold_changes_nothing() {
 
     idx.apply_changes(&[], &[7, 8]).unwrap();
 
-    assert_eq!(idx.num_docs(), 1);
+    assert_eq!(idx.num_docs().unwrap(), 1);
     assert!(idx.contains(1).unwrap());
     assert!(!idx.contains(7).unwrap());
 }
@@ -481,7 +485,7 @@ fn replace_all_drops_documents_not_listed() {
     idx.replace_all(&[(1, props(&[("body", "stays here")]))])
         .unwrap();
 
-    assert_eq!(idx.num_docs(), 1);
+    assert_eq!(idx.num_docs().unwrap(), 1);
     assert!(!idx.contains(2).unwrap());
     assert!(idx.search("deleted", 10).unwrap().is_empty());
     assert_eq!(idx.search("stays", 10).unwrap().len(), 1);
@@ -1250,7 +1254,8 @@ fn a_reopened_index_reads_a_settled_change_as_settled() {
 
 /// Settling commits durably, and then the reader cannot be moved to that
 /// commit at once. The commit stands: settling reports it done, reads
-/// answer the settled documents and statistics, the next change and its
+/// refuse until the owner catches the reader up and then answer the
+/// settled documents and statistics, the next change and its
 /// withdrawal never take in a document the settled one kept, and a reopen
 /// finds the same. Before, a failed move after the commit put the old epoch
 /// and the old statistics back over the committed documents.
@@ -1287,8 +1292,22 @@ fn a_settled_commit_stands_when_the_reader_lags() {
             &[],
         )
         .unwrap();
-        idx.inner_mut().fail_reload.store(true, SeqCst);
+        idx.inner().hooks.fail_reloads.store(1, SeqCst);
         let settled = idx.settle(Scope::Retired);
+        assert!(
+            matches!(
+                idx.find(
+                    terms("rust"),
+                    Matches::All,
+                    &PendingDocuments::none(),
+                    None,
+                    &mut Unmetered
+                ),
+                Err(TextSearchError::ReaderBehind)
+            ),
+            "reads refuse until the owner catches the reader up"
+        );
+        idx.catch_up().unwrap();
         for query in ["rust", "graph", "store"] {
             assert_same_scores(
                 &scores(&idx, query, &PendingDocuments::none()),
@@ -1308,6 +1327,87 @@ fn a_settled_commit_stands_when_the_reader_lags() {
     let idx = open();
     assert!(idx.all_shared());
     assert_eq!(found(&idx), [1, 4], "after a reopen");
+}
+
+/// A commit lands but reads back as unknown. Every later write refuses
+/// before it stages anything, through the multi-language index and through
+/// the inner index's own writes alike, and a reopen finds exactly what
+/// landed and takes writes again. Before, only the multi-language index's
+/// writes were refused, and the inner index's own committed past it.
+#[test]
+fn a_commit_of_unknown_outcome_refuses_every_later_write() {
+    use core::sync::atomic::Ordering::SeqCst;
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        MultiLanguageTextIndex::open_or_create(
+            dir.path(),
+            15_000_000,
+            MultiLangConfig::with_default_language("english"),
+        )
+        .unwrap()
+    };
+    let found = |idx: &MultiLanguageTextIndex| -> Vec<u64> {
+        scores(idx, "rust", &PendingDocuments::none())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    };
+    {
+        let mut idx = open();
+        idx.apply_scoped_changes(&[(1, props(&[("body", "rust graph")]), Scope::Shared)], &[])
+            .unwrap();
+        idx.inner().hooks.lose_commit_readback.store(true, SeqCst);
+        assert!(
+            idx.apply_scoped_changes(&[(2, props(&[("body", "rust tools")]), Scope::Shared)], &[])
+                .is_err(),
+            "the outcome is unknown"
+        );
+        assert!(
+            idx.apply_scoped_changes(&[(3, props(&[("body", "rust web")]), Scope::Shared)], &[])
+                .is_err()
+        );
+        assert!(idx.inner_mut().add_document(4, "rust store").is_err());
+        assert!(idx.inner_mut().add_documents_batch(&[(5, "rust")]).is_err());
+        assert!(idx.inner_mut().delete_document(1).is_err());
+    }
+    let mut idx = open();
+    assert_eq!(found(&idx), [1, 2], "what landed, and nothing after it");
+    idx.apply_scoped_changes(&[(6, props(&[("body", "rust")]), Scope::Shared)], &[])
+        .unwrap();
+    assert_eq!(found(&idx), [1, 2, 6], "writes are taken again");
+}
+
+/// A commit lands and the reader cannot follow it. A read neither answers
+/// from the older commit nor moves the reader itself, which would put the
+/// owner's repair inside a search: it refuses, however often it is asked.
+/// Before, the first read moved the reader.
+#[test]
+fn a_read_never_moves_a_lagging_reader() {
+    use core::sync::atomic::Ordering::SeqCst;
+    let dir = tempfile::tempdir().unwrap();
+    let mut idx = fresh(dir.path(), &[(1, "rust graph")]);
+    idx.inner().hooks.fail_reloads.store(1, SeqCst);
+    idx.apply_scoped_changes(&[(2, props(&[("body", "rust tools")]), Scope::Shared)], &[])
+        .unwrap();
+    let attempts = idx.inner().hooks.reload_attempts.load(SeqCst);
+    for _ in 0..3 {
+        assert!(
+            idx.find(
+                terms("rust"),
+                Matches::All,
+                &PendingDocuments::none(),
+                None,
+                &mut Unmetered
+            )
+            .is_err(),
+            "a read of a lagging reader refuses"
+        );
+    }
+    assert_eq!(
+        idx.inner().hooks.reload_attempts.load(SeqCst),
+        attempts,
+        "no read moved the reader"
+    );
 }
 
 /// A document rewritten into another scope leaves its old scope's

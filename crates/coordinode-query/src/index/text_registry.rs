@@ -42,6 +42,9 @@ pub type Judged = (
 pub enum FindError {
     /// The query's budget stopped it.
     Budget(BudgetStop),
+    /// The index's reader is behind its last commit until the worker
+    /// maintaining it catches it up; nothing older is answered meanwhile.
+    NotReady(String),
     /// The nodes could not be read or the query not run, as described.
     Failed(String),
 }
@@ -50,7 +53,7 @@ impl core::fmt::Display for FindError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Budget(stop) => stop.fmt(f),
-            Self::Failed(reason) => f.write_str(reason),
+            Self::Failed(reason) | Self::NotReady(reason) => f.write_str(reason),
         }
     }
 }
@@ -486,6 +489,9 @@ impl TextIndexRegistry {
         };
         let searched = |e: TextSearchError| match e {
             TextSearchError::Budget(stop) => FindError::Budget(stop),
+            TextSearchError::ReaderBehind => {
+                FindError::NotReady(format!("text index :{label}({property}): {e}"))
+            }
             other => failed(&other),
         };
         let installed = handle.read().map_err(|_| failed(&"lock poisoned"))?;
@@ -570,6 +576,39 @@ impl TextIndexRegistry {
             .values()
             .filter_map(|handle| handle.read().ok()?.index.first_end())
             .min()
+    }
+
+    /// Whether some index's reader is behind its last commit, so its
+    /// searches refuse until [`Self::catch_up_lagging`] moves it.
+    pub fn any_lagging(&self) -> bool {
+        self.indexes.read().is_ok_and(|indexes| {
+            indexes.values().any(|handle| {
+                handle
+                    .read()
+                    .is_ok_and(|installed| installed.index.inner().reader_behind())
+            })
+        })
+    }
+
+    /// Move every reader left behind its last commit there: the repair the
+    /// worker maintaining the indexes runs, never a search. Returns whether
+    /// every one now follows.
+    pub fn catch_up_lagging(&self) -> bool {
+        let Ok(indexes) = self.indexes.read() else {
+            return false;
+        };
+        let mut all = true;
+        for ((label, property), handle) in indexes.iter() {
+            let Ok(installed) = handle.read() else {
+                all = false;
+                continue;
+            };
+            if let Err(e) = installed.index.catch_up() {
+                tracing::warn!(label, property, error = %e, "text index reader still behind its last commit");
+                all = false;
+            }
+        }
+        all
     }
 
     /// The nodes whose held state in the index of `(label, property)` does

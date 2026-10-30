@@ -145,8 +145,16 @@ impl Worker {
                 Some(wait) if refold_failed => Some(wait.max(REFOLD_RETRY)),
                 wait => wait,
             };
+            // A reader left behind its last commit refuses searches until it
+            // is caught up: this worker, the indexes' owner, retries it.
+            let wait = if self.registry.any_lagging() {
+                Some(wait.map_or(REFOLD_RETRY, |w| w.min(REFOLD_RETRY)))
+            } else {
+                wait
+            };
             let Some(first) = self.applied.next(wait) else {
                 if !self.stop.load(Ordering::Acquire) {
+                    self.registry.catch_up_lagging();
                     // Woken for a change of what a type implies, or for
                     // ended temporal states.
                     self.sync_selections_logged();
