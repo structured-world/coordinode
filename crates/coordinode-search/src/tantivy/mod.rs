@@ -155,6 +155,71 @@ pub struct TextSearchResult {
 
 /// Full-text index backed by tantivy.
 ///
+/// Which interpretations of an index's label hold a document while a change
+/// of what a type implies keeps the label's carriers apart: the documents of
+/// both interpretations share the index, and a search under one leaves the
+/// other's own documents out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Scope {
+    /// Held under the facts in force and the change alike; every document
+    /// outside a change.
+    #[default]
+    Shared,
+    /// Held under the facts in force only: the change takes it out.
+    Retired,
+    /// Held under the change only: the change brings it in.
+    Gained,
+}
+
+impl Scope {
+    /// The value of the document's scope field.
+    pub const fn as_u64(self) -> u64 {
+        match self {
+            Self::Shared => 0,
+            Self::Retired => 1,
+            Self::Gained => 2,
+        }
+    }
+
+    /// The scope a stored scope field value names; an absent or unknown one
+    /// is shared, as a document written outside any change.
+    pub const fn from_u64(value: u64) -> Self {
+        match value {
+            1 => Self::Retired,
+            2 => Self::Gained,
+            _ => Self::Shared,
+        }
+    }
+}
+
+/// The statistics of the documents of each scope apart from the shared one,
+/// so a search that leaves a scope out scores against the rest without
+/// counting anything at query time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Aside {
+    pub(crate) retired: corpus::Corpus,
+    pub(crate) gained: corpus::Corpus,
+}
+
+impl Aside {
+    /// The statistics of `scope`'s documents; `None` for the shared one.
+    pub(crate) fn of(&self, scope: Scope) -> Option<&corpus::Corpus> {
+        match scope {
+            Scope::Shared => None,
+            Scope::Retired => Some(&self.retired),
+            Scope::Gained => Some(&self.gained),
+        }
+    }
+
+    pub(crate) fn of_mut(&mut self, scope: Scope) -> Option<&mut corpus::Corpus> {
+        match scope {
+            Scope::Shared => None,
+            Scope::Retired => Some(&mut self.retired),
+            Scope::Gained => Some(&mut self.gained),
+        }
+    }
+}
+
 /// A search result with highlighted text snippet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HighlightedResult {
@@ -189,6 +254,8 @@ pub struct TextIndex {
     commit_ts_field: Field,
     /// Stored-only tokens of a pre-tokenized body (see [`encode_tokens`]).
     tokens_field: Field,
+    /// Indexed and stored [`Scope`] of each document.
+    scope_field: Field,
     /// Per-segment `(min_ts, max_ts)` cache, reconciled after every reader
     /// reload. Used to partition segments on `search_at(T)` into fully-visible,
     /// fully-hidden, and straddle buckets.
@@ -197,6 +264,9 @@ pub struct TextIndex {
     /// carry their tokens (a [`multi_lang::MultiLanguageTextIndex`]); `None`
     /// scores with Tantivy's own counts.
     corpus: Option<corpus::Corpus>,
+    /// What the documents of the scopes other than the shared one add to
+    /// `corpus`, kept in step with it.
+    aside: Aside,
 }
 
 /// The schema of a text index and the fields the index reads by handle.
@@ -207,7 +277,15 @@ struct Layout {
     body_field: Field,
     commit_ts_field: Field,
     tokens_field: Field,
+    scope_field: Field,
 }
+
+/// Field holding each document's [`Scope`].
+const SCOPE_FIELD: &str = "scope";
+
+/// A live document's tokens (`None` for a body stored as plain text) and
+/// scope.
+type LiveDocument = (Option<Vec<String>>, Scope);
 
 /// Stored-only field holding the tokens a pre-tokenized body was indexed with.
 const TOKENS_FIELD: &str = "tokens";
@@ -270,6 +348,13 @@ impl Layout {
             TOKENS_FIELD,
             tantivy::schema::BytesOptions::default().set_stored(),
         );
+        // Indexed, so a search leaves a scope out by its term before the
+        // best matches are taken; stored, so a replaced document is taken out
+        // of its own scope's statistics.
+        let scope_field = schema_builder.add_u64_field(
+            SCOPE_FIELD,
+            NumericOptions::default().set_indexed().set_stored(),
+        );
         Self {
             tokenizer_name,
             schema: schema_builder.build(),
@@ -277,6 +362,7 @@ impl Layout {
             body_field,
             commit_ts_field,
             tokens_field,
+            scope_field,
         }
     }
 }
@@ -348,6 +434,7 @@ impl TextIndex {
             body_field,
             commit_ts_field,
             tokens_field,
+            scope_field,
         } = layout;
 
         // Register language-specific tokenizer.
@@ -373,8 +460,10 @@ impl TextIndex {
             body_field,
             commit_ts_field,
             tokens_field,
+            scope_field,
             registry: RwLock::new(SegmentRegistry::new()),
             corpus: None,
+            aside: Aside::default(),
         })
     }
 
@@ -384,13 +473,23 @@ impl TextIndex {
         decode_tokens(doc.get_first(self.tokens_field)?.as_bytes()?)
     }
 
+    /// The scope a stored document was written in.
+    fn stored_scope(&self, doc: &TantivyDocument) -> Scope {
+        Scope::from_u64(
+            doc.get_first(self.scope_field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        )
+    }
+
     /// `node_id`'s live document as `searcher` sees it, by its tokens (`None`
-    /// inside for a body stored as plain text); `None` when there is none.
+    /// for a body stored as plain text) and its scope; `None` when there is
+    /// none.
     fn live_tokens(
         &self,
         searcher: &tantivy::Searcher,
         node_id: u64,
-    ) -> Result<Option<Option<Vec<String>>>, TextSearchError> {
+    ) -> Result<Option<LiveDocument>, TextSearchError> {
         let term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
         let found = searcher.search(&query, &TopDocs::with_limit(1).order_by_score())?;
@@ -398,13 +497,15 @@ impl TextIndex {
             return Ok(None);
         };
         let doc: TantivyDocument = searcher.doc(*address)?;
-        Ok(Some(self.stored_tokens(&doc)))
+        Ok(Some((self.stored_tokens(&doc), self.stored_scope(&doc))))
     }
 
-    /// Count every live document of the committed index.
-    fn recount(&self) -> Result<corpus::Corpus, TextSearchError> {
+    /// Count every live document of the committed index, and those of the
+    /// scopes apart from the shared one.
+    fn recount(&self) -> Result<(corpus::Corpus, Aside), TextSearchError> {
         let searcher = self.reader.searcher();
         let mut counted = corpus::Corpus::default();
+        let mut aside = Aside::default();
         for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
                 TextSearchError::IndexCorrupted("more segments than a u32 holds".into())
@@ -414,10 +515,31 @@ impl TextIndex {
                     searcher.doc(tantivy::DocAddress::new(ordinal, doc_id))?;
                 if let Some(tokens) = self.stored_tokens(&doc) {
                     counted.add(&tokens);
+                    if let Some(scoped) = aside.of_mut(self.stored_scope(&doc)) {
+                        scoped.add(&tokens);
+                    }
                 }
             }
         }
-        Ok(counted)
+        Ok((counted, aside))
+    }
+
+    /// The node ids of the live documents of `scope`, as the committed
+    /// index holds them, ascending.
+    fn scope_members(&self, scope: Scope) -> Result<Vec<u64>, TextSearchError> {
+        let searcher = self.reader.searcher();
+        let term = tantivy::Term::from_field_u64(self.scope_field, scope.as_u64());
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let addresses = searcher.search(&query, &tantivy::collector::DocSetCollector)?;
+        let mut members = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let doc: TantivyDocument = searcher.doc(address)?;
+            if let Some(id) = doc.get_first(self.node_id_field).and_then(|v| v.as_u64()) {
+                members.push(id);
+            }
+        }
+        members.sort_unstable();
+        Ok(members)
     }
 
     /// Reconcile per-segment commit_ts ranges from the current searcher state.
@@ -709,6 +831,7 @@ impl TextIndex {
             &*query,
             Matches::Top(limit),
             &PendingDocuments::none(),
+            None,
             pending::Highlight::NearWords(query_str),
             &mut coordinode_core::budget::Unmetered,
         )
@@ -942,6 +1065,7 @@ impl TextIndex {
                 &*query,
                 Matches::Top(limit),
                 &PendingDocuments::none(),
+                None,
                 pending::Highlight::Off,
                 &mut coordinode_core::budget::Unmetered,
             )?
@@ -997,6 +1121,7 @@ impl TextIndex {
             &*query,
             Matches::Top(limit),
             &PendingDocuments::none(),
+            None,
             pending::Highlight::Query,
             &mut coordinode_core::budget::Unmetered,
         )

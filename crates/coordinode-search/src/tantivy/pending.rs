@@ -21,7 +21,7 @@ use tantivy::{
 };
 
 use super::corpus::{Corpus, CorpusChange};
-use super::{HighlightedResult, TextIndex, TextSearchError};
+use super::{HighlightedResult, Scope, TextIndex, TextSearchError};
 
 /// Memory budget of the writer that builds a pending segment. It sizes the
 /// writer's term table only; the arena grows with the documents.
@@ -136,12 +136,15 @@ impl TextIndex {
 
     /// Run `query` over the index and `pending`, best score first (ties by
     /// node id), with snippets highlighting what `highlight` says, reporting
-    /// the documents it reads and scores to `meter`, which can stop it.
+    /// the documents it reads and scores to `meter`, which can stop it. The
+    /// index's documents of scope `exclude` are left out of the matches and
+    /// of the corpus.
     pub(crate) fn collect<M: Meter>(
         &self,
         query: &dyn Query,
         matches: Matches,
         pending: &PendingDocuments,
+        exclude: Option<Scope>,
         highlight: Highlight<'_>,
         meter: &mut M,
     ) -> Result<Vec<HighlightedResult>, TextSearchError>
@@ -149,15 +152,27 @@ impl TextIndex {
         TextSearchError: From<M::Stop>,
     {
         let searcher = self.reader.searcher();
+        // A scope is left out of statistics only the index counts exactly.
+        let excluded = match exclude.and_then(|scope| self.aside.of(scope)) {
+            Some(_) if self.corpus.is_none() => {
+                return Err(TextSearchError::IndexCorrupted(
+                    "an index without exact statistics cannot leave a scope out".to_string(),
+                ));
+            }
+            excluded => excluded,
+        };
         // One corpus for both sides, so their scores rank on one scale and a
         // term only the pending documents hold still scores there: the
-        // index's live documents, less the superseded ones as this same
-        // searcher holds them, plus the pending ones.
+        // index's live documents, less the excluded scope's, less the
+        // superseded ones as this same searcher holds them (those of the
+        // excluded scope are out already), plus the pending ones.
         let mut removed = Corpus::default();
         if let (Some(_), Superseded::Nodes(nodes)) = (&self.corpus, &pending.superseded) {
             for node_id in nodes {
                 meter.work(1)?;
-                if let Some(Some(tokens)) = self.live_tokens(&searcher, *node_id)? {
+                if let Some((Some(tokens), scope)) = self.live_tokens(&searcher, *node_id)?
+                    && Some(scope) != exclude.filter(|s| *s != Scope::Shared)
+                {
                     removed.add(&tokens);
                 }
             }
@@ -173,22 +188,40 @@ impl TextIndex {
             body: self.body_field,
             added: &pending.added,
             removed: &removed,
+            excluded: match pending.superseded {
+                // Nothing of the index is counted.
+                Superseded::All => None,
+                _ => excluded,
+            },
         };
+        let mut left_out: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        if let Some(scope) = exclude.filter(|s| *s != Scope::Shared) {
+            let term = Term::from_field_u64(self.scope_field, scope.as_u64());
+            left_out.push((
+                Occur::MustNot,
+                Box::new(tantivy::query::TermQuery::new(
+                    term,
+                    tantivy::schema::IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if let Superseded::Nodes(nodes) = &pending.superseded {
+            let terms = nodes
+                .iter()
+                .map(|id| Term::from_field_u64(self.node_id_field, *id));
+            left_out.push((Occur::MustNot, Box::new(TermSetQuery::new(terms))));
+        }
         let mut hits = match &pending.superseded {
-            Superseded::None => {
+            Superseded::All => Vec::new(),
+            _ if left_out.is_empty() => {
                 self.hits(&searcher, query, matches, &statistics, highlight, meter)?
             }
-            Superseded::Nodes(nodes) => {
-                let terms = nodes
-                    .iter()
-                    .map(|id| Term::from_field_u64(self.node_id_field, *id));
-                let current = BooleanQuery::new(vec![
-                    (Occur::Must, query.box_clone()),
-                    (Occur::MustNot, Box::new(TermSetQuery::new(terms))),
-                ]);
+            _ => {
+                let mut clauses = vec![(Occur::Must, query.box_clone())];
+                clauses.extend(left_out);
+                let current = BooleanQuery::new(clauses);
                 self.hits(&searcher, &current, matches, &statistics, highlight, meter)?
             }
-            Superseded::All => Vec::new(),
         };
         if let Some(segment) = &pending.segment {
             hits.extend(self.hits(segment, query, matches, &statistics, highlight, meter)?);
@@ -370,6 +403,8 @@ struct CorpusStatistics<'a> {
     body: Field,
     added: &'a Corpus,
     removed: &'a Corpus,
+    /// The documents of the scope the search leaves out, counted apart.
+    excluded: Option<&'a Corpus>,
 }
 
 impl CorpusStatistics<'_> {
@@ -394,7 +429,8 @@ impl Bm25StatisticsProvider for CorpusStatistics<'_> {
             Base::Index(searcher) => searcher.total_num_tokens(field)?,
             Base::Nothing => 0,
         };
-        self.combine(base, self.added.tokens, self.removed.tokens)
+        let excluded = self.excluded.map_or(0, |c| c.tokens);
+        self.combine(base, self.added.tokens, self.removed.tokens + excluded)
     }
 
     fn total_num_docs(&self) -> tantivy::Result<u64> {
@@ -403,7 +439,8 @@ impl Bm25StatisticsProvider for CorpusStatistics<'_> {
             Base::Index(searcher) => Bm25StatisticsProvider::total_num_docs(searcher)?,
             Base::Nothing => 0,
         };
-        self.combine(base, self.added.docs, self.removed.docs)
+        let excluded = self.excluded.map_or(0, |c| c.docs);
+        self.combine(base, self.added.docs, self.removed.docs + excluded)
     }
 
     fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
@@ -420,7 +457,8 @@ impl Bm25StatisticsProvider for CorpusStatistics<'_> {
             Base::Index(searcher) => searcher.doc_freq(term)?,
             Base::Nothing => 0,
         };
-        self.combine(base, count(self.added), count(self.removed))
+        let excluded = self.excluded.map_or(0, count);
+        self.combine(base, count(self.added), count(self.removed) + excluded)
     }
 }
 

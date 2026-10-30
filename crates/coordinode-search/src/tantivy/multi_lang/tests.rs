@@ -494,7 +494,7 @@ fn scores(
     pending: &PendingDocuments,
 ) -> Vec<(u64, f32)> {
     let mut hits: Vec<(u64, f32)> = idx
-        .find(terms(query), Matches::All, pending, &mut Unmetered)
+        .find(terms(query), Matches::All, pending, None, &mut Unmetered)
         .unwrap()
         .into_iter()
         .map(|hit| (hit.node_id, hit.score))
@@ -718,6 +718,7 @@ fn a_malformed_query_is_refused() {
             terms("(raft"),
             Matches::All,
             &PendingDocuments::none(),
+            None,
             &mut Unmetered
         ),
         Err(TextSearchError::QuerySyntax(_))
@@ -770,7 +771,7 @@ fn terms(query: &str) -> TextRequest<'_> {
 
 fn found(idx: &MultiLanguageTextIndex, query: &str, pending: &PendingDocuments) -> Vec<u64> {
     let mut ids: Vec<u64> = idx
-        .find(terms(query), Matches::All, pending, &mut Unmetered)
+        .find(terms(query), Matches::All, pending, None, &mut Unmetered)
         .unwrap()
         .into_iter()
         .map(|hit| hit.node_id)
@@ -850,7 +851,7 @@ fn pending_documents_score_on_the_index_scale() {
         .pending(Some(&[9]), &[(9, props(&[("body", "rust graph engine")]))])
         .unwrap();
     let hits = idx
-        .find(terms("rust"), Matches::All, &pending, &mut Unmetered)
+        .find(terms("rust"), Matches::All, &pending, None, &mut Unmetered)
         .unwrap();
 
     assert_eq!(hits.len(), 2);
@@ -881,6 +882,7 @@ fn a_search_for_every_match_stops_with_its_budget() {
         terms("graph"),
         Matches::All,
         &PendingDocuments::none(),
+        None,
         &mut batch,
     );
     assert!(
@@ -913,7 +915,13 @@ fn matches_bound_the_merged_list() {
         .unwrap();
 
     let top = idx
-        .find(terms("graph"), Matches::Top(2), &pending, &mut Unmetered)
+        .find(
+            terms("graph"),
+            Matches::Top(2),
+            &pending,
+            None,
+            &mut Unmetered,
+        )
         .unwrap();
     assert_eq!(top.len(), 2);
     assert!(top[0].score >= top[1].score, "best first: {top:?}");
@@ -939,6 +947,7 @@ fn pending_documents_carry_snippets() {
             },
             Matches::Top(10),
             &pending,
+            None,
             &mut Unmetered,
         )
         .unwrap();
@@ -1009,4 +1018,160 @@ fn writes_to_a_lost_directory_keep_failing_without_a_panic() {
             "attempt {attempt} succeeded"
         );
     }
+}
+
+/// Scores of `query` by node, leaving `exclude`'s documents out.
+fn scores_without(idx: &MultiLanguageTextIndex, query: &str, exclude: Scope) -> Vec<(u64, f32)> {
+    let mut hits: Vec<(u64, f32)> = idx
+        .find(
+            terms(query),
+            Matches::All,
+            &PendingDocuments::none(),
+            Some(exclude),
+            &mut Unmetered,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|hit| (hit.node_id, hit.score))
+        .collect();
+    hits.sort_by_key(|(id, _)| *id);
+    hits
+}
+
+/// An index holding both interpretations of a change answers each exactly:
+/// leaving the gained documents out ranks as an index of the facts in force
+/// alone, leaving the retired ones out as an index of the change alone, so
+/// neither side's documents leak into the other's matches or statistics.
+#[test]
+fn each_interpretation_ranks_as_its_own_index() {
+    let dirs = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let shared = [(1, "rust graph rust"), (2, "rust engine")];
+    let retired = (3, "rust graph");
+    let gained = (4, "graph graph store");
+    let mut both = MultiLanguageTextIndex::create_scratch(
+        dirs.0.path(),
+        15_000_000,
+        MultiLangConfig::with_default_language("english"),
+        Default::default(),
+    )
+    .unwrap();
+    let mut upserts: Vec<ScopedUpsert> = shared
+        .iter()
+        .map(|(id, body)| (*id, props(&[("body", body)]), Scope::Shared))
+        .collect();
+    upserts.push((retired.0, props(&[("body", retired.1)]), Scope::Retired));
+    upserts.push((gained.0, props(&[("body", gained.1)]), Scope::Gained));
+    both.apply_scoped_changes(&upserts, &[]).unwrap();
+
+    let mut in_force = shared.to_vec();
+    in_force.push(retired);
+    let mut changed = shared.to_vec();
+    changed.push(gained);
+    let in_force = fresh(dirs.1.path(), &in_force);
+    let changed = fresh(dirs.2.path(), &changed);
+    for query in ["rust", "graph", "store", "rust graph"] {
+        assert_same_scores(
+            &scores_without(&both, query, Scope::Gained),
+            &scores(&in_force, query, &PendingDocuments::none()),
+        );
+        assert_same_scores(
+            &scores_without(&both, query, Scope::Retired),
+            &scores(&changed, query, &PendingDocuments::none()),
+        );
+    }
+}
+
+/// Nodes a search reads from the store in place of their documents are
+/// taken out of the corpus once: a superseded node whose document is in the
+/// left-out scope is out of the corpus already, so the search still ranks as
+/// an index of its interpretation with the current documents.
+#[test]
+fn a_superseded_node_of_the_left_out_scope_is_not_taken_out_twice() {
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut both = MultiLanguageTextIndex::create_scratch(
+        dirs.0.path(),
+        15_000_000,
+        MultiLangConfig::with_default_language("english"),
+        Default::default(),
+    )
+    .unwrap();
+    both.apply_scoped_changes(
+        &[
+            (1, props(&[("body", "rust graph")]), Scope::Shared),
+            (2, props(&[("body", "rust rust")]), Scope::Retired),
+            (3, props(&[("body", "graph rust store")]), Scope::Gained),
+        ],
+        &[],
+    )
+    .unwrap();
+    // Nodes 2 and 3 were written since: the facts in force now give node 2
+    // new text and node 3 none.
+    let pending = both
+        .pending(Some(&[2, 3]), &[(2, props(&[("body", "graph store")]))])
+        .unwrap();
+    let in_force = fresh(dirs.1.path(), &[(1, "rust graph"), (2, "graph store")]);
+    for query in ["rust", "graph", "store"] {
+        let mut hits: Vec<(u64, f32)> = both
+            .find(
+                terms(query),
+                Matches::All,
+                &pending,
+                Some(Scope::Gained),
+                &mut Unmetered,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.node_id, hit.score))
+            .collect();
+        hits.sort_by_key(|(id, _)| *id);
+        assert_same_scores(&hits, &scores(&in_force, query, &PendingDocuments::none()));
+    }
+}
+
+/// A document rewritten into another scope leaves its old scope's
+/// statistics, so once every document is shared again the change ends, and
+/// the scopes' members are the nodes written there.
+#[test]
+fn a_document_moved_between_scopes_is_counted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut idx = MultiLanguageTextIndex::create_scratch(
+        dir.path(),
+        15_000_000,
+        MultiLangConfig::with_default_language("english"),
+        Default::default(),
+    )
+    .unwrap();
+    idx.begin_selection(7);
+    idx.apply_scoped_changes(
+        &[
+            (1, props(&[("body", "graph")]), Scope::Shared),
+            (2, props(&[("body", "graph store")]), Scope::Gained),
+            (3, props(&[("body", "old graph")]), Scope::Retired),
+        ],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(idx.scope_members(Scope::Gained).unwrap(), [2]);
+    assert_eq!(idx.scope_members(Scope::Retired).unwrap(), [3]);
+    assert!(!idx.end_selection(), "documents are still kept apart");
+
+    // The change is put in force: the retired document goes, the gained one
+    // becomes shared.
+    idx.apply_scoped_changes(
+        &[(2, props(&[("body", "graph store")]), Scope::Shared)],
+        &[3],
+    )
+    .unwrap();
+    assert!(idx.scope_members(Scope::Gained).unwrap().is_empty());
+    assert!(idx.end_selection());
+    assert_eq!(idx.selection(), None);
+    let ids: Vec<u64> = scores_without(&idx, "graph", Scope::Gained)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, [1, 2]);
 }

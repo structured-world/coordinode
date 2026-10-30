@@ -22,15 +22,15 @@ use super::corpus::Corpus;
 use super::pending::{Highlight, Matches, PendingDocuments};
 use super::tokenize;
 use super::validity::{Validities, Validity};
-use super::{HighlightedResult, TextIndex, TextSearchError, TextSearchResult};
+use super::{Aside, HighlightedResult, Scope, TextIndex, TextSearchError, TextSearchResult};
 
 /// What one write has done so far, so a node it touches twice is counted
 /// once and its committed document is read once.
 struct Batch {
     /// The committed state the write started from.
     searcher: tantivy::Searcher,
-    /// Tokens of the documents this write staged, by node.
-    staged: HashMap<u64, Vec<String>>,
+    /// Tokens and scope of the documents this write staged, by node.
+    staged: HashMap<u64, (Vec<String>, Scope)>,
     /// Nodes whose committed document this write already removed.
     forgotten: HashSet<u64>,
     /// Every committed document was removed.
@@ -47,6 +47,21 @@ impl Batch {
         }
     }
 }
+
+/// The change of what a type implies whose interpretations the index's
+/// scoped documents belong to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    /// The change's identity.
+    pub operation: u64,
+    /// Whether every stored node was written in its scope since the change
+    /// began: until then the documents gained are partial and those retired
+    /// unmarked, so only the facts in force read the index exactly.
+    pub prepared: bool,
+}
+
+/// One node's document as a write puts it: its text by property, in a scope.
+pub type ScopedUpsert = (u64, HashMap<String, String>, Scope);
 
 /// What a search looks for.
 #[derive(Debug, Clone, Copy)]
@@ -137,6 +152,8 @@ pub struct MultiLanguageTextIndex {
     /// it, and a writer left without its directory lock panics on the next
     /// rollback. Every later write is refused with this reason instead.
     writer_lost: Option<String>,
+    /// The change the scoped documents belong to, while there is one.
+    selection: Option<Selection>,
 }
 
 impl MultiLanguageTextIndex {
@@ -159,7 +176,9 @@ impl MultiLanguageTextIndex {
 
     /// `inner` with its live documents counted.
     fn counted(mut inner: TextIndex, config: MultiLangConfig) -> Result<Self, TextSearchError> {
-        inner.corpus = Some(inner.recount()?);
+        let (corpus, aside) = inner.recount()?;
+        inner.corpus = Some(corpus);
+        inner.aside = aside;
         Ok(Self::over(inner, config))
     }
 
@@ -169,7 +188,53 @@ impl MultiLanguageTextIndex {
             config,
             validities: Validities::default(),
             writer_lost: None,
+            selection: None,
         }
+    }
+
+    /// The change the scoped documents belong to, while there is one.
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
+    /// Start keeping the documents of change `operation` in their scopes,
+    /// not yet prepared. A change already kept is left as it is.
+    pub fn begin_selection(&mut self, operation: u64) {
+        if self.selection.is_none_or(|s| s.operation != operation) {
+            self.selection = Some(Selection {
+                operation,
+                prepared: false,
+            });
+        }
+    }
+
+    /// Record that every stored node was written in its scope for change
+    /// `operation`.
+    pub fn mark_prepared(&mut self, operation: u64) {
+        if let Some(selection) = self.selection.as_mut()
+            && selection.operation == operation
+        {
+            selection.prepared = true;
+        }
+    }
+
+    /// Stop keeping documents apart once none is left outside the shared
+    /// scope; whether it stopped.
+    pub fn end_selection(&mut self) -> bool {
+        let settled = self.inner.aside.retired.docs == 0 && self.inner.aside.gained.docs == 0;
+        if settled {
+            self.selection = None;
+        }
+        settled
+    }
+
+    /// The nodes whose live document is in `scope`, ascending.
+    ///
+    /// # Errors
+    ///
+    /// A failed read of the index.
+    pub fn scope_members(&self, scope: Scope) -> Result<Vec<u64>, TextSearchError> {
+        self.inner.scope_members(scope)
     }
 
     /// Record that the state held for `node_id` (its document, or the lack
@@ -235,7 +300,7 @@ impl MultiLanguageTextIndex {
         node_id: u64,
         properties: &HashMap<String, String>,
     ) -> Result<(), TextSearchError> {
-        self.write(|index, batch| index.stage_node(batch, node_id, properties))
+        self.write(|index, batch| index.stage_node(batch, node_id, properties, Scope::Shared))
     }
 
     /// Add multiple nodes in a single batch commit.
@@ -246,7 +311,7 @@ impl MultiLanguageTextIndex {
         self.write(|index, batch| {
             let mut changed = false;
             for (node_id, properties) in nodes {
-                changed |= index.stage_node(batch, *node_id, properties)?;
+                changed |= index.stage_node(batch, *node_id, properties, Scope::Shared)?;
             }
             Ok(changed)
         })
@@ -269,7 +334,29 @@ impl MultiLanguageTextIndex {
             for (node_id, properties) in upserts {
                 // A node whose text tokenizes to nothing is left out, as
                 // removed.
-                changed |= index.stage_node(batch, *node_id, properties)?;
+                changed |= index.stage_node(batch, *node_id, properties, Scope::Shared)?;
+            }
+            Ok(changed)
+        })
+    }
+
+    /// [`Self::apply_changes`] with each document put in its own scope.
+    ///
+    /// # Errors
+    ///
+    /// A failed write; nothing of it is visible then.
+    pub fn apply_scoped_changes(
+        &mut self,
+        upserts: &[ScopedUpsert],
+        removals: &[u64],
+    ) -> Result<(), TextSearchError> {
+        self.write(|index, batch| {
+            let mut changed = false;
+            for node_id in removals {
+                changed |= index.forget(batch, *node_id)?;
+            }
+            for (node_id, properties, scope) in upserts {
+                changed |= index.stage_node(batch, *node_id, properties, *scope)?;
             }
             Ok(changed)
         })
@@ -299,7 +386,16 @@ impl MultiLanguageTextIndex {
             // that read fails, drop the exact statistics so searches use
             // Tantivy's own counts of the committed index instead.
             if self.inner.corpus.is_some() {
-                self.inner.corpus = self.inner.recount().ok();
+                match self.inner.recount() {
+                    Ok((corpus, aside)) => {
+                        self.inner.corpus = Some(corpus);
+                        self.inner.aside = aside;
+                    }
+                    Err(_) => {
+                        self.inner.corpus = None;
+                        self.inner.aside = Aside::default();
+                    }
+                }
             }
             if let Err(e) = rollback {
                 let reason = format!("the index writer is gone after a failed rollback: {e}");
@@ -312,18 +408,21 @@ impl MultiLanguageTextIndex {
 
     /// Stage the removal of `node_id`'s document; whether there was one.
     fn forget(&mut self, batch: &mut Batch, node_id: u64) -> Result<bool, TextSearchError> {
-        let tokens = if let Some(staged) = batch.staged.remove(&node_id) {
-            Some(Some(staged))
+        let found = if let Some((tokens, scope)) = batch.staged.remove(&node_id) {
+            Some((Some(tokens), scope))
         } else if batch.cleared || !batch.forgotten.insert(node_id) {
             None
         } else {
             self.inner.live_tokens(&batch.searcher, node_id)?
         };
-        let Some(tokens) = tokens else {
+        let Some((tokens, scope)) = found else {
             return Ok(false);
         };
         if let (Some(corpus), Some(tokens)) = (self.inner.corpus.as_mut(), tokens) {
             corpus.remove(&tokens);
+            if let Some(scoped) = self.inner.aside.of_mut(scope) {
+                scoped.remove(&tokens);
+            }
         }
         self.inner.writer.delete_term(tantivy::Term::from_field_u64(
             self.inner.node_id_field,
@@ -352,17 +451,42 @@ impl MultiLanguageTextIndex {
         documents: &[(u64, HashMap<String, String>)],
     ) -> Result<(), TextSearchError> {
         self.write(|index, batch| {
-            index.inner.writer.delete_all_documents()?;
-            batch.cleared = true;
-            batch.staged.clear();
-            if index.inner.corpus.is_some() {
-                index.inner.corpus = Some(Corpus::default());
-            }
+            index.clear_staged(batch)?;
             for (node_id, properties) in documents {
-                index.stage_node(batch, *node_id, properties)?;
+                index.stage_node(batch, *node_id, properties, Scope::Shared)?;
             }
             Ok(true)
         })
+    }
+
+    /// [`Self::replace_all`] with each document put in its own scope.
+    ///
+    /// # Errors
+    ///
+    /// A failed write; the index is left as it was then.
+    pub fn replace_all_scoped(
+        &mut self,
+        documents: &[ScopedUpsert],
+    ) -> Result<(), TextSearchError> {
+        self.write(|index, batch| {
+            index.clear_staged(batch)?;
+            for (node_id, properties, scope) in documents {
+                index.stage_node(batch, *node_id, properties, *scope)?;
+            }
+            Ok(true)
+        })
+    }
+
+    /// Stage the removal of every committed document.
+    fn clear_staged(&mut self, batch: &mut Batch) -> Result<(), TextSearchError> {
+        self.inner.writer.delete_all_documents()?;
+        batch.cleared = true;
+        batch.staged.clear();
+        if self.inner.corpus.is_some() {
+            self.inner.corpus = Some(Corpus::default());
+        }
+        self.inner.aside = Aside::default();
+        Ok(())
     }
 
     /// Queue `node_id`'s document built from `properties` in place of any
@@ -374,8 +498,9 @@ impl MultiLanguageTextIndex {
         batch: &mut Batch,
         node_id: u64,
         properties: &HashMap<String, String>,
+        scope: Scope,
     ) -> Result<bool, TextSearchError> {
-        let built = self.document(node_id, properties);
+        let built = self.document(node_id, properties, scope);
         let removed = self.forget(batch, node_id)?;
         let Some((doc, tokens)) = built else {
             return Ok(removed);
@@ -383,18 +508,22 @@ impl MultiLanguageTextIndex {
         self.inner.writer.add_document(doc)?;
         if let Some(corpus) = self.inner.corpus.as_mut() {
             corpus.add(&tokens);
+            if let Some(scoped) = self.inner.aside.of_mut(scope) {
+                scoped.add(&tokens);
+            }
         }
-        batch.staged.insert(node_id, tokens);
+        batch.staged.insert(node_id, (tokens, scope));
         Ok(true)
     }
 
     /// `node_id`'s document built from `properties`, each field tokenized by
-    /// the language the cascade resolves, with its tokens; `None` when there
-    /// is no text.
+    /// the language the cascade resolves, in `scope`, with its tokens; `None`
+    /// when there is no text.
     fn document(
         &self,
         node_id: u64,
         properties: &HashMap<String, String>,
+        scope: Scope,
     ) -> Option<(tantivy::TantivyDocument, Vec<String>)> {
         // Extract the language override from the node properties (level 2)
         let node_language_override = properties
@@ -471,6 +600,10 @@ impl MultiLanguageTextIndex {
             self.inner.tokens_field,
             &tantivy::schema::OwnedValue::Bytes(super::encode_tokens(&token_texts)),
         );
+        doc.add_field_value(
+            self.inner.scope_field,
+            &tantivy::schema::OwnedValue::U64(scope.as_u64()),
+        );
         Some((doc, token_texts))
     }
 
@@ -485,14 +618,18 @@ impl MultiLanguageTextIndex {
     ) -> Result<PendingDocuments, TextSearchError> {
         let documents = documents
             .iter()
-            .filter_map(|(node_id, properties)| self.document(*node_id, properties))
+            // What the search's own interpretation holds of these nodes:
+            // they are read in its scope, so none is left out again.
+            .filter_map(|(node_id, properties)| self.document(*node_id, properties, Scope::Shared))
             .collect();
         self.inner.pending(superseded, documents)
     }
 
     /// Run `request` over the index and `pending`, best score first,
     /// reporting the documents it reads and scores to `meter`, which can
-    /// stop it.
+    /// stop it. The documents of `exclude`, the scope the search's
+    /// interpretation does not hold, are left out before the best matches
+    /// are taken and scored against the rest of the corpus.
     ///
     /// # Errors
     ///
@@ -502,6 +639,7 @@ impl MultiLanguageTextIndex {
         request: TextRequest<'_>,
         matches: Matches,
         pending: &PendingDocuments,
+        exclude: Option<Scope>,
         meter: &mut M,
     ) -> Result<Vec<HighlightedResult>, TextSearchError>
     where
@@ -522,7 +660,7 @@ impl MultiLanguageTextIndex {
                 match self.inner.language_query(query, language)? {
                     Some(query) => self
                         .inner
-                        .collect(&*query, matches, pending, highlight, meter),
+                        .collect(&*query, matches, pending, exclude, highlight, meter),
                     None => Ok(Vec::new()),
                 }
             }
@@ -536,7 +674,7 @@ impl MultiLanguageTextIndex {
                 };
                 let query = self.inner.build_query_fuzzy(query, None)?;
                 self.inner
-                    .collect(&*query, matches, pending, highlight, meter)
+                    .collect(&*query, matches, pending, exclude, highlight, meter)
             }
         }
     }
