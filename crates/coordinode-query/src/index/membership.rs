@@ -49,8 +49,21 @@ pub fn label_carriers(
     engine: &StorageEngine,
     label: &str,
 ) -> Result<Option<LabelCarriers>, StoreError> {
+    label_carriers_in(engine, label, &mut CatalogMembership::current(engine))
+}
+
+/// The carriers of `label` under the view of the catalog `cache` reads: a
+/// snapshot's, or the one with every published candidate put in force.
+///
+/// # Errors
+///
+/// As [`label_carriers`].
+pub fn label_carriers_in(
+    engine: &StorageEngine,
+    label: &str,
+    cache: &mut CatalogMembership<'_>,
+) -> Result<Option<LabelCarriers>, StoreError> {
     let store = LocalSchemaStore::new(engine);
-    let mut cache = CatalogMembership::current(engine);
     let Some(label) = cache.label_id(label)? else {
         return Ok(None);
     };

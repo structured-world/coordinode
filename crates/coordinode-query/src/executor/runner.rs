@@ -12170,15 +12170,31 @@ fn text_index_matches(
     use coordinode_search::tantivy::multi_lang::TextRequest;
     use coordinode_search::tantivy::pending::Matches;
 
+    use crate::index::membership::{CatalogMembership, label_carriers_in};
+    use crate::index::selection::{Change, change_in, outcome};
+
+    let failed = |e: coordinode_modality::StoreError| FindError::Failed(e.to_string());
     let also = read_delta(IndexDelta::Nodes(Default::default()), ctx)
         .map_err(|e| FindError::Failed(e.to_string()))?;
-    let carriers = crate::index::membership::label_carriers(ctx.engine, label)
-        .map_err(|e| FindError::Failed(e.to_string()))?;
+    // The label's carriers and the change of what a type implies as this
+    // statement's view of the catalog has them: the index answers with that
+    // interpretation.
+    let mut catalog = match ctx.txn.snapshot() {
+        Some(snapshot) => CatalogMembership::at(ctx.engine, snapshot),
+        None => CatalogMembership::current(ctx.engine),
+    };
+    let carriers = label_carriers_in(ctx.engine, label, &mut catalog).map_err(failed)?;
+    let change = match carriers.as_ref() {
+        Some(carriers) => change_in(ctx.engine, &ctx.txn, carriers.label).map_err(failed)?,
+        None => Change::None,
+    };
+    let concluded = |operation| outcome(ctx.engine, operation, label);
     let mut search = coordinode_core::budget::BatchedWork::new(&ctx.budget);
     let Some(hits) = registry.find(
         label,
         property,
-        carriers.as_ref(),
+        (carriers.as_ref(), change),
+        &concluded,
         &ctx.txn,
         ctx.shard_id,
         ctx.interner,

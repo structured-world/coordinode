@@ -10,6 +10,7 @@ pub mod ops;
 pub mod reconcile;
 pub mod registry;
 mod repair;
+pub mod selection;
 pub mod transfer;
 pub mod ttl_reaper;
 

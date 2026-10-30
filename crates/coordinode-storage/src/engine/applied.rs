@@ -101,6 +101,9 @@ struct Subscriber {
     wake: Wake,
     /// Set by [`AppliedStop::stop`]; a waiting subscriber returns `None`.
     stopped: AtomicBool,
+    /// Set by [`AppliedNudge::nudge`]; the next wait returns `None` once and
+    /// clears it.
+    nudged: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -216,11 +219,26 @@ impl AppliedStop {
     }
 }
 
+/// Wakes the consumer of one subscription from another thread for work its
+/// events do not carry, without ending its waits for good.
+#[derive(Debug, Clone)]
+pub struct AppliedNudge(Arc<Subscriber>);
+
+impl AppliedNudge {
+    /// Make the current or next [`AppliedSubscription::next`] that waits
+    /// return `None` once. Nudges given before that return count as one.
+    pub fn nudge(&self) {
+        self.0.nudged.store(true, Ordering::Release);
+        self.0.wake.notify();
+    }
+}
+
 impl AppliedSubscription {
     /// The next event, waiting at most `wait`, or until one arrives or the
     /// subscription is stopped when `wait` is `None`. `None` when none
-    /// arrived. An event the queue could not hold comes back as
-    /// [`AppliedEvent::Replaced`], once, before the events queued after it.
+    /// arrived, or the wait was [nudged](AppliedNudge::nudge). An event the
+    /// queue could not hold comes back as [`AppliedEvent::Replaced`], once,
+    /// before the events queued after it.
     ///
     /// The thread that waits is the one the events wake, so one thread
     /// consumes a subscription.
@@ -230,7 +248,9 @@ impl AppliedSubscription {
             if let Some(event) = self.try_next() {
                 return Some(event);
             }
-            if self.subscriber.stopped.load(Ordering::Acquire) {
+            if self.subscriber.stopped.load(Ordering::Acquire)
+                || self.subscriber.nudged.swap(false, Ordering::AcqRel)
+            {
                 return None;
             }
             let timeout = match deadline {
@@ -253,6 +273,11 @@ impl AppliedSubscription {
     /// A handle that stops this subscription's waits.
     pub fn stopper(&self) -> AppliedStop {
         AppliedStop(Arc::clone(&self.subscriber))
+    }
+
+    /// A handle that wakes this subscription's consumer once.
+    pub fn nudger(&self) -> AppliedNudge {
+        AppliedNudge(Arc::clone(&self.subscriber))
     }
 
     /// A handle reading how far this subscription's events were offered.
@@ -324,6 +349,7 @@ impl AppliedFeed {
             queue: parking_lot::Mutex::new(Queue::default()),
             wake: Wake::default(),
             stopped: AtomicBool::new(false),
+            nudged: AtomicBool::new(false),
         });
         {
             let mut subscribers = self.subscribers.write();

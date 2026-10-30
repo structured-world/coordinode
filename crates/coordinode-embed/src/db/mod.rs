@@ -3468,12 +3468,20 @@ impl Database {
         use coordinode_query::index::text_registry::FindError;
         let budget = statement_budget(self.query_memory_limit, None, None);
         let mut search = coordinode_core::budget::BatchedWork::new(&budget);
+        use coordinode_query::index::selection::{Change, change_now, outcome};
         let carriers = coordinode_query::index::membership::label_carriers(&self.engine, label)
             .map_err(|e| DatabaseError::Other(e.to_string()))?;
+        let change = match carriers.as_ref() {
+            Some(carriers) => change_now(&self.engine, carriers.label)
+                .map_err(|e| DatabaseError::Other(e.to_string()))?,
+            None => Change::None,
+        };
+        let concluded = |operation| outcome(&self.engine, operation, label);
         let found = self.text_index_registry.find(
             label,
             property,
-            carriers.as_ref(),
+            (carriers.as_ref(), change),
+            &concluded,
             &read,
             self.shard_id,
             &interner,

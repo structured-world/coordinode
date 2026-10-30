@@ -154,6 +154,8 @@ pub struct MultiLanguageTextIndex {
     writer_lost: Option<String>,
     /// The change the scoped documents belong to, while there is one.
     selection: Option<Selection>,
+    /// The last change whose documents were brought back to one scope.
+    settled: Option<u64>,
 }
 
 impl MultiLanguageTextIndex {
@@ -189,7 +191,13 @@ impl MultiLanguageTextIndex {
             validities: Validities::default(),
             writer_lost: None,
             selection: None,
+            settled: None,
         }
+    }
+
+    /// The last change whose documents were brought back to one scope.
+    pub fn settled(&self) -> Option<u64> {
+        self.settled
     }
 
     /// The change the scoped documents belong to, while there is one.
@@ -219,11 +227,14 @@ impl MultiLanguageTextIndex {
     }
 
     /// Stop keeping documents apart once none is left outside the shared
-    /// scope; whether it stopped.
+    /// scope, recording the change as settled; whether it stopped.
     pub fn end_selection(&mut self) -> bool {
         let settled = self.inner.aside.retired.docs == 0 && self.inner.aside.gained.docs == 0;
-        if settled {
-            self.selection = None;
+        if settled && let Some(selection) = self.selection.take() {
+            self.settled = Some(
+                self.settled
+                    .map_or(selection.operation, |s| s.max(selection.operation)),
+            );
         }
         settled
     }

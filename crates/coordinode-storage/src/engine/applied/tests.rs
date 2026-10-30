@@ -169,6 +169,36 @@ fn a_stop_ends_a_wait_without_deadline() {
     assert_eq!(waiter.join().expect("waiter"), (None, None));
 }
 
+/// A nudge ends one wait that has no deadline, and the consumer keeps
+/// receiving the events applied after it: it wakes for work the events do
+/// not carry without losing its subscription.
+#[test]
+fn a_nudge_ends_one_wait_and_events_keep_coming() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = std::sync::Arc::new(engine(&dir));
+    let sub = engine.subscribe_applied(Partition::Node, 16);
+    let nudge = sub.nudger();
+
+    let waiter = std::thread::spawn(move || {
+        let nudged = sub.next(None);
+        let next = sub.next(Some(Duration::from_secs(10)));
+        (nudged, next)
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    nudge.nudge();
+    std::thread::sleep(Duration::from_millis(50));
+    engine
+        .apply_proposal_at(&[put(PartitionId::Node, b"after")], 0)
+        .expect("apply");
+
+    let (nudged, next) = waiter.join().expect("waiter");
+    assert_eq!(nudged, None, "the nudge ends the wait");
+    assert!(
+        matches!(next, Some(AppliedEvent::Keys { ref keys, .. }) if keys.as_ref() == [b"after".to_vec()]),
+        "{next:?}"
+    );
+}
+
 /// An applied entry reaches the subscriber with its index, its commit
 /// timestamp and the keys it wrote in the subscribed partition, and nothing
 /// of the partitions the subscriber does not follow.

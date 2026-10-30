@@ -19,7 +19,7 @@ use coordinode_search::tantivy::multi_lang::{
 };
 use coordinode_search::tantivy::pending::Matches;
 use coordinode_search::tantivy::validity::Validity;
-use coordinode_search::tantivy::{HighlightedResult, TextSearchError, TextSearchResult};
+use coordinode_search::tantivy::{HighlightedResult, Scope, TextSearchError, TextSearchResult};
 use coordinode_storage::engine::transaction::Transaction;
 
 use super::coverage::{IndexCoverage, IndexDelta};
@@ -89,12 +89,18 @@ pub struct NodeText {
     pub text: Option<String>,
     /// The valid time over which the node keeps that text, or its lack.
     pub validity: Validity,
+    /// Which interpretations of the index's label hold the node's document
+    /// while a change of what a type implies is followed.
+    pub scope: Scope,
 }
 
 /// How a text index reads one property of one label off a node's rows.
 #[derive(Debug, Clone, Copy)]
 pub struct TextSource<'a> {
     carriers: Option<&'a crate::index::membership::LabelCarriers>,
+    /// The carriers under the change being followed, when one is: a node
+    /// either interpretation holds has a document, in its scope.
+    candidate: Option<Option<&'a crate::index::membership::LabelCarriers>>,
     field_id: Option<u32>,
     timeline: TimelineFields,
 }
@@ -111,6 +117,7 @@ impl<'a> TextSource<'a> {
     ) -> Self {
         Self {
             carriers,
+            candidate: None,
             field_id: interner.lookup(property),
             timeline: TimelineFields {
                 valid_to: interner.lookup("valid_to"),
@@ -119,22 +126,47 @@ impl<'a> TextSource<'a> {
         }
     }
 
-    /// Whether `record` carries the index's label.
-    fn carries(&self, record: &NodeRecord) -> bool {
-        self.carriers
-            .is_some_and(|carriers| carriers.carried_by(&record.labels))
+    /// This source while a change of what a type implies is followed, the
+    /// label's carriers under it being `candidate`: a node either
+    /// interpretation holds has its text, in the scope of the
+    /// interpretations that hold it.
+    #[must_use]
+    pub fn following(
+        mut self,
+        candidate: Option<&'a crate::index::membership::LabelCarriers>,
+    ) -> Self {
+        self.candidate = Some(candidate);
+        self
     }
 
-    fn text(&self, record: &NodeRecord) -> Option<String> {
-        // The index covers every node carrying its label.
-        if !self.carries(record) {
-            return None;
+    /// The scope of `record`'s document: `None` when no interpretation
+    /// holds it.
+    fn scope(&self, record: &NodeRecord) -> Option<Scope> {
+        let carried = |carriers: Option<&crate::index::membership::LabelCarriers>| {
+            carriers.is_some_and(|carriers| carriers.carried_by(&record.labels))
+        };
+        let in_force = carried(self.carriers);
+        let candidate = self.candidate.map_or(in_force, carried);
+        match (in_force, candidate) {
+            (true, true) => Some(Scope::Shared),
+            (true, false) => Some(Scope::Retired),
+            (false, true) => Some(Scope::Gained),
+            (false, false) => None,
         }
-        record
-            .props
-            .get(&self.field_id?)?
-            .as_str()
-            .map(str::to_string)
+    }
+
+    /// `record`'s text and its scope, when an interpretation holds it.
+    fn text(&self, record: &NodeRecord) -> (Option<String>, Scope) {
+        // The index covers every node carrying its label.
+        let Some(scope) = self.scope(record) else {
+            return (None, Scope::Shared);
+        };
+        let text = self
+            .field_id
+            .and_then(|field| record.props.get(&field))
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        (text, scope)
     }
 
     /// What the index holds for `node_id`, stored as `rows`, at valid-time
@@ -142,11 +174,17 @@ impl<'a> TextSource<'a> {
     /// interval its timeline keeps that state.
     pub fn at(&self, node_id: NodeId, rows: &NodeRows, at: i64) -> NodeText {
         match rows {
-            NodeRows::Plain(record) => NodeText {
-                node_id,
-                text: record.as_ref().and_then(|r| self.text(r)),
-                validity: Validity::ALWAYS,
-            },
+            NodeRows::Plain(record) => {
+                let (text, scope) = record
+                    .as_ref()
+                    .map_or((None, Scope::Shared), |r| self.text(r));
+                NodeText {
+                    node_id,
+                    text,
+                    validity: Validity::ALWAYS,
+                    scope,
+                }
+            }
             NodeRows::Timeline(versions) => {
                 let span = state_span(
                     versions.iter().map(|(from, record)| (*from, record)),
@@ -155,10 +193,16 @@ impl<'a> TextSource<'a> {
                 );
                 // A timeline none of whose versions carries the label never
                 // enters this index.
-                let ours = versions.iter().any(|(_, record)| self.carries(record));
+                let ours = versions
+                    .iter()
+                    .any(|(_, record)| self.scope(record).is_some());
+                let (text, scope) = span
+                    .state
+                    .positive()
+                    .map_or((None, Scope::Shared), |(_, r)| self.text(r));
                 NodeText {
                     node_id,
-                    text: span.state.positive().and_then(|(_, r)| self.text(r)),
+                    text,
                     validity: if ours {
                         Validity {
                             from: span.from,
@@ -167,6 +211,7 @@ impl<'a> TextSource<'a> {
                     } else {
                         Validity::ALWAYS
                     },
+                    scope,
                 }
             }
         }
@@ -345,6 +390,13 @@ impl TextIndexRegistry {
     /// ones the choice was made against. The nodes read and the documents
     /// scored are reported to `meter`, which can stop the search.
     ///
+    /// `carriers` are the label's carriers as `read` sees the catalog, and
+    /// `change` where a change of what a type implies stands at that view:
+    /// the index answers with that interpretation, leaving the other's
+    /// documents out, or reads every node itself while it does not hold it
+    /// (see [`crate::index::selection::answer`], to which `concluded` gives
+    /// the outcome of a change whose parts are folded).
+    ///
     /// # Errors
     ///
     /// [`FindError::Budget`] when `meter` stopped it, [`FindError::Failed`]
@@ -354,7 +406,16 @@ impl TextIndexRegistry {
         &self,
         label: &str,
         property: &str,
-        carriers: Option<&crate::index::membership::LabelCarriers>,
+        (carriers, change): (
+            Option<&crate::index::membership::LabelCarriers>,
+            crate::index::selection::Change,
+        ),
+        concluded: &dyn Fn(
+            coordinode_core::index::identity::GenerationId,
+        ) -> Result<
+            Option<crate::index::selection::Change>,
+            coordinode_modality::StoreError,
+        >,
         read: &Transaction<'_>,
         shard_id: u16,
         interner: &FieldInterner,
@@ -367,6 +428,7 @@ impl TextIndexRegistry {
     where
         TextSearchError: From<M::Stop>,
     {
+        use crate::index::selection::{Answer, answer};
         let Some(handle) = self.get(label, property) else {
             return Ok(None);
         };
@@ -378,12 +440,34 @@ impl TextIndexRegistry {
             other => failed(&other),
         };
         let index = handle.read().map_err(|_| failed(&"lock poisoned"))?;
-        let delta = match self.coverage() {
-            Some(coverage) => coverage.delta(shard_id),
-            None => IndexDelta::Nodes(Default::default()),
-        }
-        .union(also)
-        .with_nodes(index.outside(at).into_iter().map(NodeId::from_raw));
+        let followed = crate::index::selection::Followed {
+            current: index.selection().map(|s| {
+                (
+                    coordinode_core::index::identity::GenerationId::from_raw(s.operation),
+                    s.prepared,
+                )
+            }),
+            settled: index
+                .settled()
+                .map(coordinode_core::index::identity::GenerationId::from_raw),
+        };
+        let (exclude, held) = match answer(change, followed, concluded).map_err(|e| failed(&e))? {
+            Answer::Whole => (None, true),
+            Answer::Without(scope) => (Some(scope), true),
+            Answer::Unable => (None, false),
+        };
+        let delta = if held {
+            match self.coverage() {
+                Some(coverage) => coverage.delta(shard_id),
+                None => IndexDelta::Nodes(Default::default()),
+            }
+            .union(also)
+            .with_nodes(index.outside(at).into_iter().map(NodeId::from_raw))
+        } else {
+            // The index does not hold this view's interpretation: every node
+            // is read in its place.
+            IndexDelta::Unknown
+        };
         let source = TextSource::new(interner, carriers, property);
         let mut texts: Vec<(NodeId, String)> = Vec::new();
         let superseded = match &delta {
@@ -431,7 +515,7 @@ impl TextIndexRegistry {
             .pending(superseded.as_deref(), &documents)
             .map_err(searched)?;
         index
-            .find(request, matches, &pending, meter)
+            .find(request, matches, &pending, exclude, meter)
             .map(Some)
             .map_err(searched)
     }
@@ -475,12 +559,49 @@ impl TextIndexRegistry {
         let mut idx = handle
             .write()
             .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
-        idx.apply_changes(&upserts, &removals)
+        idx.apply_scoped_changes(&upserts, &removals)
             .map_err(|e| format!("text index :{label}({property}): {e}"))?;
         for change in changes {
             idx.set_validity(change.node_id.as_raw(), change.validity);
         }
         Ok(())
+    }
+
+    /// What the index of `(label, property)` keeps of its label's changes;
+    /// `None` when there is no such index.
+    pub fn followed(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<crate::index::selection::Followed> {
+        use coordinode_core::index::identity::GenerationId;
+        let handle = self.get(label, property)?;
+        let index = handle.read().ok()?;
+        Some(crate::index::selection::Followed {
+            current: index
+                .selection()
+                .map(|s| (GenerationId::from_raw(s.operation), s.prepared)),
+            settled: index.settled().map(GenerationId::from_raw),
+        })
+    }
+
+    /// Run `step` on the index of `(label, property)` under its write lock;
+    /// `Ok(None)` when there is no such index.
+    pub fn with_index<T>(
+        &self,
+        label: &str,
+        property: &str,
+        step: impl FnOnce(&mut MultiLanguageTextIndex) -> Result<T, TextSearchError>,
+    ) -> Result<Option<T>, String> {
+        let Some(handle) = self.get(label, property) else {
+            return Ok(None);
+        };
+        let mut index = handle
+            .write()
+            .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
+        step(&mut index)
+            .map(Some)
+            .map_err(|e| format!("text index :{label}({property}): {e}"))
     }
 
     /// Rebuild the index of `(label, property)` from `scan`, the nodes'
@@ -504,7 +625,7 @@ impl TextIndexRegistry {
             .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
         let scanned = scan()?;
         let (documents, _) = split_changes(property, &scanned);
-        idx.replace_all(&documents)
+        idx.replace_all_scoped(&documents)
             .map_err(|e| format!("text index :{label}({property}): {e}"))?;
         idx.clear_validities();
         for node in &scanned {
@@ -772,8 +893,11 @@ pub fn stored_texts(
     Ok(texts)
 }
 
-/// Documents to hold, by node, and the nodes to take out.
-type DocumentChanges = (Vec<(u64, HashMap<String, String>)>, Vec<u64>);
+/// Documents to hold, by node and in their scopes, and the nodes to take out.
+type DocumentChanges = (
+    Vec<coordinode_search::tantivy::multi_lang::ScopedUpsert>,
+    Vec<u64>,
+);
 
 /// `changes` as the documents the index takes for the nodes with text and
 /// the nodes to take out.
@@ -785,7 +909,7 @@ fn split_changes(property: &str, changes: &[NodeText]) -> DocumentChanges {
             Some(text) => {
                 let mut props = HashMap::with_capacity(1);
                 props.insert(property.to_string(), text.clone());
-                upserts.push((change.node_id.as_raw(), props));
+                upserts.push((change.node_id.as_raw(), props, change.scope));
             }
             None => removals.push(change.node_id.as_raw()),
         }

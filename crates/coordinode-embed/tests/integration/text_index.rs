@@ -69,6 +69,7 @@ fn planted(texts: &[(u64, Option<&str>)]) -> Vec<coordinode_query::index::text_r
                 node_id: coordinode_core::graph::node::NodeId::from_raw(*id),
                 text: text.map(str::to_string),
                 validity: coordinode_search::tantivy::validity::Validity::ALWAYS,
+                scope: coordinode_search::tantivy::Scope::Shared,
             },
         )
         .collect()
