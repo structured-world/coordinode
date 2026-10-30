@@ -1,4 +1,5 @@
-//! Metadata the ordered application decides: field bindings and NodeId leases.
+//! Metadata the ordered application decides: field bindings, implicit label
+//! identities and NodeId leases.
 //!
 //! A [`MetadataCommand`] is decided against the state the engine holds when it
 //! applies, under the engine's decision lock, and turned into plain Schema
@@ -24,6 +25,11 @@ use coordinode_core::graph::node::{
 use coordinode_core::group::{
     DEPLOYMENT_KEY, DeploymentId, ENROLLED_DEPLOYMENT_KEY, retired_identity_key,
 };
+use coordinode_core::schema::definition::encode_label_current_revision_key;
+use coordinode_core::schema::label_id::{
+    BindingState, FIRST_LABEL_ID, LABEL_ID_KEY_PREFIX, LabelBinding, LabelId, decode_label_id_key,
+    label_id_key,
+};
 use coordinode_core::txn::proposal::{MetadataCommand, Mutation, PartitionId};
 use coordinode_core::version::{
     GROUP_PAIR_KEY_PREFIX, RecordedPair, VersionPair, decode_group_pair_key, decode_pair,
@@ -34,15 +40,18 @@ use crate::engine::core::StorageEngine;
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 
-/// The effects `command` has against the state `engine` holds now. An empty
-/// result is a refusal: the command's whole batch publishes nothing.
+/// The effects `command`, committing at `commit_ts`, has against the state
+/// `engine` holds now. An empty result is a refusal: the command's whole
+/// batch publishes nothing.
 pub(crate) fn decide(
     engine: &StorageEngine,
     command: &MetadataCommand,
+    commit_ts: u64,
 ) -> StorageResult<Vec<Mutation>> {
     match command {
         MetadataCommand::RegisterFields { names } => decide_registration(engine, names),
         MetadataCommand::AdoptFields { bindings } => decide_adoption(engine, bindings),
+        MetadataCommand::BindLabels { names } => label_binding_effects(engine, names, commit_ts),
         MetadataCommand::GrantNodeLease {
             base,
             ceiling,
@@ -410,6 +419,101 @@ fn read_id_records(
         by_id.insert(id, name);
     }
     Ok(by_id)
+}
+
+/// The newest label identity issued, `None` before the first. Read from the
+/// identity records, which are written once, so it never moves back whatever
+/// order their commit timestamps land in.
+///
+/// # Errors
+///
+/// The newest identity record's key does not name an identity.
+pub fn label_frontier(engine: &StorageEngine) -> StorageResult<Option<LabelId>> {
+    let Some(guard) = engine
+        .prefix_scan_rev(Partition::Schema, LABEL_ID_KEY_PREFIX)?
+        .next()
+    else {
+        return Ok(None);
+    };
+    let key = guard.key()?;
+    decode_label_id_key(&key).map(Some).ok_or_else(|| {
+        StorageError::Serialization("a label identity record key names no identity".into())
+    })
+}
+
+/// The identity after `frontier`, the newest issued (`None` when none was).
+///
+/// # Errors
+///
+/// The identity space is exhausted.
+pub fn next_label_id(frontier: Option<LabelId>) -> StorageResult<LabelId> {
+    match frontier {
+        None => Ok(FIRST_LABEL_ID),
+        Some(id) => id.next().ok_or_else(|| {
+            StorageError::Serialization("the label identity space is exhausted".into())
+        }),
+    }
+}
+
+/// The records binding each of `names` that has no live binding to a new
+/// identity, in the order given, committing at `commit_ts`: its write-once
+/// identity record and an implicit name binding. A name already bound to a
+/// live identity is left as it is, so concurrent first uses converge on the
+/// identity applied first. An invalid batch publishes nothing, and so does a
+/// batch rebinding a retired name whose retirement carries a later version
+/// than `commit_ts`: written below it, the binding would read as older than
+/// the retirement it replaces. Its proposer retries at a fresh timestamp.
+///
+/// # Errors
+///
+/// A binding or identity record does not decode, or the identity space is
+/// exhausted.
+pub fn label_binding_effects(
+    engine: &StorageEngine,
+    names: &[String],
+    commit_ts: u64,
+) -> StorageResult<Vec<Mutation>> {
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    if let Err(e) = validate_registration(&refs) {
+        tracing::warn!(error = %e, "label binding refused");
+        return Ok(Vec::new());
+    }
+    let mut seen = HashSet::with_capacity(refs.len());
+    let mut frontier = label_frontier(engine)?;
+    let mut effects = Vec::new();
+    for name in refs {
+        if !seen.insert(name) {
+            continue;
+        }
+        let key = encode_label_current_revision_key(name);
+        if let Some((bytes, version)) = engine.get_versioned(Partition::Schema, &key)? {
+            let binding = LabelBinding::decode(&bytes).ok_or_else(|| {
+                StorageError::Serialization(format!(
+                    "the binding of label {name:?} does not decode"
+                ))
+            })?;
+            if binding.live_id().is_some() {
+                continue;
+            }
+            if version > commit_ts {
+                tracing::debug!(name, version, commit_ts, "label binding deferred");
+                return Ok(Vec::new());
+            }
+        }
+        let id = next_label_id(frontier)?;
+        frontier = Some(id);
+        effects.push(schema_put(
+            label_id_key(id).to_vec(),
+            name.as_bytes().to_vec(),
+        ));
+        let binding = LabelBinding {
+            id,
+            revision: 0,
+            state: BindingState::Implicit,
+        };
+        effects.push(schema_put(key, binding.encode().to_vec()));
+    }
+    Ok(effects)
 }
 
 /// The ceiling of the last granted NodeId lease; 0 before the first grant.

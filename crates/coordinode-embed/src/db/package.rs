@@ -331,6 +331,10 @@ impl Database {
             edge_types,
             constraints,
         } = package;
+        self.bind_declared_labels(
+            labels.iter().map(|d| &d.schema),
+            constraints.iter().map(|c| c.label.as_str()),
+        )?;
         let mut txn = self.begin_catalog_txn();
         let staged = self.stage_declarations(
             &mut txn,
@@ -362,9 +366,40 @@ impl Database {
         edge_types: Vec<(EdgeTypeSchema, Existing)>,
         constraints: Vec<PackageConstraint>,
     ) -> Result<SchemaPublication, DatabaseError> {
+        self.bind_declared_labels(
+            labels.iter().map(|(schema, _)| schema),
+            constraints.iter().map(|c| c.label.as_str()),
+        )?;
         let mut txn = self.begin_catalog_txn();
         let staged = self.stage_declarations(&mut txn, labels, edge_types, constraints)?;
         self.finish_publication(txn, staged)
+    }
+
+    /// Bind every label a publication declares, implies or constrains,
+    /// before its catalog transaction begins: identities come from the one
+    /// ordered allocator, so a first use racing the publication converges on
+    /// the same identity, and the transaction's view holds the binding it
+    /// declares.
+    fn bind_declared_labels<'s>(
+        &self,
+        labels: impl Iterator<Item = &'s LabelSchema>,
+        constrained: impl Iterator<Item = &'s str>,
+    ) -> Result<(), DatabaseError> {
+        use coordinode_core::schema::label_id::LabelRegistrar as _;
+        let mut names: Vec<&str> = Vec::new();
+        for schema in labels {
+            names.push(&schema.name);
+            names.extend(schema.implies().iter().map(String::as_str));
+        }
+        names.extend(constrained);
+        names.sort_unstable();
+        names.dedup();
+        for batch in names.chunks(coordinode_core::graph::intern::MAX_REGISTRATION_BATCH) {
+            self.fields
+                .bind_labels(batch)
+                .map_err(|e| DatabaseError::from(ExecutionError::from(e)))?;
+        }
+        Ok(())
     }
 
     /// Stage every declaration in `txn` against the catalog it reads, plus
@@ -992,10 +1027,14 @@ fn stage_label(
             .into());
         }
         let revision = schema.schema_revision;
+        // A kind or implication that nodes already stored under the name
+        // cannot have is checked against them at the commit, with writers
+        // under the binding they used held out: a scan before it would miss
+        // a node stored meanwhile.
+        let checked_at_commit = schema.is_auxiliary() || !schema.implies().is_empty();
         // Until proved, the label is held to nothing more than it was
         // without a definition.
-        let proved_over = schema
-            .facts_can_refuse_nodes()
+        let proved_over = (!checked_at_commit && schema.facts_can_refuse_nodes())
             .then(|| (BTreeMap::new(), SchemaMode::Flexible));
         return Ok((
             StagedLabel {
@@ -1003,7 +1042,7 @@ fn stage_label(
                 read_revision: None,
                 dirty: true,
                 proved_over,
-                checked_at_commit: false,
+                checked_at_commit,
             },
             object(Disposition::Created, revision),
         ));

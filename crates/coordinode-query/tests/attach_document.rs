@@ -32,6 +32,7 @@ fn make_test_ctx<'a>(
         engine,
         interner,
         field_registrar: None,
+        label_registrar: None,
         id_allocator: allocator,
         shard_id: 1,
         scan_paging: None,

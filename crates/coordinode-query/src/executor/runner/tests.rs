@@ -234,18 +234,40 @@ fn a_blocked_reader_waits_no_longer_than_its_bound() {
 fn a_zero_bound_refuses_a_building_index_at_once() {
     let (_dir, _oracle, engine, registry) = building_vector_index();
 
-    let started = std::time::Instant::now();
     let result = gate_vector_index_read(
         vector_indexes(&engine, &registry, std::time::Duration::ZERO),
         "Doc",
         "embedding",
     );
-
     assert!(result.is_err(), "a building index with no wait is refused");
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(20),
-        "no poll step was slept"
+
+    // Whether a step is slept is decided apart from the clock it would run
+    // on, so a loaded host cannot make the answer look slept.
+    let now = std::time::Instant::now();
+    let step = std::time::Duration::from_millis(25);
+    assert_eq!(
+        build_poll_step(Some(now), now, step),
+        None,
+        "a zero bound sleeps no poll step"
     );
+    assert_eq!(
+        build_poll_step(
+            now.checked_add(std::time::Duration::from_millis(10)),
+            now,
+            step
+        ),
+        Some(std::time::Duration::from_millis(10)),
+        "never past the bound"
+    );
+    assert_eq!(
+        build_poll_step(
+            now.checked_add(std::time::Duration::from_secs(1)),
+            now,
+            step
+        ),
+        Some(step)
+    );
+    assert_eq!(build_poll_step(None, now, step), Some(step), "no bound");
 }
 
 /// Commit a temporal node version in its own MVCC transaction.
@@ -380,6 +402,7 @@ fn make_ctx<'a>(
         engine,
         interner,
         field_registrar: None,
+        label_registrar: None,
         id_allocator: allocator,
         shard_id: 1,
         scan_paging: None,

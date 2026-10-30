@@ -24,10 +24,7 @@ use coordinode_core::schema::definition::{
     encode_constraint_name_key, encode_edge_type_current_revision_key, encode_edge_type_schema_key,
     encode_label_current_revision_key, encode_label_schema_key,
 };
-use coordinode_core::schema::label_id::{
-    BindingState, FIRST_LABEL_ID, LABEL_ID_FRONTIER_KEY, LabelBinding, LabelId, decode_frontier,
-    encode_frontier, label_id_key,
-};
+use coordinode_core::schema::label_id::{BindingState, LabelBinding, LabelId, label_id_key};
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -214,21 +211,29 @@ pub trait SchemaStore {
     /// atomically at commit.
     fn drop_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
 
-    /// The identity `name` is bound to, read through the transaction; `None`
-    /// when no write or definition ever used the name, or the label was
-    /// dropped. Never allocates one.
+    /// The identity `name` is bound to, read through the transaction; when the
+    /// name has no live binding there, the one the store holds now; `None`
+    /// when it has neither. Never allocates one.
+    ///
+    /// The fallback is sound for any view: no record the view holds carries
+    /// the name under another identity, since none was live there, and a
+    /// write of this transaction that first used the label bound it outside
+    /// the transaction, after its view was taken.
     fn label_id_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<Option<LabelId>>;
 
-    /// The identity `name` is bound to, allocating one when it has none: the
-    /// first use of a label a write stores, which makes it an implicit
-    /// FLEXIBLE type. Two attempts allocating for one name both write its
-    /// binding, so one commits and the other runs again and finds it.
+    /// The identity `name` is bound to, allocating one in the transaction
+    /// when it has none: for a catalog transaction declaring a label. Two
+    /// attempts allocating for one name, or an allocation racing a label
+    /// binding applied meanwhile, both write its binding, so one commits and
+    /// the other runs again and finds it. A data write binds a label it uses
+    /// for the first time outside its transaction instead.
     fn bind_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<LabelId>;
 
-    /// The name identity `id` was allocated for, read through the
-    /// transaction; `None` when no label has that id. A dropped label's
-    /// identity keeps its name, so a record written before the drop still
-    /// reads with it.
+    /// The name identity `id` was allocated for; `None` when no label has
+    /// that id. An identity record is written once, so the store's latest
+    /// names an identity bound after the transaction's view as truly. A
+    /// dropped label's identity keeps its name, so a record written before
+    /// the drop still reads with it.
     fn label_name_txn(&self, txn: &mut Transaction, id: LabelId) -> StoreResult<Option<String>>;
 
     /// [`Self::label_id_txn`] at the latest committed state, for readers
@@ -351,14 +356,15 @@ impl<'a> LocalSchemaStore<'a> {
         decode_label_body(name, revision, &schema_bytes).map(Some)
     }
 
-    /// The identity `name` is bound to as `snapshot` reads it; `None` when
-    /// it has none there.
+    /// The identity `name` is bound to as `snapshot` reads it; when it has no
+    /// live binding there, the one the store holds now (see
+    /// [`SchemaStore::label_id_txn`]); `None` when it has neither.
     pub fn label_id_at(
         &self,
         snapshot: coordinode_storage::engine::StorageSnapshot,
         name: &str,
     ) -> StoreResult<Option<LabelId>> {
-        Ok(self
+        let at = self
             .engine
             .snapshot_get(
                 &snapshot,
@@ -367,7 +373,11 @@ impl<'a> LocalSchemaStore<'a> {
             )?
             .map(|bytes| decode_binding(name, &bytes))
             .transpose()?
-            .and_then(|b| b.live_id()))
+            .and_then(|b| b.live_id());
+        match at {
+            Some(id) => Ok(Some(id)),
+            None => self.label_id(name),
+        }
     }
 
     /// Label `id` as `snapshot` reads the catalog: the name it was allocated
@@ -398,39 +408,34 @@ impl<'a> LocalSchemaStore<'a> {
         Ok((name, schema))
     }
 
-    /// The identity `name` is bound to, allocating an implicit one when it
-    /// has none, committed at once: for a single writer outside any
-    /// transaction (a test, a tool), as [`SchemaStore::save_label`] is. A
-    /// statement binds through [`SchemaStore::bind_label_txn`].
+    /// The identity `name` is bound to, binding an implicit one when it has
+    /// none, committed at once: for an engine written without a proposal
+    /// pipeline (a test, a tool, a direct-mode statement), deciding exactly as
+    /// the ordered application of a label binding does.
     pub fn bind_label(&self, name: &str) -> StoreResult<LabelId> {
         if let Some(id) = self.binding(name)?.and_then(|b| b.live_id()) {
             return Ok(id);
         }
-        let frontier = self.engine.get(Partition::Schema, LABEL_ID_FRONTIER_KEY)?;
-        let id = next_label_id(frontier.as_deref())?;
+        // Written at the engine's latest version, never below a retirement.
+        let effects = coordinode_storage::engine::metadata::label_binding_effects(
+            self.engine,
+            &[name.to_owned()],
+            u64::MAX,
+        )?;
         let mut batch = WriteBatch::new(self.engine);
-        batch.put(
-            Partition::Schema,
-            label_id_key(id).to_vec(),
-            name.as_bytes().to_vec(),
-        );
-        batch.put(
-            Partition::Schema,
-            LABEL_ID_FRONTIER_KEY.to_vec(),
-            encode_frontier(id).to_vec(),
-        );
-        let binding = LabelBinding {
-            id,
-            revision: 0,
-            state: BindingState::Implicit,
-        };
-        batch.put(
-            Partition::Schema,
-            encode_label_current_revision_key(name),
-            binding.encode().to_vec(),
-        );
+        for effect in effects {
+            if let coordinode_core::txn::proposal::Mutation::Put { key, value, .. } = effect {
+                batch.put(Partition::Schema, key, value);
+            }
+        }
         batch.commit()?;
-        Ok(id)
+        self.binding(name)?
+            .and_then(|b| b.live_id())
+            .ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "label '{name}' was not bound: the binding was refused"
+                ))
+            })
     }
 
     /// Every label identity allocated so far with the name it was allocated
@@ -549,52 +554,50 @@ fn binding_txn(txn: &mut Transaction, name: &str) -> StoreResult<Option<LabelBin
         .transpose()
 }
 
-/// The id after `frontier`, the largest handed out (`None` when none was).
-fn next_label_id(frontier: Option<&[u8]>) -> StoreResult<LabelId> {
-    match frontier {
-        None => Ok(FIRST_LABEL_ID),
-        Some(bytes) => decode_frontier(bytes)
-            .ok_or_else(|| StoreError::Decode {
-                kind: "label id frontier",
-                message: format!("expected 4 bytes naming an id, got {}", bytes.len()),
-            })?
+/// Allocate a new identity for `name` on `txn`, a catalog transaction: the
+/// identity after the newest issued, as the store holds it now, and its
+/// write-once record. An attempt racing another allocation, or a label
+/// binding applied meanwhile, writes the same record or the same binding,
+/// so it is a write conflict its catalog commit retries, then finding the
+/// identity bound.
+fn allocate_label_id_txn(
+    engine: &StorageEngine,
+    txn: &mut Transaction,
+    name: &str,
+) -> StoreResult<LabelId> {
+    use coordinode_storage::engine::metadata::{label_frontier, next_label_id};
+    let mut id = next_label_id(label_frontier(engine)?)?;
+    // Identities this transaction allocated itself are past the store's
+    // newest record: skip them.
+    while txn.get(Partition::Schema, &label_id_key(id))?.is_some() {
+        id = id
             .next()
-            .ok_or_else(|| StoreError::Invariant("the label id space is exhausted".into())),
+            .ok_or_else(|| StoreError::Invariant("the label id space is exhausted".into()))?;
     }
-}
-
-/// Allocate a new identity for `name` on `txn`: the id after the frontier,
-/// its identity record and the moved frontier. Two attempts allocating at
-/// once both write the frontier and the same record, so one of them commits
-/// and the other is a write conflict its statement retries. A record already
-/// present under the next id means the frontier fell behind the ids issued:
-/// the id is refused rather than handed out twice.
-fn allocate_label_id_txn(txn: &mut Transaction, name: &str) -> StoreResult<LabelId> {
-    let frontier = txn.get(Partition::Schema, LABEL_ID_FRONTIER_KEY)?;
-    let id = next_label_id(frontier.as_deref())?;
-    let key = label_id_key(id);
-    if txn.get(Partition::Schema, &key)?.is_some() {
-        return Err(StoreError::Invariant(format!(
-            "label id {id} is already issued but lies past the frontier"
-        )));
-    }
-    txn.put(Partition::Schema, &key, name.as_bytes())?;
-    txn.put(
-        Partition::Schema,
-        LABEL_ID_FRONTIER_KEY,
-        &encode_frontier(id),
-    )?;
+    txn.put(Partition::Schema, &label_id_key(id), name.as_bytes())?;
     Ok(id)
 }
 
 /// Stage `schema` as the current definition of its label on `txn`: under
 /// the identity its name is bound to, or a new one when the name has none
 /// or was dropped.
-fn stage_label_definition(txn: &mut Transaction, schema: &LabelSchema) -> StoreResult<()> {
+fn stage_label_definition(
+    engine: &StorageEngine,
+    txn: &mut Transaction,
+    schema: &LabelSchema,
+) -> StoreResult<()> {
     let body = encode_label_body(schema)?;
-    let id = match binding_txn(txn, &schema.name)?.and_then(|b| b.live_id()) {
+    // The binding is read as allocation reads the newest identity: past the
+    // transaction's view when the name was bound since (a first use binds it
+    // outside any transaction). Reading the two at different points could
+    // give one name a second identity.
+    let live = match binding_txn(txn, &schema.name)?.and_then(|b| b.live_id()) {
+        Some(id) => Some(id),
+        None => LocalSchemaStore::new(engine).label_id(&schema.name)?,
+    };
+    let id = match live {
         Some(id) => id,
-        None => allocate_label_id_txn(txn, &schema.name)?,
+        None => allocate_label_id_txn(engine, txn, &schema.name)?,
     };
     txn.put(
         Partition::Schema,
@@ -712,17 +715,12 @@ impl SchemaStore for LocalSchemaStore<'_> {
             None => {
                 // The batch commits unconditionally: this path serves a
                 // single writer (a test, a tool) and is not raced.
-                let frontier = self.engine.get(Partition::Schema, LABEL_ID_FRONTIER_KEY)?;
-                let id = next_label_id(frontier.as_deref())?;
+                use coordinode_storage::engine::metadata::{label_frontier, next_label_id};
+                let id = next_label_id(label_frontier(self.engine)?)?;
                 batch.put(
                     Partition::Schema,
                     label_id_key(id).to_vec(),
                     schema.name.as_bytes().to_vec(),
-                );
-                batch.put(
-                    Partition::Schema,
-                    LABEL_ID_FRONTIER_KEY.to_vec(),
-                    encode_frontier(id).to_vec(),
                 );
                 id
             }
@@ -948,7 +946,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn save_label_txn(&self, txn: &mut Transaction, schema: &LabelSchema) -> StoreResult<()> {
-        stage_label_definition(txn, schema)?;
+        stage_label_definition(self.engine, txn, schema)?;
         // A definition changed, so predicates other attempts evaluated under
         // the old one stop counting as evidence once this lands.
         txn.note_schema_change();
@@ -963,7 +961,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
         txn: &mut Transaction,
         schema: &LabelSchema,
     ) -> StoreResult<()> {
-        stage_label_definition(txn, schema)?;
+        stage_label_definition(self.engine, txn, schema)?;
         txn.note_schema_change();
         Ok(())
     }
@@ -1004,7 +1002,10 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn label_id_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<Option<LabelId>> {
-        Ok(binding_txn(txn, name)?.and_then(|b| b.live_id()))
+        match binding_txn(txn, name)?.and_then(|b| b.live_id()) {
+            Some(id) => Ok(Some(id)),
+            None => self.label_id(name),
+        }
     }
 
     fn bind_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<LabelId> {
@@ -1013,7 +1014,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
         }
         // An implicit binding declares nothing, so it does not move the
         // schema generation: it changes no predicate another attempt holds.
-        let id = allocate_label_id_txn(txn, name)?;
+        let id = allocate_label_id_txn(self.engine, txn, name)?;
         let binding = LabelBinding {
             id,
             revision: 0,
@@ -1028,9 +1029,12 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn label_name_txn(&self, txn: &mut Transaction, id: LabelId) -> StoreResult<Option<String>> {
-        txn.get(Partition::Schema, &label_id_key(id))?
-            .map(|bytes| decode_label_name(id, bytes))
-            .transpose()
+        match txn.get(Partition::Schema, &label_id_key(id))? {
+            Some(bytes) => decode_label_name(id, bytes).map(Some),
+            // Written once, so the latest record names an identity bound
+            // after the transaction's view just as truly.
+            None => self.label_name(id),
+        }
     }
 
     fn label_id(&self, name: &str) -> StoreResult<Option<LabelId>> {

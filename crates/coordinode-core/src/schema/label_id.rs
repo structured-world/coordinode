@@ -130,11 +130,10 @@ impl LabelBinding {
     }
 }
 
-/// Key prefix of the identity records.
+/// Key prefix of the identity records. Each is written once, and the newest
+/// identity issued is the last of them: allocation reads that, never a
+/// separately kept counter a commit could move back.
 pub const LABEL_ID_KEY_PREFIX: &[u8] = b"schema:label_id:";
-
-/// Key of the allocation frontier.
-pub const LABEL_ID_FRONTIER_KEY: &[u8] = b"schema:label_id_frontier";
 
 /// Key of the identity record of `id`. Big-endian, so the records sort by id.
 pub fn label_id_key(id: LabelId) -> [u8; LABEL_ID_KEY_PREFIX.len() + 4] {
@@ -150,15 +149,31 @@ pub fn decode_label_id_key(key: &[u8]) -> Option<LabelId> {
     LabelId::new(u32::from_be_bytes(raw))
 }
 
-/// The value of the allocation frontier: the largest id handed out.
-pub fn encode_frontier(id: LabelId) -> [u8; 4] {
-    id.get().to_be_bytes()
-}
-
-/// The largest id handed out, from the frontier's stored bytes; `None` when
-/// they are not a frontier.
-pub fn decode_frontier(bytes: &[u8]) -> Option<LabelId> {
-    LabelId::new(u32::from_be_bytes(bytes.try_into().ok()?))
+/// The authority that publishes label identities a write uses for the first
+/// time.
+///
+/// A database implements this over its ordered write path: a binding is a
+/// proposal whose application assigns the identity, outside the transaction
+/// that needs it, so two transactions first using one label converge on one
+/// identity instead of one of them aborting. An identity bound for a write
+/// that later rolls back stays bound and empty, as a field binding does.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot publish label identities",
+    label = "not a label registrar",
+    note = "an embedded `Database` provides one beside its field registrar"
+)]
+pub trait LabelRegistrar: Send + Sync {
+    /// The live identities of `names`, in order, binding the ones that have
+    /// none. Every returned binding is applied when this returns.
+    ///
+    /// # Errors
+    ///
+    /// The batch is invalid, the identity space is exhausted, or the binding
+    /// could not be published.
+    fn bind_labels(
+        &self,
+        names: &[&str],
+    ) -> Result<alloc::vec::Vec<LabelId>, crate::graph::intern::DictionaryError>;
 }
 
 /// The first id a database hands out.

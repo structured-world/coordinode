@@ -671,11 +671,15 @@ fn label_schema_admits_stored_nodes(
         return Ok(Verdict::Undecidable);
     };
     // The kind binds the stored nodes as the properties do: none may have an
-    // auxiliary label as its type. What a type implies is derived from its
-    // definition, so no stored node can lack it.
-    if schema.is_auxiliary()
+    // auxiliary label as its type. A type that has stored nodes cannot come
+    // to imply labels either: their lookup postings and index entries would
+    // be missing until reconciled, which only an ALTER of the implication
+    // performs. Checked here, at the commit, so a writer storing a node of
+    // the type while the declaration was prepared is seen.
+    if (schema.is_auxiliary() || !schema.implies().is_empty())
         && let Some(binding) = current_binding(engine, label, staged_points)?
-        && first_node_typed_by(engine, binding.id, staged_points)?.is_some()
+        && let Some(id) = binding.live_id()
+        && first_node_typed_by(engine, id, staged_points)?.is_some()
     {
         return Ok(Verdict::Broken);
     }

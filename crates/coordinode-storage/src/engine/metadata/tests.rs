@@ -526,3 +526,88 @@ fn a_retired_identity_is_retired_alone() {
     assert!(!identity_retired(&engine, b"spiffe://td/ab").unwrap());
     assert!(!identity_retired(&engine, b"spiffe://td/").unwrap());
 }
+
+fn bind_labels(names: &[&str]) -> Mutation {
+    Mutation::Command(MetadataCommand::BindLabels {
+        names: names.iter().map(|n| (*n).to_owned()).collect(),
+    })
+}
+
+/// The binding of label `name` as the store holds it now.
+fn label_binding(
+    engine: &StorageEngine,
+    name: &str,
+) -> Option<coordinode_core::schema::label_id::LabelBinding> {
+    engine
+        .get(
+            Partition::Schema,
+            &coordinode_core::schema::definition::encode_label_current_revision_key(name),
+        )
+        .unwrap()
+        .map(|bytes| coordinode_core::schema::label_id::LabelBinding::decode(&bytes).unwrap())
+}
+
+/// Two first uses of one label converge: the binding applied first stands,
+/// the second changes nothing, and new names take the identities after the
+/// newest issued in the order the batch lists them, even when proposals
+/// apply against their timestamps' order.
+#[test]
+fn concurrent_label_bindings_converge_on_one_identity() {
+    use coordinode_core::schema::label_id::BindingState;
+    let dir = TempDir::new().unwrap();
+    let (engine, oracle) = open(&dir);
+    let early = oracle.next().as_raw();
+    let late = oracle.next().as_raw();
+    apply(&engine, late, bind_labels(&["Goal", "Thing", "Goal"]));
+    apply(&engine, early, bind_labels(&["Thing", "Task"]));
+    let goal = label_binding(&engine, "Goal").unwrap();
+    let thing = label_binding(&engine, "Thing").unwrap();
+    let task = label_binding(&engine, "Task").unwrap();
+    assert_eq!(goal.state, BindingState::Implicit);
+    assert_eq!(
+        [goal.id.get(), thing.id.get(), task.id.get()],
+        [1, 2, 3],
+        "in application order, each name once"
+    );
+    assert_eq!(label_frontier(&engine).unwrap(), Some(task.id));
+}
+
+/// A retired name is bound again to a new identity, never the retired one;
+/// a binding stamped below the retirement's own version publishes nothing,
+/// since it would read as older than the retirement, and its proposer
+/// retries at a later stamp.
+#[test]
+fn a_retired_label_is_rebound_only_above_its_retirement() {
+    use coordinode_core::schema::label_id::{BindingState, LabelBinding};
+    let dir = TempDir::new().unwrap();
+    let (engine, oracle) = open(&dir);
+    let below = oracle.next().as_raw();
+    apply(&engine, oracle.next().as_raw(), bind_labels(&["Goal"]));
+    let first = label_binding(&engine, "Goal").unwrap();
+    let retired = LabelBinding {
+        state: BindingState::Retired,
+        ..first
+    };
+    engine
+        .apply_proposal_at(
+            &[Mutation::Put {
+                partition: PartitionId::Schema,
+                key: coordinode_core::schema::definition::encode_label_current_revision_key("Goal"),
+                value: retired.encode().to_vec(),
+            }],
+            oracle.next().as_raw(),
+        )
+        .unwrap();
+
+    apply(&engine, below, bind_labels(&["Goal"]));
+    assert_eq!(
+        label_binding(&engine, "Goal").unwrap().state,
+        BindingState::Retired,
+        "stamped below the retirement: nothing published"
+    );
+
+    apply(&engine, oracle.next().as_raw(), bind_labels(&["Goal"]));
+    let again = label_binding(&engine, "Goal").unwrap();
+    assert_eq!(again.state, BindingState::Implicit);
+    assert!(again.id > first.id, "a new identity, never the retired one");
+}

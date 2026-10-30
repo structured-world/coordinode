@@ -2684,6 +2684,7 @@ impl Database {
                 engine: &self.engine,
                 interner: &mut fields_view,
                 field_registrar: Some(self.fields.as_ref()),
+                label_registrar: Some(self.fields.as_ref()),
                 id_allocator: &self.allocator,
                 shard_id: self.shard_id,
                 scan_paging: scan_paging.clone(),

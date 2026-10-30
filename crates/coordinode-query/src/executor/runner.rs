@@ -469,6 +469,18 @@ impl From<coordinode_core::graph::intern::DictionaryError> for ExecutionError {
             coordinode_core::graph::intern::DictionaryError::NotLeader { leader_id } => {
                 ExecutionError::NotLeader { leader_id }
             }
+            // The typed refusal a commit past the limit gives.
+            coordinode_core::graph::intern::DictionaryError::CapacityExhausted {
+                endpoint_id,
+                used_bytes,
+                hard_limit_bytes,
+            } => ExecutionError::Storage(
+                coordinode_storage::error::StorageError::CapacityExhausted {
+                    endpoint_id,
+                    used_bytes,
+                    hard_limit_bytes,
+                },
+            ),
             other => ExecutionError::FieldDictionary(other),
         }
     }
@@ -1215,6 +1227,10 @@ pub struct ExecutionContext<'a> {
     /// encoded with them is written. `None` when `interner` is itself the
     /// only authority (a context over a bare engine, as in tests).
     pub field_registrar: Option<&'a dyn coordinode_core::graph::intern::FieldRegistrar>,
+    /// The authority a label a write uses for the first time is bound with,
+    /// outside the statement's transaction. `None` on an engine written
+    /// without a proposal pipeline, which binds it directly.
+    pub label_registrar: Option<&'a dyn coordinode_core::schema::label_id::LabelRegistrar>,
     /// Node ID allocator for CREATE operations.
     pub id_allocator: &'a NodeIdAllocator,
     /// Default shard ID for single-node deployment.
@@ -1925,20 +1941,32 @@ impl<'a> ExecutionContext<'a> {
         Ok(id)
     }
 
-    /// The identity of label `name` for a write that stores it, allocated in
-    /// the statement when the label has none: its first use makes it an
-    /// implicit FLEXIBLE type.
+    /// The identity of label `name` for a write that stores it, bound when
+    /// the label has none: its first use makes it an implicit FLEXIBLE type.
+    /// The binding is published outside the statement's transaction, through
+    /// the label registrar, so concurrent first uses converge on one
+    /// identity rather than conflict.
     ///
     /// # Errors
     ///
-    /// A catalog read or write failure.
+    /// A catalog read failure, or the binding could not be published.
     pub fn bind_label(&mut self, name: &str) -> Result<LabelId, ExecutionError> {
-        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
-        if let Some(Some(id)) = self.labels.id(name) {
+        if let Some(id) = self.label_id(name)? {
             return Ok(id);
         }
-        self.sync_txn_state();
-        let id = LocalSchemaStore::new(self.engine).bind_label_txn(&mut self.txn, name)?;
+        let id = match self.label_registrar {
+            Some(registrar) => registrar
+                .bind_labels(&[name])
+                .map_err(ExecutionError::from)?
+                .first()
+                .copied()
+                .ok_or_else(|| {
+                    ExecutionError::Serialization(format!("label '{name}' was not bound"))
+                })?,
+            // An engine written without a proposal pipeline binds it directly,
+            // deciding as the ordered application does.
+            None => coordinode_modality::LocalSchemaStore::new(self.engine).bind_label(name)?,
+        };
         self.labels.learn_id(name, Some(id));
         Ok(id)
     }
@@ -2321,11 +2349,17 @@ impl<'a> ExecutionContext<'a> {
     /// conditioning the statement's commit on it still being the current
     /// one: two statements changing one label's schema cannot both build on
     /// the same revision.
+    ///
+    /// The label is bound first, by the ordered allocator outside the
+    /// statement's transaction: a declaration then names the identity a first
+    /// use racing it converges on, and the condition is stated on the binding
+    /// as bound.
     pub fn load_label_schema_for_update(
         &mut self,
         name: &str,
     ) -> Result<Option<LabelSchema>, ExecutionError> {
         use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.bind_label(name)?;
         self.sync_txn_state();
         Ok(LocalSchemaStore::new(self.engine).load_label_for_update_txn(&mut self.txn, name)?)
     }
@@ -2359,15 +2393,21 @@ impl<'a> ExecutionContext<'a> {
         Ok(LocalSchemaStore::new(self.engine).save_edge_type_txn(&mut self.txn, schema)?)
     }
 
-    /// Write a label schema as the current revision: writes the schema body
-    /// at `schema:label:<name>:<schema.schema_revision>` and updates the pointer
-    /// `schema:current_revision:label:<name>` to that revision. Use this for
-    /// the canonical "create or update current schema" operation.
+    /// Write a label schema as the current revision: the body under the
+    /// label's identity and revision, and the name binding naming that
+    /// revision. Use this for the canonical "create or update current schema"
+    /// operation. The label and every label it implies are bound by the
+    /// ordered allocator first, outside the statement's transaction, so a
+    /// first use racing the declaration converges on the same identity.
     pub fn save_current_label_schema(
         &mut self,
         schema: &LabelSchema,
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.bind_label(&schema.name)?;
+        for implied in schema.implies() {
+            self.bind_label(implied)?;
+        }
         self.sync_txn_state();
         self.forget_label_schema(&schema.name);
         Ok(LocalSchemaStore::new(self.engine).save_label_txn(&mut self.txn, schema)?)
@@ -14556,24 +14596,36 @@ fn gate_vector_index_read(
                 )));
             }
             OnlineDuringBuild::Block => {
-                let remaining = match deadline {
-                    Some(deadline) => deadline.saturating_duration_since(std::time::Instant::now()),
-                    None => poll_step,
-                };
-                if remaining.is_zero() {
+                let Some(step) = build_poll_step(deadline, std::time::Instant::now(), poll_step)
+                else {
                     return Err(ExecutionError::Unsupported(format!(
                         "vector index '{def}' still building after {wait:?}; wait longer \
                          with /*+ vector_build_wait('...') */ or the session's \
                          vector_build_wait"
                     )));
-                }
-                // Never sleep past the caller's bound.
-                std::thread::sleep(poll_step.min(remaining));
+                };
+                std::thread::sleep(step);
             }
             // Returned above.
             OnlineDuringBuild::PartialRecall => return Ok(()),
         }
     }
+}
+
+/// How long a reader waiting for a building index sleeps before it looks
+/// again at `now`: one poll step, never past the caller's `deadline`; `None`
+/// when the deadline has passed (at once for a zero bound), and the read is
+/// refused without sleeping. No deadline is no bound.
+fn build_poll_step(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+    poll_step: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let remaining = match deadline {
+        Some(deadline) => deadline.saturating_duration_since(now),
+        None => poll_step,
+    };
+    (!remaining.is_zero()).then(|| poll_step.min(remaining))
 }
 
 /// CREATE node: allocate ID, build record, write to storage.
@@ -20336,6 +20388,11 @@ fn execute_create_node_type(
         LabelSchema, PlacementPolicy, PropertyDef, PropertyType,
     };
 
+    // The labels it implies are bound before the admission reads them; the
+    // label itself is bound by the update read.
+    for implied in implies {
+        ctx.bind_label(implied)?;
+    }
     // Reject if the label already has a schema; a concurrent definition of
     // the same label refuses this commit.
     if ctx.load_label_schema_for_update(name)?.is_some() {
@@ -22285,6 +22342,9 @@ fn execute_create_constraint(
         sparse: shape.sparse,
         maintenance: shape.maintenance,
     };
+    // A constraint on a label without a definition declares one: its
+    // identity is bound by the ordered allocator first, as a declaration's is.
+    ctx.bind_label(label)?;
     let schema = ctx.load_current_label_schema(label)?;
     let planned = plan_constraint(&request, schema.as_ref())?;
     let constraint = planned.constraint.clone();

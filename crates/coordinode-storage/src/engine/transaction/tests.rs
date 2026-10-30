@@ -1833,8 +1833,11 @@ mod unique_while_building {
         Value::String(v.into())
     }
 
-    fn record(value: &str) -> Vec<u8> {
-        let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
+    /// A `User` node holding `value`; the uncovered read finds holders of the
+    /// claim's label through its catalog binding.
+    fn record(engine: &StorageEngine, value: &str) -> Vec<u8> {
+        let user = crate::engine::test_labels::bind(engine, "User");
+        let mut record = NodeRecord::new(user);
         record.set(EMAIL, email(value));
         record.to_msgpack().unwrap()
     }
@@ -1889,7 +1892,7 @@ mod unique_while_building {
         };
         let mut txn = mvcc_txn(engine, oracle);
         for (id, value, covered) in users {
-            txn.put(Partition::Node, &key(engine, *id), &record(value))
+            txn.put(Partition::Node, &key(engine, *id), &record(engine, value))
                 .unwrap();
             txn.claim(claim(engine, *id, value, *covered));
         }
@@ -1903,7 +1906,7 @@ mod unique_while_building {
     fn one_held_value_among_many_refuses_the_commit() {
         let (engine, oracle, _d) = test_engine();
         engine
-            .put(Partition::Node, &key(&engine, 1), &record("b@x"))
+            .put(Partition::Node, &key(&engine, 1), &record(&engine, "b@x"))
             .unwrap();
 
         let err = commit_new_users(
@@ -1933,7 +1936,7 @@ mod unique_while_building {
         let (engine, oracle, _d) = test_engine();
         for (id, value) in [(1, "a@x"), (3, "held@x"), (5, "e@x")] {
             engine
-                .put(Partition::Node, &key(&engine, id), &record(value))
+                .put(Partition::Node, &key(&engine, id), &record(&engine, value))
                 .unwrap();
         }
 

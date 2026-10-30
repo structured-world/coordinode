@@ -254,6 +254,16 @@ pub enum MetadataCommand {
         /// `(name, id)` pairs to publish.
         bindings: Vec<(String, u32)>,
     },
+    /// Get-or-create label identities: each name without a live binding gets
+    /// the identity after the newest issued and an implicit binding, in the
+    /// order given. A name already bound keeps its identity, so concurrent
+    /// first uses of a label converge on one. Refused as a whole, publishing
+    /// nothing, when invalid.
+    BindLabels {
+        /// Label names to bind, at most
+        /// [`MAX_REGISTRATION_BATCH`](crate::graph::intern::MAX_REGISTRATION_BATCH).
+        names: Vec<String>,
+    },
     /// Grant the NodeId range `(base, ceiling]` to the proposer identified by
     /// `token`, only while the granted ceiling is still `base`.
     GrantNodeLease {
@@ -282,7 +292,9 @@ impl MetadataCommand {
     /// Approximate encoded size, for rate limiting and dedup.
     pub fn size_estimate(&self) -> usize {
         match self {
-            Self::RegisterFields { names } => names.iter().map(|n| n.len() + 2).sum(),
+            Self::RegisterFields { names } | Self::BindLabels { names } => {
+                names.iter().map(|n| n.len() + 2).sum()
+            }
             Self::AdoptFields { bindings } => bindings.iter().map(|(n, _)| n.len() + 6).sum(),
             Self::GrantNodeLease { token, .. } => 16 + token.len(),
             Self::RecordGroupPair { .. } => 12,

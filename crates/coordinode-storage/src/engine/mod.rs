@@ -33,6 +33,8 @@ pub mod space;
 pub mod stats;
 pub mod store_transfer;
 pub mod tap;
+#[cfg(test)]
+pub(crate) mod test_labels;
 pub mod transaction;
 pub mod vector_keys;
 

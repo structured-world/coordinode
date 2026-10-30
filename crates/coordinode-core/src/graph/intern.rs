@@ -97,6 +97,20 @@ pub enum DictionaryError {
     /// Stored or transferred dictionary bytes that do not decode.
     #[error("malformed field dictionary: {0}")]
     Malformed(String),
+    /// The registration's record was refused by an endpoint at its hard
+    /// capacity limit, as any write past it is.
+    #[error(
+        "endpoint {endpoint_id:?} capacity exhausted (used={used_bytes}, \
+         hard_limit={hard_limit_bytes})"
+    )]
+    CapacityExhausted {
+        /// The endpoint that refused the write.
+        endpoint_id: String,
+        /// Its bytes in use.
+        used_bytes: u64,
+        /// Its hard limit.
+        hard_limit_bytes: u64,
+    },
     /// A name longer than [`MAX_FIELD_NAME_BYTES`].
     #[error("field name of {len} bytes is longer than the {max}-byte limit")]
     NameTooLong {

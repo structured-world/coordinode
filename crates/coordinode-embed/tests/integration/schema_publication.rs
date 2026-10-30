@@ -226,12 +226,28 @@ fn a_refused_definition_fails_the_call_and_registers_nothing() {
         db.create_label_schema(LabelSchema::new_node_id("Person"))
             .is_err()
     );
+    // The label's identity is bound before the declaration, as a first use
+    // binds it, and stays bound and undeclared, as a field binding stays
+    // after a refused write: no definition is left behind.
     let stored = db
         .engine()
         .get(
             coordinode_storage::engine::partition::Partition::Schema,
             &encode_label_current_revision_key("Person"),
         )
-        .unwrap();
-    assert!(stored.is_none(), "a refused schema left a pointer behind");
+        .unwrap()
+        .and_then(|bytes| LabelBinding::decode(&bytes));
+    assert!(
+        stored.is_none_or(|b| b.state == BindingState::Implicit),
+        "a refused schema left a declaration behind: {stored:?}"
+    );
+    assert_eq!(
+        {
+            use coordinode_modality::SchemaStore as _;
+            coordinode_modality::LocalSchemaStore::new(db.engine())
+                .load_label("Person")
+                .unwrap()
+        },
+        None
+    );
 }

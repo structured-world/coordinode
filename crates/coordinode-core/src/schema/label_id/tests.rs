@@ -62,15 +62,17 @@ fn binding_state_decides_definition_and_liveness() {
     assert_eq!(at(BindingState::Retired).live_id(), None);
 }
 
-/// Identity record keys sort by id, so the frontier is recoverable by
-/// order, and decode only keys of their own family.
+/// Identity record keys sort by id, so the newest identity issued is the
+/// last record, and decode only keys of their own family.
 #[test]
 fn identity_keys_sort_by_id_and_decode() {
     assert!(label_id_key(id(255)) < label_id_key(id(256)));
     assert_eq!(decode_label_id_key(&label_id_key(id(9))), Some(id(9)));
     assert_eq!(decode_label_id_key(b"schema:label:User:1"), None);
-    assert_eq!(decode_frontier(&encode_frontier(id(12))), Some(id(12)));
-    assert_eq!(decode_frontier(&[0, 0, 0, 0]), None);
+    assert_eq!(
+        decode_label_id_key(b"schema:label_id:\x00\x00\x00\x00"),
+        None
+    );
 }
 
 /// A record stores an id as a plain MessagePack integer.

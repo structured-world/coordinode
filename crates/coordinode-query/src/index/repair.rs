@@ -176,6 +176,8 @@ fn attempt(
         engine,
         interner: &mut fields,
         field_registrar: None,
+        // A repair renames values of nodes already stored: it binds no label.
+        label_registrar: None,
         id_allocator: &allocator,
         shard_id: env.shard_id(),
         scan_paging: None,

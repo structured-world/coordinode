@@ -41,6 +41,16 @@ fn registration_refusal(e: ProposalError) -> DictionaryError {
         ProposalError::LeadershipLost { .. } | ProposalError::ShuttingDown => {
             DictionaryError::NotLeader { leader_id: None }
         }
+        // Refused as any write past the limit is, and reported the same way.
+        ProposalError::CapacityExhausted {
+            endpoint_id,
+            used_bytes,
+            hard_limit_bytes,
+        } => DictionaryError::CapacityExhausted {
+            endpoint_id,
+            used_bytes,
+            hard_limit_bytes,
+        },
         other => DictionaryError::Registration(other.to_string()),
     }
 }
@@ -247,6 +257,63 @@ impl FieldRegistrar for FieldDictionary {
         self.view_or_err()
     }
 }
+
+/// The label identities a write uses for the first time are published
+/// through the same ordered path as field bindings: each is a metadata
+/// command whose application decides the identity, so concurrent first uses
+/// converge on one.
+impl coordinode_core::schema::label_id::LabelRegistrar for FieldDictionary {
+    fn bind_labels(
+        &self,
+        names: &[&str],
+    ) -> Result<Vec<coordinode_core::schema::label_id::LabelId>, DictionaryError> {
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        let store = LocalSchemaStore::new(&self.engine);
+        let bound = |store: &LocalSchemaStore<'_>, name: &str| {
+            store
+                .label_id(name)
+                .map_err(|e| DictionaryError::Registration(e.to_string()))
+        };
+        let mut missing: Vec<&str> = Vec::new();
+        for &name in names {
+            if bound(&store, name)?.is_none() && !missing.contains(&name) {
+                missing.push(name);
+            }
+        }
+        for batch in missing.chunks(MAX_REGISTRATION_BATCH) {
+            validate_registration(batch)?;
+            // A binding refused because a retirement of the name carries a
+            // later timestamp than the command is proposed again, at a fresh
+            // one; anything else that leaves a name unbound is reported below.
+            for _ in 0..MAX_BINDING_ATTEMPTS {
+                self.propose(MetadataCommand::BindLabels {
+                    names: batch.iter().map(|n| (*n).to_owned()).collect(),
+                })?;
+                if batch
+                    .iter()
+                    .try_fold(true, |all, name| Ok(all && bound(&store, name)?.is_some()))?
+                {
+                    break;
+                }
+            }
+        }
+        names
+            .iter()
+            .map(|name| {
+                bound(&store, name)?.ok_or_else(|| {
+                    DictionaryError::Registration(format!(
+                        "label {name:?} was not bound; the binding was refused"
+                    ))
+                })
+            })
+            .collect()
+    }
+}
+
+/// Proposals of one label binding batch before its refusal is reported: a
+/// batch is refused only while a concurrent retirement of one of its names
+/// carries a later timestamp, which a fresh proposal moves past.
+const MAX_BINDING_ATTEMPTS: usize = 4;
 
 /// Refuse an empty dictionary over stored properties: the bindings their ids
 /// need are gone. Nodes without properties need none, so the check reads node

@@ -672,38 +672,43 @@ fn a_label_keeps_its_identity_until_dropped_and_a_recreation_gets_a_new_one() {
     );
 }
 
-/// An identity is never handed out twice: an allocation whose identity
-/// record is already there, past a frontier that fell behind, is refused
-/// rather than binding a second name to the id.
+/// An identity is never handed out twice: the next one follows the newest
+/// identity record, even when the label holding it was dropped since, and a
+/// catalog allocation racing another of the same identity is a conflict.
 #[test]
 fn an_allocation_never_reuses_an_identity() {
-    use coordinode_core::schema::label_id::{LABEL_ID_FRONTIER_KEY, label_id_key};
+    use coordinode_core::schema::label_id::label_id_key;
     let fx = open_engine();
     let engine = &fx.engine;
     let oracle = coordinode_core::txn::timestamp::TimestampOracle::new();
     let store = LocalSchemaStore::new(engine);
 
+    let first = store.bind_label("First").expect("bind");
+    let second = store.bind_label("Second").expect("bind");
     let mut txn = identity_txn(engine, &oracle);
-    let first = store.bind_label_txn(&mut txn, "First").expect("bind");
+    store.drop_label_txn(&mut txn, "Second").expect("drop");
     commit_identity(&mut txn).expect("commit");
-    engine
-        .delete(Partition::Schema, LABEL_ID_FRONTIER_KEY)
-        .expect("damage the frontier");
+    let third = store.bind_label("Third").expect("bind");
+    assert!(first < second && second < third, "{first} {second} {third}");
 
-    let mut txn = identity_txn(engine, &oracle);
-    let refused = store
-        .bind_label_txn(&mut txn, "Second")
-        .expect_err("the frontier fell behind to an issued id");
+    // Two catalog transactions take the same next identity: the one that
+    // commits second meets the other's record and is refused.
+    let mut racing = identity_txn(engine, &oracle);
+    let mut winner = identity_txn(engine, &oracle);
+    let a = store.bind_label_txn(&mut racing, "Fourth").expect("bind");
+    let b = store.bind_label_txn(&mut winner, "Fifth").expect("bind");
+    assert_eq!(a, b, "both read the same newest record");
+    commit_identity(&mut winner).expect("the first commit");
     assert!(
-        matches!(&refused, StoreError::Invariant(m) if m.contains(&first.to_string())),
-        "{refused:?}"
+        commit_identity(&mut racing).is_err(),
+        "the same identity record was written concurrently"
     );
     assert_eq!(
         engine
-            .get(Partition::Schema, &label_id_key(first))
+            .get(Partition::Schema, &label_id_key(b))
             .expect("get")
             .as_deref(),
-        Some(&b"First"[..])
+        Some(&b"Fifth"[..])
     );
-    assert_eq!(store.label_id("Second").expect("read"), None);
+    assert_eq!(store.label_id("Fourth").expect("read"), None);
 }

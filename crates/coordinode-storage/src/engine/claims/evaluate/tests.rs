@@ -617,48 +617,7 @@ fn a_cleanup_condition_is_broken_by_a_renewal_of_the_record() {
     );
 }
 
-/// The identity label `name` is bound to, allocated as the schema store
-/// allocates it on the label's first use when it has none.
-fn bind(engine: &StorageEngine, name: &str) -> coordinode_core::schema::label_id::LabelId {
-    use coordinode_core::schema::definition::encode_label_current_revision_key;
-    use coordinode_core::schema::label_id::{
-        BindingState, FIRST_LABEL_ID, LABEL_ID_FRONTIER_KEY, LabelBinding, decode_frontier,
-        encode_frontier, label_id_key,
-    };
-    let key = encode_label_current_revision_key(name);
-    if let Some(bytes) = engine.get(Partition::Schema, &key).expect("binding") {
-        return LabelBinding::decode(&bytes).expect("a binding").id;
-    }
-    let id = match engine
-        .get(Partition::Schema, LABEL_ID_FRONTIER_KEY)
-        .expect("frontier")
-    {
-        None => FIRST_LABEL_ID,
-        Some(bytes) => decode_frontier(&bytes)
-            .expect("a frontier")
-            .next()
-            .expect("room"),
-    };
-    engine
-        .put(Partition::Schema, &label_id_key(id), name.as_bytes())
-        .expect("identity record");
-    engine
-        .put(
-            Partition::Schema,
-            LABEL_ID_FRONTIER_KEY,
-            &encode_frontier(id),
-        )
-        .expect("frontier");
-    let binding = LabelBinding {
-        id,
-        revision: 0,
-        state: BindingState::Implicit,
-    };
-    engine
-        .put(Partition::Schema, &key, &binding.encode())
-        .expect("binding");
-    id
-}
+use crate::engine::test_labels::bind;
 
 /// The key of label `name`'s definition at `revision`, under its identity.
 fn body_key(engine: &StorageEngine, name: &str, revision: u64) -> Vec<u8> {

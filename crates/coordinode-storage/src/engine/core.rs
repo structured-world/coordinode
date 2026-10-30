@@ -4328,6 +4328,7 @@ impl StorageEngine {
     fn decide_commands(
         &self,
         mutations: &[Mutation],
+        commit_ts: u64,
     ) -> StorageResult<(Vec<Mutation>, DictionaryChange)> {
         use coordinode_core::txn::proposal::MetadataCommand;
         let mut effects = Vec::with_capacity(mutations.len() + 1);
@@ -4346,12 +4347,13 @@ impl StorageEngine {
                 continue;
             }
             decided = true;
-            let decided_effects = crate::engine::metadata::decide(self, command)?;
+            let decided_effects = crate::engine::metadata::decide(self, command, commit_ts)?;
             if !decided_effects.is_empty() {
                 dictionary = match command {
                     MetadataCommand::RegisterFields { .. } => DictionaryChange::Extended,
                     MetadataCommand::AdoptFields { .. } => DictionaryChange::Replaced,
-                    MetadataCommand::GrantNodeLease { .. }
+                    MetadataCommand::BindLabels { .. }
+                    | MetadataCommand::GrantNodeLease { .. }
                     | MetadataCommand::RecordGroupPair { .. }
                     | MetadataCommand::RecordDeployment { .. } => DictionaryChange::None,
                 };
@@ -4528,7 +4530,7 @@ impl StorageEngine {
             // lock: the journal then records each decision's effects in the
             // order they were decided, and replay reproduces them exactly.
             let _decisions = self.metadata_exclusive();
-            let (effects, dictionary) = self.decide_commands(mutations)?;
+            let (effects, dictionary) = self.decide_commands(mutations, commit_ts)?;
             // Nothing decided (names already bound, or a refusal) leaves the
             // state as it is, so there is nothing to journal or replay; the
             // bindings it found may still be unsynced.
@@ -4802,7 +4804,7 @@ impl StorageEngine {
         let mutations = mutations.as_ref();
         if mutations.iter().any(|m| matches!(m, Mutation::Command(_))) {
             let _decisions = self.metadata_exclusive();
-            let (effects, dictionary) = self.decide_commands(mutations)?;
+            let (effects, dictionary) = self.decide_commands(mutations, commit_ts)?;
             self.apply_effects_covered(&effects, commit_ts, cover)?;
             self.note_dictionary(dictionary);
             return Ok(());
