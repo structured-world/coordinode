@@ -543,6 +543,91 @@ fn a_settle_decided_before_a_rebuild_changes_nothing() {
     assert!(thing, "the rebuilt document of the thing stays");
 }
 
+/// The worker follows a change that makes `Task` imply `Thing`, which is
+/// then withdrawn; once the worker has decided to settle the withdrawal and
+/// before it drops anything, the implication is put in force by another
+/// path and another thread rebuilds the index, the task's document now
+/// shared. Whatever the worker does after, the index holds every document
+/// of the interpretation it says it holds. Before settling was one guarded
+/// step, it removed the documents it had listed before the rebuild, the
+/// task's among them, from the rebuilt index.
+#[test]
+fn a_settle_raced_by_a_rebuild_keeps_the_rebuilt_documents() {
+    use coordinode_core::schema::definition::{LabelCandidate, LabelSchema, PlacementPolicy};
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    let rig = Rig::new();
+    let (_, after) = rig.carriers.clone();
+    let schemas = LocalSchemaStore::new(&rig.engine);
+    let task = |implies: Option<Vec<String>>, candidate: Option<Vec<String>>, revision| {
+        let mut schema = LabelSchema::new("Task", PlacementPolicy::NodeId);
+        if let Some(implies) = implies {
+            schema.set_implies(implies);
+        }
+        if candidate.is_some() {
+            schema.set_candidate(LabelCandidate {
+                properties: Default::default(),
+                mode: schema.mode,
+                implies: candidate,
+                operation: coordinode_query::index::GenerationId::from_raw(40),
+            });
+        }
+        schema.schema_revision = revision;
+        schema
+    };
+    // The change is certified, and the worker keeps the task apart for it.
+    schemas
+        .save_label(&task(None, Some(vec!["Thing".into()]), 2))
+        .expect("propose");
+    rig.worker.sync_selections().expect("prepare");
+    assert_eq!(
+        rig.registry
+            .held("Thing", "title")
+            .expect("registered")
+            .candidate,
+        Some((after.clone(), true)),
+        "prepared"
+    );
+
+    // Withdrawn; while the worker settles that, the implication is put in
+    // force elsewhere and the index rebuilt under it.
+    schemas.save_label(&task(None, None, 3)).expect("withdraw");
+    let (engine, registry) = (
+        std::sync::Arc::clone(&rig.engine),
+        std::sync::Arc::clone(&rig.registry),
+    );
+    let interner = rig.worker.fields.view().expect("fields");
+    *super::SETTLE_DECIDED.lock() = Some(Box::new(move || {
+        LocalSchemaStore::new(&engine)
+            .save_label(&task(Some(vec!["Thing".into()]), None, 4))
+            .expect("put in force elsewhere");
+        registry
+            .rebuild_index("Thing", "title", || {
+                coordinode_query::index::text_registry::stored_texts(
+                    &engine, 1, &interner, "Thing", "title", 0,
+                )
+            })
+            .expect("rebuild");
+    }));
+    rig.worker.sync_selections().expect("settle");
+    assert!(
+        super::SETTLE_DECIDED.lock().is_none(),
+        "the worker settled the withdrawal"
+    );
+
+    let (held, task_indexed) = rig
+        .registry
+        .with_index("Thing", "title", |index, held| {
+            Ok((held.clone(), index.contains(7)?))
+        })
+        .expect("read")
+        .expect("registered");
+    assert_eq!(held.base, Some(after), "the rebuild's interpretation");
+    assert!(
+        task_indexed,
+        "the task is a thing under it, and its document is there"
+    );
+}
+
 /// A rebuild leaving the index holding the very interpretations it held
 /// before still moves their revision: a preparation decided before it is
 /// refused, so equal interpretations never pass for unchanged documents.

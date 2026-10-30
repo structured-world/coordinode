@@ -493,6 +493,8 @@ impl Worker {
         } else {
             Scope::Gained
         };
+        #[cfg(test)]
+        settle_decided();
         self.registry
             .settle(
                 (&def.label, property),
@@ -540,6 +542,22 @@ impl Worker {
             }
         }
         (!failed).then_some(covered)
+    }
+}
+
+/// A step a test runs once settling has decided what to drop and before it
+/// drops anything: the window another thread's rebuild races it in.
+#[cfg(test)]
+type SettleHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static SETTLE_DECIDED: parking_lot::Mutex<Option<SettleHook>> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+fn settle_decided() {
+    let hook = SETTLE_DECIDED.lock().take();
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
