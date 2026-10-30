@@ -714,10 +714,10 @@ fn allocated(meta: &std::fs::Metadata, unit: u64) -> u64 {
 fn allocation_unit(path: &Path) -> u64 {
     let mut at = Some(path);
     while let Some(dir) = at {
-        if let Ok(unit) = fs4::allocation_granularity(dir) {
-            if unit > 0 {
-                return unit;
-            }
+        if let Ok(unit) = fs4::allocation_granularity(dir)
+            && unit > 0
+        {
+            return unit;
         }
         at = dir.parent();
     }

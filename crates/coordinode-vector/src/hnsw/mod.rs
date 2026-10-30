@@ -1049,10 +1049,10 @@ impl HnswIndex {
         // Offload: free the f32 from the layer-0 store so the RAM is actually
         // returned and `read_node_f32` reports None (rerank then loads f32
         // from disk).
-        if self.config.offload_vectors {
-            if let Some(b) = self.data_level0.get_mut() {
-                b.drop_f32();
-            }
+        if self.config.offload_vectors
+            && let Some(b) = self.data_level0.get_mut()
+        {
+            b.drop_f32();
         }
         self.sq8_params = Some(params);
     }
@@ -1061,10 +1061,10 @@ impl HnswIndex {
     /// `params`.
     fn quantize_all(&mut self, params: &Sq8Params) {
         for idx in 0..self.node_len() {
-            if let Some(code) = self.read_node_f32(idx).map(|v| params.quantize(v)) {
-                if let Some(store) = self.nodes_mut() {
-                    store.set_sq8(idx, Some(code));
-                }
+            if let Some(code) = self.read_node_f32(idx).map(|v| params.quantize(v))
+                && let Some(store) = self.nodes_mut()
+            {
+                store.set_sq8(idx, Some(code));
             }
         }
     }
@@ -1119,10 +1119,10 @@ impl HnswIndex {
             // Offload: free the f32 from the layer-0 store so the RAM is
             // actually returned and `read_node_f32` reports None for these
             // nodes (rerank then loads f32 from disk via VectorLoader).
-            if self.config.offload_vectors {
-                if let Some(b) = self.data_level0.get_mut() {
-                    b.drop_f32();
-                }
+            if self.config.offload_vectors
+                && let Some(b) = self.data_level0.get_mut()
+            {
+                b.drop_f32();
             }
             self.sq8_params = Some(params);
         }
@@ -1626,10 +1626,10 @@ impl HnswIndex {
     ) {
         // `data_level0` holds every node's published layer-0 list (u32 ids);
         // read straight into `out`, widening u32 -> u64.
-        if let Some(block) = self.data_level0.get() {
-            if block.read_list_u64(idx, out, guard) {
-                return;
-            }
+        if let Some(block) = self.data_level0.get()
+            && block.read_list_u64(idx, out, guard)
+        {
+            return;
         }
         // data_level0 is the sole layer-0 neighbour store and is grown to
         // cover every node during allocation, so this fallback only fires for
@@ -1819,10 +1819,10 @@ impl HnswIndex {
         // f32 directly from the truth tier. Tier writes never roll back
         // the in-RAM insert: the in-RAM graph is authoritative, and the
         // truth tier regenerates from data on recovery.
-        if let Some(tier) = self.vector_tier.as_ref() {
-            if let Err(e) = tier.put_f32(id, vector) {
-                warn!(node_id = id, error = %e, "vector_tier put_f32 failed");
-            }
+        if let Some(tier) = self.vector_tier.as_ref()
+            && let Err(e) = tier.put_f32(id, vector)
+        {
+            warn!(node_id = id, error = %e, "vector_tier put_f32 failed");
         }
 
         self.ensure_rabitq_block(idx, vector.len());
@@ -1868,10 +1868,10 @@ impl HnswIndex {
         self.note_estimator_domain(vector);
         self.admit();
         let op = self.begin_operation();
-        if let Some(current) = self.id_to_idx.get(id) {
-            if self.read_node_f32(current) == Some(vector) {
-                return Ok(false);
-            }
+        if let Some(current) = self.id_to_idx.get(id)
+            && self.read_node_f32(current) == Some(vector)
+        {
+            return Ok(false);
         }
         let new_level = self.random_level();
         let Some(idx) = self.allocate_node(id, new_level, vector) else {
@@ -2454,13 +2454,12 @@ impl HnswIndex {
             .data_level0
             .get()
             .map(data_level0::DataLevel0Block::dim)
+            && dim != query.len()
         {
-            if dim != query.len() {
-                return Err(VectorDomainError::DimensionMismatch {
-                    left: query.len(),
-                    right: dim,
-                });
-            }
+            return Err(VectorDomainError::DimensionMismatch {
+                left: query.len(),
+                right: dim,
+            });
         }
         Ok(exact)
     }
@@ -2725,11 +2724,11 @@ impl HnswIndex {
             };
             if heap.len() < k {
                 heap.push(cand);
-            } else if let Some(top) = heap.peek() {
-                if cand < *top {
-                    heap.pop();
-                    heap.push(cand);
-                }
+            } else if let Some(top) = heap.peek()
+                && cand < *top
+            {
+                heap.pop();
+                heap.push(cand);
             }
         }
         Ok(heap
@@ -3245,13 +3244,13 @@ impl HnswIndex {
                             distance: dist,
                             idx: neighbor_idx as u32,
                         });
-                    } else if let Some(mut top) = results.peek_mut() {
-                        if metrics::nearer(dist, top.distance) {
-                            *top = FarCandidate {
-                                distance: dist,
-                                idx: neighbor_idx as u32,
-                            };
-                        }
+                    } else if let Some(mut top) = results.peek_mut()
+                        && metrics::nearer(dist, top.distance)
+                    {
+                        *top = FarCandidate {
+                            distance: dist,
+                            idx: neighbor_idx as u32,
+                        };
                     }
                     if let Some(top) = results.peek() {
                         farthest_dist = top.distance;
@@ -3406,10 +3405,10 @@ impl HnswIndex {
             // it is a random access the hardware prefetcher cannot
             // predict (hnswlib issues the same hint on its candidate
             // top inside `searchBaseLayerST`).
-            if level == 0 {
-                if let (Some(next), Some(block)) = (candidates.peek(), self.data_level0.get()) {
-                    block.prefetch_neighbours(next.idx as usize, guard);
-                }
+            if level == 0
+                && let (Some(next), Some(block)) = (candidates.peek(), self.data_level0.get())
+            {
+                block.prefetch_neighbours(next.idx as usize, guard);
             }
 
             // Every node takes part in layer 0, so only upper layers ask.
@@ -3497,14 +3496,14 @@ impl HnswIndex {
                                 farthest_dist = top.distance;
                             }
                         } else {
-                            if let Some(mut top) = results.peek_mut() {
-                                if metrics::nearer(exact_dist, top.distance) {
-                                    *top = FarCandidate {
-                                        distance: exact_dist,
-                                        idx: neighbor_idx as u32,
-                                    };
-                                }
-                                // peek_mut sifts on drop here.
+                            // peek_mut sifts on drop, after the replacement.
+                            if let Some(mut top) = results.peek_mut()
+                                && metrics::nearer(exact_dist, top.distance)
+                            {
+                                *top = FarCandidate {
+                                    distance: exact_dist,
+                                    idx: neighbor_idx as u32,
+                                };
                             }
                             if let Some(top) = results.peek() {
                                 farthest_dist = top.distance;
@@ -3594,30 +3593,29 @@ impl HnswIndex {
             // every unquantized search.
             if let (Some(params), Some(qenc)) =
                 (self.rabitq_params.as_ref(), ctx.rabitq_query.as_ref())
+                && let Some(xcode) = self.node_rabitq(node_idx)
             {
-                if let Some(xcode) = self.node_rabitq(node_idx) {
-                    match (qenc, xcode) {
-                        // 1-bit data × 4-bit-plane query — paper §3.3.2 kernel.
-                        // Lifts the cosine estimator from `O(1/√(D/4))` (legacy
-                        // XOR popcount) to `O(1/√D)`, which is what closes the
-                        // glove-100 recall=0.17 plateau (chroma single_bit.rs
-                        // does the same).
-                        (RabitqQuery::OneBit(q), RabitqEncoded::OneBit(x)) => {
-                            return params.estimate_cosine_distance_q(x, q);
-                        }
-                        (RabitqQuery::Multi(q), RabitqEncoded::Multi(x)) if q.bits == x.bits => {
-                            return params.estimate_cosine_distance_ext(q, x);
-                        }
-                        _ => {}
+                match (qenc, xcode) {
+                    // 1-bit data × 4-bit-plane query — paper §3.3.2 kernel.
+                    // Lifts the cosine estimator from `O(1/√(D/4))` (plain
+                    // XOR popcount) to `O(1/√D)`, which is what closes the
+                    // glove-100 recall=0.17 plateau (chroma single_bit.rs
+                    // does the same).
+                    (RabitqQuery::OneBit(q), RabitqEncoded::OneBit(x)) => {
+                        return params.estimate_cosine_distance_q(x, q);
                     }
+                    (RabitqQuery::Multi(q), RabitqEncoded::Multi(x)) if q.bits == x.bits => {
+                        return params.estimate_cosine_distance_ext(q, x);
+                    }
+                    _ => {}
                 }
             }
         }
-        if let Some(params) = &self.sq8_params {
-            if let Some(quantized) = self.node_sq8(node_idx) {
-                let dequantized = params.dequantize(quantized);
-                return self.distance_for_metric(ctx, &dequantized);
-            }
+        if let Some(params) = &self.sq8_params
+            && let Some(quantized) = self.node_sq8(node_idx)
+        {
+            let dequantized = params.dequantize(quantized);
+            return self.distance_for_metric(ctx, &dequantized);
         }
         self.compute_exact_distance(ctx, node_idx)
     }
@@ -3632,21 +3630,21 @@ impl HnswIndex {
             // RaBitQ code is available, then feed the both-norms helper to
             // skip the `norm_l2(b)` pass per neighbour visit.
             if matches!(self.config.metric, VectorMetric::Cosine) {
-                // Nested, not a tuple pattern: a tuple would read the node's
-                // RaBitQ code (random 72B-stride read, a cache miss per
-                // visit) even on unquantized indexes where the params are
-                // None. A range-safe search takes no norm from a code.
-                if let Some(params) = self.rabitq_params.as_ref().filter(|_| !ctx.wide) {
-                    if let Some(enc) = self.node_rabitq(node_idx) {
-                        let b_norm = rabitq_code_norm(enc, params);
-                        return 1.0
-                            - metrics::cosine_similarity_with_both_norms(
-                                ctx.vec,
-                                node_vec,
-                                ctx.norm_l2,
-                                b_norm,
-                            );
-                    }
+                // A short-circuit chain, not a tuple pattern: a tuple would
+                // read the node's RaBitQ code (random 72B-stride read, a cache
+                // miss per visit) even on unquantized indexes where the params
+                // are None. A range-safe search takes no norm from a code.
+                if let Some(params) = self.rabitq_params.as_ref().filter(|_| !ctx.wide)
+                    && let Some(enc) = self.node_rabitq(node_idx)
+                {
+                    let b_norm = rabitq_code_norm(enc, params);
+                    return 1.0
+                        - metrics::cosine_similarity_with_both_norms(
+                            ctx.vec,
+                            node_vec,
+                            ctx.norm_l2,
+                            b_norm,
+                        );
                 }
                 // Cached inverse norm available even without RaBitQ — skip
                 // the per-visit `norm_l2(b)` pass AND the divide: the score
@@ -3669,11 +3667,11 @@ impl HnswIndex {
             return self.distance_for_metric(ctx, node_vec);
         }
         // f32 offloaded — fall back to dequantized SQ8 (slightly less accurate)
-        if let Some(ref params) = self.sq8_params {
-            if let Some(quantized) = self.node_sq8(node_idx) {
-                let dequantized = params.dequantize(quantized);
-                return self.distance_for_metric(ctx, &dequantized);
-            }
+        if let Some(ref params) = self.sq8_params
+            && let Some(quantized) = self.node_sq8(node_idx)
+        {
+            let dequantized = params.dequantize(quantized);
+            return self.distance_for_metric(ctx, &dequantized);
         }
         f32::INFINITY
     }
@@ -4094,10 +4092,13 @@ impl HnswIndex {
                     .data_level0
                     .get()
                     .map(|block| (block.norm(a_idx), block.norm(b_idx)));
-                if let Some((Some(na), Some(nb))) = norms {
-                    if na.is_finite() && na > 0.0 && nb.is_finite() && nb > 0.0 {
-                        return 1.0 - metrics::cosine_similarity_with_both_norms(va, vb, na, nb);
-                    }
+                if let Some((Some(na), Some(nb))) = norms
+                    && na.is_finite()
+                    && na > 0.0
+                    && nb.is_finite()
+                    && nb > 0.0
+                {
+                    return 1.0 - metrics::cosine_similarity_with_both_norms(va, vb, na, nb);
                 }
             }
             // The build context: a pair distance uses no RaBitQ code, so the
@@ -4169,25 +4170,26 @@ impl HnswIndex {
         // perf measured it at ~32% of search_layer self-time on glove-50k
         // ST. RaBitQ codes exist only after calibration, which requires
         // `rabitq_params`.
-        if self.rabitq_params.is_some() && matches!(self.config.metric, VectorMetric::Cosine) {
-            if let Some(enc) = self.node_rabitq(idx) {
-                let code_words = match enc {
-                    RabitqEncoded::OneBit(c) => c.code.as_ptr() as *const u8,
-                    RabitqEncoded::Multi(c) => c.packed.as_ptr(),
-                };
-                prefetch_read_data(code_words);
-                return;
-            }
+        if self.rabitq_params.is_some()
+            && matches!(self.config.metric, VectorMetric::Cosine)
+            && let Some(enc) = self.node_rabitq(idx)
+        {
+            let code_words = match enc {
+                RabitqEncoded::OneBit(c) => c.code.as_ptr() as *const u8,
+                RabitqEncoded::Multi(c) => c.packed.as_ptr(),
+            };
+            prefetch_read_data(code_words);
+            return;
         }
         // Prefer the contiguous f32-only block when present: prefetch
         // target address is `base + idx * stride` — one ALU op, zero
         // SoA cache misses. Matches hnswlib's `_mm_prefetch(data_level0_memory_
         // + idx * size_data_per_element_)` shape.
-        if let Some(block) = self.data_level0.get() {
-            if block.has_f32() {
-                block.prefetch(idx);
-                return;
-            }
+        if let Some(block) = self.data_level0.get()
+            && block.has_f32()
+        {
+            block.prefetch(idx);
+            return;
         }
         if let Some(q) = self.node_sq8(idx) {
             prefetch_read_data(q.as_ptr());

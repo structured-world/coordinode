@@ -97,10 +97,10 @@ impl SegmentRegistry {
             let alive = seg_reader.alive_bitset();
             let mut any_alive = false;
             for doc_id in 0..max_doc {
-                if let Some(bitset) = alive {
-                    if !bitset.is_alive(doc_id) {
-                        continue;
-                    }
+                if let Some(bitset) = alive
+                    && !bitset.is_alive(doc_id)
+                {
+                    continue;
                 }
                 any_alive = true;
                 // Full cardinality: every document has its value.

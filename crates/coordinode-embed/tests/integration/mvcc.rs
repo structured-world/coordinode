@@ -1148,10 +1148,10 @@ fn snapshot_isolation_through_database() {
     // Count nodes visible at old seqno
     let mut old_count = 0;
     for (_key, value) in &old_nodes {
-        if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value) {
-            if record.labels.contains(&"Snap".to_string()) {
-                old_count += 1;
-            }
+        if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value)
+            && record.labels.contains(&"Snap".to_string())
+        {
+            old_count += 1;
         }
     }
     assert_eq!(old_count, 1, "old snapshot should see only alice, not bob");
@@ -1201,13 +1201,13 @@ fn snapshot_sees_old_version_after_set() {
 
     let mut found_v1 = false;
     for (_key, value) in &old_nodes {
-        if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value) {
-            if record.labels.contains(&"VersionTest".to_string()) {
-                // Check the val property (interned)
-                for val in record.props.values() {
-                    if *val == coordinode_core::graph::types::Value::String("v1".into()) {
-                        found_v1 = true;
-                    }
+        if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value)
+            && record.labels.contains(&"VersionTest".to_string())
+        {
+            // Check the val property (interned)
+            for val in record.props.values() {
+                if *val == coordinode_core::graph::types::Value::String("v1".into()) {
+                    found_v1 = true;
                 }
             }
         }
@@ -1251,10 +1251,10 @@ fn snapshot_before_delete_still_visible() {
 
     let mut found_ephemeral = false;
     for (_key, value) in &old_nodes {
-        if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value) {
-            if record.labels.contains(&"Ephemeral".to_string()) {
-                found_ephemeral = true;
-            }
+        if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value)
+            && record.labels.contains(&"Ephemeral".to_string())
+        {
+            found_ephemeral = true;
         }
     }
     assert!(

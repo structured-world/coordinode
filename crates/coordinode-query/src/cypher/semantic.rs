@@ -203,13 +203,13 @@ impl<'a> Analyzer<'a> {
             // Column-name compatibility: all branches must project the same
             // columns in the same order. `*` projections can't be compared
             // statically, so a branch using `RETURN *` skips the check.
-            if let (Some(left), Some(right)) = (&first_cols, return_columns(&branch.clauses)) {
-                if *left != right {
-                    self.errors.push(SemanticError::UnionColumnMismatch {
-                        left: left.clone(),
-                        right,
-                    });
-                }
+            if let (Some(left), Some(right)) = (&first_cols, return_columns(&branch.clauses))
+                && *left != right
+            {
+                self.errors.push(SemanticError::UnionColumnMismatch {
+                    left: left.clone(),
+                    right,
+                });
             }
         }
     }
@@ -486,7 +486,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_delete(&mut self, dc: &DeleteClause) {
         for expr in &dc.exprs {
             // DELETE should reference variables
-            if let Expr::Variable(ref name) = expr {
+            if let Expr::Variable(name) = expr {
                 if !self.scope.contains_key(name) {
                     self.errors
                         .push(SemanticError::UndefinedVariable { name: name.clone() });
@@ -682,14 +682,14 @@ impl<'a> Analyzer<'a> {
                 when_clauses,
                 else_clause,
             } => {
-                if let Some(ref op) = operand {
+                if let Some(op) = operand {
                     self.check_expr(op);
                 }
                 for (when, then) in when_clauses {
                     self.check_expr(when);
                     self.check_expr(then);
                 }
-                if let Some(ref el) = else_clause {
+                if let Some(el) = else_clause {
                     self.check_expr(el);
                 }
             }
@@ -706,12 +706,11 @@ impl<'a> Analyzer<'a> {
                 for elem in &pattern.elements {
                     match elem {
                         PatternElement::Node(node) => {
-                            if let Some(ref name) = node.variable {
-                                if !self.scope.contains_key(name) {
-                                    self.errors.push(SemanticError::UndefinedVariable {
-                                        name: name.clone(),
-                                    });
-                                }
+                            if let Some(ref name) = node.variable
+                                && !self.scope.contains_key(name)
+                            {
+                                self.errors
+                                    .push(SemanticError::UndefinedVariable { name: name.clone() });
                             }
                             for (_, v) in &node.properties {
                                 self.check_expr(v);
@@ -926,25 +925,24 @@ impl<'a> Analyzer<'a> {
 
     /// Check that a property exists on the label associated with a variable.
     fn check_property_on_variable(&mut self, var_name: &str, property: &str) {
-        if let Some(schema) = self.schema {
-            if let Some(labels) = self.scope.get(var_name) {
-                for label in labels {
-                    if let Some(label_schema) = schema.get_label(label) {
-                        if label_schema.mode.rejects_unknown()
-                            && label_schema.get_property(property).is_none()
-                        {
-                            self.errors.push(SemanticError::UnknownProperty {
-                                label: label.clone(),
-                                property: property.to_string(),
-                            });
-                        }
-                    }
-                    // Also check edge type schemas
-                    if let Some(edge_schema) = schema.get_edge_type(label) {
-                        // Edge type schemas don't have strict mode currently,
-                        // but we could check if the property exists
-                        let _ = edge_schema.get_property(property);
-                    }
+        if let Some(schema) = self.schema
+            && let Some(labels) = self.scope.get(var_name)
+        {
+            for label in labels {
+                if let Some(label_schema) = schema.get_label(label)
+                    && label_schema.mode.rejects_unknown()
+                    && label_schema.get_property(property).is_none()
+                {
+                    self.errors.push(SemanticError::UnknownProperty {
+                        label: label.clone(),
+                        property: property.to_string(),
+                    });
+                }
+                // Also check edge type schemas
+                if let Some(edge_schema) = schema.get_edge_type(label) {
+                    // Edge type schemas don't have strict mode currently,
+                    // but we could check if the property exists
+                    let _ = edge_schema.get_property(property);
                 }
             }
         }

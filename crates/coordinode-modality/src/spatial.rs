@@ -319,11 +319,11 @@ fn morton_2d_decompose(bx_min: u32, bx_max: u32, by_min: u32, by_max: u32) -> Ve
     raw.sort_unstable_by_key(|&(lo, _)| lo);
     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(raw.len());
     for (lo, hi) in raw {
-        if let Some(last) = merged.last_mut() {
-            if last.1.saturating_add(1) >= lo {
-                last.1 = last.1.max(hi);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && last.1.saturating_add(1) >= lo
+        {
+            last.1 = last.1.max(hi);
+            continue;
         }
         merged.push((lo, hi));
     }
@@ -706,11 +706,11 @@ fn hilbert_2d_decompose(bx_min: u32, bx_max: u32, by_min: u32, by_max: u32) -> V
     raw.sort_unstable_by_key(|&(lo, _)| lo);
     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(raw.len());
     for (lo, hi) in raw {
-        if let Some(last) = merged.last_mut() {
-            if last.1.saturating_add(1) >= lo {
-                last.1 = last.1.max(hi);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && last.1.saturating_add(1) >= lo
+        {
+            last.1 = last.1.max(hi);
+            continue;
         }
         merged.push((lo, hi));
     }
@@ -846,11 +846,11 @@ fn wgs84_3d_s2_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
     intervals.sort_unstable_by_key(|&(lo, _)| lo);
     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
     for (lo, hi) in intervals {
-        if let Some(last) = merged.last_mut() {
-            if last.1.saturating_add(1) >= lo {
-                last.1 = last.1.max(hi);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && last.1.saturating_add(1) >= lo
+        {
+            last.1 = last.1.max(hi);
+            continue;
         }
         merged.push((lo, hi));
     }
@@ -886,11 +886,11 @@ fn wgs84_s2_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
     intervals.sort_unstable_by_key(|&(lo, _)| lo);
     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
     for (lo, hi) in intervals {
-        if let Some(last) = merged.last_mut() {
-            if last.1.saturating_add(1) >= lo {
-                last.1 = last.1.max(hi);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && last.1.saturating_add(1) >= lo
+        {
+            last.1 = last.1.max(hi);
+            continue;
         }
         merged.push((lo, hi));
     }

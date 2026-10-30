@@ -496,10 +496,10 @@ pub fn export_binary<W: Write>(
         writer.write_all(&encoded)?;
 
         let key_str = std::str::from_utf8(key_bytes).unwrap_or("");
-        if key_str.contains(":out:") {
-            if let Ok(pl) = PostingList::from_bytes(value_bytes) {
-                stats.edges += pl.len() as u64;
-            }
+        if key_str.contains(":out:")
+            && let Ok(pl) = PostingList::from_bytes(value_bytes)
+        {
+            stats.edges += pl.len() as u64;
         }
     }
 

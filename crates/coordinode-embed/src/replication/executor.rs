@@ -148,14 +148,14 @@ pub fn write_paged(
             ANSWER_PAGE,
         )?;
         read_ts = Some(page.read_ts);
-        if columns.is_none() {
-            if let Some(first) = page.rows.first() {
-                let names: Vec<String> = first.keys().cloned().collect();
-                if !answer.columns(&names) {
-                    return Ok(stats(&page.write_stats, admitted));
-                }
-                columns = Some(names);
+        if columns.is_none()
+            && let Some(first) = page.rows.first()
+        {
+            let names: Vec<String> = first.keys().cloned().collect();
+            if !answer.columns(&names) {
+                return Ok(stats(&page.write_stats, admitted));
             }
+            columns = Some(names);
         }
         if let Some(columns) = &columns {
             for row in &page.rows {

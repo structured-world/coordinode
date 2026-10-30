@@ -623,10 +623,10 @@ impl KeysetCursor {
             execution_time_ms: self.busy.as_millis() as i64,
             ..write_stats(&page.write_stats)
         };
-        if self.columns.is_empty() {
-            if let Some(first) = page.rows.first() {
-                self.columns = first.keys().cloned().collect();
-            }
+        if self.columns.is_empty()
+            && let Some(first) = page.rows.first()
+        {
+            self.columns = first.keys().cloned().collect();
         }
         for row in &page.rows {
             self.pending.push_back(project_row(row, &self.columns));

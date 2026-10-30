@@ -134,7 +134,7 @@ fn update_lowers_to_update_over_filter_nodescan() {
     match &items[0] {
         crate::plan::SetItem::Property { property, expr, .. } => {
             assert_eq!(property, "name");
-            assert!(matches!(expr, Expr::Literal(Value::String(ref s)) if s == "Bob"));
+            assert!(matches!(expr, Expr::Literal(Value::String(s)) if s == "Bob"));
         }
         other => panic!("expected SetItem::Property, got {other:?}"),
     }

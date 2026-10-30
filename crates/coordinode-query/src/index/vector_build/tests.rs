@@ -342,14 +342,14 @@ impl tracing::Subscriber for SnapshotTaken {
         }
         // A full channel was told already; a closed one has a test no
         // longer waiting, and neither needs telling again.
-        if self.taken.try_send(()).is_ok() {
-            if let Some(release) = &self.release {
-                release
-                    .lock()
-                    .expect("release")
-                    .recv()
-                    .expect("the test lets the build scan");
-            }
+        if self.taken.try_send(()).is_ok()
+            && let Some(release) = &self.release
+        {
+            release
+                .lock()
+                .expect("release")
+                .recv()
+                .expect("the test lets the build scan");
         }
     }
 

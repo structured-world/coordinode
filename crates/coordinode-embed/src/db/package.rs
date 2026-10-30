@@ -346,10 +346,10 @@ impl Database {
         )?;
         // The commit records the operation; a concurrent attempt of the same
         // one that committed first refuses this commit there.
-        if let Some((descriptor, intent)) = operation {
-            if staged.changes {
-                txn.bind_operation(descriptor.op, intent);
-            }
+        if let Some((descriptor, intent)) = operation
+            && staged.changes
+        {
+            txn.bind_operation(descriptor.op, intent);
         }
         self.finish_publication(txn, staged)
     }

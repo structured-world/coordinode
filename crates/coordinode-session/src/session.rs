@@ -174,27 +174,27 @@ impl Session {
         // Configure so the next statement already runs under it, and answers
         // with the empty result the statement has. Never the engine's own
         // settings: those are every other session's too.
-        if let SessionOp::Execute { query, .. } = &op {
-            if let Some(change) = self.engine.session_setting(query) {
-                let change = match change {
-                    Ok(change) => change,
-                    Err(refused) => {
-                        send_error(out, request_id, refused.0).await;
-                        return;
-                    }
-                };
-                self.settings.lock().apply(&change);
-                let opened = SessionEvent::CursorOpen {
-                    columns: Vec::new(),
-                };
-                if out.send((request_id, opened)).await.is_ok() {
-                    let ended = SessionEvent::CursorEnd {
-                        stats: SessionStats::default(),
-                    };
-                    let _ = out.send((request_id, ended)).await;
+        if let SessionOp::Execute { query, .. } = &op
+            && let Some(change) = self.engine.session_setting(query)
+        {
+            let change = match change {
+                Ok(change) => change,
+                Err(refused) => {
+                    send_error(out, request_id, refused.0).await;
+                    return;
                 }
-                return;
+            };
+            self.settings.lock().apply(&change);
+            let opened = SessionEvent::CursorOpen {
+                columns: Vec::new(),
+            };
+            if out.send((request_id, opened)).await.is_ok() {
+                let ended = SessionEvent::CursorEnd {
+                    stats: SessionStats::default(),
+                };
+                let _ = out.send((request_id, ended)).await;
             }
+            return;
         }
         match op {
             // A transaction's operation is named on its begin or its commit:

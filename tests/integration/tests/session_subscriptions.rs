@@ -390,10 +390,10 @@ async fn the_registration_outlives_the_subscription() {
 
     let mut again = Session::open(&proc).await;
     let mut resume = subscribe("survivor", 1);
-    if let client_frame::Op::Subscribe(sub) = &mut resume {
-        if let Some(request) = sub.request.as_mut() {
-            request.incarnation = incarnation;
-        }
+    if let client_frame::Op::Subscribe(sub) = &mut resume
+        && let Some(request) = sub.request.as_mut()
+    {
+        request.incarnation = incarnation;
     }
     again.send(1, resume).await;
     match again.answer(1, |_| {}).await {

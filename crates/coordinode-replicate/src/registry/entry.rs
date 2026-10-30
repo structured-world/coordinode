@@ -68,19 +68,18 @@ impl RegistryEntry {
                 return Some(TerminalReason::LivenessExpired);
             }
         }
-        if self.checkpoint_seqno < source.head(self.kind) {
-            if let Some(produced) = source.produced_at_ms(self.kind, self.checkpoint_seqno) {
-                // Same clock rule as above: work stamped after `now_ms` has
-                // no age yet.
-                if now_ms.saturating_sub(produced) > bounds.max_progress_lag_ms() {
-                    return Some(TerminalReason::ProgressLagExceeded);
-                }
-            }
+        if self.checkpoint_seqno < source.head(self.kind)
+            && let Some(produced) = source.produced_at_ms(self.kind, self.checkpoint_seqno)
+            // Same clock rule as above: work stamped after `now_ms` has
+            // no age yet.
+            && now_ms.saturating_sub(produced) > bounds.max_progress_lag_ms()
+        {
+            return Some(TerminalReason::ProgressLagExceeded);
         }
-        if let Some(bytes) = source.retained_bytes_from(self.kind, self.checkpoint_seqno) {
-            if bytes > bounds.max_retained_bytes() {
-                return Some(TerminalReason::RetainedBytesExceeded);
-            }
+        if let Some(bytes) = source.retained_bytes_from(self.kind, self.checkpoint_seqno)
+            && bytes > bounds.max_retained_bytes()
+        {
+            return Some(TerminalReason::RetainedBytesExceeded);
         }
         None
     }

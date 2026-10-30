@@ -3198,18 +3198,17 @@ impl StorageEngine {
                     key,
                     value,
                 } = op
+                    && table == table_id
                 {
-                    if table == table_id {
-                        let (added, memtable) = apply_columnar_row(
-                            &tree,
-                            key.clone(),
-                            value.clone(),
-                            entry.ts,
-                            Some(entry.index),
-                        )?;
-                        self.coordinator.flush_trigger().wrote(added, memtable);
-                        replayed += 1;
-                    }
+                    let (added, memtable) = apply_columnar_row(
+                        &tree,
+                        key.clone(),
+                        value.clone(),
+                        entry.ts,
+                        Some(entry.index),
+                    )?;
+                    self.coordinator.flush_trigger().wrote(added, memtable);
+                    replayed += 1;
                 }
             }
         }
@@ -4735,10 +4734,10 @@ impl StorageEngine {
     /// the accumulated markers when enough have built up. The fold runs on
     /// the committing thread unless another one is already folding.
     fn note_applied(&self, coverage: &Coverage, index: u64) {
-        if coverage.mark_applied(index) {
-            if let Some(mut folded) = coverage.try_lock_folded() {
-                self.fold_coverage(coverage, &mut folded, coverage::FoldScope::Touched);
-            }
+        if coverage.mark_applied(index)
+            && let Some(mut folded) = coverage.try_lock_folded()
+        {
+            self.fold_coverage(coverage, &mut folded, coverage::FoldScope::Touched);
         }
     }
 
@@ -5434,10 +5433,10 @@ impl StorageEngine {
                 | ScanSinceEvent::WeakTombstone { key, .. } => {
                     if !coverage::is_reserved(&key) {
                         let mut key = key.to_vec();
-                        if let Some(bindings) = &bindings {
-                            if let Some(generation) = bindings.logical(&key)? {
-                                crate::engine::installation::put_generation(&mut key, generation);
-                            }
+                        if let Some(bindings) = &bindings
+                            && let Some(generation) = bindings.logical(&key)?
+                        {
+                            crate::engine::installation::put_generation(&mut key, generation);
                         }
                         keys.push(key);
                     }
@@ -6101,10 +6100,10 @@ impl StorageEngine {
         if cache.label_weights_empty() {
             return 1.0;
         }
-        if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value) {
-            if let Some(label) = record.labels.first() {
-                return cache.resolve_weight(label);
-            }
+        if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value)
+            && let Some(label) = record.labels.first()
+        {
+            return cache.resolve_weight(label);
         }
         1.0
     }

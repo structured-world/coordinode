@@ -496,7 +496,8 @@ impl LocalNodeStore {
         snapshot: u64,
         shard_id: u16,
     ) -> StoreResult<
-        impl Iterator<Item = StoreResult<(EntryOwner, impl core::ops::Deref<Target = [u8]>)>> + use<>,
+        impl Iterator<Item = StoreResult<(EntryOwner, impl core::ops::Deref<Target = [u8]> + use<>)>>
+        + use<>,
     > {
         let prefix = LocalNodeStore.shard_scan_prefix(shard_id);
         let rows = engine.snapshot_prefix_iter(&snapshot, Partition::Node, &prefix)?;

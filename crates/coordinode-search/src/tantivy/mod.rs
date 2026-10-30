@@ -655,10 +655,10 @@ impl TextIndex {
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
-                if let Some(node_id) = node_id_val.as_u64() {
-                    results.push(TextSearchResult { node_id, score });
-                }
+            if let Some(node_id_val) = doc.get_first(self.node_id_field)
+                && let Some(node_id) = node_id_val.as_u64()
+            {
+                results.push(TextSearchResult { node_id, score });
             }
         }
 
@@ -683,10 +683,10 @@ impl TextIndex {
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
-                if let Some(node_id) = node_id_val.as_u64() {
-                    results.push(TextSearchResult { node_id, score });
-                }
+            if let Some(node_id_val) = doc.get_first(self.node_id_field)
+                && let Some(node_id) = node_id_val.as_u64()
+            {
+                results.push(TextSearchResult { node_id, score });
             }
         }
 
@@ -732,15 +732,15 @@ impl TextIndex {
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
-                if let Some(node_id) = node_id_val.as_u64() {
-                    let snippet = snippet_gen.snippet_from_doc(&doc);
-                    results.push(HighlightedResult {
-                        node_id,
-                        score,
-                        snippet_html: snippet.to_html(),
-                    });
-                }
+            if let Some(node_id_val) = doc.get_first(self.node_id_field)
+                && let Some(node_id) = node_id_val.as_u64()
+            {
+                let snippet = snippet_gen.snippet_from_doc(&doc);
+                results.push(HighlightedResult {
+                    node_id,
+                    score,
+                    snippet_html: snippet.to_html(),
+                });
             }
         }
 
@@ -1058,10 +1058,10 @@ impl TextIndex {
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
-                if let Some(node_id) = node_id_val.as_u64() {
-                    results.push(TextSearchResult { node_id, score });
-                }
+            if let Some(node_id_val) = doc.get_first(self.node_id_field)
+                && let Some(node_id) = node_id_val.as_u64()
+            {
+                results.push(TextSearchResult { node_id, score });
             }
         }
 

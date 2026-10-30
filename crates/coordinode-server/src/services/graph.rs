@@ -278,10 +278,10 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let mut properties: std::collections::HashMap<String, common::PropertyValue> =
             std::collections::HashMap::new();
         for (k, v) in row {
-            if let Some(prop_name) = k.strip_prefix("n.") {
-                if !prop_name.starts_with("__") {
-                    properties.insert(prop_name.to_string(), value_to_proto_pub(v));
-                }
+            if let Some(prop_name) = k.strip_prefix("n.")
+                && !prop_name.starts_with("__")
+            {
+                properties.insert(prop_name.to_string(), value_to_proto_pub(v));
             }
         }
 
@@ -476,10 +476,10 @@ fn traversed_nodes(db: &Database, rows: &[coordinode_query::executor::Row]) -> V
             let mut properties: std::collections::HashMap<String, common::PropertyValue> =
                 std::collections::HashMap::new();
             for (k, v) in row {
-                if let Some(prop_name) = k.strip_prefix("n.") {
-                    if !prop_name.starts_with("__") {
-                        properties.insert(prop_name.to_string(), value_to_proto_pub(v));
-                    }
+                if let Some(prop_name) = k.strip_prefix("n.")
+                    && !prop_name.starts_with("__")
+                {
+                    properties.insert(prop_name.to_string(), value_to_proto_pub(v));
                 }
             }
 

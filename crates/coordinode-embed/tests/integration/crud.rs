@@ -6702,10 +6702,10 @@ fn doc_push_on_temporal_node_writes_new_version_with_append() {
     let extract_items = |row: &std::collections::BTreeMap<String, Value>| -> Vec<rmpv::Value> {
         if let Some(Value::Document(rmpv::Value::Map(entries))) = row.get("data") {
             for (k, v) in entries {
-                if matches!(k, rmpv::Value::String(s) if s.as_str() == Some("items")) {
-                    if let rmpv::Value::Array(arr) = v {
-                        return arr.clone();
-                    }
+                if matches!(k, rmpv::Value::String(s) if s.as_str() == Some("items"))
+                    && let rmpv::Value::Array(arr) = v
+                {
+                    return arr.clone();
                 }
             }
         }
@@ -7058,10 +7058,10 @@ fn doc_pull_on_temporal_node_writes_new_version_with_removed_element() {
     let extract_items = |row: &std::collections::BTreeMap<String, Value>| -> Vec<rmpv::Value> {
         if let Some(Value::Document(rmpv::Value::Map(entries))) = row.get("data") {
             for (k, v) in entries {
-                if matches!(k, rmpv::Value::String(s) if s.as_str() == Some("items")) {
-                    if let rmpv::Value::Array(arr) = v {
-                        return arr.clone();
-                    }
+                if matches!(k, rmpv::Value::String(s) if s.as_str() == Some("items"))
+                    && let rmpv::Value::Array(arr) = v
+                {
+                    return arr.clone();
                 }
             }
         }
@@ -7111,10 +7111,10 @@ fn doc_add_to_set_on_temporal_node_writes_new_version_with_dedup() {
         .expect("new version");
     if let Some(Value::Document(rmpv::Value::Map(entries))) = new_version.get("data") {
         for (k, v) in entries {
-            if matches!(k, rmpv::Value::String(s) if s.as_str() == Some("tags")) {
-                if let rmpv::Value::Array(arr) = v {
-                    assert_eq!(arr.len(), 1, "dedup: same array: {arr:?}");
-                }
+            if matches!(k, rmpv::Value::String(s) if s.as_str() == Some("tags"))
+                && let rmpv::Value::Array(arr) = v
+            {
+                assert_eq!(arr.len(), 1, "dedup: same array: {arr:?}");
             }
         }
     }

@@ -87,10 +87,10 @@ impl EncryptedIndex {
 
         let mut keys_to_delete = Vec::new();
         for (key, _value) in pairs {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if key_str.ends_with(&node_suffix) {
-                    keys_to_delete.push(key);
-                }
+            if let Ok(key_str) = std::str::from_utf8(&key)
+                && key_str.ends_with(&node_suffix)
+            {
+                keys_to_delete.push(key);
             }
         }
 

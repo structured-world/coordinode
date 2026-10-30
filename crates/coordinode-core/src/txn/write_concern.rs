@@ -191,13 +191,13 @@ impl WriteConcern {
     /// volatile journal level is honoured for `w: 1` only, see
     /// [`WriteConcernError::VolatileReplication`].
     pub fn validate(&self, members: Option<u32>) -> Result<(), WriteConcernError> {
-        if let (WriteAck::Acks(n), Some(members)) = (self.w, members) {
-            if n > members {
-                return Err(WriteConcernError::TooManyAcks {
-                    requested: n,
-                    members,
-                });
-            }
+        if let (WriteAck::Acks(n), Some(members)) = (self.w, members)
+            && n > members
+        {
+            return Err(WriteConcernError::TooManyAcks {
+                requested: n,
+                members,
+            });
         }
         if self.journal.is_volatile() && self.w.needs_replication() {
             return Err(WriteConcernError::VolatileReplication(*self));

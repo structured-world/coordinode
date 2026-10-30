@@ -464,10 +464,10 @@ impl<'t> Projection<'t> {
                 .chain(interpretation.filter.as_ref().map(|f| f.property()));
             for property in read {
                 // A property is read by id and, missing there, by name.
-                if let Some(field) = property.field {
-                    if !projection.fields.contains(&field) {
-                        projection.fields.push(field);
-                    }
+                if let Some(field) = property.field
+                    && !projection.fields.contains(&field)
+                {
+                    projection.fields.push(field);
                 }
                 if !projection.names.contains(&property.name.as_str()) {
                     projection.names.push(property.name.as_str());
@@ -660,11 +660,11 @@ where
         // A stored key that is no entry of this generation's shape names no
         // owner a repair could act on: it is skipped, as it is skipped when
         // read entry by entry.
-        if let Some((key, _)) = &have {
-            if decode_entry_parts(generation, key).is_none() {
-                have = next_stored(stored)?;
-                continue;
-            }
+        if let Some((key, _)) = &have
+            && decode_entry_parts(generation, key).is_none()
+        {
+            have = next_stored(stored)?;
+            continue;
         }
         match (want.get(), &have) {
             (None, None) => return Ok(()),

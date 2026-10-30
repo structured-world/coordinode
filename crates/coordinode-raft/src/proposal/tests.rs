@@ -224,9 +224,9 @@ fn node_scoped_id_generator_uniqueness() {
 fn node_scoped_id_high_bits_preserved() {
     // Verify that node_id is encoded in the high 16 bits
     let node_id: u64 = 42;
-    let gen = ProposalIdGenerator::with_base(node_id << 48);
+    let ids = ProposalIdGenerator::with_base(node_id << 48);
 
-    let id = gen.next();
+    let id = ids.next();
     // High 16 bits should contain node_id
     assert_eq!(id.as_raw() >> 48, node_id);
 }

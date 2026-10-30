@@ -630,10 +630,10 @@ fn eval_scalar_function(
                 let mut map: std::collections::BTreeMap<String, Value> =
                     std::collections::BTreeMap::new();
                 for (k, v) in row {
-                    if let Some(rest) = k.strip_prefix(&prefix) {
-                        if !rest.starts_with("__") {
-                            map.insert(rest.to_string(), v.clone());
-                        }
+                    if let Some(rest) = k.strip_prefix(&prefix)
+                        && !rest.starts_with("__")
+                    {
+                        map.insert(rest.to_string(), v.clone());
                     }
                 }
                 Value::Map(map)

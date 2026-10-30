@@ -98,12 +98,12 @@ pub fn resolve_node_labels<'a, E>(
     mut facts: impl FnMut(&str) -> Result<LabelFacts, E>,
 ) -> Result<Result<NodeLabels<'a>, LabelKindError>, E> {
     // One type label, the common case, is stored as is.
-    if let [only] = labels {
-        if facts(only)?.kind == LabelKind::Type {
-            return Ok(Ok(NodeLabels {
-                labels: Cow::Borrowed(labels),
-            }));
-        }
+    if let [only] = labels
+        && facts(only)?.kind == LabelKind::Type
+    {
+        return Ok(Ok(NodeLabels {
+            labels: Cow::Borrowed(labels),
+        }));
     }
 
     let mut written: SmallVec<[(&str, LabelFacts); 4]> = SmallVec::new();
@@ -321,7 +321,7 @@ impl<'a> Membership<'a> {
 
     /// Every label the node carries, each once: its type first, then the
     /// implied and auxiliary ones merged in byte order.
-    pub fn iter(&self) -> impl Iterator<Item = &'a str> + 'a {
+    pub fn iter(&self) -> impl Iterator<Item = &'a str> + use<'a> {
         let (primary, auxiliary) = self
             .stored
             .split_first()

@@ -1270,14 +1270,14 @@ impl VectorIndexRegistry {
         let Some(handle) = self.get(label, property) else {
             return Ok(0);
         };
-        if let Some(dim) = declared {
-            if let Ok(graph) = handle.read() {
-                admit_all(
-                    graph.config().metric,
-                    Some(dim),
-                    items.iter().map(|(id, v)| (*id, v.as_slice())),
-                )?;
-            }
+        if let Some(dim) = declared
+            && let Ok(graph) = handle.read()
+        {
+            admit_all(
+                graph.config().metric,
+                Some(dim),
+                items.iter().map(|(id, v)| (*id, v.as_slice())),
+            )?;
         }
         let count = items.len();
         insert_many(&handle, items)?;
@@ -1310,10 +1310,10 @@ impl VectorIndexRegistry {
                 return;
             }
         }
-        if let Some(handle) = self.get(label, property) {
-            if let Ok(graph) = handle.read() {
-                graph.remove(node_id.as_raw());
-            }
+        if let Some(handle) = self.get(label, property)
+            && let Ok(graph) = handle.read()
+        {
+            graph.remove(node_id.as_raw());
         }
     }
 

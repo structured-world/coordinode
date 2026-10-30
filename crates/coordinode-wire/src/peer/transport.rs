@@ -302,10 +302,10 @@ impl PeerConnections {
     /// The address is not `host:port`, or no TLS configuration can be built.
     pub fn channel(&self, target: &PeerTarget) -> Result<tonic::transport::Channel, DialError> {
         let mut channels = self.channels.lock();
-        if let Some((addr, channel)) = channels.get(&target.identity) {
-            if *addr == target.addr {
-                return Ok(channel.clone());
-            }
+        if let Some((addr, channel)) = channels.get(&target.identity)
+            && *addr == target.addr
+        {
+            return Ok(channel.clone());
         }
         let channel = self.dial(target)?;
         channels.insert(

@@ -493,10 +493,10 @@ async fn run_cell(
                     .await
                     .map_err(|e| e.to_string())?;
                 lats.push(t.elapsed().as_micros() as f64);
-                if let Some(row) = rows.first() {
-                    if let Some(Value::Int(r)) = row.get("reach") {
-                        reach_sum += *r as u64;
-                    }
+                if let Some(row) = rows.first()
+                    && let Some(Value::Int(r)) = row.get("reach")
+                {
+                    reach_sum += *r as u64;
                 }
             }
             Ok::<(Vec<f64>, u64), String>((lats, reach_sum))

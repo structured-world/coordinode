@@ -867,13 +867,13 @@ impl SegmentWriter {
     /// An index not above the last one appended here (reads find entries by
     /// index), a serialization failure or an I/O failure.
     pub fn append(&mut self, entry: &OplogEntry) -> StorageResult<()> {
-        if let Some(&(last, _)) = self.frames.last() {
-            if entry.index <= last {
-                return Err(StorageError::Io(format!(
-                    "oplog entry {} appended after entry {last} in {:?}",
-                    entry.index, self.path
-                )));
-            }
+        if let Some(&(last, _)) = self.frames.last()
+            && entry.index <= last
+        {
+            return Err(StorageError::Io(format!(
+                "oplog entry {} appended after entry {last} in {:?}",
+                entry.index, self.path
+            )));
         }
         let payload = entry
             .encode()
@@ -1018,10 +1018,10 @@ impl SegmentWriter {
     /// the allowance charged ahead of the appends is given back, an
     /// allocation past it kept.
     fn settle_charge(&self) {
-        if let Some(charge) = &self.charge {
-            if let Some(allocated) = crate::engine::footprint::allocated_at(&self.path) {
-                charge.settle(allocated);
-            }
+        if let Some(charge) = &self.charge
+            && let Some(allocated) = crate::engine::footprint::allocated_at(&self.path)
+        {
+            charge.settle(allocated);
         }
     }
 
@@ -1037,10 +1037,10 @@ impl SegmentWriter {
             .flush()
             .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
         // What the kernel allocated past the allowance is counted at once.
-        if let Some(charge) = &self.charge {
-            if let Some(allocated) = crate::engine::footprint::allocated_at(&self.path) {
-                charge.observe(allocated);
-            }
+        if let Some(charge) = &self.charge
+            && let Some(allocated) = crate::engine::footprint::allocated_at(&self.path)
+        {
+            charge.observe(allocated);
         }
         if let Some(handle) = &self.sync_handle {
             return Ok(handle.clone());

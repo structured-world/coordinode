@@ -559,10 +559,10 @@ impl ReplyQueue {
         if self.overrun.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(end) = self.end_stream.lock().take() {
-            if end.send(()).is_err() {
-                tracing::trace!("a routing session's stream was gone before its overrun");
-            }
+        if let Some(end) = self.end_stream.lock().take()
+            && end.send(()).is_err()
+        {
+            tracing::trace!("a routing session's stream was gone before its overrun");
         }
         // Stored for a reader not yet waiting.
         self.end_reader.notify_one();
@@ -859,11 +859,11 @@ impl<E: CommandExecutor> ServedSession<E> {
         }
         // A credential that expired or was withdrawn since the session
         // opened stops the commands that come after it.
-        if let Some(admit) = self.admit {
-            if let Err(status) = admit(self.connection.as_ref()) {
-                self.refuse(call, "admission", status.message().to_owned());
-                return;
-            }
+        if let Some(admit) = self.admit
+            && let Err(status) = admit(self.connection.as_ref())
+        {
+            self.refuse(call, "admission", status.message().to_owned());
+            return;
         }
         // Taken without waiting: a reader that waited for a slot would hold
         // back the credits and cancellations that free one.

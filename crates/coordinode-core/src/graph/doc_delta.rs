@@ -240,11 +240,11 @@ fn array_pull(doc: &mut rmpv::Value, path: &[String], value: &rmpv::Value) -> bo
         Some(v) => v,
         None => return false,
     };
-    if let rmpv::Value::Array(arr) = target {
-        if let Some(pos) = arr.iter().position(|v| v == value) {
-            arr.remove(pos);
-            return true;
-        }
+    if let rmpv::Value::Array(arr) = target
+        && let Some(pos) = arr.iter().position(|v| v == value)
+    {
+        arr.remove(pos);
+        return true;
     }
     false
 }

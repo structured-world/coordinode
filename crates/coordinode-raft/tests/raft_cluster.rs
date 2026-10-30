@@ -338,10 +338,10 @@ async fn await_leadership(node: &RaftNode) {
 /// it always said, against a state that has settled.
 async fn await_replicated(engine: &StorageEngine, key: &[u8], expected: &[u8]) -> bool {
     for _ in 0..150 {
-        if let Ok(Some(v)) = engine.get(Partition::Node, key) {
-            if v.as_ref() == expected {
-                return true;
-            }
+        if let Ok(Some(v)) = engine.get(Partition::Node, key)
+            && v.as_ref() == expected
+        {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

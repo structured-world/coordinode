@@ -261,10 +261,10 @@ impl BuildEnvironment for TestEnv {
         // Taken out while it runs: the hook commits through `commit`, not
         // through this method, and must not hold the lock across it.
         let hook = self.after_catalog.lock().take();
-        if let Some(mut hook) = hook {
-            if !hook(&self.engine) {
-                *self.after_catalog.lock() = Some(hook);
-            }
+        if let Some(mut hook) = hook
+            && !hook(&self.engine)
+        {
+            *self.after_catalog.lock() = Some(hook);
         }
         Ok(())
     }

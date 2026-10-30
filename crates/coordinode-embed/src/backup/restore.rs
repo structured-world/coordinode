@@ -1937,10 +1937,10 @@ fn parse_label_list(head: &str) -> Vec<String> {
 /// at whitespace or `{`.
 fn strip_label_token(s: &str) -> String {
     let s = s.trim();
-    if let Some(rest) = s.strip_prefix('`') {
-        if let Some(end) = rest.find('`') {
-            return rest[..end].to_string();
-        }
+    if let Some(rest) = s.strip_prefix('`')
+        && let Some(end) = rest.find('`')
+    {
+        return rest[..end].to_string();
     }
     s.split(|c: char| c.is_whitespace() || c == '{')
         .next()
@@ -2310,22 +2310,22 @@ fn json_to_value(v: &serde_json::Value) -> Value {
             if let Some(doc_val) = obj.get("_document") {
                 return Value::Document(json_to_rmpv(doc_val));
             }
-            if let Some(mv_val) = obj.get("_multi_vector") {
-                if let Some(arr) = mv_val.as_array() {
-                    let rows: Vec<Vec<f32>> = arr
-                        .iter()
-                        .filter_map(|row| row.as_array())
-                        .map(|row| {
-                            row.iter()
-                                .filter_map(|x| x.as_f64().map(|f| f as f32))
-                                .collect()
-                        })
-                        .collect();
-                    if let Some(v) = Value::try_multi_vector(rows) {
-                        return v;
-                    }
-                    return Value::Null;
+            if let Some(mv_val) = obj.get("_multi_vector")
+                && let Some(arr) = mv_val.as_array()
+            {
+                let rows: Vec<Vec<f32>> = arr
+                    .iter()
+                    .filter_map(|row| row.as_array())
+                    .map(|row| {
+                        row.iter()
+                            .filter_map(|x| x.as_f64().map(|f| f as f32))
+                            .collect()
+                    })
+                    .collect();
+                if let Some(v) = Value::try_multi_vector(rows) {
+                    return v;
                 }
+                return Value::Null;
             }
             let map: std::collections::BTreeMap<String, Value> = obj
                 .iter()
@@ -2427,10 +2427,10 @@ fn restore_hetio_json<R: BufRead>(
         let id = idx as u64;
         // Selective restore: a node whose kind is filtered out is never added to
         // the id map, so edges referencing it resolve to None and drop below.
-        if let Some(filter) = only_labels {
-            if !filter.contains(&n.kind) {
-                continue;
-            }
+        if let Some(filter) = only_labels
+            && !filter.contains(&n.kind)
+        {
+            continue;
         }
         id_map.insert((n.kind.clone(), ident_key(&n.identifier)), id);
         let mut props = n.data.clone();

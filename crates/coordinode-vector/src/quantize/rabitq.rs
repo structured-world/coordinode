@@ -235,19 +235,26 @@ unsafe fn fht_in_place_unscaled_avx2(x: &mut [f32]) {
                 // Vectorised stage: process 8 f32 per add/sub pair.
                 let mut j = 0;
                 while j < h {
-                    let a = _mm256_loadu_ps(ptr.add(i + j));
-                    let b = _mm256_loadu_ps(ptr.add(i + j + h));
-                    _mm256_storeu_ps(ptr.add(i + j), _mm256_add_ps(a, b));
-                    _mm256_storeu_ps(ptr.add(i + j + h), _mm256_sub_ps(a, b));
+                    // SAFETY: `i + j + h + 8 <= i + 2h <= d`, so both
+                    // 8-lane accesses stay inside `x`.
+                    unsafe {
+                        let a = _mm256_loadu_ps(ptr.add(i + j));
+                        let b = _mm256_loadu_ps(ptr.add(i + j + h));
+                        _mm256_storeu_ps(ptr.add(i + j), _mm256_add_ps(a, b));
+                        _mm256_storeu_ps(ptr.add(i + j + h), _mm256_sub_ps(a, b));
+                    }
                     j += 8;
                 }
             } else {
                 // Scalar tail for the narrow stages (h ∈ {1,2,4}).
                 for j in 0..h {
-                    let a = *ptr.add(i + j);
-                    let b = *ptr.add(i + j + h);
-                    *ptr.add(i + j) = a + b;
-                    *ptr.add(i + j + h) = a - b;
+                    // SAFETY: `i + j + h < i + 2h <= d`.
+                    unsafe {
+                        let a = *ptr.add(i + j);
+                        let b = *ptr.add(i + j + h);
+                        *ptr.add(i + j) = a + b;
+                        *ptr.add(i + j + h) = a - b;
+                    }
                 }
             }
             i += h * 2;
@@ -271,19 +278,26 @@ unsafe fn fht_in_place_unscaled_neon(x: &mut [f32]) {
                 // Vectorised stage: process 4 f32 per add/sub pair.
                 let mut j = 0;
                 while j < h {
-                    let a = vld1q_f32(ptr.add(i + j));
-                    let b = vld1q_f32(ptr.add(i + j + h));
-                    vst1q_f32(ptr.add(i + j), vaddq_f32(a, b));
-                    vst1q_f32(ptr.add(i + j + h), vsubq_f32(a, b));
+                    // SAFETY: `i + j + h + 4 <= i + 2h <= d`, so both
+                    // 4-lane accesses stay inside `x`.
+                    unsafe {
+                        let a = vld1q_f32(ptr.add(i + j));
+                        let b = vld1q_f32(ptr.add(i + j + h));
+                        vst1q_f32(ptr.add(i + j), vaddq_f32(a, b));
+                        vst1q_f32(ptr.add(i + j + h), vsubq_f32(a, b));
+                    }
                     j += 4;
                 }
             } else {
                 // Scalar tail for the narrow stages (h ∈ {1,2}).
                 for j in 0..h {
-                    let a = *ptr.add(i + j);
-                    let b = *ptr.add(i + j + h);
-                    *ptr.add(i + j) = a + b;
-                    *ptr.add(i + j + h) = a - b;
+                    // SAFETY: `i + j + h < i + 2h <= d`.
+                    unsafe {
+                        let a = *ptr.add(i + j);
+                        let b = *ptr.add(i + j + h);
+                        *ptr.add(i + j) = a + b;
+                        *ptr.add(i + j + h) = a - b;
+                    }
                 }
             }
             i += h * 2;

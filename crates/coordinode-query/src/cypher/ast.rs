@@ -1073,7 +1073,7 @@ impl Expr {
             Expr::MapProjection { expr, items } => {
                 expr.substitute_params(params);
                 for item in items {
-                    if let MapProjectionItem::Computed(_, ref mut value) = item {
+                    if let MapProjectionItem::Computed(_, value) = item {
                         value.substitute_params(params);
                     }
                 }

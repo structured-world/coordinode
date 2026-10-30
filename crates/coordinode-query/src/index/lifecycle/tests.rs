@@ -109,10 +109,10 @@ fn service(env: &Arc<TestEnv>) -> IndexBuildService {
 fn await_running(env: &TestEnv, def: &IndexDefinition, besides: Option<u64>) -> u64 {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
-        if let BuildState::Running { executor } = env.record(def).expect("record").state {
-            if Some(executor) != besides {
-                return executor;
-            }
+        if let BuildState::Running { executor } = env.record(def).expect("record").state
+            && Some(executor) != besides
+        {
+            return executor;
         }
         assert!(std::time::Instant::now() < deadline, "never taken");
         std::thread::sleep(Duration::from_millis(5));

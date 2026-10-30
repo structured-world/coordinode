@@ -566,10 +566,10 @@ impl Drop for JournalFlusher {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         self.shared.deferred.wake.interrupt();
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                tracing::error!("the journal flusher panicked");
-            }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::error!("the journal flusher panicked");
         }
     }
 }

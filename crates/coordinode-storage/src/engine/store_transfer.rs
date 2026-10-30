@@ -750,10 +750,10 @@ fn write_new(path: &Path, reader: &mut impl Read, len: Option<u64>) -> StorageRe
 
 /// Remove `dir` and everything under it; a failure only leaves it behind.
 fn remove_quietly(dir: &Path) {
-    if let Err(e) = std::fs::remove_dir_all(dir) {
-        if e.kind() != io::ErrorKind::NotFound {
-            tracing::warn!(?dir, %e, "could not remove a received store");
-        }
+    if let Err(e) = std::fs::remove_dir_all(dir)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(?dir, %e, "could not remove a received store");
     }
 }
 

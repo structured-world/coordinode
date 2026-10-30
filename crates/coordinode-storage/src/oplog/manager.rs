@@ -145,13 +145,13 @@ fn recover_segments(
 
     // The log now ends below `next` when its last segment was recovered, and
     // below `lost_from` when a segment past the end was set aside.
-    if let (Some(ends_before), Some(must_hold)) = (lost_from.or(next), must_hold) {
-        if ends_before <= must_hold {
-            return Err(StorageError::Io(format!(
-                "the oplog no longer holds entries from index {ends_before}, but entries \
-                 through index {must_hold} were acknowledged"
-            )));
-        }
+    if let (Some(ends_before), Some(must_hold)) = (lost_from.or(next), must_hold)
+        && ends_before <= must_hold
+    {
+        return Err(StorageError::Io(format!(
+            "the oplog no longer holds entries from index {ends_before}, but entries \
+             through index {must_hold} were acknowledged"
+        )));
     }
 
     for repair in repairs {
@@ -442,10 +442,10 @@ impl OplogManager {
     /// `max_entries` is reached.
     pub fn append(&mut self, entry: &OplogEntry) -> StorageResult<()> {
         // Auto-rotate if the current segment is over limit
-        if let Some(ref w) = self.current {
-            if w.total_bytes() >= self.max_bytes || w.entry_count() >= self.max_entries {
-                self.rotate()?;
-            }
+        if let Some(ref w) = self.current
+            && (w.total_bytes() >= self.max_bytes || w.entry_count() >= self.max_entries)
+        {
+            self.rotate()?;
         }
 
         // Open a new segment on the entry's index
@@ -454,13 +454,14 @@ impl OplogManager {
             // Reads locate a segment by its first index, so a new segment
             // must start above every earlier one. A header-only leftover at
             // this very index is replaced below and does not count.
-            if let Some((first, earlier)) = self.sealed.last() {
-                if entry.index <= *first && *earlier != path {
-                    return Err(StorageError::Io(format!(
-                        "oplog entry {} appended below segment {:?}",
-                        entry.index, earlier
-                    )));
-                }
+            if let Some((first, earlier)) = self.sealed.last()
+                && entry.index <= *first
+                && *earlier != path
+            {
+                return Err(StorageError::Io(format!(
+                    "oplog entry {} appended below segment {:?}",
+                    entry.index, earlier
+                )));
             }
             // The header is charged before the file is made.
             let charge = self.footprints.file(&path);
@@ -893,10 +894,10 @@ impl OplogManager {
         self.rotate()?;
         let mut touched_dirs: Vec<PathBuf> = Vec::new();
         let mut note_dir = |path: &Path| {
-            if let Some(dir) = path.parent() {
-                if !touched_dirs.iter().any(|d| d == dir) {
-                    touched_dirs.push(dir.to_path_buf());
-                }
+            if let Some(dir) = path.parent()
+                && !touched_dirs.iter().any(|d| d == dir)
+            {
+                touched_dirs.push(dir.to_path_buf());
             }
         };
         // Newest first: what remains is the log's prefix at every step.

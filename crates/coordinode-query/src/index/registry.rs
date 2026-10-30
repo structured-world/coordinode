@@ -201,10 +201,10 @@ impl Catalog {
 
     /// Drop `def`'s name binding while it is still `def`'s.
     fn unbind(&mut self, def: &IndexDefinition) {
-        if let Some(name) = &def.name {
-            if self.by_name.get(name) == Some(&def.id) {
-                self.by_name.remove(name);
-            }
+        if let Some(name) = &def.name
+            && self.by_name.get(name) == Some(&def.id)
+        {
+            self.by_name.remove(name);
         }
     }
 }
@@ -1505,10 +1505,10 @@ impl IndexRegistry {
             return Ok(read);
         }
         let mut indexes = self.indexes.write();
-        if let Some(registered) = indexes.by_id.get_mut(&index.id) {
-            if registered.version == Some(read) {
-                registered.version = Some(0);
-            }
+        if let Some(registered) = indexes.by_id.get_mut(&index.id)
+            && registered.version == Some(read)
+        {
+            registered.version = Some(0);
         }
         Ok(0)
     }
@@ -1595,42 +1595,41 @@ fn stage(
     let node_id = NodeId::from_raw(owner.node_id);
     let store = LocalIndexStore::new(staging.engine);
     let mut needs_source_proof = false;
-    if index.unique {
-        if let Some(values) = &new {
-            // The entries prove a value free only from a copy armed for use
-            // and not suspect. A holder they name is checked against its own
-            // record either way, so it is positive evidence from any copy.
-            needs_source_proof = staging.registry.is_some_and(|(r, armed)| {
-                !r.use_copy(staging.engine, index.generation, armed)
-                    || r.is_suspect(index.generation)
-            });
-            if let Some(holder) = store.unique_conflict(txn, index, values, node_id)? {
-                if holds_values(
-                    staging.engine,
-                    txn,
-                    staging.shard_id,
-                    index,
-                    staging.field_of,
-                    holder,
-                    values,
-                )? {
-                    return Err(UniqueViolation::new(index, values, holder).into());
-                }
-                if let Some((registry, _)) = staging.registry {
-                    for tuple in held_tuples(&store, txn, index, values, holder)? {
-                        registry.report_mismatch(
-                            staging.engine,
-                            index,
-                            Mismatch::Extra {
-                                node: holder.as_raw(),
-                                valid_from: None,
-                                tuple,
-                            },
-                        );
-                    }
-                }
-                needs_source_proof = true;
+    if index.unique
+        && let Some(values) = &new
+    {
+        // The entries prove a value free only from a copy armed for use
+        // and not suspect. A holder they name is checked against its own
+        // record either way, so it is positive evidence from any copy.
+        needs_source_proof = staging.registry.is_some_and(|(r, armed)| {
+            !r.use_copy(staging.engine, index.generation, armed) || r.is_suspect(index.generation)
+        });
+        if let Some(holder) = store.unique_conflict(txn, index, values, node_id)? {
+            if holds_values(
+                staging.engine,
+                txn,
+                staging.shard_id,
+                index,
+                staging.field_of,
+                holder,
+                values,
+            )? {
+                return Err(UniqueViolation::new(index, values, holder).into());
             }
+            if let Some((registry, _)) = staging.registry {
+                for tuple in held_tuples(&store, txn, index, values, holder)? {
+                    registry.report_mismatch(
+                        staging.engine,
+                        index,
+                        Mismatch::Extra {
+                            node: holder.as_raw(),
+                            valid_from: None,
+                            tuple,
+                        },
+                    );
+                }
+            }
+            needs_source_proof = true;
         }
     }
     let written = store.stage_membership(
@@ -1641,15 +1640,16 @@ fn stage(
         old.as_deref(),
         new.as_deref(),
     )? > 0;
-    if index.unique && written {
-        if let Some(values) = new {
-            claims.push(UniqueClaim {
-                index: index.clone(),
-                values,
-                node_id,
-                needs_source_proof,
-            });
-        }
+    if index.unique
+        && written
+        && let Some(values) = new
+    {
+        claims.push(UniqueClaim {
+            index: index.clone(),
+            values,
+            node_id,
+            needs_source_proof,
+        });
     }
     Ok(written)
 }
@@ -1705,10 +1705,10 @@ pub fn holds_values(
                     .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t))),
         )
     };
-    if let Some(record) = LocalNodeStore.get(txn, shard_id, holder)? {
-        if holds(&record)? {
-            return Ok(true);
-        }
+    if let Some(record) = LocalNodeStore.get(txn, shard_id, holder)?
+        && holds(&record)?
+    {
+        return Ok(true);
     }
     for (_, record) in LocalNodeStore.versions(txn, shard_id, holder)? {
         if holds(&record)? {

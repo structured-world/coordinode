@@ -269,10 +269,10 @@ impl SourceTracker {
             .min_by_key(|(_, s)| s.count())
             .map(|(i, _)| i);
 
-        if let Some(idx) = min_idx {
-            if self.sources[idx].count() <= 1 {
-                self.sources[idx] = TrackedSource::from_context(ctx);
-            }
+        if let Some(idx) = min_idx
+            && self.sources[idx].count() <= 1
+        {
+            self.sources[idx] = TrackedSource::from_context(ctx);
         }
     }
 

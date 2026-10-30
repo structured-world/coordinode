@@ -190,10 +190,10 @@ impl LocalJournal {
                 Domain::Local,
             )?;
         }
-        if self.coverage.mark_applied(index) {
-            if let Some(mut folded) = self.coverage.try_lock_folded() {
-                self.fold(trees, &mut folded, fold_seqno());
-            }
+        if self.coverage.mark_applied(index)
+            && let Some(mut folded) = self.coverage.try_lock_folded()
+        {
+            self.fold(trees, &mut folded, fold_seqno());
         }
         // Counts entries, far below u64::MAX.
         Ok(self.since_compaction.fetch_add(1, Ordering::Relaxed) + 1 >= self.compact_every)

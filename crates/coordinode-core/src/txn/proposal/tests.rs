@@ -12,10 +12,10 @@ fn every_process_draws_its_own_proposal_id_range() {
 
 #[test]
 fn proposal_id_monotonic() {
-    let gen = ProposalIdGenerator::new();
-    let id1 = gen.next();
-    let id2 = gen.next();
-    let id3 = gen.next();
+    let ids = ProposalIdGenerator::new();
+    let id1 = ids.next();
+    let id2 = ids.next();
+    let id3 = ids.next();
     assert_eq!(id1.as_raw(), 1);
     assert_eq!(id2.as_raw(), 2);
     assert_eq!(id3.as_raw(), 3);
@@ -26,13 +26,13 @@ fn proposal_id_concurrent() {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    let gen = Arc::new(ProposalIdGenerator::new());
+    let ids = Arc::new(ProposalIdGenerator::new());
     let mut handles = Vec::new();
 
     for _ in 0..4 {
-        let gen = Arc::clone(&gen);
+        let ids = Arc::clone(&ids);
         handles.push(std::thread::spawn(move || {
-            (0..1000).map(|_| gen.next().as_raw()).collect::<Vec<_>>()
+            (0..1000).map(|_| ids.next().as_raw()).collect::<Vec<_>>()
         }));
     }
 

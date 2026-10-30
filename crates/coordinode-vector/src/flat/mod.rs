@@ -57,13 +57,13 @@ impl FlatIndex {
     /// stored.
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) -> Result<(), VectorDomainError> {
         exact::admit(&vector, self.metric)?;
-        if let Some(dim) = self.dimension() {
-            if dim != vector.len() {
-                return Err(VectorDomainError::DimensionMismatch {
-                    left: vector.len(),
-                    right: dim,
-                });
-            }
+        if let Some(dim) = self.dimension()
+            && dim != vector.len()
+        {
+            return Err(VectorDomainError::DimensionMismatch {
+                left: vector.len(),
+                right: dim,
+            });
         }
         if !self.vectors.iter().any(|(existing, _)| *existing == id) {
             self.vectors.push((id, vector));

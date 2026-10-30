@@ -65,10 +65,10 @@ impl IndexDefinitionFollower {
 impl Drop for IndexDefinitionFollower {
     fn drop(&mut self) {
         self.stop.stop();
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                tracing::error!("the index definition follower panicked");
-            }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::error!("the index definition follower panicked");
         }
     }
 }

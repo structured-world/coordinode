@@ -65,7 +65,7 @@ fn undefined_variable_in_where() {
     let errors = parse_and_analyze("MATCH (n) WHERE m.age > 25 RETURN n");
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UndefinedVariable { ref name } if name == "m"
+        SemanticError::UndefinedVariable { name } if name == "m"
     )));
 }
 
@@ -95,7 +95,7 @@ fn with_hides_unprojected_variables() {
     // b is not projected through WITH, so RETURN b is an error
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UndefinedVariable { ref name } if name == "b"
+        SemanticError::UndefinedVariable { name } if name == "b"
     )));
 }
 
@@ -111,7 +111,7 @@ fn with_alias_old_var_not_visible() {
     // n is not projected, only username
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UndefinedVariable { ref name } if name == "n"
+        SemanticError::UndefinedVariable { name } if name == "n"
     )));
 }
 
@@ -186,7 +186,7 @@ fn set_requires_defined_variable() {
     let errors = parse_and_analyze("MATCH (n:User) SET m.name = 'Bob' RETURN n");
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UndefinedVariable { ref name } if name == "m"
+        SemanticError::UndefinedVariable { name } if name == "m"
     )));
 }
 
@@ -201,7 +201,7 @@ fn delete_undefined_variable() {
     let errors = parse_and_analyze("MATCH (n:User) DELETE m");
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UndefinedVariable { ref name } if name == "m"
+        SemanticError::UndefinedVariable { name } if name == "m"
     )));
 }
 
@@ -226,7 +226,7 @@ fn transfer_edges_binds_r_for_its_predicate_only() {
     assert!(
         errors.iter().any(|e| matches!(
             e,
-            SemanticError::UndefinedVariable { ref name } if name == "r"
+            SemanticError::UndefinedVariable { name } if name == "r"
         )),
         "r must not leak past the predicate: {errors:?}"
     );
@@ -311,7 +311,7 @@ fn order_by_undefined_alias_fails() {
     let errors = parse_and_analyze("MATCH (n) RETURN n.name ORDER BY nonexistent");
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UndefinedVariable { ref name } if name == "nonexistent"
+        SemanticError::UndefinedVariable { name } if name == "nonexistent"
     )));
 }
 
@@ -323,7 +323,7 @@ fn unknown_label() {
     let errors = parse_and_analyze_with_schema("MATCH (n:NonExistent) RETURN n", &schema);
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UnknownLabel { ref name } if name == "NonExistent"
+        SemanticError::UnknownLabel { name } if name == "NonExistent"
     )));
 }
 
@@ -341,7 +341,7 @@ fn unknown_edge_type() {
         parse_and_analyze_with_schema("MATCH (a)-[:NONEXISTENT]->(b) RETURN a, b", &schema);
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UnknownEdgeType { ref name } if name == "NONEXISTENT"
+        SemanticError::UnknownEdgeType { name } if name == "NONEXISTENT"
     )));
 }
 
@@ -361,7 +361,7 @@ fn unknown_property_on_strict_label() {
     );
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UnknownProperty { ref label, ref property }
+        SemanticError::UnknownProperty { label, property }
             if label == "User" && property == "nonexistent"
     )));
 }
@@ -409,7 +409,7 @@ fn remove_requires_defined_variable() {
     let errors = parse_and_analyze("MATCH (n) REMOVE m.age");
     assert!(errors.iter().any(|e| matches!(
         e,
-        SemanticError::UndefinedVariable { ref name } if name == "m"
+        SemanticError::UndefinedVariable { name } if name == "m"
     )));
 }
 

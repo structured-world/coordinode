@@ -1041,14 +1041,14 @@ impl StorageConfig {
                     minimum: MIN_HARD_LIMIT_BYTES,
                 });
             }
-            if let Some(reserve) = ep.recovery_reserve_bytes {
-                if ep.hard_limit_bytes == 0 || reserve > ep.hard_limit_bytes {
-                    return Err(EndpointConfigError::ReserveOutsideLimit {
-                        id: ep.id.clone(),
-                        reserve,
-                        hard_limit: ep.hard_limit_bytes,
-                    });
-                }
+            if let Some(reserve) = ep.recovery_reserve_bytes
+                && (ep.hard_limit_bytes == 0 || reserve > ep.hard_limit_bytes)
+            {
+                return Err(EndpointConfigError::ReserveOutsideLimit {
+                    id: ep.id.clone(),
+                    reserve,
+                    hard_limit: ep.hard_limit_bytes,
+                });
             }
         }
         Ok(())
@@ -1383,10 +1383,10 @@ impl StorageConfig {
             // A scan over the vectors (an index build, a calibration) reads
             // them in key order; inserts spread over time interleave them
             // across blob files, which a compaction can rewrite as runs.
-            if part == Partition::VectorF32 {
-                if let Some(depth) = std::num::NonZeroU64::new(self.vector_locality_depth) {
-                    separation = separation.relocate_for_locality(depth, VECTOR_LOCALITY_BUDGET);
-                }
+            if part == Partition::VectorF32
+                && let Some(depth) = std::num::NonZeroU64::new(self.vector_locality_depth)
+            {
+                separation = separation.relocate_for_locality(depth, VECTOR_LOCALITY_BUDGET);
             }
             config = config.with_kv_separation(Some(separation));
         }

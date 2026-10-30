@@ -626,20 +626,20 @@ impl MultiLanguageTextIndex {
         field_value: &str,
         node_language_override: Option<&str>,
     ) -> String {
-        // Level 1: Explicit per-field analyzer
-        if let Some(field_lang) = self.config.field_analyzers.get(field_name) {
-            if field_lang != "auto_detect" {
-                return field_lang.clone();
-            }
-            // Field is set to "auto_detect" — fall through to level 2
+        // Level 1: Explicit per-field analyzer; a field set to "auto_detect"
+        // falls through to level 2.
+        if let Some(field_lang) = self.config.field_analyzers.get(field_name)
+            && field_lang != "auto_detect"
+        {
+            return field_lang.clone();
         }
 
-        // Level 2: Per-node language override
-        if let Some(override_lang) = node_language_override {
-            if override_lang != "auto_detect" {
-                return override_lang.to_string();
-            }
-            // Override is "auto_detect" — fall through to level 3
+        // Level 2: Per-node language override; an override of "auto_detect"
+        // falls through to level 3.
+        if let Some(override_lang) = node_language_override
+            && override_lang != "auto_detect"
+        {
+            return override_lang.to_string();
         }
 
         // Level 3: Auto-detection (whatlang)
@@ -652,10 +652,8 @@ impl MultiLanguageTextIndex {
             .map(|l| l == "auto_detect")
             .unwrap_or(true); // No explicit field → auto-detect by default
 
-        if should_auto_detect {
-            if let Some(detected) = crate::lang::detect_language(field_value) {
-                return detected.name.to_string();
-            }
+        if should_auto_detect && let Some(detected) = crate::lang::detect_language(field_value) {
+            return detected.name.to_string();
         }
 
         // Level 4: Index-level default

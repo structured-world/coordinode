@@ -86,10 +86,10 @@ async fn concurrent_proposals_via_submit() {
     let mut handles = Vec::new();
     for i in 0..10u64 {
         let svc = Arc::clone(&service);
-        let gen = Arc::clone(&id_gen);
+        let ids = Arc::clone(&id_gen);
         handles.push(tokio::spawn(async move {
             let proposal = make_proposal(
-                &gen,
+                &ids,
                 &format!("node:1:batch-{i}"),
                 &format!("val-{i}"),
                 1000 + i,
@@ -352,10 +352,10 @@ async fn mixed_bypass_and_normal_batch() {
     // 5 normal proposals
     for i in 0..5u64 {
         let svc = Arc::clone(&service);
-        let gen = Arc::clone(&id_gen);
+        let ids = Arc::clone(&id_gen);
         handles.push(tokio::spawn(async move {
             let p = make_proposal(
-                &gen,
+                &ids,
                 &format!("node:1:mix-n{i}"),
                 &format!("n{i}"),
                 1000 + i,
@@ -367,10 +367,10 @@ async fn mixed_bypass_and_normal_batch() {
     // 3 bypass proposals
     for i in 0..3u64 {
         let svc = Arc::clone(&service);
-        let gen = Arc::clone(&id_gen);
+        let ids = Arc::clone(&id_gen);
         handles.push(tokio::spawn(async move {
             let p = RaftProposal {
-                id: gen.next(),
+                id: ids.next(),
                 mutations: vec![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:mix-b{i}").into_bytes(),

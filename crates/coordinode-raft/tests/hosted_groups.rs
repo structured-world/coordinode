@@ -186,10 +186,10 @@ async fn await_leadership(node: &RaftNode) {
 
 async fn await_value(engine: &StorageEngine, key: &[u8], expected: &[u8]) -> bool {
     for _ in 0..150 {
-        if let Ok(Some(v)) = engine.get(Partition::Node, key) {
-            if v.as_ref() == expected {
-                return true;
-            }
+        if let Ok(Some(v)) = engine.get(Partition::Node, key)
+            && v.as_ref() == expected
+        {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

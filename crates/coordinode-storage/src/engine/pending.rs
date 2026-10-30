@@ -321,13 +321,13 @@ impl PendingCommits {
                 );
                 reservation = Some(id);
             }
-            if self.finished.wait_until(&mut table, deadline).timed_out() {
-                if let Some(refusal) = Self::overlap(&table, &candidate) {
-                    if let Some(id) = reservation {
-                        table.reserved.remove(&id);
-                    }
-                    return Err(refusal);
+            if self.finished.wait_until(&mut table, deadline).timed_out()
+                && let Some(refusal) = Self::overlap(&table, &candidate)
+            {
+                if let Some(id) = reservation {
+                    table.reserved.remove(&id);
                 }
+                return Err(refusal);
             }
         }
         if let Some(id) = reservation {
@@ -370,10 +370,10 @@ impl PendingCommits {
             holder_ts: table.holder_ts(holder),
         };
         for key in &candidate.scope {
-            if let Some(holders) = table.by_key.get(key) {
-                if let Some(holder) = holders.writers.first().or(holders.conditions.first()) {
-                    return Some(refusal(key, *holder));
-                }
+            if let Some(holders) = table.by_key.get(key)
+                && let Some(holder) = holders.writers.first().or(holders.conditions.first())
+            {
+                return Some(refusal(key, *holder));
             }
         }
         for key in &candidate.guards {

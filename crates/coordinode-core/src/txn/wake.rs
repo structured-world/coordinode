@@ -37,10 +37,10 @@ impl Wake {
         if self.pending.load(Ordering::Relaxed) {
             return;
         }
-        if !self.pending.swap(true, Ordering::AcqRel) {
-            if let Some(thread) = self.thread.get() {
-                thread.unpark();
-            }
+        if !self.pending.swap(true, Ordering::AcqRel)
+            && let Some(thread) = self.thread.get()
+        {
+            thread.unpark();
         }
     }
 

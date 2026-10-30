@@ -587,10 +587,10 @@ fn run(chain: Chain, reached: &mut BTreeSet<(&'static str, &'static str)>) -> bo
     if chain.reopen {
         writer = Writer::default();
     }
-    if let Some(point) = chain.retry {
-        if !step(&mut writer, chain.before, point, "retry") {
-            return false;
-        }
+    if let Some(point) = chain.retry
+        && !step(&mut writer, chain.before, point, "retry")
+    {
+        return false;
     }
     if chain.reopen_again {
         writer = Writer::default();

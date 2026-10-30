@@ -1076,13 +1076,13 @@ fn resolve_anchor(
             }
         }
         // Field exists in interner but not in this node → check extra map.
-        if let Some(extra) = &record.extra {
-            if let Some(val) = extra.get(anchor_name) {
-                match val {
-                    Value::Timestamp(ts) => return Some(*ts),
-                    Value::Int(ts) => return Some(*ts),
-                    _ => {}
-                }
+        if let Some(extra) = &record.extra
+            && let Some(val) = extra.get(anchor_name)
+        {
+            match val {
+                Value::Timestamp(ts) => return Some(*ts),
+                Value::Int(ts) => return Some(*ts),
+                _ => {}
             }
         }
         return None;
@@ -1151,13 +1151,13 @@ pub fn find_anchor_timestamp_with_interner(
     }
 
     // Check extra overflow map.
-    if let Some(extra) = &record.extra {
-        if let Some(val) = extra.get(anchor_name) {
-            match val {
-                Value::Timestamp(ts) => return Some(*ts),
-                Value::Int(ts) => return Some(*ts),
-                _ => {}
-            }
+    if let Some(extra) = &record.extra
+        && let Some(val) = extra.get(anchor_name)
+    {
+        match val {
+            Value::Timestamp(ts) => return Some(*ts),
+            Value::Int(ts) => return Some(*ts),
+            _ => {}
         }
     }
 

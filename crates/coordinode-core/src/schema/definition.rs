@@ -716,14 +716,14 @@ impl LabelSchema {
                     ));
                 }
                 Some(p) => {
-                    if let ConstraintKind::Type(required) = &constraint.kind {
-                        if &p.property_type != required {
-                            return Some(format!(
-                                "property `{name}` of :{} is declared {}, so a value of type \
-                                 {required} can never be stored",
-                                self.name, p.property_type
-                            ));
-                        }
+                    if let ConstraintKind::Type(required) = &constraint.kind
+                        && &p.property_type != required
+                    {
+                        return Some(format!(
+                            "property `{name}` of :{} is declared {}, so a value of type \
+                             {required} can never be stored",
+                            self.name, p.property_type
+                        ));
                     }
                 }
                 None if self.is_strict() && constraint.requires_presence() => {

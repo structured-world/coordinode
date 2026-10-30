@@ -364,8 +364,7 @@ fn order_by_skip_limit() {
     assert!(q.clauses.iter().any(|c| matches!(c, Clause::Skip(_))));
     assert!(q.clauses.iter().any(|c| matches!(c, Clause::Limit(_))));
 
-    if let Some(Clause::OrderBy(ref items)) =
-        q.clauses.iter().find(|c| matches!(c, Clause::OrderBy(_)))
+    if let Some(Clause::OrderBy(items)) = q.clauses.iter().find(|c| matches!(c, Clause::OrderBy(_)))
     {
         assert_eq!(items.len(), 1);
         assert!(!items[0].ascending);
@@ -399,10 +398,10 @@ fn parameter_in_where() {
 #[test]
 fn parameter_in_properties() {
     let q = parse_ok("MATCH (n:User {email: $email}) RETURN n");
-    if let Clause::Match(ref m) = q.clauses[0] {
-        if let PatternElement::Node(ref np) = m.patterns[0].elements[0] {
-            assert!(matches!(np.properties[0].1, Expr::Parameter(ref s) if s == "email"));
-        }
+    if let Clause::Match(ref m) = q.clauses[0]
+        && let PatternElement::Node(ref np) = m.patterns[0].elements[0]
+    {
+        assert!(matches!(np.properties[0].1, Expr::Parameter(ref s) if s == "email"));
     }
 }
 
@@ -597,10 +596,10 @@ fn invalid_syntax_fails() {
 #[test]
 fn backtick_identifier() {
     let q = parse_ok("MATCH (n:`My Label`) RETURN n");
-    if let Clause::Match(ref m) = q.clauses[0] {
-        if let PatternElement::Node(ref np) = m.patterns[0].elements[0] {
-            assert_eq!(np.labels, vec!["My Label"]);
-        }
+    if let Clause::Match(ref m) = q.clauses[0]
+        && let PatternElement::Node(ref np) = m.patterns[0].elements[0]
+    {
+        assert_eq!(np.labels, vec!["My Label"]);
     }
 }
 
@@ -626,10 +625,10 @@ fn not_expression() {
 #[test]
 fn multiple_rel_types() {
     let q = parse_ok("MATCH (a)-[:KNOWS|:FOLLOWS]->(b) RETURN a, b");
-    if let Clause::Match(ref m) = q.clauses[0] {
-        if let PatternElement::Relationship(ref rp) = m.patterns[0].elements[1] {
-            assert_eq!(rp.rel_types, vec!["KNOWS", "FOLLOWS"]);
-        }
+    if let Clause::Match(ref m) = q.clauses[0]
+        && let PatternElement::Relationship(ref rp) = m.patterns[0].elements[1]
+    {
+        assert_eq!(rp.rel_types, vec!["KNOWS", "FOLLOWS"]);
     }
 }
 
@@ -638,14 +637,13 @@ fn multiple_rel_types() {
 #[test]
 fn count_distinct() {
     let q = parse_ok("MATCH (n) RETURN count(DISTINCT n.city) AS cities");
-    if let Clause::Return(ref rc) = q.clauses[1] {
-        if let Expr::FunctionCall {
+    if let Clause::Return(ref rc) = q.clauses[1]
+        && let Expr::FunctionCall {
             ref name, distinct, ..
         } = rc.items[0].expr
-        {
-            assert_eq!(name, "count");
-            assert!(distinct);
-        }
+    {
+        assert_eq!(name, "count");
+        assert!(distinct);
     }
 }
 
@@ -725,11 +723,11 @@ fn case_insensitive_keywords() {
 #[test]
 fn empty_node() {
     let q = parse_ok("MATCH () RETURN *");
-    if let Clause::Match(ref m) = q.clauses[0] {
-        if let PatternElement::Node(ref np) = m.patterns[0].elements[0] {
-            assert!(np.variable.is_none());
-            assert!(np.labels.is_empty());
-        }
+    if let Clause::Match(ref m) = q.clauses[0]
+        && let PatternElement::Node(ref np) = m.patterns[0].elements[0]
+    {
+        assert!(np.variable.is_none());
+        assert!(np.labels.is_empty());
     }
 }
 

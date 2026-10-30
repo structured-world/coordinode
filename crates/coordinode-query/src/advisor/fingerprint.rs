@@ -781,7 +781,7 @@ fn write_expr(buf: &mut String, expr: &Expr) {
             else_clause,
         } => {
             buf.push_str("CASE");
-            if let Some(ref op) = operand {
+            if let Some(op) = operand {
                 buf.push(' ');
                 write_expr(buf, op);
             }
@@ -791,7 +791,7 @@ fn write_expr(buf: &mut String, expr: &Expr) {
                 buf.push_str(" THEN ");
                 write_expr(buf, then);
             }
-            if let Some(ref else_expr) = else_clause {
+            if let Some(else_expr) = else_clause {
                 buf.push_str(" ELSE ");
                 write_expr(buf, else_expr);
             }

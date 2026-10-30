@@ -403,10 +403,10 @@ impl Admitter {
             });
         };
         let mut routers = self.routers.lock();
-        if let Some((found, router)) = routers.get(&member) {
-            if *found == target {
-                return Ok(router.clone());
-            }
+        if let Some((found, router)) = routers.get(&member)
+            && *found == target
+        {
+            return Ok(router.clone());
         }
         let (target, channel) = CommandRouter::member_channel(node, member)?;
         let router = CommandRouter::new(member, channel);

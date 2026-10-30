@@ -249,10 +249,11 @@ async fn commit_on_majority(
 async fn await_new_leader(survivors: &[&TestNode], excluded: u64) -> u64 {
     for _ in 0..150 {
         for n in survivors {
-            if let Some(l) = n.node.current_leader() {
-                if l != excluded && survivors.iter().any(|s| s.node.node_id() == l) {
-                    return l;
-                }
+            if let Some(l) = n.node.current_leader()
+                && l != excluded
+                && survivors.iter().any(|s| s.node.node_id() == l)
+            {
+                return l;
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1095,8 +1096,7 @@ async fn linearizability_workload(
     for t in tasks {
         t.await.expect("client task");
     }
-    let recorded = history.lock().unwrap().clone();
-    recorded
+    history.lock().unwrap().clone()
 }
 
 // ── Clock-skew nemesis: linearizability holds despite per-node clock skew ────

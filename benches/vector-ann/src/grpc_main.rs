@@ -464,10 +464,10 @@ async fn run_rounds(
                     .map(|x| i64::from(*x))
                     .collect();
                 for row in rows.iter().take(k) {
-                    if let Some(Value::Int(id)) = row.get("ext_id") {
-                        if gt_row.contains(id) {
-                            hits += 1;
-                        }
+                    if let Some(Value::Int(id)) = row.get("ext_id")
+                        && gt_row.contains(id)
+                    {
+                        hits += 1;
                     }
                 }
                 denom += k as u64;

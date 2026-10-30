@@ -103,10 +103,10 @@ impl Drop for LogSync {
             queue.closed = true;
             self.shared.queued.notify_all();
         }
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                tracing::error!("the raft log sync thread panicked");
-            }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::error!("the raft log sync thread panicked");
         }
     }
 }

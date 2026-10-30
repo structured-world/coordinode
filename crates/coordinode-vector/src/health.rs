@@ -254,10 +254,8 @@ impl HealthSignal {
                 Ordering::Acquire,
             )
             .is_ok();
-        if turned {
-            if let Ok(mut g) = self.offline_reason.lock() {
-                *g = None;
-            }
+        if turned && let Ok(mut g) = self.offline_reason.lock() {
+            *g = None;
         }
         turned
     }

@@ -281,11 +281,11 @@ impl CacheLayer {
     /// entry found by a read, and not one a later fill put in its place.
     fn remove_stale(&self, cache_key: CacheKey, stamp: FillTicket) {
         let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
-        if idx.get(&cache_key).is_some_and(|meta| meta.stamp == stamp) {
-            if let Some(meta) = idx.remove(&cache_key) {
-                self.live_bytes
-                    .fetch_sub(u64::from(meta.total_size), Ordering::Relaxed);
-            }
+        if idx.get(&cache_key).is_some_and(|meta| meta.stamp == stamp)
+            && let Some(meta) = idx.remove(&cache_key)
+        {
+            self.live_bytes
+                .fetch_sub(u64::from(meta.total_size), Ordering::Relaxed);
         }
     }
 

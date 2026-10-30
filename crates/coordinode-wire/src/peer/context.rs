@@ -484,21 +484,20 @@ impl ClientCertVerifier for InboundVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
-        if let InboundAuth::Shared { clients } = &self.inbound {
-            if !self
+        if let InboundAuth::Shared { clients } = &self.inbound
+            && !self
                 .context
                 .state
                 .load()
                 .profile
                 .claims_node_identity(end_entity)
-            {
-                return match clients {
-                    Some(clients) => clients.verify_client_cert(end_entity, intermediates, now),
-                    None => Err(Error::InvalidCertificate(
-                        CertificateError::ApplicationVerificationFailure,
-                    )),
-                };
-            }
+        {
+            return match clients {
+                Some(clients) => clients.verify_client_cert(end_entity, intermediates, now),
+                None => Err(Error::InvalidCertificate(
+                    CertificateError::ApplicationVerificationFailure,
+                )),
+            };
         }
         self.context
             .verify_peer(end_entity, intermediates, now, PeerRole::Client)

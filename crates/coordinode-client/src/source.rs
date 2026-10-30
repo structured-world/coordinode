@@ -50,15 +50,15 @@ pub(crate) fn inject_grpc_metadata(
 /// on the unary path, once per stream on a session, whose statements carry
 /// only their own location.
 pub(crate) fn inject_app_metadata(meta: &mut MetadataMap, config: &ClientConfig) {
-    if !config.app_name.is_empty() {
-        if let Ok(v) = config.app_name.parse() {
-            meta.insert("x-source-app", v);
-        }
+    if !config.app_name.is_empty()
+        && let Ok(v) = config.app_name.parse()
+    {
+        meta.insert("x-source-app", v);
     }
-    if !config.app_version.is_empty() {
-        if let Ok(v) = config.app_version.parse() {
-            meta.insert("x-source-version", v);
-        }
+    if !config.app_version.is_empty()
+        && let Ok(v) = config.app_version.parse()
+    {
+        meta.insert("x-source-version", v);
     }
 }
 

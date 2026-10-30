@@ -499,53 +499,53 @@ fn contract_bm25_is_not_runtime_configurable() {
     // For now, we lock the assertion to: the plan-build step either rejects
     // the 3rd arg, OR the executor ignores it. In either case, passing k1
     // must not change the score.
-    if let Ok(ast) = ast {
-        if build_logical_plan(&ast).is_ok() {
-            // Plan accepted — verify executor ignores the alleged k1 override.
-            let fx = test_engine();
-            let engine = &fx.engine;
-            let mut interner = FieldInterner::new();
-            insert_node(
-                engine,
-                1,
-                "Article",
-                &[("body", Value::String("x x x".to_string()))],
-                &mut interner,
-            );
+    if let Ok(ast) = ast
+        && build_logical_plan(&ast).is_ok()
+    {
+        // Plan accepted — verify executor ignores the alleged k1 override.
+        let fx = test_engine();
+        let engine = &fx.engine;
+        let mut interner = FieldInterner::new();
+        insert_node(
+            engine,
+            1,
+            "Article",
+            &[("body", Value::String("x x x".to_string()))],
+            &mut interner,
+        );
 
-            let text_dir = fx.scratch_path().join("k1_bm25");
-            let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
-            text_idx.add_document(1, "x x x").unwrap();
-            let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
+        let text_dir = fx.scratch_path().join("k1_bm25");
+        let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
+        text_idx.add_document(1, "x x x").unwrap();
+        let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
 
-            let baseline = run_cypher_bm25(
-                "MATCH (a:Article) WHERE text_match(a.body, \"x\") \
+        let baseline = run_cypher_bm25(
+            "MATCH (a:Article) WHERE text_match(a.body, \"x\") \
                  RETURN text_score(a.body, \"x\") AS s",
-                engine,
-                &mut interner,
-                &multi_idx,
-            );
-            let with_k1 = run_cypher_bm25(
-                "MATCH (a:Article) WHERE text_match(a.body, \"x\") \
+            engine,
+            &mut interner,
+            &multi_idx,
+        );
+        let with_k1 = run_cypher_bm25(
+            "MATCH (a:Article) WHERE text_match(a.body, \"x\") \
                  RETURN text_score(a.body, \"x\", {k1: 2.0}) AS s",
-                engine,
-                &mut interner,
-                &multi_idx,
-            );
-            let b = match baseline[0].get("s") {
-                Some(Value::Float(f)) => *f,
-                other => panic!("expected Float, got {other:?}"),
-            };
-            let w = match with_k1.first().and_then(|r| r.get("s")) {
-                Some(Value::Float(f)) => *f,
-                _ => return, // k1 variant may have degraded to Null — still contract-OK
-            };
-            assert!(
-                (b - w).abs() < 1e-9,
-                "contract violation — k1 override must not change text_score: baseline={b}, with_k1={w}. \
+            engine,
+            &mut interner,
+            &multi_idx,
+        );
+        let b = match baseline[0].get("s") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("expected Float, got {other:?}"),
+        };
+        let w = match with_k1.first().and_then(|r| r.get("s")) {
+            Some(Value::Float(f)) => *f,
+            _ => return, // k1 variant may have degraded to Null — still contract-OK
+        };
+        assert!(
+            (b - w).abs() < 1e-9,
+            "contract violation — k1 override must not change text_score: baseline={b}, with_k1={w}. \
                  k1/b are not runtime-configurable."
-            );
-        }
+        );
     }
 }
 

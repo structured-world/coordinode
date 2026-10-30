@@ -419,10 +419,10 @@ fn rmpv_to_extra(rec: &mut NodeRecord, doc: &rmpv::Value) {
         } else {
             let mut extra = std::collections::HashMap::new();
             for (k, v) in entries {
-                if let rmpv::Value::String(key) = k {
-                    if let Some(s) = key.as_str() {
-                        extra.insert(s.to_string(), rmpv_to_value(v));
-                    }
+                if let rmpv::Value::String(key) = k
+                    && let Some(s) = key.as_str()
+                {
+                    extra.insert(s.to_string(), rmpv_to_value(v));
                 }
             }
             rec.extra = Some(extra);

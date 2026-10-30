@@ -46,15 +46,15 @@ impl Database {
                 incarnation,
                 window: self.operation_admission_window.get(),
             })?;
-            if let Some(record) = records::incarnation_record(&self.engine, &issuer, incarnation)? {
-                if record.open {
-                    return Ok(OperationIssuer::new(
-                        issuer,
-                        incarnation,
-                        record.retired_below,
-                        deployment,
-                    ));
-                }
+            if let Some(record) = records::incarnation_record(&self.engine, &issuer, incarnation)?
+                && record.open
+            {
+                return Ok(OperationIssuer::new(
+                    issuer,
+                    incarnation,
+                    record.retired_below,
+                    deployment,
+                ));
             }
         }
         Err(DatabaseError::Other(format!(

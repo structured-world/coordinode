@@ -69,8 +69,14 @@ unsafe fn xor_popcount_avx512(a: &[u64], b: &[u64]) -> u32 {
 
     // Process 8 u64 = 512 bits per iteration.
     while i + 8 <= len {
-        let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const _);
-        let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const _);
+        // SAFETY: `i + 8 <= len` and both slices hold `len` words, so each
+        // 64-byte load stays in bounds.
+        let (va, vb) = unsafe {
+            (
+                _mm512_loadu_si512(a.as_ptr().add(i) as *const _),
+                _mm512_loadu_si512(b.as_ptr().add(i) as *const _),
+            )
+        };
         let vx = _mm512_xor_si512(va, vb);
         let vp = _mm512_popcnt_epi64(vx);
         sum += _mm512_reduce_add_epi64(vp);
@@ -97,10 +103,13 @@ unsafe fn xor_popcount_neon(a: &[u64], b: &[u64]) -> u32 {
 
     // Process 2 u64 = 128 bits = 16 bytes per iteration.
     while i + 2 <= len {
-        let pa = a.as_ptr().add(i) as *const u8;
-        let pb = b.as_ptr().add(i) as *const u8;
-        let va = vld1q_u8(pa);
-        let vb = vld1q_u8(pb);
+        // SAFETY: `i + 2 <= len` and both slices hold `len` words, so the
+        // 16 bytes read from each base stay in bounds.
+        let (va, vb) = unsafe {
+            let pa = a.as_ptr().add(i) as *const u8;
+            let pb = b.as_ptr().add(i) as *const u8;
+            (vld1q_u8(pa), vld1q_u8(pb))
+        };
         let vx = veorq_u8(va, vb);
         let vp = vcntq_u8(vx);
         sum += vaddvq_u8(vp) as u32;
@@ -177,8 +186,14 @@ unsafe fn and_popcount_avx512(a: &[u64], b: &[u64]) -> u32 {
     let mut i = 0;
 
     while i + 8 <= len {
-        let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const _);
-        let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const _);
+        // SAFETY: `i + 8 <= len` and both slices hold `len` words, so each
+        // 64-byte load stays in bounds.
+        let (va, vb) = unsafe {
+            (
+                _mm512_loadu_si512(a.as_ptr().add(i) as *const _),
+                _mm512_loadu_si512(b.as_ptr().add(i) as *const _),
+            )
+        };
         let vand = _mm512_and_si512(va, vb);
         let vp = _mm512_popcnt_epi64(vand);
         sum += _mm512_reduce_add_epi64(vp);
@@ -203,10 +218,13 @@ unsafe fn and_popcount_neon(a: &[u64], b: &[u64]) -> u32 {
     let mut i = 0;
 
     while i + 2 <= len {
-        let pa = a.as_ptr().add(i) as *const u8;
-        let pb = b.as_ptr().add(i) as *const u8;
-        let va = vld1q_u8(pa);
-        let vb = vld1q_u8(pb);
+        // SAFETY: `i + 2 <= len` and both slices hold `len` words, so the
+        // 16 bytes read from each base stay in bounds.
+        let (va, vb) = unsafe {
+            let pa = a.as_ptr().add(i) as *const u8;
+            let pb = b.as_ptr().add(i) as *const u8;
+            (vld1q_u8(pa), vld1q_u8(pb))
+        };
         let vand = vandq_u8(va, vb);
         let vp = vcntq_u8(vand);
         sum += vaddvq_u8(vp) as u32;
@@ -330,11 +348,17 @@ unsafe fn and_popcount_4planes_avx512(
     let mut i = 0;
 
     while i + 8 <= len {
-        let vx = _mm512_loadu_si512(code.as_ptr().add(i) as *const _);
-        let v0 = _mm512_loadu_si512(p0.as_ptr().add(i) as *const _);
-        let v1 = _mm512_loadu_si512(p1.as_ptr().add(i) as *const _);
-        let v2 = _mm512_loadu_si512(p2.as_ptr().add(i) as *const _);
-        let v3 = _mm512_loadu_si512(p3.as_ptr().add(i) as *const _);
+        // SAFETY: `i + 8 <= len` and every plane holds `len` words (the
+        // caller asserts equal lengths), so each 64-byte load stays in bounds.
+        let (vx, v0, v1, v2, v3) = unsafe {
+            (
+                _mm512_loadu_si512(code.as_ptr().add(i) as *const _),
+                _mm512_loadu_si512(p0.as_ptr().add(i) as *const _),
+                _mm512_loadu_si512(p1.as_ptr().add(i) as *const _),
+                _mm512_loadu_si512(p2.as_ptr().add(i) as *const _),
+                _mm512_loadu_si512(p3.as_ptr().add(i) as *const _),
+            )
+        };
         s0 += _mm512_reduce_add_epi64(_mm512_popcnt_epi64(_mm512_and_si512(vx, v0)));
         s1 += _mm512_reduce_add_epi64(_mm512_popcnt_epi64(_mm512_and_si512(vx, v1)));
         s2 += _mm512_reduce_add_epi64(_mm512_popcnt_epi64(_mm512_and_si512(vx, v2)));

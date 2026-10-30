@@ -205,14 +205,14 @@ fn validate_property(
     // field — SchemaService/CreateLabel always writes 0). Treat 0 as "any dimension".
     if let (Value::Vector(vec), PropertyType::Vector { dimensions, .. }) =
         (value, &def.property_type)
+        && *dimensions != 0
+        && vec.len() != *dimensions as usize
     {
-        if *dimensions != 0 && vec.len() != *dimensions as usize {
-            return Err(ValidationError::VectorDimsMismatch {
-                property: prop_name.to_string(),
-                expected: *dimensions,
-                got: vec.len(),
-            });
-        }
+        return Err(ValidationError::VectorDimsMismatch {
+            property: prop_name.to_string(),
+            expected: *dimensions,
+            got: vec.len(),
+        });
     }
 
     // Array homogeneity check
@@ -229,16 +229,15 @@ fn validate_property(
     }
 
     // Document size check (4MB default limit)
-    if let Value::Document(_) = value {
-        if let Some(size) = value.document_serialized_size() {
-            if size > Value::DOCUMENT_MAX_SIZE {
-                return Err(ValidationError::DocumentTooLarge {
-                    property: prop_name.to_string(),
-                    max_bytes: Value::DOCUMENT_MAX_SIZE,
-                    got_bytes: size,
-                });
-            }
-        }
+    if let Value::Document(_) = value
+        && let Some(size) = value.document_serialized_size()
+        && size > Value::DOCUMENT_MAX_SIZE
+    {
+        return Err(ValidationError::DocumentTooLarge {
+            property: prop_name.to_string(),
+            max_bytes: Value::DOCUMENT_MAX_SIZE,
+            got_bytes: size,
+        });
     }
 
     Ok(())
@@ -271,10 +270,10 @@ pub fn validate_properties(
 
         if let Some(def) = schema.get_property(prop_name) {
             // Declared property — validate type if mode supports it
-            if schema.mode.validates_declared() {
-                if let Err(e) = validate_property(prop_name, value, def) {
-                    errors.push(e);
-                }
+            if schema.mode.validates_declared()
+                && let Err(e) = validate_property(prop_name, value, def)
+            {
+                errors.push(e);
             }
         } else if schema.mode.rejects_unknown() {
             // Strict mode: reject undeclared properties

@@ -448,10 +448,10 @@ impl BlobCollector {
     fn work(&self, stop: &AtomicBool) {
         self.wake.bind();
         while !stop.load(Ordering::Acquire) {
-            if (self.active)() {
-                if let Err(e) = self.run(false) {
-                    tracing::warn!(error = %e, "blob collection pass failed");
-                }
+            if (self.active)()
+                && let Err(e) = self.run(false)
+            {
+                tracing::warn!(error = %e, "blob collection pass failed");
             }
             let ran = std::time::Instant::now();
             if stop.load(Ordering::Acquire) {
@@ -1162,10 +1162,10 @@ impl Drop for CollectorWorker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.wake.interrupt();
-        if let Some(handle) = self.handle.take() {
-            if handle.join().is_err() {
-                tracing::error!("the blob collector panicked");
-            }
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            tracing::error!("the blob collector panicked");
         }
     }
 }

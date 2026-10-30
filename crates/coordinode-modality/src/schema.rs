@@ -800,10 +800,10 @@ impl SchemaStore for LocalSchemaStore<'_> {
     fn list_edge_type_names(&self, txn: &mut Transaction) -> StoreResult<Vec<String>> {
         let mut types: Vec<String> = Vec::new();
         for (k, _) in txn.prefix_scan(Partition::Schema, EDGE_TYPE_SCHEMA_KEY_PREFIX)? {
-            if let Some(name) = decode_edge_type_schema_key_name(&k) {
-                if !types.iter().any(|t| t == name) {
-                    types.push(name.to_string());
-                }
+            if let Some(name) = decode_edge_type_schema_key_name(&k)
+                && !types.iter().any(|t| t == name)
+            {
+                types.push(name.to_string());
             }
         }
         Ok(types)
@@ -816,10 +816,10 @@ impl SchemaStore for LocalSchemaStore<'_> {
             .prefix_scan(Partition::Schema, EDGE_TYPE_SCHEMA_KEY_PREFIX)?
         {
             let (k, _) = guard.into_inner()?;
-            if let Some(name) = decode_edge_type_schema_key_name(&k) {
-                if !types.iter().any(|t| t == name) {
-                    types.push(name.to_string());
-                }
+            if let Some(name) = decode_edge_type_schema_key_name(&k)
+                && !types.iter().any(|t| t == name)
+            {
+                types.push(name.to_string());
             }
         }
         Ok(types)

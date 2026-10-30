@@ -37,10 +37,10 @@ fn status_of(db: &Database, name: &str) -> Option<BuildStatus> {
 fn await_held(db: &Database, name: &str) -> BuildStatus {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some(status) = status_of(db, name) {
-            if status.phase == Some(BuildPhase::AwaitingOlderTransactions) {
-                return status;
-            }
+        if let Some(status) = status_of(db, name)
+            && status.phase == Some(BuildPhase::AwaitingOlderTransactions)
+        {
+            return status;
         }
         assert!(Instant::now() < deadline, "the build never waited");
         std::thread::sleep(Duration::from_millis(5));

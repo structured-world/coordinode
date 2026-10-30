@@ -65,10 +65,10 @@ struct UnsyncedWriter {
 
 impl UnsyncedWriter {
     fn settle(&self) {
-        if let Some(charge) = &self.charge {
-            if let Some(allocated) = allocated_at(&self.path) {
-                charge.settle(allocated);
-            }
+        if let Some(charge) = &self.charge
+            && let Some(allocated) = allocated_at(&self.path)
+        {
+            charge.settle(allocated);
         }
     }
 }
@@ -81,10 +81,10 @@ impl Write for UnsyncedWriter {
         }
         let n = self.file.write(buf)?;
         self.len += n as u64;
-        if let Some(charge) = &self.charge {
-            if let Some(allocated) = allocated_at(&self.path) {
-                charge.observe(allocated);
-            }
+        if let Some(charge) = &self.charge
+            && let Some(allocated) = allocated_at(&self.path)
+        {
+            charge.observe(allocated);
         }
         Ok(n)
     }

@@ -1762,13 +1762,13 @@ impl<'a> ExecutionContext<'a> {
         }
         // The type decides the node's schema and placement; SET or REMOVE of
         // a label adds or drops membership only and never changes the type.
-        if let Some(before) = labels_before.first() {
-            if before != resolved.primary() {
-                return Err(ExecutionError::SchemaViolation(format!(
-                    "node's type :{before} cannot change to :{}",
-                    resolved.primary()
-                )));
-            }
+        if let Some(before) = labels_before.first()
+            && before != resolved.primary()
+        {
+            return Err(ExecutionError::SchemaViolation(format!(
+                "node's type :{before} cannot change to :{}",
+                resolved.primary()
+            )));
         }
         // Borrowed labels are the record's own, already in stored order.
         if let std::borrow::Cow::Owned(labels) = resolved.labels {
@@ -2993,21 +2993,20 @@ impl<'a> ExecutionContext<'a> {
         // The winner may have taken its timestamp and not applied yet; let the
         // commits already numbered land before asking who holds the key. This
         // is a read of the key's outcome, so it waits as long as a read does.
-        if let Some(oracle) = self.mvcc_oracle {
-            if self
+        if let Some(oracle) = self.mvcc_oracle
+            && self
                 .engine
                 .pending_commits()
                 .await_complete_at(oracle.current().as_raw(), self.read_timeout)
                 .is_err()
-            {
-                return error;
-            }
+        {
+            return error;
         }
         for (table, key, claimed_for) in &self.key_claims.tables {
-            if let Ok(Some(holder)) = LocalTableKeyStore.committed_holder(self.engine, table, key) {
-                if holder != *claimed_for {
-                    return duplicate_key(table, key, holder);
-                }
+            if let Ok(Some(holder)) = LocalTableKeyStore.committed_holder(self.engine, table, key)
+                && holder != *claimed_for
+            {
+                return duplicate_key(table, key, holder);
             }
         }
         let indexes = LocalIndexStore::new(self.engine);
@@ -3502,15 +3501,16 @@ impl<'a> ExecutionContext<'a> {
             );
         }
         self.sync_txn_state();
-        if let Some(registry) = self.btree_index_registry {
-            if registry.label_lookup().is_some() && !record.labels.is_empty() {
-                // Every label the version carries, its type's implied ones
-                // included.
-                let carried = self.carried_labels(&record.labels)?;
-                let names: Vec<&str> = carried.iter().map(String::as_str).collect();
-                let held = self.field_ids(&names)?;
-                registry.on_labels_held(self.engine, &mut self.txn, shard_id, node_id, &held)?;
-            }
+        if let Some(registry) = self.btree_index_registry
+            && registry.label_lookup().is_some()
+            && !record.labels.is_empty()
+        {
+            // Every label the version carries, its type's implied ones
+            // included.
+            let carried = self.carried_labels(&record.labels)?;
+            let names: Vec<&str> = carried.iter().map(String::as_str).collect();
+            let held = self.field_ids(&names)?;
+            registry.on_labels_held(self.engine, &mut self.txn, shard_id, node_id, &held)?;
         }
         Ok(LocalNodeStore.put_temporal(&mut self.txn, shard_id, node_id, valid_from_ms, record)?)
     }
@@ -3920,13 +3920,13 @@ impl<'a> ExecutionContext<'a> {
         operand: Vec<u8>,
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        if let Some(label) = self.schema_label_for_node(shard_id, node_id)? {
-            if self.label_checks_writes(&label)? {
-                self.txn
-                    .note_post_state_check(&coordinode_core::graph::node::encode_node_key(
-                        shard_id, node_id,
-                    ));
-            }
+        if let Some(label) = self.schema_label_for_node(shard_id, node_id)?
+            && self.label_checks_writes(&label)?
+        {
+            self.txn
+                .note_post_state_check(&coordinode_core::graph::node::encode_node_key(
+                    shard_id, node_id,
+                ));
         }
         LocalNodeStore.buffer_node_delta(&mut self.txn, shard_id, node_id, operand);
         Ok(())
@@ -4677,25 +4677,25 @@ pub fn execute_no_commit(
     // otherwise `mvcc_read_ts` (statement start_ts). If the watermark is not
     // wired into this context (legacy / single-writer test), skip the wait —
     // the test is responsible for sequencing reads after writes itself.
-    if plan.read_consistency.requires_snapshot_wait() {
-        if let Some(ref wm) = ctx.applied_watermark.clone() {
-            let target_raw = ctx
-                .snapshot_ts
-                .map(|t| t.max(0) as u64)
-                .unwrap_or_else(|| ctx.mvcc_read_ts.as_raw());
-            if target_raw > 0 {
-                let target = coordinode_core::txn::timestamp::Timestamp::from_raw(target_raw);
-                let timeout = ctx.read_timeout;
-                // The executor is sync, and so is the wait: it parks this
-                // thread until the applier reaches the target.
-                if let Err(err) = wm.wait_for(target, timeout) {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "read_consistency='{}' timed out waiting for applier \
-                         to reach commit_ts={target_raw}: {err}. Retry or fall \
-                         back to read_consistency='current'.",
-                        plan.read_consistency
-                    )));
-                }
+    if plan.read_consistency.requires_snapshot_wait()
+        && let Some(ref wm) = ctx.applied_watermark.clone()
+    {
+        let target_raw = ctx
+            .snapshot_ts
+            .map(|t| t.max(0) as u64)
+            .unwrap_or_else(|| ctx.mvcc_read_ts.as_raw());
+        if target_raw > 0 {
+            let target = coordinode_core::txn::timestamp::Timestamp::from_raw(target_raw);
+            let timeout = ctx.read_timeout;
+            // The executor is sync, and so is the wait: it parks this
+            // thread until the applier reaches the target.
+            if let Err(err) = wm.wait_for(target, timeout) {
+                return Err(ExecutionError::Unsupported(format!(
+                    "read_consistency='{}' timed out waiting for applier \
+                     to reach commit_ts={target_raw}: {err}. Retry or fall \
+                     back to read_consistency='current'.",
+                    plan.read_consistency
+                )));
             }
         }
     }
@@ -5587,17 +5587,16 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     value_expr,
                     ..
                 } = right.as_ref()
+                    && !is_relationship_merge(right)
                 {
-                    if !is_relationship_merge(right) {
-                        let scan = IndexKeyScan {
-                            variable,
-                            label,
-                            index: *index,
-                            property,
-                            value_expr,
-                        };
-                        return join_by_index_key(left_rows, right, scan, ctx);
-                    }
+                    let scan = IndexKeyScan {
+                        variable,
+                        label,
+                        index: *index,
+                        property,
+                        value_expr,
+                    };
+                    return join_by_index_key(left_rows, right, scan, ctx);
                 }
                 let prev_corr = ctx.correlated_row.take();
                 let mut result = Vec::new();
@@ -7143,10 +7142,10 @@ impl<'s, 'b> NodeScanFold<'s, 'b> {
             ExecutionError::Serialization(format!("node deserialization error: {e}"))
         })?;
         if let Some((_, node_id, valid_from)) = temporal {
-            if self.versions_of != Some(node_id) {
-                if let Some(previous) = self.versions_of.replace(node_id) {
-                    self.flush_versions(previous, env)?;
-                }
+            if self.versions_of != Some(node_id)
+                && let Some(previous) = self.versions_of.replace(node_id)
+            {
+                self.flush_versions(previous, env)?;
             }
             let bytes = record.held_bytes();
             self.kept.grow(bytes)?;
@@ -7279,10 +7278,10 @@ fn named_instants(predicate: &crate::plan::expr::Expr, out: &mut Vec<(String, i6
             named_instants(right, out);
         }
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("temporal_active_at") => {
-            if let [Expr::Variable(v), at] = args.as_slice() {
-                if let Ok(Value::Int(t) | Value::Timestamp(t)) = eval_neutral(at, &Row::new()) {
-                    out.push((v.clone(), t));
-                }
+            if let [Expr::Variable(v), at] = args.as_slice()
+                && let Ok(Value::Int(t) | Value::Timestamp(t)) = eval_neutral(at, &Row::new())
+            {
+                out.push((v.clone(), t));
             }
         }
         _ => {}
@@ -7716,13 +7715,13 @@ fn refuse_key_changes_in_remove(
                 continue;
             }
         };
-        if let Some((table, columns)) = bound_table_key(row, variable, ctx)? {
-            if columns.iter().any(|c| c == column) {
-                return Err(ExecutionError::KeyImmutable {
-                    table,
-                    column: column.to_string(),
-                });
-            }
+        if let Some((table, columns)) = bound_table_key(row, variable, ctx)?
+            && columns.iter().any(|c| c == column)
+        {
+            return Err(ExecutionError::KeyImmutable {
+                table,
+                column: column.to_string(),
+            });
         }
     }
     Ok(())
@@ -7745,17 +7744,17 @@ fn execute_filter_input(
     {
         // A server-side cursor pages through the scan's own key order, and a
         // COLUMNAR table keeps its rows outside the node records.
-        if ctx.scan_paging.is_none() {
-            if let Some(id) = node_id_filter(predicate, variable) {
-                let columnar = match labels.first() {
-                    Some(label) => ctx
-                        .load_current_label_schema(label)?
-                        .is_some_and(|s| s.is_columnar()),
-                    None => false,
-                };
-                if !columnar {
-                    return scan_by_node_id(variable, labels, id, property_filters, ctx);
-                }
+        if ctx.scan_paging.is_none()
+            && let Some(id) = node_id_filter(predicate, variable)
+        {
+            let columnar = match labels.first() {
+                Some(label) => ctx
+                    .load_current_label_schema(label)?
+                    .is_some_and(|s| s.is_columnar()),
+                None => false,
+            };
+            if !columnar {
+                return scan_by_node_id(variable, labels, id, property_filters, ctx);
             }
         }
         let mut key_filters = property_filters.clone();
@@ -7902,14 +7901,14 @@ fn execute_btree_index_scan(
     // records only when everything this statement does with them is charged
     // to its budget; otherwise it is refused before reading.
     let scan_records = |ctx: &mut ExecutionContext<'_>, why: IndexUnanswered, lookup_val: Value| {
-        if why == IndexUnanswered::Unproved {
-            if let Some(operator) = ctx.unaccounted_operator {
-                return Err(ExecutionError::IndexUnresolved {
-                    label: label.to_string(),
-                    property: property.to_string(),
-                    operator,
-                });
-            }
+        if why == IndexUnanswered::Unproved
+            && let Some(operator) = ctx.unaccounted_operator
+        {
+            return Err(ExecutionError::IndexUnresolved {
+                label: label.to_string(),
+                property: property.to_string(),
+                operator,
+            });
         }
         execute_node_scan(
             variable,
@@ -8945,10 +8944,10 @@ fn process_targets_parallel(
                     // Track the node key in the OCC read-set: each worker records
                     // into the shared accumulator; merged into the statement's
                     // read-set after the parallel section.
-                    if let Some(ref keys) = pctx.occ_read_keys {
-                        if let Ok(mut guard) = keys.node.lock() {
-                            guard.push(target_key);
-                        }
+                    if let Some(ref keys) = pctx.occ_read_keys
+                        && let Ok(mut guard) = keys.node.lock()
+                    {
+                        guard.push(target_key);
                     }
 
                     if let Err(error) = compile_implied_at_snapshot(
@@ -9017,54 +9016,52 @@ fn process_targets_parallel(
 
                     // Edge variable: type + edge properties
                     let edge_type = params.edge_types.get(*et_idx).map(|s| s.as_str());
-                    if let Some(ev) = edge_variable {
-                        if let Some(et) = edge_type {
-                            out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
-                            // Store the relationship variable itself for count(r) support
-                            out_row.insert(ev.to_string(), Value::String(et.to_string()));
+                    if let Some(ev) = edge_variable
+                        && let Some(et) = edge_type
+                    {
+                        out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
+                        // Store the relationship variable itself for count(r) support
+                        out_row.insert(ev.to_string(), Value::String(et.to_string()));
 
+                        {
+                            let (ep_src, ep_tgt) = hop.endpoints(src);
+                            let (ep_src, ep_tgt) =
+                                (NodeId::from_raw(ep_src), NodeId::from_raw(ep_tgt));
+                            // Hidden metadata for downstream SET / DELETE on r.
+                            out_row.insert(
+                                format!("{ev}.__src__"),
+                                Value::Int(ep_src.as_raw() as i64),
+                            );
+                            out_row.insert(
+                                format!("{ev}.__tgt__"),
+                                Value::Int(ep_tgt.as_raw() as i64),
+                            );
+                            // Stateless snapshot read via the Layer-4 store
+                            // (Variant A): shared snapshot seqno, no &mut txn
+                            // across rayon threads; the store returns the key
+                            // for the worker's OCC accumulator.
+                            use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+                            let (ep_key, ep_bytes) = LocalEdgeStore
+                                .edgeprop_at_snapshot(
+                                    pctx.engine,
+                                    pctx.mvcc_snapshot,
+                                    et,
+                                    ep_src,
+                                    ep_tgt,
+                                )
+                                .unwrap_or((Vec::new(), None));
+                            // Track the EdgeProp key in the OCC read-set.
+                            if let Some(ref keys) = pctx.occ_read_keys
+                                && let Ok(mut guard) = keys.edge_prop.lock()
                             {
-                                let (ep_src, ep_tgt) = hop.endpoints(src);
-                                let (ep_src, ep_tgt) =
-                                    (NodeId::from_raw(ep_src), NodeId::from_raw(ep_tgt));
-                                // Hidden metadata for downstream SET / DELETE on r.
-                                out_row.insert(
-                                    format!("{ev}.__src__"),
-                                    Value::Int(ep_src.as_raw() as i64),
-                                );
-                                out_row.insert(
-                                    format!("{ev}.__tgt__"),
-                                    Value::Int(ep_tgt.as_raw() as i64),
-                                );
-                                // Stateless snapshot read via the Layer-4 store
-                                // (Variant A): shared snapshot seqno, no &mut txn
-                                // across rayon threads; the store returns the key
-                                // for the worker's OCC accumulator.
-                                use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
-                                let (ep_key, ep_bytes) = LocalEdgeStore
-                                    .edgeprop_at_snapshot(
-                                        pctx.engine,
-                                        pctx.mvcc_snapshot,
-                                        et,
-                                        ep_src,
-                                        ep_tgt,
-                                    )
-                                    .unwrap_or((Vec::new(), None));
-                                // Track the EdgeProp key in the OCC read-set.
-                                if let Some(ref keys) = pctx.occ_read_keys {
-                                    if let Ok(mut guard) = keys.edge_prop.lock() {
-                                        guard.push(ep_key);
-                                    }
-                                }
-                                if let Some(ep_bytes) = ep_bytes {
-                                    if let Ok(prop_map) = decode_edge_props(&ep_bytes) {
-                                        for (field_id, value) in prop_map {
-                                            if let Some(field_name) =
-                                                pctx.interner.resolve(field_id)
-                                            {
-                                                out_row.insert(format!("{ev}.{field_name}"), value);
-                                            }
-                                        }
+                                guard.push(ep_key);
+                            }
+                            if let Some(ep_bytes) = ep_bytes
+                                && let Ok(prop_map) = decode_edge_props(&ep_bytes)
+                            {
+                                for (field_id, value) in prop_map {
+                                    if let Some(field_name) = pctx.interner.resolve(field_id) {
+                                        out_row.insert(format!("{ev}.{field_name}"), value);
                                     }
                                 }
                             }
@@ -9244,14 +9241,14 @@ fn execute_single_hop_traverse(
             }
             // Merge OCC read keys from parallel workers into the Layer-3 scope
             // via the typed per-partition extends.
-            if let Some(ref keys) = pctx.occ_read_keys {
-                if let Some(scope) = ctx.ensure_occ_scope() {
-                    if let Ok(mut node) = keys.node.lock() {
-                        scope.extend_node_keys(node.drain(..));
-                    }
-                    if let Ok(mut ep) = keys.edge_prop.lock() {
-                        scope.extend_edge_prop_keys(ep.drain(..));
-                    }
+            if let Some(ref keys) = pctx.occ_read_keys
+                && let Some(scope) = ctx.ensure_occ_scope()
+            {
+                if let Ok(mut node) = keys.node.lock() {
+                    scope.extend_node_keys(node.drain(..));
+                }
+                if let Ok(mut ep) = keys.edge_prop.lock() {
+                    scope.extend_edge_prop_keys(ep.drain(..));
                 }
             }
             keep_rows(&mut kept, parallel_rows, &mut results)?;
@@ -9665,14 +9662,14 @@ fn execute_varlen_traverse(
                 }
                 // Merge OCC read keys from parallel workers into the Layer-3
                 // scope via the typed per-partition extends.
-                if let Some(ref keys) = pctx.occ_read_keys {
-                    if let Some(scope) = ctx.ensure_occ_scope() {
-                        if let Ok(mut node) = keys.node.lock() {
-                            scope.extend_node_keys(node.drain(..));
-                        }
-                        if let Ok(mut ep) = keys.edge_prop.lock() {
-                            scope.extend_edge_prop_keys(ep.drain(..));
-                        }
+                if let Some(ref keys) = pctx.occ_read_keys
+                    && let Some(scope) = ctx.ensure_occ_scope()
+                {
+                    if let Ok(mut node) = keys.node.lock() {
+                        scope.extend_node_keys(node.drain(..));
+                    }
+                    if let Ok(mut ep) = keys.edge_prop.lock() {
+                        scope.extend_edge_prop_keys(ep.drain(..));
                     }
                 }
                 keep_rows(&mut kept, parallel_rows, &mut results)?;
@@ -10362,10 +10359,10 @@ fn extract_method_ident(expr: &crate::plan::expr::Expr) -> Option<(String, Strin
 fn resolve_label_for_var(rows: &[Row], variable: &str) -> Option<String> {
     let key = format!("{variable}.__label__");
     for row in rows {
-        if let Some(Value::String(s)) = row.get(&key) {
-            if !s.is_empty() {
-                return Some(s.clone());
-            }
+        if let Some(Value::String(s)) = row.get(&key)
+            && !s.is_empty()
+        {
+            return Some(s.clone());
         }
     }
     None
@@ -10402,24 +10399,23 @@ fn resolve_rank_fuse_method(
 
     // Prefer typed registry hits keyed by the variable's label.
     if let Some(label) = label_opt.as_deref() {
-        if let Some(reg) = ctx.vector_index_registry() {
-            if let Some(def) = reg.get_definition(label, &property) {
-                if let Some(cfg) = def.vector_config.as_ref() {
-                    return Ok(RankFuseMethodKind::VectorHnsw {
-                        label: label.to_string(),
-                        property,
-                        metric: cfg.metric,
-                    });
-                }
-            }
+        if let Some(reg) = ctx.vector_index_registry()
+            && let Some(def) = reg.get_definition(label, &property)
+            && let Some(cfg) = def.vector_config.as_ref()
+        {
+            return Ok(RankFuseMethodKind::VectorHnsw {
+                label: label.to_string(),
+                property,
+                metric: cfg.metric,
+            });
         }
-        if let Some(reg) = ctx.text_index_registry {
-            if reg.has_index(label, &property) {
-                return Ok(RankFuseMethodKind::TextBm25 {
-                    label: label.to_string(),
-                    property,
-                });
-            }
+        if let Some(reg) = ctx.text_index_registry
+            && reg.has_index(label, &property)
+        {
+            return Ok(RankFuseMethodKind::TextBm25 {
+                label: label.to_string(),
+                property,
+            });
         }
     }
 
@@ -10626,22 +10622,22 @@ fn execute_rank_fuse(
     }
 
     // Apply shard overfetch cap (set by a distributed plan; None in CE).
-    if let Some(cap) = shard_overfetch_cap {
-        if out_rows.len() > cap {
-            // Sort by __rrf_score__ DESC and truncate to keep best candidates.
-            out_rows.sort_by(|a, b| {
-                let sa = a.get("__rrf_score__").and_then(|v| match v {
-                    Value::Float(f) => Some(*f),
-                    _ => None,
-                });
-                let sb = b.get("__rrf_score__").and_then(|v| match v {
-                    Value::Float(f) => Some(*f),
-                    _ => None,
-                });
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    if let Some(cap) = shard_overfetch_cap
+        && out_rows.len() > cap
+    {
+        // Sort by __rrf_score__ DESC and truncate to keep best candidates.
+        out_rows.sort_by(|a, b| {
+            let sa = a.get("__rrf_score__").and_then(|v| match v {
+                Value::Float(f) => Some(*f),
+                _ => None,
             });
-            out_rows.truncate(cap);
-        }
+            let sb = b.get("__rrf_score__").and_then(|v| match v {
+                Value::Float(f) => Some(*f),
+                _ => None,
+            });
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out_rows.truncate(cap);
     }
 
     Ok(out_rows)
@@ -11525,13 +11521,13 @@ fn execute_text_filter(
             _ => None,
         };
 
-        if let Some(nid) = node_id {
-            if let Some(&score) = matching_scores.get(&nid) {
-                let mut out_row = row.clone();
-                // Store BM25 score for text_score() access in RETURN clause
-                out_row.insert("__text_score__".to_string(), Value::Float(score as f64));
-                results.push(out_row);
-            }
+        if let Some(nid) = node_id
+            && let Some(&score) = matching_scores.get(&nid)
+        {
+            let mut out_row = row.clone();
+            // Store BM25 score for text_score() access in RETURN clause
+            out_row.insert("__text_score__".to_string(), Value::Float(score as f64));
+            results.push(out_row);
         }
     }
 
@@ -11666,10 +11662,10 @@ fn execute_encrypted_filter(
             }
         });
 
-        if let Some(nid) = node_id {
-            if matching_set.contains(&nid) {
-                results.push(row.clone());
-            }
+        if let Some(nid) = node_id
+            && matching_set.contains(&nid)
+        {
+            results.push(row.clone());
         }
     }
 
@@ -12853,10 +12849,8 @@ fn execute_merge(
     //   1. Find or create source nodes (all of them).
     //   2. Find or create target nodes (all of them).
     //   3. For each (src, tgt) pair: find-or-create the relationship individually.
-    if multi {
-        if let Some(traverse) = as_traverse_op(pattern) {
-            return execute_mergemany_standalone(traverse, on_match, on_create, ctx);
-        }
+    if multi && let Some(traverse) = as_traverse_op(pattern) {
+        return execute_mergemany_standalone(traverse, on_match, on_create, ctx);
     }
 
     // Standalone relationship MERGE — no correlated_row (no preceding MATCH).
@@ -13247,12 +13241,12 @@ fn execute_merge_relationship_check(
             row.insert(format!("{ev}.__tgt__"), Value::Int(ep_tgt.as_raw() as i64));
             // Populate stored edge properties into the result row so ON MATCH SET can
             // reference them via `r.prop_name`.
-            if !edge_filters.is_empty() {
-                if let Some(prop_map) = ctx.mvcc_get_edge_props(et, ep_src, ep_tgt)? {
-                    for (field_id, value) in prop_map {
-                        if let Some(field_name) = ctx.interner.resolve(field_id) {
-                            row.insert(format!("{ev}.{field_name}"), value);
-                        }
+            if !edge_filters.is_empty()
+                && let Some(prop_map) = ctx.mvcc_get_edge_props(et, ep_src, ep_tgt)?
+            {
+                for (field_id, value) in prop_map {
+                    if let Some(field_name) = ctx.interner.resolve(field_id) {
+                        row.insert(format!("{ev}.{field_name}"), value);
                     }
                 }
             }
@@ -13807,14 +13801,14 @@ fn execute_upsert(
             for element in &create_pattern.elements {
                 if let PatternElement::Node(np) = element {
                     for lbl in &np.labels {
-                        if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
-                            if s.temporal {
-                                return Err(ExecutionError::Unsupported(format!(
-                                    "UPSERT ON CREATE into temporal label '{lbl}' is not \
-                                     yet supported. Use an explicit CREATE clause for \
-                                     temporal labels."
-                                )));
-                            }
+                        if let Ok(Some(s)) = ctx.load_current_label_schema(lbl)
+                            && s.temporal
+                        {
+                            return Err(ExecutionError::Unsupported(format!(
+                                "UPSERT ON CREATE into temporal label '{lbl}' is not \
+                                 yet supported. Use an explicit CREATE clause for \
+                                 temporal labels."
+                            )));
                         }
                     }
                 }
@@ -13962,13 +13956,13 @@ fn execute_create_from_pattern(
             // non-temporal storage, so MERGE/UPSERT on temporal labels is
             // refused until it writes per-version keys.
             for lbl in labels {
-                if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
-                    if s.temporal {
-                        return Err(ExecutionError::Unsupported(format!(
-                            "MERGE / UPSERT into temporal label '{lbl}' is not yet \
-                             supported. Use explicit CREATE for temporal labels."
-                        )));
-                    }
+                if let Ok(Some(s)) = ctx.load_current_label_schema(lbl)
+                    && s.temporal
+                {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "MERGE / UPSERT into temporal label '{lbl}' is not yet \
+                         supported. Use explicit CREATE for temporal labels."
+                    )));
                 }
             }
 
@@ -14204,17 +14198,18 @@ fn execute_create_node(
     // missing this property are rejected in STRICT and VALIDATED modes."
     // The clause is the same for every row, so it is checked once, when
     // there is a row to create.
-    if !input_rows.is_empty() && matches!(mode, SchemaMode::Strict | SchemaMode::Validated) {
-        if let Some(schema_ref) = schema.as_ref() {
-            for (prop_name, def) in &schema_ref.properties {
-                if def.not_null
-                    && def.default.is_none()
-                    && !properties.iter().any(|(n, _)| n == prop_name)
-                {
-                    return Err(ExecutionError::SchemaViolation(format!(
-                        "required property '{prop_name}' is missing in CREATE"
-                    )));
-                }
+    if !input_rows.is_empty()
+        && matches!(mode, SchemaMode::Strict | SchemaMode::Validated)
+        && let Some(schema_ref) = schema.as_ref()
+    {
+        for (prop_name, def) in &schema_ref.properties {
+            if def.not_null
+                && def.default.is_none()
+                && !properties.iter().any(|(n, _)| n == prop_name)
+            {
+                return Err(ExecutionError::SchemaViolation(format!(
+                    "required property '{prop_name}' is missing in CREATE"
+                )));
             }
         }
     }
@@ -14329,7 +14324,7 @@ fn execute_create_node(
         // `valid_to` must be strictly greater than `valid_from`. Same rule
         // as temporal edges — a zero-duration version is never useful and
         // almost certainly a user mistake.
-        if let (Some(ref tlabel), Some(vf)) = (&temporal_label, valid_from_for_key) {
+        if let (Some(tlabel), Some(vf)) = (&temporal_label, valid_from_for_key) {
             for (prop_name, expr) in properties {
                 if prop_name == "valid_to" {
                     let val = eval_neutral(expr, input_row)?;
@@ -14344,13 +14339,13 @@ fn execute_create_node(
                             )));
                         }
                     };
-                    if let Some(vt) = vt_opt {
-                        if vt <= vf {
-                            return Err(ExecutionError::Unsupported(format!(
-                                "label '{tlabel}' is TEMPORAL: valid_to ({vt}) must be strictly \
-                                 greater than valid_from ({vf})"
-                            )));
-                        }
+                    if let Some(vt) = vt_opt
+                        && vt <= vf
+                    {
+                        return Err(ExecutionError::Unsupported(format!(
+                            "label '{tlabel}' is TEMPORAL: valid_to ({vt}) must be strictly \
+                             greater than valid_from ({vf})"
+                        )));
                     }
                     break;
                 }
@@ -14570,13 +14565,13 @@ fn execute_create_edge(
             // A zero-duration version (valid_to == valid_from) is rejected too
             // — temporal_active_at would never return true for it, so it is
             // never a useful piece of data and almost certainly a bug.
-            if let (Some(vf), Some(vt)) = (valid_from_value, valid_to_value) {
-                if vt <= vf {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "temporal edge '{edge_type}': valid_to ({vt}) must be strictly \
-                         greater than valid_from ({vf})"
-                    )));
-                }
+            if let (Some(vf), Some(vt)) = (valid_from_value, valid_to_value)
+                && vt <= vf
+            {
+                return Err(ExecutionError::Unsupported(format!(
+                    "temporal edge '{edge_type}': valid_to ({vt}) must be strictly \
+                     greater than valid_from ({vf})"
+                )));
             }
             let valid_from_for_key = if is_temporal { valid_from_value } else { None };
             ctx.mvcc_put_edge_props_either(
@@ -14816,10 +14811,10 @@ fn execute_update(
                         continue;
                     }
                     // Skip valid_to (in-place) and valid_from (rejected at pre-scan).
-                    if let crate::plan::SetItem::Property { property, .. } = item {
-                        if property == "valid_to" || property == "valid_from" {
-                            continue;
-                        }
+                    if let crate::plan::SetItem::Property { property, .. } = item
+                        && (property == "valid_to" || property == "valid_from")
+                    {
+                        continue;
                     }
                     match item {
                         crate::plan::SetItem::Property { property, expr, .. } => {
@@ -15264,13 +15259,13 @@ fn execute_update(
                                 )));
                             }
                         };
-                        if let Some(vt) = new_valid_to {
-                            if vt <= valid_from {
-                                return Err(ExecutionError::Unsupported(format!(
-                                    "SET {variable}.valid_to ({vt}) must be strictly \
-                                     greater than valid_from ({valid_from})"
-                                )));
-                            }
+                        if let Some(vt) = new_valid_to
+                            && vt <= valid_from
+                        {
+                            return Err(ExecutionError::Unsupported(format!(
+                                "SET {variable}.valid_to ({vt}) must be strictly \
+                                 greater than valid_from ({valid_from})"
+                            )));
                         }
                         let mut record = ctx
                             .mvcc_get_node_temporal(ctx.shard_id, node_id, valid_from)?
@@ -16579,10 +16574,10 @@ fn execute_delete(
             // The node's B-tree entries go with it, so its unique values are
             // free for a new node. Vector and text indexes follow the
             // committed deletion on their own.
-            if ctx.btree_index_registry.is_some() {
-                if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-                    ctx.index_node_deleted(node_id, &record)?;
-                }
+            if ctx.btree_index_registry.is_some()
+                && let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)?
+            {
+                ctx.index_node_deleted(node_id, &record)?;
             }
             if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
                 ctx.release_table_key(&record)?;
@@ -16685,13 +16680,13 @@ fn execute_merge_nodes(
             let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
                 continue;
             };
-            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
-                if s.temporal {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "MERGE NODES on temporal label '{primary}' is not yet supported: \
-                         merging needs to fold per-version histories."
-                    )));
-                }
+            if let Ok(Some(s)) = ctx.load_current_label_schema(primary)
+                && s.temporal
+            {
+                return Err(ExecutionError::Unsupported(format!(
+                    "MERGE NODES on temporal label '{primary}' is not yet supported: \
+                     merging needs to fold per-version histories."
+                )));
             }
         }
     }
@@ -16800,17 +16795,17 @@ fn execute_merge_nodes(
             // STRICT this slot must be empty. Catch source-only fields that
             // were merged into the target's extra and bail rather than
             // committing an out-of-schema record.
-            if matches!(schema.mode, SchemaMode::Strict) {
-                if let Some(extra) = &target_rec.extra {
-                    for (name, val) in extra {
-                        if target_extra_before.get(name) == Some(val) {
-                            continue;
-                        }
-                        return Err(ExecutionError::SchemaViolation(format!(
-                            "MERGE NODES would set unknown property '{name}' \
-                             on strict label '{target_label}'"
-                        )));
+            if matches!(schema.mode, SchemaMode::Strict)
+                && let Some(extra) = &target_rec.extra
+            {
+                for (name, val) in extra {
+                    if target_extra_before.get(name) == Some(val) {
+                        continue;
                     }
+                    return Err(ExecutionError::SchemaViolation(format!(
+                        "MERGE NODES would set unknown property '{name}' \
+                         on strict label '{target_label}'"
+                    )));
                 }
             }
         }
@@ -17015,11 +17010,11 @@ fn execute_clone_node(
         // create path requires `valid_from` on temporal labels — injected below.
         let mut is_temporal = false;
         for lbl in &labels {
-            if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
-                if s.temporal {
-                    is_temporal = true;
-                    break;
-                }
+            if let Ok(Some(s)) = ctx.load_current_label_schema(lbl)
+                && s.temporal
+            {
+                is_temporal = true;
+                break;
             }
         }
 
@@ -17688,33 +17683,33 @@ fn transfer_edgeprop_record(
         return Ok(());
     };
 
-    if merge_with_existing {
-        if let Some(mut tgt) = ctx.mvcc_get_edge_props(edge_type, new_src, new_tgt)? {
-            // Edgeprop records are `Vec<(field_id, Value)>` of interned
-            // (field_id, value) pairs. COALESCE: non-null source fills
-            // missing/null target keys.
-            let mut tgt_index: HashMap<u32, usize> =
-                tgt.iter().enumerate().map(|(i, (k, _))| (*k, i)).collect();
-            for (k, v) in old_props {
-                if matches!(v, Value::Null) {
-                    continue;
+    if merge_with_existing
+        && let Some(mut tgt) = ctx.mvcc_get_edge_props(edge_type, new_src, new_tgt)?
+    {
+        // Edgeprop records are `Vec<(field_id, Value)>` of interned
+        // (field_id, value) pairs. COALESCE: non-null source fills
+        // missing/null target keys.
+        let mut tgt_index: HashMap<u32, usize> =
+            tgt.iter().enumerate().map(|(i, (k, _))| (*k, i)).collect();
+        for (k, v) in old_props {
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            match tgt_index.get(&k) {
+                Some(&idx) => {
+                    if matches!(tgt[idx].1, Value::Null) {
+                        tgt[idx].1 = v;
+                    }
                 }
-                match tgt_index.get(&k) {
-                    Some(&idx) => {
-                        if matches!(tgt[idx].1, Value::Null) {
-                            tgt[idx].1 = v;
-                        }
-                    }
-                    None => {
-                        tgt_index.insert(k, tgt.len());
-                        tgt.push((k, v));
-                    }
+                None => {
+                    tgt_index.insert(k, tgt.len());
+                    tgt.push((k, v));
                 }
             }
-            ctx.mvcc_put_edge_props(edge_type, new_src, new_tgt, &tgt)?;
-            ctx.mvcc_delete_edge_props(edge_type, old_src, old_tgt)?;
-            return Ok(());
         }
+        ctx.mvcc_put_edge_props(edge_type, new_src, new_tgt, &tgt)?;
+        ctx.mvcc_delete_edge_props(edge_type, old_src, old_tgt)?;
+        return Ok(());
     }
 
     // No collision (or merge not requested): simple rename.
@@ -18550,19 +18545,18 @@ fn execute_attach_document(
     // which on a temporal label needs the positive-bitemporal-fact
     // tombstone composition + cross-version edge cleanup.
     for row in input_rows {
-        if let Some(Value::String(primary)) = row.get(&format!("{source_variable}.__label__")) {
-            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
-                if s.temporal {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "ATTACH DOCUMENT on a temporal *source* (var \
-                         `{source_variable}`, label '{primary}') is not yet \
-                         supported: ATTACH cascade-deletes the source, which on \
-                         a temporal label requires the positive-bitemporal-fact \
-                         tombstone composition + cross-version edge cleanup. \
-                         ATTACH onto a temporal *target* is supported."
-                    )));
-                }
-            }
+        if let Some(Value::String(primary)) = row.get(&format!("{source_variable}.__label__"))
+            && let Ok(Some(s)) = ctx.load_current_label_schema(primary)
+            && s.temporal
+        {
+            return Err(ExecutionError::Unsupported(format!(
+                "ATTACH DOCUMENT on a temporal *source* (var \
+                 `{source_variable}`, label '{primary}') is not yet \
+                 supported: ATTACH cascade-deletes the source, which on \
+                 a temporal label requires the positive-bitemporal-fact \
+                 tombstone composition + cross-version edge cleanup. \
+                 ATTACH onto a temporal *target* is supported."
+            )));
         }
     }
 
@@ -18870,13 +18864,13 @@ fn property_set_deltas(
     use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
     let mut deltas = Vec::with_capacity(2);
     if by_name {
-        if let Some(field_id) = ctx.interner.lookup(name) {
-            if record.props.contains_key(&field_id) {
-                deltas.push(DocDelta::RemoveProperty {
-                    target: PathTarget::PropField(field_id),
-                    key: None,
-                });
-            }
+        if let Some(field_id) = ctx.interner.lookup(name)
+            && record.props.contains_key(&field_id)
+        {
+            deltas.push(DocDelta::RemoveProperty {
+                target: PathTarget::PropField(field_id),
+                key: None,
+            });
         }
         deltas.push(DocDelta::SetProperty {
             target: PathTarget::Extra,
@@ -19271,10 +19265,10 @@ fn cascade_delete_source_node(
     let pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> = ctx
         .mvcc_get_node(ctx.shard_id, source_id)?
         .map(|rec| snapshot_node_record(&rec, ctx));
-    if ctx.btree_index_registry.is_some() {
-        if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {
-            ctx.index_node_deleted(source_id, &record)?;
-        }
+    if ctx.btree_index_registry.is_some()
+        && let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)?
+    {
+        ctx.index_node_deleted(source_id, &record)?;
     }
     if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {
         ctx.release_table_key(&record)?;
@@ -21551,13 +21545,13 @@ fn execute_reindex(
             name: name.to_string(),
         }
     })?;
-    if let Some(label) = label {
-        if def.label != label {
-            return Err(ExecutionError::CatalogRefused(format!(
-                "index '{name}' is on :{}, not :{label}",
-                def.label
-            )));
-        }
+    if let Some(label) = label
+        && def.label != label
+    {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "index '{name}' is on :{}, not :{label}",
+            def.label
+        )));
     }
     if def.index_type != crate::index::IndexType::BTree {
         return Err(ExecutionError::CatalogRefused(format!(
@@ -22059,11 +22053,11 @@ pub fn stage_constraint_withdrawal(
 ) -> Result<(), coordinode_modality::StoreError> {
     use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
     let store = LocalSchemaStore::new(engine);
-    if let Some(mut latest) = store.load_label_for_update_txn(txn, label)? {
-        if latest.remove_constraint(name).is_some() {
-            latest.schema_revision = next_revision(&latest).map_err(store_error)?;
-            store.save_label_admitting_txn(txn, &latest)?;
-        }
+    if let Some(mut latest) = store.load_label_for_update_txn(txn, label)?
+        && latest.remove_constraint(name).is_some()
+    {
+        latest.schema_revision = next_revision(&latest).map_err(store_error)?;
+        store.save_label_admitting_txn(txn, &latest)?;
     }
     store.release_constraint_name_txn(txn, name)
 }
@@ -22159,10 +22153,10 @@ fn execute_drop_constraint(
     });
     ctx.forget_label_schema(&label);
     dropped?;
-    if let Some((def, _)) = &index {
-        if let Some(registry) = ctx.btree_index_registry {
-            registry.unregister(def.id);
-        }
+    if let Some((def, _)) = &index
+        && let Some(registry) = ctx.btree_index_registry
+    {
+        registry.unregister(def.id);
     }
     Ok(vec![constraint_row(&removed, &label, ("dropped", true))])
 }
@@ -22225,10 +22219,10 @@ fn execute_procedure_call(
             for (index, variable) in &bindings {
                 joined.insert(variable.clone(), result[*index].clone());
             }
-            if let Some(filter) = filter {
-                if !is_truthy(&eval_neutral_with_storage(filter, &joined, ctx)?) {
-                    continue;
-                }
+            if let Some(filter) = filter
+                && !is_truthy(&eval_neutral_with_storage(filter, &joined, ctx)?)
+            {
+                continue;
             }
             out.push(joined);
         }

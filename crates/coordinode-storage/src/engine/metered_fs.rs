@@ -216,10 +216,10 @@ impl Fs for MeteredFs {
 
     fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
         self.inner.punch_hole(path, offset, len)?;
-        if let Some(charge) = self.footprints.file(path) {
-            if let Some(allocated) = self.inner.allocated_size(path)? {
-                charge.settle(allocated);
-            }
+        if let Some(charge) = self.footprints.file(path)
+            && let Some(allocated) = self.inner.allocated_size(path)?
+        {
+            charge.settle(allocated);
         }
         Ok(())
     }

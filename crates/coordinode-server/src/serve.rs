@@ -1396,12 +1396,10 @@ pub(crate) async fn serve(
                 let key =
                     std::fs::read(key_path).map_err(|e| format!("read tls key {key_path}: {e}"))?;
                 let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert, &key));
-                if tls_require_client_auth {
-                    if let Some(ca_path) = tls_ca.as_ref() {
-                        let ca = std::fs::read(ca_path)
-                            .map_err(|e| format!("read tls ca {ca_path}: {e}"))?;
-                        tls = tls.client_ca_root(Certificate::from_pem(ca));
-                    }
+                if tls_require_client_auth && let Some(ca_path) = tls_ca.as_ref() {
+                    let ca = std::fs::read(ca_path)
+                        .map_err(|e| format!("read tls ca {ca_path}: {e}"))?;
+                    tls = tls.client_ca_root(Certificate::from_pem(ca));
                 }
                 server = server
                     .tls_config(tls)

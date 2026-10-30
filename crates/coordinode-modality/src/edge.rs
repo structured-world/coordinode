@@ -614,15 +614,15 @@ impl EdgeStore for LocalEdgeStore {
         let rev_key = encode_adj_key_reverse(edge_type, tgt);
         txn.merge_adj_add(&fwd_key, tgt.as_raw());
         txn.merge_adj_add(&rev_key, src.as_raw());
-        if let Some(p) = props {
-            if !p.is_empty() {
-                let body = Self::encode_props(p)?;
-                txn.put(
-                    Partition::EdgeProp,
-                    &encode_edgeprop_key(edge_type, src, tgt),
-                    &body,
-                )?;
-            }
+        if let Some(p) = props
+            && !p.is_empty()
+        {
+            let body = Self::encode_props(p)?;
+            txn.put(
+                Partition::EdgeProp,
+                &encode_edgeprop_key(edge_type, src, tgt),
+                &body,
+            )?;
         }
         Ok(())
     }
@@ -1081,10 +1081,10 @@ impl EdgeStore for LocalEdgeStore {
         let bound = upper_ms.map(|ms| valid_from_upper_bound_key(edge_type, src, tgt, ms));
         let mut out = Vec::new();
         for (key, bytes) in scanned {
-            if let Some(ref b) = bound {
-                if &key >= b {
-                    continue;
-                }
+            if let Some(ref b) = bound
+                && &key >= b
+            {
+                continue;
             }
             if let Some((_, _, _, vf)) = decode_temporal_edgeprop_key(&key) {
                 out.push((vf, bytes));

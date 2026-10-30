@@ -517,15 +517,15 @@ fn bind_enrollment(
         bound,
         asked: enrollment.deployment,
     };
-    if let Some(recorded) = *state_machine.subscribe_deployment().borrow() {
-        if recorded != enrollment.deployment {
-            return Err(refuse(recorded));
-        }
+    if let Some(recorded) = *state_machine.subscribe_deployment().borrow()
+        && recorded != enrollment.deployment
+    {
+        return Err(refuse(recorded));
     }
-    if let Some(bound) = enrolled_deployment(engine)? {
-        if bound != enrollment.deployment {
-            return Err(refuse(bound));
-        }
+    if let Some(bound) = enrolled_deployment(engine)?
+        && bound != enrollment.deployment
+    {
+        return Err(refuse(bound));
     }
     // The authorities first: a recorded deployment then always comes with
     // the members to ask about it.
@@ -1148,13 +1148,12 @@ impl RaftNode {
         // store is in; a store recorded in another is not served under it.
         if let (Some(named), Some(recorded)) =
             (forming_in, *state_machine.subscribe_deployment().borrow())
+            && named != recorded
         {
-            if named != recorded {
-                return Err(RaftNodeError::OtherDeployment {
-                    bound: recorded,
-                    asked: named,
-                });
-            }
+            return Err(RaftNodeError::OtherDeployment {
+                bound: recorded,
+                asked: named,
+            });
         }
         // A store enrolled earlier stays a member of the group it joined,
         // however it is opened now and whether or not that group's log has
@@ -1854,12 +1853,11 @@ impl RaftNode {
         let member = {
             let rx = self.raft.metrics();
             let metrics = rx.borrow_watched();
-            let known = metrics
+            metrics
                 .membership_config
                 .membership()
                 .get_node(&node_id)
-                .is_some();
-            known
+                .is_some()
         };
         let learner = member && !voting.contains(&node_id);
 
@@ -2454,7 +2452,7 @@ impl RaftNode {
             .membership_config
             .membership()
             .nodes()
-            .filter(|(&id, _)| id != self.node_id)
+            .filter(|&(&id, _)| id != self.node_id)
             .filter_map(|(_, node)| admission::member_target(node))
             .collect()
     }
@@ -2743,12 +2741,11 @@ impl RaftNode {
         use openraft::async_runtime::watch::WatchReceiver;
 
         let metrics = self.raft.metrics().borrow_watched().clone();
-        let peers = metrics
+        metrics
             .membership_config
             .membership()
             .voter_ids()
-            .any(|id| id != self.node_id);
-        peers
+            .any(|id| id != self.node_id)
     }
 
     /// Stop the node. A member of a group with other voters shuts down
@@ -2787,13 +2784,12 @@ impl RaftNode {
         let sender = self.grpc_shutdown.lock().ok().and_then(|mut g| g.take());
         drop(sender);
         let task = self.grpc_task.lock().ok().and_then(|mut g| g.take());
-        if let Some(mut task) = task {
-            if tokio::time::timeout(std::time::Duration::from_millis(500), &mut task)
+        if let Some(mut task) = task
+            && tokio::time::timeout(std::time::Duration::from_millis(500), &mut task)
                 .await
                 .is_err()
-            {
-                task.abort();
-            }
+        {
+            task.abort();
         }
 
         // What openraft spawned can outlive its core and hold the engine: a

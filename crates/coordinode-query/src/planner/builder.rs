@@ -638,7 +638,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 .exprs
                 .iter()
                 .filter_map(|e| {
-                    if let Expr::Variable(ref v) = e {
+                    if let Expr::Variable(v) = e {
                         Some(v.clone())
                     } else {
                         None
@@ -1293,25 +1293,18 @@ pub fn optimize_index_selection(
                 ref labels,
                 ref property_filters,
             } = *input
+                && labels.len() == 1
+                && property_filters.is_empty()
+                && let crate::plan::expr::Expr::Binary {
+                    ref left,
+                    op: crate::plan::expr::BinOp::Eq,
+                    ref right,
+                } = predicate
+                && let Some(prop) = extract_index_property(left, variable)
+                && !expr_references_var(right, variable)
+                && let Some(scan) = try_index_rewrite(variable, &labels[0], &prop, right, registry)
             {
-                if labels.len() == 1 && property_filters.is_empty() {
-                    if let crate::plan::expr::Expr::Binary {
-                        ref left,
-                        op: crate::plan::expr::BinOp::Eq,
-                        ref right,
-                    } = predicate
-                    {
-                        if let Some(prop) = extract_index_property(left, variable) {
-                            if !expr_references_var(right, variable) {
-                                if let Some(scan) =
-                                    try_index_rewrite(variable, &labels[0], &prop, right, registry)
-                                {
-                                    return scan;
-                                }
-                            }
-                        }
-                    }
-                }
+                return scan;
             }
             // Correlated equality lifted above a join (later MATCH on a prior
             // binding): pull it into a correlated IndexScan on the right side.
@@ -1334,10 +1327,10 @@ pub fn optimize_index_selection(
             property_filters,
         } if labels.len() == 1 && property_filters.len() == 1 => {
             let (prop, key) = &property_filters[0];
-            if !expr_references_var(key, &variable) {
-                if let Some(scan) = try_index_rewrite(&variable, &labels[0], prop, key, registry) {
-                    return scan;
-                }
+            if !expr_references_var(key, &variable)
+                && let Some(scan) = try_index_rewrite(&variable, &labels[0], prop, key, registry)
+            {
+                return scan;
             }
             LogicalOp::NodeScan {
                 variable,
@@ -1976,16 +1969,18 @@ pub fn apply_text_index_scan_access_path(
     ) = (input.as_ref(), &text_expr)
     {
         let on_scanned = matches!(base.as_ref(), Expr::Variable(v) if v == variable);
-        if let [label] = labels.as_slice() {
-            if on_scanned && property_filters.is_empty() && registry.has_index(label, key) {
-                return LogicalOp::TextIndexScan {
-                    label: label.clone(),
-                    property: key.clone(),
-                    binding: variable.clone(),
-                    query_string,
-                    language,
-                };
-            }
+        if let [label] = labels.as_slice()
+            && on_scanned
+            && property_filters.is_empty()
+            && registry.has_index(label, key)
+        {
+            return LogicalOp::TextIndexScan {
+                label: label.clone(),
+                property: key.clone(),
+                binding: variable.clone(),
+                query_string,
+                language,
+            };
         }
     }
     LogicalOp::TextFilter {
@@ -2390,10 +2385,10 @@ fn extract_predicate_leaves(
             let op_forward = numeric_cmp_from_op(*cmp);
             if let Some(leaf) = property_cmp_leaf(left, right, variable, op_forward) {
                 out.push(leaf);
-            } else if let Some(flipped) = flip_numeric_cmp(*cmp) {
-                if let Some(leaf) = property_cmp_leaf(right, left, variable, flipped) {
-                    out.push(leaf);
-                }
+            } else if let Some(flipped) = flip_numeric_cmp(*cmp)
+                && let Some(leaf) = property_cmp_leaf(right, left, variable, flipped)
+            {
+                out.push(leaf);
             }
         }
         _ => {}
@@ -3250,16 +3245,16 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
         //
         // This happens for: `MATCH (n) RETURN n.name ORDER BY vector_distance(n.emb,...) LIMIT K`
         // — Project drops `n.embedding`, so VectorTopK input rows don't have it.
-        if let LogicalOp::Project { items, .. } = sort_input.as_ref() {
-            if !project_preserves_vector_expr(&vector_expr, items) {
-                return LogicalOp::Limit {
-                    input: Box::new(LogicalOp::Sort {
-                        input: sort_input,
-                        items: vec![sort_item],
-                    }),
-                    count,
-                };
-            }
+        if let LogicalOp::Project { items, .. } = sort_input.as_ref()
+            && !project_preserves_vector_expr(&vector_expr, items)
+        {
+            return LogicalOp::Limit {
+                input: Box::new(LogicalOp::Sort {
+                    input: sort_input,
+                    items: vec![sort_item],
+                }),
+                count,
+            };
         }
 
         return LogicalOp::VectorTopK {
@@ -3288,16 +3283,16 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
         // would see rows missing the multi-vector and score zero. The
         // generic Sort + Limit path computes against the original row
         // which still binds the variable. Fall back in that case.
-        if let LogicalOp::Project { items, .. } = sort_input.as_ref() {
-            if !project_preserves_vector_expr(&doc_expr, items) {
-                return LogicalOp::Limit {
-                    input: Box::new(LogicalOp::Sort {
-                        input: sort_input,
-                        items: vec![sort_item],
-                    }),
-                    count,
-                };
-            }
+        if let LogicalOp::Project { items, .. } = sort_input.as_ref()
+            && !project_preserves_vector_expr(&doc_expr, items)
+        {
+            return LogicalOp::Limit {
+                input: Box::new(LogicalOp::Sort {
+                    input: sort_input,
+                    items: vec![sort_item],
+                }),
+                count,
+            };
         }
         return LogicalOp::MaxSimTopK {
             input: sort_input,
@@ -3327,45 +3322,43 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
             let matching_idx = items
                 .iter()
                 .position(|it| it.alias.as_ref() == Some(&alias));
-            if let Some(idx) = matching_idx {
-                if let Some((vector_expr, query_vector, function)) =
+            if let Some(idx) = matching_idx
+                && let Some((vector_expr, query_vector, function)) =
                     match_vector_distance_call(&items[idx].expr)
-                {
-                    if is_valid_direction(&function, sort_item.ascending) {
-                        // Remove the vector_distance item from the Project items;
-                        // VectorTopK will write the alias directly into result rows.
-                        // Preserve other Project items by wrapping VectorTopK in a
-                        // replacement Project.
-                        let mut other_items: Vec<ProjectItem> = items
-                            .into_iter()
-                            .enumerate()
-                            .filter_map(|(i, it)| if i == idx { None } else { Some(it) })
-                            .collect();
-                        // Ensure the alias is still projected as a passthrough so
-                        // downstream operators see it.
-                        other_items.push(ProjectItem {
-                            expr: crate::plan::expr::Expr::Variable(alias.clone()),
-                            alias: Some(alias.clone()),
-                        });
+                && is_valid_direction(&function, sort_item.ascending)
+            {
+                // Remove the vector_distance item from the Project items;
+                // VectorTopK will write the alias directly into result rows.
+                // Preserve other Project items by wrapping VectorTopK in a
+                // replacement Project.
+                let mut other_items: Vec<ProjectItem> = items
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, it)| if i == idx { None } else { Some(it) })
+                    .collect();
+                // Ensure the alias is still projected as a passthrough so
+                // downstream operators see it.
+                other_items.push(ProjectItem {
+                    expr: crate::plan::expr::Expr::Variable(alias.clone()),
+                    alias: Some(alias.clone()),
+                });
 
-                        let top_k = LogicalOp::VectorTopK {
-                            input: proj_input,
-                            vector_expr,
-                            query_vector,
-                            function,
-                            k,
-                            distance_alias: Some(alias),
-                            hnsw_index: None,
-                            predicate: None,
-                        };
+                let top_k = LogicalOp::VectorTopK {
+                    input: proj_input,
+                    vector_expr,
+                    query_vector,
+                    function,
+                    k,
+                    distance_alias: Some(alias),
+                    hnsw_index: None,
+                    predicate: None,
+                };
 
-                        return LogicalOp::Project {
-                            input: Box::new(top_k),
-                            items: other_items,
-                            distinct,
-                        };
-                    }
-                }
+                return LogicalOp::Project {
+                    input: Box::new(top_k),
+                    items: other_items,
+                    distinct,
+                };
             }
 
             // Pattern B didn't match — rebuild original tree.
@@ -3447,10 +3440,12 @@ fn project_preserves_vector_expr(
                 base: item_inner,
                 key: item_prop,
             } => {
-                if let PExpr::Variable(item_var) = item_inner.as_ref() {
-                    if item_var == var_name && item_prop == property && item.alias.is_none() {
-                        return true;
-                    }
+                if let PExpr::Variable(item_var) = item_inner.as_ref()
+                    && item_var == var_name
+                    && item_prop == property
+                    && item.alias.is_none()
+                {
+                    return true;
                 }
             }
             _ => {}
@@ -3464,14 +3459,14 @@ fn project_preserves_vector_expr(
 fn match_vector_distance_call(
     expr: &crate::plan::expr::Expr,
 ) -> Option<(crate::plan::expr::Expr, crate::plan::expr::Expr, String)> {
-    if let crate::plan::expr::Expr::Call { name, args, .. } = expr {
-        if matches!(
+    if let crate::plan::expr::Expr::Call { name, args, .. } = expr
+        && matches!(
             name.as_str(),
             "vector_distance" | "vector_similarity" | "vector_dot" | "vector_manhattan"
-        ) && args.len() == 2
-        {
-            return Some((args[0].clone(), args[1].clone(), name.clone()));
-        }
+        )
+        && args.len() == 2
+    {
+        return Some((args[0].clone(), args[1].clone(), name.clone()));
     }
     None
 }
@@ -3482,10 +3477,11 @@ fn match_vector_distance_call(
 fn match_maxsim_score_call(
     expr: &crate::plan::expr::Expr,
 ) -> Option<(crate::plan::expr::Expr, crate::plan::expr::Expr)> {
-    if let crate::plan::expr::Expr::Call { name, args, .. } = expr {
-        if name == "maxsim_score" && args.len() == 2 {
-            return Some((args[0].clone(), args[1].clone()));
-        }
+    if let crate::plan::expr::Expr::Call { name, args, .. } = expr
+        && name == "maxsim_score"
+        && args.len() == 2
+    {
+        return Some((args[0].clone(), args[1].clone()));
     }
     None
 }
@@ -3519,12 +3515,11 @@ fn reconstruct_limit_sort(
 
 /// Extract the property name if `expr` is `variable.property`.
 fn extract_variable_property(expr: &crate::plan::expr::Expr, variable: &str) -> Option<String> {
-    if let crate::plan::expr::Expr::Property { base, key } = expr {
-        if let crate::plan::expr::Expr::Variable(var) = base.as_ref() {
-            if var == variable {
-                return Some(key.clone());
-            }
-        }
+    if let crate::plan::expr::Expr::Property { base, key } = expr
+        && let crate::plan::expr::Expr::Variable(var) = base.as_ref()
+        && var == variable
+    {
+        return Some(key.clone());
     }
     None
 }
@@ -3696,12 +3691,11 @@ fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
     // one-hop `p = (a)-[:R]->(b)`): bind the route on the lone Traverse so the
     // executor reconstructs it. Multi-relationship linear named paths are not
     // yet projected (the path would have to span multiple Traverse ops).
-    if let Some(pv) = &pattern.path_variable {
-        if pattern.elements.len() == 3 {
-            if let LogicalOp::Traverse { path_variable, .. } = &mut result {
-                *path_variable = Some(pv.clone());
-            }
-        }
+    if let Some(pv) = &pattern.path_variable
+        && pattern.elements.len() == 3
+        && let LogicalOp::Traverse { path_variable, .. } = &mut result
+    {
+        *path_variable = Some(pv.clone());
     }
 
     Ok(result)
@@ -5048,41 +5042,42 @@ fn conjoin_predicates(mut predicates: Vec<Expr>) -> Expr {
 }
 
 fn try_extract_text_filter(expr: &Expr, input: LogicalOp) -> Option<LogicalOp> {
-    if let Expr::FunctionCall { name, args, .. } = expr {
-        if name == "text_match" && (args.len() == 2 || args.len() == 3) {
-            // Second arg must be a string literal (query string)
-            if let Expr::Literal(Value::String(query_str)) = &args[1] {
-                // Optional third arg: language string literal
-                let language = if args.len() == 3 {
-                    if let Expr::Literal(Value::String(lang)) = &args[2] {
-                        Some(lang.clone())
-                    } else {
-                        return None; // 3rd arg must be string literal
-                    }
-                } else {
-                    None
-                };
-                return Some(LogicalOp::TextFilter {
-                    input: Box::new(input),
-                    text_expr: super::lower_expr(&args[0]).ok()?,
-                    query_string: query_str.clone(),
-                    language,
-                });
+    if let Expr::FunctionCall { name, args, .. } = expr
+        && name == "text_match"
+        && (args.len() == 2 || args.len() == 3)
+        // Second arg must be a string literal (query string)
+        && let Expr::Literal(Value::String(query_str)) = &args[1]
+    {
+        // Optional third arg: language string literal
+        let language = if args.len() == 3 {
+            if let Expr::Literal(Value::String(lang)) = &args[2] {
+                Some(lang.clone())
+            } else {
+                return None; // 3rd arg must be string literal
             }
-        }
+        } else {
+            None
+        };
+        return Some(LogicalOp::TextFilter {
+            input: Box::new(input),
+            text_expr: super::lower_expr(&args[0]).ok()?,
+            query_string: query_str.clone(),
+            language,
+        });
     }
     None
 }
 
 fn try_extract_encrypted_filter(expr: &Expr, input: LogicalOp) -> Option<LogicalOp> {
-    if let Expr::FunctionCall { name, args, .. } = expr {
-        if name == "encrypted_match" && args.len() == 2 {
-            return Some(LogicalOp::EncryptedFilter {
-                input: Box::new(input),
-                field_expr: super::lower_expr(&args[0]).ok()?,
-                token_expr: super::lower_expr(&args[1]).ok()?,
-            });
-        }
+    if let Expr::FunctionCall { name, args, .. } = expr
+        && name == "encrypted_match"
+        && args.len() == 2
+    {
+        return Some(LogicalOp::EncryptedFilter {
+            input: Box::new(input),
+            field_expr: super::lower_expr(&args[0]).ok()?,
+            token_expr: super::lower_expr(&args[1]).ok()?,
+        });
     }
     None
 }
@@ -5249,10 +5244,10 @@ fn neutral_expr_contains_call(expr: &crate::plan::expr::Expr, pred: &dyn Fn(&str
 fn match_fusion_call_neutral(
     expr: &crate::plan::expr::Expr,
 ) -> Option<(FusionScalar, &[crate::plan::expr::Expr])> {
-    if let crate::plan::expr::Expr::Call { name, args, .. } = expr {
-        if let Some(kind) = FusionScalar::from_name(name) {
-            return Some((kind, args));
-        }
+    if let crate::plan::expr::Expr::Call { name, args, .. } = expr
+        && let Some(kind) = FusionScalar::from_name(name)
+    {
+        return Some((kind, args));
     }
     None
 }
@@ -5484,15 +5479,15 @@ fn collect_rrf_sig_in_expr_neutral(
 
 fn rewrite_rrf_in_expr_neutral(expr: &mut crate::plan::expr::Expr) {
     use crate::plan::expr::Expr as PExpr;
-    if let PExpr::Call { name, .. } = expr {
-        if let Some(kind) = FusionScalar::from_name(name) {
-            let column = match kind {
-                FusionScalar::Rrf => "__rrf_score__",
-                FusionScalar::Cc | FusionScalar::Dbsf => "__hybrid_score__",
-            };
-            *expr = PExpr::Variable(column.to_string());
-            return;
-        }
+    if let PExpr::Call { name, .. } = expr
+        && let Some(kind) = FusionScalar::from_name(name)
+    {
+        let column = match kind {
+            FusionScalar::Rrf => "__rrf_score__",
+            FusionScalar::Cc | FusionScalar::Dbsf => "__hybrid_score__",
+        };
+        *expr = PExpr::Variable(column.to_string());
+        return;
     }
     match expr {
         PExpr::Binary { left, right, .. } => {
@@ -5836,10 +5831,10 @@ fn default_doc_weight(value: f64) -> crate::plan::expr::Expr {
 // ---- Neutral-IR twins of the doc-score rewrite machinery (Project path) ----
 
 fn match_doc_score_neutral(expr: &crate::plan::expr::Expr) -> Option<&[crate::plan::expr::Expr]> {
-    if let crate::plan::expr::Expr::Call { name, args, .. } = expr {
-        if name == "doc_score" {
-            return Some(args);
-        }
+    if let crate::plan::expr::Expr::Call { name, args, .. } = expr
+        && name == "doc_score"
+    {
+        return Some(args);
     }
     None
 }
@@ -5980,11 +5975,11 @@ fn collect_doc_sig_in_expr_neutral(
 
 fn rewrite_doc_in_expr_neutral(expr: &mut crate::plan::expr::Expr) {
     use crate::plan::expr::Expr as PExpr;
-    if let PExpr::Call { name, .. } = expr {
-        if name == "doc_score" {
-            *expr = PExpr::Variable("__doc_score__".to_string());
-            return;
-        }
+    if let PExpr::Call { name, .. } = expr
+        && name == "doc_score"
+    {
+        *expr = PExpr::Variable("__doc_score__".to_string());
+        return;
     }
     match expr {
         PExpr::Binary { left, right, .. } => {

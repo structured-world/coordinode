@@ -61,14 +61,14 @@ fn snapshot_at_10_timestamps_returns_correct_value() {
         let expected_val = format!("v{i}");
         let mut found = false;
         for (_key, value) in &nodes {
-            if let Ok(record) = NodeRecord::from_msgpack(value) {
-                if record.labels.contains(&"Versioned".to_string()) {
-                    // Find the "val" property by scanning interned props
-                    for prop_val in record.props.values() {
-                        if *prop_val == Value::String(expected_val.clone()) {
-                            found = true;
-                            break;
-                        }
+            if let Ok(record) = NodeRecord::from_msgpack(value)
+                && record.labels.contains(&"Versioned".to_string())
+            {
+                // Find the "val" property by scanning interned props
+                for prop_val in record.props.values() {
+                    if *prop_val == Value::String(expected_val.clone()) {
+                        found = true;
+                        break;
                     }
                 }
             }

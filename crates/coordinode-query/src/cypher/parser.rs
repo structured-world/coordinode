@@ -1052,10 +1052,10 @@ fn build_create_text_index_clause(
 /// Extract a string literal value from a rule that contains a string_literal child.
 fn extract_string_literal(pair: &Pair<'_, Rule>) -> Option<String> {
     for inner in pair.clone().into_inner() {
-        if inner.as_rule() == Rule::string_literal {
-            if let Some(content) = inner.into_inner().next() {
-                return Some(content.as_str().to_string());
-            }
+        if inner.as_rule() == Rule::string_literal
+            && let Some(content) = inner.into_inner().next()
+        {
+            return Some(content.as_str().to_string());
         }
     }
     None
@@ -2396,10 +2396,10 @@ fn build_redirect_edges_clause(pair: Pair<'_, Rule>) -> Result<RedirectEdgesClau
             Rule::redirect_type_filter => {
                 let mut types = Vec::new();
                 for c in inner.into_inner() {
-                    if c.as_rule() == Rule::string_literal {
-                        if let Ok(Expr::Literal(Value::String(s))) = build_string_literal(c) {
-                            types.push(s);
-                        }
+                    if c.as_rule() == Rule::string_literal
+                        && let Ok(Expr::Literal(Value::String(s))) = build_string_literal(c)
+                    {
+                        types.push(s);
                     }
                 }
                 edge_types = Some(types);

@@ -272,10 +272,10 @@ impl Drop for PrefetchingReserver {
             state.stop = true;
             self.shared.wake.notify_one();
         }
-        if let Some(worker) = self.worker.take() {
-            if worker.join().is_err() {
-                tracing::error!("the NodeId lease worker panicked");
-            }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("the NodeId lease worker panicked");
         }
     }
 }

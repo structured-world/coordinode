@@ -2092,8 +2092,8 @@ impl LocalIndexStore<'_> {
     ) -> StoreResult<
         impl Iterator<
             Item = StoreResult<(
-                impl core::ops::Deref<Target = [u8]>,
-                impl core::ops::Deref<Target = [u8]>,
+                impl core::ops::Deref<Target = [u8]> + use<>,
+                impl core::ops::Deref<Target = [u8]> + use<>,
             )>,
         > + use<>,
     > {

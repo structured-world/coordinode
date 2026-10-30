@@ -181,12 +181,12 @@ impl TryFrom<CompressionFile> for CompressionSettings {
 
     fn try_from(file: CompressionFile) -> Result<Self, String> {
         // Levels run 0..=6, so 7 puts every level on the hot codec.
-        if let Some(threshold) = file.cold_level_threshold {
-            if threshold > 7 {
-                return Err(format!(
-                    "storage.compression.cold_level_threshold: {threshold} is past the last level (7)"
-                ));
-            }
+        if let Some(threshold) = file.cold_level_threshold
+            && threshold > 7
+        {
+            return Err(format!(
+                "storage.compression.cold_level_threshold: {threshold} is past the last level (7)"
+            ));
         }
         let mut partitions = Vec::with_capacity(file.partitions.len());
         for (name, codec) in file.partitions {

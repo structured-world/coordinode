@@ -247,10 +247,10 @@ pub(crate) fn plan(
     // A commit usually writes one or two types, so a short list beats a set.
     let mut types: Vec<&str> = Vec::new();
     for (key, _) in staged {
-        if let Some((edge_type, _, _)) = adj_parts(key) {
-            if !types.contains(&edge_type) {
-                types.push(edge_type);
-            }
+        if let Some((edge_type, _, _)) = adj_parts(key)
+            && !types.contains(&edge_type)
+        {
+            types.push(edge_type);
         }
     }
     for (part, key) in staged_points.keys() {
@@ -259,10 +259,10 @@ pub(crate) fn plan(
             Partition::EdgeProp => split_discriminated_edgeprop_key(key).map(|(t, _, _, _)| t),
             _ => None,
         };
-        if let Some(edge_type) = edge_type {
-            if !types.contains(&edge_type) {
-                types.push(edge_type);
-            }
+        if let Some(edge_type) = edge_type
+            && !types.contains(&edge_type)
+        {
+            types.push(edge_type);
         }
     }
     let mut counts = CommitCounts::default();

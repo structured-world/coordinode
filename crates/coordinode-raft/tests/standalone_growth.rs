@@ -74,10 +74,10 @@ async fn await_leadership(node: &RaftNode) {
 
 async fn await_value(engine: &StorageEngine, key: &[u8], expected: &[u8]) -> bool {
     for _ in 0..150 {
-        if let Ok(Some(v)) = engine.get(Partition::Node, key) {
-            if v.as_ref() == expected {
-                return true;
-            }
+        if let Ok(Some(v)) = engine.get(Partition::Node, key)
+            && v.as_ref() == expected
+        {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -108,13 +108,12 @@ fn put(node: &RaftNode, ids: &ProposalIdGenerator, key: &str, value: &str, commi
 fn member_addr(node: &RaftNode, node_id: u64) -> Option<String> {
     let rx = node.raft().metrics();
     let metrics = rx.borrow_watched();
-    let addr = metrics
+    metrics
         .membership_config
         .membership()
         .nodes()
         .find(|(id, _)| **id == node_id)
-        .map(|(_, info)| info.addr.clone());
-    addr
+        .map(|(_, info)| info.addr.clone())
 }
 
 fn voters(node: &RaftNode) -> Vec<u64> {

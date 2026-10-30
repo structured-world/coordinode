@@ -168,10 +168,10 @@ impl VectorBuild<'_> {
                     // write the maintainer left to the build. They are in the
                     // graphs now; the maintainer has every later one.
                     for target in self.targets {
-                        if target.health.mark_ready_after_handover() {
-                            if let Some(fresh) = fresh {
-                                target.health.advance_indexed_hlc(fresh);
-                            }
+                        if target.health.mark_ready_after_handover()
+                            && let Some(fresh) = fresh
+                        {
+                            target.health.advance_indexed_hlc(fresh);
                         }
                     }
                     return Ok(outcome);

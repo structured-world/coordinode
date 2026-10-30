@@ -440,10 +440,10 @@ pub fn entry_passes(entry: &OplogEntry, filters: &CdcFilters) -> bool {
 /// filters.
 fn passes_filter(entry: &OplogEntry, ops: &[OplogOp], filters: &CdcFilters) -> bool {
     // is_migration filter
-    if let Some(expected_migration) = filters.is_migration {
-        if entry.is_migration != expected_migration {
-            return false;
-        }
+    if let Some(expected_migration) = filters.is_migration
+        && entry.is_migration != expected_migration
+    {
+        return false;
     }
 
     // edge_types filter: deliver entry only if at least one op touches an

@@ -67,10 +67,10 @@ fn row_to_vector_result(
     let mut properties: std::collections::HashMap<String, common::PropertyValue> =
         std::collections::HashMap::new();
     for (k, v) in &row {
-        if let Some(prop_name) = k.strip_prefix("n.") {
-            if !prop_name.starts_with("__") {
-                properties.insert(prop_name.to_string(), value_to_proto_pub(v));
-            }
+        if let Some(prop_name) = k.strip_prefix("n.")
+            && !prop_name.starts_with("__")
+        {
+            properties.insert(prop_name.to_string(), value_to_proto_pub(v));
         }
     }
     Some(query::VectorResult {
@@ -127,10 +127,10 @@ fn index_health_to_proto(
 /// header so a client library can read it without decoding the body. No-op
 /// when the query did not run against a managed HNSW index.
 fn set_indexed_hlc_header<T>(resp: &mut Response<T>, health: Option<&query::VectorIndexHealth>) {
-    if let Some(h) = health {
-        if let Ok(val) = h.indexed_hlc.to_string().parse() {
-            resp.metadata_mut().insert("coordinode-indexed-hlc", val);
-        }
+    if let Some(h) = health
+        && let Ok(val) = h.indexed_hlc.to_string().parse()
+    {
+        resp.metadata_mut().insert("coordinode-indexed-hlc", val);
     }
 }
 

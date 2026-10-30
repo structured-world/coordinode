@@ -1252,10 +1252,10 @@ pub(crate) fn kernels() -> Kernels {
     *CHOSEN.get_or_init(|| {
         let sets = Kernels::available();
         #[cfg(feature = "kernel-select")]
-        if let Ok(name) = std::env::var("COORDINODE_VECTOR_EXACT_KERNELS") {
-            if let Some(set) = sets.iter().find(|set| set.name() == name) {
-                return *set;
-            }
+        if let Ok(name) = std::env::var("COORDINODE_VECTOR_EXACT_KERNELS")
+            && let Some(set) = sets.iter().find(|set| set.name() == name)
+        {
+            return *set;
         }
         sets.last().copied().unwrap_or(Kernels::Scalar)
     })

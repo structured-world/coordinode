@@ -163,10 +163,10 @@ impl<'a> Evaluation<'a> {
             .prefix_scan(Partition::Schema, EDGE_TYPE_SCHEMA_KEY_PREFIX)?
         {
             let (key, _) = guard.into_inner()?;
-            if let Some(name) = decode_edge_type_schema_key_name(&key) {
-                if !types.iter().any(|t| t == name) {
-                    types.push(name.to_string());
-                }
+            if let Some(name) = decode_edge_type_schema_key_name(&key)
+                && !types.iter().any(|t| t == name)
+            {
+                types.push(name.to_string());
             }
         }
         Ok(self.edge_types.get_or_init(|| types))
@@ -199,16 +199,14 @@ impl<'a> Evaluation<'a> {
                 // the scope's count proves a lower bound by its own change,
                 // without folding the scope's count, which on a node many
                 // writers add to is a long chain of changes.
-                if *bound == coordinode_core::txn::invariant::CardinalityBound::AtLeastOne {
-                    if let Some(kept) = self.kept_counts {
-                        if crate::engine::cardinality::kept_change(
-                            engine, *node, edge_type, *direction, *measure, kept,
-                        )?
-                        .is_some_and(|change| change >= 1)
-                        {
-                            return Ok(Verdict::Holds);
-                        }
-                    }
+                if *bound == coordinode_core::txn::invariant::CardinalityBound::AtLeastOne
+                    && let Some(kept) = self.kept_counts
+                    && crate::engine::cardinality::kept_change(
+                        engine, *node, edge_type, *direction, *measure, kept,
+                    )?
+                    .is_some_and(|change| change >= 1)
+                {
+                    return Ok(Verdict::Holds);
                 }
                 let kept = match self.kept_counts {
                     Some(kept) => crate::engine::cardinality::kept_count(
@@ -503,10 +501,10 @@ pub fn uncovered_holders(
         if *part != Partition::Node || !key.starts_with(&prefix) {
             continue;
         }
-        if let Some(bytes) = value {
-            if let Some(held) = holder(key, bytes)? {
-                return Ok(held);
-            }
+        if let Some(bytes) = value
+            && let Some(held) = holder(key, bytes)?
+        {
+            return Ok(held);
         }
     }
     Ok(Verdict::Holds)
@@ -935,10 +933,10 @@ pub fn first_label_schema_violation(
         if *part != Partition::Node || !is_node_record_key(key) {
             continue;
         }
-        if let Some(bytes) = value {
-            if let Some(violation) = check(key, bytes)? {
-                return Ok(Some(violation));
-            }
+        if let Some(bytes) = value
+            && let Some(violation) = check(key, bytes)?
+        {
+            return Ok(Some(violation));
         }
     }
     Ok(None)
@@ -991,10 +989,10 @@ pub fn first_node_breaking_label_kind(
         if *part != Partition::Node || !is_node_record_key(key) {
             continue;
         }
-        if let Some(bytes) = value {
-            if breaks(bytes)? {
-                return Ok(Some(node_of_record_key(key)));
-            }
+        if let Some(bytes) = value
+            && breaks(bytes)?
+        {
+            return Ok(Some(node_of_record_key(key)));
         }
     }
     Ok(None)
@@ -1291,14 +1289,14 @@ fn endpoint_alive(
     // lookup key has to be built by cloning, and an attempt that staged no
     // point writes at all (every plain edge attachment) would pay that
     // allocation to look inside an empty map.
-    if !staged_points.is_empty() {
-        if let Some(staged) = staged_points.get(&(Partition::Node, key.clone())) {
-            return Ok(if staged.is_some() {
-                Verdict::Holds
-            } else {
-                Verdict::Broken
-            });
-        }
+    if !staged_points.is_empty()
+        && let Some(staged) = staged_points.get(&(Partition::Node, key.clone()))
+    {
+        return Ok(if staged.is_some() {
+            Verdict::Holds
+        } else {
+            Verdict::Broken
+        });
     }
 
     // The ordinary answer is decided without reading the node at all. Nobody

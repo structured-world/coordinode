@@ -51,39 +51,38 @@ fn detect_missing_index(
             if let LogicalOp::NodeScan {
                 labels, variable, ..
             } = input.as_ref()
+                && !labels.is_empty()
             {
-                if !labels.is_empty() {
-                    // Extract property names referenced in the filter predicate
-                    let props = extract_property_accesses(predicate, variable);
-                    for prop in props {
-                        let label = &labels[0];
+                // Extract property names referenced in the filter predicate
+                let props = extract_property_accesses(predicate, variable);
+                for prop in props {
+                    let label = &labels[0];
 
-                        // Skip if an index already covers this label+property
-                        if let Some(reg) = registry {
-                            if !reg.indexes_for_property(label, &prop).is_empty() {
-                                continue;
-                            }
-                        }
+                    // Skip if an index already covers this label+property
+                    if let Some(reg) = registry
+                        && !reg.indexes_for_property(label, &prop).is_empty()
+                    {
+                        continue;
+                    }
 
-                        suggestions.push(
-                            Suggestion::new(
-                                SuggestionKind::CreateIndex,
-                                Severity::Critical,
-                                format!(
-                                    "Full label scan on {label}.{prop} — \
+                    suggestions.push(
+                        Suggestion::new(
+                            SuggestionKind::CreateIndex,
+                            Severity::Critical,
+                            format!(
+                                "Full label scan on {label}.{prop} — \
                                      filtering {label} nodes by '{prop}' without an index \
                                      requires scanning all {label} nodes"
-                                ),
-                            )
-                            .with_ddl(format!(
-                                "CREATE INDEX {}_{} ON {}({})",
-                                label.to_lowercase(),
-                                prop.to_lowercase(),
-                                label,
-                                prop,
-                            )),
-                        );
-                    }
+                            ),
+                        )
+                        .with_ddl(format!(
+                            "CREATE INDEX {}_{} ON {}({})",
+                            label.to_lowercase(),
+                            prop.to_lowercase(),
+                            label,
+                            prop,
+                        )),
+                    );
                 }
             }
 
@@ -110,29 +109,28 @@ fn detect_unbounded_traversal(op: &LogicalOp, suggestions: &mut Vec<Suggestion>)
         length: Some(bounds),
         ..
     } = op
+        && bounds.max.is_none()
     {
-        if bounds.max.is_none() {
-            let types_str = if edge_types.is_empty() {
-                String::new()
-            } else {
-                format!(":{}", edge_types.join("|"))
-            };
-            let min = bounds.min.unwrap_or(1);
-            suggestions.push(
-                Suggestion::new(
-                    SuggestionKind::AddDepthBound,
-                    Severity::Warning,
-                    format!(
-                        "Unbounded variable-length traversal [{types_str}*{min}..] — \
+        let types_str = if edge_types.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", edge_types.join("|"))
+        };
+        let min = bounds.min.unwrap_or(1);
+        suggestions.push(
+            Suggestion::new(
+                SuggestionKind::AddDepthBound,
+                Severity::Warning,
+                format!(
+                    "Unbounded variable-length traversal [{types_str}*{min}..] — \
                          may cause exponential fan-out on dense graphs. \
                          Add an upper bound to prevent runaway queries"
-                    ),
-                )
-                .with_rewrite(format!(
-                    "Use [{types_str}*{min}..10] or another reasonable upper bound"
-                )),
-            );
-        }
+                ),
+            )
+            .with_rewrite(format!(
+                "Use [{types_str}*{min}..10] or another reasonable upper bound"
+            )),
+        );
     }
 
     for child in children(op) {
@@ -311,10 +309,10 @@ fn find_node_scan_label(op: &LogicalOp, var_name: &str) -> Option<String> {
     if let LogicalOp::NodeScan {
         variable, labels, ..
     } = op
+        && variable == var_name
+        && !labels.is_empty()
     {
-        if variable == var_name && !labels.is_empty() {
-            return Some(labels[0].clone());
-        }
+        return Some(labels[0].clone());
     }
     for child in children(op) {
         if let Some(l) = find_node_scan_label(child, var_name) {
@@ -329,18 +327,18 @@ fn find_node_scan_label(op: &LogicalOp, var_name: &str) -> Option<String> {
 // Pattern: VectorFilter { input: NodeScan { .. }, .. }
 
 fn detect_vector_without_prefilter(op: &LogicalOp, suggestions: &mut Vec<Suggestion>) {
-    if let LogicalOp::VectorFilter { input, .. } = op {
-        if matches!(input.as_ref(), LogicalOp::NodeScan { .. }) {
-            suggestions.push(Suggestion::new(
-                SuggestionKind::AddGraphPreFilter,
-                Severity::Info,
-                "Vector search on full label scan without graph pre-filter — \
-                 scanning all vectors in the label. \
-                 Add a graph traversal or property filter before the vector search \
-                 to narrow the candidate set"
-                    .to_string(),
-            ));
-        }
+    if let LogicalOp::VectorFilter { input, .. } = op
+        && matches!(input.as_ref(), LogicalOp::NodeScan { .. })
+    {
+        suggestions.push(Suggestion::new(
+            SuggestionKind::AddGraphPreFilter,
+            Severity::Info,
+            "Vector search on full label scan without graph pre-filter — \
+             scanning all vectors in the label. \
+             Add a graph traversal or property filter before the vector search \
+             to narrow the candidate set"
+                .to_string(),
+        ));
     }
 
     for child in children(op) {
@@ -450,10 +448,11 @@ fn collect_property_accesses(
     match expr {
         PExpr::Property { base, key } => {
             // Check if the inner expression is the variable we're looking for
-            if let PExpr::Variable(var) = base.as_ref() {
-                if var == variable && !props.contains(key) {
-                    props.push(key.clone());
-                }
+            if let PExpr::Variable(var) = base.as_ref()
+                && var == variable
+                && !props.contains(key)
+            {
+                props.push(key.clone());
             }
             collect_property_accesses(base, variable, props);
         }

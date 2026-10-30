@@ -63,10 +63,10 @@ fn rest_write_is_visible_over_grpc() -> Result<(), Box<dyn std::error::Error>> {
             server.0.try_wait()?.is_none(),
             "server exited before readiness"
         );
-        if let Ok(response) = request(ops, "/ready", None) {
-            if response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200") {
-                break;
-            }
+        if let Ok(response) = request(ops, "/ready", None)
+            && (response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"))
+        {
+            break;
         }
         assert!(Instant::now() < deadline, "server did not become ready");
         std::thread::sleep(Duration::from_millis(100));

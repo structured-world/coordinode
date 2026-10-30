@@ -53,10 +53,10 @@ pub fn extract_at_path(value: &rmpv::Value, path: &[&str]) -> rmpv::Value {
         }
         rmpv::Value::Array(items) => {
             // Numeric segment → array index access
-            if let Ok(idx) = segment.parse::<usize>() {
-                if let Some(elem) = items.get(idx) {
-                    return extract_at_path(elem, rest);
-                }
+            if let Ok(idx) = segment.parse::<usize>()
+                && let Some(elem) = items.get(idx)
+            {
+                return extract_at_path(elem, rest);
             }
             // Non-numeric segment on array or out-of-bounds → Nil
             rmpv::Value::Nil

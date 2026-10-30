@@ -667,13 +667,13 @@ impl<'a> Transaction<'a> {
         // The record alone answers the common case, that this attempt took
         // effect; the incarnation is read only to classify a refusal.
         let record = operation_record(self.engine, &op)?;
-        if let Some(record) = record.as_ref() {
-            if matches!(
+        if let Some(record) = record.as_ref()
+            && matches!(
                 record.state,
                 OperationState::Committed { attempt: theirs, .. } if theirs == attempt
-            ) {
-                return Ok(());
-            }
+            )
+        {
+            return Ok(());
         }
         let incarnation = incarnation_record(self.engine, &op.issuer, op.incarnation)?;
         let outcome = outcome_of(&op, incarnation.as_ref(), record.as_ref());
@@ -2647,10 +2647,10 @@ impl<'a> Transaction<'a> {
             }
             // Own writes before this key come first, in order.
             while let Some((own_key, own_value)) = overlay.next_if(|(k, _)| *k < key.as_ref()) {
-                if let Some(own_value) = own_value {
-                    if emit(own_key, own_value)?.is_break() {
-                        return Ok(());
-                    }
+                if let Some(own_value) = own_value
+                    && emit(own_key, own_value)?.is_break()
+                {
+                    return Ok(());
                 }
             }
             // An own write of the same key replaces this row, or removes it.
@@ -2667,10 +2667,10 @@ impl<'a> Transaction<'a> {
             }
         }
         for (own_key, own_value) in overlay {
-            if let Some(own_value) = own_value {
-                if emit(own_key, own_value)?.is_break() {
-                    return Ok(());
-                }
+            if let Some(own_value) = own_value
+                && emit(own_key, own_value)?.is_break()
+            {
+                return Ok(());
             }
         }
         Ok(())

@@ -10,7 +10,7 @@
 name = "coordinode-bench-vector-ann"
 description = "ann-benchmarks SIFT1M / GloVe / Deep-image adapter for CoordiNode HNSW — recall@k + QPS sweep against ann-benchmarks.com datasets. Outputs canonical JSON (coordinode-bench schema). Competitors (hnswlib, faiss, Annoy) run in Docker on the same host; results placed manually in `bench-results/`."
 version = "0.4.3"
-edition = "2021"
+edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
 
@@ -71,6 +71,14 @@ path = "src/graph_main.rs"
 [[bin]]
 name = "shard-traverse"
 path = "src/shard_traverse.rs"
+
+# A standalone workspace does not inherit the production workspace's lint
+# table, so the one entry that matters here is repeated: the repo-wide
+# clippy.toml lists the storage partition enum as a disallowed type for the
+# query layer, and the shard-traverse prototype drives the storage engine's
+# KV path directly, where naming a partition is the point.
+[lints.clippy]
+disallowed_types = "allow"
 
 # Match the production workspace release profile: one codegen unit for
 # stable, maximally optimized benchmark binaries (run-to-run comparability).

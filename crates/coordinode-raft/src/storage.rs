@@ -692,12 +692,11 @@ impl AppendNotifier {
             if waiters
                 .get(&id)
                 .is_some_and(|w| w.reach == LogReach::Written)
+                && let Some(waiter) = waiters.remove(&id)
             {
-                if let Some(waiter) = waiters.remove(&id) {
-                    self.written
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    waiter.answer(index);
-                }
+                self.written
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                waiter.answer(index);
             }
         }
     }
@@ -1216,15 +1215,15 @@ impl LogStore {
         // An entry written before proposals were stored as unit frames holds
         // them in its envelope, followed by their operations for change
         // streams; the envelope alone is read then.
-        if let openraft::entry::EntryPayload::Normal(request) = &mut entry.payload {
-            if request.proposals.is_empty() {
-                for op in ops {
-                    if let OplogOp::Unit { frame } = op {
-                        request.proposals.push(
-                            decode_proposal(&frame, &DecodeLimits::DEFAULT)
-                                .map_err(io::Error::other)?,
-                        );
-                    }
+        if let openraft::entry::EntryPayload::Normal(request) = &mut entry.payload
+            && request.proposals.is_empty()
+        {
+            for op in ops {
+                if let OplogOp::Unit { frame } = op {
+                    request.proposals.push(
+                        decode_proposal(&frame, &DecodeLimits::DEFAULT)
+                            .map_err(io::Error::other)?,
+                    );
                 }
             }
         }
@@ -2201,19 +2200,19 @@ impl CoordinodeStateMachine {
                 .lock()
                 .map_err(|e| io::Error::other(format!("dedup mutex poisoned: {e}")))?;
 
-            if let Some(entry) = dedup.get_mut(&proposal_key) {
-                if entry.size == proposal_size {
-                    // Exact duplicate — skip application, update timestamp
-                    entry.seen = Instant::now();
-                    tracing::debug!(
-                        proposal_id = proposal_key,
-                        "duplicate proposal detected, skipping apply"
-                    );
-                    return Ok(Response {
-                        mutations_applied: 0,
-                    });
-                }
-                // Different size = different retry payload, re-apply
+            // An exact duplicate is skipped; a different size is a different
+            // retry payload and is applied again.
+            if let Some(entry) = dedup.get_mut(&proposal_key)
+                && entry.size == proposal_size
+            {
+                entry.seen = Instant::now();
+                tracing::debug!(
+                    proposal_id = proposal_key,
+                    "duplicate proposal detected, skipping apply"
+                );
+                return Ok(Response {
+                    mutations_applied: 0,
+                });
             }
         }
 
@@ -2244,10 +2243,10 @@ impl CoordinodeStateMachine {
                 },
             )
             .map_err(|e| io::Error::other(e.to_string()))?;
-        if let Some(ref oracle) = self.oracle {
-            if proposal.commit_ts.as_raw() > 0 {
-                oracle.advance_to(proposal.commit_ts);
-            }
+        if let Some(ref oracle) = self.oracle
+            && proposal.commit_ts.as_raw() > 0
+        {
+            oracle.advance_to(proposal.commit_ts);
         }
 
         // Record in dedup map
@@ -2274,10 +2273,10 @@ impl CoordinodeStateMachine {
         // Monotonic — a proposal whose commit_ts is below the current
         // watermark is a no-op (shouldn't happen in a healthy cluster; HLC
         // guarantees per-shard monotonicity — but defensive).
-        if let Some(ref wm) = self.max_assigned {
-            if proposal.commit_ts.as_raw() > 0 {
-                wm.advance(proposal.commit_ts);
-            }
+        if let Some(ref wm) = self.max_assigned
+            && proposal.commit_ts.as_raw() > 0
+        {
+            wm.advance(proposal.commit_ts);
         }
 
         Ok(Response {
@@ -2675,10 +2674,10 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         self.engine
             .reload_closure_frontier()
             .map_err(|e| io::Error::other(format!("read the installed closed bound: {e}")))?;
-        if let Some(ref oracle) = self.oracle {
-            if let Some(at) = self.engine.closure_frontier().checked_sub(1) {
-                oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
-            }
+        if let Some(ref oracle) = self.oracle
+            && let Some(at) = self.engine.closure_frontier().checked_sub(1)
+        {
+            oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
         }
 
         *self

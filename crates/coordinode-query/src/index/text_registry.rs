@@ -693,35 +693,34 @@ impl TextIndexRegistry {
     /// per-node override, auto-detect, or default). This ensures tokens
     /// match the query-time tokenization in `search()`/`search_with_language()`.
     pub fn on_text_written(&self, label: &str, node_id: NodeId, property: &str, text: &str) {
-        if let Some(handle) = self.get(label, property) {
-            if let Ok(mut idx) = handle.write() {
-                let mut props = HashMap::new();
-                props.insert(property.to_string(), text.to_string());
-                if let Err(e) = idx.add_node(node_id.as_raw(), &props) {
-                    tracing::warn!(
-                        label,
-                        property,
-                        node_id = node_id.as_raw(),
-                        "failed to index text: {e}"
-                    );
-                }
+        if let Some(handle) = self.get(label, property)
+            && let Ok(mut idx) = handle.write()
+        {
+            let mut props = HashMap::new();
+            props.insert(property.to_string(), text.to_string());
+            if let Err(e) = idx.add_node(node_id.as_raw(), &props) {
+                tracing::warn!(
+                    label,
+                    property,
+                    node_id = node_id.as_raw(),
+                    "failed to index text: {e}"
+                );
             }
         }
     }
 
     /// Remove a document from applicable text indexes.
     pub fn on_text_deleted(&self, label: &str, node_id: NodeId, property: &str) {
-        if let Some(handle) = self.get(label, property) {
-            if let Ok(mut idx) = handle.write() {
-                if let Err(e) = idx.delete_document(node_id.as_raw()) {
-                    tracing::warn!(
-                        label,
-                        property,
-                        node_id = node_id.as_raw(),
-                        "failed to delete text from index: {e}"
-                    );
-                }
-            }
+        if let Some(handle) = self.get(label, property)
+            && let Ok(mut idx) = handle.write()
+            && let Err(e) = idx.delete_document(node_id.as_raw())
+        {
+            tracing::warn!(
+                label,
+                property,
+                node_id = node_id.as_raw(),
+                "failed to delete text from index: {e}"
+            );
         }
     }
 

@@ -261,10 +261,10 @@ impl coordinode_vector::VectorLoader for StorageVectorLoader {
                 Ok(Some(r)) => r,
                 _ => continue,
             };
-            if let Some(val) = record.props.get(&field_id) {
-                if let Some(vec_data) = try_extract_vector(val) {
-                    result.insert(node_id, vec_data);
-                }
+            if let Some(val) = record.props.get(&field_id)
+                && let Some(vec_data) = try_extract_vector(val)
+            {
+                result.insert(node_id, vec_data);
             }
         }
 
@@ -2827,16 +2827,16 @@ impl Database {
             .record_with_plan(fp, &canonical, duration_us, plan_str, source);
 
         // N+1 detection: check if this (fingerprint, source) exceeds threshold
-        if let Some(src) = source {
-            if let Some(alert) = self.nplus1_detector.record(fp, &canonical, src) {
-                tracing::warn!(
-                    fingerprint = fp,
-                    count = alert.call_count,
-                    file = %alert.source_file,
-                    line = alert.source_line,
-                    "N+1 query pattern detected"
-                );
-            }
+        if let Some(src) = source
+            && let Some(alert) = self.nplus1_detector.record(fp, &canonical, src)
+        {
+            tracing::warn!(
+                fingerprint = fp,
+                count = alert.call_count,
+                file = %alert.source_file,
+                line = alert.source_line,
+                "N+1 query pattern detected"
+            );
         }
 
         // Invalidate cached storage statistics after any mutation so that
@@ -3079,10 +3079,11 @@ impl Database {
         // moves the generation past this one, so its result is not reused.
         let generation = self.stats_generation.load(Ordering::Acquire);
         let mut guard = self.cached_stats.lock().ok()?;
-        if let Some((ref stats, computed_at, computed_for)) = *guard {
-            if computed_for == generation && computed_at.elapsed() < self.stats_ttl {
-                return stats.clone();
-            }
+        if let Some((ref stats, computed_at, computed_for)) = *guard
+            && computed_for == generation
+            && computed_at.elapsed() < self.stats_ttl
+        {
+            return stats.clone();
         }
         // Cache miss or expired — recompute.
         #[cfg(test)]

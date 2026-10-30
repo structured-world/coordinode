@@ -318,25 +318,24 @@ async fn submit_batch(
         let mut request = Request::batch(proposals.clone());
         // Each submitter holds its timestamp until its submission returns,
         // which is after this hand-over.
-        if let Some(engine) = closure {
-            if let Err(e) = crate::closure::stamp(raft, engine, &mut request).await {
-                // An earlier attempt is in the log, where it may commit or
-                // has: these refusals mean nothing was written only for a
-                // first one.
-                let e = match e {
-                    ProposalError::BelowClosedBound { .. }
-                    | ProposalError::LeaderNotReady { .. }
-                        if attempt > 0 =>
-                    {
-                        ProposalError::Timeout { retries: attempt }
-                    }
-                    e => e,
-                };
-                for entry in batch {
-                    let _ = entry.response_tx.send(Err(e.clone()));
+        if let Some(engine) = closure
+            && let Err(e) = crate::closure::stamp(raft, engine, &mut request).await
+        {
+            // An earlier attempt is in the log, where it may commit or
+            // has: these refusals mean nothing was written only for a
+            // first one.
+            let e = match e {
+                ProposalError::BelowClosedBound { .. } | ProposalError::LeaderNotReady { .. }
+                    if attempt > 0 =>
+                {
+                    ProposalError::Timeout { retries: attempt }
                 }
-                return;
+                e => e,
+            };
+            for entry in batch {
+                let _ = entry.response_tx.send(Err(e.clone()));
             }
+            return;
         }
 
         let leading = crate::authority::leading_term(raft);

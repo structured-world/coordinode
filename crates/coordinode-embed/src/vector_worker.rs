@@ -92,10 +92,10 @@ impl VectorIndexWorker {
     fn stop_and_join(&mut self) {
         self.stop.cancel();
         self.applied_stop.stop();
-        if let Some(handle) = self.handle.take() {
-            if handle.join().is_err() {
-                tracing::error!("the vector index worker panicked");
-            }
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            tracing::error!("the vector index worker panicked");
         }
     }
 }

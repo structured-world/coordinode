@@ -286,10 +286,10 @@ impl QueryBudget {
         if self.cancelled.is_cancelled() {
             return Err(BudgetStop::Cancelled);
         }
-        if let Some((deadline, clock)) = self.deadline {
-            if clock() >= deadline {
-                return Err(BudgetStop::Deadline);
-            }
+        if let Some((deadline, clock)) = self.deadline
+            && clock() >= deadline
+        {
+            return Err(BudgetStop::Deadline);
         }
         Ok(())
     }

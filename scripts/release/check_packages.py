@@ -215,7 +215,7 @@ def main():
         for index, toolchain in enumerate(toolchains):
             prefix = ["rustup", "run", toolchain] if toolchain else []
             # Each toolchain resolves its own fresh consumer graph. Never let
-            # the minimum-toolchain lock hide a newer allowed resolution.
+            # an earlier toolchain's lock hide a newer allowed resolution.
             (consumer / "Cargo.lock").unlink(missing_ok=True)
             graph = subprocess.check_output(
                 [*prefix, "cargo", "metadata", *network, "--all-features", "--format-version=1"],

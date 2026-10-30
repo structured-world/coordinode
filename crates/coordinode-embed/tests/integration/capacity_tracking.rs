@@ -491,10 +491,8 @@ fn threshold_alert_counter_increments_on_severity_crossing() {
                 .key()
                 .labels()
                 .any(|l| l.key() == "endpoint_id" && l.value() == "alert-ep");
-            if has_endpoint {
-                if let DebugValue::Counter(n) = value {
-                    alert_count += n;
-                }
+            if has_endpoint && let DebugValue::Counter(n) = value {
+                alert_count += n;
             }
         }
     }
@@ -552,10 +550,8 @@ fn cascade_events_counter_increments_on_auto_cascade() {
                 .key()
                 .labels()
                 .any(|l| l.key() == "endpoint_id" && l.value() == "ep-hot");
-            if has_endpoint {
-                if let DebugValue::Counter(n) = value {
-                    cascade_count += n;
-                }
+            if has_endpoint && let DebugValue::Counter(n) = value {
+                cascade_count += n;
             }
         }
     }
@@ -955,14 +951,14 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
 
     let snapshot = snapshotter.snapshot();
     for (key, _unit, _desc, value) in snapshot.into_vec() {
-        if key.key().name() == "endpoint_threshold_alerts_total" {
-            if let DebugValue::Counter(n) = value {
-                assert_eq!(
-                    n, 0,
-                    "DOWN-crossing must not increment the alert counter — \
-                     the counter records severity escalations only",
-                );
-            }
+        if key.key().name() == "endpoint_threshold_alerts_total"
+            && let DebugValue::Counter(n) = value
+        {
+            assert_eq!(
+                n, 0,
+                "DOWN-crossing must not increment the alert counter — \
+                 the counter records severity escalations only",
+            );
         }
     }
 }

@@ -78,12 +78,11 @@ fn an_unknown_shape_is_refused_not_rewritten() {
     let entry = current_entry(4, Request::closing(0));
     let current = rmp_serde::to_vec(&entry).expect("encode");
     let mut value = rmpv::decode::read_value(&mut &current[..]).expect("decode");
-    if let rmpv::Value::Array(fields) = &mut value {
-        if let Some(rmpv::Value::Map(payload)) = fields.get_mut(1) {
-            if let [(_, rmpv::Value::Array(request))] = payload.as_mut_slice() {
-                request.push(rmpv::Value::from(1u64));
-            }
-        }
+    if let rmpv::Value::Array(fields) = &mut value
+        && let Some(rmpv::Value::Map(payload)) = fields.get_mut(1)
+        && let [(_, rmpv::Value::Array(request))] = payload.as_mut_slice()
+    {
+        request.push(rmpv::Value::from(1u64));
     }
     let mut three = Vec::new();
     rmpv::encode::write_value(&mut three, &value).expect("encode");
