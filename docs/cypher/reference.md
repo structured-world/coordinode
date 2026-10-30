@@ -400,7 +400,7 @@ ALTER NODE TYPE Task SET IMPLIES ()        -- and stop being things
 - The change is published as the type's candidate and proved over the stored nodes of the type and of every type implying it before it is put in force: a node breaking an explicit constraint of a label it would come to carry, or a `UNIQUE` value it would share with another carrier of that label, refuses the change and is named in the error. A refused change leaves the implication, the label scans, the indexes and the constraints as they were. Writes made while the change is proved are held to both the implication in force and the proposed one.
 - Label scans, counts and B-tree indexes of the labels whose carriers move find exactly the nodes of the implication in force at each statement's snapshot, before, during and after the change: the stored nodes are reconciled in the background, without rewriting a node record, and the change takes effect in one commit. The statement answers with the implication in force and, while the proof runs past the statement wait, the operation proving it.
 - The result row has `label`, `implies`, `changed` (`false` when the implication was already the one asked for) and `operation`.
-- A full-text or vector index on a label whose carriers the change moves refuses it.
+- A full-text index on a label whose carriers the change moves answers each search with the implication in force at the search's snapshot, before, during and after the change, ranked as an index holding exactly those carriers. A vector index on such a label refuses the change.
 - One change moving the carriers of a label at a time: a second one is refused until the first ends.
 
 #### CREATE INDEX / DROP INDEX ✅
