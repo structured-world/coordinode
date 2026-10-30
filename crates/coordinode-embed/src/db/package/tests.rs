@@ -1016,6 +1016,83 @@ fn a_cancelled_implication_change_leaves_the_facts_in_force() {
     );
 }
 
+/// The store closes while the fold of a change put in force is still
+/// moving entries a page of one at a time. Reads stay exact over the
+/// unfolded parts before the close and after the reopen, which folds the
+/// rest: every carrier is counted once by scan and by counter, and an index
+/// lookup finds each one.
+#[test]
+fn a_fold_interrupted_by_a_close_finishes_after_a_reopen() {
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = |db: &mut Database| {
+        let scanned = db
+            .execute_cypher("MATCH (n:Thing) WHERE n.title + '' <> '' RETURN n")
+            .expect("scan")
+            .len();
+        let rows = db
+            .execute_cypher("MATCH (n:Thing) RETURN count(n) AS c")
+            .expect("count");
+        let looked_up = db
+            .execute_cypher("MATCH (n:Thing {title: 't7'}) RETURN n")
+            .expect("lookup")
+            .len();
+        (scanned, rows[0].get("c").cloned(), looked_up)
+    };
+    let tasks = 40;
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+            fold_page: 1,
+            ..db.index_build_config()
+        });
+        for ddl in [
+            "CREATE NODE TYPE Thing WITH (title: STRING)",
+            "CREATE NODE TYPE Task WITH (title: STRING)",
+            "CREATE INDEX thing_title ON :Thing(title)",
+            "CREATE (:Thing {title: 'c'})",
+        ] {
+            db.execute_cypher(ddl).expect(ddl);
+        }
+        for n in 0..tasks {
+            db.execute_cypher(&format!("CREATE (:Task {{title: 't{n}'}})"))
+                .expect("task");
+        }
+        db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+            .expect("alter");
+        // Exact whether or not the fold has finished.
+        assert_eq!(
+            state(&mut db),
+            (tasks + 1, Some(Value::Int(tasks as i64 + 1)), 1),
+            "before the close"
+        );
+    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    assert_eq!(
+        state(&mut db),
+        (tasks + 1, Some(Value::Int(tasks as i64 + 1)), 1),
+        "after the reopen"
+    );
+    let deadline = std::time::Instant::now() + WAIT;
+    {
+        use coordinode_modality::IndexStore as _;
+        while coordinode_modality::LocalIndexStore::new(db.engine())
+            .list_definitions()
+            .expect("definitions")
+            .iter()
+            .any(|def| !def.selection.is_empty())
+        {
+            assert!(std::time::Instant::now() < deadline, "parts left unfolded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert_eq!(
+        state(&mut db),
+        (tasks + 1, Some(Value::Int(tasks as i64 + 1)), 1),
+        "folded"
+    );
+}
+
 /// The schema of label `name` as the catalog holds it.
 fn user_named(db: &Database, name: &str) -> LabelSchema {
     db.label_schemas()
