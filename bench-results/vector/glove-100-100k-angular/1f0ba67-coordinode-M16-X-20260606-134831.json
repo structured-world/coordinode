@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-06-06T13:48:31.294616098Z",
+  "git": {
+    "sha": "1f0ba67da0dd613fa530c92d81fbabbd30bf6c79",
+    "sha_short": "1f0ba67",
+    "branch": "main",
+    "dirty": true,
+    "commit_date": "2026-06-06T12:16:37Z"
+  },
+  "hardware": {
+    "cpu_brand": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
+    "cpu_cores": 8,
+    "cpu_threads": 16,
+    "ram_gb": 62,
+    "os_name": "Fedora Linux",
+    "os_version": "44",
+    "arch": "x86_64"
+  },
+  "modality": "vector",
+  "benchmark": "ann-benchmarks",
+  "dataset": "glove-100-100k-angular",
+  "subject": "coordinode",
+  "codec": "none",
+  "version": "0.4.3",
+  "metrics": {
+    "build_secs": 43.762764594,
+    "dataset_dim": 100,
+    "dataset_n_test": 10000,
+    "dataset_n_train": 100000,
+    "hnsw_alpha_pruning": 1.0,
+    "hnsw_ef_construction": 200,
+    "hnsw_m": 16,
+    "hnsw_rerank_mode": "inline",
+    "hnsw_rerank_oversample": 1.0,
+    "k": 10,
+    "qps_at_recall_0_95": 205.4751287319862,
+    "qps_at_recall_peak": 205.4751287319862,
+    "quantization": "none",
+    "rayon_threads": 1,
+    "rayon_threads_effective": 1,
+    "recall_at_k_peak": 1.0,
+    "rss_kib_after_build": 776888,
+    "rss_kib_before_build": 471184,
+    "rss_kib_peak": 778324,
+    "search_threads": 1,
+    "subset_size": 100000,
+    "sweep": [
+      {
+        "ef_search": 0,
+        "latency_us_mean": 4865.7986,
+        "latency_us_p50": 4857.0,
+        "latency_us_p95": 4920.0,
+        "latency_us_p99": 4975.0,
+        "qps": 205.4751287319862,
+        "recall_at_k": 1.0
+      }
+    ]
+  }
+}
