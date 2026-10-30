@@ -4047,11 +4047,11 @@ impl<'a> ExecutionContext<'a> {
             node_id,
             coordinode_modality::LabelMembership {
                 in_force: &before,
-                candidate: &before_candidate,
+                candidate: before_candidate,
             },
             coordinode_modality::LabelMembership {
                 in_force: &after,
-                candidate: &after_candidate,
+                candidate: after_candidate,
             },
         )?;
         Ok(())

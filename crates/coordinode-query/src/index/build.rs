@@ -205,7 +205,9 @@ impl<'a> Backfill<'a> {
     /// the shard, in the label lookup `index`, appending the node keys read
     /// to `read`; returns the postings staged. A row last written after
     /// `maintained_after` was written by a writer that staged its postings
-    /// itself, and is passed over rather than written twice.
+    /// itself, and is passed over rather than written twice. `memberships`
+    /// judges the labels a node carries under the facts in force and under
+    /// the candidate.
     fn stage_page_labels(
         &self,
         txn: &mut Transaction<'a>,
@@ -213,8 +215,10 @@ impl<'a> Backfill<'a> {
         rows: &[(Vec<u8>, Vec<u8>)],
         maintained_after: u64,
         read: &mut Vec<Vec<u8>>,
-        membership: &mut crate::index::membership::CatalogMembership<'_>,
-        candidate_membership: &mut crate::index::membership::CatalogMembership<'_>,
+        (membership, candidate_membership): (
+            &mut crate::index::membership::CatalogMembership<'_>,
+            &mut crate::index::membership::CatalogMembership<'_>,
+        ),
     ) -> Result<u64, BackfillError> {
         let store = coordinode_modality::LocalIndexStore::new(self.engine);
         let mut staged = 0u64;
@@ -348,8 +352,7 @@ impl<'a> Backfill<'a> {
                     &page.rows,
                     maintained_after,
                     &mut read,
-                    &mut membership,
-                    &mut candidate_membership,
+                    (&mut membership, &mut candidate_membership),
                 )?;
             }
             for (key, bytes) in &page.rows {

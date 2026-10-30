@@ -340,6 +340,37 @@ pub trait IndexStore {
     /// A storage failure in legacy (no-MVCC) mode, which removes at once.
     fn clear_txn(&self, txn: &mut Transaction, generation: GenerationId) -> StoreResult<()>;
 
+    /// Stage the move of up to `limit` entries of the key scope `part`, of
+    /// both shapes, into the scope `base`, each keyed the same past its
+    /// generation, as `txn` sees them. Returns whether `part` held no more:
+    /// then it is empty once `txn` commits.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn move_scope_page_txn(
+        &self,
+        txn: &mut Transaction,
+        part: GenerationId,
+        base: GenerationId,
+        limit: usize,
+    ) -> StoreResult<bool>;
+
+    /// The number of postings of `label` in the label lookup `lookup`'s own
+    /// scope in shard `shard`, read in `txn`: the range read binds the
+    /// commit, so a writer moving the label meanwhile conflicts with it.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn count_label_postings_txn(
+        &self,
+        txn: &mut Transaction,
+        lookup: &IndexDefinition,
+        shard: u16,
+        label: LabelId,
+    ) -> StoreResult<u64>;
+
     /// Apply one unit of mutations straight to the engine as one batch, for a
     /// context that has no log to replicate them through.
     ///
@@ -545,8 +576,11 @@ pub trait IndexStore {
     /// gone. What an executor holding a definition across many commits binds
     /// each of them to: storage may renumber a record it keeps no older
     /// version of without writing it, so a version read once can stop
-    /// matching a definition that never changed, while a definition never
-    /// returns to an earlier value once it moves (its generation only grows).
+    /// matching a definition that never changed. The binding is by value:
+    /// a definition that returns to an earlier value (a withdrawn selection
+    /// change folded away) serves exactly that interpretation again, over
+    /// entries the fold brought back into its one scope, so effects derived
+    /// from it hold.
     ///
     /// # Errors
     ///
@@ -1349,6 +1383,68 @@ impl IndexStore for LocalIndexStore<'_> {
             txn.remove_range(Partition::Idx, &start, &end)?;
         }
         Ok(())
+    }
+
+    fn move_scope_page_txn(
+        &self,
+        txn: &mut Transaction,
+        part: GenerationId,
+        base: GenerationId,
+        limit: usize,
+    ) -> StoreResult<bool> {
+        use coordinode_core::index::encoding::GENERATION_PREFIX_LEN;
+        let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
+        // One entry past the limit tells whether the scope holds more.
+        let mut page: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (start, end) in generation_ranges(part) {
+            txn.range_for_each(Partition::Idx, &start, &end, &budget, |key, value| {
+                page.push((key.to_vec(), value.to_vec()));
+                Ok::<_, StoreError>(if page.len() > limit {
+                    core::ops::ControlFlow::Break(())
+                } else {
+                    core::ops::ControlFlow::Continue(())
+                })
+            })?;
+            if page.len() > limit {
+                break;
+            }
+        }
+        let empty = page.len() <= limit;
+        page.truncate(limit);
+        let base = base.as_raw().to_be_bytes();
+        for (key, value) in page {
+            txn.delete(Partition::Idx, &key)?;
+            let mut moved = key;
+            // The shape tag, then the generation: the rest names the same entry.
+            moved[1..GENERATION_PREFIX_LEN].copy_from_slice(&base);
+            txn.put(Partition::Idx, &moved, &value)?;
+        }
+        Ok(empty)
+    }
+
+    fn count_label_postings_txn(
+        &self,
+        txn: &mut Transaction,
+        lookup: &IndexDefinition,
+        shard: u16,
+        label: LabelId,
+    ) -> StoreResult<u64> {
+        use coordinode_core::index::encoding::{label_range_prefix, prefix_end};
+        let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
+        let range = label_range_prefix(lookup.generation, shard, label);
+        let mut members: u64 = 0;
+        txn.range_for_each(
+            Partition::Idx,
+            &range,
+            &prefix_end(&range),
+            &budget,
+            |_, _| {
+                // One posting per key; a shard holds far fewer than u64::MAX.
+                members += 1;
+                Ok::<_, StoreError>(core::ops::ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(members)
     }
 
     fn apply_unreplicated(&self, mutations: &[Mutation]) -> StoreResult<()> {

@@ -297,7 +297,7 @@ impl Fold<'_> {
                     | (PartState::Withdrawn, coordinode_modality::PartRole::Retired)
             );
             let empty = if keep {
-                move_page(&mut txn, part.part, def.generation)?
+                store.move_scope_page_txn(&mut txn, part.part, def.generation, FOLD_PAGE)?
             } else {
                 store.clear_txn(&mut txn, part.part)?;
                 true
@@ -334,44 +334,6 @@ impl Fold<'_> {
     }
 }
 
-/// Move up to [`FOLD_PAGE`] entries of the scope `part` into `base`, keyed
-/// the same past the generation, as `txn` sees them. Returns whether the
-/// part had no more: then it is empty once `txn` commits.
-fn move_page(
-    txn: &mut Transaction<'_>,
-    part: GenerationId,
-    base: GenerationId,
-) -> Result<bool, StoreError> {
-    use coordinode_core::index::encoding::{GENERATION_PREFIX_LEN, generation_ranges};
-    use coordinode_storage::engine::partition::Partition;
-    let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
-    let mut page: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for (start, end) in generation_ranges(part) {
-        txn.range_for_each(Partition::Idx, &start, &end, &budget, |key, value| {
-            page.push((key.to_vec(), value.to_vec()));
-            Ok::<_, StoreError>(if page.len() > FOLD_PAGE {
-                core::ops::ControlFlow::Break(())
-            } else {
-                core::ops::ControlFlow::Continue(())
-            })
-        })?;
-        if page.len() > FOLD_PAGE {
-            break;
-        }
-    }
-    let empty = page.len() <= FOLD_PAGE;
-    page.truncate(FOLD_PAGE);
-    let base = base.as_raw().to_be_bytes();
-    for (key, value) in page {
-        txn.delete(Partition::Idx, &key)?;
-        let mut moved = key;
-        // The shape tag, then the generation: the rest names the same entry.
-        moved[1..GENERATION_PREFIX_LEN].copy_from_slice(&base);
-        txn.put(Partition::Idx, &moved, &value)?;
-    }
-    Ok(empty)
-}
-
 /// Set the counter of `label` to the number of its postings in the label
 /// lookup `lookup`'s own scope in shard `shard`, read in `txn`: the range
 /// read binds the commit, so a writer moving the label meanwhile conflicts
@@ -383,42 +345,16 @@ fn recount(
     shard: u16,
     label: LabelId,
 ) -> Result<(), StoreError> {
-    use coordinode_core::index::encoding::{label_range_prefix, prefix_end};
-    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
-    use coordinode_storage::engine::partition::Partition;
+    use coordinode_modality::{
+        IndexStore as _, LocalIndexStore, LocalSchemaStore, LocalStatsStore, SchemaStore as _,
+        StatsStore as _,
+    };
     let Some(name) = LocalSchemaStore::new(engine).label_name(label)? else {
         return Ok(());
     };
-    let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
-    let range = label_range_prefix(lookup.generation, shard, label);
-    let mut members: i64 = 0;
-    txn.range_for_each(
-        Partition::Idx,
-        &range,
-        &prefix_end(&range),
-        &budget,
-        |_, _| {
-            members += 1;
-            Ok::<_, StoreError>(core::ops::ControlFlow::Continue(()))
-        },
-    )?;
-    let key = coordinode_core::graph::stats::label_count_key(&name);
-    let counted = match txn.get(Partition::Counter, &key)? {
-        Some(bytes) => coordinode_storage::engine::merge::decode_counter(&bytes).map_err(|e| {
-            StoreError::Decode {
-                kind: "node counter",
-                message: format!("label {name}: {e}"),
-            }
-        })?,
-        None => 0,
-    };
-    let delta = members
-        .checked_sub(counted)
-        .ok_or_else(|| StoreError::Invariant(format!("the counter of :{name} is out of range")))?;
-    if delta != 0 {
-        txn.push_counter_delta(&key, delta);
-    }
-    Ok(())
+    let members =
+        LocalIndexStore::new(engine).count_label_postings_txn(txn, lookup, shard, label)?;
+    LocalStatsStore.set_label_count(txn, &name, members)
 }
 
 /// The owner of the entries of the stored node row under `key`: the node,

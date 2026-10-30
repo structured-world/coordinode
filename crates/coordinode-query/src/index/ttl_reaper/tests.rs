@@ -1023,6 +1023,53 @@ fn a_ready_anchor_index_supplies_the_candidates() {
     assert!(node_exists(&engine, 1, 4) && node_exists(&engine, 1, 100));
 }
 
+/// While a change of what a type implies keeps the label's carriers apart,
+/// an expired member the change brought in stands in the gained part, not in
+/// the index's own entries: the pass reaps it there. A node the change took
+/// out of the label stands in the retired part, which the facts in force no
+/// longer read, and is left alone. Before the pass read the parts, the gained
+/// member outlived its expiry until the parts were folded.
+#[test]
+fn an_anchor_index_with_parts_reaps_the_members_in_force() {
+    use coordinode_core::index::identity::GenerationId;
+    use coordinode_modality::{IndexStore as _, LocalIndexStore, PartState};
+    use coordinode_storage::engine::transaction::Transaction;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Node));
+    let mut index = publish_index(
+        &engine,
+        super::super::IndexDescriptor::btree("s_created", "Session", "created_at"),
+    );
+    let operation = GenerationId::from_raw(1_000);
+    let (gained, retired) = (GenerationId::from_raw(1_001), GenerationId::from_raw(1_002));
+    index.propose_parts(label(&engine, "Session"), operation, gained, retired);
+    index.conclude_parts(operation, PartState::InForce);
+    LocalIndexStore::new(&engine)
+        .put_definition_txn(
+            &mut Transaction::new(&engine, None, Timestamp::ZERO, None),
+            &index,
+        )
+        .expect("record the parts");
+    let old = now_us() - 2 * 3600 * 1_000_000;
+    for (node, scope) in [(1, index.generation), (2, gained), (3, retired)] {
+        let record = session(&engine, &mut interner, old);
+        seed_with_anchor_entry(&engine, &index.in_scope(scope), node, &record, old);
+    }
+
+    let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+
+    assert_eq!(result.nodes_deleted, 2, "{:?}", result.errors);
+    assert!(!node_exists(&engine, 1, 1), "the member in the own entries");
+    assert!(
+        !node_exists(&engine, 1, 2),
+        "the member the change brought in"
+    );
+    assert!(node_exists(&engine, 1, 3), "the node the change took out");
+}
+
 /// An index still being built is not evidence that a node absent from it
 /// has not expired: the pass reads the shard for that target.
 #[test]

@@ -21,7 +21,10 @@
 //! that reach it the chain on a key grows with the write volume and every
 //! read of the counter resolves all of it.
 
+use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
+
+use crate::error::{StoreError, StoreResult};
 
 // The key shapes live in coordinode-core (`graph::stats`) so the storage
 // layer's statistics reader shares them; re-exported here for Layer-5
@@ -51,6 +54,16 @@ pub trait StatsStore {
 
     /// Record one label removed from an existing node row (`REMOVE n:Label`).
     fn label_removed(&self, txn: &mut Transaction, label: &str);
+
+    /// Stage the delta that brings the count of `label`, as `txn` reads it,
+    /// to `count`: what a recount of the label's members commits. The read
+    /// binds the commit to the counter it corrected.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or a stored counter that does not decode or
+    /// differs from `count` by more than an i64 holds.
+    fn set_label_count(&self, txn: &mut Transaction, label: &str, count: u64) -> StoreResult<()>;
 }
 
 /// CE statistics store over the counter partition's merge operator.
@@ -78,6 +91,31 @@ impl StatsStore for LocalStatsStore {
 
     fn label_removed(&self, txn: &mut Transaction, label: &str) {
         txn.push_counter_delta(&label_count_key(label), -1);
+    }
+
+    fn set_label_count(&self, txn: &mut Transaction, label: &str, count: u64) -> StoreResult<()> {
+        let key = label_count_key(label);
+        let counted = match txn.get(Partition::Counter, &key)? {
+            Some(bytes) => {
+                coordinode_storage::engine::merge::decode_counter(&bytes).map_err(|e| {
+                    StoreError::Decode {
+                        kind: "node counter",
+                        message: format!("label {label}: {e}"),
+                    }
+                })?
+            }
+            None => 0,
+        };
+        let out_of_range =
+            || StoreError::Invariant(format!("the counter of :{label} is out of range"));
+        let delta = i64::try_from(count)
+            .map_err(|_| out_of_range())?
+            .checked_sub(counted)
+            .ok_or_else(out_of_range)?;
+        if delta != 0 {
+            txn.push_counter_delta(&key, delta);
+        }
+        Ok(())
     }
 }
 

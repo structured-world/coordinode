@@ -716,6 +716,62 @@ fn reap_through_index<'a>(
     use coordinode_modality::{IndexStore as _, LocalIndexStore};
 
     let store = LocalIndexStore::new(engine);
+    // While a change of what a type implies keeps the label's carriers in
+    // parts, the members in force stand in the parts that interpretation
+    // reads as well as in the index's own entries. A member a fold moves
+    // during the pass is reaped by the next one.
+    let stored = match store.load_definition(index.id) {
+        Ok(stored) => stored,
+        Err(e) => {
+            result
+                .errors
+                .push(format!("label {}: index definition: {e}", target.label));
+            return;
+        }
+    };
+    let scopes = match stored {
+        Some(def) if def.generation == index.generation => def.eligible_scopes(
+            target.label_id,
+            coordinode_modality::Interpretation::InForce,
+        ),
+        _ => smallvec::smallvec![index.generation],
+    };
+    for scope in scopes {
+        let scoped = if scope == index.generation {
+            std::borrow::Cow::Borrowed(index)
+        } else {
+            std::borrow::Cow::Owned(index.in_scope(scope))
+        };
+        reap_scope(
+            engine,
+            shard_id,
+            target,
+            &scoped,
+            cutoff_us,
+            max_deletions,
+            oracle,
+            commit,
+            result,
+        );
+    }
+}
+
+/// [`reap_through_index`] over the entries of one key scope of `index`.
+#[allow(clippy::too_many_arguments)]
+fn reap_scope<'a>(
+    engine: &'a StorageEngine,
+    shard_id: u16,
+    target: &TtlTarget,
+    index: &super::IndexDefinition,
+    cutoff_us: i64,
+    max_deletions: usize,
+    oracle: Option<&'a TimestampOracle>,
+    commit: &mut dyn FnMut(&mut Transaction<'a>) -> Result<(), CommitError>,
+    result: &mut ComputedTtlReapResult,
+) {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+
+    let store = LocalIndexStore::new(engine);
     let nodes = LocalNodeStore;
     let ranges = [
         (Value::Int(i64::MIN), Value::Int(cutoff_us)),
