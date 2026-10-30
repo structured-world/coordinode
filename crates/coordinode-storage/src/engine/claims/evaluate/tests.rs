@@ -770,10 +770,69 @@ fn a_schema_read_is_asked_from_the_first_unseen_number() {
     );
 }
 
+/// A type with stored nodes gains no implied labels by an activation (only
+/// the reconciliation of an implication change covers its nodes), but a type
+/// already implying labels changes anything else over its stored nodes.
+#[test]
+fn an_activation_changing_what_a_typed_label_implies_is_refused() {
+    use coordinode_core::graph::node::{NodeRecord, encode_node_key};
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+
+    let (engine, _d) = engine();
+    bind(&engine, "Base");
+    let mut goal = LabelSchema::new_node_id("Goal");
+    goal.set_implies(vec!["Base".to_string()]);
+    store_label_schema(&engine, &goal);
+    let record = NodeRecord::with_labels(ids(&engine, &["Goal"]));
+    engine
+        .put(
+            Partition::Node,
+            &encode_node_key(0, node(1)),
+            &record.to_msgpack().expect("encode"),
+        )
+        .expect("node");
+    let view = engine.snapshot();
+    let staged = |schema: &LabelSchema| {
+        let mut points = HashMap::new();
+        points.insert(
+            (
+                Partition::Schema,
+                body_key(&engine, "Goal", schema.schema_revision),
+            ),
+            Some(schema.to_msgpack().expect("encode")),
+        );
+        points
+    };
+
+    let mut same_implication = goal.clone();
+    same_implication.schema_revision = goal.schema_revision + 1;
+    same_implication.add_property(PropertyDef::new("note", PropertyType::String));
+    let activation = schema_claim(
+        "Goal",
+        ClaimPredicate::SchemaActivated {
+            revision: same_implication.schema_revision,
+        },
+    );
+    assert_eq!(
+        evaluate(&engine, &activation, &[], &staged(&same_implication), view).expect("evaluate"),
+        Verdict::Holds,
+        "the implication in force is kept"
+    );
+
+    let mut more = same_implication.clone();
+    bind(&engine, "Extra");
+    more.set_implies(vec!["Base".to_string(), "Extra".to_string()]);
+    assert_eq!(
+        evaluate(&engine, &activation, &[], &staged(&more), view).expect("evaluate"),
+        Verdict::Broken,
+        "node 1 would carry Extra without its lookup postings and index entries"
+    );
+}
+
 /// What a type implies is derived from its definition, never stored, so an
-/// activation of a type implying labels holds over nodes that store only
-/// their type; an activation declaring a label auxiliary is refused by a
-/// stored node it types, since an auxiliary label types none.
+/// activation of a type implying labels holds over nodes of other types; an
+/// activation declaring a label auxiliary is refused by a stored node it
+/// types, since an auxiliary label types none.
 #[test]
 fn an_activation_is_refused_only_by_a_node_its_kind_cannot_type() {
     use coordinode_core::graph::node::{NodeRecord, encode_node_key};
@@ -804,12 +863,12 @@ fn an_activation_is_refused_only_by_a_node_its_kind_cannot_type() {
             .expect("node");
     };
 
-    put_node(1, &["Top"]);
+    put_node(1, &["Middle"]);
     let activation = schema_claim("Top", ClaimPredicate::SchemaActivated { revision: 1 });
     assert_eq!(
         evaluate(&engine, &activation, &[], &points, view).expect("evaluate"),
         Verdict::Holds,
-        "node 1 carries Middle and Base through its type without storing them"
+        "node 1 is of another type, carrying Base through it without storing it"
     );
 
     let mut tag = LabelSchema::new_node_id("Tag");
@@ -909,6 +968,7 @@ fn a_candidate_holds_only_the_nodes_the_attempt_writes() {
     schema.set_candidate(LabelCandidate {
         properties: std::collections::BTreeMap::new(),
         mode: SchemaMode::Strict,
+        implies: None,
         operation: GenerationId::from_raw(7),
     });
     store_label_schema(&engine, &schema);

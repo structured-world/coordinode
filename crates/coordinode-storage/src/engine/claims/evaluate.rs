@@ -675,8 +675,9 @@ fn label_schema_admits_stored_nodes(
     // to imply labels either: their lookup postings and index entries would
     // be missing until reconciled, which only an ALTER of the implication
     // performs. Checked here, at the commit, so a writer storing a node of
-    // the type while the declaration was prepared is seen.
-    if (schema.is_auxiliary() || !schema.implies().is_empty())
+    // the type while the declaration was prepared is seen. A revision keeping
+    // the implication in force changes nobody's membership.
+    if (schema.is_auxiliary() || changes_implication(engine, &schema)?)
         && let Some(binding) = current_binding(engine, label, staged_points)?
         && let Some(id) = binding.live_id()
         && first_node_typed_by(engine, id, staged_points)?.is_some()
@@ -691,6 +692,30 @@ fn label_schema_admits_stored_nodes(
     )
 }
 
+/// Whether `schema` makes its label imply other labels than the revision in
+/// force before the attempt does: none for a label not declared yet.
+fn changes_implication(
+    engine: &StorageEngine,
+    schema: &coordinode_core::schema::definition::LabelSchema,
+) -> StorageResult<bool> {
+    let nothing_staged = std::collections::HashMap::new();
+    let in_force = match current_binding(engine, &schema.name, &nothing_staged)? {
+        Some(binding) if binding.declared_revision() != 0 => label_body(
+            engine,
+            &schema.name,
+            binding.declared_revision(),
+            &nothing_staged,
+        )?,
+        _ => None,
+    };
+    let before: &[String] = in_force.as_ref().map_or(&[], |s| s.implies());
+    let mut after = schema.implies().to_vec();
+    let mut before = before.to_vec();
+    after.sort_unstable();
+    before.sort_unstable();
+    Ok(after != before)
+}
+
 /// What each type met implies, under the definitions an attempt leaves (its
 /// own staged schema writes over the stored ones), compiled once per type,
 /// with the label identities it met: a judgement over many records reads no
@@ -700,6 +725,9 @@ pub(crate) struct Closures<'e> {
     staged_points: StagedPoints<'e>,
     implied: coordinode_core::schema::labels::ImpliedCache,
     ids: rustc_hash::FxHashMap<String, Option<coordinode_core::schema::label_id::LabelId>>,
+    /// Whether a label's candidate, when it has one, answers for it instead
+    /// of the facts in force.
+    candidates: bool,
 }
 
 impl<'e> Closures<'e> {
@@ -709,6 +737,19 @@ impl<'e> Closures<'e> {
             staged_points,
             implied: coordinode_core::schema::labels::ImpliedCache::default(),
             ids: rustc_hash::FxHashMap::default(),
+            candidates: false,
+        }
+    }
+
+    /// [`Self::new`] under the catalog the published candidates would leave:
+    /// what each type implies once its candidate is put in force.
+    pub(crate) fn of_candidates(
+        engine: &'e StorageEngine,
+        staged_points: StagedPoints<'e>,
+    ) -> Self {
+        Self {
+            candidates: true,
+            ..Self::new(engine, staged_points)
         }
     }
 
@@ -765,9 +806,14 @@ impl<'e> Closures<'e> {
         if revision == 0 {
             return Ok(LabelFacts::default());
         }
-        let Some(schema) = label_body(self.engine, &name, revision, self.staged_points)? else {
+        let Some(mut schema) = label_body(self.engine, &name, revision, self.staged_points)? else {
             return Ok(LabelFacts::default());
         };
+        if self.candidates
+            && let Some(candidate) = schema.candidate_schema()
+        {
+            schema = candidate;
+        }
         let mut implies = Vec::with_capacity(schema.implies().len());
         for implied in schema.implies() {
             let Some(implied_id) = self.label_id(implied)? else {
@@ -830,6 +876,63 @@ impl<'e> Closures<'e> {
     }
 }
 
+/// The labels `schema`'s candidate makes its type imply that the facts in
+/// force do not, each with explicit constraints a node carrying it must
+/// meet: the definitions its carriers answer to once the candidate is put in
+/// force. Empty for a schema without a candidate or one leaving the
+/// implication as it is.
+fn newly_implied(
+    engine: &StorageEngine,
+    schema: &coordinode_core::schema::definition::LabelSchema,
+    staged_points: StagedPoints<'_>,
+) -> StorageResult<Vec<coordinode_core::schema::definition::LabelSchema>> {
+    let Some(candidate) = schema.candidate_schema() else {
+        return Ok(Vec::new());
+    };
+    if candidate.implies() == schema.implies() {
+        return Ok(Vec::new());
+    }
+    let mut in_force = Closures::new(engine, staged_points);
+    let Some(id) = in_force.label_id(&schema.name)? else {
+        return Ok(Vec::new());
+    };
+    let before = in_force.implied(id)?.as_slice().to_vec();
+    let mut proposed = Closures::of_candidates(engine, staged_points);
+    let after = proposed.implied(id)?.as_slice().to_vec();
+    let mut gained = Vec::new();
+    for label in after.into_iter().filter(|l| !before.contains(l)) {
+        let name = in_force.name_of(label)?;
+        // An undeclared label is a FLEXIBLE type with nothing to refuse.
+        let Some(binding) = current_binding(engine, &name, staged_points)?
+            .filter(|b| b.live_id() == Some(label) && b.declared_revision() != 0)
+        else {
+            continue;
+        };
+        let Some(implied) = label_body(engine, &name, binding.declared_revision(), staged_points)?
+        else {
+            continue;
+        };
+        if implied.constraints().iter().any(|c| c.checks_each_node()) {
+            gained.push(implied);
+        }
+    }
+    Ok(gained)
+}
+
+/// What a node carrying a type breaks among the explicit constraints of the
+/// labels `gained` its type comes to imply, named by the label.
+fn gained_violation(
+    gained: &[coordinode_core::schema::definition::LabelSchema],
+    record: &coordinode_core::graph::node::NodeRecord,
+    names: &std::collections::HashMap<u32, String>,
+    frontier: u32,
+) -> Option<String> {
+    gained.iter().find_map(|implied| {
+        carrier_violation(implied, record.clone(), false, true, names, frontier)
+            .map(|why| format!("as a member of :{}: {why}", implied.name))
+    })
+}
+
 /// Whether every node the attempt writes carrying `label` satisfies the
 /// candidate the label's schema carried at `revision`.
 ///
@@ -856,6 +959,9 @@ fn candidate_admits_written_nodes(
     let Some(candidate) = schema.candidate_schema() else {
         return Ok(Verdict::Holds);
     };
+    // A candidate changing what the type implies holds its carriers to the
+    // explicit constraints of the labels they come to carry as well.
+    let gained = newly_implied(engine, &schema, staged_points)?;
 
     let mut names: Option<(std::collections::HashMap<u32, String>, u32)> = None;
     let mut closures = Closures::new(engine, staged_points);
@@ -883,14 +989,15 @@ fn candidate_admits_written_nodes(
         };
         // A carrier answers to the candidate as the proof holds it: whole
         // as its type, by its explicit constraints otherwise.
-        Ok(
-            carrier_violation(&candidate, record, typed, true, names, *frontier).map(|reason| {
+        let as_member = gained_violation(&gained, &record, names, *frontier);
+        Ok(as_member
+            .or_else(|| carrier_violation(&candidate, record, typed, true, names, *frontier))
+            .map(|reason| {
                 Verdict::Violates(LabelSchemaViolation {
                     node: node_of_record_key(key),
                     reason,
                 })
-            }),
-        )
+            }))
     };
 
     for ((part, key), value) in staged_points.iter() {
@@ -1139,6 +1246,78 @@ pub fn label_schema_violations(
                 },
             ));
             pending.remove(&id);
+        }
+        if pending.is_empty() {
+            break;
+        }
+    }
+    Ok(found)
+}
+
+/// For each of `schemas` whose candidate changes what its type implies, the
+/// first stored node carrying the type that breaks an explicit constraint of
+/// a label the candidate makes it imply, in one pass over the stored nodes;
+/// labels whose carriers all hold are absent from the answer.
+///
+/// # Errors
+///
+/// A stored record, a definition or the field dictionary does not decode.
+pub fn implication_violations(
+    engine: &StorageEngine,
+    schemas: &[coordinode_core::schema::definition::LabelSchema],
+) -> StorageResult<Vec<(String, LabelSchemaViolation)>> {
+    use coordinode_core::graph::node::NodeRecord;
+
+    let nothing_staged = std::collections::HashMap::new();
+    let mut closures = Closures::new(engine, &nothing_staged);
+    let mut pending: Vec<(
+        coordinode_core::schema::label_id::LabelId,
+        &str,
+        Vec<coordinode_core::schema::definition::LabelSchema>,
+    )> = Vec::new();
+    for schema in schemas {
+        let gained = newly_implied(engine, schema, &nothing_staged)?;
+        if gained.is_empty() {
+            continue;
+        }
+        if let Some(id) = closures.label_id(&schema.name)? {
+            pending.push((id, schema.name.as_str(), gained));
+        }
+    }
+    let mut found = Vec::new();
+    if pending.is_empty() {
+        return Ok(found);
+    }
+    let dictionary = crate::engine::metadata::load_field_dictionary(engine)?;
+    let names: std::collections::HashMap<u32, String> = dictionary
+        .iter()
+        .map(|(name, id)| (id, name.to_string()))
+        .collect();
+    for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
+        let (key, value) = guard.into_inner()?;
+        if !is_node_record_key(&key) {
+            continue;
+        }
+        let record = NodeRecord::from_msgpack(&value)
+            .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
+        let mut index = 0;
+        while index < pending.len() {
+            let (type_id, name, gained) = &pending[index];
+            if closures.carries(&record.labels, *type_id)?
+                && let Some(reason) =
+                    gained_violation(gained, &record, &names, dictionary.frontier())
+            {
+                found.push((
+                    (*name).to_string(),
+                    LabelSchemaViolation {
+                        node: node_of_record_key(&key),
+                        reason,
+                    },
+                ));
+                pending.swap_remove(index);
+                continue;
+            }
+            index += 1;
         }
         if pending.is_empty() {
             break;
