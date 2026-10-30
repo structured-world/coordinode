@@ -968,6 +968,7 @@ fn a_candidate_holds_only_the_nodes_the_attempt_writes() {
     schema.set_candidate(LabelCandidate {
         properties: std::collections::BTreeMap::new(),
         mode: SchemaMode::Strict,
+        implies: None,
         operation: GenerationId::from_raw(7),
     });
     store_label_schema(&engine, &schema);
