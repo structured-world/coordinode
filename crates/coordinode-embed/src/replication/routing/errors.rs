@@ -81,6 +81,7 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::Unsupported(_) => "Unsupported",
         E::Budget(_) => "Budget",
         E::IndexUnresolved { .. } => "IndexUnresolved",
+        E::TextIndexNotReady { .. } => "TextIndexNotReady",
         E::CascadeOverflow { .. } => "CascadeOverflow",
         E::CascadeFanoutOverflow { .. } => "CascadeFanoutOverflow",
         E::SchemaViolation(_) => "SchemaViolation",
@@ -389,6 +390,15 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             label,
             property,
             operator,
+        }),
+        E::TextIndexNotReady {
+            label,
+            property,
+            reason,
+        } => Kind::TextIndexNotReady(wire::TextIndexNotReady {
+            label,
+            property,
+            reason,
         }),
         E::CascadeOverflow {
             current,
@@ -788,6 +798,11 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             label: i.label,
             property: i.property,
             operator: i.operator,
+        },
+        Kind::TextIndexNotReady(t) => E::TextIndexNotReady {
+            label: t.label,
+            property: t.property,
+            reason: t.reason,
         },
         Kind::CascadeOverflow(c) => E::CascadeOverflow {
             current: c.current,

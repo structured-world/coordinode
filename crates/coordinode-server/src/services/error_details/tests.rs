@@ -100,6 +100,7 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::OutsideRetention,
         Reason::InvalidWriteConcern,
         Reason::ReadNotReady,
+        Reason::TextIndexNotReady,
         Reason::DuplicateKey,
         Reason::KeyImmutable,
         Reason::ConstraintViolation,

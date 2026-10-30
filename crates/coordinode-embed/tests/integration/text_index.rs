@@ -142,6 +142,59 @@ fn text_match_over_one_label_reads_through_the_index() {
     db.rollback_transaction(tx).expect("rollback");
 }
 
+/// A text index whose reader cannot follow its last commit refuses its
+/// searches with the typed not-ready refusal through every public path, a
+/// statement's `text_match` and a direct search alike, never as an
+/// unsupported query or an untyped failure, so a caller can tell a
+/// transient refusal from a query that cannot run. Before, the refusal
+/// reached the caller as `Unsupported` or `Other`.
+#[test]
+fn a_lagging_text_index_refuses_with_a_typed_not_ready() {
+    use coordinode_search::tantivy::multi_lang::TextRequest;
+    use coordinode_search::tantivy::pending::Matches;
+    use core::sync::atomic::Ordering::SeqCst;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.text_index_registry()
+        .with_index("Article", "body", |index, _| {
+            // Every move of the reader fails, the worker's retries included.
+            index.inner().hooks.fail_reloads.store(u32::MAX, SeqCst);
+            Ok(())
+        })
+        .expect("hook")
+        .expect("registered");
+    db.execute_cypher("CREATE (:Article {body: 'rust graph'})")
+        .expect("create article");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !db.text_index_registry().any_lagging() {
+        assert!(std::time::Instant::now() < deadline, "never folded");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let statement = db
+        .execute_cypher("MATCH (n:Article) WHERE text_match(n.body, 'rust') RETURN n")
+        .expect_err("a statement over the lagging index refuses");
+    let direct = db
+        .text_search(
+            "Article",
+            "body",
+            TextRequest::Terms {
+                query: "rust",
+                language: None,
+                snippets: false,
+            },
+            Matches::Top(10),
+        )
+        .expect_err("a direct search refuses");
+    for refused in [statement, direct] {
+        assert!(
+            format!("{refused:?}").starts_with("TextIndexNotReady"),
+            "{refused:?}"
+        );
+    }
+}
+
 // ── Transactional maintenance ──────────────────────────────────────
 
 /// A text change in a transaction that rolls back is never searchable: the

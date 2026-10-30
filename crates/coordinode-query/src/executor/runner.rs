@@ -107,6 +107,20 @@ pub enum ExecutionError {
         operator: &'static str,
     },
 
+    /// A text index cannot answer yet: its reader has not followed its last
+    /// write, or whether that write landed is unknown until the index is
+    /// opened again. Nothing was answered; the same statement succeeds once
+    /// the member maintaining the index has brought it in line.
+    #[error("the text index on :{label}({property}) is not ready: {reason}; retry shortly")]
+    TextIndexNotReady {
+        /// The indexed label.
+        label: String,
+        /// The indexed property.
+        property: String,
+        /// Why, for a person.
+        reason: String,
+    },
+
     /// Arithmetic with no answer: division or modulo by an integer zero, or an
     /// integer operation whose exact result leaves the `i64` range. Carries the
     /// message verbatim, so a driver sees the same text it would elsewhere.
@@ -12238,9 +12252,35 @@ fn text_search_error(
     use crate::index::text_registry::FindError;
     match error {
         FindError::Budget(stop) => ExecutionError::Budget(stop),
-        FindError::Failed(reason) | FindError::NotReady(reason) => {
-            ExecutionError::Unsupported(format!("{context}: {reason}"))
-        }
+        FindError::Failed(reason) => ExecutionError::Unsupported(format!("{context}: {reason}")),
+        FindError::NotReady {
+            label,
+            property,
+            reason,
+        } => ExecutionError::TextIndexNotReady {
+            label,
+            property,
+            reason,
+        },
+    }
+}
+
+/// A search of a directly wired text index's failure as the statement fails
+/// with it: an index that cannot answer yet is the typed not-ready refusal,
+/// naming the `(label, property)` the statement read when it is known.
+fn direct_text_search_error(
+    (label, property): (Option<&str>, Option<&str>),
+    error: coordinode_search::tantivy::TextSearchError,
+) -> ExecutionError {
+    use coordinode_search::tantivy::TextSearchError as E;
+    match error {
+        E::ReaderBehind | E::CommitUnknown(_) => ExecutionError::TextIndexNotReady {
+            label: label.unwrap_or_default().to_owned(),
+            property: property.unwrap_or_default().to_owned(),
+            reason: error.to_string(),
+        },
+        E::Budget(stop) => ExecutionError::Budget(stop),
+        other => ExecutionError::Unsupported(format!("text search error: {other}")),
     }
 }
 
@@ -12317,7 +12357,7 @@ fn execute_text_filter(
                 // the text_expr shape: the directly wired index answers.
                 text_index
                     .search_all(query_string, language)
-                    .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
+                    .map_err(|e| direct_text_search_error((label, property), e))?
             } else {
                 // Neither registry lookup worked nor legacy index present.
                 return Err(text_match_missing_index_error(label, property));
@@ -12326,7 +12366,7 @@ fn execute_text_filter(
             // A single text index wired directly.
             text_index
                 .search_all(query_string, language)
-                .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
+                .map_err(|e| direct_text_search_error((label, property), e))?
         } else {
             // No registry and no legacy index — hard-fail.
             return Err(text_match_missing_index_error(label, property));

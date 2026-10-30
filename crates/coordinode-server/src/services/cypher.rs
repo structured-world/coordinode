@@ -425,6 +425,18 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 ],
             );
         }
+        // The index answers again once the member maintaining it catches
+        // up: transient, retried after a pause (AIP-194).
+        DatabaseError::TextIndexNotReady {
+            label, property, ..
+        } => {
+            return status_with_reason(
+                Code::Unavailable,
+                rendered,
+                Reason::TextIndexNotReady,
+                [("label", label.clone()), ("property", property.clone())],
+            );
+        }
         DatabaseError::SessionSetting { setting, reason } => {
             return super::error_details::invalid_field(setting, reason.clone());
         }

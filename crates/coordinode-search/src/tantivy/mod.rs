@@ -294,12 +294,31 @@ pub struct TextIndex {
     /// it is durable, and a move of the reader that failed after it is
     /// tried again before the next read, which never reads the commit before.
     reader_behind: core::sync::atomic::AtomicBool,
-    /// Why the index takes no more writes: a commit's outcome is unknown,
-    /// or the writer could not discard what it staged.
-    lost: Option<String>,
+    /// Why the index takes no more writes, and for an unknown commit no
+    /// more reads either.
+    lost: Option<Lost>,
     /// Failures a test injects, and the reader moves it counts.
     #[cfg(any(test, feature = "test-hooks"))]
     pub hooks: TestHooks,
+}
+
+/// Why a [`TextIndex`] stopped taking writes.
+#[derive(Debug, Clone)]
+enum Lost {
+    /// The writer could not discard what it staged. The reader still holds
+    /// the last commit, which is what the directory holds.
+    Writer(String),
+    /// A commit's outcome cannot be read back: the directory may hold it or
+    /// not, so no read answers either, until the index is opened again.
+    Unknown(String),
+}
+
+impl Lost {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Writer(reason) | Self::Unknown(reason) => reason,
+        }
+    }
 }
 
 /// Failure injection a test drives through [`TextIndex::hooks`].
@@ -584,7 +603,13 @@ impl TextIndex {
     ///
     /// [`TextSearchError::ReaderBehind`] while the reader is behind it:
     /// nothing older is read, and the read does not repair it.
-    fn searcher(&self) -> Result<tantivy::Searcher, TextSearchError> {
+    /// [`TextSearchError::CommitUnknown`] once a commit's outcome is
+    /// unknown: whether the reader's commit is the last one is not known,
+    /// until the index is opened again.
+    pub(crate) fn searcher(&self) -> Result<tantivy::Searcher, TextSearchError> {
+        if let Some(Lost::Unknown(reason)) = &self.lost {
+            return Err(TextSearchError::CommitUnknown(reason.clone()));
+        }
         if self.reader_behind() {
             return Err(TextSearchError::ReaderBehind);
         }
@@ -653,7 +678,9 @@ impl TextIndex {
 
     /// A commit whose outcome is unknown: the index takes no more writes.
     fn unknown(&mut self, reason: String) -> TextSearchError {
-        self.lost = Some(format!("a commit's outcome is unknown: {reason}"));
+        self.lost = Some(Lost::Unknown(format!(
+            "a commit's outcome is unknown: {reason}"
+        )));
         TextSearchError::CommitUnknown(reason)
     }
 
@@ -876,7 +903,7 @@ impl TextIndex {
     /// which only reopening the index reads again.
     pub(crate) fn writable(&self) -> Result<(), TextSearchError> {
         match &self.lost {
-            Some(reason) => Err(TextSearchError::IndexCorrupted(reason.clone())),
+            Some(lost) => Err(TextSearchError::IndexCorrupted(lost.reason().to_owned())),
             None => Ok(()),
         }
     }
@@ -886,7 +913,7 @@ impl TextIndex {
     pub(crate) fn discard_staged(&mut self) -> Result<(), TextSearchError> {
         if let Err(e) = self.writer.rollback() {
             let reason = format!("the index writer is gone after a failed rollback: {e}");
-            self.lost = Some(reason.clone());
+            self.lost = Some(Lost::Writer(reason.clone()));
             return Err(TextSearchError::IndexCorrupted(reason));
         }
         Ok(())

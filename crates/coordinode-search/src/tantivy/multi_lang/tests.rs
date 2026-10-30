@@ -1377,6 +1377,91 @@ fn a_commit_of_unknown_outcome_refuses_every_later_write() {
     assert_eq!(found(&idx), [1, 2, 6], "writes are taken again");
 }
 
+/// A commit lands, an addition, a removal or a settling, and reads back as
+/// unknown. Until the index is opened again no read answers: not from the
+/// reader's older commit, and not by moving the reader, which the owner's
+/// catch-up does not do either, as it cannot tell the outcome. Writes stay
+/// refused. A reopen reads the commit that landed, epoch and statistics
+/// with it. Before, reads answered from the older commit.
+#[test]
+fn reads_refuse_while_a_commit_outcome_is_unknown() {
+    use core::sync::atomic::Ordering::SeqCst;
+    type Step = fn(&mut MultiLanguageTextIndex) -> Result<(), TextSearchError>;
+    let steps: [(&str, Step, &[u64]); 3] = [
+        (
+            "an addition",
+            |idx| {
+                idx.apply_scoped_changes(
+                    &[(2, props(&[("body", "rust tools")]), Scope::Shared)],
+                    &[],
+                )
+            },
+            &[1, 2, 3],
+        ),
+        ("a removal", |idx| idx.apply_scoped_changes(&[], &[1]), &[3]),
+        ("a settling", |idx| idx.settle(Scope::Gained), &[1]),
+    ];
+    for (what, step, landed) in steps {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            MultiLanguageTextIndex::open_or_create(
+                dir.path(),
+                15_000_000,
+                MultiLangConfig::with_default_language("english"),
+            )
+            .unwrap()
+        };
+        {
+            let mut idx = open();
+            idx.apply_scoped_changes(
+                &[
+                    (1, props(&[("body", "rust graph")]), Scope::Shared),
+                    (3, props(&[("body", "rust web")]), Scope::Gained),
+                ],
+                &[],
+            )
+            .unwrap();
+            idx.inner().hooks.lose_commit_readback.store(true, SeqCst);
+            assert!(step(&mut idx).is_err(), "{what}: the outcome is unknown");
+            let attempts = idx.inner().hooks.reload_attempts.load(SeqCst);
+            let refused = |idx: &MultiLanguageTextIndex| {
+                idx.find(
+                    terms("rust"),
+                    Matches::All,
+                    &PendingDocuments::none(),
+                    None,
+                    &mut Unmetered,
+                )
+                .is_err()
+                    && idx.num_docs().is_err()
+                    && idx.contains(1).is_err()
+            };
+            assert!(refused(&idx), "{what}: reads refuse");
+            let _ = idx.catch_up();
+            assert!(refused(&idx), "{what}: a catch-up does not resolve it");
+            assert_eq!(
+                idx.inner().hooks.reload_attempts.load(SeqCst),
+                attempts,
+                "{what}: no read moved the reader"
+            );
+            assert!(
+                idx.apply_scoped_changes(&[(5, props(&[("body", "rust")]), Scope::Shared)], &[])
+                    .is_err(),
+                "{what}: writes stay refused"
+            );
+        }
+        let idx = open();
+        let ids: Vec<u64> = scores(&idx, "rust", &PendingDocuments::none())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids, landed,
+            "{what}: the commit that landed, after a reopen"
+        );
+    }
+}
+
 /// A commit lands and the reader cannot follow it. A read neither answers
 /// from the older commit nor moves the reader itself, which would put the
 /// owner's repair inside a search: it refuses, however often it is asked.

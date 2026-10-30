@@ -3493,7 +3493,16 @@ impl Database {
         );
         let found = found.map_err(|e| match e {
             FindError::Budget(stop) => DatabaseError::Budget(stop),
-            FindError::Failed(reason) | FindError::NotReady(reason) => DatabaseError::Other(reason),
+            FindError::Failed(reason) => DatabaseError::Other(reason),
+            FindError::NotReady {
+                label,
+                property,
+                reason,
+            } => DatabaseError::TextIndexNotReady {
+                label,
+                property,
+                reason,
+            },
         })?;
         search.finish().map_err(DatabaseError::Budget)?;
         Ok(found)

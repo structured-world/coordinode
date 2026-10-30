@@ -96,6 +96,11 @@ fn every_variant() -> Vec<DatabaseError> {
             property: "email".into(),
             operator: "Aggregate".into(),
         },
+        E::TextIndexNotReady {
+            label: "Article".into(),
+            property: "body".into(),
+            reason: "the text index reader has not caught up with its last commit".into(),
+        },
         E::CascadeOverflow {
             current: 9,
             limit: 8,

@@ -2767,6 +2767,29 @@ fn an_unresolved_index_maps_to_unavailable_with_retry_advice() {
     assert!(details.retry_info().is_some(), "retryable once proved");
 }
 
+/// A text index that cannot answer yet is UNAVAILABLE / TEXT_INDEX_NOT_READY
+/// naming the index, with retry advice, so a client tells a transient
+/// refusal from a query that cannot run.
+#[test]
+fn a_text_index_not_ready_maps_to_unavailable_with_retry_advice() {
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::TextIndexNotReady {
+        label: "Article".into(),
+        property: "body".into(),
+        reason: "the text index reader has not caught up with its last commit".into(),
+    }));
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "TEXT_INDEX_NOT_READY");
+    let meta = |k: &str| info.metadata.get(k).map(String::as_str);
+    assert_eq!(meta("label"), Some("Article"));
+    assert_eq!(meta("property"), Some("body"));
+    assert!(details.retry_info().is_some(), "transient");
+}
+
 /// A memory limit past the ceiling, or zero, is the caller's error naming the
 /// field; one within it is taken as bytes.
 #[test]

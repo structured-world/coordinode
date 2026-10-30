@@ -65,6 +65,8 @@ coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-h
 
 [dev-dependencies]
 chrono = { workspace = true }
+# Failure injection into the text indexes this crate's tests drive.
+coordinode-search = { workspace = true, features = ["test-hooks"] }
 # The oplog placement test opens the consensus log store on an embedded
 # directory.
 coordinode-raft = { workspace = true }

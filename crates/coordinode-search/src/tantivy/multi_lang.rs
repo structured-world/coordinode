@@ -433,8 +433,7 @@ impl MultiLanguageTextIndex {
         let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
         let live = self
             .inner
-            .reader
-            .searcher()
+            .searcher()?
             .search(&query, &tantivy::collector::Count)?;
         Ok(live > 0)
     }

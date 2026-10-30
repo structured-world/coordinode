@@ -42,9 +42,18 @@ pub type Judged = (
 pub enum FindError {
     /// The query's budget stopped it.
     Budget(BudgetStop),
-    /// The index's reader is behind its last commit until the worker
-    /// maintaining it catches it up; nothing older is answered meanwhile.
-    NotReady(String),
+    /// The index cannot answer yet: its reader is behind its last commit
+    /// until the worker maintaining it catches it up, or whether that commit
+    /// landed is unknown until the index is opened again. Nothing older is
+    /// answered meanwhile.
+    NotReady {
+        /// The indexed label.
+        label: String,
+        /// The indexed property.
+        property: String,
+        /// Why, for a person.
+        reason: String,
+    },
     /// The nodes could not be read or the query not run, as described.
     Failed(String),
 }
@@ -53,7 +62,12 @@ impl core::fmt::Display for FindError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Budget(stop) => stop.fmt(f),
-            Self::Failed(reason) | Self::NotReady(reason) => f.write_str(reason),
+            Self::Failed(reason) => f.write_str(reason),
+            Self::NotReady {
+                label,
+                property,
+                reason,
+            } => write!(f, "text index :{label}({property}) is not ready: {reason}"),
         }
     }
 }
@@ -489,8 +503,12 @@ impl TextIndexRegistry {
         };
         let searched = |e: TextSearchError| match e {
             TextSearchError::Budget(stop) => FindError::Budget(stop),
-            TextSearchError::ReaderBehind => {
-                FindError::NotReady(format!("text index :{label}({property}): {e}"))
+            TextSearchError::ReaderBehind | TextSearchError::CommitUnknown(_) => {
+                FindError::NotReady {
+                    label: label.to_owned(),
+                    property: property.to_owned(),
+                    reason: e.to_string(),
+                }
             }
             other => failed(&other),
         };

@@ -4296,7 +4296,13 @@ fn text_match_over_a_lagging_index_never_drops_matches() {
     ctx.text_index_registry = None;
     match execute(&plan, &mut ctx) {
         Ok(rows) => assert_eq!(rows.len(), 3, "every match kept: {rows:?}"),
-        Err(refused) => assert!(refused.to_string().contains("not caught up"), "{refused}"),
+        Err(refused) => assert!(
+            matches!(
+                refused,
+                coordinode_query::executor::runner::ExecutionError::TextIndexNotReady { .. }
+            ),
+            "{refused}"
+        ),
     }
 }
 

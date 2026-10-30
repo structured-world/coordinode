@@ -245,6 +245,11 @@ pub enum Reason {
     /// `label`, `property` and `operator`. Retry once the index is verified
     /// or rebuilt.
     IndexUnresolved,
+    /// A text index the statement reads cannot answer yet: its reader has
+    /// not followed its last write, or whether that write landed is unknown
+    /// until the index is opened again. Nothing was answered. Metadata
+    /// carries `label` and `property`. Retry after the advised delay.
+    TextIndexNotReady,
     /// The client operation the write carries out already stands settled, or
     /// cannot be admitted: this attempt ran and applied nothing. Metadata
     /// carries `outcome` (COMMITTED, ABORTED, UNKNOWN or RETIRED,
@@ -325,6 +330,7 @@ impl Reason {
             Reason::QueryDeadlineExceeded => "QUERY_DEADLINE_EXCEEDED",
             Reason::QueryCancelled => "QUERY_CANCELLED",
             Reason::IndexUnresolved => "INDEX_UNRESOLVED",
+            Reason::TextIndexNotReady => "TEXT_INDEX_NOT_READY",
             Reason::OperationSettled => "OPERATION_SETTLED",
             Reason::ForeignOperation => "FOREIGN_OPERATION",
             Reason::MemberUnreachable => "MEMBER_UNREACHABLE",
@@ -383,6 +389,10 @@ impl Reason {
             // The index answers again once its check proves it, which takes
             // a verification pass, not a moment.
             Reason::IndexUnresolved => Some(std::time::Duration::from_secs(5)),
+            // The worker maintaining the index retries a lagging reader
+            // every second; an index whose last write is unknown answers
+            // after it is opened again, which no shorter wait brings.
+            Reason::TextIndexNotReady => Some(std::time::Duration::from_secs(1)),
             // Nothing ran; a member that could not be reached is usually back
             // or replaced within an election.
             Reason::MemberUnreachable => Some(std::time::Duration::from_millis(100)),

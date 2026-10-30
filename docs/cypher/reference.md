@@ -553,7 +553,14 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
 - **Member-local indexes.** A full-text index and a vector index are built by
   every member from the data it holds; their definitions replicate, their
   readiness is each member's own. A full-text index's backfill runs on the
-  same engine builds as the others.
+  same engine builds as the others. A full-text search never answers from an
+  older state of its index than the index's last write: while the member has
+  not brought the index in line with that write, or cannot tell whether it
+  landed, the search is refused with gRPC `UNAVAILABLE`, reason
+  `TEXT_INDEX_NOT_READY` (metadata `label`, `property`) and retry advice
+  (`DatabaseError::TextIndexNotReady` in the embedded API). A write whose
+  outcome on the index is unknown keeps it refused until the index is opened
+  again, as a restart of the member does.
 - **Lists.** A list value is indexed by each element, so a unique index keeps
   an element to one node. An equality on the property still means the whole
   value: `n.tags = 'x'` does not match a node whose `tags` is `['x', 'y']`.

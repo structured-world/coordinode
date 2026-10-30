@@ -108,6 +108,20 @@ pub enum DatabaseError {
         operator: String,
     },
 
+    /// A text index cannot answer yet: its reader has not followed its last
+    /// write, or whether that write landed is unknown until the index is
+    /// opened again. Nothing was answered; the same read succeeds once the
+    /// member maintaining the index has brought it in line.
+    #[error("the text index on :{label}({property}) is not ready: {reason}; retry shortly")]
+    TextIndexNotReady {
+        /// The indexed label.
+        label: String,
+        /// The indexed property.
+        property: String,
+        /// Why, for a person.
+        reason: String,
+    },
+
     /// Triggers fired in a chain deeper than its limit. `chain` names them in
     /// firing order.
     #[error("trigger cascade depth exceeded: current={current}, limit={limit}, chain={chain:?}")]
@@ -750,6 +764,15 @@ impl From<ExecutionError> for DatabaseError {
                 label,
                 property,
                 operator: operator.to_owned(),
+            },
+            E::TextIndexNotReady {
+                label,
+                property,
+                reason,
+            } => Self::TextIndexNotReady {
+                label,
+                property,
+                reason,
             },
             E::Arithmetic(EvalError::VectorDomain(e)) | E::VectorDomain(e) => Self::VectorDomain(e),
             E::Arithmetic(eval) => Self::Arithmetic(eval),
