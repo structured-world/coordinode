@@ -694,6 +694,23 @@ impl IndexDefinition {
         self.selection.retain(|p| p.part != part);
     }
 
+    /// This index with its entries keyed under `scope` (its own generation
+    /// or one of its parts): what the entry codec, the unique checks and the
+    /// readers of one scope take. Its parts are not carried over.
+    pub fn in_scope(&self, scope: GenerationId) -> Self {
+        Self {
+            id: self.id,
+            generation: scope,
+            descriptor: self.descriptor.clone(),
+            selection: Vec::new(),
+        }
+    }
+
+    /// Whether some part of this index is kept apart for `label`.
+    pub fn has_parts_for(&self, label: coordinode_core::schema::label_id::LabelId) -> bool {
+        self.selection.iter().any(|p| p.label == label)
+    }
+
     /// The interpretation that decides this B-tree index's entries, with
     /// each property resolved to the field id `field_of` binds it to now:
     /// what a DERIVED effect is sealed with, so no member consults the

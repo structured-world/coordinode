@@ -87,7 +87,7 @@ impl IndexBuildService {
             };
             match committed {
                 Ok(()) => {
-                    refresh_lookup(env).map_err(text)?;
+                    refresh_lookup(env, generation).map_err(text)?;
                     return Ok(true);
                 }
                 Err(e) if is_contention(&e) => continue,
@@ -183,9 +183,11 @@ impl Shared {
         if !moves {
             return Ok(Some(Vec::new()));
         }
+        let fields = env.fields()?;
         let placed = crate::index::reconcile::Reconcile {
             engine: env.engine(),
             oracle: env.oracle(),
+            interner: &fields,
             shard_id: env.shard_id(),
             operation: generation,
             stop: Some(&self.stopping),
@@ -429,7 +431,7 @@ impl Shared {
             };
             match committed {
                 Ok(outcome) => {
-                    refresh_lookup(env).map_err(text)?;
+                    refresh_lookup(env, generation).map_err(text)?;
                     return Ok(Executed::Outcome(outcome));
                 }
                 Err(e) if is_contention(&e) => continue,
@@ -444,21 +446,21 @@ impl Shared {
     }
 }
 
-/// Register the label lookup as its record now stands with this member's
-/// writers, after a commit that concluded parts of it.
-fn refresh_lookup(env: &dyn super::BuildEnvironment) -> Result<(), StoreError> {
-    if let Some(lookup) = LocalIndexStore::new(env.engine()).label_lookup()? {
-        env.registry()
-            .register_published(env.engine(), lookup)
-            .map_err(StoreError::from)?;
-    }
-    Ok(())
+/// Register the indexes with parts of the certification `generation` with
+/// this member's writers as their records now stand, after a commit that
+/// concluded them.
+fn refresh_lookup(
+    env: &dyn super::BuildEnvironment,
+    generation: GenerationId,
+) -> Result<(), StoreError> {
+    crate::index::reconcile::register_parts_of(env.engine(), env.registry(), generation)
 }
 
-/// Stage the label lookup's parts of the certification `generation` moving
-/// to `state`, conditioned on the lookup's record as read: its readers pick
-/// their scopes from that record, and a writer still bound to the record as
-/// it was is refused at its commit. Nothing when the lookup has none.
+/// Stage the parts of the certification `generation` moving to `state` in
+/// every index that keeps some, the label lookup and the declared indexes
+/// alike, each conditioned on its record as read: readers pick their scopes
+/// from that record, and a writer still bound to the record as it was is
+/// refused at its commit.
 fn stage_selection_conclusion(
     engine: &coordinode_storage::engine::core::StorageEngine,
     txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
@@ -466,15 +468,15 @@ fn stage_selection_conclusion(
     state: PartState,
 ) -> Result<(), StoreError> {
     let store = LocalIndexStore::new(engine);
-    let Some(mut lookup) = store.label_lookup()? else {
-        return Ok(());
-    };
-    let version = store.definition_version(lookup.id)?;
-    if !lookup.conclude_parts(generation, state) {
-        return Ok(());
+    for mut def in store.list_definitions()? {
+        let version = store.definition_version(def.id)?;
+        if !def.conclude_parts(generation, state) {
+            continue;
+        }
+        store.expect_definition_txn(txn, def.id, version)?;
+        store.put_definition_txn(txn, &def)?;
     }
-    store.expect_definition_txn(txn, lookup.id, version)?;
-    store.put_definition_txn(txn, &lookup)
+    Ok(())
 }
 
 /// Stage putting the candidate `generation` of `label` in force, at the

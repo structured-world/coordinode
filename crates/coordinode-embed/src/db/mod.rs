@@ -2750,6 +2750,7 @@ impl Database {
                 feedback_cache: Some(self.feedback_cache.clone()),
                 schema_label_cache: std::collections::HashMap::new(),
                 label_schema_cache: std::collections::HashMap::new(),
+                index_scopes: Default::default(),
                 labels: Default::default(),
                 index_deferred: Default::default(),
                 node_columns: None,

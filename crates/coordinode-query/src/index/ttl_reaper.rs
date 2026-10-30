@@ -209,13 +209,27 @@ impl BtreeIndexes {
         let field_of = |name: &str| self.fields.get(name).copied();
         // A reaped node leaves the index of every label it carries; the
         // expiry policy stays its type's. The reaper reads only node keys
-        // that are not temporal versions.
-        for label in carried.filter(|l| self.registry.has_btree_for(l)) {
+        // that are not temporal versions. While a change of what a type
+        // implies keeps parts apart, an entry may stand under a label the
+        // node carries under the candidate alone: those labels are cleared
+        // too, a removal touching only what the node holds.
+        let mut labels: Vec<&str> = carried.collect();
+        let with_parts = self.registry.btree_labels_with_parts();
+        for label in &with_parts {
+            if !labels.contains(&label.as_str()) {
+                labels.push(label);
+            }
+        }
+        for label in labels
+            .into_iter()
+            .filter(|l| self.registry.has_btree_for(l))
+        {
             let node = super::registry::NodeState {
                 node_id,
                 valid_from: None,
                 label,
                 value_of: &lookup,
+                carried: super::registry::Carried::SETTLED,
             };
             self.registry
                 .on_node_deleted(engine, txn, &node, &field_of)?;

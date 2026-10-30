@@ -74,6 +74,7 @@ fn create(
             valid_from: None,
             label: "User",
             value_of: &lookup,
+            carried: super::Carried::SETTLED,
         },
         &no_fields,
         &mut Vec::new(),
@@ -103,6 +104,7 @@ fn change(
             properties: &[property],
             before: &before,
             after: &after,
+            carried: super::Carried::SETTLED,
         },
         &no_fields,
         &mut Vec::new(),
@@ -935,6 +937,7 @@ fn a_deleted_node_leaves_the_index() {
             valid_from: None,
             label: "User",
             value_of: &props_lookup(&props),
+            carried: super::Carried::SETTLED,
         },
         &no_fields,
     )

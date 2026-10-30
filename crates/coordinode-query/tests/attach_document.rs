@@ -88,6 +88,7 @@ fn make_test_ctx<'a>(
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         label_schema_cache: HashMap::new(),
+        index_scopes: Default::default(),
         labels: Default::default(),
         index_deferred: Default::default(),
         node_columns: None,

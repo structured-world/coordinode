@@ -1573,6 +1573,7 @@ fn take_while_building(
                 valid_from: None,
                 label: "User",
                 value_of: &lookup,
+                carried: crate::index::registry::Carried::SETTLED,
             },
             &field_of,
             &mut claims,

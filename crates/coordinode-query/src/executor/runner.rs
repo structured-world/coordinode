@@ -1471,6 +1471,13 @@ pub struct ExecutionContext<'a> {
     /// schema the statement changes. Shared, so a write can hold its type's
     /// schema while it stages through the context, without reading it again.
     pub label_schema_cache: HashMap<String, Option<Arc<LabelSchema>>>,
+    /// Per-statement cache: index and generation → the key scopes its label
+    /// is read from at the statement's view, read once from the index's
+    /// record there, so a correlated probe reads no catalog per row.
+    pub index_scopes: rustc_hash::FxHashMap<
+        (crate::index::IndexId, crate::index::GenerationId),
+        smallvec::SmallVec<[crate::index::GenerationId; 2]>,
+    >,
     /// Per-statement view of the label catalog: each label name met bound
     /// to its identity, each identity named, and what each type met implies,
     /// compiled from the schemas in `label_schema_cache` and dropped with
@@ -2720,9 +2727,65 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        let carried = self.carried_beyond_stored(&record.labels)?;
-        let labels = carried.as_deref().unwrap_or(&record.labels);
-        self.index_labels_gained(registry, node_id, valid_from, record, labels, &[])
+        let labels = self.btree_labels(registry, &record.labels)?;
+        self.index_labels_gained(registry, node_id, valid_from, record, &labels, &[])
+    }
+
+    /// The labels a node storing `stored` carries, each with the
+    /// interpretations it carries it under: the facts in force, and while a
+    /// change of what a type implies is certified for a B-tree index, its
+    /// candidate too. What the B-tree indexes of a write follow.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compile_implied`].
+    fn btree_labels(
+        &mut self,
+        registry: &crate::index::IndexRegistry,
+        stored: &[LabelId],
+    ) -> Result<smallvec::SmallVec<[(LabelId, crate::index::registry::Carried); 8]>, ExecutionError>
+    {
+        use crate::index::registry::Carried;
+        if !registry.has_proposed_btree() {
+            // The steady state: one interpretation, and no list of the
+            // node's own unless its type implies labels.
+            let beyond = self.carried_beyond_stored(stored)?;
+            return Ok(beyond
+                .as_deref()
+                .unwrap_or(stored)
+                .iter()
+                .map(|&l| (l, Carried::SETTLED))
+                .collect());
+        }
+        let in_force = self.carried_labels(stored)?;
+        let candidate = self.candidate_carried_labels(stored)?;
+        let mut labels: smallvec::SmallVec<[(LabelId, Carried); 8]> = in_force
+            .iter()
+            .map(|&l| {
+                (
+                    l,
+                    Carried {
+                        in_force: true,
+                        candidate: candidate.contains(&l),
+                    },
+                )
+            })
+            .collect();
+        labels.extend(
+            candidate
+                .iter()
+                .filter(|l| !in_force.contains(l))
+                .map(|&l| {
+                    (
+                        l,
+                        Carried {
+                            in_force: false,
+                            candidate: true,
+                        },
+                    )
+                }),
+        );
+        Ok(labels)
     }
 
     /// Learn the name of each of `labels`, so a pass over them borrows each
@@ -2739,28 +2802,31 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// Stage the B-tree entries `record` holds in the indexes of `labels`,
-    /// labels it carries, except those in `kept` (already indexed): an index
-    /// covers every node carrying its label, whether the label is the node's
-    /// type, one its type implies or an auxiliary one. A unique value another
-    /// node holds refuses the write.
+    /// labels it carries with the interpretations it carries them under,
+    /// except those in `kept` (already indexed so): an index covers every
+    /// node carrying its label, whether the label is the node's type, one its
+    /// type implies or an auxiliary one. A unique value another node holds
+    /// refuses the write.
     fn index_labels_gained(
         &mut self,
         registry: &crate::index::IndexRegistry,
         node_id: NodeId,
         valid_from: Option<i64>,
         record: &NodeRecord,
-        labels: &[LabelId],
-        kept: &[LabelId],
+        labels: &[(LabelId, crate::index::registry::Carried)],
+        kept: &[(LabelId, crate::index::registry::Carried)],
     ) -> Result<(), ExecutionError> {
-        self.name_labels(labels)?;
+        for (label, _) in labels {
+            self.label_name(*label)?;
+        }
         let view = &self.labels;
-        let indexed = |l: &&LabelId| {
+        let indexed = |l: &(LabelId, crate::index::registry::Carried)| {
             !kept.contains(l)
                 && view
-                    .name(**l)
+                    .name(l.0)
                     .is_some_and(|name| registry.has_btree_for(name))
         };
-        if !labels.iter().any(|l| indexed(&l)) {
+        if !labels.iter().any(indexed) {
             return Ok(());
         }
         self.sync_txn_state();
@@ -2770,11 +2836,11 @@ impl<'a> ExecutionContext<'a> {
             let lookup = crate::index::registry::record_lookup(record, interner);
             let field_of = |name: &str| interner.lookup(name);
             let view = &self.labels;
-            for label in labels
+            for (label, carried) in labels
                 .iter()
                 .filter(|l| !kept.contains(l))
-                .filter_map(|l| view.name(*l))
-                .filter(|name| registry.has_btree_for(name))
+                .filter_map(|(l, carried)| view.name(*l).map(|name| (name, *carried)))
+                .filter(|(name, _)| registry.has_btree_for(name))
             {
                 registry
                     .on_node_created(
@@ -2786,6 +2852,7 @@ impl<'a> ExecutionContext<'a> {
                             valid_from,
                             label,
                             value_of: &lookup,
+                            carried,
                         },
                         &field_of,
                         &mut self.key_claims.indexes,
@@ -2798,25 +2865,29 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// Stage the removal of the B-tree entries `record` holds in the indexes
-    /// of `labels`, labels it carried, except those in `kept` (still carried).
+    /// of `labels`, labels it carried with the interpretations it carried
+    /// them under, except those in `kept` (still carried so). The entry is
+    /// cleared from every scope of the label it may stand in.
     fn index_labels_lost(
         &mut self,
         registry: &crate::index::IndexRegistry,
         node_id: NodeId,
         valid_from: Option<i64>,
         record: &NodeRecord,
-        labels: &[LabelId],
-        kept: &[LabelId],
+        labels: &[(LabelId, crate::index::registry::Carried)],
+        kept: &[(LabelId, crate::index::registry::Carried)],
     ) -> Result<(), ExecutionError> {
-        self.name_labels(labels)?;
+        for (label, _) in labels {
+            self.label_name(*label)?;
+        }
         let view = &self.labels;
-        let indexed = |l: &&LabelId| {
+        let indexed = |l: &(LabelId, crate::index::registry::Carried)| {
             !kept.contains(l)
                 && view
-                    .name(**l)
+                    .name(l.0)
                     .is_some_and(|name| registry.has_btree_for(name))
         };
-        if !labels.iter().any(|l| indexed(&l)) {
+        if !labels.iter().any(indexed) {
             return Ok(());
         }
         self.sync_txn_state();
@@ -2824,11 +2895,11 @@ impl<'a> ExecutionContext<'a> {
         let lookup = crate::index::registry::record_lookup(record, interner);
         let field_of = |name: &str| interner.lookup(name);
         let view = &self.labels;
-        for label in labels
+        for (label, carried) in labels
             .iter()
             .filter(|l| !kept.contains(l))
-            .filter_map(|l| view.name(*l))
-            .filter(|name| registry.has_btree_for(name))
+            .filter_map(|(l, carried)| view.name(*l).map(|name| (name, *carried)))
+            .filter(|(name, _)| registry.has_btree_for(name))
         {
             registry.on_node_deleted(
                 self.engine,
@@ -2838,6 +2909,7 @@ impl<'a> ExecutionContext<'a> {
                     valid_from,
                     label,
                     value_of: &lookup,
+                    carried,
                 },
                 &field_of,
             )?;
@@ -2863,12 +2935,12 @@ impl<'a> ExecutionContext<'a> {
         if self.index_deferred.contains(&node_id) {
             return Ok(());
         }
-        let carried_before = self.carried_beyond_stored(labels_before)?;
-        let carried_after = self.carried_beyond_stored(&record.labels)?;
-        let before = carried_before.as_deref().unwrap_or(labels_before);
-        let after = carried_after.as_deref().unwrap_or(&record.labels);
-        self.index_labels_lost(registry, node_id, valid_from, record, before, after)?;
-        self.index_labels_gained(registry, node_id, valid_from, record, after, before)
+        // A label whose interpretations change leaves and rejoins: its entry
+        // is cleared wherever it stands and placed where it now belongs.
+        let before = self.btree_labels(registry, labels_before)?;
+        let after = self.btree_labels(registry, &record.labels)?;
+        self.index_labels_lost(registry, node_id, valid_from, record, &before, &after)?;
+        self.index_labels_gained(registry, node_id, valid_from, record, &after, &before)
     }
 
     /// Compile what the type of a node storing `stored` implies, and name
@@ -2906,8 +2978,8 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        self.bind_membership(&before.labels)?;
-        if !carried_names(&self.labels, before).any(|l| registry.has_btree_for(l)) {
+        let labels = self.btree_labels(registry, &before.labels)?;
+        if !self.names_indexed(registry, &labels)? {
             return Ok(());
         }
         self.sync_txn_state();
@@ -2928,7 +3000,11 @@ impl<'a> ExecutionContext<'a> {
             let after_of = crate::index::registry::record_lookup(after, interner);
             let field_of = |name: &str| interner.lookup(name);
             let view = &self.labels;
-            for label in carried_names(view, before).filter(|l| registry.has_btree_for(l)) {
+            for (label, carried) in labels
+                .iter()
+                .filter_map(|(l, carried)| view.name(*l).map(|name| (name, *carried)))
+                .filter(|(name, _)| registry.has_btree_for(name))
+            {
                 registry
                     .on_property_changed(
                         self.engine,
@@ -2941,6 +3017,7 @@ impl<'a> ExecutionContext<'a> {
                             properties: &changed,
                             before: &before_of,
                             after: &after_of,
+                            carried,
                         },
                         &field_of,
                         &mut self.key_claims.indexes,
@@ -2950,6 +3027,23 @@ impl<'a> ExecutionContext<'a> {
         }
         self.claim_building_uniques(from);
         Ok(())
+    }
+
+    /// Name each of `labels` and say whether one has a B-tree index.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::label_name`].
+    fn names_indexed(
+        &mut self,
+        registry: &crate::index::IndexRegistry,
+        labels: &[(LabelId, crate::index::registry::Carried)],
+    ) -> Result<bool, ExecutionError> {
+        let mut any = false;
+        for (label, _) in labels {
+            any |= registry.has_btree_for(self.label_name(*label)?);
+        }
+        Ok(any)
     }
 
     /// Move the B-tree index entries of `record` as its `property` changes to
@@ -2965,7 +3059,11 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        if self.index_deferred.contains(&node_id) || !self.indexes_record(record)? {
+        if self.index_deferred.contains(&node_id) {
+            return Ok(());
+        }
+        let labels = self.btree_labels(registry, &record.labels)?;
+        if !self.names_indexed(registry, &labels)? {
             return Ok(());
         }
         self.sync_txn_state();
@@ -2982,7 +3080,11 @@ impl<'a> ExecutionContext<'a> {
             };
             let field_of = |name: &str| interner.lookup(name);
             let view = &self.labels;
-            for label in carried_names(view, record).filter(|l| registry.has_btree_for(l)) {
+            for (label, carried) in labels
+                .iter()
+                .filter_map(|(l, carried)| view.name(*l).map(|name| (name, *carried)))
+                .filter(|(name, _)| registry.has_btree_for(name))
+            {
                 registry
                     .on_property_changed(
                         self.engine,
@@ -2995,6 +3097,7 @@ impl<'a> ExecutionContext<'a> {
                             properties: &[property],
                             before: &before,
                             after: &after,
+                            carried,
                         },
                         &field_of,
                         &mut self.key_claims.indexes,
@@ -3025,7 +3128,16 @@ impl<'a> ExecutionContext<'a> {
             return Ok(false);
         };
         self.bind_membership(&record.labels)?;
-        Ok(carried_names(&self.labels, record).any(|l| registry.has_btree_for(l)))
+        if carried_names(&self.labels, record).any(|l| registry.has_btree_for(l)) {
+            return Ok(true);
+        }
+        // A label the record carries under a candidate alone has entries of
+        // its own to keep while the change is certified.
+        if !registry.has_proposed_btree() {
+            return Ok(false);
+        }
+        let labels = self.btree_labels(registry, &record.labels)?;
+        self.names_indexed(registry, &labels)
     }
 
     /// Move the B-tree index entries of a node whose `properties` go from
@@ -3048,6 +3160,7 @@ impl<'a> ExecutionContext<'a> {
         {
             return Ok(());
         }
+        let labels = self.btree_labels(registry, &before.labels)?;
         self.sync_txn_state();
         let from = self.key_claims.indexes.len();
         {
@@ -3056,7 +3169,11 @@ impl<'a> ExecutionContext<'a> {
             let after_of = crate::index::registry::record_lookup(after, interner);
             let field_of = |name: &str| interner.lookup(name);
             let view = &self.labels;
-            for label in carried_names(view, before).filter(|l| registry.has_btree_for(l)) {
+            for (label, carried) in labels
+                .iter()
+                .filter_map(|(l, carried)| view.name(*l).map(|name| (name, *carried)))
+                .filter(|(name, _)| registry.has_btree_for(name))
+            {
                 registry
                     .on_property_changed(
                         self.engine,
@@ -3069,6 +3186,7 @@ impl<'a> ExecutionContext<'a> {
                             properties,
                             before: &before_of,
                             after: &after_of,
+                            carried,
                         },
                         &field_of,
                         &mut self.key_claims.indexes,
@@ -3095,14 +3213,8 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        let carried = self.carried_labels(labels)?;
-        self.name_labels(&carried)?;
-        let view = &self.labels;
-        if !carried
-            .iter()
-            .filter_map(|l| view.name(*l))
-            .any(|l| registry.has_btree_for(l))
-        {
+        let carried = self.btree_labels(registry, labels)?;
+        if !self.names_indexed(registry, &carried)? {
             return Ok(());
         }
         self.sync_txn_state();
@@ -3121,10 +3233,10 @@ impl<'a> ExecutionContext<'a> {
         let field_of = |name: &str| interner.lookup(name);
         let from = self.key_claims.indexes.len();
         let view = &self.labels;
-        for label in carried
+        for (label, carried) in carried
             .iter()
-            .filter_map(|l| view.name(*l))
-            .filter(|l| registry.has_btree_for(l))
+            .filter_map(|(l, carried)| view.name(*l).map(|name| (name, *carried)))
+            .filter(|(name, _)| registry.has_btree_for(name))
         {
             registry
                 .on_property_changed(
@@ -3138,6 +3250,7 @@ impl<'a> ExecutionContext<'a> {
                         properties: &changed,
                         before: &before,
                         after: &after,
+                        carried,
                     },
                     &field_of,
                     &mut self.key_claims.indexes,
@@ -3161,15 +3274,61 @@ impl<'a> ExecutionContext<'a> {
             Err(why) => return Ok(Err(why)),
         };
         self.sync_txn_state();
-        match LocalIndexStore::new(self.engine).scan_exact(
-            &mut self.txn,
-            &index,
-            std::slice::from_ref(value),
-            &self.budget,
-        )? {
-            Some(ids) => Ok(Ok(ids)),
-            None => Ok(Err(IndexUnanswered::NotServing)),
+        let store = LocalIndexStore::new(self.engine);
+        let scopes = self.index_scopes(&index)?;
+        let mut found: Vec<NodeId> = Vec::new();
+        for scope in &scopes {
+            let scoped;
+            let def = if *scope == index.generation {
+                &*index
+            } else {
+                scoped = index.in_scope(*scope);
+                &scoped
+            };
+            match store.scan_exact(
+                &mut self.txn,
+                def,
+                std::slice::from_ref(value),
+                &self.budget,
+            )? {
+                Some(ids) => found.extend(ids),
+                None => return Ok(Err(IndexUnanswered::NotServing)),
+            }
         }
+        // The scopes are disjoint by construction; a merge keeps the order
+        // the index gives.
+        if scopes.len() > 1 {
+            found.sort_unstable();
+            found.dedup();
+        }
+        Ok(Ok(found))
+    }
+
+    /// The key scopes of index `index` the statement reads its label's
+    /// members from: the index's own generation, and while a change of what
+    /// a type implies moves the label's carriers, the parts the facts in
+    /// force at the statement's view read, from the definition at that view.
+    fn index_scopes(
+        &mut self,
+        index: &crate::index::IndexDefinition,
+    ) -> Result<smallvec::SmallVec<[crate::index::GenerationId; 2]>, ExecutionError> {
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
+        if let Some(scopes) = self.index_scopes.get(&(index.id, index.generation)) {
+            return Ok(scopes.clone());
+        }
+        let Some(label) = self.label_id(&index.label)? else {
+            return Ok(smallvec::smallvec![index.generation]);
+        };
+        let at_view = LocalIndexStore::new(self.engine).definition_in(&mut self.txn, index.id)?;
+        let scopes = match at_view {
+            Some(def) if def.generation == index.generation => {
+                def.eligible_scopes(label, coordinode_modality::Interpretation::InForce)
+            }
+            _ => smallvec::smallvec![index.generation],
+        };
+        self.index_scopes
+            .insert((index.id, index.generation), scopes.clone());
+        Ok(scopes)
     }
 
     /// [`Self::index_lookup`] for each of `keys`, in their order: the index
@@ -3185,12 +3344,33 @@ impl<'a> ExecutionContext<'a> {
             Err(why) => return Ok(Err(why)),
         };
         self.sync_txn_state();
-        Ok(Ok(LocalIndexStore::new(self.engine).scan_exact_each(
-            &mut self.txn,
-            &index,
-            keys,
-            &self.budget,
-        )?))
+        let store = LocalIndexStore::new(self.engine);
+        let scopes = self.index_scopes(&index)?;
+        let mut merged: Option<Vec<KeyCandidates>> = None;
+        for scope in &scopes {
+            let scoped;
+            let def = if *scope == index.generation {
+                &*index
+            } else {
+                scoped = index.in_scope(*scope);
+                &scoped
+            };
+            let found = store.scan_exact_each(&mut self.txn, def, keys, &self.budget)?;
+            merged = Some(match merged {
+                None => found,
+                Some(mut so_far) => {
+                    for (into, more) in so_far.iter_mut().zip(found) {
+                        if let (Some(into), Some(more)) = (into.as_mut(), more) {
+                            into.extend(more);
+                            into.sort_unstable();
+                            into.dedup();
+                        }
+                    }
+                    so_far
+                }
+            });
+        }
+        Ok(Ok(merged.unwrap_or_default()))
     }
 
     /// The definition of index `id` when its entries can answer this
@@ -3335,9 +3515,8 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        let carried = self.carried_beyond_stored(&record.labels)?;
-        let labels = carried.as_deref().unwrap_or(&record.labels);
-        self.index_labels_lost(registry, node_id, None, record, labels, &[])
+        let labels = self.btree_labels(registry, &record.labels)?;
+        self.index_labels_lost(registry, node_id, None, record, &labels, &[])
     }
 
     /// Stage and commit one catalog change in a transaction of its own,
@@ -20609,6 +20788,43 @@ fn execute_alter_node_type_implies(
             }
             indexes.put_definition_txn(txn, &lookup)?;
         }
+        // Every declared index on a label whose carriers move keeps its
+        // difference apart the same way, in the same commit.
+        for mut def in indexes.list_definitions()? {
+            let Some(&(affected_label, ref name)) =
+                affected.iter().find(|(_, name)| *name == def.label)
+            else {
+                continue;
+            };
+            match def.index_type {
+                coordinode_modality::IndexType::BTree => {}
+                coordinode_modality::IndexType::Labels => continue,
+                other => {
+                    return Err(StoreError::Invariant(format!(
+                        "the change moves the carriers of :{name}, which the {other:?} index \
+                         {} covers; an index of that kind does not take moved carriers",
+                        def.name.as_deref().unwrap_or("(unnamed)")
+                    )));
+                }
+            }
+            if def.proposed_operation(affected_label).is_some() {
+                return Err(StoreError::Invariant(format!(
+                    "another change moving the carriers of :{name} is being certified; retry \
+                     once it ends"
+                )));
+            }
+            let version = indexes.definition_version_as(&def)?.ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "the index on :{name} changed while the implication was being changed; \
+                     retry the statement"
+                ))
+            })?;
+            indexes.expect_definition_txn(txn, def.id, Some(version))?;
+            let gained = indexes.allocate_generation_txn(txn)?;
+            let retired = indexes.allocate_generation_txn(txn)?;
+            def.propose_parts(affected_label, op, gained, retired);
+            indexes.put_definition_txn(txn, &def)?;
+        }
         // The facts stay in force; the candidate is the implication.
         next.set_candidate(LabelCandidate {
             properties: next.properties.clone(),
@@ -20630,13 +20846,13 @@ fn execute_alter_node_type_implies(
     let operation = operation.ok_or_else(|| {
         ExecutionError::Unsupported("the implication change staged no certification".into())
     })?;
-    // This member's writers maintain the lookup as it now stands, with the
-    // parts proposed; others pick it up as they apply the commit.
+    // This member's writers maintain the lookup and the indexes as they now
+    // stand, with the parts proposed; others pick them up as they apply the
+    // commit.
     if !affected.is_empty()
         && let Some(registry) = ctx.btree_index_registry
-        && let Some(lookup) = LocalIndexStore::new(engine).label_lookup()?
     {
-        registry.register_published(engine, lookup)?;
+        crate::index::reconcile::register_parts_of(engine, registry, operation)?;
     }
     // The statement's own transaction is open while it waits; having staged
     // nothing, it leaves the proof's wait for older transactions.

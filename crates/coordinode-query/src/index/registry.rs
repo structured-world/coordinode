@@ -169,6 +169,16 @@ struct Catalog {
     /// The namespace's label lookup, which every node write maintains: found
     /// without walking the other indexes.
     labels: Option<IndexId>,
+    /// How many B-tree indexes have a change of what a type implies being
+    /// certified: what every write asks before it judges its labels twice,
+    /// answered without walking the indexes.
+    proposed_btree: usize,
+}
+
+/// Whether `def` is a B-tree index with a change of what a type implies
+/// being certified for its label.
+fn proposes_btree(def: &IndexDefinition) -> bool {
+    def.index_type == IndexType::BTree && def.has_proposed()
 }
 
 impl Catalog {
@@ -177,7 +187,10 @@ impl Catalog {
         if registered.def.index_type == IndexType::Labels {
             self.labels = Some(id);
         }
+        // Counted in before the old one is counted out: never below zero.
+        self.proposed_btree += usize::from(proposes_btree(&registered.def));
         if let Some(old) = self.by_id.insert(id, registered) {
+            self.proposed_btree -= usize::from(proposes_btree(&old.def));
             self.unbind(&old.def);
         }
         if let Some(name) = &self.by_id[&id].def.name {
@@ -187,6 +200,8 @@ impl Catalog {
 
     fn remove(&mut self, id: IndexId) {
         if let Some(old) = self.by_id.remove(&id) {
+            // It was counted in when inserted.
+            self.proposed_btree -= usize::from(proposes_btree(&old.def));
             self.unbind(&old.def);
         }
         if self.labels == Some(id) {
@@ -269,6 +284,8 @@ pub struct PropertyChange<'a> {
     pub before: &'a dyn Fn(&str) -> Option<Value>,
     /// The node's properties after the change.
     pub after: &'a dyn Fn(&str) -> Option<Value>,
+    /// Under which interpretations the node carries `label`.
+    pub carried: Carried,
 }
 
 /// A node, or one version of a temporal node, as it is created, or as it was
@@ -279,10 +296,31 @@ pub struct NodeState<'a> {
     /// The version's `valid_from` for a temporal node; `None` for a node
     /// that is not temporal.
     pub valid_from: Option<i64>,
-    /// Its primary label.
+    /// The label whose indexes are maintained.
     pub label: &'a str,
     /// Its properties.
     pub value_of: &'a dyn Fn(&str) -> Option<Value>,
+    /// Under which interpretations the node carries `label`.
+    pub carried: Carried,
+}
+
+/// Under which interpretations a node carries a label: the facts in force,
+/// and the candidate of a change of what a type implies being certified.
+/// Both while none is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Carried {
+    /// Under the facts in force.
+    pub in_force: bool,
+    /// Under the candidate.
+    pub candidate: bool,
+}
+
+impl Carried {
+    /// A label both interpretations give the node.
+    pub const SETTLED: Self = Self {
+        in_force: true,
+        candidate: true,
+    };
 }
 
 impl NodeState<'_> {
@@ -1140,6 +1178,29 @@ impl IndexRegistry {
         Ok(())
     }
 
+    /// The labels of the B-tree indexes with parts kept apart: a node being
+    /// removed may hold an entry in one of them under a label it does not
+    /// carry under the facts in force.
+    pub fn btree_labels_with_parts(&self) -> Vec<String> {
+        let indexes = self.indexes.read();
+        let mut labels: Vec<String> = indexes
+            .by_id
+            .values()
+            .filter(|r| r.def.index_type == IndexType::BTree && !r.def.selection.is_empty())
+            .map(|r| r.def.label.clone())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        labels
+    }
+
+    /// Whether some B-tree index has a change of what a type implies being
+    /// certified for its label: while one has, a writer judges the labels
+    /// it maintains under the candidate as well.
+    pub fn has_proposed_btree(&self) -> bool {
+        self.indexes.read().proposed_btree > 0
+    }
+
     /// The B-tree indexes on `label`: the ones whose entries this registry
     /// maintains.
     fn btree_for_label(&self, label: &str) -> Vec<Registered> {
@@ -1279,6 +1340,9 @@ impl IndexRegistry {
             let Some(values) = entry_values(&index, node.value_of) else {
                 continue;
             };
+            let Some(scope) = entry_scope(&index, node.carried) else {
+                continue;
+            };
             self.bind(engine, txn, &index, version)?;
             let staging = Staging {
                 engine,
@@ -1286,10 +1350,12 @@ impl IndexRegistry {
                 field_of,
                 registry: Some((self, &*armed)),
             };
-            stage(
+            stage_scoped(
                 &staging,
                 txn,
                 &index,
+                scope,
+                node.carried,
                 node.owner(),
                 None,
                 Some(values),
@@ -1327,6 +1393,9 @@ impl IndexRegistry {
             if old == new {
                 continue;
             }
+            let Some(scope) = entry_scope(&index, change.carried) else {
+                continue;
+            };
             self.bind(engine, txn, &index, version)?;
             let owner = EntryOwner {
                 node_id: change.node_id.as_raw(),
@@ -1338,7 +1407,22 @@ impl IndexRegistry {
                 field_of,
                 registry: Some((self, &*armed)),
             };
-            stage(&staging, txn, &index, owner, old, new, claims)?;
+            // An entry not yet moved to the scope it belongs in is cleared
+            // where it stands.
+            if let Some(old) = &old {
+                clear_elsewhere(engine, txn, &index, scope, field_of, owner, old)?;
+            }
+            stage_scoped(
+                &staging,
+                txn,
+                &index,
+                scope,
+                change.carried,
+                owner,
+                old,
+                new,
+                claims,
+            )?;
         }
         Ok(())
     }
@@ -1360,7 +1444,19 @@ impl IndexRegistry {
         {
             if let Some(values) = entry_values(&index, node.value_of) {
                 self.bind(engine, txn, &index, version)?;
-                store.stage_membership(txn, &index, field_of, node.owner(), Some(&values), None)?;
+                // The entry may stand in any scope of the label while a
+                // change moves its carriers; a unique entry is released only
+                // where the node holds it.
+                for scope in index_scopes(&index) {
+                    store.stage_membership(
+                        txn,
+                        &scoped(&index, scope),
+                        field_of,
+                        node.owner(),
+                        Some(&values),
+                        None,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1535,6 +1631,7 @@ pub fn stage_node_entry(
             },
             txn,
             index,
+            (index.generation, false),
             owner,
             None,
             Some(values),
@@ -1569,6 +1666,203 @@ struct Staging<'a> {
     registry: Option<(&'a IndexRegistry, &'a AtomicBool)>,
 }
 
+/// The key scopes an entry of `index` may stand in: its own generation, and
+/// each part a change of what a type implies keeps apart for its label.
+fn index_scopes(index: &IndexDefinition) -> smallvec::SmallVec<[GenerationId; 2]> {
+    match index.selection.first() {
+        None => smallvec::smallvec![index.generation],
+        Some(part) => index.scopes_of(part.label),
+    }
+}
+
+/// Where `index` keeps the entry of a node carrying its label as `carried`
+/// says; `None` when it keeps none.
+fn entry_scope(index: &IndexDefinition, carried: Carried) -> Option<GenerationId> {
+    match index.selection.first() {
+        None => carried.in_force.then_some(index.generation),
+        Some(part) => index.placement(part.label, carried.in_force, carried.candidate),
+    }
+}
+
+/// `index` with its entries keyed under `scope`: itself when that is its own
+/// generation, so the steady state copies no definition.
+fn scoped(index: &IndexDefinition, scope: GenerationId) -> std::borrow::Cow<'_, IndexDefinition> {
+    if scope == index.generation {
+        std::borrow::Cow::Borrowed(index)
+    } else {
+        std::borrow::Cow::Owned(index.in_scope(scope))
+    }
+}
+
+/// Clear the entry `owner` holds for `old` in every scope of `index` but
+/// `keep`: an entry a change moved, or has yet to move, stands in one of
+/// them. Nothing for an index without parts.
+fn clear_elsewhere(
+    engine: &StorageEngine,
+    txn: &mut Transaction,
+    index: &IndexDefinition,
+    keep: GenerationId,
+    field_of: FieldOf<'_>,
+    owner: EntryOwner,
+    old: &[Value],
+) -> Result<(), StoreError> {
+    if index.selection.is_empty() {
+        return Ok(());
+    }
+    let store = LocalIndexStore::new(engine);
+    for scope in index_scopes(index).into_iter().filter(|s| *s != keep) {
+        store.stage_membership(
+            txn,
+            &index.in_scope(scope),
+            field_of,
+            owner,
+            Some(old),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// Place the entry `owner` (a node of shard `shard_id`, or one version of a
+/// temporal one) holds in `index` where a node carrying its label as
+/// `carried` says belongs: cleared from every other scope, put in that one,
+/// holding a unique value to each interpretation the node carries the label
+/// under. Idempotent. What reconciling a change of what a type implies does
+/// for each stored node it moves.
+///
+/// # Errors
+///
+/// A unique value another node holds under one of those interpretations, or
+/// a storage failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn place_entry(
+    engine: &StorageEngine,
+    txn: &mut Transaction,
+    shard_id: u16,
+    index: &IndexDefinition,
+    carried: Carried,
+    owner: EntryOwner,
+    value_of: &dyn Fn(&str) -> Option<Value>,
+    field_of: FieldOf<'_>,
+) -> Result<(), IndexWriteError> {
+    let Some(values) = entry_values(index, value_of) else {
+        return Ok(());
+    };
+    let scope = entry_scope(index, carried);
+    let store = LocalIndexStore::new(engine);
+    for other in index_scopes(index)
+        .into_iter()
+        .filter(|s| Some(*s) != scope)
+    {
+        store.stage_membership(
+            txn,
+            &scoped(index, other),
+            field_of,
+            owner,
+            Some(&values),
+            None,
+        )?;
+    }
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    stage_scoped(
+        &Staging {
+            engine,
+            shard_id,
+            field_of,
+            registry: None,
+        },
+        txn,
+        index,
+        scope,
+        carried,
+        owner,
+        None,
+        Some(values),
+        &mut Vec::new(),
+    )
+    .map(|_| ())
+}
+
+/// [`stage`] of `owner`'s entry in `index` under `scope`, holding a unique
+/// value to every interpretation the node carries the label under: the
+/// value is refused when a node holding it stands in another scope one of
+/// them reads.
+#[allow(clippy::too_many_arguments)]
+fn stage_scoped(
+    staging: &Staging<'_>,
+    txn: &mut Transaction,
+    index: &IndexDefinition,
+    scope: GenerationId,
+    carried: Carried,
+    owner: EntryOwner,
+    old: Option<Vec<Value>>,
+    new: Option<Vec<Value>>,
+    claims: &mut Vec<UniqueClaim>,
+) -> Result<bool, IndexWriteError> {
+    use coordinode_modality::Interpretation;
+    if index.unique
+        && let (Some(part), Some(values)) = (index.selection.first(), &new)
+    {
+        let node_id = NodeId::from_raw(owner.node_id);
+        let store = LocalIndexStore::new(staging.engine);
+        let mut views: smallvec::SmallVec<[(GenerationId, bool); 4]> = smallvec::SmallVec::new();
+        if carried.in_force {
+            views.extend(
+                index
+                    .eligible_scopes(part.label, Interpretation::InForce)
+                    .into_iter()
+                    .map(|s| (s, false)),
+            );
+        }
+        if carried.candidate
+            && let Some(operation) = index.proposed_operation(part.label)
+        {
+            views.extend(
+                index
+                    .eligible_scopes(part.label, Interpretation::Candidate(operation))
+                    .into_iter()
+                    .map(|s| (s, true)),
+            );
+        }
+        for (other, candidate) in views.into_iter().filter(|(s, _)| *s != scope) {
+            let other = scoped(index, other);
+            if let Some(holder) = store.unique_conflict(txn, &other, values, node_id)?
+                && holds_values_as(
+                    staging.engine,
+                    txn,
+                    staging.shard_id,
+                    &other,
+                    staging.field_of,
+                    holder,
+                    values,
+                    candidate,
+                )?
+            {
+                return Err(UniqueViolation::new(index, values, holder).into());
+            }
+        }
+    }
+    let target = scoped(index, scope);
+    // A holder found in the gained part carries the label under the
+    // candidate only.
+    let candidate = index
+        .selection
+        .iter()
+        .any(|p| p.part == scope && p.role == coordinode_modality::PartRole::Gained);
+    stage(
+        staging,
+        txn,
+        &target,
+        (index.generation, candidate),
+        owner,
+        old,
+        new,
+        claims,
+    )
+}
+
 /// Stage `owner`'s membership in `index` moving from `old` to `new`,
 /// refusing a unique value another node holds, and say whether an entry was
 /// put.
@@ -1579,10 +1873,12 @@ struct Staging<'a> {
 /// suspect and leaves the value to be proved free from the stored nodes
 /// when the statement commits; a wrong entry is never taken as proof that
 /// the value is free, nor as a duplicate of the node it names.
+#[allow(clippy::too_many_arguments)]
 fn stage(
     staging: &Staging<'_>,
     txn: &mut Transaction,
     index: &IndexDefinition,
+    (serving, candidate): (GenerationId, bool),
     owner: EntryOwner,
     old: Option<Vec<Value>>,
     new: Option<Vec<Value>>,
@@ -1595,13 +1891,14 @@ fn stage(
         && let Some(values) = &new
     {
         // The entries prove a value free only from a copy armed for use
-        // and not suspect. A holder they name is checked against its own
+        // and not suspect: the copy of the generation the index serves, its
+        // parts included. A holder they name is checked against its own
         // record either way, so it is positive evidence from any copy.
         needs_source_proof = staging.registry.is_some_and(|(r, armed)| {
-            !r.use_copy(staging.engine, index.generation, armed) || r.is_suspect(index.generation)
+            !r.use_copy(staging.engine, serving, armed) || r.is_suspect(serving)
         });
         if let Some(holder) = store.unique_conflict(txn, index, values, node_id)? {
-            if holds_values(
+            if holds_values_as(
                 staging.engine,
                 txn,
                 staging.shard_id,
@@ -1609,6 +1906,7 @@ fn stage(
                 staging.field_of,
                 holder,
                 values,
+                candidate,
             )? {
                 return Err(UniqueViolation::new(index, values, holder).into());
             }
@@ -1688,11 +1986,38 @@ pub fn holds_values(
     holder: NodeId,
     values: &[Value],
 ) -> Result<bool, StoreError> {
+    holds_values_as(
+        engine, txn, shard_id, index, field_of, holder, values, false,
+    )
+}
+
+/// [`holds_values`] with the label judged under the candidates published
+/// (`candidate`) instead of the facts in force: what an entry found in a
+/// part only the candidate reads is checked against.
+///
+/// # Errors
+///
+/// As [`holds_values`].
+#[allow(clippy::too_many_arguments)]
+pub fn holds_values_as(
+    engine: &StorageEngine,
+    txn: &Transaction,
+    shard_id: u16,
+    index: &IndexDefinition,
+    field_of: FieldOf<'_>,
+    holder: NodeId,
+    values: &[Value],
+    candidate: bool,
+) -> Result<bool, StoreError> {
     use coordinode_core::index::derive::tuples;
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let wanted = tuples(values);
     let interpretation = index.interpretation(field_of);
-    let mut membership = crate::index::membership::CatalogMembership::current(engine);
+    let mut membership = if candidate {
+        crate::index::membership::CatalogMembership::candidates(engine)
+    } else {
+        crate::index::membership::CatalogMembership::current(engine)
+    };
     let mut holds = |record: &coordinode_core::graph::node::NodeRecord| {
         Ok::<_, StoreError>(
             membership.carries_named(record, &index.label)?
