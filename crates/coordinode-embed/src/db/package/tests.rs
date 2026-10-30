@@ -889,6 +889,52 @@ fn an_implication_change_crosses_pages_of_one() {
     );
 }
 
+/// A RETYPE NODE between a type placed by node id and one placed by the
+/// value of a property would move the node to another shard, which is not
+/// available: the statement is refused before anything of it takes effect,
+/// and the node keeps its type and properties. Both directions.
+#[test]
+fn a_retype_across_placements_is_refused_without_effects() {
+    use coordinode_core::schema::definition::PlacementPolicy;
+    let (mut db, _dir) = open();
+    let mut doc = LabelSchema::new("Doc", PlacementPolicy::Hash("key".into()));
+    doc.set_mode(SchemaMode::Flexible);
+    db.publish_schema(SchemaPackage {
+        labels: vec![LabelDeclaration {
+            schema: doc,
+            intent: Intent::Ensure,
+        }],
+        ..SchemaPackage::default()
+    })
+    .expect("declare Doc");
+    db.execute_cypher("CREATE (:Thing {title: 't'}), (:Doc {key: 'k'})")
+        .expect("nodes");
+
+    for (statement, stays) in [
+        (
+            "MATCH (n:Thing) RETYPE NODE n TO Doc SET n.key = 'x'",
+            "MATCH (n:Thing {title: 't'}) WHERE n.key IS NULL RETURN n",
+        ),
+        (
+            "MATCH (n:Doc) RETYPE NODE n TO Thing SET n.title = 'y'",
+            "MATCH (n:Doc {key: 'k'}) WHERE n.title IS NULL RETURN n",
+        ),
+    ] {
+        let err = db
+            .execute_cypher(statement)
+            .expect_err("a move between placements is refused");
+        assert!(
+            matches!(err, DatabaseError::SchemaViolation(_)),
+            "{statement}: {err:?}"
+        );
+        assert_eq!(
+            db.execute_cypher(stays).expect("read").len(),
+            1,
+            "{statement}: the node is as it was"
+        );
+    }
+}
+
 /// The schema of label `name` as the catalog holds it.
 fn user_named(db: &Database, name: &str) -> LabelSchema {
     db.label_schemas()

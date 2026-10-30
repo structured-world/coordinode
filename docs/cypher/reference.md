@@ -209,6 +209,10 @@ RETYPE NODE n TO Person SET n.name = 'Ship' REMOVE n.title, n.due
 - The target must be a type label: an auxiliary label is refused.
 - A node of a `TEMPORAL` type is not retyped, and no node is retyped into one:
   a node's history is not converted.
+- Both types must be placed by node id (an undeclared type is): a node of a
+  type placed by a property's value, or into one, would move to another
+  shard, which is not available, and the statement is refused before any of
+  it takes effect.
 - A property the new type does not declare is refused under `STRICT`; remove
   it in the same statement. A required property of the new type must be set.
 - `SET n:L` and `REMOVE n:L` never change a node's type; `RETYPE NODE` is the

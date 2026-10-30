@@ -2251,6 +2251,31 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
+    /// Refuse a RETYPE NODE of a node of type `from` to `label` whose
+    /// placement differs: only a node placed by its id stays where it is
+    /// under either type, and a move between shards is not available here.
+    /// Refused before anything of the statement takes effect. An undeclared
+    /// type is placed by id.
+    fn refuse_placement_move(
+        &mut self,
+        from: LabelId,
+        label: LabelId,
+    ) -> Result<(), ExecutionError> {
+        use coordinode_core::schema::definition::PlacementPolicy;
+        let by_id = |schema: Option<Arc<LabelSchema>>| {
+            schema.is_none_or(|s| s.placement == PlacementPolicy::NodeId)
+        };
+        if by_id(self.label_schema_of(from)?) && by_id(self.label_schema_of(label)?) {
+            return Ok(());
+        }
+        let from = self.label_name(from)?.to_string();
+        let label = self.label_name(label)?;
+        Err(ExecutionError::SchemaViolation(format!(
+            "RETYPE NODE cannot move a node of :{from} to :{label}: the types are not both \
+             placed by node id, and moving a node between shards is not available"
+        )))
+    }
+
     /// Admit node `node_id` as RETYPE NODE left it under its new type
     /// `label`: every property it holds is one the type admits, with the
     /// declared type, every required property is present, and each is stored
@@ -16721,6 +16746,7 @@ fn execute_retype_node(
         };
         if let Some(from) = record.primary_label() {
             ctx.refuse_temporal_retype(from, to)?;
+            ctx.refuse_placement_move(from, to)?;
         }
         let before = record.clone();
         ctx.retype_labels(&mut record, to)?;
