@@ -30,6 +30,13 @@ use crate::executor::temporal_read::{TimelineFields, state_span};
 /// Key for text index lookup: (label, property).
 type TextIndexKey = (String, String);
 
+/// The label's carriers documents are judged by, and the candidate's when
+/// they are kept in scopes (see [`TextIndexRegistry::apply_rows`]).
+pub type Judged = (
+    Option<crate::index::membership::LabelCarriers>,
+    Option<Option<crate::index::membership::LabelCarriers>>,
+);
+
 /// Why a search of a text index ([`TextIndexRegistry::find`]) did not answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FindError {
@@ -318,6 +325,36 @@ fn for_each_node_read(
     grouper.flush(visit)
 }
 
+/// The visitor of [`for_each_rows_batch`]: one batch of nodes with their rows.
+pub type RowsVisit<'v> = dyn FnMut(&[(NodeId, NodeRows)]) -> Result<(), String> + 'v;
+
+/// Every node of `shard_id` with its rows, in id order, as `engine` holds
+/// them now, handed to `visit` `batch` nodes at a time.
+///
+/// # Errors
+///
+/// The scan failed, a row did not decode, or `visit` failed.
+pub fn for_each_rows_batch(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    shard_id: u16,
+    batch: usize,
+    visit: &mut RowsVisit<'_>,
+) -> Result<(), String> {
+    let mut pending: Vec<(NodeId, NodeRows)> = Vec::with_capacity(batch);
+    for_each_node_latest(engine, shard_id, &mut |id, rows| {
+        pending.push((id, rows));
+        if pending.len() >= batch {
+            visit(&pending)?;
+            pending.clear();
+        }
+        Ok(())
+    })?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    visit(&pending)
+}
+
 /// Every node of `shard_id` with its rows, in id order, as `engine` holds
 /// them now, streamed.
 fn for_each_node_latest(
@@ -551,6 +588,49 @@ impl TextIndexRegistry {
             idx.set_validity(change.node_id.as_raw(), change.validity);
         }
         Ok(())
+    }
+
+    /// Write the documents of the nodes `rows` (at valid-time instant `at`)
+    /// in the index of `(label, property)` under the interpretations
+    /// `choose` picks from the ones the index holds, read under the index's
+    /// write lock: the label's carriers its documents are judged by, and the
+    /// candidate's when they are kept in scopes. `choose` returning `None`
+    /// writes nothing. Returns whether it wrote.
+    ///
+    /// Judging the documents by what the index holds at the moment they are
+    /// written, rather than by a catalog read before, keeps every document
+    /// in the interpretations a reader is answered with.
+    ///
+    /// # Errors
+    ///
+    /// A failed write; nothing of it is visible then.
+    pub fn apply_rows(
+        &self,
+        (label, property): (&str, &str),
+        interner: &FieldInterner,
+        (rows, at): (&[(NodeId, NodeRows)], i64),
+        choose: impl FnOnce(&Held) -> Option<Judged>,
+    ) -> Result<bool, String> {
+        let wrote = self.with_index(label, property, |index, held| {
+            let Some((carriers, candidate)) = choose(held) else {
+                return Ok(false);
+            };
+            let mut source = TextSource::new(interner, carriers.as_ref(), property);
+            if let Some(candidate) = candidate.as_ref() {
+                source = source.following(candidate.as_ref());
+            }
+            let changes: Vec<NodeText> = rows
+                .iter()
+                .map(|(id, rows)| source.at(*id, rows, at))
+                .collect();
+            let (upserts, removals) = split_changes(property, &changes);
+            index.apply_scoped_changes(&upserts, &removals)?;
+            for change in &changes {
+                index.set_validity(change.node_id.as_raw(), change.validity);
+            }
+            Ok(true)
+        })?;
+        Ok(wrote.unwrap_or(false))
     }
 
     /// The interpretations the documents of the index of `(label, property)`
@@ -890,7 +970,7 @@ pub fn stored_texts(
 /// # Errors
 ///
 /// As [`stored_texts`].
-pub fn stored_texts_with(
+fn stored_texts_with(
     engine: &coordinode_storage::engine::core::StorageEngine,
     shard_id: u16,
     source: TextSource<'_>,

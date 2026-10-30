@@ -25,7 +25,7 @@ use coordinode_core::graph::intern::FieldRegistrar;
 use coordinode_core::graph::node::{NodeId, decode_written_node};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_query::executor::runner::wall_clock_us;
-use coordinode_query::index::text_registry::{NodeText, TextSource, read_nodes, stored_texts};
+use coordinode_query::index::text_registry::{NodeText, read_nodes, stored_texts};
 use coordinode_query::index::{IndexCoverage, TextIndexRegistry};
 use coordinode_storage::engine::applied::{
     AppliedEvent, AppliedPosition, AppliedStop, AppliedSubscription,
@@ -268,30 +268,28 @@ impl Worker {
             .map_err(|e| format!("read the field dictionary: {e}"))?;
         let now = wall_clock_us();
         for def in &definitions {
-            // The index covers the nodes of every type implying its label.
-            let carriers =
-                coordinode_query::index::membership::label_carriers(&self.engine, &def.label)
-                    .map_err(|e| format!("read the carriers of :{}: {e}", def.label))?;
-            let candidate = self.candidate_carriers(&def.label)?;
             for property in &def.properties {
-                let mut source = TextSource::new(&interner, carriers.as_ref(), property);
-                // While the index follows a change, a node either
-                // interpretation holds keeps its document, in its scope.
-                if self
-                    .registry
-                    .held(&def.label, property)
-                    .is_some_and(|held| held.candidate.is_some())
-                {
-                    source = source.following(candidate.as_ref());
-                }
-                // A node without text is taken out only if the index holds
-                // it, so writes to other labels cost the index nothing.
-                let changes: Vec<NodeText> = nodes
-                    .iter()
-                    .map(|(id, rows)| source.at(*id, rows, now))
-                    .collect();
-                self.registry
-                    .apply_changes(&def.label, property, &changes)?;
+                // Judged by the interpretations the index holds as it is
+                // written, never by a catalog read before: a change the
+                // worker has not followed yet leaves the documents in the
+                // interpretation readers are answered with. A node without
+                // text is taken out only if the index holds it, so writes to
+                // other labels cost the index nothing.
+                self.registry.apply_rows(
+                    (&def.label, property),
+                    &interner,
+                    (&nodes, now),
+                    |held| {
+                        // An index not built yet is written by its build.
+                        if held.base.is_none() && held.candidate.is_none() {
+                            return None;
+                        }
+                        Some((
+                            held.base.clone().flatten(),
+                            held.candidate.as_ref().map(|(c, _)| c.clone()),
+                        ))
+                    },
+                )?;
             }
         }
         Ok(())
@@ -408,23 +406,56 @@ impl Worker {
         ),
         interner: &coordinode_core::graph::intern::FieldInterner,
     ) -> Result<(), String> {
-        use coordinode_query::index::text_registry::stored_texts_with;
-        // Not prepared until the pass below wrote every node.
-        self.registry.with_index(&def.label, property, |_, held| {
-            held.candidate = Some((candidate.clone(), false));
-            Ok(())
-        })?;
-        let source =
-            TextSource::new(interner, in_force.as_ref(), property).following(candidate.as_ref());
-        let texts = stored_texts_with(&self.engine, self.shard_id, source, wall_clock_us())?;
-        for batch in texts.chunks(BATCH) {
-            self.registry.apply_changes(&def.label, property, batch)?;
+        use coordinode_query::index::selection::Held;
+        use coordinode_query::index::text_registry::for_each_rows_batch;
+        // Not prepared until the pass below wrote every node; begun only on
+        // an index holding the facts in force.
+        let preparing = Held {
+            base: Some(in_force.clone()),
+            candidate: Some((candidate.clone(), false)),
+        };
+        let begun = self
+            .registry
+            .with_index(&def.label, property, |_, held| {
+                if held.base != preparing.base {
+                    return Ok(false);
+                }
+                *held = preparing.clone();
+                Ok(true)
+            })?
+            .unwrap_or(false);
+        if !begun {
+            return Ok(());
+        }
+        // Each batch is written only while the index still holds what the
+        // pass began with: a rebuild by another thread meanwhile ends it.
+        let mut interrupted = false;
+        let now = wall_clock_us();
+        for_each_rows_batch(&self.engine, self.shard_id, BATCH, &mut |rows| {
+            let wrote = self.registry.apply_rows(
+                (&def.label, property),
+                interner,
+                (rows, now),
+                |held| (*held == preparing).then(|| (in_force.clone(), Some(candidate.clone()))),
+            )?;
+            if wrote {
+                Ok(())
+            } else {
+                interrupted = true;
+                Err("the index changed while it was prepared".to_string())
+            }
+        })
+        .or_else(|e| if interrupted { Ok(()) } else { Err(e) })?;
+        if interrupted {
+            return Ok(());
         }
         // Writes applied while the pass ran are folded under both
         // interpretations by this worker after it, and searches read them
         // from the store until then.
         self.registry.with_index(&def.label, property, |_, held| {
-            held.candidate = Some((candidate.clone(), true));
+            if *held == preparing {
+                held.candidate = Some((candidate.clone(), true));
+            }
             Ok(())
         })?;
         Ok(())
@@ -456,7 +487,7 @@ impl Worker {
         } else {
             (Scope::Gained, Scope::Retired)
         };
-        self.registry.with_index(&def.label, property, |_, held| {
+        let settling = self.registry.with_index(&def.label, property, |_, held| {
             if put_in_force {
                 // The base's retired documents go: its readers read the
                 // store; the candidate's readers leave them out.
@@ -466,8 +497,11 @@ impl Worker {
                 // candidate; the base's readers leave them out.
                 *prepared = false;
             }
-            Ok(())
+            Ok(held.clone())
         })?;
+        let Some(settling) = settling else {
+            return Ok(());
+        };
         let members = |scope| {
             self.registry
                 .with_index(&def.label, property, |index, _| index.scope_members(scope))
@@ -486,45 +520,33 @@ impl Worker {
             self.registry.apply_changes(&def.label, property, batch)?;
         }
         // The kept documents are written again from the store as the facts
-        // now in force hold them, shared.
+        // now in force hold them, shared, while the index is still settling
+        // this change.
         let kept: Vec<NodeId> = members(kept)?.into_iter().map(NodeId::from_raw).collect();
+        let now = wall_clock_us();
         for batch in kept.chunks(BATCH) {
-            self.refold_plain(def, property, (batch, in_force), interner)?;
+            let read = Transaction::new(&self.engine, None, Timestamp::ZERO, None);
+            let nodes = read_nodes(&read, self.shard_id, batch)?;
+            let wrote = self.registry.apply_rows(
+                (&def.label, property),
+                interner,
+                (&nodes, now),
+                |held| (*held == settling).then(|| (in_force.clone(), None)),
+            )?;
+            if !wrote {
+                return Ok(());
+            }
         }
         // A write folded meanwhile under both interpretations may have kept
         // a document apart: the next wake-up settles it.
         self.registry
             .with_index(&def.label, property, |index, held| {
-                if index.all_shared() {
+                if *held == settling && index.all_shared() {
                     *held = Held::built(in_force.clone());
                 }
                 Ok(())
             })?;
         Ok(())
-    }
-
-    /// Write the documents of `ids` in `def`'s index of `property` from the
-    /// store under the facts in force alone, the label's carriers being
-    /// `carriers`.
-    fn refold_plain(
-        &self,
-        def: &coordinode_query::index::IndexDefinition,
-        property: &str,
-        (ids, carriers): (
-            &[NodeId],
-            &Option<coordinode_query::index::membership::LabelCarriers>,
-        ),
-        interner: &coordinode_core::graph::intern::FieldInterner,
-    ) -> Result<(), String> {
-        let read = Transaction::new(&self.engine, None, Timestamp::ZERO, None);
-        let nodes = read_nodes(&read, self.shard_id, ids)?;
-        let source = TextSource::new(interner, carriers.as_ref(), property);
-        let now = wall_clock_us();
-        let changes: Vec<NodeText> = nodes
-            .iter()
-            .map(|(id, rows)| source.at(*id, rows, now))
-            .collect();
-        self.registry.apply_changes(&def.label, property, &changes)
     }
 
     /// Rebuild every index from the store, since what changed is not known;
