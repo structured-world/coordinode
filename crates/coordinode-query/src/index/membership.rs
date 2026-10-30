@@ -79,6 +79,8 @@ pub fn label_carriers_in(
             implying.push(id);
         }
     }
+    // In id order: two views holding the same interpretation compare equal.
+    implying.sort_unstable();
     Ok(Some(LabelCarriers { label, implying }))
 }
 

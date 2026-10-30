@@ -379,19 +379,6 @@ pub trait IndexStore {
     /// A storage failure, or DERIVED work that cannot be derived.
     fn apply_unreplicated(&self, mutations: &[Mutation]) -> StoreResult<()>;
 
-    /// The definition `id` as `snapshot` reads the catalog, without binding
-    /// any transaction to it: what a reader consults to learn how an index
-    /// answers its view.
-    ///
-    /// # Errors
-    ///
-    /// A storage failure or an undecodable record.
-    fn definition_at(
-        &self,
-        snapshot: coordinode_storage::engine::StorageSnapshot,
-        id: IndexId,
-    ) -> StoreResult<Option<IndexDefinition>>;
-
     /// Load a persisted index definition.
     ///
     /// # Errors
@@ -1472,22 +1459,6 @@ impl IndexStore for LocalIndexStore<'_> {
             .map(|bytes| decode("index definition", &bytes))
             .transpose()
     }
-
-    fn definition_at(
-        &self,
-        snapshot: coordinode_storage::engine::StorageSnapshot,
-        id: IndexId,
-    ) -> StoreResult<Option<IndexDefinition>> {
-        self.engine
-            .snapshot_get(
-                &snapshot,
-                Partition::Schema,
-                &IndexDefinition::schema_key_of(id),
-            )?
-            .map(|bytes| decode("index definition", &bytes))
-            .transpose()
-    }
-
     fn definition_in(
         &self,
         txn: &mut Transaction,

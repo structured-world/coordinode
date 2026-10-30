@@ -1133,8 +1133,8 @@ fn a_superseded_node_of_the_left_out_scope_is_not_taken_out_twice() {
 }
 
 /// A document rewritten into another scope leaves its old scope's
-/// statistics, so once every document is shared again the change ends, and
-/// the scopes' members are the nodes written there.
+/// statistics, so once every document is shared again the index says so,
+/// and the scopes' members are the nodes written there.
 #[test]
 fn a_document_moved_between_scopes_is_counted_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -1145,7 +1145,6 @@ fn a_document_moved_between_scopes_is_counted_once() {
         Default::default(),
     )
     .unwrap();
-    idx.begin_selection(7);
     idx.apply_scoped_changes(
         &[
             (1, props(&[("body", "graph")]), Scope::Shared),
@@ -1157,7 +1156,7 @@ fn a_document_moved_between_scopes_is_counted_once() {
     .unwrap();
     assert_eq!(idx.scope_members(Scope::Gained).unwrap(), [2]);
     assert_eq!(idx.scope_members(Scope::Retired).unwrap(), [3]);
-    assert!(!idx.end_selection(), "documents are still kept apart");
+    assert!(!idx.all_shared(), "documents are still kept apart");
 
     // The change is put in force: the retired document goes, the gained one
     // becomes shared.
@@ -1167,8 +1166,7 @@ fn a_document_moved_between_scopes_is_counted_once() {
     )
     .unwrap();
     assert!(idx.scope_members(Scope::Gained).unwrap().is_empty());
-    assert!(idx.end_selection());
-    assert_eq!(idx.selection(), None);
+    assert!(idx.all_shared());
     let ids: Vec<u64> = scores_without(&idx, "graph", Scope::Gained)
         .into_iter()
         .map(|(id, _)| id)

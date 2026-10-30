@@ -24,6 +24,7 @@ use coordinode_storage::engine::transaction::Transaction;
 
 use super::coverage::{IndexCoverage, IndexDelta};
 use super::definition::{IndexDefinition, TextIndexConfig};
+use super::selection::Held;
 use crate::executor::temporal_read::{TimelineFields, state_span};
 
 /// Key for text index lookup: (label, property).
@@ -67,6 +68,9 @@ pub struct TextIndexRegistry {
     /// The writes the indexes have not folded, when a worker maintains them
     /// from the applied entries; a registry without one serves what it holds.
     coverage: RwLock<Option<Arc<IndexCoverage>>>,
+    /// The interpretations each index's documents hold, changed only under
+    /// that index's write lock (see [`Self::with_index`]).
+    held: RwLock<HashMap<TextIndexKey, Held>>,
     /// The owned footprints the index files are charged to.
     footprints: coordinode_storage::engine::footprint::Footprints,
 }
@@ -348,6 +352,7 @@ impl TextIndexRegistry {
             definitions: RwLock::new(HashMap::new()),
             base_dir: base_dir.into(),
             coverage: RwLock::new(None),
+            held: RwLock::new(HashMap::new()),
             footprints: Default::default(),
         }
     }
@@ -390,12 +395,10 @@ impl TextIndexRegistry {
     /// ones the choice was made against. The nodes read and the documents
     /// scored are reported to `meter`, which can stop the search.
     ///
-    /// `carriers` are the label's carriers as `read` sees the catalog, and
-    /// `change` where a change of what a type implies stands at that view:
-    /// the index answers with that interpretation, leaving the other's
-    /// documents out, or reads every node itself while it does not hold it
-    /// (see [`crate::index::selection::answer`], to which `concluded` gives
-    /// the outcome of a change whose parts are folded).
+    /// `carriers` are the label's carriers as `read` sees the catalog: the
+    /// index answers with that interpretation, leaving another's documents
+    /// out, or reads every node itself when it does not hold it (see
+    /// [`crate::index::selection::answer`]).
     ///
     /// # Errors
     ///
@@ -406,16 +409,7 @@ impl TextIndexRegistry {
         &self,
         label: &str,
         property: &str,
-        (carriers, change): (
-            Option<&crate::index::membership::LabelCarriers>,
-            crate::index::selection::Change,
-        ),
-        concluded: &dyn Fn(
-            coordinode_core::index::identity::GenerationId,
-        ) -> Result<
-            Option<crate::index::selection::Change>,
-            coordinode_modality::StoreError,
-        >,
+        carriers: Option<&crate::index::membership::LabelCarriers>,
         read: &Transaction<'_>,
         shard_id: u16,
         interner: &FieldInterner,
@@ -440,18 +434,10 @@ impl TextIndexRegistry {
             other => failed(&other),
         };
         let index = handle.read().map_err(|_| failed(&"lock poisoned"))?;
-        let followed = crate::index::selection::Followed {
-            current: index.selection().map(|s| {
-                (
-                    coordinode_core::index::identity::GenerationId::from_raw(s.operation),
-                    s.prepared,
-                )
-            }),
-            settled: index
-                .settled()
-                .map(coordinode_core::index::identity::GenerationId::from_raw),
-        };
-        let (exclude, held) = match answer(change, followed, concluded).map_err(|e| failed(&e))? {
+        // Read under the index's lock, which every change of what it holds
+        // takes too: the documents and the interpretations they hold agree.
+        let interpretation = self.held(label, property).unwrap_or_default();
+        let (exclude, held) = match answer(carriers, &interpretation) {
             Answer::Whole => (None, true),
             Answer::Without(scope) => (Some(scope), true),
             Answer::Unable => (None, false),
@@ -567,45 +553,46 @@ impl TextIndexRegistry {
         Ok(())
     }
 
-    /// What the index of `(label, property)` keeps of its label's changes;
-    /// `None` when there is no such index.
-    pub fn followed(
-        &self,
-        label: &str,
-        property: &str,
-    ) -> Option<crate::index::selection::Followed> {
-        use coordinode_core::index::identity::GenerationId;
-        let handle = self.get(label, property)?;
-        let index = handle.read().ok()?;
-        Some(crate::index::selection::Followed {
-            current: index
-                .selection()
-                .map(|s| (GenerationId::from_raw(s.operation), s.prepared)),
-            settled: index.settled().map(GenerationId::from_raw),
-        })
+    /// The interpretations the documents of the index of `(label, property)`
+    /// hold; `None` when there is no such index.
+    pub fn held(&self, label: &str, property: &str) -> Option<Held> {
+        self.held
+            .read()
+            .ok()?
+            .get(&(label.to_string(), property.to_string()))
+            .cloned()
     }
 
-    /// Run `step` on the index of `(label, property)` under its write lock;
+    /// Run `step` on the index of `(label, property)` and the
+    /// interpretations its documents hold, under the index's write lock, so
+    /// a search sees the documents and what they hold change together;
     /// `Ok(None)` when there is no such index.
     pub fn with_index<T>(
         &self,
         label: &str,
         property: &str,
-        step: impl FnOnce(&mut MultiLanguageTextIndex) -> Result<T, TextSearchError>,
+        step: impl FnOnce(&mut MultiLanguageTextIndex, &mut Held) -> Result<T, TextSearchError>,
     ) -> Result<Option<T>, String> {
         let Some(handle) = self.get(label, property) else {
             return Ok(None);
         };
-        let mut index = handle
+        let failed =
+            |what: &dyn std::fmt::Display| format!("text index :{label}({property}): {what}");
+        let mut index = handle.write().map_err(|_| failed(&"lock poisoned"))?;
+        // Changed on a copy, and stored while the index is still locked: the
+        // registry-wide map is held for the store alone, never for a step.
+        let mut interpretation = self.held(label, property).unwrap_or_default();
+        let outcome = step(&mut index, &mut interpretation).map_err(|e| failed(&e))?;
+        self.held
             .write()
-            .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
-        step(&mut index)
-            .map(Some)
-            .map_err(|e| format!("text index :{label}({property}): {e}"))
+            .map_err(|_| failed(&"lock poisoned"))?
+            .insert((label.to_string(), property.to_string()), interpretation);
+        Ok(Some(outcome))
     }
 
     /// Rebuild the index of `(label, property)` from `scan`, the nodes'
-    /// texts as the store holds them; how many documents it then holds.
+    /// texts as the store holds them under the interpretations it returns
+    /// with them; how many documents it then holds.
     ///
     /// The index stays locked from before the scan until the rebuilt
     /// contents are committed, so a change folded in meanwhile lands after
@@ -615,23 +602,20 @@ impl TextIndexRegistry {
         &self,
         label: &str,
         property: &str,
-        scan: impl FnOnce() -> Result<Vec<NodeText>, String>,
+        scan: impl FnOnce() -> Result<(Vec<NodeText>, Held), String>,
     ) -> Result<usize, String> {
-        let Some(handle) = self.get(label, property) else {
-            return Ok(0);
-        };
-        let mut idx = handle
-            .write()
-            .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
-        let scanned = scan()?;
-        let (documents, _) = split_changes(property, &scanned);
-        idx.replace_all_scoped(&documents)
-            .map_err(|e| format!("text index :{label}({property}): {e}"))?;
-        idx.clear_validities();
-        for node in &scanned {
-            idx.set_validity(node.node_id.as_raw(), node.validity);
-        }
-        Ok(documents.len())
+        let rebuilt = self.with_index(label, property, |idx, held| {
+            let (scanned, interpretation) = scan().map_err(TextSearchError::IndexCorrupted)?;
+            let (documents, _) = split_changes(property, &scanned);
+            idx.replace_all_scoped(&documents)?;
+            idx.clear_validities();
+            for node in &scanned {
+                idx.set_validity(node.node_id.as_raw(), node.validity);
+            }
+            *held = interpretation;
+            Ok(documents.len())
+        })?;
+        Ok(rebuilt.unwrap_or(0))
     }
 
     /// Convert a `TextIndexConfig` to `MultiLangConfig`.
@@ -738,6 +722,10 @@ impl TextIndexRegistry {
             };
 
             let key = (def.label.clone(), prop.clone());
+            // A new index holds no interpretation until it is built.
+            if let Ok(mut held) = self.held.write() {
+                held.remove(&key);
+            }
             if let Ok(mut indexes) = self.indexes.write() {
                 indexes.insert(key, Arc::new(RwLock::new(text_index)));
             }
@@ -765,6 +753,11 @@ impl TextIndexRegistry {
         if let Ok(mut indexes) = self.indexes.write() {
             for prop in &all_properties {
                 indexes.remove(&(label.to_string(), prop.clone()));
+            }
+        }
+        if let Ok(mut held) = self.held.write() {
+            for prop in &all_properties {
+                held.remove(&(label.to_string(), prop.clone()));
             }
         }
         if let Ok(mut defs) = self.definitions.write() {
@@ -866,7 +859,8 @@ impl TextIndexRegistry {
 /// What a text index of `(label, property)` holds when it covers the store
 /// as it stands now, at valid-time instant `at`: every node of `label` on
 /// `shard_id` with its text, and every temporal node of `label` with the
-/// interval its state at `at` holds over, text or not.
+/// interval its state at `at` holds over, text or not; with the
+/// interpretation those texts hold, the label's carriers in force.
 ///
 /// # Errors
 ///
@@ -878,10 +872,30 @@ pub fn stored_texts(
     label: &str,
     property: &str,
     at: i64,
-) -> Result<Vec<NodeText>, String> {
+) -> Result<(Vec<NodeText>, Held), String> {
     let carriers =
         crate::index::membership::label_carriers(engine, label).map_err(|e| e.to_string())?;
-    let source = TextSource::new(interner, carriers.as_ref(), property);
+    let texts = stored_texts_with(
+        engine,
+        shard_id,
+        TextSource::new(interner, carriers.as_ref(), property),
+        at,
+    )?;
+    Ok((texts, Held::built(carriers)))
+}
+
+/// [`stored_texts`] as `source` reads the nodes: under both interpretations
+/// of a change it follows, each document in its scope.
+///
+/// # Errors
+///
+/// As [`stored_texts`].
+pub fn stored_texts_with(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    shard_id: u16,
+    source: TextSource<'_>,
+    at: i64,
+) -> Result<Vec<NodeText>, String> {
     let mut texts = Vec::new();
     for_each_node_latest(engine, shard_id, &mut |id, rows| {
         let held = source.at(id, &rows, at);

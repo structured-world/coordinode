@@ -1,121 +1,102 @@
 use super::*;
+use coordinode_core::schema::label_id::LabelId;
 
-const OP: GenerationId = GenerationId::from_raw(10);
-const OLDER: GenerationId = GenerationId::from_raw(4);
-
-fn following(prepared: bool) -> Followed {
-    Followed {
-        current: Some((OP, prepared)),
-        settled: None,
-    }
+fn id(raw: u32) -> LabelId {
+    LabelId::new(raw).expect("a label id is never zero")
 }
 
-fn never(_: GenerationId) -> Result<Option<Change>, StoreError> {
-    panic!("the outcome is not asked for while the parts are kept")
+fn carriers(implying: &[u32]) -> Option<LabelCarriers> {
+    Some(LabelCarriers {
+        label: id(1),
+        implying: implying.iter().copied().map(id).collect(),
+    })
 }
 
-/// While the change is certified or after it is withdrawn, the facts in
-/// force hold: an index following it leaves the gained documents out, and
-/// one not following it yet holds the facts in force as they are.
+/// An index built under one interpretation answers its readers whole and
+/// cannot answer a reader of another, whichever of the two came first:
+/// the index's interpretation is compared, never how recent it is.
 #[test]
-fn the_facts_in_force_read_without_the_gained_documents() {
-    for change in [Change::Proposed(OP), Change::Withdrawn(OP)] {
-        for prepared in [false, true] {
-            assert_eq!(
-                answer(change, following(prepared), never).unwrap(),
-                Answer::Without(Scope::Gained)
-            );
-        }
-        assert_eq!(
-            answer(change, Followed::default(), never).unwrap(),
-            Answer::Whole
-        );
-    }
-}
-
-/// Once the change is in force, only an index that wrote every stored node
-/// in its scope holds it: it leaves the retired documents out. One still
-/// preparing, or not following the change at all, cannot answer.
-#[test]
-fn the_change_in_force_needs_a_prepared_index() {
-    let change = Change::InForce(OP);
+fn a_built_index_answers_only_its_interpretation() {
+    let old = carriers(&[]);
+    let new = carriers(&[2]);
+    let held = Held::built(new.clone());
+    assert_eq!(answer(new.as_ref(), &held), Answer::Whole);
     assert_eq!(
-        answer(change, following(true), never).unwrap(),
-        Answer::Without(Scope::Retired)
-    );
-    assert_eq!(
-        answer(change, following(false), never).unwrap(),
-        Answer::Unable
-    );
-    assert_eq!(
-        answer(change, Followed::default(), never).unwrap(),
-        Answer::Unable
-    );
-}
-
-/// An index that brought this change, or a later one, back to one
-/// interpretation holds the outcome alone, whatever the view still sees.
-#[test]
-fn a_settled_change_reads_the_whole_index() {
-    let settled = Followed {
-        current: None,
-        settled: Some(OP),
-    };
-    for change in [
-        Change::Proposed(OLDER),
-        Change::InForce(OLDER),
-        Change::InForce(OP),
-        Change::Withdrawn(OP),
-    ] {
-        assert_eq!(answer(change, settled, never).unwrap(), Answer::Whole);
-    }
-    assert_eq!(
-        answer(Change::InForce(GenerationId::from_raw(11)), settled, never).unwrap(),
+        answer(old.as_ref(), &held),
         Answer::Unable,
-        "a later change in force is not settled"
+        "a reader before the change"
+    );
+    let held = Held::built(old.clone());
+    assert_eq!(
+        answer(new.as_ref(), &held),
+        Answer::Unable,
+        "a reader after it"
     );
 }
 
-/// Once the parts are folded, the view no longer shows the change: the
-/// record of the change the index keeps says which scope belongs to the
-/// outcome, and an index keeping a change whose outcome is unknown cannot
-/// answer.
+/// While a change is followed, a reader of the base leaves the gained
+/// documents out, and a reader of the candidate the retired ones, but only
+/// once every stored node was written in its scope.
 #[test]
-fn a_folded_change_is_read_by_its_outcome() {
-    let in_force = |_: GenerationId| Ok(Some(Change::InForce(OP)));
-    let withdrawn = |_: GenerationId| Ok(Some(Change::Withdrawn(OP)));
-    let unknown = |_: GenerationId| Ok(None);
+fn a_followed_change_answers_both_interpretations() {
+    let old = carriers(&[]);
+    let new = carriers(&[2]);
+    let preparing = Held {
+        base: Some(old.clone()),
+        candidate: Some((new.clone(), false)),
+    };
     assert_eq!(
-        answer(Change::None, following(true), in_force).unwrap(),
-        Answer::Without(Scope::Retired)
+        answer(old.as_ref(), &preparing),
+        Answer::Without(Scope::Gained)
     );
+    assert_eq!(answer(new.as_ref(), &preparing), Answer::Unable);
+    let prepared = Held {
+        candidate: Some((new.clone(), true)),
+        ..preparing
+    };
     assert_eq!(
-        answer(Change::None, following(true), withdrawn).unwrap(),
+        answer(old.as_ref(), &prepared),
         Answer::Without(Scope::Gained)
     );
     assert_eq!(
-        answer(Change::None, following(true), unknown).unwrap(),
-        Answer::Unable
+        answer(new.as_ref(), &prepared),
+        Answer::Without(Scope::Retired)
     );
     assert_eq!(
-        answer(Change::None, Followed::default(), never).unwrap(),
-        Answer::Whole
+        answer(carriers(&[3]).as_ref(), &prepared),
+        Answer::Unable,
+        "a third interpretation"
     );
 }
 
-/// An index keeping another change than the one the view sees does not
-/// hold the view's interpretation.
+/// While the retired documents of a change put in force are removed, the
+/// base is answered by nobody and the candidate still is.
 #[test]
-fn another_change_kept_cannot_answer() {
-    let other = Followed {
-        current: Some((OLDER, true)),
-        settled: None,
+fn a_change_being_settled_answers_only_the_candidate() {
+    let old = carriers(&[]);
+    let new = carriers(&[2]);
+    let settling = Held {
+        base: None,
+        candidate: Some((new.clone(), true)),
     };
-    for change in [
-        Change::Proposed(OP),
-        Change::InForce(OP),
-        Change::Withdrawn(OP),
-    ] {
-        assert_eq!(answer(change, other, never).unwrap(), Answer::Unable);
-    }
+    assert_eq!(answer(old.as_ref(), &settling), Answer::Unable);
+    assert_eq!(
+        answer(new.as_ref(), &settling),
+        Answer::Without(Scope::Retired)
+    );
+}
+
+/// An index not built yet answers nobody, and a label without an identity
+/// is an interpretation of its own.
+#[test]
+fn an_unbuilt_index_answers_nobody() {
+    assert_eq!(
+        answer(carriers(&[]).as_ref(), &Held::default()),
+        Answer::Unable
+    );
+    assert_eq!(answer(None, &Held::built(None)), Answer::Whole);
+    assert_eq!(
+        answer(carriers(&[]).as_ref(), &Held::built(None)),
+        Answer::Unable
+    );
 }

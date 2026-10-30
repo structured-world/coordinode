@@ -379,6 +379,9 @@ pub struct Database {
     /// Background follower of the applied commits keeping the text indexes
     /// current with them (see [`crate::text_worker`]). Held for its Drop.
     _text_worker: crate::text_worker::TextIndexWorker,
+    /// Wakes the index workers when the catalog changes a label's carriers
+    /// (see [`crate::catalog_watch`]). Held for its Drop.
+    _catalog_watch: crate::catalog_watch::CatalogWatch,
     /// Extension-op handler registry threaded into every ExecutionContext.
     /// Empty for a plain CE Database (no extension ops dispatchable);
     /// populated via [`Database::register_extension`] by an enterprise layer
@@ -1039,6 +1042,10 @@ impl Database {
             &text_index_base,
         )?);
         text_index_registry.set_coverage(Arc::clone(&text_coverage));
+        // A change of what a type implies writes no node: the catalog watch
+        // wakes the worker for it.
+        let catalog_watch =
+            crate::catalog_watch::CatalogWatch::spawn(&engine, vec![text_applied.nudger()]);
         let text_worker = crate::text_worker::TextIndexWorker::spawn(
             Arc::clone(&engine),
             text_applied,
@@ -1147,6 +1154,7 @@ impl Database {
             _vector_worker: vector_worker,
             text_index_registry,
             _text_worker: text_worker,
+            _catalog_watch: catalog_watch,
             extension_registry: ExtensionRegistry::new(),
             procedure_registry: ProcedureRegistry::with_builtins(),
             adaptive_config: AdaptiveConfig::default(),
@@ -3468,20 +3476,12 @@ impl Database {
         use coordinode_query::index::text_registry::FindError;
         let budget = statement_budget(self.query_memory_limit, None, None);
         let mut search = coordinode_core::budget::BatchedWork::new(&budget);
-        use coordinode_query::index::selection::{Change, change_now, outcome};
         let carriers = coordinode_query::index::membership::label_carriers(&self.engine, label)
             .map_err(|e| DatabaseError::Other(e.to_string()))?;
-        let change = match carriers.as_ref() {
-            Some(carriers) => change_now(&self.engine, carriers.label)
-                .map_err(|e| DatabaseError::Other(e.to_string()))?,
-            None => Change::None,
-        };
-        let concluded = |operation| outcome(&self.engine, operation, label);
         let found = self.text_index_registry.find(
             label,
             property,
-            (carriers.as_ref(), change),
-            &concluded,
+            carriers.as_ref(),
             &read,
             self.shard_id,
             &interner,

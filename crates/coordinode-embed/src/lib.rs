@@ -47,6 +47,7 @@
 
 pub mod api;
 pub mod backup;
+mod catalog_watch;
 pub mod db;
 pub mod operation;
 pub mod repair;

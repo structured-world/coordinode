@@ -48,18 +48,6 @@ impl Batch {
     }
 }
 
-/// The change of what a type implies whose interpretations the index's
-/// scoped documents belong to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Selection {
-    /// The change's identity.
-    pub operation: u64,
-    /// Whether every stored node was written in its scope since the change
-    /// began: until then the documents gained are partial and those retired
-    /// unmarked, so only the facts in force read the index exactly.
-    pub prepared: bool,
-}
-
 /// One node's document as a write puts it: its text by property, in a scope.
 pub type ScopedUpsert = (u64, HashMap<String, String>, Scope);
 
@@ -152,10 +140,6 @@ pub struct MultiLanguageTextIndex {
     /// it, and a writer left without its directory lock panics on the next
     /// rollback. Every later write is refused with this reason instead.
     writer_lost: Option<String>,
-    /// The change the scoped documents belong to, while there is one.
-    selection: Option<Selection>,
-    /// The last change whose documents were brought back to one scope.
-    settled: Option<u64>,
 }
 
 impl MultiLanguageTextIndex {
@@ -190,53 +174,13 @@ impl MultiLanguageTextIndex {
             config,
             validities: Validities::default(),
             writer_lost: None,
-            selection: None,
-            settled: None,
         }
     }
 
-    /// The last change whose documents were brought back to one scope.
-    pub fn settled(&self) -> Option<u64> {
-        self.settled
-    }
-
-    /// The change the scoped documents belong to, while there is one.
-    pub fn selection(&self) -> Option<Selection> {
-        self.selection
-    }
-
-    /// Start keeping the documents of change `operation` in their scopes,
-    /// not yet prepared. A change already kept is left as it is.
-    pub fn begin_selection(&mut self, operation: u64) {
-        if self.selection.is_none_or(|s| s.operation != operation) {
-            self.selection = Some(Selection {
-                operation,
-                prepared: false,
-            });
-        }
-    }
-
-    /// Record that every stored node was written in its scope for change
-    /// `operation`.
-    pub fn mark_prepared(&mut self, operation: u64) {
-        if let Some(selection) = self.selection.as_mut()
-            && selection.operation == operation
-        {
-            selection.prepared = true;
-        }
-    }
-
-    /// Stop keeping documents apart once none is left outside the shared
-    /// scope, recording the change as settled; whether it stopped.
-    pub fn end_selection(&mut self) -> bool {
-        let settled = self.inner.aside.retired.docs == 0 && self.inner.aside.gained.docs == 0;
-        if settled && let Some(selection) = self.selection.take() {
-            self.settled = Some(
-                self.settled
-                    .map_or(selection.operation, |s| s.max(selection.operation)),
-            );
-        }
-        settled
+    /// Whether every live document is shared: none is kept apart for one
+    /// interpretation of a change.
+    pub fn all_shared(&self) -> bool {
+        self.inner.aside.retired.docs == 0 && self.inner.aside.gained.docs == 0
     }
 
     /// The nodes whose live document is in `scope`, ascending.

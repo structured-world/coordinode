@@ -235,6 +235,124 @@ fn a_concluded_change_is_folded_into_one_scope() {
     }
 }
 
+/// Run `statement` in its own transaction and return its commit timestamp.
+fn commit(db: &mut Database, statement: &str) -> u64 {
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(tx, statement, None)
+        .unwrap_or_else(|e| panic!("{statement}: {e}"));
+    db.commit_transaction(tx)
+        .expect("commit")
+        .commit_ts
+        .as_raw()
+}
+
+/// Names and full-text scores of the things matching `words` through the
+/// text index, by name; read at `as_of` when given.
+fn text_hits(db: &mut Database, words: &str, as_of: Option<u64>) -> Vec<(String, f64)> {
+    let as_of = as_of.map_or(String::new(), |ts| format!(" AS OF TIMESTAMP {ts}"));
+    let query = format!(
+        "MATCH (n:Thing) WHERE text_match(n.title, '{words}') \
+         RETURN n.title AS name, text_score(n.title, '{words}') AS score \
+         ORDER BY name{as_of}"
+    );
+    db.execute_cypher(&query)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .iter()
+        .map(|row| match (row.get("name"), row.get("score")) {
+            (Some(Value::String(name)), Some(Value::Float(score))) => (name.clone(), *score),
+            other => panic!("row {other:?}"),
+        })
+        .collect()
+}
+
+/// A database of things only, the oracle a text read is compared with:
+/// `titles` as the things a text index on `:Thing(title)` holds.
+fn things_holding(dir: &std::path::Path, titles: &[&str]) -> Database {
+    let mut db = Database::open(dir).expect("open");
+    db.execute_cypher("CREATE NODE TYPE Thing WITH (title: STRING)")
+        .expect("type");
+    db.execute_cypher("CREATE TEXT INDEX thing_text ON :Thing(title)")
+        .expect("text index");
+    for title in titles {
+        db.execute_cypher(&format!("CREATE (:Thing {{title: '{title}'}})"))
+            .expect("thing");
+    }
+    db
+}
+
+fn assert_same_hits(read: &[(String, f64)], oracle: &[(String, f64)], what: &str) {
+    assert_eq!(
+        read.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        oracle.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "{what}: {read:?} vs {oracle:?}"
+    );
+    for ((_, a), (_, b)) in read.iter().zip(oracle) {
+        assert!((a - b).abs() < 1e-5, "{what}: {read:?} vs {oracle:?}");
+    }
+}
+
+/// A text read keeps the interpretation of its view of the catalog. Once
+/// the text index has brought a change of what a type implies back to one
+/// interpretation, a read at a timestamp before the change still finds the
+/// label's carriers then, and ranks them as an index holding only those
+/// would; a read now finds the carriers the change put in force. Before the
+/// index's own interpretation was compared with the reader's, an index that
+/// had settled a later change answered the old view whole.
+#[test]
+fn a_text_read_keeps_its_views_interpretation_after_a_change() {
+    let dirs = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let mut db = Database::open(dirs.0.path()).expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE TEXT INDEX thing_text ON :Thing(title)",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    commit(&mut db, "CREATE (:Thing {title: 'rust graph'})");
+    let before = commit(&mut db, "CREATE (:Task {title: 'rust rust tools'})");
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("alter");
+    await_folded(&db);
+    // The index itself comes to hold the facts now in force, so a read now
+    // is answered from it rather than from the store.
+    let in_force = coordinode_query::index::membership::label_carriers(db.engine(), "Thing")
+        .expect("carriers");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while db.text_index_registry().held("Thing", "title")
+        != Some(coordinode_query::index::selection::Held::built(
+            in_force.clone(),
+        ))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the text index never settled the change: {:?}",
+            db.text_index_registry().held("Thing", "title")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let mut then = things_holding(dirs.1.path(), &["rust graph"]);
+    let mut now = things_holding(dirs.2.path(), &["rust graph", "rust rust tools"]);
+    for words in ["rust", "graph", "tools"] {
+        assert_same_hits(
+            &text_hits(&mut db, words, Some(before)),
+            &text_hits(&mut then, words, None),
+            &format!("{words} before the change"),
+        );
+        assert_same_hits(
+            &text_hits(&mut db, words, None),
+            &text_hits(&mut now, words, None),
+            &format!("{words} now"),
+        );
+    }
+}
+
 /// One schema package moving a value's holder out of a label and another
 /// into it: Chore stops implying Thing while Task starts, a Chore and a Task
 /// holding the same title under a uniqueness on Thing. Each interpretation

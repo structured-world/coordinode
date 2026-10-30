@@ -398,7 +398,7 @@ pub fn text_build(label: String, properties: Vec<String>) -> LocalBuild {
         for property in &properties {
             registry
                 .rebuild_index(&label, property, || {
-                    let texts = super::text_registry::stored_texts(
+                    let (texts, held) = super::text_registry::stored_texts(
                         env.engine(),
                         env.shard_id(),
                         &fields,
@@ -407,7 +407,7 @@ pub fn text_build(label: String, properties: Vec<String>) -> LocalBuild {
                         crate::executor::runner::wall_clock_us(),
                     )?;
                     nodes.extend(texts.iter().filter(|t| t.text.is_some()).map(|t| t.node_id));
-                    Ok(texts)
+                    Ok((texts, held))
                 })
                 .map_err(|e| BuildError::Other(format!("backfill text index: {e}")))?;
         }
