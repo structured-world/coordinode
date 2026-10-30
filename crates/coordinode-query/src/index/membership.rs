@@ -67,15 +67,14 @@ pub fn label_carriers_in(
     let Some(label) = cache.label_id(label)? else {
         return Ok(None);
     };
+    // Every identity ever allocated, each judged by the view's own facts:
+    // the latest catalog's types and implications are not the view's, which
+    // may hold a type that implies nothing now, or a candidate's implication
+    // the types in force lack. Identity records are never removed, so none
+    // the view knows is missed; one allocated after it has no facts there.
     let mut implying = Vec::new();
-    for schema in store.list_labels()? {
-        if schema.is_auxiliary() || schema.implies().is_empty() {
-            continue;
-        }
-        let Some(id) = cache.label_id(&schema.name)? else {
-            continue;
-        };
-        if cache.of_stored(&[id])?.contains(label) {
+    for (id, _) in store.label_names()? {
+        if id != label && cache.of_stored(&[id])?.contains(label) {
             implying.push(id);
         }
     }

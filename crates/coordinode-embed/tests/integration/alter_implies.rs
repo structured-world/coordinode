@@ -300,6 +300,32 @@ fn assert_same_hits(read: &[(String, f64)], oracle: &[(String, f64)], what: &str
 /// had settled a later change answered the old view whole.
 #[test]
 fn a_text_read_keeps_its_views_interpretation_after_a_change() {
+    text_reads_across_a_change(
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "ALTER NODE TYPE Task SET IMPLIES (Thing)",
+        (&["rust graph"], &["rust graph", "rust rust tools"]),
+    );
+}
+
+/// The other way round: a type stops implying the label. A read at a
+/// timestamp before still finds the type's nodes, which its view of the
+/// catalog holds as carriers although the type implies nothing now. Before
+/// the carriers were judged by the view's own catalog, the type was passed
+/// over for implying nothing in the latest one, and the old read lost them.
+#[test]
+fn a_text_read_before_a_lost_implication_keeps_its_carriers() {
+    text_reads_across_a_change(
+        "CREATE NODE TYPE Task IMPLIES (Thing) WITH (title: STRING)",
+        "ALTER NODE TYPE Task SET IMPLIES ()",
+        (&["rust graph", "rust rust tools"], &["rust graph"]),
+    );
+}
+
+/// A thing and a task, a text index on `:Thing(title)`, the task's type
+/// declared by `task` and changed by `alter`. Once the index settles the
+/// change, a read at a timestamp before it ranks as an index of the
+/// `then` titles, and a read now as one of the `now` titles.
+fn text_reads_across_a_change(task: &str, alter: &str, (then, now): (&[&str], &[&str])) {
     let dirs = (
         tempfile::tempdir().expect("tempdir"),
         tempfile::tempdir().expect("tempdir"),
@@ -308,7 +334,7 @@ fn a_text_read_keeps_its_views_interpretation_after_a_change() {
     let mut db = Database::open(dirs.0.path()).expect("open");
     for ddl in [
         "CREATE NODE TYPE Thing WITH (title: STRING)",
-        "CREATE NODE TYPE Task WITH (title: STRING)",
+        task,
         "CREATE TEXT INDEX thing_text ON :Thing(title)",
     ] {
         db.execute_cypher(ddl)
@@ -316,8 +342,7 @@ fn a_text_read_keeps_its_views_interpretation_after_a_change() {
     }
     commit(&mut db, "CREATE (:Thing {title: 'rust graph'})");
     let before = commit(&mut db, "CREATE (:Task {title: 'rust rust tools'})");
-    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
-        .expect("alter");
+    db.execute_cypher(alter).expect("alter");
     await_folded(&db);
     // The index itself comes to hold the facts now in force, so a read now
     // is answered from it rather than from the store.
@@ -337,8 +362,8 @@ fn a_text_read_keeps_its_views_interpretation_after_a_change() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut then = things_holding(dirs.1.path(), &["rust graph"]);
-    let mut now = things_holding(dirs.2.path(), &["rust graph", "rust rust tools"]);
+    let mut then = things_holding(dirs.1.path(), then);
+    let mut now = things_holding(dirs.2.path(), now);
     for words in ["rust", "graph", "tools"] {
         assert_same_hits(
             &text_hits(&mut db, words, Some(before)),
