@@ -48,6 +48,7 @@ fn members(db: &Database, label: &str) -> Vec<i64> {
                 lookup: &lookup,
                 shard: SHARD,
                 label: id,
+                interpretation: coordinode_modality::Interpretation::InForce,
             },
             None,
             &budget,

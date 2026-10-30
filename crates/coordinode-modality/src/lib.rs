@@ -89,16 +89,16 @@ pub use encrypted_index::{
 };
 pub use error::{StoreError, StoreResult};
 pub use index::{
-    EntryPage, IndexStore, LabelScope, LatestEntry, LocalCopy, LocalIndexStore, StoredEntry,
-    StoredEntryPage,
+    EntryPage, IndexStore, LabelMembership, LabelScope, LatestEntry, LocalCopy, LocalIndexStore,
+    StoredEntry, StoredEntryPage,
 };
 pub use index_def::{
     BuildFailure, BuildState, CheckState, CopyQualification, DuplicateRepair,
     DuplicateRepairRecord, ENTRY_LAYOUT, GenerationId, IndexBuildRecord, IndexCheck,
     IndexDefinition, IndexDescriptor, IndexId, IndexIntegrityRecord, IndexMaintenance,
-    IndexProfile, IndexState, IndexType, Integrity, LabelCertificationRecord, Mismatch,
-    NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter, ProfileSource, TextFieldConfig,
-    TextIndexConfig, VectorIndexConfig,
+    IndexProfile, IndexState, IndexType, Integrity, Interpretation, LabelCertificationRecord,
+    Mismatch, NamespaceIndexPolicy, OnlineDuringBuild, PartRole, PartState, PartialFilter,
+    ProfileSource, SelectionPart, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };
 pub use node::{LocalNodeStore, NodeStore, RowPage};
 pub use schema::{LocalSchemaStore, SchemaStore};

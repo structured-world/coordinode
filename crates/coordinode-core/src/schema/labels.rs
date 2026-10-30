@@ -310,6 +310,9 @@ pub struct LabelView {
     ids: rustc_hash::FxHashMap<String, Option<LabelId>>,
     names: rustc_hash::FxHashMap<LabelId, String>,
     implied: ImpliedCache,
+    /// What each type met implies under the candidates published at the
+    /// view: what a writer holds a label to while a change of it is proved.
+    candidate_implied: ImpliedCache,
 }
 
 impl LabelView {
@@ -347,12 +350,24 @@ impl LabelView {
         &mut self.implied
     }
 
+    /// What each type met implies under the candidates published at the
+    /// view.
+    pub fn candidate_implied(&self) -> &ImpliedCache {
+        &self.candidate_implied
+    }
+
+    /// [`Self::candidate_implied`], to compile a type into.
+    pub fn candidate_implied_mut(&mut self) -> &mut ImpliedCache {
+        &mut self.candidate_implied
+    }
+
     /// Forget what the view said about `name` and every compiled type: the
     /// reader changed that label's binding or definition. The names of
     /// identities stay, since an identity keeps its name.
     pub fn forget(&mut self, name: &str) {
         self.ids.remove(name);
         self.implied.clear();
+        self.candidate_implied.clear();
     }
 }
 

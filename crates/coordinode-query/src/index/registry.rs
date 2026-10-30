@@ -12,7 +12,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::EntryOwner;
-use coordinode_core::schema::label_id::LabelId;
 use coordinode_modality::{IndexStore as _, LocalCopy, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
@@ -1390,40 +1389,40 @@ impl IndexRegistry {
         Some((IndexDefinition::clone(&registered.def), registered.version))
     }
 
-    /// Stage node `node` of shard `shard` leaving the labels `removed` and
-    /// joining the labels `added` in the namespace's label lookup, bound to
-    /// its definition as this member read it: a building lookup is
-    /// maintained as a ready one is, so its build misses no write. Nothing
-    /// while the namespace has none.
+    /// Stage node `node` of shard `shard` moving from the labels `before` to
+    /// `after` in the namespace's label lookup `lookup` (as
+    /// [`Self::label_lookup_published`] gave it, with the version of its
+    /// record), bound to that definition: a building lookup is maintained as
+    /// a ready one is, so its build misses no write, and a change of its
+    /// selection before the commit refuses the write, to be retried under
+    /// the selection in force. The memberships are judged under the same
+    /// definition the caller read.
     ///
     /// # Errors
     ///
     /// A storage failure.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_labels_changed(
         &self,
         engine: &StorageEngine,
         txn: &mut Transaction,
+        (def, version): (&IndexDefinition, Option<u64>),
         shard: u16,
         node: NodeId,
-        removed: &[LabelId],
-        added: &[LabelId],
+        before: coordinode_modality::LabelMembership<'_>,
+        after: coordinode_modality::LabelMembership<'_>,
     ) -> Result<(), StoreError> {
-        let Some(Registered { def, version, .. }) = self.indexes.read().label_lookup().cloned()
-        else {
-            return Ok(());
-        };
         if matches!(def.state, super::IndexState::Failed { .. }) {
             return Ok(());
         }
-        self.bind(engine, txn, &def, version)?;
-        LocalIndexStore::new(engine)
-            .stage_label_postings_txn(txn, &def, shard, node, removed, added)
+        self.bind(engine, txn, def, version)?;
+        LocalIndexStore::new(engine).stage_label_postings_txn(txn, def, shard, node, before, after)
     }
 
     /// Stage the postings node `node` of shard `shard` does not have yet for
-    /// the labels `held`, bound to the label lookup as this member read it:
-    /// a version of a temporal node, whose earlier versions keep their labels
-    /// in its history. Nothing while the namespace has no lookup.
+    /// the labels `held`, bound to the label lookup `lookup` as
+    /// [`Self::on_labels_changed`] is: a version of a temporal node, whose
+    /// earlier versions keep their labels in its history.
     ///
     /// # Errors
     ///
@@ -1432,19 +1431,16 @@ impl IndexRegistry {
         &self,
         engine: &StorageEngine,
         txn: &mut Transaction,
+        (def, version): (&IndexDefinition, Option<u64>),
         shard: u16,
         node: NodeId,
-        held: &[LabelId],
+        held: coordinode_modality::LabelMembership<'_>,
     ) -> Result<(), StoreError> {
-        let Some(Registered { def, version, .. }) = self.indexes.read().label_lookup().cloned()
-        else {
-            return Ok(());
-        };
         if matches!(def.state, super::IndexState::Failed { .. }) {
             return Ok(());
         }
-        self.bind(engine, txn, &def, version)?;
-        LocalIndexStore::new(engine).stage_label_presence_txn(txn, &def, shard, node, held)
+        self.bind(engine, txn, def, version)?;
+        LocalIndexStore::new(engine).stage_label_presence_txn(txn, def, shard, node, held)
     }
 
     /// Bind the writing transaction's effects in `index` to the definition

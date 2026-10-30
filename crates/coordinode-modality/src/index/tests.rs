@@ -4,7 +4,20 @@ use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError};
 
-use crate::index_def::IndexMaintenance;
+use crate::index_def::{IndexMaintenance, Interpretation, PartState};
+
+/// A membership both interpretations agree on.
+fn settled(labels: &[LabelId]) -> LabelMembership<'_> {
+    LabelMembership::settled(labels)
+}
+
+/// A membership the interpretations disagree on.
+fn both<'a>(in_force: &'a [LabelId], candidate: &'a [LabelId]) -> LabelMembership<'a> {
+    LabelMembership {
+        in_force,
+        candidate,
+    }
+}
 
 /// Logic-test fixture (memory backing, env-flippable).
 fn open_engine() -> coordinode_test_fixtures::EngineFixture {
@@ -674,17 +687,31 @@ fn label_members_follow_staged_postings() {
     let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
     for n in [3, 1, 2] {
         store
-            .stage_label_postings_txn(&mut t, &lookup, 0, id(n), &[], &[user])
+            .stage_label_postings_txn(&mut t, &lookup, 0, id(n), settled(&[]), settled(&[user]))
             .unwrap();
     }
     store
-        .stage_label_postings_txn(&mut t, &lookup, 0, id(2), &[], &[admin])
+        .stage_label_postings_txn(
+            &mut t,
+            &lookup,
+            0,
+            id(2),
+            settled(&[user]),
+            settled(&[user, admin]),
+        )
         .unwrap();
     store
-        .stage_label_postings_txn(&mut t, &lookup, 1, id(9), &[], &[user])
+        .stage_label_postings_txn(&mut t, &lookup, 1, id(9), settled(&[]), settled(&[user]))
         .unwrap();
     store
-        .stage_label_postings_txn(&mut t, &other_generation, 0, id(7), &[], &[user])
+        .stage_label_postings_txn(
+            &mut t,
+            &other_generation,
+            0,
+            id(7),
+            settled(&[]),
+            settled(&[user]),
+        )
         .unwrap();
     commit(&mut t).unwrap();
 
@@ -700,6 +727,7 @@ fn label_members_follow_staged_postings() {
                     lookup: &lookup,
                     shard: 0,
                     label,
+                    interpretation: Interpretation::InForce,
                 },
                 after.map(id),
                 &budget(),
@@ -745,13 +773,20 @@ fn label_members_follow_staged_postings() {
     // Node 2 moves from Admin and User to User alone; node 4 joins User;
     // node 1 leaves it. A label held before and after writes nothing.
     store
-        .stage_label_postings_txn(&mut t, &lookup, 0, id(2), &[user, admin], &[user])
+        .stage_label_postings_txn(
+            &mut t,
+            &lookup,
+            0,
+            id(2),
+            settled(&[user, admin]),
+            settled(&[user]),
+        )
         .unwrap();
     store
-        .stage_label_postings_txn(&mut t, &lookup, 0, id(4), &[], &[user])
+        .stage_label_postings_txn(&mut t, &lookup, 0, id(4), settled(&[]), settled(&[user]))
         .unwrap();
     store
-        .stage_label_postings_txn(&mut t, &lookup, 0, id(1), &[user], &[])
+        .stage_label_postings_txn(&mut t, &lookup, 0, id(1), settled(&[user]), settled(&[]))
         .unwrap();
     assert_eq!(
         members(&t, user, None, usize::MAX),
@@ -775,14 +810,15 @@ fn label_members_follow_staged_postings() {
     );
 }
 
-/// A label whose postings an implication change rebuilds keeps being served
-/// from where they were while its pending generation fills, writers keep
-/// both, and putting the rebuild in force serves the label from the new
-/// generation alone; other labels never move. Abandoning a rebuild leaves
-/// the label served from where it was.
+/// While an implication change is certified, a label's postings agreed on by
+/// both interpretations stay in the lookup's own scope and only the
+/// difference is kept apart: the facts in force read their own scope and the
+/// retired part, the candidate its own scope and the gained part, each
+/// without a node of the other. Put in force, the facts read the gained
+/// part; withdrawn, the retired one. Merging scopes keeps NodeId order past
+/// a page, a resume and a break; other labels never move.
 #[test]
-fn a_label_rebuild_serves_its_old_postings_until_finished() {
-    use crate::index_def::PendingGeneration;
+fn a_label_change_keeps_only_its_difference_apart() {
     use core::ops::ControlFlow;
     let fx = open_engine();
     let engine = &fx.engine;
@@ -791,13 +827,15 @@ fn a_label_rebuild_serves_its_old_postings_until_finished() {
     let label = |raw| coordinode_core::schema::label_id::LabelId::new(raw).expect("nonzero");
     let (thing, other) = (label(10), label(11));
     let operation = GenerationId::from_raw(20);
-    let pending = PendingGeneration {
-        generation: GenerationId::from_raw(21),
-        operation,
-    };
+    let (gained, retired) = (GenerationId::from_raw(21), GenerationId::from_raw(22));
     let mut lookup =
         IndexDescriptor::label_lookup().bind(IndexId::from_raw(1), GenerationId::from_raw(4));
-    let members = |txn: &Transaction, def: &IndexDefinition, label| {
+    let members = |txn: &Transaction,
+                   def: &IndexDefinition,
+                   label,
+                   interpretation,
+                   after: Option<u64>,
+                   stop: usize| {
         let mut out = Vec::new();
         store
             .label_members(
@@ -806,65 +844,127 @@ fn a_label_rebuild_serves_its_old_postings_until_finished() {
                     lookup: def,
                     shard: 0,
                     label,
+                    interpretation,
                 },
-                None,
+                after.map(id),
                 &budget(),
                 |node| {
                     out.push(node.as_raw());
-                    Ok::<_, StoreError>(ControlFlow::Continue(()))
+                    Ok::<_, StoreError>(if out.len() == stop {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    })
                 },
             )
             .unwrap();
         out
     };
-
+    // Nodes 1..=1000 carry Thing; the odd ones are of the type the change
+    // removes Thing from. Nodes 2001.. are of the type it adds Thing to.
     let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
-    store
-        .stage_label_postings_txn(&mut t, &lookup, 0, id(1), &[], &[thing, other])
-        .unwrap();
+    for n in 1..=1000 {
+        store
+            .stage_label_postings_txn(
+                &mut t,
+                &lookup,
+                0,
+                id(n),
+                settled(&[]),
+                settled(&[thing, other]),
+            )
+            .unwrap();
+    }
     commit(&mut t).unwrap();
 
-    lookup.begin_label_rebuild(thing, pending);
-    assert!(lookup.has_label_pending());
-    assert_eq!(lookup.label_generation(thing), GenerationId::from_raw(4));
-    // The rebuild holds what the candidate's interpretation gives: node 2
-    // carries Thing under it, node 1 does not.
+    lookup.propose_parts(thing, operation, gained, retired);
+    assert!(lookup.has_proposed());
+    assert_eq!(lookup.proposed_operation(thing), Some(operation));
+    assert_eq!(lookup.proposed_operation(other), None);
     let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
-    store
-        .stage_pending_label_postings_txn(&mut t, &lookup, 0, id(2), &[], &[thing])
-        .unwrap();
-    store
-        .stage_pending_label_postings_txn(&mut t, &lookup, 0, id(3), &[], &[other])
-        .unwrap();
+    // The losing carriers move to the retired part, as the certification's
+    // preparation moves them.
+    for n in (1..=1000).step_by(2) {
+        store
+            .stage_label_postings_txn(
+                &mut t,
+                &lookup,
+                0,
+                id(n),
+                settled(&[thing, other]),
+                both(&[thing, other], &[other]),
+            )
+            .unwrap();
+    }
+    // The gaining carriers write the gained part, interleaved by NodeId.
+    for n in (1..=1000).step_by(2).map(|n| n + 2000) {
+        store
+            .stage_label_postings_txn(&mut t, &lookup, 0, id(n), settled(&[]), both(&[], &[thing]))
+            .unwrap();
+    }
     commit(&mut t).unwrap();
-    let t = Transaction::begin(engine, Some(&oracle), oracle.next());
-    assert_eq!(members(&t, &lookup, thing), vec![1], "served as before");
-    assert_eq!(members(&t, &lookup, other), vec![1], "a label not rebuilt");
-
-    let mut abandoned = lookup.clone();
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let all: Vec<u64> = (1..=1000).collect();
+    let evens: Vec<u64> = (2..=1000).step_by(2).collect();
+    let mut kept_and_gained = evens.clone();
+    kept_and_gained.extend((1..=1000).step_by(2).map(|n| n + 2000));
+    let in_force = Interpretation::InForce;
+    let candidate = Interpretation::Candidate(operation);
+    assert_eq!(members(&t, &lookup, thing, in_force, None, usize::MAX), all);
     assert_eq!(
-        abandoned.abandon_label_rebuilds(operation),
-        vec![(thing, pending.generation)]
+        members(&t, &lookup, thing, candidate, None, usize::MAX),
+        kept_and_gained,
+        "past several merge pages"
+    );
+    assert_eq!(
+        members(&t, &lookup, thing, candidate, Some(999), 3),
+        vec![1000, 2001, 2003],
+        "a resume and a break across scopes"
+    );
+    assert_eq!(
+        members(&t, &lookup, other, candidate, None, usize::MAX),
+        all,
+        "a label the change leaves alone"
     );
     assert!(
-        abandoned.label_generations.is_empty(),
-        "nothing left to say"
+        t.get(
+            Partition::Idx,
+            &coordinode_core::index::encoding::encode_label_posting(lookup.generation, 0, thing, 1)
+        )
+        .unwrap()
+        .is_none(),
+        "a retired posting left the lookup's own scope"
     );
-    assert_eq!(members(&t, &abandoned, thing), vec![1]);
 
+    let mut withdrawn = lookup.clone();
+    assert!(withdrawn.conclude_parts(operation, PartState::Withdrawn));
     assert_eq!(
-        lookup.finish_label_rebuilds(operation),
-        vec![(thing, GenerationId::from_raw(4))]
+        members(&t, &withdrawn, thing, in_force, None, usize::MAX),
+        all
     );
-    assert!(!lookup.has_label_pending());
-    assert_eq!(lookup.label_generation(thing), pending.generation);
-    assert_eq!(
-        members(&t, &lookup, thing),
-        vec![2],
-        "served from the rebuild"
-    );
-    assert_eq!(members(&t, &lookup, other), vec![1], "never moved");
 
+    assert!(lookup.conclude_parts(operation, PartState::InForce));
+    assert!(!lookup.has_proposed());
+    assert_eq!(
+        members(&t, &lookup, thing, in_force, None, usize::MAX),
+        kept_and_gained,
+        "in force"
+    );
+    // A writer after the change judges by one interpretation; a node leaving
+    // Thing is cleared from whichever scope holds its posting.
+    let mut w = Transaction::begin(engine, Some(&oracle), oracle.next());
+    for n in [2, 2001] {
+        store
+            .stage_label_postings_txn(&mut w, &lookup, 0, id(n), settled(&[thing]), settled(&[]))
+            .unwrap();
+    }
+    assert_eq!(members(&w, &lookup, thing, in_force, None, 2), vec![4, 6]);
+    assert_eq!(
+        members(&w, &lookup, thing, in_force, Some(1000), 1),
+        vec![2003]
+    );
+
+    lookup.drop_part(retired);
     let bytes = rmp_serde::to_vec(&lookup).unwrap();
     assert_eq!(
         rmp_serde::from_slice::<IndexDefinition>(&bytes).unwrap(),

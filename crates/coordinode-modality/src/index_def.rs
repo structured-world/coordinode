@@ -95,36 +95,65 @@ pub struct IndexDefinition {
     pub generation: GenerationId,
     /// What the index is.
     pub descriptor: IndexDescriptor,
-    /// A representation being built beside [`Self::generation`] under a
-    /// label candidate's interpretation, maintained by every writer with
-    /// it and served from once the candidate is put in force.
-    pub replacement: Option<PendingGeneration>,
-    /// The label lookup's labels whose postings are kept in a generation of
-    /// their own, sorted by label: one an implication change rebuilt, or is
-    /// rebuilding. Every other label's postings are in
-    /// [`Self::generation`]. Empty for every other index.
-    pub label_generations: Vec<LabelGeneration>,
+    /// Entries the interpretations of a label disagree on, kept apart from
+    /// [`Self::generation`] while an implication change is certified, in
+    /// force but not folded in yet, or withdrawn but not folded back: each
+    /// holds only that difference. Empty in the steady state.
+    pub selection: Vec<SelectionPart>,
 }
 
-/// A representation of an index, or of one label of the label lookup,
-/// being built for a label candidate.
+/// Entries of one label of an index kept apart because an implication
+/// change makes the interpretations disagree on them. Its entries are keyed
+/// exactly as the index's own, under [`Self::part`] in place of the
+/// index's generation, so it holds only the difference, never a copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingGeneration {
-    /// Where its entries are written.
-    pub generation: GenerationId,
-    /// The certification that builds it and puts it in force.
-    pub operation: GenerationId,
-}
-
-/// Where the label lookup keeps the postings of one label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LabelGeneration {
-    /// The label.
+pub struct SelectionPart {
+    /// The label whose membership differs: for the label lookup, the label
+    /// of its postings; for a declared index, the index's label.
     pub label: coordinode_core::schema::label_id::LabelId,
-    /// The generation its postings are served from.
-    pub serving: GenerationId,
-    /// The generation its postings are being rebuilt in, if they are.
-    pub pending: Option<PendingGeneration>,
+    /// The key scope its entries are written under, from the generation
+    /// allocator.
+    pub part: GenerationId,
+    /// The certification of the implication change it belongs to.
+    pub operation: GenerationId,
+    /// Which interpretation alone holds its entries.
+    pub role: PartRole,
+    /// Where the change stands.
+    pub state: PartState,
+}
+
+/// Which interpretation alone holds the entries of a [`SelectionPart`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartRole {
+    /// Carriers the change adds: members under the candidate only.
+    Gained,
+    /// Carriers the change removes: members under the facts it replaces
+    /// only, moved out of the index's own entries before it is put in force.
+    Retired,
+}
+
+/// Where the implication change a [`SelectionPart`] belongs to stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartState {
+    /// Being certified: the facts in force read the retired part, the
+    /// candidate the gained one.
+    Proposed,
+    /// Put in force: the gained part is read until it is folded into the
+    /// index's own entries; the retired one serves only views before it.
+    InForce,
+    /// Withdrawn: the retired part is read until it is folded back; the
+    /// gained one is read by nobody.
+    Withdrawn,
+}
+
+/// The interpretation a reader or writer holds a label to, as its view of
+/// the catalog has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interpretation {
+    /// The facts in force at the view.
+    InForce,
+    /// The candidate of the certification named, published at the view.
+    Candidate(GenerationId),
 }
 
 impl core::ops::Deref for IndexDefinition {
@@ -481,8 +510,7 @@ impl IndexDescriptor {
             id,
             generation,
             descriptor: self,
-            replacement: None,
-            label_generations: Vec::new(),
+            selection: Vec::new(),
         }
     }
 
@@ -534,101 +562,136 @@ impl IndexDescriptor {
 }
 
 impl IndexDefinition {
-    /// Where the label lookup serves the postings of `label` from: its own
-    /// generation when an implication change rebuilt it, the lookup's
-    /// otherwise. One search of a short sorted list.
-    pub fn label_generation(
+    /// The key scopes holding the entries of `label` under `interpretation`:
+    /// the index's own, then each part that interpretation reads. Disjoint
+    /// by construction, so a node is in at most one of them, and the label's
+    /// members are their union. In the steady state, the index's own alone.
+    pub fn eligible_scopes(
         &self,
         label: coordinode_core::schema::label_id::LabelId,
-    ) -> GenerationId {
-        self.label_entry(label)
-            .map_or(self.generation, |entry| entry.serving)
-    }
-
-    /// The generation the postings of `label` are being rebuilt in, with
-    /// the certification building it; `None` when they are not.
-    pub fn label_pending(
-        &self,
-        label: coordinode_core::schema::label_id::LabelId,
-    ) -> Option<PendingGeneration> {
-        self.label_entry(label).and_then(|entry| entry.pending)
-    }
-
-    /// Whether some label's postings are being rebuilt: what a writer checks
-    /// once before it looks for the labels whose rebuild it maintains.
-    pub fn has_label_pending(&self) -> bool {
-        self.label_generations.iter().any(|e| e.pending.is_some())
-    }
-
-    fn label_entry(
-        &self,
-        label: coordinode_core::schema::label_id::LabelId,
-    ) -> Option<&LabelGeneration> {
-        self.label_generations
-            .binary_search_by_key(&label, |entry| entry.label)
-            .ok()
-            .map(|at| &self.label_generations[at])
-    }
-
-    /// Start rebuilding the postings of `label` in `pending`, keeping them
-    /// served from where they are.
-    pub fn begin_label_rebuild(
-        &mut self,
-        label: coordinode_core::schema::label_id::LabelId,
-        pending: PendingGeneration,
-    ) {
-        let serving = self.label_generation(label);
-        let entry = LabelGeneration {
-            label,
-            serving,
-            pending: Some(pending),
-        };
-        match self
-            .label_generations
-            .binary_search_by_key(&label, |entry| entry.label)
-        {
-            Ok(at) => self.label_generations[at] = entry,
-            Err(at) => self.label_generations.insert(at, entry),
-        }
-    }
-
-    /// Serve the postings of every label rebuilt by `operation` from their
-    /// rebuilt generation. Returns the generations they were served from,
-    /// whose postings are left to be removed.
-    pub fn finish_label_rebuilds(
-        &mut self,
-        operation: GenerationId,
-    ) -> Vec<(coordinode_core::schema::label_id::LabelId, GenerationId)> {
-        let mut retired = Vec::new();
-        for entry in &mut self.label_generations {
-            if let Some(pending) = entry.pending.filter(|p| p.operation == operation) {
-                retired.push((entry.label, entry.serving));
-                entry.serving = pending.generation;
-                entry.pending = None;
+        interpretation: Interpretation,
+    ) -> smallvec::SmallVec<[GenerationId; 2]> {
+        let mut scopes = smallvec::smallvec![self.generation];
+        for part in self.selection.iter().filter(|p| p.label == label) {
+            let candidate = interpretation == Interpretation::Candidate(part.operation);
+            let read = match (part.state, part.role) {
+                (PartState::Proposed, PartRole::Retired) => !candidate,
+                (PartState::Proposed, PartRole::Gained) => candidate,
+                (PartState::InForce, PartRole::Gained) => true,
+                (PartState::InForce, PartRole::Retired) => false,
+                (PartState::Withdrawn, PartRole::Retired) => true,
+                (PartState::Withdrawn, PartRole::Gained) => false,
+            };
+            if read {
+                scopes.push(part.part);
             }
         }
-        retired
+        scopes
     }
 
-    /// Drop every rebuild `operation` started, the postings staying served
-    /// from where they were. Returns the generations dropped, whose postings
-    /// are left to be removed.
-    pub fn abandon_label_rebuilds(
+    /// Every key scope an entry of `label` may be in: the index's own and
+    /// each of its parts. What a writer removing a membership clears, since
+    /// an entry moves between them as a change is certified and folded.
+    pub fn scopes_of(
+        &self,
+        label: coordinode_core::schema::label_id::LabelId,
+    ) -> smallvec::SmallVec<[GenerationId; 2]> {
+        let mut scopes = smallvec::smallvec![self.generation];
+        scopes.extend(
+            self.selection
+                .iter()
+                .filter(|p| p.label == label)
+                .map(|p| p.part),
+        );
+        scopes
+    }
+
+    /// The certification being proved for `label`, if one is: while it is,
+    /// a writer holds the label to both interpretations.
+    pub fn proposed_operation(
+        &self,
+        label: coordinode_core::schema::label_id::LabelId,
+    ) -> Option<GenerationId> {
+        self.selection
+            .iter()
+            .find(|p| p.label == label && p.state == PartState::Proposed)
+            .map(|p| p.operation)
+    }
+
+    /// Whether some label has a change being certified: what a writer checks
+    /// once before it judges any membership twice.
+    pub fn has_proposed(&self) -> bool {
+        self.selection
+            .iter()
+            .any(|p| p.state == PartState::Proposed)
+    }
+
+    /// Where the entry of a member of `label` is written: in the index's own
+    /// entries while both interpretations hold it (`in_force` and
+    /// `candidate`), in the part of the interpretation that alone does
+    /// otherwise; `None` for a node neither holds. A label without a change
+    /// being certified is judged by `in_force` alone.
+    pub fn placement(
+        &self,
+        label: coordinode_core::schema::label_id::LabelId,
+        in_force: bool,
+        candidate: bool,
+    ) -> Option<GenerationId> {
+        let role = match (in_force, candidate) {
+            (false, false) => return None,
+            (true, true) => return Some(self.generation),
+            (false, true) => PartRole::Gained,
+            (true, false) => PartRole::Retired,
+        };
+        let proposed = self
+            .selection
+            .iter()
+            .find(|p| p.label == label && p.state == PartState::Proposed && p.role == role);
+        match (proposed, in_force) {
+            (Some(part), _) => Some(part.part),
+            // No change being certified: the facts in force alone decide.
+            (None, true) => Some(self.generation),
+            (None, false) => None,
+        }
+    }
+
+    /// Record that the certification `operation` keeps `label`'s gained and
+    /// retired entries in `gained` and `retired`, proposed.
+    pub fn propose_parts(
         &mut self,
+        label: coordinode_core::schema::label_id::LabelId,
         operation: GenerationId,
-    ) -> Vec<(coordinode_core::schema::label_id::LabelId, GenerationId)> {
-        let mut dropped = Vec::new();
-        let generation = self.generation;
-        self.label_generations.retain_mut(|entry| {
-            let Some(pending) = entry.pending.filter(|p| p.operation == operation) else {
-                return true;
-            };
-            dropped.push((entry.label, pending.generation));
-            entry.pending = None;
-            // An entry serving from the lookup's own generation says nothing.
-            entry.serving != generation
-        });
-        dropped
+        gained: GenerationId,
+        retired: GenerationId,
+    ) {
+        for (part, role) in [(gained, PartRole::Gained), (retired, PartRole::Retired)] {
+            self.selection.push(SelectionPart {
+                label,
+                part,
+                operation,
+                role,
+                state: PartState::Proposed,
+            });
+        }
+    }
+
+    /// Move every part of `operation` to `state`. Returns whether it had any.
+    pub fn conclude_parts(&mut self, operation: GenerationId, state: PartState) -> bool {
+        let mut any = false;
+        for part in self
+            .selection
+            .iter_mut()
+            .filter(|p| p.operation == operation)
+        {
+            part.state = state;
+            any = true;
+        }
+        any
+    }
+
+    /// Drop the part `part` once its entries are folded or no longer read.
+    pub fn drop_part(&mut self, part: GenerationId) {
+        self.selection.retain(|p| p.part != part);
     }
 
     /// The interpretation that decides this B-tree index's entries, with

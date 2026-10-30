@@ -20,6 +20,8 @@ rmpv = { workspace = true, features = ["with-serde"] }
 # We add an in-tree RegionCoverer over its CellID / Cap / Rect primitives.
 s2 = "0.2"
 serde = { workspace = true }
+# Inline scope lists: a label is read from one or two key scopes.
+smallvec = "1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }

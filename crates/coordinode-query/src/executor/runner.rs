@@ -2442,6 +2442,63 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// [`Self::label_facts`] under the candidate the label's schema carries,
+    /// when it carries one: what the label is held to while it is proved.
+    fn candidate_label_facts(&mut self, id: LabelId) -> Result<LabelFacts, ExecutionError> {
+        let Some(schema) = self.label_schema_of(id)? else {
+            return Ok(LabelFacts::default());
+        };
+        let Some(candidate) = schema.candidate_schema() else {
+            return self.label_facts(id);
+        };
+        let mut implies = smallvec::SmallVec::new();
+        for implied in candidate.implies() {
+            let Some(implied_id) = self.label_id(implied)? else {
+                return Err(ExecutionError::Serialization(format!(
+                    ":{} implies :{implied}, which has no identity",
+                    candidate.name
+                )));
+            };
+            implies.push(implied_id);
+        }
+        Ok(LabelFacts {
+            kind: candidate.kind(),
+            implies,
+        })
+    }
+
+    /// Every label a node storing `stored` carries under the candidates
+    /// published at the statement's view: what a writer keeps the label
+    /// lookup and the indexes of a label for while a change of what a type
+    /// implies is proved.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compile_implied`].
+    pub fn candidate_carried_labels(
+        &mut self,
+        stored: &[LabelId],
+    ) -> Result<Vec<LabelId>, ExecutionError> {
+        let Some(&primary) = stored.first() else {
+            return Ok(Vec::new());
+        };
+        if self.labels.candidate_implied().implied(primary).is_none() {
+            let mut implied = std::mem::take(self.labels.candidate_implied_mut());
+            let compiled = implied.compile(primary, |label| self.candidate_label_facts(label));
+            *self.labels.candidate_implied_mut() = implied;
+            if let Err(e) = compiled? {
+                return Err(ExecutionError::SchemaViolation(
+                    self.describe_label_error(&e)?,
+                ));
+            }
+        }
+        Ok(self
+            .labels
+            .candidate_implied()
+            .membership(stored)
+            .map_or_else(|| stored.to_vec(), |m| m.iter().collect()))
+    }
+
     /// Every label a node storing `stored` carries, its type's implied ones
     /// included: what the indexes, the label lookup and the statistics of
     /// a write follow.
@@ -3771,9 +3828,9 @@ impl<'a> ExecutionContext<'a> {
         let Some(registry) = self.btree_index_registry else {
             return Ok(());
         };
-        if registry.label_lookup().is_none() {
+        let Some((lookup, version)) = registry.label_lookup_published() else {
             return Ok(());
-        }
+        };
         let key = coordinode_core::graph::node::encode_node_key(shard_id, node_id);
         let stored_before = match self.txn.get(Partition::Node, &key)? {
             Some(bytes) => NodeRecord::labels_from_msgpack(&bytes).map_err(|e| {
@@ -3788,16 +3845,35 @@ impl<'a> ExecutionContext<'a> {
             return Ok(());
         }
         // The lookup holds every label a node carries, its type's implied
-        // ones included.
+        // ones included; while a change of what a type implies is proved,
+        // under the candidate as well.
         let before = self.carried_labels(&stored_before)?;
         let after = self.carried_labels(stored_after)?;
+        let candidates = if lookup.has_proposed() {
+            Some((
+                self.candidate_carried_labels(&stored_before)?,
+                self.candidate_carried_labels(stored_after)?,
+            ))
+        } else {
+            None
+        };
+        let (before_candidate, after_candidate) = candidates
+            .as_ref()
+            .map_or((&before, &after), |(b, a)| (b, a));
         registry.on_labels_changed(
             self.engine,
             &mut self.txn,
+            (&lookup, version),
             shard_id,
             node_id,
-            &before,
-            &after,
+            coordinode_modality::LabelMembership {
+                in_force: &before,
+                candidate: &before_candidate,
+            },
+            coordinode_modality::LabelMembership {
+                in_force: &after,
+                candidate: &after_candidate,
+            },
         )?;
         Ok(())
     }
@@ -4016,13 +4092,28 @@ impl<'a> ExecutionContext<'a> {
         }
         self.sync_txn_state();
         if let Some(registry) = self.btree_index_registry
-            && registry.label_lookup().is_some()
+            && let Some((lookup, version)) = registry.label_lookup_published()
             && !record.labels.is_empty()
         {
             // Every label the version carries, its type's implied ones
-            // included.
+            // included; under the candidate too while a change is proved.
             let carried = self.carried_labels(&record.labels)?;
-            registry.on_labels_held(self.engine, &mut self.txn, shard_id, node_id, &carried)?;
+            let candidate = if lookup.has_proposed() {
+                Some(self.candidate_carried_labels(&record.labels)?)
+            } else {
+                None
+            };
+            registry.on_labels_held(
+                self.engine,
+                &mut self.txn,
+                (&lookup, version),
+                shard_id,
+                node_id,
+                coordinode_modality::LabelMembership {
+                    in_force: &carried,
+                    candidate: candidate.as_deref().unwrap_or(&carried),
+                },
+            )?;
         }
         Ok(LocalNodeStore.put_temporal(&mut self.txn, shard_id, node_id, valid_from_ms, record)?)
     }
@@ -7377,6 +7468,19 @@ fn label_lookup_scan(
     if !registry.answers_at(lookup.generation, read_ts) {
         return fallback("the label lookup's copy is not proved for this snapshot");
     }
+    // The scopes a label is read from are the ones the definition names at
+    // the statement's view, so they agree with the postings it reads there:
+    // a change of what a type implies moves postings between scopes, and
+    // the record moves with it.
+    let lookup = {
+        use coordinode_modality::IndexStore as _;
+        match coordinode_modality::LocalIndexStore::new(ctx.engine)
+            .definition_in(&mut ctx.txn, lookup.id)?
+        {
+            Some(at_view) if at_view.generation == lookup.generation => at_view,
+            _ => return fallback("the label lookup's record differs at this snapshot"),
+        }
+    };
     let mut driving: Option<(u64, LabelId)> = None;
     for (name, &id) in labels.iter().zip(ids) {
         // One label drives itself; only a conjunction compares counts.
@@ -7490,6 +7594,8 @@ fn read_label_members(
                 lookup: &scan.lookup,
                 shard,
                 label,
+                // A statement reads the facts in force at its view.
+                interpretation: coordinode_modality::Interpretation::InForce,
             },
             after,
             budget,

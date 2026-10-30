@@ -214,6 +214,7 @@ impl<'a> Backfill<'a> {
         maintained_after: u64,
         read: &mut Vec<Vec<u8>>,
         membership: &mut crate::index::membership::CatalogMembership<'_>,
+        candidate_membership: &mut crate::index::membership::CatalogMembership<'_>,
     ) -> Result<u64, BackfillError> {
         let store = coordinode_modality::LocalIndexStore::new(self.engine);
         let mut staged = 0u64;
@@ -239,10 +240,26 @@ impl<'a> Backfill<'a> {
                     message: format!("node {}: {e}", node.as_raw()),
                 })?;
             // The lookup holds every label a node carries, its type's
-            // implied ones included.
+            // implied ones included; under the candidate too while a change
+            // of what a type implies is proved.
             let carried: smallvec::SmallVec<[LabelId; 8]> =
                 membership.of_stored(&stored)?.iter().collect();
-            store.stage_label_postings_txn(txn, index, self.shard_id, node, &[], &carried)?;
+            let candidate: Option<smallvec::SmallVec<[LabelId; 8]>> = if index.has_proposed() {
+                Some(candidate_membership.of_stored(&stored)?.iter().collect())
+            } else {
+                None
+            };
+            store.stage_label_postings_txn(
+                txn,
+                index,
+                self.shard_id,
+                node,
+                coordinode_modality::LabelMembership::settled(&[]),
+                coordinode_modality::LabelMembership {
+                    in_force: &carried,
+                    candidate: candidate.as_deref().unwrap_or(&carried),
+                },
+            )?;
             // One posting per label held; a node holds few labels.
             staged += carried.len() as u64;
             read.push(key.clone());
@@ -296,6 +313,8 @@ impl<'a> Backfill<'a> {
         let mut page_repairs = 0usize;
         // What each type implies, compiled once for the whole build.
         let mut membership = crate::index::membership::CatalogMembership::current(self.engine);
+        let mut candidate_membership =
+            crate::index::membership::CatalogMembership::candidates(self.engine);
         // The identity the index's label is bound to; a label without one
         // is carried by no node yet.
         let label = membership.label_id(&index.label)?;
@@ -330,6 +349,7 @@ impl<'a> Backfill<'a> {
                     maintained_after,
                     &mut read,
                     &mut membership,
+                    &mut candidate_membership,
                 )?;
             }
             for (key, bytes) in &page.rows {

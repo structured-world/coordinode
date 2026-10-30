@@ -63,6 +63,48 @@ pub struct LabelScope<'a> {
     pub shard: u16,
     /// The label's catalog identity.
     pub label: LabelId,
+    /// The interpretation the reader holds the label to, which picks the
+    /// key scopes read.
+    pub interpretation: crate::index_def::Interpretation,
+}
+
+/// The labels a node carries under the facts in force and under the
+/// candidate of a change being certified: the same list while none is.
+#[derive(Debug, Clone, Copy)]
+pub struct LabelMembership<'a> {
+    /// The labels under the facts in force.
+    pub in_force: &'a [LabelId],
+    /// The labels under the candidate interpretation.
+    pub candidate: &'a [LabelId],
+}
+
+impl<'a> LabelMembership<'a> {
+    /// A membership both interpretations agree on.
+    pub fn settled(labels: &'a [LabelId]) -> Self {
+        Self {
+            in_force: labels,
+            candidate: labels,
+        }
+    }
+
+    /// Where `def` keeps the posting of `label` for this membership.
+    fn placement(&self, def: &IndexDefinition, label: LabelId) -> Option<GenerationId> {
+        def.placement(
+            label,
+            self.in_force.contains(&label),
+            self.candidate.contains(&label),
+        )
+    }
+
+    /// Every label either interpretation names, each once.
+    fn labels(&self) -> impl Iterator<Item = LabelId> + '_ {
+        self.in_force.iter().copied().chain(
+            self.candidate
+                .iter()
+                .copied()
+                .filter(|l| !self.in_force.contains(l)),
+        )
+    }
 }
 
 const LABEL_LOOKUP_KEY: &[u8] = IndexDefinition::LABEL_LOOKUP_KEY;
@@ -313,6 +355,20 @@ pub trait IndexStore {
     /// A storage failure or an undecodable definition.
     fn load_definition(&self, id: IndexId) -> StoreResult<Option<IndexDefinition>>;
 
+    /// The definition of index `id` as `txn` sees it: its snapshot with its
+    /// own writes. A reader picks the scopes it reads from this record, so
+    /// they agree with the entries at the same view; the read binds a
+    /// writing transaction to it.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn definition_in(
+        &self,
+        txn: &mut Transaction,
+        id: IndexId,
+    ) -> StoreResult<Option<IndexDefinition>>;
+
     /// The live index the name `name` binds, if any.
     ///
     /// # Errors
@@ -367,9 +423,11 @@ pub trait IndexStore {
         descriptor: IndexDescriptor,
     ) -> StoreResult<Option<IndexDefinition>>;
 
-    /// Stage node `node` of shard `shard` leaving the labels `removed` and
-    /// joining the labels `added` in the label lookup `def`: one posting
-    /// removed or put per label, nothing for a label in both.
+    /// Stage node `node` of shard `shard` moving from the labels `before` to
+    /// the labels `after` in the label lookup `def`, each under both
+    /// interpretations: a label whose posting stays where it was costs
+    /// nothing; one that moves is cleared from every scope it may be in and
+    /// put where [`IndexDefinition::placement`] says.
     ///
     /// # Errors
     ///
@@ -380,26 +438,8 @@ pub trait IndexStore {
         def: &IndexDefinition,
         shard: u16,
         node: NodeId,
-        removed: &[LabelId],
-        added: &[LabelId],
-    ) -> StoreResult<()>;
-
-    /// [`Self::stage_label_postings_txn`] in the generations the postings of
-    /// `removed` and `added` are being rebuilt in, for the labels being
-    /// rebuilt: what a writer maintains under a label candidate's
-    /// interpretation while the candidate is proved. Nothing for the others.
-    ///
-    /// # Errors
-    ///
-    /// A storage failure.
-    fn stage_pending_label_postings_txn(
-        &self,
-        txn: &mut Transaction,
-        def: &IndexDefinition,
-        shard: u16,
-        node: NodeId,
-        removed: &[LabelId],
-        added: &[LabelId],
+        before: LabelMembership<'_>,
+        after: LabelMembership<'_>,
     ) -> StoreResult<()>;
 
     /// Stage the postings of node `node` of shard `shard` for the labels
@@ -416,7 +456,7 @@ pub trait IndexStore {
         def: &IndexDefinition,
         shard: u16,
         node: NodeId,
-        held: &[LabelId],
+        held: LabelMembership<'_>,
     ) -> StoreResult<()>;
 
     /// The nodes `scope` names, as `txn` sees them, in NodeId order after
@@ -980,6 +1020,46 @@ fn decode_catalog<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Postings read per scope per round when several scopes of one label are
+/// merged: what a round may read past its frontier and read again.
+const MERGE_PAGE: usize = 256;
+
+/// The nodes holding `label` in shard `shard` under the key scope
+/// `generation`, after `after`, in NodeId order, handed to `visit` until it
+/// breaks.
+fn read_label_range<E>(
+    txn: &Transaction,
+    generation: GenerationId,
+    shard: u16,
+    label: LabelId,
+    after: Option<NodeId>,
+    budget: &coordinode_core::budget::QueryBudget,
+    mut visit: impl FnMut(NodeId) -> Result<core::ops::ControlFlow<()>, E>,
+) -> Result<(), E>
+where
+    E: From<coordinode_storage::error::StorageError> + From<coordinode_core::budget::BudgetStop>,
+{
+    use coordinode_core::index::encoding::{
+        decode_label_posting, encode_label_posting, label_range_prefix,
+    };
+    let range = label_range_prefix(generation, shard, label);
+    let start = match after.map(NodeId::as_raw) {
+        // The first posting after `after`: a resume past the last NodeId
+        // has nothing left to read.
+        Some(u64::MAX) => return Ok(()),
+        Some(node) => encode_label_posting(generation, shard, label, node + 1).to_vec(),
+        None => range.to_vec(),
+    };
+    let end = coordinode_core::index::encoding::prefix_end(&range);
+    txn.range_for_each(Partition::Idx, &start, &end, budget, |key, _| {
+        match decode_label_posting(generation, key) {
+            Some((_, _, node)) => visit(NodeId::from_raw(node)),
+            // A key of another shape inside the range is no posting.
+            None => Ok(core::ops::ControlFlow::Continue(())),
+        }
+    })
+}
+
 fn decode_index_id(bytes: &[u8]) -> StoreResult<IndexId> {
     match <[u8; 8]>::try_from(bytes) {
         Ok(raw) => Ok(IndexId::from_raw(u64::from_be_bytes(raw))),
@@ -1284,6 +1364,16 @@ impl IndexStore for LocalIndexStore<'_> {
             .transpose()
     }
 
+    fn definition_in(
+        &self,
+        txn: &mut Transaction,
+        id: IndexId,
+    ) -> StoreResult<Option<IndexDefinition>> {
+        txn.get(Partition::Schema, &IndexDefinition::schema_key_of(id))?
+            .map(|bytes| decode("index definition", &bytes))
+            .transpose()
+    }
+
     fn resolve_name(&self, name: &str) -> StoreResult<Option<IndexId>> {
         self.engine
             .get(Partition::Schema, &IndexDefinition::name_key_of(name))?
@@ -1364,52 +1454,41 @@ impl IndexStore for LocalIndexStore<'_> {
         def: &IndexDefinition,
         shard: u16,
         node: NodeId,
-        removed: &[LabelId],
-        added: &[LabelId],
+        before: LabelMembership<'_>,
+        after: LabelMembership<'_>,
     ) -> StoreResult<()> {
         use coordinode_core::index::encoding::encode_label_posting;
-        for &label in removed.iter().filter(|l| !added.contains(l)) {
-            txn.delete(
-                Partition::Idx,
-                &encode_label_posting(def.label_generation(label), shard, label, node.as_raw()),
-            )?;
-        }
-        for &label in added.iter().filter(|l| !removed.contains(l)) {
-            txn.put(
-                Partition::Idx,
-                &encode_label_posting(def.label_generation(label), shard, label, node.as_raw()),
-                &[],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn stage_pending_label_postings_txn(
-        &self,
-        txn: &mut Transaction,
-        def: &IndexDefinition,
-        shard: u16,
-        node: NodeId,
-        removed: &[LabelId],
-        added: &[LabelId],
-    ) -> StoreResult<()> {
-        use coordinode_core::index::encoding::encode_label_posting;
-        for &label in removed.iter().filter(|l| !added.contains(l)) {
-            if let Some(pending) = def.label_pending(label) {
+        let mut stage = |label: LabelId| -> StoreResult<()> {
+            let was = before.placement(def, label);
+            let now = after.placement(def, label);
+            if was == now {
+                return Ok(());
+            }
+            // The posting may sit in any scope of the label: a change being
+            // certified or folded moves postings between them.
+            for scope in def.scopes_of(label).into_iter().filter(|s| Some(*s) != now) {
                 txn.delete(
                     Partition::Idx,
-                    &encode_label_posting(pending.generation, shard, label, node.as_raw()),
+                    &encode_label_posting(scope, shard, label, node.as_raw()),
                 )?;
             }
-        }
-        for &label in added.iter().filter(|l| !removed.contains(l)) {
-            if let Some(pending) = def.label_pending(label) {
+            if let Some(scope) = now {
                 txn.put(
                     Partition::Idx,
-                    &encode_label_posting(pending.generation, shard, label, node.as_raw()),
+                    &encode_label_posting(scope, shard, label, node.as_raw()),
                     &[],
                 )?;
             }
+            Ok(())
+        };
+        for label in before.labels() {
+            stage(label)?;
+        }
+        for label in after
+            .labels()
+            .filter(|l| !before.in_force.contains(l) && !before.candidate.contains(l))
+        {
+            stage(label)?;
         }
         Ok(())
     }
@@ -1420,15 +1499,27 @@ impl IndexStore for LocalIndexStore<'_> {
         def: &IndexDefinition,
         shard: u16,
         node: NodeId,
-        held: &[LabelId],
+        held: LabelMembership<'_>,
     ) -> StoreResult<()> {
         use coordinode_core::index::encoding::encode_label_posting;
-        for &label in held {
-            let key =
-                encode_label_posting(def.label_generation(label), shard, label, node.as_raw());
-            if txn.get(Partition::Idx, &key)?.is_none() {
-                txn.put(Partition::Idx, &key, &[])?;
+        'labels: for label in held.labels() {
+            let Some(scope) = held.placement(def, label) else {
+                continue;
+            };
+            // A posting already in any scope of the label stands: one not
+            // moved yet is moved by the certification that owns its part,
+            // and a second copy would count the node twice.
+            for existing in def.scopes_of(label) {
+                let key = encode_label_posting(existing, shard, label, node.as_raw());
+                if txn.get(Partition::Idx, &key)?.is_some() {
+                    continue 'labels;
+                }
             }
+            txn.put(
+                Partition::Idx,
+                &encode_label_posting(scope, shard, label, node.as_raw()),
+                &[],
+            )?;
         }
         Ok(())
     }
@@ -1440,6 +1531,7 @@ impl IndexStore for LocalIndexStore<'_> {
             lookup: def,
             shard,
             label,
+            interpretation,
         }: LabelScope<'_>,
         after: Option<NodeId>,
         budget: &coordinode_core::budget::QueryBudget,
@@ -1449,26 +1541,70 @@ impl IndexStore for LocalIndexStore<'_> {
         E: From<coordinode_storage::error::StorageError>
             + From<coordinode_core::budget::BudgetStop>,
     {
-        use coordinode_core::index::encoding::{
-            decode_label_posting, encode_label_posting, label_range_prefix,
-        };
-        let generation = def.label_generation(label);
-        let range = label_range_prefix(generation, shard, label);
-        let start = match after.map(NodeId::as_raw) {
-            // The first posting after `after`: a resume past the last NodeId
-            // has nothing left to read.
-            Some(u64::MAX) => return Ok(()),
-            Some(node) => encode_label_posting(generation, shard, label, node + 1).to_vec(),
-            None => range.to_vec(),
-        };
-        let end = coordinode_core::index::encoding::prefix_end(&range);
-        txn.range_for_each(Partition::Idx, &start, &end, budget, |key, _| {
-            match decode_label_posting(generation, key) {
-                Some((_, _, node)) => visit(NodeId::from_raw(node)),
-                // A key of another shape inside the range is no posting.
-                None => Ok(core::ops::ControlFlow::Continue(())),
+        use core::ops::ControlFlow;
+        let scopes = def.eligible_scopes(label, interpretation);
+        if let [generation] = scopes.as_slice() {
+            return read_label_range(txn, *generation, shard, label, after, budget, |node| {
+                visit(node)
+            });
+        }
+        // Several disjoint scopes: their postings are merged in NodeId order
+        // a page at a time. Each round emits what lies at or below the
+        // lowest last node of the scopes that may hold more, the frontier no
+        // unread posting can precede, and resumes every scope after it.
+        let mut cursor = after;
+        let mut done = vec![false; scopes.len()];
+        let mut pages: Vec<Vec<NodeId>> = vec![Vec::new(); scopes.len()];
+        loop {
+            let mut frontier: Option<NodeId> = None;
+            for (at, &generation) in scopes.iter().enumerate() {
+                pages[at].clear();
+                if done[at] {
+                    continue;
+                }
+                let page = &mut pages[at];
+                read_label_range::<E>(txn, generation, shard, label, cursor, budget, |node| {
+                    page.push(node);
+                    Ok(if page.len() == MERGE_PAGE {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    })
+                })?;
+                if page.len() == MERGE_PAGE
+                    && let Some(&last) = page.last()
+                {
+                    frontier = Some(frontier.map_or(last, |f| f.min(last)));
+                }
             }
-        })
+            // A scope read to its end is done once nothing of it lies past
+            // the frontier; what does is read again from the frontier.
+            for (at, page) in pages.iter().enumerate() {
+                if !done[at]
+                    && page.len() < MERGE_PAGE
+                    && frontier.is_none_or(|f| page.last().is_none_or(|last| *last <= f))
+                {
+                    done[at] = true;
+                }
+            }
+            let mut merged: Vec<NodeId> = pages
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|node| frontier.is_none_or(|f| *node <= f))
+                .collect();
+            merged.sort_unstable();
+            merged.dedup();
+            for node in merged {
+                if visit(node)?.is_break() {
+                    return Ok(());
+                }
+            }
+            match frontier {
+                Some(frontier) => cursor = Some(frontier),
+                None => return Ok(()),
+            }
+        }
     }
 
     fn allocate_generation_txn(&self, txn: &mut Transaction) -> StoreResult<GenerationId> {

@@ -76,6 +76,9 @@ pub struct CatalogMembership<'a> {
     snapshot: Option<StorageSnapshot>,
     implied: ImpliedCache,
     ids: rustc_hash::FxHashMap<String, Option<LabelId>>,
+    /// Whether a label's published candidate answers for it instead of the
+    /// facts in force.
+    candidates: bool,
 }
 
 impl<'a> CatalogMembership<'a> {
@@ -86,16 +89,24 @@ impl<'a> CatalogMembership<'a> {
             snapshot: None,
             implied: ImpliedCache::default(),
             ids: rustc_hash::FxHashMap::default(),
+            candidates: false,
+        }
+    }
+
+    /// Membership under the latest catalog with every published candidate
+    /// put in force: what a node carries once the changes being proved are.
+    pub fn candidates(engine: &'a StorageEngine) -> Self {
+        Self {
+            candidates: true,
+            ..Self::current(engine)
         }
     }
 
     /// Membership under the catalog as `snapshot` reads it.
     pub fn at(engine: &'a StorageEngine, snapshot: StorageSnapshot) -> Self {
         Self {
-            engine,
             snapshot: Some(snapshot),
-            implied: ImpliedCache::default(),
-            ids: rustc_hash::FxHashMap::default(),
+            ..Self::current(engine)
         }
     }
 
@@ -136,9 +147,14 @@ impl<'a> CatalogMembership<'a> {
     /// What the catalog says about label `id` under the view.
     fn facts(&mut self, id: LabelId) -> Result<LabelFacts, StoreError> {
         let (name, schema) = LocalSchemaStore::new(self.engine).identity_at(self.view(), id)?;
-        let Some(schema) = schema else {
+        let Some(mut schema) = schema else {
             return Ok(LabelFacts::default());
         };
+        if self.candidates
+            && let Some(candidate) = schema.candidate_schema()
+        {
+            schema = candidate;
+        }
         let mut implies = Vec::with_capacity(schema.implies().len());
         for implied in schema.implies() {
             let Some(implied_id) = self.label_id(implied)? else {

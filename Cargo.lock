@@ -972,6 +972,7 @@ dependencies = [
  "rmpv",
  "s2",
  "serde",
+ "smallvec",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
