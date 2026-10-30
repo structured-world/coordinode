@@ -3,8 +3,6 @@ name = "coordinode-server"
 description = "CoordiNode server binary: gRPC, HTTP/REST, Bolt, WebSocket, metrics"
 version.workspace = true
 edition.workspace = true
-# The REST transcoding proxy it embeds needs 1.99.
-rust-version = "1.99"
 license.workspace = true
 publish.workspace = true
 

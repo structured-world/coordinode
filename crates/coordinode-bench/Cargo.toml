@@ -3,7 +3,6 @@ name = "coordinode-bench"
 description = "Benchmark harness — JSON result schema, hardware fingerprint, git commit metadata, runner utilities. Consumed by per-modality bench binaries under benches/* and the gh-pages reporting layer."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish = false  # internal harness, never to crates.io
 

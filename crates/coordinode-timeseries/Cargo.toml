@@ -3,7 +3,6 @@ name = "coordinode-timeseries"
 description = "Layer-3 above-store time-series catalog: BucketCatalog (per-shard open buckets with striped locking, rollover triggers), late-arrival routing (Tier 1 buffer / Tier 2 reopen / Tier 3 overflow), bitemporal __ingestion_ts__ axis, background overflow compactor. Consumes coordinode_modality::TimeSeriesStore unchanged."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

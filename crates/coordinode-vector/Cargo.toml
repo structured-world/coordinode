@@ -3,7 +3,6 @@ name = "coordinode-vector"
 description = "Vector search: HNSW index, scalar quantization, distance metrics with SIMD"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish = true
 repository.workspace = true

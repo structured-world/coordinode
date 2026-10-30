@@ -3,7 +3,6 @@ name = "coordinode-replicate"
 description = "Replication-orchestration layer: replicated writes and consumer-retention tracking"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish = true
 repository.workspace = true

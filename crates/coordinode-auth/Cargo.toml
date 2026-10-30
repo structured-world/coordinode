@@ -3,7 +3,6 @@ name = "coordinode-auth"
 description = "Authentication and security: API keys, TLS/mTLS, ACL, SSE"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

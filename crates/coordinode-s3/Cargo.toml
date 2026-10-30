@@ -3,7 +3,6 @@ name = "coordinode-s3"
 description = "S3-compatible gateway binary for CoordiNode BlobStore"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

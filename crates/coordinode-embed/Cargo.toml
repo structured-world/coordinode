@@ -3,7 +3,6 @@ name = "coordinode-embed"
 description = "Embedded library API: open database, execute Cypher, vector search"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish = true
 repository.workspace = true

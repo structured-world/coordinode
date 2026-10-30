@@ -2,7 +2,6 @@
 name = "coordinode-embedded-quickstart"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
 license = "AGPL-3.0-only"
 publish = false
 description = "An application embedding CoordiNode: an on-disk database, parameters, commit, rollback, a typed refusal and a reopen."

@@ -3,7 +3,6 @@ name = "coordinode-core"
 description = "Core graph engine: property graph model, schema, MVCC transactions"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish = true
 repository.workspace = true

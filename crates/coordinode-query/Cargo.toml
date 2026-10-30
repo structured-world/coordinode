@@ -3,7 +3,6 @@ name = "coordinode-query"
 description = "Query layer: OpenCypher parser, query planner, GraphQL auto-generation"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish = true
 repository.workspace = true

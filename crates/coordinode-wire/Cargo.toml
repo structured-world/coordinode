@@ -3,7 +3,6 @@ name = "coordinode-wire"
 description = "Inter-node wire transport codec: pure-Rust zstd compression for gRPC messages"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish = true
 repository.workspace = true

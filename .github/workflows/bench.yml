@@ -177,8 +177,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         # The self-hosted runner doesn't preinstall Rust; this
         # action puts cargo / rustc on PATH for the rest of the job.
-        # `stable` matches the workspace MSRV without pinning a
-        # specific minor — fast updates land when stable refreshes.
+        # The workspace builds on current stable; no minor is pinned.
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4

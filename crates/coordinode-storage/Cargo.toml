@@ -3,7 +3,6 @@ name = "coordinode-storage"
 description = "Storage engine: LSM-tree, WAL, BlobStore, compression"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish = true
 repository.workspace = true

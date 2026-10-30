@@ -29,5 +29,5 @@ checks those, so running it again is safe. It never deletes anything. Give it a
 directory of its own, never another application's database. Remove the
 directory yourself when you are done with it.
 
-Requirements: Rust 1.95 or newer. The guide this example goes with is
+Requirements: current stable Rust. The guide this example goes with is
 [Embedded (Rust)](../../docs/guide/embedded.md).

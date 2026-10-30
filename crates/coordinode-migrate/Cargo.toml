@@ -3,7 +3,6 @@ name = "coordinode-migrate"
 description = "Offline migration of a data directory written by an earlier build to the current engine format"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
