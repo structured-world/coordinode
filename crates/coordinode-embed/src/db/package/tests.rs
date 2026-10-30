@@ -935,6 +935,87 @@ fn a_retype_across_placements_is_refused_without_effects() {
     }
 }
 
+/// A change of what a type implies is cancelled while it waits to be
+/// proved, after a write to a carrier it would gain: the implication in
+/// force stays, the label's scan and counter answer it once the parts are
+/// folded back, nothing the change kept apart is left behind, and the same
+/// change made afterwards goes through and counts every carrier once.
+#[test]
+fn a_cancelled_implication_change_leaves_the_facts_in_force() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open();
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE INDEX thing_title ON :Thing(title)",
+        "CREATE (:Task {title: 'a'}), (:Thing {title: 'c'})",
+    ] {
+        db.execute_cypher(ddl).expect(ddl);
+    }
+    let run = |db: &Database, query: &str| {
+        db.execute_cypher_shared(query, None, None, None, None)
+            .unwrap_or_else(|e| panic!("{query}: {e}"))
+            .rows
+    };
+    let state = |db: &Database| {
+        let rows = run(db, "MATCH (n:Thing) RETURN count(n) AS c");
+        (
+            run(db, "MATCH (n:Thing) WHERE n.title + '' <> '' RETURN n").len(),
+            rows[0].get("c").cloned(),
+            run(db, "MATCH (n:Thing {title: 'b'}) RETURN n").len(),
+        )
+    };
+    let folded = |db: &Database| {
+        use coordinode_modality::IndexStore as _;
+        let deadline = std::time::Instant::now() + WAIT;
+        while coordinode_modality::LocalIndexStore::new(db.engine())
+            .list_definitions()
+            .expect("definitions")
+            .iter()
+            .any(|def| !def.selection.is_empty())
+        {
+            assert!(std::time::Instant::now() < deadline, "parts left unfolded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let older = db.begin_catalog_txn();
+    occupy_the_only_seat(&db);
+    let mut task = user_named(&db, "Task");
+    let revision = task.schema_revision;
+    task.set_implies(vec!["Thing".into()]);
+    let published = db
+        .publish_schema(SchemaPackage {
+            labels: vec![LabelDeclaration {
+                schema: task,
+                intent: Intent::Change {
+                    expected_revision: revision,
+                },
+            }],
+            ..SchemaPackage::default()
+        })
+        .expect("publish");
+    run(&db, "CREATE (:Task {title: 'b'})");
+    let operation = published.objects[0].operation.expect("operation");
+    assert!(db.cancel_index_build(operation).expect("cancel"));
+    drop(older);
+    folded(&db);
+    assert!(user_named(&db, "Task").implies().is_empty(), "still none");
+    assert_eq!(
+        state(&db),
+        (1, Some(Value::Int(1)), 0),
+        "the facts in force"
+    );
+
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("the same change afterwards");
+    folded(&db);
+    assert_eq!(
+        state(&db),
+        (3, Some(Value::Int(3)), 1),
+        "every carrier once"
+    );
+}
+
 /// The schema of label `name` as the catalog holds it.
 fn user_named(db: &Database, name: &str) -> LabelSchema {
     db.label_schemas()

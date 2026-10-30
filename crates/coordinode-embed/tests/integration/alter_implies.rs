@@ -378,6 +378,90 @@ fn text_reads_across_a_change(task: &str, alter: &str, (then, now): (&[&str], &[
     }
 }
 
+/// The implication goes A→B→A: Task comes to imply Thing, stops, and comes
+/// to imply it again, each change folded before the next. After each one
+/// the label scan, its counter, a B-tree lookup and a full-text search all
+/// answer the implication in force, and the text index ranks as one holding
+/// exactly its carriers: nothing an earlier change kept apart leaks into a
+/// later one.
+#[test]
+fn an_implication_changed_there_and_back_answers_each_state() {
+    let dirs = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let mut db = Database::open(dirs.0.path()).expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE INDEX thing_title ON :Thing(title)",
+        "CREATE TEXT INDEX thing_text ON :Thing(title)",
+        "CREATE (:Thing {title: 'rust graph'}), (:Task {title: 'rust rust tools'})",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    let mut with_task = things_holding(dirs.1.path(), &["rust graph", "rust rust tools"]);
+    let mut without = things_holding(dirs.2.path(), &["rust graph"]);
+    for (alter, carriers) in [
+        ("ALTER NODE TYPE Task SET IMPLIES (Thing)", 2),
+        ("ALTER NODE TYPE Task SET IMPLIES ()", 1),
+        ("ALTER NODE TYPE Task SET IMPLIES (Thing)", 2),
+    ] {
+        db.execute_cypher(alter).expect(alter);
+        await_folded(&db);
+        let in_force = coordinode_query::index::membership::label_carriers(db.engine(), "Thing")
+            .expect("carriers");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while db.text_index_registry().held("Thing", "title")
+            != Some(coordinode_query::index::selection::Held::built(
+                in_force.clone(),
+            ))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{alter}: the text index never settled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            count(&mut db, "MATCH (n:Thing) WHERE n.title + '' <> '' RETURN n"),
+            carriers,
+            "{alter}: scan"
+        );
+        let rows = db
+            .execute_cypher("MATCH (n:Thing) RETURN count(n) AS c")
+            .expect("count");
+        assert_eq!(
+            rows[0].get("c"),
+            Some(&Value::Int(carriers as i64)),
+            "{alter}: counter"
+        );
+        assert_eq!(
+            count(
+                &mut db,
+                "MATCH (n:Thing {title: 'rust rust tools'}) RETURN n"
+            ),
+            carriers - 1,
+            "{alter}: B-tree lookup"
+        );
+        let oracle = if carriers == 2 {
+            &mut with_task
+        } else {
+            &mut without
+        };
+        for words in ["rust", "graph", "tools"] {
+            assert_same_hits(
+                &text_hits(&mut db, words, None),
+                &text_hits(oracle, words, None),
+                &format!("{alter}: {words}"),
+            );
+        }
+    }
+}
+
 /// One schema package moving a value's holder out of a label and another
 /// into it: Chore stops implying Thing while Task starts, a Chore and a Task
 /// holding the same title under a uniqueness on Thing. Each interpretation

@@ -38,8 +38,9 @@ impl IndexBuildService {
     }
 
     /// Cancel the certification `generation`: its candidates are withdrawn,
-    /// the facts in force stay. `false` when it already had an outcome or no
-    /// certification has the number.
+    /// the facts in force stay, and what it kept apart in the indexes is
+    /// folded back before this returns. `false` when it already had an
+    /// outcome or no certification has the number.
     ///
     /// # Errors
     ///
@@ -88,6 +89,10 @@ impl IndexBuildService {
             match committed {
                 Ok(()) => {
                     refresh_lookup(env, generation).map_err(text)?;
+                    // The withdrawn parts are folded back now, as a
+                    // concluded certification's are; the next open folds
+                    // what this leaves if it stops first.
+                    self.shared.fold_parts();
                     return Ok(true);
                 }
                 Err(e) if is_contention(&e) => continue,
