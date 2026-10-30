@@ -188,7 +188,10 @@ impl MultiLanguageTextIndex {
     /// their scope's term, and their statistics, counted apart all along,
     /// leave the corpus; the documents of the other scope stay as they are
     /// and count as shared from then on, as the index moves on to the next
-    /// change, whose tags never name them. No document is read or rewritten.
+    /// change, whose tags never name them. No document is read or rewritten;
+    /// the step costs one pass over the dropped scope's vocabulary to take
+    /// its statistics out, under the write lock, and the commit that marks
+    /// its documents deleted, linear in that scope's postings of its term.
     ///
     /// # Errors
     ///
