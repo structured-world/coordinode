@@ -176,6 +176,7 @@ impl Shared {
             oracle: env.oracle(),
             stop: Some(&self.stopping),
             registry: Some(env.registry()),
+            page: self.config.read().fold_page,
         }
         .run(&mut |txn| env.commit_page(txn));
         match folded {
@@ -217,6 +218,7 @@ impl Shared {
             interner: &fields,
             shard_id: env.shard_id(),
             operation: generation,
+            page: self.config.read().reconcile_page,
             stop: Some(&self.stopping),
         }
         .run(&mut |txn| env.commit_page(txn));

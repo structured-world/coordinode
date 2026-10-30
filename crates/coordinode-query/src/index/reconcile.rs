@@ -34,9 +34,6 @@ use super::build::BackfillError;
 use super::membership::CatalogMembership;
 use super::registry::{Carried, place_entry, record_lookup};
 
-/// Nodes read per page.
-const PAGE: usize = 512;
-
 /// Conflicts one page may meet in a row before the pass gives up.
 const MAX_PAGE_CONFLICTS: u32 = 64;
 
@@ -52,6 +49,8 @@ pub(crate) struct Reconcile<'a> {
     pub shard_id: u16,
     /// The certification whose parts are filled.
     pub operation: GenerationId,
+    /// Stored node rows one commit reads (at least one).
+    pub page: usize,
     /// Set when the process is closing.
     pub stop: Option<&'a core::sync::atomic::AtomicBool>,
 }
@@ -135,8 +134,12 @@ impl Reconcile<'_> {
             })?;
             let mut in_force = CatalogMembership::at(self.engine, view);
             let mut candidate = CatalogMembership::candidates_at(self.engine, view);
-            let page =
-                nodes.prefix_scan_paged_tracked(&mut txn, &prefix, start_after.as_deref(), PAGE)?;
+            let page = nodes.prefix_scan_paged_tracked(
+                &mut txn,
+                &prefix,
+                start_after.as_deref(),
+                self.page.max(1),
+            )?;
             let mut read = Vec::with_capacity(page.rows.len());
             let mut page_placed = 0u64;
             for (key, bytes) in &page.rows {
@@ -254,10 +257,9 @@ pub(crate) struct Fold<'a> {
     /// as it commits: a writer still bound to the definition before the
     /// step is refused at its commit.
     pub registry: Option<&'a super::IndexRegistry>,
+    /// Entries one fold transaction moves (at least one).
+    pub page: usize,
 }
-
-/// Entries one fold transaction moves.
-const FOLD_PAGE: usize = 512;
 
 impl Fold<'_> {
     /// Fold every concluded part of every index, committing each step
@@ -309,7 +311,7 @@ impl Fold<'_> {
                     | (PartState::Withdrawn, coordinode_modality::PartRole::Retired)
             );
             let empty = if keep {
-                store.move_scope_page_txn(&mut txn, part.part, def.generation, FOLD_PAGE)?
+                store.move_scope_page_txn(&mut txn, part.part, def.generation, self.page.max(1))?
             } else {
                 store.clear_txn(&mut txn, part.part)?;
                 true

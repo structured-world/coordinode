@@ -237,6 +237,8 @@ pub(crate) async fn serve(
         index_check_repair_batch,
         index_check_memory_mb,
         index_check_max_repairs,
+        index_implication_page,
+        index_fold_page,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -800,6 +802,8 @@ pub(crate) async fn serve(
                 Some(0) => None,
                 Some(secs) => Some(std::time::Duration::from_secs(secs)),
             },
+            reconcile_page: index_implication_page.map_or(defaults.reconcile_page, |n| n.get()),
+            fold_page: index_fold_page.map_or(defaults.fold_page, |n| n.get()),
         });
         // What a statement executes under when neither it nor its session names a
         // concern.

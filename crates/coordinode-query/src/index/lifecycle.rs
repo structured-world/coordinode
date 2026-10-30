@@ -257,7 +257,20 @@ pub struct IndexBuildConfig {
     /// when nothing reported it wrong; `None` checks only on reports and
     /// requests.
     pub check_interval: Option<Duration>,
+    /// Stored node rows one commit of a change of what a type implies
+    /// places in the indexes, while the change is proved.
+    pub reconcile_page: usize,
+    /// Index entries one commit moves back into an index's own entries
+    /// once such a change concluded.
+    pub fold_page: usize,
 }
+
+/// Stored node rows one placement commit of an implication change reads
+/// by default.
+pub const DEFAULT_RECONCILE_PAGE: usize = 512;
+
+/// Index entries one fold commit moves by default.
+pub const DEFAULT_FOLD_PAGE: usize = 512;
 
 /// The most stored node rows a write reads by default to prove a value
 /// free in a unique index still being built.
@@ -289,17 +302,22 @@ impl Default for IndexBuildConfig {
             check_memory: DEFAULT_CHECK_MEMORY,
             check_max_repairs: DEFAULT_CHECK_MAX_REPAIRS,
             check_interval: Some(DEFAULT_CHECK_INTERVAL),
+            reconcile_page: DEFAULT_RECONCILE_PAGE,
+            fold_page: DEFAULT_FOLD_PAGE,
         }
     }
 }
 
 impl IndexBuildConfig {
     /// At least one build runs, or none would ever start; a check repairs at
-    /// least one entry per commit, or it would never advance.
+    /// least one entry per commit, and a placement or fold moves at least
+    /// one per commit, or it would never advance.
     fn normalized(self) -> Self {
         Self {
             max_running: self.max_running.max(1),
             check_repair_batch: self.check_repair_batch.max(1),
+            reconcile_page: self.reconcile_page.max(1),
+            fold_page: self.fold_page.max(1),
             ..self
         }
     }

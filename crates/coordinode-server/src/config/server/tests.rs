@@ -517,6 +517,30 @@ fn index_check_settings_parse_from_the_config_file() {
     assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
 }
 
+/// The pages of an implication change's placement and fold are config-file
+/// settings: unset they leave the engine defaults, and zero is refused, as
+/// a page of none would never advance.
+#[test]
+fn implication_pages_parse_from_the_config_file() {
+    let d = ServerConfig::default();
+    assert!(d.index_implication_page.is_none());
+    assert!(d.index_fold_page.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "index_implication_page: 3\nindex_fold_page: 5\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.index_implication_page.map(|v| v.get()), Some(3));
+    assert_eq!(c.index_fold_page.map(|v| v.get()), Some(5));
+
+    for zero in ["index_implication_page: 0\n", "index_fold_page: 0\n"] {
+        std::fs::write(&path, zero).unwrap();
+        assert!(
+            ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
+            "{zero}"
+        );
+    }
+}
+
 /// The auto-commit re-execution budget is a config-file setting with the
 /// engine's defaults; zero attempts is refused at parse, since a statement
 /// must run at least once.

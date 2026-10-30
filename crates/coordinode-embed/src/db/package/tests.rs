@@ -840,6 +840,55 @@ fn one_certification_places_every_label_it_changes() {
     }
 }
 
+/// The placement and the fold of an implication change take their pages
+/// from the build settings: with a page of one row and one entry, the
+/// change crosses many commits, and once it is in force and folded every
+/// carrier is placed exactly once, by scan, by counter and by the label's
+/// one scope.
+#[test]
+fn an_implication_change_crosses_pages_of_one() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open();
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        reconcile_page: 1,
+        fold_page: 1,
+        ..db.index_build_config()
+    });
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE (:Task {title: 'a'}), (:Task {title: 'b'}), (:Task {title: 'c'}), \
+         (:Thing {title: 'd'})",
+        "ALTER NODE TYPE Task SET IMPLIES (Thing)",
+    ] {
+        db.execute_cypher(ddl).expect(ddl);
+    }
+    let deadline = std::time::Instant::now() + WAIT;
+    {
+        use coordinode_modality::IndexStore as _;
+        while coordinode_modality::LocalIndexStore::new(db.engine())
+            .list_definitions()
+            .expect("definitions")
+            .iter()
+            .any(|def| !def.selection.is_empty())
+        {
+            assert!(std::time::Instant::now() < deadline, "parts left unfolded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let scanned = db
+        .execute_cypher("MATCH (n:Thing) WHERE n.title + '' <> '' RETURN n")
+        .expect("scan")
+        .len();
+    let rows = db
+        .execute_cypher("MATCH (n:Thing) RETURN count(n) AS c")
+        .expect("count");
+    assert_eq!(
+        (scanned, rows[0].get("c").cloned()),
+        (4, Some(Value::Int(4)))
+    );
+}
+
 /// The schema of label `name` as the catalog holds it.
 fn user_named(db: &Database, name: &str) -> LabelSchema {
     db.label_schemas()

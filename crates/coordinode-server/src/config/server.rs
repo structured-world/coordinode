@@ -448,6 +448,12 @@ pub struct ServerConfig {
     /// The most disagreements an index check repairs entry by entry before
     /// it rebuilds the index into a fresh generation (`None` = 10000).
     pub index_check_max_repairs: Option<u64>,
+    /// Stored node rows one commit places in the indexes while a change of
+    /// what a type implies is proved (`None` = 512).
+    pub index_implication_page: Option<std::num::NonZeroUsize>,
+    /// Index entries one commit moves back into an index's own entries once
+    /// such a change concluded (`None` = 512).
+    pub index_fold_page: Option<std::num::NonZeroUsize>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
     pub nofile: Option<u64>,
     /// Max concurrent connections (`None` = unbounded).
@@ -702,6 +708,8 @@ impl Default for ServerConfig {
             index_check_repair_batch: None,
             index_check_memory_mb: None,
             index_check_max_repairs: None,
+            index_implication_page: None,
+            index_fold_page: None,
             nofile: None,
             max_connections: None,
             max_request_size_mb: 16,
