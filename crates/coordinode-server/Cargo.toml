@@ -104,6 +104,8 @@ harness = false
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Failure injection into the text indexes the text service tests drive.
+coordinode-search = { workspace = true, features = ["test-hooks"] }
 coordinode-client = { workspace = true }
 coordinode-modality = { workspace = true }
 coordinode-test-fixtures = { workspace = true }

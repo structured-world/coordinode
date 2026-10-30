@@ -157,7 +157,9 @@ impl TextServiceImpl {
             ) {
                 Ok(Some(results)) => results,
                 Ok(None) => continue,
-                Err(e) => return Err(Status::internal(format!("text_search: {e}"))),
+                // One mapping for every service: an index not ready is a
+                // transient refusal with its reason and retry advice.
+                Err(e) => return Err(super::cypher::db_error_to_status(e)),
             };
             for r in results {
                 let current = node_scores.entry(r.node_id).or_insert(0.0_f32);

@@ -65,6 +65,79 @@ fn test_service_with_text_index(
     (TextServiceImpl::new(database), dir)
 }
 
+/// TextSearch over a text index that cannot answer yet, its reader behind
+/// its last write or that write's outcome unknown, is UNAVAILABLE with
+/// reason TEXT_INDEX_NOT_READY naming the index, and retry advice, like the
+/// same refusal through Cypher. Before, the service answered INTERNAL with
+/// the refusal flattened into its message.
+#[tokio::test]
+async fn text_search_over_an_index_not_ready_is_unavailable_with_retry_advice() {
+    use core::sync::atomic::Ordering::SeqCst;
+    use tonic_types::StatusExt;
+    type Inject = fn(&coordinode_search::tantivy::TextIndex);
+    let cases: [(&str, Inject); 2] = [
+        ("a lagging reader", |index| {
+            index.hooks.fail_reloads.store(u32::MAX, SeqCst);
+        }),
+        ("an unknown commit", |index| {
+            index.hooks.lose_commit_readback.store(true, SeqCst);
+        }),
+    ];
+    for (what, inject) in cases {
+        let (svc, _dir) = test_service_with_text_index("Article", "body");
+        {
+            let mut db = svc.database.write();
+            db.text_index_registry()
+                .with_index("Article", "body", |index, _| {
+                    inject(index.inner());
+                    Ok(())
+                })
+                .expect("hook")
+                .expect("registered");
+            db.execute_cypher("CREATE (:Article {body: 'rust graph'})")
+                .expect("create article");
+        }
+        // The worker folds the write into the index, which then refuses.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while svc
+            .database
+            .read()
+            .text_index_registry()
+            .search("Article", "body", "rust", 10)
+            .is_some()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: never refused"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let status = svc
+            .text_search(Request::new(crate::proto::query::TextSearchRequest {
+                label: "Article".to_string(),
+                query: "rust".to_string(),
+                limit: 10,
+                fuzzy: false,
+                language: "".to_string(),
+            }))
+            .await
+            .expect_err("the search refuses");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "{what}: {status:?}"
+        );
+        let details = status.get_error_details();
+        let info = details.error_info().expect("ErrorInfo expected");
+        assert_eq!(info.reason, "TEXT_INDEX_NOT_READY", "{what}");
+        let meta = |k: &str| info.metadata.get(k).map(String::as_str);
+        assert_eq!(meta("label"), Some("Article"), "{what}");
+        assert_eq!(meta("property"), Some("body"), "{what}");
+        assert!(details.retry_info().is_some(), "{what}: transient");
+    }
+}
+
 /// text_search: rejects empty label.
 #[tokio::test]
 async fn text_search_requires_label() {
