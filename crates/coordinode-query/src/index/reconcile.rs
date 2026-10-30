@@ -59,7 +59,9 @@ pub(crate) struct Reconcile<'a> {
 /// An index with parts of the certification, as one page reads it.
 struct Placing {
     def: IndexDefinition,
-    /// The label its parts are kept for.
+    /// The label a B-tree index's parts are kept for: its own. The label
+    /// lookup keeps parts for every label the certification changes, and
+    /// places a node's postings for all of them at once.
     label: LabelId,
 }
 
@@ -81,8 +83,6 @@ impl Reconcile<'_> {
         let store = LocalIndexStore::new(self.engine);
         let nodes = LocalNodeStore;
         let prefix = nodes.shard_scan_prefix(self.shard_id);
-        let mut in_force = CatalogMembership::current(self.engine);
-        let mut candidate = CatalogMembership::candidates(self.engine);
         let field_of = |name: &str| self.interner.lookup(name);
         let mut start_after: Option<Vec<u8>> = None;
         let mut placed = 0u64;
@@ -125,6 +125,20 @@ impl Reconcile<'_> {
             if placing.is_empty() {
                 return Err(BackfillError::Superseded);
             }
+            // Both interpretations of the catalog as the page's own snapshot
+            // reads it, the one its nodes are read at: every fact a node is
+            // judged by is of one committed state, never a mix.
+            let (view, _pin) = match txn.snapshot() {
+                Some(view) => (view, None),
+                // A direct-mode transaction reads the latest state: both
+                // views take one snapshot of it, held while they are built.
+                None => {
+                    let (view, pin) = self.engine.pin_latest_snapshot();
+                    (view, pin)
+                }
+            };
+            let mut in_force = CatalogMembership::at(self.engine, view);
+            let mut candidate = CatalogMembership::candidates_at(self.engine, view);
             let page =
                 nodes.prefix_scan_paged_tracked(&mut txn, &prefix, start_after.as_deref(), PAGE)?;
             let mut read = Vec::with_capacity(page.rows.len());
@@ -152,7 +166,11 @@ impl Reconcile<'_> {
                         in_force: now.contains(label),
                         candidate: then.contains(label),
                     };
-                    if carried.in_force == carried.candidate {
+                    // The lookup moves the postings of every label the two
+                    // interpretations disagree on; a B-tree index only its
+                    // own label's entry.
+                    if def.index_type != IndexType::Labels && carried.in_force == carried.candidate
+                    {
                         continue;
                     }
                     match def.index_type {

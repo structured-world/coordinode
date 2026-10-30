@@ -495,12 +495,20 @@ fn stage_selection_conclusion(
     state: PartState,
 ) -> Result<(), StoreError> {
     let store = LocalIndexStore::new(engine);
-    for mut def in store.list_definitions()? {
-        let version = store.definition_version(def.id)?;
+    let listed_all = store.list_definitions()?;
+    #[cfg(test)]
+    after_listing();
+    for listed in listed_all {
+        // The record and its version in one read: the conclusion rewrites
+        // exactly the definition its commit is conditioned on, never one
+        // listed before a fold of another change moved it.
+        let Some((mut def, version)) = store.definition_versioned(listed.id)? else {
+            continue;
+        };
         if !def.conclude_parts(generation, state) {
             continue;
         }
-        store.expect_definition_txn(txn, def.id, version)?;
+        store.expect_definition_txn(txn, def.id, Some(version))?;
         store.put_definition_txn(txn, &def)?;
     }
     Ok(())
@@ -596,3 +604,24 @@ fn next_revision(
         ))
     })
 }
+
+/// A step a test runs once a conclusion has listed the definitions and
+/// before it reads any of them: the window a fold of another change races
+/// it in.
+#[cfg(test)]
+type ListedHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static AFTER_LISTING: parking_lot::Mutex<Option<ListedHook>> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+fn after_listing() {
+    let hook = AFTER_LISTING.lock().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests;

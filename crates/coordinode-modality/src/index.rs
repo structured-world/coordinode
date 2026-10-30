@@ -609,6 +609,15 @@ pub trait IndexStore {
     /// A storage or decoding failure.
     fn definition_version_as(&self, def: &IndexDefinition) -> StoreResult<Option<u64>>;
 
+    /// The definition of `id` with the version of its record, read in one
+    /// step: a change conditioned on the version acts on exactly this
+    /// definition. `None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// A storage or decoding failure.
+    fn definition_versioned(&self, id: IndexId) -> StoreResult<Option<(IndexDefinition, u64)>>;
+
     /// Write the transaction only while the definition record of `id` is at
     /// `version` when it commits, so DDL and builds act on the definition
     /// they inspected.
@@ -1779,6 +1788,13 @@ impl IndexStore for LocalIndexStore<'_> {
         };
         let stored: IndexDefinition = decode("index definition", &bytes)?;
         Ok((stored == *def).then_some(version))
+    }
+
+    fn definition_versioned(&self, id: IndexId) -> StoreResult<Option<(IndexDefinition, u64)>> {
+        self.engine
+            .get_versioned(Partition::Schema, &IndexDefinition::schema_key_of(id))?
+            .map(|(bytes, version)| Ok((decode("index definition", &bytes)?, version)))
+            .transpose()
     }
 
     fn expect_definition_txn(

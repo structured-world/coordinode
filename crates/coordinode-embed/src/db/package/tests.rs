@@ -778,6 +778,68 @@ fn writes_during_an_implication_change_are_counted_once_it_is_in_force() {
     assert_eq!(counted(&db), (Some(Value::Int(3)), 3), "folded");
 }
 
+/// One package changes what two types imply: Task comes to imply Thing and
+/// Job comes to imply Gadget. Both labels' carriers are placed in the one
+/// label lookup by the same certification, so once it is in force a scan
+/// of each label finds its stored carriers, and each label's counter
+/// agrees. Before, the certification placed the carriers of the first
+/// label it found in the lookup only, and the other label lost its
+/// stored carriers.
+#[test]
+fn one_certification_places_every_label_it_changes() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open();
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Gadget WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE NODE TYPE Job WITH (title: STRING)",
+        "CREATE (:Task {title: 'a'}), (:Job {title: 'b'}), (:Thing {title: 'c'})",
+    ] {
+        db.execute_cypher(ddl).expect(ddl);
+    }
+    let older = db.begin_catalog_txn();
+    occupy_the_only_seat(&db);
+    let mut labels = Vec::new();
+    for (name, implies) in [("Task", "Thing"), ("Job", "Gadget")] {
+        let mut schema = user_named(&db, name);
+        let revision = schema.schema_revision;
+        schema.set_implies(vec![implies.into()]);
+        labels.push(LabelDeclaration {
+            schema,
+            intent: Intent::Change {
+                expected_revision: revision,
+            },
+        });
+    }
+    let published = db
+        .publish_schema(SchemaPackage {
+            labels,
+            ..SchemaPackage::default()
+        })
+        .expect("publish");
+    drop(older);
+    let readiness = db.await_schema(&published, WAIT).expect("await");
+    assert!(readiness.all_ready(), "{readiness:?}");
+
+    for (label, members) in [("Thing", 2), ("Gadget", 1)] {
+        let scanned = db
+            .execute_cypher(&format!(
+                "MATCH (n:{label}) WHERE n.title + '' <> '' RETURN n"
+            ))
+            .expect("scan")
+            .len();
+        let rows = db
+            .execute_cypher(&format!("MATCH (n:{label}) RETURN count(n) AS c"))
+            .expect("count");
+        assert_eq!(
+            (scanned, rows[0].get("c").cloned()),
+            (members, Some(Value::Int(members as i64))),
+            ":{label}"
+        );
+    }
+}
+
 /// The schema of label `name` as the catalog holds it.
 fn user_named(db: &Database, name: &str) -> LabelSchema {
     db.label_schemas()
