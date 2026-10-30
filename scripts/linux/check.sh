@@ -219,7 +219,8 @@ export CARGO_TARGET_DIR='$remote_root/target' $bench_env
 # run: its background uploads otherwise share the CPU with the measurement.
 cargo bench $only_bench --no-run > ../bench-build.log 2>&1
 echo build=\$? >> ../status.txt
-if command -v sccache >/dev/null 2>&1; then sccache --stop-server >/dev/null 2>&1; fi
+# This account's own server (provision.sh); the default port may be another's.
+if command -v sccache >/dev/null 2>&1; then SCCACHE_SERVER_UDS=\"\$HOME/.cache/sccache-server.sock\" sccache --stop-server >/dev/null 2>&1; fi
 cargo bench $only_bench > ../bench.log 2>&1
 echo bench=\$? >> ../status.txt
 echo done >> ../status.txt" || true
@@ -246,7 +247,7 @@ export CARGO_TARGET_DIR='$remote_root/target' CARGO_PROFILE_BENCH_DEBUG=line-tab
 cargo bench $only_profile --no-run > ../bench-build.log 2>&1
 echo build=\$? >> ../status.txt
 bin=\$(sed -n 's/.*Executable .*(\(.*\))\$/\1/p' ../bench-build.log | tail -n 1)
-if command -v sccache >/dev/null 2>&1; then sccache --stop-server >/dev/null 2>&1; fi
+if command -v sccache >/dev/null 2>&1; then SCCACHE_SERVER_UDS=\"\$HOME/.cache/sccache-server.sock\" sccache --stop-server >/dev/null 2>&1; fi
 \"\$bin\" --bench > ../bench.log 2>&1 &
 pid=\$!
 if [ -n '$profile_after' ]; then

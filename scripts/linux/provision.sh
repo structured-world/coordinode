@@ -100,8 +100,12 @@ fi
 # someone else's and stays as it is.
 marker='# Compilation cache for every cargo invocation on this host, including the'
 config="$HOME/.cargo/config.toml"
+# This account's own sccache server. A stop names it too: a bare
+# `sccache --stop-server` reaches whichever server holds the default port,
+# another account's included.
+server_uds="$HOME/.cache/sccache-server.sock"
 if [ ! -e "$config" ] || [ "$(head -n 1 "$config")" = "$marker" ]; then
-  mkdir -p "$HOME/.cargo"
+  mkdir -p "$HOME/.cargo" "$HOME/.cache"
   cat > "$config" <<CONFIG
 $marker
 # non-interactive ssh shells the remote check scripts run in.
@@ -113,6 +117,10 @@ rustc-wrapper = "sccache"
 # changing these.
 SCCACHE_DIR = "$cache_dir"
 SCCACHE_CACHE_SIZE = "${cache_gib}G"
+# This account's own server. The server compiles and writes the outputs as
+# its own user, so a server on the shared default port would leave another
+# account's build (a CI runner's) with files it cannot read.
+SCCACHE_SERVER_UDS = "$server_uds"
 
 # The same dev profile as the developer machines, so the profile part of
 # sccache's cache key matches and a build script and the library built from
@@ -126,11 +134,11 @@ CONFIG
   # A cache an earlier run left in the default place moves along (its
   # entries stay valid), and the server restarts on the new settings.
   if [ "$cache_dir" != "$old_cache" ] && [ -d "$old_cache" ]; then
-    sccache --stop-server >/dev/null 2>&1 || true
+    SCCACHE_SERVER_UDS="$server_uds" sccache --stop-server >/dev/null 2>&1 || true
     cp -a "$old_cache/." "$cache_dir/"
     rm -rf "$old_cache"
   fi
-  sccache --stop-server >/dev/null 2>&1 || true
+  SCCACHE_SERVER_UDS="$server_uds" sccache --stop-server >/dev/null 2>&1 || true
 elif ! grep -qs 'rustc-wrapper *= *"sccache"' "$config"; then
   echo "note: $config exists and does not use sccache; left unchanged" >&2
 fi
