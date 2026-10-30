@@ -7226,6 +7226,21 @@ fn counted_nodes(
     if ctx.snapshot_ts.is_some() || !node_counter_answers_scan(ctx.engine, label)? {
         return Ok(None);
     }
+    // A label whose carriers a change of what a type implies moves has its
+    // members split across the lookup's scopes until the change is folded
+    // in; its counter follows the facts it was kept under, so the members
+    // are counted from the lookup instead.
+    if let Some(registry) = ctx.btree_index_registry
+        && let Some((lookup, _)) = registry.label_lookup_published()
+        && let Some(id) = ctx.label_id(label)?
+    {
+        use coordinode_modality::IndexStore as _;
+        let at_view = coordinode_modality::LocalIndexStore::new(ctx.engine)
+            .definition_in(&mut ctx.txn, lookup.id)?;
+        if at_view.is_some_and(|def| def.scopes_of(id).len() > 1) {
+            return Ok(None);
+        }
+    }
     let key = coordinode_core::graph::stats::label_count_key(label);
     ctx.sync_txn_state();
     let stored = match ctx.txn.get(Partition::Counter, &key)? {
@@ -20546,6 +20561,10 @@ fn execute_alter_node_type_implies(
         &|_| None,
     )?;
 
+    // The labels whose carriers the change moves: those the type comes to
+    // carry and those it stops carrying. Its descendants move with it, by
+    // the same labels. Every other label's postings and entries stay put.
+    let affected = implication_delta(label, current.implies(), &wanted, ctx)?;
     let read_revision = current.schema_revision;
     let mut next = current;
     next.schema_revision = next_revision(&next)?;
@@ -20562,6 +20581,34 @@ fn execute_alter_node_type_implies(
         }
         let indexes = LocalIndexStore::new(engine);
         let op = indexes.allocate_generation_txn(txn)?;
+        // The label lookup keeps each affected label's difference apart, in
+        // parts proposed with the candidate, in the same commit: every
+        // writer from then on keeps both interpretations, and one still
+        // holding the lookup as it was is refused at its commit.
+        if !affected.is_empty()
+            && let Some(mut lookup) = indexes.label_lookup()?
+        {
+            let version = indexes.definition_version_as(&lookup)?.ok_or_else(|| {
+                StoreError::Invariant(
+                    "the label lookup changed while the implication was being changed; retry \
+                     the statement"
+                        .into(),
+                )
+            })?;
+            indexes.expect_definition_txn(txn, lookup.id, Some(version))?;
+            for &(affected_label, ref name) in &affected {
+                if lookup.proposed_operation(affected_label).is_some() {
+                    return Err(StoreError::Invariant(format!(
+                        "another change moving the carriers of :{name} is being certified; \
+                         retry once it ends"
+                    )));
+                }
+                let gained = indexes.allocate_generation_txn(txn)?;
+                let retired = indexes.allocate_generation_txn(txn)?;
+                lookup.propose_parts(affected_label, op, gained, retired);
+            }
+            indexes.put_definition_txn(txn, &lookup)?;
+        }
         // The facts stay in force; the candidate is the implication.
         next.set_candidate(LabelCandidate {
             properties: next.properties.clone(),
@@ -20583,6 +20630,14 @@ fn execute_alter_node_type_implies(
     let operation = operation.ok_or_else(|| {
         ExecutionError::Unsupported("the implication change staged no certification".into())
     })?;
+    // This member's writers maintain the lookup as it now stands, with the
+    // parts proposed; others pick it up as they apply the commit.
+    if !affected.is_empty()
+        && let Some(registry) = ctx.btree_index_registry
+        && let Some(lookup) = LocalIndexStore::new(engine).label_lookup()?
+    {
+        registry.register_published(engine, lookup)?;
+    }
     // The statement's own transaction is open while it waits; having staged
     // nothing, it leaves the proof's wait for older transactions.
     ctx.txn.release_from_schema_waits();
@@ -20621,6 +20676,48 @@ fn execute_alter_node_type_implies(
     }
     ctx.sync_for_answer()?;
     Ok(vec![row])
+}
+
+/// The labels type `label` carries through one of `before` (what it implies
+/// now) and `after` (what it is to imply) but not the other, with their
+/// names, in identity order: the labels whose carriers a change of its
+/// implication moves. Each implied label brings its own closure.
+fn implication_delta(
+    label: &str,
+    before: &[String],
+    after: &[String],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<(LabelId, String)>, ExecutionError> {
+    let mut closure = |implies: &[String]| -> Result<Vec<LabelId>, ExecutionError> {
+        let mut carried = Vec::new();
+        for name in implies {
+            let Some(id) = ctx.label_id(name)? else {
+                return Err(ExecutionError::CatalogRefused(format!(
+                    ":{label} would imply :{name}, which has no identity"
+                )));
+            };
+            for implied in ctx.carried_labels(&[id])? {
+                if !carried.contains(&implied) {
+                    carried.push(implied);
+                }
+            }
+        }
+        Ok(carried)
+    };
+    let before = closure(before)?;
+    let after = closure(after)?;
+    let mut moved: Vec<LabelId> = before
+        .iter()
+        .filter(|l| !after.contains(l))
+        .chain(after.iter().filter(|l| !before.contains(l)))
+        .copied()
+        .collect();
+    moved.sort_unstable();
+    let mut named = Vec::with_capacity(moved.len());
+    for id in moved {
+        named.push((id, ctx.label_name(id)?.to_string()));
+    }
+    Ok(named)
 }
 
 /// Execute `CREATE NODE TYPE <name> [TEMPORAL] [IMPLIES (...)] [WITH (...)]`

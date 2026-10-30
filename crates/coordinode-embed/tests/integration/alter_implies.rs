@@ -64,6 +64,58 @@ fn a_type_without_nodes_comes_to_imply_a_label() {
     assert_eq!(count(&mut db, "MATCH (n:Thing) RETURN n"), 1);
 }
 
+/// A scan of a label a type comes to imply finds the type's stored nodes,
+/// beside the label's own and those carrying it explicitly, each once; and
+/// stops finding them when the implication is dropped, while the others
+/// stay. Counted and paged the same way.
+#[test]
+fn a_label_scan_follows_the_implication_both_ways() {
+    let mut db = things();
+    db.execute_cypher(
+        "CREATE (:Task {title: 'a'}), (:Task:Activity {title: 'b'}), (:Thing {title: 'c'})",
+    )
+    .expect("nodes");
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("gain");
+    assert_eq!(count(&mut db, "MATCH (n:Thing) RETURN n"), 3);
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (n:Thing) RETURN n.title AS t ORDER BY t LIMIT 2"
+        ),
+        2
+    );
+    let rows = db
+        .execute_cypher("MATCH (n:Thing) RETURN count(n) AS c")
+        .expect("count");
+    assert_eq!(rows[0].get("c"), Some(&Value::Int(3)));
+    db.execute_cypher("CREATE (:Task {title: 'd'})")
+        .expect("a task written after the change");
+    assert_eq!(count(&mut db, "MATCH (n:Thing) RETURN n"), 4);
+
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES ()")
+        .expect("loss");
+    assert_eq!(
+        count(&mut db, "MATCH (n:Thing) RETURN n"),
+        1,
+        "the thing alone"
+    );
+    assert_eq!(
+        count(&mut db, "MATCH (n:Task) RETURN n"),
+        3,
+        "tasks stay tasks"
+    );
+    assert_eq!(
+        count(&mut db, "MATCH (n:Activity) RETURN n"),
+        1,
+        "an explicit label stays"
+    );
+    let rows = db
+        .execute_cypher("MATCH (n:Thing) RETURN count(n) AS c")
+        .expect("count");
+    assert_eq!(rows[0].get("c"), Some(&Value::Int(1)));
+}
+
 /// The stored nodes of a type are found under a label it comes to imply,
 /// by a scan of the label and through an index on it, once the change
 /// answers; and leave it when the implication is dropped.

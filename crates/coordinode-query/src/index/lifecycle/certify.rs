@@ -14,7 +14,8 @@
 //! and on each label's schema as it read it.
 
 use coordinode_modality::{
-    BuildState, IndexStore as _, LocalIndexStore, LocalSchemaStore, SchemaStore as _, StoreError,
+    BuildState, IndexStore as _, LocalIndexStore, LocalSchemaStore, PartState, SchemaStore as _,
+    StoreError,
 };
 
 use super::{
@@ -75,10 +76,20 @@ impl IndexBuildService {
                 for label in &record.labels {
                     stage_withdrawal(env.engine(), &mut txn, label, generation).map_err(text)?;
                 }
+                stage_selection_conclusion(
+                    env.engine(),
+                    &mut txn,
+                    generation,
+                    PartState::Withdrawn,
+                )
+                .map_err(text)?;
                 env.commit_catalog(&mut txn)
             };
             match committed {
-                Ok(()) => return Ok(true),
+                Ok(()) => {
+                    refresh_lookup(env).map_err(text)?;
+                    return Ok(true);
+                }
                 Err(e) if is_contention(&e) => continue,
                 Err(e) => return Err(e.to_string()),
             }
@@ -137,8 +148,64 @@ impl Shared {
         // (`CandidatePublished`), and a later one is held to the candidate.
         // Every node the proof must see is in the store already.
         self.set_phase(generation, BuildPhase::Indexing { indexed: None });
-        let refused = self.prove(generation, &labels)?;
+        let mut refused = self.prove(generation, &labels)?;
+        if refused.is_empty() {
+            match self.reconcile(generation, &labels)? {
+                Some(not_reconciled) => refused = not_reconciled,
+                // The process is closing: the record stays running, and the
+                // certification is taken again where the storage is opened.
+                None => return Ok(Executed::Lost),
+            }
+        }
         self.conclude_certification(generation, token, &labels, refused)
+    }
+
+    /// Place the label lookup postings of the stored nodes whose labels a
+    /// candidate changing what a type implies moves, into the parts
+    /// published with it. Returns every label refused, with why, when the
+    /// placement could not be completed (the candidates of such a change
+    /// are put in force together or not at all), none when it was, and
+    /// `None` when the process is closing.
+    fn reconcile(
+        &self,
+        generation: GenerationId,
+        labels: &[String],
+    ) -> Result<Option<Vec<(String, String)>>, String> {
+        let env = self.env.as_ref();
+        let store = LocalSchemaStore::new(env.engine());
+        let mut moves = false;
+        for label in labels {
+            moves |= store
+                .load_label(label)
+                .map_err(text)?
+                .is_some_and(|s| s.candidate_changes_implies());
+        }
+        if !moves {
+            return Ok(Some(Vec::new()));
+        }
+        let placed = crate::index::reconcile::Reconcile {
+            engine: env.engine(),
+            oracle: env.oracle(),
+            shard_id: env.shard_id(),
+            operation: generation,
+            stop: Some(&self.stopping),
+        }
+        .run(&mut |txn| env.commit_page(txn));
+        match placed {
+            Ok(_) => Ok(Some(Vec::new())),
+            Err(crate::index::build::BackfillError::Stopped) => Ok(None),
+            Err(e) => Ok(Some(
+                labels
+                    .iter()
+                    .map(|label| {
+                        (
+                            label.clone(),
+                            format!("the carriers of :{label} were not reconciled: {e}"),
+                        )
+                    })
+                    .collect(),
+            )),
+        }
     }
 
     /// Check the stored nodes of `labels` against their candidates as
@@ -255,16 +322,42 @@ impl Shared {
     /// refused ones withdrawn, and the record ended, in one commit
     /// conditioned on the record still naming the token and on each label's
     /// schema as read; retried while a conflicting move leaves the
-    /// certification the executor's.
+    /// certification the executor's. A set with a candidate changing what a
+    /// type implies is coupled: one refusal withdraws them all, and the
+    /// label lookup's parts of the change conclude in the same commit.
     fn conclude_certification(
         &self,
         generation: GenerationId,
         token: u64,
         labels: &[String],
-        refused: Vec<(String, String)>,
+        mut refused: Vec<(String, String)>,
     ) -> Result<Executed, String> {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
+        let schemas = LocalSchemaStore::new(env.engine());
+        let mut coupled = false;
+        for label in labels {
+            coupled |= schemas.load_label(label).map_err(text)?.is_some_and(|s| {
+                s.candidate().is_some_and(|c| c.operation == generation)
+                    && s.candidate_changes_implies()
+            });
+        }
+        let withdraw_all = |refused: &mut Vec<(String, String)>| {
+            for label in labels {
+                if !refused.iter().any(|(l, _)| l == label) {
+                    refused.push((
+                        label.clone(),
+                        format!(
+                            "the definition of :{label} is withdrawn with the change it was \
+                             published with"
+                        ),
+                    ));
+                }
+            }
+        };
+        if coupled && !refused.is_empty() {
+            withdraw_all(&mut refused);
+        }
         for () in move_attempts() {
             let Some((mut record, version)) = store.load_certification(generation).map_err(text)?
             else {
@@ -294,6 +387,26 @@ impl Shared {
                         ));
                     }
                 }
+                if coupled && withdrawn.len() > refused.len() {
+                    // A coupled candidate vanished after others were staged
+                    // in force: none of them may be. Staged again, all
+                    // withdrawn.
+                    drop(txn);
+                    refused = withdrawn;
+                    withdraw_all(&mut refused);
+                    continue;
+                }
+                stage_selection_conclusion(
+                    env.engine(),
+                    &mut txn,
+                    generation,
+                    if withdrawn.is_empty() {
+                        PartState::InForce
+                    } else {
+                        PartState::Withdrawn
+                    },
+                )
+                .map_err(text)?;
                 let outcome = if withdrawn.is_empty() {
                     record.state = BuildState::Published;
                     IndexBuildOutcome::Published { indexed: None }
@@ -315,7 +428,10 @@ impl Shared {
                 env.commit_catalog(&mut txn).map(|()| outcome)
             };
             match committed {
-                Ok(outcome) => return Ok(Executed::Outcome(outcome)),
+                Ok(outcome) => {
+                    refresh_lookup(env).map_err(text)?;
+                    return Ok(Executed::Outcome(outcome));
+                }
                 Err(e) if is_contention(&e) => continue,
                 Err(e) if cannot_move_here(&e) => return Ok(Executed::Lost),
                 Err(e) => return Err(e.to_string()),
@@ -326,6 +442,39 @@ impl Shared {
             generation.as_raw()
         ))
     }
+}
+
+/// Register the label lookup as its record now stands with this member's
+/// writers, after a commit that concluded parts of it.
+fn refresh_lookup(env: &dyn super::BuildEnvironment) -> Result<(), StoreError> {
+    if let Some(lookup) = LocalIndexStore::new(env.engine()).label_lookup()? {
+        env.registry()
+            .register_published(env.engine(), lookup)
+            .map_err(StoreError::from)?;
+    }
+    Ok(())
+}
+
+/// Stage the label lookup's parts of the certification `generation` moving
+/// to `state`, conditioned on the lookup's record as read: its readers pick
+/// their scopes from that record, and a writer still bound to the record as
+/// it was is refused at its commit. Nothing when the lookup has none.
+fn stage_selection_conclusion(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
+    generation: GenerationId,
+    state: PartState,
+) -> Result<(), StoreError> {
+    let store = LocalIndexStore::new(engine);
+    let Some(mut lookup) = store.label_lookup()? else {
+        return Ok(());
+    };
+    let version = store.definition_version(lookup.id)?;
+    if !lookup.conclude_parts(generation, state) {
+        return Ok(());
+    }
+    store.expect_definition_txn(txn, lookup.id, version)?;
+    store.put_definition_txn(txn, &lookup)
 }
 
 /// Stage putting the candidate `generation` of `label` in force, at the
