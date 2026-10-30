@@ -206,12 +206,12 @@ impl MultiLanguageTextIndex {
                 corpus.subtract(gone);
             }
             index.inner.aside = super::Aside::default();
+            // Committed with the deletion: a reopen reads the remaining tags
+            // under the next change, never the one they were written in. A
+            // failed commit puts the epoch back (see `Self::write`).
+            index.inner.epoch += 1;
             Ok(true)
-        })?;
-        // Only once the commit is visible: a failed one recounted the scopes
-        // under the change still followed.
-        self.inner.epoch += 1;
-        Ok(())
+        })
     }
 
     /// The nodes whose live document is in `scope`, ascending.
@@ -360,12 +360,16 @@ impl MultiLanguageTextIndex {
             return Err(TextSearchError::IndexCorrupted(reason.clone()));
         }
         let mut batch = Batch::new(self.inner.reader.searcher());
+        let epoch = self.inner.epoch;
         let outcome = match work(self, &mut batch) {
             Ok(true) => self.publish(),
             Ok(false) => Ok(()),
             Err(e) => Err(e),
         };
         if outcome.is_err() {
+            // The committed documents are read under the change the last
+            // commit recorded.
+            self.inner.epoch = epoch;
             let rollback = self.inner.writer.rollback();
             // The staging counted documents no reader will see. Count the
             // committed ones again, whatever happened to the writer; if even
@@ -668,7 +672,7 @@ impl MultiLanguageTextIndex {
     /// Commit the staged changes and make them visible to readers.
     fn publish(&mut self) -> Result<(), TextSearchError> {
         // No birth-time bounds to keep: the documents carry none.
-        self.inner.writer.commit()?;
+        self.inner.commit_staged()?;
         self.inner.reader.reload()?;
         Ok(())
     }

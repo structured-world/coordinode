@@ -302,6 +302,24 @@ type LiveDocument = (Option<Vec<String>>, Scope);
 /// Stored-only field holding the tokens a pre-tokenized body was indexed with.
 const TOKENS_FIELD: &str = "tokens";
 
+/// Prefix of the commit payload naming the change the index follows.
+const EPOCH_PAYLOAD: &str = "scope-epoch:";
+
+/// The commit payload recording `epoch`.
+fn encode_epoch(epoch: u64) -> String {
+    format!("{EPOCH_PAYLOAD}{epoch}")
+}
+
+/// The epoch a commit payload [`encode_epoch`] wrote records.
+fn decode_epoch(payload: &str) -> Result<u64, TextSearchError> {
+    payload
+        .strip_prefix(EPOCH_PAYLOAD)
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| {
+            TextSearchError::IndexCorrupted(format!("unreadable commit payload {payload:?}"))
+        })
+}
+
 /// `tokens` as the bytes of [`TOKENS_FIELD`]: each token's UTF-8 length as a
 /// little-endian u32, then its bytes.
 fn encode_tokens(tokens: &[String]) -> Vec<u8> {
@@ -457,6 +475,12 @@ impl TextIndex {
             Self::register_language_tokenizer(&index, lang, &tokenizer_name);
         }
 
+        // The change the committed documents' tags name was committed with
+        // them; an index without one follows the first.
+        let epoch = match index.load_metas()?.payload {
+            Some(payload) => decode_epoch(&payload)?,
+            None => 0,
+        };
         let writer = index.writer(heap_size_bytes)?;
         let reader = index
             .reader_builder()
@@ -476,8 +500,18 @@ impl TextIndex {
             registry: RwLock::new(SegmentRegistry::new()),
             corpus: None,
             aside: Aside::default(),
-            epoch: 0,
+            epoch,
         })
+    }
+
+    /// Commit the staged changes with the change the index follows, so the
+    /// documents' scope tags and the epoch they are read under are one
+    /// commit: a reopen reads both or neither.
+    fn commit_staged(&mut self) -> Result<(), TextSearchError> {
+        let mut prepared = self.writer.prepare_commit()?;
+        prepared.set_payload(&encode_epoch(self.epoch));
+        prepared.commit()?;
+        Ok(())
     }
 
     /// The scope field value of a document written in `scope` now.
@@ -660,7 +694,7 @@ impl TextIndex {
             self.writer.add_document(doc)?;
         }
 
-        self.writer.commit()?;
+        self.commit_staged()?;
         self.reader.reload()?;
         self.reconcile_registry()?;
         Ok(())
@@ -672,7 +706,7 @@ impl TextIndex {
     pub fn delete_document(&mut self, node_id: u64) -> Result<(), TextSearchError> {
         let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
         self.writer.delete_term(node_id_term);
-        self.writer.commit()?;
+        self.commit_staged()?;
         self.reader.reload()?;
         self.reconcile_registry()?;
         Ok(())
@@ -1060,7 +1094,7 @@ impl TextIndex {
             self.writer.add_document(doc)?;
         }
 
-        self.writer.commit()?;
+        self.commit_staged()?;
         self.reader.reload()?;
         self.reconcile_registry()?;
         Ok(())
