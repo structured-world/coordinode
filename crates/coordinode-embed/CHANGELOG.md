@@ -2,6 +2,77 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-10-30
+
+### Added
+
+- *(query)* change a node's type with RETYPE NODE
+- *(schema)* declare type, implied and auxiliary labels
+- *(cluster)* replace a member whose vote no copy proves
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(storage)* judge, repair and drop columnar tables as partitions
+- *(embed)* physical backup of the whole database
+- *(vector)* exact scores and domain errors end to end
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(cluster)* describe a replacement refused by a changed group
+
+### Fixed
+
+- *(query)* defer only the retyped nodes' index entries in RETYPE
+- *(embed)* outwait the commits in flight before re-running a statement
+- *(vector)* draw each HNSW level once and finite
+- *(raft)* refuse a member without its vote with a typed error
+- *(storage)* serve a rebuilt tree's history above its copy's floor
+- *(storage)* refuse a rebuild from a damaged checkpoint copy
+- *(storage)* rebuild a partition at its original seqnos
+- *(storage)* rebuild a table only from provable state
+- *(embed)* finish an interrupted table rebuild on open
+- *(query)* plan subqueries with the index access paths
+- *(query)* keep rows without a vector in a vector ordering
+- *(query)* order by variables the projection drops
+- *(storage)* capture the journal tail after a checkpoint's trees
+- *(query)* subqueries see the outer row; one index search per top-k
+- *(query)* keep each edge's orientation in undirected hops
+- *(replication)* wait for the leader's address, not pauses
+- *(query)* three-valued AND/OR, simple CASE, correlated keys
+- *(storage)* refuse a hard limit below the supported minimum
+
+### Performance
+
+- *(query)* build only the node properties a statement reads
+- *(bench)* declare the label the label-scan bench adds
+- *(bench)* measure label kinds on the write path
+- *(query)* look the keys of a correlated index join up in batches
+- *(query)* look a correlated index key up once per distinct key
+
+### Refactored
+
+- *(schema)* store canonical labels and judge RETYPE by its result
+
+### Testing
+
+- *(embed)* cover expiry, merge, restore and failed declarations for label kinds
+- *(embed)* keep an operation's outcome across a replacement
+- *(embed)* accept a cascade the capacity scanner ran first
+- *(embed)* report a table rebuild the open cannot finish
+- *(embed)* refuse an unevaluable query vector in every top-k form
+- *(embed)* measure the index top-k with the vector not returned
+- *(embed)* measure the correlated join one row per key and as a search
+- *(embed)* wait for reports and rebuilds before index checks
+- *(embed)* cover the fallbacks of the batched correlated join
+- *(embed)* wait for the recorded suspicion before a failing check
+- *(embed)* measure a correlated join through a unique index
+- *(embed)* count allocations per vector statement
+- *(embed)* bench the index-served top-k shape, store beside the build
+- *(embed)* measure vector statements end to end
+- *(embed)* keep the cascade's data on hot until it moves it
+- *(embed)* lower a full group to the supported minimum
+- *(embed)* lower the limit below the data, not the transient charge
+
 ## v0.9.0 - 2026-10-24
 
 ### Fixed

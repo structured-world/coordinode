@@ -2,6 +2,28 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-10-30
+
+### Added
+
+- *(schema)* declare type, implied and auxiliary labels
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(storage)* hold the database to a strict total footprint limit
+
+### Fixed
+
+- *(query)* charge exact dedup memory before allocating it
+
+### Performance
+
+- *(query)* read a node's schemas once per write
+- *(query)* hashed exact DISTINCT, grouping and UNION
+
+### Refactored
+
+- *(schema)* store canonical labels and judge RETYPE by its result
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
