@@ -1,7 +1,7 @@
 {
   "name": "coordinode-docs",
   "private": true,
-  "packageManager": "yarn@4.14.1",
+  "packageManager": "yarn@4.18.1",
   "scripts": {
     "gen-api-docs": "python3 scripts/gen-api-docs.py",
     "build-bench-manifest": "python3 scripts/build-bench-manifest.py",
@@ -10,14 +10,14 @@
     "docs:preview": "DOCS_BASE=/ vitepress preview docs"
   },
   "devDependencies": {
-    "@structured-world/vue-privacy": "^2.0.2",
+    "@structured-world/vue-privacy": "^2.1.0",
     "echarts": "^6.1.0",
-    "vitepress": "2.0.0-alpha.20",
+    "vitepress": "^2.0.0-alpha.21",
     "vue": "^3.5.44",
     "vue-echarts": "^8.3.2"
   },
   "resolutions": {
-    "tar": "7.5.22",
-    "vite": "8.3.5"
+    "tar": "^7.5.22",
+    "vite": "^8.3.5"
   }
 }
