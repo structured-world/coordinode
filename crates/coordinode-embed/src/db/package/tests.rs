@@ -1093,6 +1093,63 @@ fn a_fold_interrupted_by_a_close_finishes_after_a_reopen() {
     );
 }
 
+/// While a change making Task imply Thing waits to be proved, under a
+/// uniqueness on Thing's title, two transactions take one title at once: one
+/// as a thing, the other as a task, each from a view without the other.
+/// Under the change both would be things holding that title. Either one of
+/// them is refused, or the change is; never both in force with the change.
+#[test]
+fn a_unique_value_taken_on_both_sides_of_a_change_is_held_once() {
+    let (mut db, _dir) = open();
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE CONSTRAINT thing_title FOR (n:Thing) REQUIRE n.title IS UNIQUE",
+    ] {
+        db.execute_cypher(ddl).expect(ddl);
+    }
+    let older = db.begin_catalog_txn();
+    occupy_the_only_seat(&db);
+    let mut task = user_named(&db, "Task");
+    let revision = task.schema_revision;
+    task.set_implies(vec!["Thing".into()]);
+    let published = db
+        .publish_schema(SchemaPackage {
+            labels: vec![LabelDeclaration {
+                schema: task,
+                intent: Intent::Change {
+                    expected_revision: revision,
+                },
+            }],
+            ..SchemaPackage::default()
+        })
+        .expect("publish");
+
+    let thing = db.begin_transaction().expect("begin");
+    let task_tx = db.begin_transaction().expect("begin");
+    let thing_ok = db
+        .execute_in_transaction(thing, "CREATE (:Thing {title: 'v'})", None)
+        .is_ok();
+    let task_ok = db
+        .execute_in_transaction(task_tx, "CREATE (:Task {title: 'v'})", None)
+        .is_ok();
+    let thing_committed = thing_ok && db.commit_transaction(thing).is_ok();
+    let task_committed = task_ok && db.commit_transaction(task_tx).is_ok();
+
+    drop(older);
+    let _ = db.await_schema(&published, WAIT).expect("await");
+    let in_force = user_named(&db, "Task").implies() == ["Thing"];
+    let holders = db
+        .execute_cypher("MATCH (n:Thing {title: 'v'}) RETURN n")
+        .expect("lookup")
+        .len();
+    assert!(
+        !(thing_committed && task_committed && in_force),
+        "both holders committed and the change is in force: {holders} things hold 'v'"
+    );
+    assert!(holders <= 1, "{holders} things hold 'v'");
+}
+
 /// The schema of label `name` as the catalog holds it.
 fn user_named(db: &Database, name: &str) -> LabelSchema {
     db.label_schemas()
