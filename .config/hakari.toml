@@ -103,4 +103,8 @@ third-party = [
     # TLS over tokio, which the inter-node channel and the routing bench use:
     # unified here it would bring tokio back into that build.
     { name = "tokio-rustls" },
+    # The parser generator needs pest's `std`, whose native stack guard
+    # (stacker / psm) is built with a C compiler. Unified here, that would
+    # reach the query layer's own pest, which needs no `std`.
+    { name = "pest" },
 ]

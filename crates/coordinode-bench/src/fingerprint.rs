@@ -78,18 +78,21 @@ pub fn git_metadata() -> BenchResult<GitMetadata> {
 /// sysinfo can't probe.
 #[must_use]
 pub fn hardware_fingerprint() -> HardwareFingerprint {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-    let cpu_brand = sys
-        .cpus()
+    // A host sysinfo cannot probe reports no CPU and no memory.
+    let sys = System::new_all().ok().map(|mut sys| {
+        sys.refresh_all();
+        sys
+    });
+    let cpus = sys.as_ref().map_or(&[][..], System::cpus);
+    let cpu_brand = cpus
         .first()
         .map(|c| c.brand().to_string())
         .unwrap_or_default();
-    let cpu_threads = sys.cpus().len();
-    // sysinfo 0.39: physical_core_count is an associated function (no
-    // instance needed); fall back to thread count when unavailable.
+    let cpu_threads = cpus.len();
+    // physical_core_count is an associated function (no instance needed);
+    // fall back to thread count when unavailable.
     let cpu_cores = System::physical_core_count().unwrap_or(cpu_threads);
-    let ram_gb = sys.total_memory() / 1024 / 1024 / 1024;
+    let ram_gb = sys.as_ref().map_or(0, System::total_memory) / 1024 / 1024 / 1024;
     let os_name = System::name().unwrap_or_default();
     let os_version = System::os_version().unwrap_or_default();
     let arch = std::env::consts::ARCH.to_string();

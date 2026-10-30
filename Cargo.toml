@@ -47,23 +47,25 @@ publish = false
 # it first). The floor is the oldest release the code actually needs: 7.4,
 # whose flushes can leave their durability to a barrier (`persist_flushes`)
 # for trees a journal already covers.
-lsm-tree = { package = "coordinode-lsm-tree", version = "7.4.0", default-features = false }
+lsm-tree = { package = "coordinode-lsm-tree", version = "7.4.1", default-features = false }
 
 # Consensus
-openraft = { version = "0.10.0-alpha.36", features = ["serde"] }
+openraft = { version = "0.10.0-alpha.37", features = ["serde"] }
 
 # Full-text search.
 # default-features = false to drop `columnar-zstd-compression`, the only tantivy
 # default feature that pulls the C `zstd` (zstd-sys) crate. FTS index compression
 # uses lz4 instead, keeping the whole stack pure Rust (no FFI) and
 # letting the musl release build run without the `-D_FORTIFY_SOURCE=0` workaround.
-tantivy = { version = "0.26", default-features = false, features = [
+tantivy = { version = "0.27", default-features = false, features = [
     "mmap",
     "stopwords",
     "lz4-compression",
     "stemmer",
 ] }
-rust-stemmers = { package = "structured-stemmers", version = "=1.2.0" }
+# Stored full-text and encrypted stem tokens depend on the exact stems; the
+# search crate's stem-stability test fails when an update changes one.
+rust-stemmers = { package = "structured-stemmers", version = "1.2.1" }
 whatlang = "0.18"
 
 # CJK tokenization (optional, per-language feature flags)
@@ -107,10 +109,11 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # Parser
-# Preserve the supported pure-Rust parser and proc-macro dependency family.
-# https://github.com/pest-parser/pest/issues/1233
-pest = "=2.9.2"
-pest_derive = "=2.9.2"
+# Without default features: pest's `std` feature pulls its native stack
+# guard (stacker / psm, which need a C compiler), and the grammar needs
+# nothing from `std`.
+pest = { version = "2.9.5", default-features = false, features = ["memchr"] }
+pest_derive = { version = "2.9.5", default-features = false }
 # SQL parser for the SQL QueryFrontend, pure Rust, Apache-2.0.
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 
@@ -140,7 +143,7 @@ bzip2-rs = "0.1"
 flate2 = "1"
 # parking_lot: fast userspace-fast-path RwLock/Mutex, ~8-byte vs std's ~40-byte,
 # no futex syscall on the uncontended path. Std-only, std-tier consumers only.
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Async utilities
 futures-util = "0.3"

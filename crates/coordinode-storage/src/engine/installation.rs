@@ -714,7 +714,8 @@ pub(crate) struct Installations {
     /// Every batch applied to the index tree holds it shared; registering or
     /// publishing a replacement holds it exclusively, for the time of one
     /// catalog write, so a batch reaches either both copies or the old one.
-    fence: parking_lot::RwLock<()>,
+    /// Recursive: a batch may run inside another engine write.
+    fence: parking_lot::RecursiveRwLock<()>,
     /// Replacements found unfinished at open, cleared once the store's seqno
     /// is restored.
     unfinished: parking_lot::Mutex<Vec<(u64, u64)>>,
@@ -812,7 +813,7 @@ impl Installations {
             }),
             imported: parking_lot::Mutex::new(bindings.staging.keys().copied().collect()),
             current: parking_lot::RwLock::new(Arc::new(bindings)),
-            fence: parking_lot::RwLock::new(()),
+            fence: parking_lot::RecursiveRwLock::new(()),
             unfinished: parking_lot::Mutex::new(unfinished),
         })
     }
@@ -1159,7 +1160,7 @@ fn lower_admits(bound: &Bound<Vec<u8>>, key: &[u8]) -> bool {
 /// published between batches, never inside one.
 pub(crate) struct Addressing<'a> {
     installations: Option<&'a Installations>,
-    _applying: Option<parking_lot::RwLockReadGuard<'a, ()>>,
+    _applying: Option<parking_lot::RecursiveRwLockReadGuard<'a, ()>>,
     tree: &'a AnyTree,
     seqno: SeqNo,
     bindings: Option<Arc<Bindings>>,
@@ -1176,8 +1177,8 @@ impl<'a> Addressing<'a> {
         seqno: SeqNo,
     ) -> Self {
         // Taken before the bindings are read, so they stay current for the
-        // whole batch. Recursive: a batch may run inside another engine write.
-        let applying = installations.map(|i| i.fence.read_recursive());
+        // whole batch.
+        let applying = installations.map(|i| i.fence.read());
         Self {
             bindings: installations.map(Installations::current),
             _applying: applying,

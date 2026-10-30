@@ -4,6 +4,9 @@
 // fixtures that plant raw state. See clippy.toml for the disallowed type.
 #![deny(clippy::disallowed_types)]
 
+// The pest parsers are generated against `alloc` (pest builds without `std`).
+extern crate alloc;
+
 pub mod advisor;
 pub mod cypher;
 pub mod executor;

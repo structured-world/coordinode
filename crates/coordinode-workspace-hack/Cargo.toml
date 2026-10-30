@@ -28,7 +28,7 @@ anstyle-parse = { version = "1" }
 anstyle-query = { version = "1", default-features = false }
 arc-swap = { version = "1", default-features = false }
 atomic-waker = { version = "1", default-features = false }
-base64 = { version = "0.22" }
+base64 = { version = "0.23" }
 bigdecimal = { version = "0.4", default-features = false, features = ["serde"] }
 bit-set = { version = "0.11" }
 bit-vec = { version = "0.10" }
@@ -70,7 +70,7 @@ crypto-common = { version = "0.2", default-features = false, features = ["getran
 ctr = { version = "0.10", default-features = false }
 ctutils = { version = "0.4", default-features = false }
 dashmap = { version = "6", default-features = false }
-datasketches = { version = "0.2", default-features = false }
+datasketches = { version = "0.5", features = ["hll"] }
 deranged = { version = "0.5", features = ["serde"] }
 digest = { version = "0.11", features = ["alloc", "mac", "oid"] }
 downcast-rs = { version = "2" }
@@ -86,6 +86,7 @@ flume = { version = "0.12", default-features = false }
 fnv = { version = "1" }
 foldhash-6f8ce4dd05d13bba = { package = "foldhash", version = "0.2", default-features = false }
 foldhash-c65f7effa3be6d31 = { package = "foldhash", version = "0.1", default-features = false }
+frostem = { version = "1", default-features = false, features = ["arabic", "danish", "dutch", "english", "finnish", "french", "german", "greek", "hungarian", "italian", "norwegian", "portuguese", "romanian", "russian", "spanish", "swedish", "tamil", "turkish"] }
 fs4-594e8ee84c453af0 = { package = "fs4", version = "0.13" }
 fs4-dff4ba8e3ae991db = { package = "fs4", version = "1" }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
@@ -97,8 +98,8 @@ ghash = { version = "0.6", default-features = false }
 half = { version = "2", default-features = false }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
-hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false }
-hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
+hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
+hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", default-features = false, features = ["default-hasher", "raw-entry"] }
 hmac = { version = "0.13", default-features = false }
 htmlescape = { version = "0.3", default-features = false }
 hybrid-array = { version = "0.4", default-features = false }
@@ -112,19 +113,19 @@ itoa = { version = "1", default-features = false }
 lazy_static = { version = "1", default-features = false }
 levenshtein_automata = { version = "0.2", default-features = false }
 libm = { version = "0.2" }
-lock_api = { version = "0.4" }
+lock_api-9fbad63c4bcf4a8f = { package = "lock_api", version = "0.4" }
+lock_api-d8f496e17d97b5cb = { package = "lock_api", version = "0.5" }
 log = { version = "0.4", default-features = false, features = ["std"] }
-lru = { version = "0.16" }
-lz4_flex-582f2526e08bb6a0 = { package = "lz4_flex", version = "0.14" }
-lz4_flex-594e8ee84c453af0 = { package = "lz4_flex", version = "0.13", default-features = false }
+lru = { version = "0.18" }
+lz4_flex = { version = "0.14" }
 matchers = { version = "0.2", default-features = false }
 measure_time = { version = "0.9", default-features = false }
-memchr = { version = "2" }
+memchr = { version = "2", default-features = false, features = ["std"] }
 memmap2 = { version = "0.9", default-features = false }
 metrics = { version = "0.24", default-features = false }
 metrics-util = { version = "0.20" }
 minimal-lexical = { version = "0.2", default-features = false, features = ["std"] }
-murmurhash32 = { version = "0.3", default-features = false }
+murmurhash32 = { version = "0.4", default-features = false }
 nanoid = { version = "0.5" }
 nibble_vec = { version = "0.1", default-features = false }
 nom = { version = "7" }
@@ -139,9 +140,9 @@ oorandom = { version = "11", default-features = false }
 ordered-float = { version = "5" }
 ownedbytes = { version = "0.9", default-features = false }
 page_size = { version = "0.6", default-features = false }
-parking_lot = { version = "0.12" }
-parking_lot_core = { version = "0.9", default-features = false }
-pest = { version = "2" }
+parking_lot = { version = "0.13" }
+parking_lot_core-274715c4dabd11b0 = { package = "parking_lot_core", version = "0.9", default-features = false }
+parking_lot_core-93f6ce9d446188ac = { package = "parking_lot_core", version = "0.10", default-features = false }
 pin-project-lite = { version = "0.2", default-features = false }
 plotters = { version = "0.3", default-features = false, features = ["area_series", "line_series", "svg_backend"] }
 plotters-backend = { version = "0.3", default-features = false }
@@ -169,7 +170,6 @@ regex-syntax = { version = "0.8" }
 rmp = { version = "0.8" }
 rmp-serde = { version = "1", default-features = false }
 rmpv = { version = "1", default-features = false, features = ["with-serde"] }
-rust-stemmers = { version = "1", default-features = false }
 rustc-hash = { version = "2" }
 rustls-pki-types = { version = "1", features = ["std"] }
 rusty-fork = { version = "0.3", default-features = false, features = ["timeout"] }
@@ -177,6 +177,7 @@ s2 = { version = "0.2" }
 same-file = { version = "1", default-features = false }
 scopeguard = { version = "1", default-features = false }
 serde = { version = "1", features = ["alloc", "derive"] }
+serde-tuple-vec-map = { version = "1" }
 serde_bytes = { version = "0.11" }
 serde_core = { version = "1", default-features = false, features = ["alloc", "result", "std"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -192,14 +193,15 @@ stable_deref_trait = { version = "1" }
 stats_alloc = { version = "0.1" }
 streamvbyte64 = { version = "0.2", default-features = false }
 structured-stemmers = { version = "1", default-features = false }
-tantivy = { version = "0.26", default-features = false, features = ["lz4-compression", "mmap", "stemmer", "stopwords"] }
-tantivy-bitpacker = { version = "0.10", default-features = false }
-tantivy-columnar = { version = "0.7", default-features = false }
-tantivy-common = { version = "0.11", default-features = false }
+structured-zstd = { version = "0.2" }
+tantivy = { version = "0.27", default-features = false, features = ["lz4-compression", "mmap", "stemmer", "stopwords"] }
+tantivy-bitpacker = { version = "0.27", default-features = false }
+tantivy-columnar = { version = "0.27", default-features = false }
+tantivy-common = { version = "0.27", default-features = false }
 tantivy-fst = { version = "0.5" }
-tantivy-query-grammar = { version = "0.26", default-features = false }
-tantivy-sstable = { version = "0.7", default-features = false }
-tantivy-stacker = { version = "0.7", default-features = false }
+tantivy-query-grammar = { version = "0.27", default-features = false }
+tantivy-sstable = { version = "0.27", default-features = false }
+tantivy-stacker = { version = "0.27", default-features = false }
 tantivy-tokenizer-api = { version = "0.7", default-features = false }
 tempfile = { version = "3" }
 test-log = { version = "0.2" }
@@ -214,14 +216,14 @@ tracing-core = { version = "0.1" }
 tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
 tracing-serde = { version = "0.2", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-twox-hash = { version = "2", default-features = false, features = ["xxhash32"] }
+twox-hash = { version = "2", default-features = false, features = ["xxhash32", "xxhash64"] }
 typeid = { version = "1", default-features = false }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 typetag = { version = "0.2", default-features = false }
-ucd-trie = { version = "0.1", default-features = false, features = ["std"] }
 unarray = { version = "0.1", default-features = false }
 unicode-normalization = { version = "0.1" }
 universal-hash = { version = "0.6", default-features = false }
+unwrap-infallible = { version = "1" }
 utf8-ranges = { version = "1", default-features = false }
 utf8parse = { version = "0.2" }
 uuid = { version = "1", features = ["serde", "v4"] }
@@ -248,7 +250,7 @@ arc-swap = { version = "1", default-features = false }
 async-trait = { version = "0.1", default-features = false }
 atomic-waker = { version = "1", default-features = false }
 autocfg = { version = "1", default-features = false }
-base64 = { version = "0.22" }
+base64 = { version = "0.23" }
 bigdecimal = { version = "0.4", default-features = false, features = ["serde"] }
 bit-set = { version = "0.11" }
 bit-vec = { version = "0.10" }
@@ -294,7 +296,7 @@ darling = { version = "0.24" }
 darling_core = { version = "0.24", default-features = false, features = ["suggestions"] }
 darling_macro = { version = "0.24", default-features = false }
 dashmap = { version = "6", default-features = false }
-datasketches = { version = "0.2", default-features = false }
+datasketches = { version = "0.5", features = ["hll"] }
 deranged = { version = "0.5", features = ["serde"] }
 digest = { version = "0.11", features = ["alloc", "mac", "oid"] }
 downcast-rs = { version = "2" }
@@ -310,6 +312,7 @@ flume = { version = "0.12", default-features = false }
 fnv = { version = "1" }
 foldhash-6f8ce4dd05d13bba = { package = "foldhash", version = "0.2", default-features = false }
 foldhash-c65f7effa3be6d31 = { package = "foldhash", version = "0.1", default-features = false }
+frostem = { version = "1", default-features = false, features = ["arabic", "danish", "dutch", "english", "finnish", "french", "german", "greek", "hungarian", "italian", "norwegian", "portuguese", "romanian", "russian", "spanish", "swedish", "tamil", "turkish"] }
 fs4-594e8ee84c453af0 = { package = "fs4", version = "0.13" }
 fs4-dff4ba8e3ae991db = { package = "fs4", version = "1" }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
@@ -322,8 +325,8 @@ ghash = { version = "0.6", default-features = false }
 half = { version = "2", default-features = false }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
-hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false }
-hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
+hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
+hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", default-features = false, features = ["default-hasher", "raw-entry"] }
 hmac = { version = "0.13", default-features = false }
 htmlescape = { version = "0.3", default-features = false }
 hybrid-array = { version = "0.4", default-features = false }
@@ -338,19 +341,19 @@ itoa = { version = "1", default-features = false }
 lazy_static = { version = "1", default-features = false }
 levenshtein_automata = { version = "0.2", default-features = false }
 libm = { version = "0.2" }
-lock_api = { version = "0.4" }
+lock_api-9fbad63c4bcf4a8f = { package = "lock_api", version = "0.4" }
+lock_api-d8f496e17d97b5cb = { package = "lock_api", version = "0.5" }
 log = { version = "0.4", default-features = false, features = ["std"] }
-lru = { version = "0.16" }
-lz4_flex-582f2526e08bb6a0 = { package = "lz4_flex", version = "0.14" }
-lz4_flex-594e8ee84c453af0 = { package = "lz4_flex", version = "0.13", default-features = false }
+lru = { version = "0.18" }
+lz4_flex = { version = "0.14" }
 matchers = { version = "0.2", default-features = false }
 measure_time = { version = "0.9", default-features = false }
-memchr = { version = "2" }
+memchr = { version = "2", default-features = false, features = ["std"] }
 memmap2 = { version = "0.9", default-features = false }
 metrics = { version = "0.24", default-features = false }
 metrics-util = { version = "0.20" }
 minimal-lexical = { version = "0.2", default-features = false, features = ["std"] }
-murmurhash32 = { version = "0.3", default-features = false }
+murmurhash32 = { version = "0.4", default-features = false }
 nanoid = { version = "0.5" }
 nibble_vec = { version = "0.1", default-features = false }
 nom = { version = "7" }
@@ -365,11 +368,11 @@ oorandom = { version = "11", default-features = false }
 ordered-float = { version = "5" }
 ownedbytes = { version = "0.9", default-features = false }
 page_size = { version = "0.6", default-features = false }
-parking_lot = { version = "0.12" }
-parking_lot_core = { version = "0.9", default-features = false }
-pest = { version = "2" }
-pest_derive = { version = "2" }
-pest_generator = { version = "2", default-features = false, features = ["std"] }
+parking_lot = { version = "0.13" }
+parking_lot_core-274715c4dabd11b0 = { package = "parking_lot_core", version = "0.9", default-features = false }
+parking_lot_core-93f6ce9d446188ac = { package = "parking_lot_core", version = "0.10", default-features = false }
+pest_derive = { version = "2", default-features = false }
+pest_generator = { version = "2", default-features = false }
 pest_meta = { version = "2" }
 pin-project-lite = { version = "0.2", default-features = false }
 plotters = { version = "0.3", default-features = false, features = ["area_series", "line_series", "svg_backend"] }
@@ -401,7 +404,6 @@ regex-syntax = { version = "0.8" }
 rmp = { version = "0.8" }
 rmp-serde = { version = "1", default-features = false }
 rmpv = { version = "1", default-features = false, features = ["with-serde"] }
-rust-stemmers = { version = "1", default-features = false }
 rustc-hash = { version = "2" }
 rustc_version = { version = "0.4", default-features = false }
 rustls-pki-types = { version = "1", features = ["std"] }
@@ -412,6 +414,7 @@ same-file = { version = "1", default-features = false }
 scopeguard = { version = "1", default-features = false }
 semver = { version = "1" }
 serde = { version = "1", features = ["alloc", "derive"] }
+serde-tuple-vec-map = { version = "1" }
 serde_bytes = { version = "0.11" }
 serde_core = { version = "1", default-features = false, features = ["alloc", "result", "std"] }
 serde_derive = { version = "1" }
@@ -429,16 +432,17 @@ stats_alloc = { version = "0.1" }
 streamvbyte64 = { version = "0.2", default-features = false }
 strsim = { version = "0.11", default-features = false }
 structured-stemmers = { version = "1", default-features = false }
+structured-zstd = { version = "0.2" }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit-mut"] }
-tantivy = { version = "0.26", default-features = false, features = ["lz4-compression", "mmap", "stemmer", "stopwords"] }
-tantivy-bitpacker = { version = "0.10", default-features = false }
-tantivy-columnar = { version = "0.7", default-features = false }
-tantivy-common = { version = "0.11", default-features = false }
+tantivy = { version = "0.27", default-features = false, features = ["lz4-compression", "mmap", "stemmer", "stopwords"] }
+tantivy-bitpacker = { version = "0.27", default-features = false }
+tantivy-columnar = { version = "0.27", default-features = false }
+tantivy-common = { version = "0.27", default-features = false }
 tantivy-fst = { version = "0.5" }
-tantivy-query-grammar = { version = "0.26", default-features = false }
-tantivy-sstable = { version = "0.7", default-features = false }
-tantivy-stacker = { version = "0.7", default-features = false }
+tantivy-query-grammar = { version = "0.27", default-features = false }
+tantivy-sstable = { version = "0.27", default-features = false }
+tantivy-stacker = { version = "0.27", default-features = false }
 tantivy-tokenizer-api = { version = "0.7", default-features = false }
 tempfile = { version = "3" }
 test-log = { version = "0.2" }
@@ -457,16 +461,16 @@ tracing-core = { version = "0.1" }
 tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
 tracing-serde = { version = "0.2", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-twox-hash = { version = "2", default-features = false, features = ["xxhash32"] }
+twox-hash = { version = "2", default-features = false, features = ["xxhash32", "xxhash64"] }
 typeid = { version = "1", default-features = false }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 typetag = { version = "0.2", default-features = false }
 typetag-impl = { version = "0.2", default-features = false }
-ucd-trie = { version = "0.1", default-features = false, features = ["std"] }
 unarray = { version = "0.1", default-features = false }
 unicode-ident = { version = "1", default-features = false }
 unicode-normalization = { version = "0.1" }
 universal-hash = { version = "0.6", default-features = false }
+unwrap-infallible = { version = "1" }
 utf8-ranges = { version = "1", default-features = false }
 utf8parse = { version = "0.2" }
 uuid = { version = "1", features = ["serde", "v4"] }
@@ -588,7 +592,8 @@ winapi = { version = "0.3", default-features = false, features = ["profileapi", 
 winapi-util = { version = "0.1", default-features = false }
 windows-link = { version = "0.2", default-features = false }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_SystemInformation"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO"] }
 windows-targets = { version = "0.52", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }
 
@@ -605,7 +610,8 @@ winapi = { version = "0.3", default-features = false, features = ["profileapi", 
 winapi-util = { version = "0.1", default-features = false }
 windows-link = { version = "0.2", default-features = false }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_SystemInformation"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO"] }
 windows-targets = { version = "0.52", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }
 

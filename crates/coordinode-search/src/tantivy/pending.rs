@@ -8,6 +8,7 @@
 
 use coordinode_core::budget::Meter;
 use tantivy::collector::TopDocs;
+use tantivy::directory::RamDirectory;
 use tantivy::query::{
     Bm25StatisticsProvider, BooleanQuery, EnableScoring, Occur, Query, TermSetQuery,
 };
@@ -15,7 +16,7 @@ use tantivy::schema::Field;
 use tantivy::schema::document::Value as _;
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{
-    DocAddress, DocId, DocSet as _, Index, ReloadPolicy, Score, Searcher, SegmentOrdinal,
+    DocAddress, DocId, DocSet as _, IndexBuilder, ReloadPolicy, Score, Searcher, SegmentOrdinal,
     SingleSegmentIndexWriter, TERMINATED, TantivyDocument, Term,
 };
 
@@ -111,11 +112,11 @@ impl TextIndex {
                 added: Corpus::default(),
             });
         }
-        let mut index = Index::create_in_ram(self.schema.clone());
         // The same analyzers, for snippets of the pending documents.
-        index.set_tokenizers(self.index.tokenizers().clone());
-        let mut writer: SingleSegmentIndexWriter =
-            SingleSegmentIndexWriter::new(index, PENDING_SEGMENT_BUDGET)?;
+        let mut writer: SingleSegmentIndexWriter = IndexBuilder::new()
+            .schema(self.schema.clone())
+            .tokenizers(self.index.tokenizers().clone())
+            .single_segment_index_writer(RamDirectory::create(), PENDING_SEGMENT_BUDGET)?;
         let mut added = Corpus::default();
         for (document, tokens) in documents {
             added.add(&tokens);
