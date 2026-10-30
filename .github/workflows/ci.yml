@@ -25,6 +25,25 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  parser:
+    name: Generated parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The committed parser matches the grammar
+        run: cargo run --locked --manifest-path tools/pest-codegen/Cargo.toml -- --check
+      - name: No parser generator in the product's build
+        # The parser is generated ahead of time so a build needs pest's
+        # runtime only; pest's generator brings a native stack guard
+        # (stacker / psm) built with a C compiler.
+        run: |
+          tree=$(cargo tree --workspace --all-features -e all --target all --prefix none)
+          if printf '%s\n' "$tree" | grep -E '^(pest_derive|pest_generator|pest_meta|stacker|psm) v'; then
+            echo "::error::the product's build must not compile pest's generator or a native stack guard"
+            exit 1
+          fi
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

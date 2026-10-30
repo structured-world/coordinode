@@ -1,0 +1,20 @@
+[workspace]
+# Standalone workspace: the parser generator runs at development time and in
+# its CI check, never in a build of the product, so its dependencies (pest's
+# generator, whose native stack guard needs a C compiler) stay out of the
+# product's dependency graph.
+
+[package]
+name = "coordinode-pest-codegen"
+description = "Generates the Cypher parser from its pest grammar, or checks that the committed parser matches it."
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+pest_generator = "2.9.5"
+prettyplease = "0.3"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full", "parsing"] }

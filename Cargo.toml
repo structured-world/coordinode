@@ -29,6 +29,8 @@ exclude = [
     # Standalone bench workspaces. Build via `cd benches/<name> && cargo build`.
     "benches/gold",
     "benches/vector-ann",
+    # The parser generator, run at development time and by its CI check.
+    "tools/pest-codegen",
 ]
 
 [workspace.package]
@@ -109,11 +111,10 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # Parser
-# Without default features: pest's `std` feature pulls its native stack
-# guard (stacker / psm, which need a C compiler), and the grammar needs
-# nothing from `std`.
+# The Cypher parser is generated ahead of time (tools/pest-codegen); a build
+# needs pest's runtime only. Without default features: pest's `std` feature
+# pulls its native stack guard (stacker / psm, which need a C compiler).
 pest = { version = "2.9.5", default-features = false, features = ["memchr"] }
-pest_derive = { version = "2.9.5", default-features = false }
 # SQL parser for the SQL QueryFrontend, pure Rust, Apache-2.0.
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 

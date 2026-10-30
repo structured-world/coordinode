@@ -23,7 +23,6 @@ coordinode-vector = { workspace = true }
 coordinode-cluster = { workspace = true }
 coordinode-search = { workspace = true }
 pest = { workspace = true }
-pest_derive = { workspace = true }
 sqlparser = { workspace = true }
 sha2 = { workspace = true }
 rmp-serde = { workspace = true }

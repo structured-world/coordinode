@@ -59,6 +59,16 @@ cargo update -p <crate>@<old version> --precise <new version>
 cargo hakari generate
 ```
 
+**After changing the Cypher grammar** (`crates/coordinode-query/src/cypher/cypher.pest`),
+regenerate its parser and commit the result; CI fails while the two disagree:
+
+```bash
+cargo run --manifest-path tools/pest-codegen/Cargo.toml
+```
+
+The parser is generated ahead of time so that a build compiles it against
+pest's runtime alone, without the parser generator.
+
 **Windows.** File locking, path handling and socket teardown differ on
 Windows. To run the same gate there before pushing, point the script at a
 Windows machine reachable over SSH (PowerShell as the default shell, with git,

@@ -105,6 +105,9 @@ benches/vector-ann/target/
 benches/vector-ann/Cargo.lock
 benches/gold/target/
 benches/gold/Cargo.lock
+# Parser generator build output (its lockfile is committed: the generated
+# parser depends on the generator's version)
+tools/pest-codegen/target/
 
 # External test fixtures (Neo4j example dumps etc.) - downloaded, not versioned
 /test-data/

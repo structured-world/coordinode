@@ -10,9 +10,12 @@ use pest::iterators::{Pair, Pairs};
 use super::ast::*;
 use super::errors::{ErrorSpan, ParseError};
 
-#[derive(pest_derive::Parser)]
-#[grammar = "cypher/cypher.pest"]
-struct CypherParser;
+// Generated from `cypher.pest` ahead of time (tools/pest-codegen), so a build
+// compiles the parser against pest's runtime alone. rustfmt stays out: the
+// generator formats it, and rustfmt takes minutes on its rule chains.
+#[rustfmt::skip]
+mod generated;
+use generated::{CypherParser, Rule};
 
 /// Parse a Cypher query string into a typed AST.
 pub fn parse(input: &str) -> Result<Query, ParseError> {
