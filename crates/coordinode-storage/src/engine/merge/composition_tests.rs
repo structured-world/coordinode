@@ -151,7 +151,7 @@ fn a_removal_folded_without_its_base_would_lose_the_removal() {
 fn a_patch_folded_without_its_base_would_replace_the_record() {
     let merger = DocumentMerge;
 
-    let mut original = NodeRecord::new("User");
+    let mut original = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
     original.set_extra(
         "name",
         coordinode_core::graph::types::Value::String("Alice".to_string()),

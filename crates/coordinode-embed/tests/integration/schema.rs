@@ -328,15 +328,16 @@ fn create_label_schema_replaces_at_the_next_revision() {
     assert!(schema.get_property("count").is_some());
 }
 
-/// Current-revision pointer is written together with the schema body on
-/// `create_label_schema`. Reading via the pointer yields the
-/// same schema as reading the versioned key directly.
+/// The name binding is written together with the schema body on
+/// `create_label_schema`: it names the label's identity and declared
+/// revision, and the body keyed by that identity and revision is the schema.
 #[test]
-fn current_revision_pointer_written_alongside_label_schema() {
+fn name_binding_written_alongside_label_schema() {
     use coordinode_core::schema::definition::{
         LabelSchema, PropertyDef, PropertyType, encode_label_current_revision_key,
         encode_label_schema_key,
     };
+    use coordinode_core::schema::label_id::{BindingState, LabelBinding};
     use coordinode_storage::engine::partition::Partition;
 
     let (db, _dir) = open_db();
@@ -345,24 +346,25 @@ fn current_revision_pointer_written_alongside_label_schema() {
     schema.add_property(PropertyDef::new("name", PropertyType::String));
     let version = db.create_label_schema(schema).expect("create");
 
-    // Pointer must exist and decode to the same version.
-    let pointer_bytes = db
+    // The binding must exist and name the declared revision.
+    let binding_bytes = db
         .engine()
         .get(
             Partition::Schema,
             &encode_label_current_revision_key("Project"),
         )
-        .expect("pointer get")
-        .expect("pointer must be present");
-    let pointer_arr: [u8; 8] = pointer_bytes.as_ref().try_into().expect("u64 BE");
-    assert_eq!(u64::from_be_bytes(pointer_arr), version);
+        .expect("binding get")
+        .expect("binding must be present");
+    let binding = LabelBinding::decode(&binding_bytes).expect("a label binding");
+    assert_eq!(binding.state, BindingState::Declared);
+    assert_eq!(binding.declared_revision(), version);
 
-    // Direct read of the versioned key returns the schema body.
+    // Direct read of the identity-keyed body returns the schema.
     let body = db
         .engine()
         .get(
             Partition::Schema,
-            &encode_label_schema_key("Project", version),
+            &encode_label_schema_key(binding.id, version),
         )
         .expect("body get")
         .expect("body must be present");
@@ -435,7 +437,10 @@ fn hash_placement_label_roundtrips() {
         .engine()
         .get(
             Partition::Schema,
-            &encode_label_schema_key("Order", version),
+            &encode_label_schema_key(
+                super::helpers::label_id(db.engine(), "Order").expect("bound"),
+                version,
+            ),
         )
         .expect("get")
         .expect("body");
@@ -470,7 +475,10 @@ fn range_placement_label_roundtrips() {
         .engine()
         .get(
             Partition::Schema,
-            &encode_label_schema_key("Event", version),
+            &encode_label_schema_key(
+                super::helpers::label_id(db.engine(), "Event").expect("bound"),
+                version,
+            ),
         )
         .expect("get")
         .expect("body");
@@ -608,8 +616,9 @@ fn dangling_label_pointer_surfaces_error() {
         .expect("seed");
 
     // Delete the schema body but keep the pointer — leaves a dangling pointer.
+    let acct = super::helpers::label_id(db.engine(), "Acct").expect("bound");
     db.engine_shared()
-        .delete(Partition::Schema, &encode_label_schema_key("Acct", version))
+        .delete(Partition::Schema, &encode_label_schema_key(acct, version))
         .expect("drop schema body");
     // Confirm pointer is still in place.
     let _present = db

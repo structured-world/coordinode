@@ -20,6 +20,7 @@ use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeRecord, decode_node_key, decode_temporal_node_key};
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::EntryOwner;
+use coordinode_core::schema::label_id::LabelId;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_modality::{IndexStore as _, LocalNodeStore, NodeStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
@@ -114,9 +115,6 @@ pub enum BackfillError {
     /// pages, leaving the build to whoever opens the storage next.
     #[error("the index backfill stopped because its process is closing")]
     Stopped,
-    /// The label names of a page could not be resolved to dictionary ids.
-    #[error("the label lookup build could not resolve label names: {0}")]
-    Names(String),
 }
 
 impl From<IndexWriteError> for BackfillError {
@@ -159,20 +157,12 @@ pub struct Backfill<'a> {
     /// Set when the process is closing: the backfill stops before its next
     /// page or wait slice with [`BackfillError::Stopped`].
     pub stop: Option<&'a core::sync::atomic::AtomicBool>,
-    /// Resolves label names to their dictionary ids, registering the ones
-    /// without one, for a label lookup build: stored nodes may hold labels
-    /// no write has registered yet. `None` for any other build.
-    pub labels: Option<ResolveNames<'a>>,
     /// A seqno past which every node row was written by a writer that
     /// maintained the index, known when the index was registered with no
     /// transaction open: the rows past it are passed over. `None`: learned
     /// by waiting for the transactions opened before the index.
     pub maintained_after: Option<u64>,
 }
-
-/// What a label lookup build resolves a page's label names through: the ids
-/// of the names given, in order, each registered first if it has none.
-pub type ResolveNames<'a> = &'a dyn Fn(&[&str]) -> Result<Vec<u32>, String>;
 
 /// What a backfill does about a stored node whose value of a unique index
 /// another node holds.
@@ -213,10 +203,9 @@ pub const DEFAULT_OLDER_TRANSACTIONS_WAIT: std::time::Duration = std::time::Dura
 impl<'a> Backfill<'a> {
     /// Stage the label postings of the ordinary nodes of `rows`, one page of
     /// the shard, in the label lookup `index`, appending the node keys read
-    /// to `read`; returns the postings staged. The page's label names are
-    /// resolved in one batch. A row last written after `maintained_after`
-    /// was written by a writer that staged its postings itself, and is
-    /// passed over rather than written twice.
+    /// to `read`; returns the postings staged. A row last written after
+    /// `maintained_after` was written by a writer that staged its postings
+    /// itself, and is passed over rather than written twice.
     fn stage_page_labels(
         &self,
         txn: &mut Transaction<'a>,
@@ -226,12 +215,8 @@ impl<'a> Backfill<'a> {
         read: &mut Vec<Vec<u8>>,
         membership: &mut crate::index::membership::CatalogMembership<'_>,
     ) -> Result<u64, BackfillError> {
-        let resolve = self.labels.ok_or_else(|| {
-            BackfillError::Store(StoreError::Invariant(
-                "a label lookup build needs the dictionary to resolve label names".into(),
-            ))
-        })?;
-        let mut members: Vec<(NodeId, Vec<String>)> = Vec::with_capacity(rows.len());
+        let store = coordinode_modality::LocalIndexStore::new(self.engine);
+        let mut staged = 0u64;
         for (key, bytes) in rows {
             // A version of a temporal node gives the node every label it
             // holds: its history keeps them.
@@ -255,44 +240,12 @@ impl<'a> Backfill<'a> {
                 })?;
             // The lookup holds every label a node carries, its type's
             // implied ones included.
-            let carried = membership
-                .of_stored(&stored)?
-                .iter()
-                .map(str::to_string)
-                .collect();
-            members.push((node, carried));
-            read.push(key.clone());
-        }
-        let mut names: Vec<&str> = members
-            .iter()
-            .flat_map(|(_, labels)| labels.iter().map(String::as_str))
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-        if names.is_empty() {
-            return Ok(0);
-        }
-        let ids = resolve(&names).map_err(BackfillError::Names)?;
-        if ids.len() != names.len() {
-            return Err(BackfillError::Names(format!(
-                "{} ids resolved for {} label names",
-                ids.len(),
-                names.len()
-            )));
-        }
-        let id_of = |name: &str| {
-            names
-                .binary_search(&name)
-                .ok()
-                .and_then(|at| ids.get(at).copied())
-        };
-        let store = coordinode_modality::LocalIndexStore::new(self.engine);
-        let mut staged = 0u64;
-        for (node, labels) in &members {
-            let added: Vec<u32> = labels.iter().filter_map(|l| id_of(l)).collect();
-            store.stage_label_postings_txn(txn, index, self.shard_id, *node, &[], &added)?;
+            let carried: smallvec::SmallVec<[LabelId; 8]> =
+                membership.of_stored(&stored)?.iter().collect();
+            store.stage_label_postings_txn(txn, index, self.shard_id, node, &[], &carried)?;
             // One posting per label held; a node holds few labels.
-            staged += added.len() as u64;
+            staged += carried.len() as u64;
+            read.push(key.clone());
         }
         Ok(staged)
     }
@@ -343,6 +296,9 @@ impl<'a> Backfill<'a> {
         let mut page_repairs = 0usize;
         // What each type implies, compiled once for the whole build.
         let mut membership = crate::index::membership::CatalogMembership::current(self.engine);
+        // The identity the index's label is bound to; a label without one
+        // is carried by no node yet.
+        let label = membership.label_id(&index.label)?;
         loop {
             self.check_stop()?;
             let mut txn = match self.oracle {
@@ -386,7 +342,10 @@ impl<'a> Backfill<'a> {
                 let record = decode_record(bytes)?;
                 // An index covers every node carrying its label, its type's
                 // implied ones included.
-                if !membership.carries(&record, &index.label)? {
+                let Some(label) = label else {
+                    continue;
+                };
+                if !membership.carries(&record, label)? {
                     continue;
                 }
                 let lookup = record_lookup(&record, self.interner);

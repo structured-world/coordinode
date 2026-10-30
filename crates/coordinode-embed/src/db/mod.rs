@@ -1336,28 +1336,27 @@ impl Database {
                 continue;
             };
             // The index covers the nodes of every type implying its label.
-            let implying =
-                match coordinode_query::index::membership::types_implying(engine, &def.label) {
-                    Ok(implying) => implying,
+            let carriers =
+                match coordinode_query::index::membership::label_carriers(engine, &def.label) {
+                    Ok(carriers) => carriers,
                     Err(reason) => {
                         tracing::warn!(index = %def, %reason, "HNSW rebuild on open failed");
                         health.mark_offline(reason.to_string());
                         continue;
                     }
                 };
-            members.push((def, field_id, hnsw, health, implying));
+            members.push((def, field_id, hnsw, health, carriers));
         }
 
         match mode {
             PopulateMode::Blocking => {
                 let targets: Vec<coordinode_query::index::BuildTarget<'_>> = members
                     .iter()
-                    .map(|(def, field_id, hnsw, health, implying)| {
+                    .map(|(_, field_id, hnsw, health, carriers)| {
                         coordinode_query::index::BuildTarget {
                             hnsw: hnsw.as_ref(),
                             health: health.as_ref(),
-                            label: &def.label,
-                            implying,
+                            carriers: carriers.as_ref(),
                             field_id: *field_id,
                         }
                     })
@@ -1399,9 +1398,9 @@ impl Database {
                 }
             }
             PopulateMode::Background => {
-                for (def, field_id, hnsw, health, implying) in members {
+                for (def, field_id, hnsw, health, carriers) in members {
                     Self::spawn_replica_build(
-                        registry, engine, shard_id, def, field_id, hnsw, health, implying,
+                        registry, engine, shard_id, def, field_id, hnsw, health, carriers,
                     );
                 }
             }
@@ -1420,13 +1419,12 @@ impl Database {
         field_id: u32,
         hnsw: Arc<std::sync::RwLock<coordinode_vector::hnsw::HnswIndex>>,
         health: Arc<coordinode_vector::health::HealthSignal>,
-        implying: Vec<String>,
+        carriers: Option<coordinode_query::index::membership::LabelCarriers>,
     ) {
         let token = registry.new_build_token();
         let build_token = token.clone();
         let engine = Arc::clone(engine);
         let name = def.to_string();
-        let label = def.label.clone();
         // The index was registered rebuilding; without a build it would stay
         // so, and a blocked reader would wait on it until its timeout.
         let unbuilt = Arc::clone(&health);
@@ -1441,8 +1439,7 @@ impl Database {
                         targets: &[coordinode_query::index::BuildTarget {
                             hnsw: hnsw.as_ref(),
                             health: health.as_ref(),
-                            label: &label,
-                            implying: &implying,
+                            carriers: carriers.as_ref(),
                             field_id,
                         }],
                     }
@@ -2752,7 +2749,7 @@ impl Database {
                 feedback_cache: Some(self.feedback_cache.clone()),
                 schema_label_cache: std::collections::HashMap::new(),
                 label_schema_cache: std::collections::HashMap::new(),
-                implied: Default::default(),
+                labels: Default::default(),
                 index_deferred: Default::default(),
                 node_columns: None,
                 applied_watermark: None,
@@ -3469,12 +3466,12 @@ impl Database {
         use coordinode_query::index::text_registry::FindError;
         let budget = statement_budget(self.query_memory_limit, None, None);
         let mut search = coordinode_core::budget::BatchedWork::new(&budget);
-        let implying = coordinode_query::index::membership::types_implying(&self.engine, label)
+        let carriers = coordinode_query::index::membership::label_carriers(&self.engine, label)
             .map_err(|e| DatabaseError::Other(e.to_string()))?;
         let found = self.text_index_registry.find(
             label,
             property,
-            &implying,
+            carriers.as_ref(),
             &read,
             self.shard_id,
             &interner,

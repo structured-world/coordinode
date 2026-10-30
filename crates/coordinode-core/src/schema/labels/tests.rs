@@ -1,45 +1,86 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use super::*;
 use crate::schema::definition::{PropertyDef, PropertyType};
 
 /// A catalog of label definitions; a label absent from it is undeclared.
+/// Each name met gets the next id, in the order it is first met, as the
+/// catalog hands them out.
 #[derive(Default)]
-struct Catalog(HashMap<String, LabelSchema>);
+struct Catalog {
+    schemas: HashMap<String, LabelSchema>,
+    ids: RefCell<Vec<String>>,
+}
 
 impl Catalog {
     fn with(mut self, schema: LabelSchema) -> Self {
-        self.0.insert(schema.name.clone(), schema);
+        self.id(&schema.name);
+        self.schemas.insert(schema.name.clone(), schema);
         self
     }
 
-    fn facts(&self, label: &str) -> Result<LabelFacts, String> {
-        Ok(self.0.get(label).map(LabelFacts::of).unwrap_or_default())
+    fn id(&self, name: &str) -> LabelId {
+        let mut ids = self.ids.borrow_mut();
+        let at = match ids.iter().position(|n| n == name) {
+            Some(at) => at,
+            None => {
+                ids.push(name.to_string());
+                ids.len() - 1
+            }
+        };
+        LabelId::new(u32::try_from(at).unwrap() + 1).unwrap()
     }
 
-    fn resolve(&self, labels: &[&str]) -> Result<NodeLabels<'static>, LabelKindError> {
-        let labels: Vec<String> = labels.iter().map(|l| (*l).to_string()).collect();
-        resolve_node_labels(&labels, |l| self.facts(l))
+    fn name(&self, id: LabelId) -> String {
+        self.ids.borrow()[id.get() as usize - 1].clone()
+    }
+
+    fn names(&self, ids: &[LabelId]) -> Vec<String> {
+        ids.iter().map(|id| self.name(*id)).collect()
+    }
+
+    fn facts(&self, label: LabelId) -> Result<LabelFacts, String> {
+        Ok(match self.schemas.get(&self.name(label)) {
+            Some(schema) => LabelFacts {
+                kind: schema.kind(),
+                implies: schema.implies().iter().map(|l| self.id(l)).collect(),
+            },
+            None => LabelFacts::default(),
+        })
+    }
+
+    /// The stored labels of a node written with `labels`, by name.
+    fn resolve(&self, labels: &[&str]) -> Result<Vec<String>, LabelKindError> {
+        let ids: Vec<LabelId> = labels.iter().map(|l| self.id(l)).collect();
+        resolve_node_labels(&ids, |l| self.facts(l))
             .expect("catalog never fails")
-            .map(NodeLabels::into_owned)
+            .map(|resolved| self.names(&resolved.labels))
     }
 
     fn implied(&self, label: &str) -> Result<ImpliedLabels, LabelKindError> {
-        compile_implied(label, |l| self.facts(l)).expect("catalog never fails")
+        compile_implied(self.id(label), |l| self.facts(l)).expect("catalog never fails")
     }
 
     /// Every label a node written with `labels` carries.
     fn membership(&self, labels: &[&str]) -> Vec<String> {
-        let stored = self.resolve(labels).expect("labels type a node");
-        let implied = self.implied(stored.primary()).expect("no cycle");
-        Membership::new(&stored.labels, &implied)
+        let stored: Vec<LabelId> = self
+            .resolve(labels)
+            .expect("labels type a node")
             .iter()
-            .map(str::to_string)
+            .map(|l| self.id(l))
+            .collect();
+        let implied = compile_implied(stored[0], |l| self.facts(l))
+            .expect("catalog never fails")
+            .expect("no cycle");
+        Membership::new(&stored, &implied)
+            .iter()
+            .map(|l| self.name(l))
             .collect()
     }
 
     fn check(&self, schema: &LabelSchema) -> Result<(), LabelDeclarationError> {
-        check_label_declaration(schema, |l| Ok::<_, String>(self.0.get(l).cloned()))
+        check_label_declaration(schema, |l| Ok::<_, String>(self.schemas.get(l).cloned()))
             .expect("catalog never fails")
     }
 }
@@ -76,21 +117,15 @@ fn goals() -> Catalog {
         .with(auxiliary("Policy"))
 }
 
-fn names<'a>(labels: &'a NodeLabels<'_>) -> Vec<&'a str> {
-    labels.labels.iter().map(String::as_str).collect()
-}
-
 // --- resolve_node_labels ---
 
-/// A single undeclared label is a FLEXIBLE type label, stored unchanged: an
-/// existing single-label database keeps its records byte for byte.
+/// A single undeclared label is a FLEXIBLE type label, stored unchanged.
 #[test]
 fn a_single_undeclared_label_is_its_own_type() {
     let labels = Catalog::default()
         .resolve(&["User"])
         .expect("one type label");
-    assert_eq!(names(&labels), ["User"]);
-    assert_eq!(labels.primary(), "User");
+    assert_eq!(labels, ["User"]);
 }
 
 /// The primary label is found by kind, so the order labels are written in
@@ -101,8 +136,7 @@ fn label_order_does_not_choose_the_primary_label() {
     let a = catalog.resolve(&["Activity", "Goal"]).expect("one type");
     let b = catalog.resolve(&["Goal", "Activity"]).expect("one type");
     assert_eq!(a, b);
-    assert_eq!(a.primary(), "Goal");
-    assert_eq!(names(&a), ["Goal", "Activity"]);
+    assert_eq!(a, ["Goal", "Activity"]);
 }
 
 /// A record stores its type and its own auxiliary labels; the labels the
@@ -111,8 +145,7 @@ fn label_order_does_not_choose_the_primary_label() {
 #[test]
 fn implied_labels_are_carried_not_stored() {
     let catalog = goals();
-    let labels = catalog.resolve(&["Goal"]).expect("one type");
-    assert_eq!(names(&labels), ["Goal"]);
+    assert_eq!(catalog.resolve(&["Goal"]).expect("one type"), ["Goal"]);
     assert_eq!(catalog.membership(&["Goal"]), ["Goal", "Thing"]);
 }
 
@@ -124,8 +157,7 @@ fn a_written_implied_label_is_not_a_second_type() {
     let labels = catalog
         .resolve(&["Thing", "Goal"])
         .expect("Thing is implied");
-    assert_eq!(labels.primary(), "Goal");
-    assert_eq!(names(&labels), ["Goal"]);
+    assert_eq!(labels, ["Goal"]);
     assert_eq!(catalog.membership(&["Thing", "Goal"]), ["Goal", "Thing"]);
 }
 
@@ -137,31 +169,32 @@ fn implied_labels_are_closed_transitively() {
         .with(type_label("Thing", &["Entity"], &[]))
         .with(type_label("Goal", &["Thing"], &[]));
     assert_eq!(
-        catalog.implied("Goal").expect("no cycle").as_slice(),
+        catalog.names(catalog.implied("Goal").expect("no cycle").as_slice()),
         ["Entity", "Thing"]
     );
     assert_eq!(catalog.membership(&["Goal"]), ["Goal", "Entity", "Thing"]);
     let labels = catalog
         .resolve(&["Entity", "Goal"])
         .expect("Entity is implied");
-    assert_eq!(labels.primary(), "Goal");
+    assert_eq!(labels, ["Goal"]);
 }
 
-/// The node's own auxiliary labels and its type's implied ones merge in byte
+/// The node's own auxiliary labels and its type's implied ones merge in id
 /// order, a label in both carried once; membership answers for each.
 #[test]
 fn membership_merges_implied_and_auxiliary_labels() {
+    // Ids in order of declaration: Thing, Goal, Activity, Policy, Thingamajig.
     let catalog = goals().with(auxiliary("Thingamajig"));
     let members = catalog.membership(&["Goal", "Thingamajig", "Activity"]);
-    assert_eq!(members, ["Goal", "Activity", "Thing", "Thingamajig"]);
-    let stored = catalog.resolve(&["Goal", "Activity"]).expect("one type");
+    assert_eq!(members, ["Goal", "Thing", "Activity", "Thingamajig"]);
+    let stored = [catalog.id("Goal"), catalog.id("Activity")];
     let implied = catalog.implied("Goal").expect("no cycle");
-    let membership = Membership::new(&stored.labels, &implied);
+    let membership = Membership::new(&stored, &implied);
     for label in ["Goal", "Activity", "Thing"] {
-        assert!(membership.contains(label), "{label}");
+        assert!(membership.contains(catalog.id(label)), "{label}");
     }
-    assert!(!membership.contains("Policy"));
-    assert_eq!(membership.primary(), Some("Goal"));
+    assert!(!membership.contains(catalog.id("Policy")));
+    assert_eq!(membership.primary(), Some(catalog.id("Goal")));
     assert_eq!(membership.len(), 3);
 }
 
@@ -169,25 +202,35 @@ fn membership_merges_implied_and_auxiliary_labels() {
 /// type label, so it cannot switch the type's schema off.
 #[test]
 fn an_undeclared_label_beside_a_type_is_a_second_type() {
-    let err = goals().resolve(&["Extra", "Goal"]).expect_err("two types");
+    let catalog = goals();
+    let err = catalog.resolve(&["Extra", "Goal"]).expect_err("two types");
     assert_eq!(
         err,
         LabelKindError::TwoTypeLabels {
-            first: "Extra".into(),
-            second: "Goal".into(),
+            first: catalog.id("Extra"),
+            second: catalog.id("Goal"),
         }
+    );
+    assert_eq!(
+        err.describe(|l| catalog.name(l)),
+        "node has two type labels :Extra and :Goal, neither implying the other"
     );
 }
 
 /// The second escape: an auxiliary label alone types nothing.
 #[test]
 fn an_auxiliary_label_alone_is_refused() {
-    let err = goals().resolve(&["Activity"]).expect_err("no type");
+    let catalog = goals();
+    let err = catalog.resolve(&["Activity"]).expect_err("no type");
     assert_eq!(
         err,
         LabelKindError::NoTypeLabel {
-            labels: vec!["Activity".into()],
+            labels: vec![catalog.id("Activity")],
         }
+    );
+    assert_eq!(
+        err.describe(|l| catalog.name(l)),
+        "node has no type label: :Activity are all auxiliary"
     );
 }
 
@@ -224,7 +267,7 @@ fn a_repeated_label_is_stored_once() {
     let labels = goals()
         .resolve(&["Goal", "Activity", "Goal", "Activity"])
         .expect("one type");
-    assert_eq!(names(&labels), ["Goal", "Activity"]);
+    assert_eq!(labels, ["Goal", "Activity"]);
 }
 
 /// A cycle the catalog somehow holds leaves no primary label among types
@@ -250,7 +293,7 @@ fn an_implication_cycle_is_refused() {
 /// The catalog's own failure reaches the caller unchanged.
 #[test]
 fn a_catalog_failure_is_returned() {
-    let labels = vec!["Goal".to_string()];
+    let labels = [LabelId::new(1).unwrap()];
     let err = resolve_node_labels(&labels, |_| Err::<LabelFacts, _>("unreadable"))
         .expect_err("catalog failure");
     assert_eq!(err, "unreadable");
@@ -263,7 +306,7 @@ fn a_catalog_failure_is_returned() {
 fn the_documented_declarations_are_accepted() {
     let catalog = goals();
     for label in ["Thing", "Goal", "Activity"] {
-        catalog.check(&catalog.0[label]).expect(label);
+        catalog.check(&catalog.schemas[label]).expect(label);
     }
 }
 

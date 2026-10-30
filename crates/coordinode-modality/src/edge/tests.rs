@@ -889,7 +889,12 @@ fn an_edge_cannot_attach_to_a_node_that_was_deleted_under_it() {
     let mut setup = mvcc_txn(&db.engine, &db.oracle);
     for id in [alice, bob] {
         LocalNodeStore
-            .put(&mut setup, shard, id, &NodeRecord::new("Person"))
+            .put(
+                &mut setup,
+                shard,
+                id,
+                &NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID),
+            )
             .expect("put node");
     }
     commit(&mut setup);
@@ -947,7 +952,12 @@ fn edges_to_one_live_node_commit_together() {
     let mut setup = mvcc_txn(&db.engine, &db.oracle);
     for id in [hub, NodeId::from_raw(8), NodeId::from_raw(9)] {
         LocalNodeStore
-            .put(&mut setup, shard, id, &NodeRecord::new("Person"))
+            .put(
+                &mut setup,
+                shard,
+                id,
+                &NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID),
+            )
             .expect("put node");
     }
     commit(&mut setup);

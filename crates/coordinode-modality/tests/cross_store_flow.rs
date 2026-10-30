@@ -12,6 +12,7 @@ use coordinode_core::graph::edge::EdgeProperties;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::EntryOwner;
+use coordinode_core::schema::label_id::LabelId;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
@@ -22,6 +23,20 @@ use coordinode_modality::{
 };
 use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 use std::collections::BTreeMap;
+
+/// The labels the flows' nodes store, by identity: the stores carry them
+/// through without reading what they name.
+const USER: LabelId = label(1);
+const SENSOR: LabelId = label(2);
+const DOCUMENT: LabelId = label(3);
+
+/// The id `raw`, evaluated at compile time: every `raw` used is nonzero.
+const fn label(raw: u32) -> LabelId {
+    match LabelId::new(raw) {
+        Some(id) => id,
+        None => unreachable!(),
+    }
+}
 
 /// Commit a transaction's buffered writes (edge merges + edgeprops).
 fn commit(txn: &mut Transaction) {
@@ -109,10 +124,10 @@ fn node_edge_index_document_flow() {
     let bob = NodeId::from_raw(2);
 
     // 1. Create two nodes with a property.
-    let mut alice_rec = NodeRecord::new("User");
+    let mut alice_rec = NodeRecord::new(USER);
     alice_rec.set_extra("name", Value::String("alice".into()));
     put_node(engine, 0, alice, &alice_rec);
-    let mut bob_rec = NodeRecord::new("User");
+    let mut bob_rec = NodeRecord::new(USER);
     bob_rec.set_extra("name", Value::String("bob".into()));
     put_node(engine, 0, bob, &bob_rec);
 
@@ -250,7 +265,7 @@ fn vector_spatial_timeseries_on_same_logical_entity() {
     let ts = LocalTimeSeriesStore;
 
     let sensor = NodeId::from_raw(42);
-    put_node(engine, 0, sensor, &NodeRecord::new("Sensor"));
+    put_node(engine, 0, sensor, &NodeRecord::new(SENSOR));
 
     // Spatial: sensor's GPS location.
     let loc = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
@@ -312,7 +327,7 @@ fn vector_spatial_timeseries_on_same_logical_entity() {
     // Original sensor node still readable through NodeStore — its
     // body wasn't touched by spatial / ts writes.
     let sensor_after = get_node(engine, 0, sensor).expect("Some");
-    assert_eq!(sensor_after.primary_label(), "Sensor");
+    assert_eq!(sensor_after.primary_label(), Some(SENSOR));
 }
 
 /// Blob + NodeStore: a node and the blob property it holds commit in one
@@ -349,7 +364,7 @@ fn a_node_and_its_blob_property_commit_together() {
     {
         let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
         LocalNodeStore
-            .put(&mut txn, 0, dropped, &NodeRecord::new("Document"))
+            .put(&mut txn, 0, dropped, &NodeRecord::new(DOCUMENT))
             .expect("node");
         blobs
             .put_blob(&mut txn, dropped, 0, &upload)
@@ -361,7 +376,7 @@ fn a_node_and_its_blob_property_commit_together() {
     let upload = blobs.upload(&payload).expect("upload");
     let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
     LocalNodeStore
-        .put(&mut txn, 0, node, &NodeRecord::new("Document"))
+        .put(&mut txn, 0, node, &NodeRecord::new(DOCUMENT))
         .expect("node");
     blobs
         .put_blob(&mut txn, node, 0, &upload)
@@ -382,7 +397,7 @@ fn a_node_and_its_blob_property_commit_together() {
             .expect("read")
             .expect("node")
             .primary_label(),
-        "Document"
+        Some(DOCUMENT)
     );
     let reader = blobs
         .open_blob(&txn, node, 0)

@@ -34,6 +34,12 @@ type PropertyTotals = HashMap<String, (u64, u64)>;
 /// The store cannot be opened, or a record cannot be read or decoded.
 pub fn node_sizes(dir: &Path) -> anyhow::Result<Vec<(String, LabelSizes)>> {
     let engine = crate::open_store(dir)?;
+    // Records store label identities; they are reported by name.
+    let names: HashMap<_, String> = coordinode_modality::LocalSchemaStore::new(&engine)
+        .label_names()
+        .context("read the label identities")?
+        .into_iter()
+        .collect();
     let mut labels: HashMap<String, (LabelSizes, PropertyTotals)> = HashMap::new();
     for row in engine
         .prefix_scan(Partition::Node, b"node:")
@@ -41,9 +47,13 @@ pub fn node_sizes(dir: &Path) -> anyhow::Result<Vec<(String, LabelSizes)>> {
     {
         let (_, value) = row.into_inner().context("read a node record")?;
         let record = NodeRecord::from_msgpack(&value).context("decode a node record")?;
-        let (sizes, properties) = labels
-            .entry(record.primary_label().to_string())
-            .or_default();
+        // A record without labels counts under no name; an id without an
+        // identity record under its number.
+        let label = match record.primary_label() {
+            None => String::new(),
+            Some(id) => names.get(&id).cloned().unwrap_or_else(|| format!("#{id}")),
+        };
+        let (sizes, properties) = labels.entry(label).or_default();
         let bytes = value.len() as u64;
         sizes.records += 1;
         sizes.bytes += bytes;

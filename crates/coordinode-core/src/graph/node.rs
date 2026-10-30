@@ -15,6 +15,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::schema::label_id::LabelId;
+
 /// Width of the `origin_shard_hint` field in the NodeId u64.
 ///
 /// Layout: `[20 bits origin_shard_hint][44 bits sequence]`. The hint records
@@ -550,9 +552,11 @@ pub fn node_write_key(shard_id: u16, node_id: NodeId, valid_from_ms: Option<i64>
 /// Nodes support multiple labels per OpenCypher spec: `(n:User:Admin)`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeRecord {
-    /// The node's labels (e.g., ["User", "Admin"]).
-    /// First label is the primary label used for schema lookups.
-    pub labels: Vec<String>,
+    /// The catalog identities of the labels the node stores: its type label
+    /// first, then its own auxiliary labels in id order. The labels its type
+    /// implies are the type's and are not stored
+    /// ([`crate::schema::labels`]).
+    pub labels: Vec<LabelId>,
 
     /// Properties keyed by interned field ID.
     /// Values are MessagePack-compatible via `PropertyValue`.
@@ -613,8 +617,7 @@ impl NodeRecord {
         let value = core::mem::size_of::<PropertyValue>();
         // Each term is a size or capacity of memory that exists, so the sums
         // stay far below u64::MAX.
-        let labels = self.labels.capacity() * core::mem::size_of::<String>()
-            + self.labels.iter().map(String::capacity).sum::<usize>();
+        let labels = self.labels.capacity() * core::mem::size_of::<LabelId>();
         let props = self.props.capacity() * (core::mem::size_of::<u32>() + value + 1);
         let extra = self.extra.as_ref().map_or(0, |extra| {
             extra.capacity() * (core::mem::size_of::<String>() + value + 1)
@@ -629,22 +632,13 @@ impl NodeRecord {
         (core::mem::size_of::<Self>() + labels + props + extra) as u64 + values
     }
 
-    /// Create a new node record with a single label and no properties.
-    pub fn new(label: impl Into<String>) -> Self {
-        let label = label.into();
-        Self {
-            labels: if label.is_empty() {
-                Vec::new()
-            } else {
-                vec![label]
-            },
-            props: HashMap::new(),
-            extra: None,
-        }
+    /// Create a new node record of type `label` with no properties.
+    pub fn new(label: LabelId) -> Self {
+        Self::with_labels(vec![label])
     }
 
-    /// Create a node record with multiple labels.
-    pub fn with_labels(labels: Vec<String>) -> Self {
+    /// Create a node record storing `labels`, its type first.
+    pub fn with_labels(labels: Vec<LabelId>) -> Self {
         Self {
             labels,
             props: HashMap::new(),
@@ -652,32 +646,32 @@ impl NodeRecord {
         }
     }
 
-    /// The primary label, or empty string if no labels. The engine stores a
-    /// node's single type label first whatever order the write named its
-    /// labels in ([`crate::schema::labels::resolve_node_labels`]), so the
-    /// first stored label is the primary one.
-    pub fn primary_label(&self) -> &str {
-        self.labels.first().map(|s| s.as_str()).unwrap_or("")
+    /// The primary label; `None` for a record without labels. The engine
+    /// stores a node's single type label first whatever order the write
+    /// named its labels in ([`crate::schema::labels::resolve_node_labels`]),
+    /// so the first stored label is the primary one.
+    pub fn primary_label(&self) -> Option<LabelId> {
+        self.labels.first().copied()
     }
 
-    /// Check if the node has a specific label. An index or a constraint
-    /// declared on a label covers every node this answers `true` for: the
-    /// label may be the node's type, one its type implies or an auxiliary one.
-    pub fn has_label(&self, label: &str) -> bool {
-        self.labels.iter().any(|l| l == label)
+    /// Whether the record stores `label`: its type or one of its own
+    /// auxiliary labels. A label its type implies is carried without being
+    /// stored; [`crate::schema::labels::Membership`] answers for those.
+    pub fn stores_label(&self, label: LabelId) -> bool {
+        self.labels.contains(&label)
     }
 
-    /// Add a label if not already present.
-    pub fn add_label(&mut self, label: String) {
-        if !self.has_label(&label) {
+    /// Add a label if not already stored.
+    pub fn add_label(&mut self, label: LabelId) {
+        if !self.stores_label(label) {
             self.labels.push(label);
         }
     }
 
-    /// Remove a label. Returns true if the label was present.
-    pub fn remove_label(&mut self, label: &str) -> bool {
+    /// Remove a label. Returns true if the label was stored.
+    pub fn remove_label(&mut self, label: LabelId) -> bool {
         let len_before = self.labels.len();
-        self.labels.retain(|l| l != label);
+        self.labels.retain(|l| *l != label);
         self.labels.len() < len_before
     }
 
@@ -752,7 +746,7 @@ impl NodeRecord {
     /// # Errors
     ///
     /// The bytes are a document delta, or not a record.
-    pub fn labels_from_msgpack(data: &[u8]) -> Result<Vec<String>, rmp_serde::decode::Error> {
+    pub fn labels_from_msgpack(data: &[u8]) -> Result<Vec<LabelId>, rmp_serde::decode::Error> {
         use serde::Deserialize as _;
         let body = match data.first() {
             Some(&crate::graph::doc_delta::PREFIX_NODE_RECORD) => &data[1..],
@@ -767,7 +761,7 @@ impl NodeRecord {
         rmp::decode::read_array_len(&mut rest)
             .map_err(|e| rmp_serde::decode::Error::Syntax(format!("record header: {e}")))?;
         let mut labels = rmp_serde::Deserializer::from_read_ref(rest);
-        Vec::<String>::deserialize(&mut labels)
+        Vec::<LabelId>::deserialize(&mut labels)
     }
 
     /// The properties `fields` and the undeclared properties `names` of a

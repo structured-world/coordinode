@@ -107,7 +107,7 @@ fn make_test_ctx<'a>(
         feedback_cache: None,
         schema_label_cache: std::collections::HashMap::new(),
         label_schema_cache: std::collections::HashMap::new(),
-        implied: Default::default(),
+        labels: Default::default(),
         index_deferred: Default::default(),
         node_columns: None,
         applied_watermark: None,
@@ -129,6 +129,9 @@ fn insert_node(
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
     use coordinode_storage::engine::transaction::{CommitContext, Transaction};
     let nid = NodeId::from_raw(node_id);
+    let label = coordinode_modality::LocalSchemaStore::new(engine)
+        .bind_label(label)
+        .expect("bind label");
     let mut record = NodeRecord::new(label);
     for (k, v) in props {
         let fid = interner.intern(k);

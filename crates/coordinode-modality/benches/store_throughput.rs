@@ -65,7 +65,7 @@ fn bench_node_put(c: &mut Criterion) {
     let (_dir, engine) = mk_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalNodeStore;
-    let record = NodeRecord::new("User");
+    let record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
 
     group.throughput(Throughput::Elements(1));
     group.bench_function("single_put", |b| {
@@ -103,7 +103,7 @@ fn bench_edge_put(c: &mut Criterion) {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalEdgeStore;
     let node_store = LocalNodeStore;
-    let record = NodeRecord::new("User");
+    let record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
 
     // Materialise the hub and the peers so the attachment references
     // endpoints that exist.
@@ -426,7 +426,12 @@ fn bench_document_set_path(c: &mut Criterion) {
         let read_ts = oracle.next();
         let mut txn = Transaction::begin(&engine, Some(&oracle), read_ts);
         LocalNodeStore
-            .put(&mut txn, 0, NodeId::from_raw(1), &NodeRecord::new("L"))
+            .put(
+                &mut txn,
+                0,
+                NodeId::from_raw(1),
+                &NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID),
+            )
             .unwrap();
         let ctx = CommitContext {
             write_concern: &wc,

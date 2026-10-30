@@ -25,9 +25,9 @@ fn node_shard_prefix(shard_id: u16) -> Vec<u8> {
 
 /// Wire-format version of the binary backup dump. Bump on any
 /// incompatible change to [`BackupEntry`] layout or to the value
-/// encodings stored inside it. Restore refuses dumps newer than the
-/// version it understands (see `restore_binary`).
-pub const BINARY_FORMAT_VERSION: u32 = 1;
+/// encodings stored inside it. Restore refuses dumps of any other version
+/// (see `restore_binary`): an older one is never converted.
+pub const BINARY_FORMAT_VERSION: u32 = 2;
 
 /// Human-readable producer string embedded in the binary dump manifest:
 /// `coordinode-embed/<crate-version>`. Used only for diagnostics in
@@ -138,6 +138,7 @@ pub fn export_json<W: Write>(
     for line in json_schema_lines(engine)? {
         writeln!(writer, "{line}")?;
     }
+    let label_names = label_names(engine)?;
 
     // Export nodes (snapshot prefix_scan returns point-in-time consistent keys)
     let node_prefix = node_shard_prefix(shard_id);
@@ -157,11 +158,12 @@ pub fn export_json<W: Write>(
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
 
         let props = resolve_properties(&record.props, interner)?;
+        let labels = name_labels(&label_names, node_id, &record.labels)?;
 
         let mut json = serde_json::json!({
             "type": "node",
             "id": node_id.as_raw(),
-            "labels": record.labels,
+            "labels": labels,
             "properties": props,
         });
         if let Some(valid_from) = valid_from {
@@ -341,6 +343,7 @@ pub fn export_cypher<W: Write>(
     writer: &mut W,
 ) -> Result<ExportStats, ExportError> {
     let mut stats = ExportStats::default();
+    let label_names = label_names(engine)?;
 
     // Export nodes
     let node_prefix = node_shard_prefix(shard_id);
@@ -360,7 +363,7 @@ pub fn export_cypher<W: Write>(
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
 
         let props = resolve_properties(&record.props, interner)?;
-        let labels = record.labels.join(":");
+        let labels = name_labels(&label_names, node_id, &record.labels)?.join(":");
         let props_str = format_cypher_props(&props);
 
         let id = node_id.as_raw();
@@ -581,6 +584,43 @@ pub struct ExportStats {
 }
 
 // -- Internal helpers --
+
+/// Every label identity with its name. Records store identities and the
+/// logical dumps name them; an identity record is written once, so the
+/// latest catalog names every identity a snapshot's records hold.
+fn label_names(
+    engine: &StorageEngine,
+) -> Result<HashMap<coordinode_core::schema::label_id::LabelId, String>, ExportError> {
+    Ok(coordinode_modality::LocalSchemaStore::new(engine)
+        .label_names()
+        .map_err(|e| ExportError::Storage(e.to_string()))?
+        .into_iter()
+        .collect())
+}
+
+/// The names of the labels `node` stores, in stored order (its type first).
+///
+/// # Errors
+///
+/// An identity the catalog cannot name: a dump that guessed a name would
+/// restore the node under a different label.
+fn name_labels<'a>(
+    names: &'a HashMap<coordinode_core::schema::label_id::LabelId, String>,
+    node: NodeId,
+    labels: &[coordinode_core::schema::label_id::LabelId],
+) -> Result<Vec<&'a str>, ExportError> {
+    labels
+        .iter()
+        .map(|id| {
+            names.get(id).map(String::as_str).ok_or_else(|| {
+                ExportError::Serialization(format!(
+                    "node {} stores label {id}, which has no identity record",
+                    node.as_raw()
+                ))
+            })
+        })
+        .collect()
+}
 
 /// Resolve interned property IDs to human-readable names.
 ///

@@ -56,6 +56,8 @@ struct Fixture {
     registry: Arc<VectorIndexRegistry>,
     fields: Arc<FixedFields>,
     field: u32,
+    /// The catalog identity of `Item`, the indexed label.
+    item: coordinode_core::schema::label_id::LabelId,
     _dir: tempfile::TempDir,
 }
 
@@ -97,18 +99,22 @@ fn fixture() -> Fixture {
     );
     let mut interner = coordinode_core::graph::intern::FieldInterner::new();
     let field = interner.intern("embedding");
+    let item = coordinode_modality::LocalSchemaStore::new(&engine)
+        .bind_label("Item")
+        .unwrap();
     Fixture {
         engine,
         registry,
         fields: Arc::new(FixedFields(interner)),
         field,
+        item,
         _dir: dir,
     }
 }
 
 impl Fixture {
     fn put_item(&self, id: u64, x: f32) -> Mutation {
-        let mut record = NodeRecord::new("Item");
+        let mut record = NodeRecord::new(self.item);
         record
             .props
             .insert(self.field, Value::Vector(vec![x, 0.0, 0.0, 0.0]));
@@ -229,7 +235,7 @@ fn applied_deletions_leave_the_index() {
         &[Mutation::Put {
             partition: PartitionId::Node,
             key: encode_node_key(SHARD, NodeId::from_raw(4)),
-            value: NodeRecord::new("Item").to_msgpack().unwrap(),
+            value: NodeRecord::new(fx.item).to_msgpack().unwrap(),
         }],
     );
 
@@ -290,6 +296,7 @@ fn every_entry_applied_across_a_build_reaches_the_index() {
     let health = fx.registry.health_handle("Item", "embedding").unwrap();
     health.report_rebuild_progress(0.0, 0);
     let token = fx.registry.new_build_token();
+    let carriers = coordinode_query::index::membership::LabelCarriers::stored_only(fx.item);
 
     let mut next = 100_000u64;
     std::thread::scope(|scope| {
@@ -301,8 +308,7 @@ fn every_entry_applied_across_a_build_reaches_the_index() {
                 targets: &[BuildTarget {
                     hnsw: hnsw.as_ref(),
                     health: health.as_ref(),
-                    label: "Item",
-                    implying: &[],
+                    carriers: Some(&carriers),
                     field_id: fx.field,
                 }],
             }
@@ -467,8 +473,13 @@ fn the_watermark_stays_below_a_commit_still_in_flight() {
     );
     // A snapshot steps behind a commit in flight at once.
     engine.set_snapshot_wait_ms(0);
+    // The indexed label is bound in this engine's catalog, not the fixture's.
+    let item = coordinode_modality::LocalSchemaStore::new(&engine)
+        .bind_label("Item")
+        .unwrap();
     let fx = Fixture {
         engine,
+        item,
         ..fixture()
     };
     let worker = fx.spawn(1024);

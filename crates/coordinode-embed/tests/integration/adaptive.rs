@@ -187,27 +187,13 @@ fn parallel_traversal_injects_computed_properties() {
         },
     ));
 
-    // Persist schema body + current_revision pointer so pointer-based readers
-    // (`load_current_label_schema_from_engine`) can find it.
+    // Persist the schema body and its name binding together, so binding-based
+    // readers find it.
     {
-        use coordinode_core::schema::definition::{
-            encode_label_current_revision_key, encode_label_schema_key,
-        };
-        use coordinode_storage::engine::partition::Partition;
-        let schema_key = encode_label_schema_key(&schema.name, schema.schema_revision);
-        let pointer_key = encode_label_current_revision_key(&schema.name);
-        let bytes = schema.to_msgpack().expect("serialize schema");
-        let engine = db.engine_shared();
-        engine
-            .put(Partition::Schema, &schema_key, &bytes)
-            .expect("persist schema body");
-        engine
-            .put(
-                Partition::Schema,
-                &pointer_key,
-                &schema.schema_revision.to_be_bytes(),
-            )
-            .expect("persist current_revision pointer");
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        LocalSchemaStore::new(db.engine())
+            .save_label(&schema)
+            .expect("persist schema");
     }
 
     // Create hub node

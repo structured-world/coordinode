@@ -87,7 +87,7 @@ fn make_test_ctx<'a>(
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         label_schema_cache: HashMap::new(),
-        implied: Default::default(),
+        labels: Default::default(),
         index_deferred: Default::default(),
         node_columns: None,
         applied_watermark: None,
@@ -136,6 +136,9 @@ fn insert_node(
     label: &str,
     props: &[(&str, Value)],
 ) {
+    let label = coordinode_modality::LocalSchemaStore::new(engine)
+        .bind_label(label)
+        .expect("bind label");
     let mut record = NodeRecord::new(label);
     for (name, value) in props {
         let fid = interner.intern(name);

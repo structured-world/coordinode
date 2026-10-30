@@ -64,30 +64,15 @@ fn a_scan_reuses_bound_schema_while_an_unrelated_commit_is_pending() {
     });
 }
 
-/// Persist a `LabelSchema` directly through the shared engine, writing both
-/// the versioned key and the current_revision pointer. Required for any test
-/// that bypasses `Database::create_label_schema` — pointer-based readers
-/// (computed-property injection, schema-mode enforcement) won't find the
-/// schema without the pointer.
+/// Persist a `LabelSchema` through the catalog store, which writes its body
+/// and its name binding together. Required for any test that bypasses
+/// `Database::create_label_schema`: binding-based readers (computed-property
+/// injection, schema-mode enforcement) find the schema only through it.
 fn persist_label_schema(db: &Database, schema: &LabelSchema) {
-    use coordinode_core::schema::definition::{
-        encode_label_current_revision_key, encode_label_schema_key,
-    };
-    use coordinode_storage::engine::partition::Partition;
-    let schema_key = encode_label_schema_key(&schema.name, schema.schema_revision);
-    let pointer_key = encode_label_current_revision_key(&schema.name);
-    let bytes = schema.to_msgpack().expect("serialize schema");
-    let engine = db.engine_shared();
-    engine
-        .put(Partition::Schema, &schema_key, &bytes)
-        .expect("persist schema body");
-    engine
-        .put(
-            Partition::Schema,
-            &pointer_key,
-            &schema.schema_revision.to_be_bytes(),
-        )
-        .expect("persist current_revision pointer");
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    LocalSchemaStore::new(db.engine())
+        .save_label(schema)
+        .expect("persist schema");
 }
 
 /// Helper: create a schema with COMPUTED properties and persist it.

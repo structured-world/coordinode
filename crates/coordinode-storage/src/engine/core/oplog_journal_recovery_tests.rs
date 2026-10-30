@@ -2760,7 +2760,7 @@ mod derived {
     /// A node record put for `email`, then the DERIVED work moving the node's
     /// entry from `old` to what that record holds.
     fn unit(node_id: u64, email: &str, old: Option<&str>) -> Vec<Mutation> {
-        let mut record = NodeRecord::new("User");
+        let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
         record.set(1, Value::String(email.into()));
         vec![
             Mutation::Put {

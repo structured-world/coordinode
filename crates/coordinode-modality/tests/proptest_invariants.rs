@@ -89,7 +89,13 @@ proptest! {
             let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
             for &vf in &valid_froms {
                 store
-                    .put_temporal(&mut txn, 0, id, vf, &NodeRecord::new("L"))
+                    .put_temporal(
+                        &mut txn,
+                        0,
+                        id,
+                        vf,
+                        &NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID),
+                    )
                     .unwrap();
             }
             let wc = WriteConcern::majority();

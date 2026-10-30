@@ -617,28 +617,86 @@ fn a_cleanup_condition_is_broken_by_a_renewal_of_the_record() {
     );
 }
 
+/// The identity label `name` is bound to, allocated as the schema store
+/// allocates it on the label's first use when it has none.
+fn bind(engine: &StorageEngine, name: &str) -> coordinode_core::schema::label_id::LabelId {
+    use coordinode_core::schema::definition::encode_label_current_revision_key;
+    use coordinode_core::schema::label_id::{
+        BindingState, FIRST_LABEL_ID, LABEL_ID_FRONTIER_KEY, LabelBinding, decode_frontier,
+        encode_frontier, label_id_key,
+    };
+    let key = encode_label_current_revision_key(name);
+    if let Some(bytes) = engine.get(Partition::Schema, &key).expect("binding") {
+        return LabelBinding::decode(&bytes).expect("a binding").id;
+    }
+    let id = match engine
+        .get(Partition::Schema, LABEL_ID_FRONTIER_KEY)
+        .expect("frontier")
+    {
+        None => FIRST_LABEL_ID,
+        Some(bytes) => decode_frontier(&bytes)
+            .expect("a frontier")
+            .next()
+            .expect("room"),
+    };
+    engine
+        .put(Partition::Schema, &label_id_key(id), name.as_bytes())
+        .expect("identity record");
+    engine
+        .put(
+            Partition::Schema,
+            LABEL_ID_FRONTIER_KEY,
+            &encode_frontier(id),
+        )
+        .expect("frontier");
+    let binding = LabelBinding {
+        id,
+        revision: 0,
+        state: BindingState::Implicit,
+    };
+    engine
+        .put(Partition::Schema, &key, &binding.encode())
+        .expect("binding");
+    id
+}
+
+/// The key of label `name`'s definition at `revision`, under its identity.
+fn body_key(engine: &StorageEngine, name: &str, revision: u64) -> Vec<u8> {
+    coordinode_core::schema::definition::encode_label_schema_key(bind(engine, name), revision)
+}
+
+/// The identities of `names`, each bound on its first use.
+fn ids(engine: &StorageEngine, names: &[&str]) -> Vec<coordinode_core::schema::label_id::LabelId> {
+    names.iter().map(|name| bind(engine, name)).collect()
+}
+
 /// Store `schema` as `label`'s current schema, the way DDL publishes it.
 fn store_label_schema(
     engine: &StorageEngine,
     schema: &coordinode_core::schema::definition::LabelSchema,
 ) {
-    use coordinode_core::schema::definition::{
-        encode_label_current_revision_key, encode_label_schema_key,
+    use coordinode_core::schema::definition::encode_label_current_revision_key;
+    use coordinode_core::schema::label_id::{BindingState, LabelBinding};
+    let id = bind(engine, &schema.name);
+    engine
+        .put(
+            Partition::Schema,
+            &body_key(engine, &schema.name, schema.schema_revision),
+            &schema.to_msgpack().expect("encode schema"),
+        )
+        .expect("schema body");
+    let binding = LabelBinding {
+        id,
+        revision: schema.schema_revision,
+        state: BindingState::Declared,
     };
     engine
         .put(
             Partition::Schema,
-            &encode_label_schema_key(&schema.name, schema.schema_revision),
-            &schema.to_msgpack().expect("encode schema"),
-        )
-        .expect("schema body");
-    engine
-        .put(
-            Partition::Schema,
             &encode_label_current_revision_key(&schema.name),
-            &schema.schema_revision.to_be_bytes(),
+            &binding.encode(),
         )
-        .expect("schema pointer");
+        .expect("schema binding");
 }
 
 fn schema_claim(label: &str, predicate: ClaimPredicate) -> Claim {
@@ -671,10 +729,7 @@ fn a_schema_read_is_broken_by_any_change_of_the_schema() {
     engine
         .put(
             Partition::Schema,
-            &coordinode_core::schema::definition::encode_label_schema_key(
-                "Doc",
-                schema.schema_revision,
-            ),
+            &body_key(&engine, "Doc", schema.schema_revision),
             &schema.to_msgpack().expect("encode"),
         )
         .expect("edit in place");
@@ -714,9 +769,7 @@ fn a_schema_read_of_an_undeclared_label_is_broken_by_its_declaration() {
 /// current state.
 #[test]
 fn a_schema_read_is_asked_from_the_first_unseen_number() {
-    use coordinode_core::schema::definition::{
-        LabelSchema, PropertyDef, PropertyType, encode_label_schema_key,
-    };
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
 
     let (engine, _d) = engine();
     let mut schema = LabelSchema::new_node_id("Doc");
@@ -733,7 +786,7 @@ fn a_schema_read_is_asked_from_the_first_unseen_number() {
     engine
         .put(
             Partition::Schema,
-            &encode_label_schema_key("Doc", schema.schema_revision),
+            &body_key(&engine, "Doc", schema.schema_revision),
             &schema.to_msgpack().expect("encode"),
         )
         .expect("edit in place");
@@ -758,30 +811,31 @@ fn a_schema_read_is_asked_from_the_first_unseen_number() {
     );
 }
 
-/// An activation of a type implying labels answers for its stored nodes'
-/// labels too: a node of the type lacking a label the type implies,
-/// directly or through another type, refuses it.
+/// What a type implies is derived from its definition, never stored, so an
+/// activation of a type implying labels holds over nodes that store only
+/// their type; an activation declaring a label auxiliary is refused by a
+/// stored node it types, since an auxiliary label types none.
 #[test]
-fn an_activation_of_implied_labels_is_decided_by_the_stored_nodes() {
+fn an_activation_is_refused_only_by_a_node_its_kind_cannot_type() {
     use coordinode_core::graph::node::{NodeRecord, encode_node_key};
-    use coordinode_core::schema::definition::{LabelSchema, encode_label_schema_key};
+    use coordinode_core::schema::definition::LabelSchema;
 
     let (engine, _d) = engine();
     let mut middle = LabelSchema::new_node_id("Middle");
     middle.set_implies(vec!["Base".to_string()]);
+    bind(&engine, "Base");
     store_label_schema(&engine, &middle);
     let mut top = LabelSchema::new_node_id("Top");
     top.set_implies(vec!["Middle".to_string()]);
     top.schema_revision = 1;
     let mut points = HashMap::new();
     points.insert(
-        (Partition::Schema, encode_label_schema_key("Top", 1)),
+        (Partition::Schema, body_key(&engine, "Top", 1)),
         Some(top.to_msgpack().expect("encode")),
     );
-    let activation = schema_claim("Top", ClaimPredicate::SchemaActivated { revision: 1 });
     let view = engine.snapshot();
     let put_node = |id: u64, labels: &[&str]| {
-        let record = NodeRecord::with_labels(labels.iter().map(|l| (*l).to_string()).collect());
+        let record = NodeRecord::with_labels(ids(&engine, labels));
         engine
             .put(
                 Partition::Node,
@@ -791,16 +845,33 @@ fn an_activation_of_implied_labels_is_decided_by_the_stored_nodes() {
             .expect("node");
     };
 
-    put_node(1, &["Top", "Base", "Middle"]);
+    put_node(1, &["Top"]);
+    let activation = schema_claim("Top", ClaimPredicate::SchemaActivated { revision: 1 });
     assert_eq!(
         evaluate(&engine, &activation, &[], &points, view).expect("evaluate"),
-        Verdict::Holds
+        Verdict::Holds,
+        "node 1 carries Middle and Base through its type without storing them"
     );
-    put_node(2, &["Top", "Middle"]);
+
+    let mut tag = LabelSchema::new_node_id("Tag");
+    tag.set_auxiliary();
+    tag.schema_revision = 1;
+    points.insert(
+        (Partition::Schema, body_key(&engine, "Tag", 1)),
+        Some(tag.to_msgpack().expect("encode")),
+    );
+    let auxiliary = schema_claim("Tag", ClaimPredicate::SchemaActivated { revision: 1 });
+    put_node(2, &["Top", "Tag"]);
     assert_eq!(
-        evaluate(&engine, &activation, &[], &points, view).expect("evaluate"),
+        evaluate(&engine, &auxiliary, &[], &points, view).expect("evaluate"),
+        Verdict::Holds,
+        "node 2 carries Tag beside its type"
+    );
+    put_node(3, &["Tag"]);
+    assert_eq!(
+        evaluate(&engine, &auxiliary, &[], &points, view).expect("evaluate"),
         Verdict::Broken,
-        "node 2 lacks Base, which Top implies through Middle"
+        "node 3 has Tag as its type"
     );
 }
 
@@ -810,7 +881,7 @@ fn an_activation_of_implied_labels_is_decided_by_the_stored_nodes() {
 #[test]
 fn an_activation_is_decided_by_the_stored_nodes_of_its_label() {
     use coordinode_core::graph::node::{NodeRecord, encode_node_key};
-    use coordinode_core::schema::definition::{LabelSchema, SchemaMode, encode_label_schema_key};
+    use coordinode_core::schema::definition::{LabelSchema, SchemaMode};
 
     let (engine, _d) = engine();
     let mut staged_schema = LabelSchema::new_node_id("Doc");
@@ -820,7 +891,7 @@ fn an_activation_is_decided_by_the_stored_nodes_of_its_label() {
     points.insert(
         (
             Partition::Schema,
-            encode_label_schema_key("Doc", staged_schema.schema_revision),
+            body_key(&engine, "Doc", staged_schema.schema_revision),
         ),
         Some(staged_schema.to_msgpack().expect("encode")),
     );
@@ -831,7 +902,7 @@ fn an_activation_is_decided_by_the_stored_nodes_of_its_label() {
 
     // A node with no properties satisfies STRICT; one of another label with
     // an undeclared property is not this label's concern.
-    let bare = NodeRecord::with_labels(vec!["Doc".to_string()]);
+    let bare = NodeRecord::with_labels(ids(&engine, &["Doc"]));
     engine
         .put(
             Partition::Node,
@@ -839,7 +910,7 @@ fn an_activation_is_decided_by_the_stored_nodes_of_its_label() {
             &bare.to_msgpack().expect("encode"),
         )
         .expect("bare node");
-    let mut other = NodeRecord::with_labels(vec!["User".to_string(), "Doc".to_string()]);
+    let mut other = NodeRecord::with_labels(ids(&engine, &["User", "Doc"]));
     other.set_extra("x", coordinode_core::graph::types::Value::Int(1));
     engine
         .put(
@@ -851,7 +922,7 @@ fn an_activation_is_decided_by_the_stored_nodes_of_its_label() {
     assert_eq!(decide_with(&engine, &points), Verdict::Holds);
 
     // An undeclared property on a node of the label breaks STRICT.
-    let mut loose = NodeRecord::with_labels(vec!["Doc".to_string()]);
+    let mut loose = NodeRecord::with_labels(ids(&engine, &["Doc"]));
     loose.set_extra("x", coordinode_core::graph::types::Value::Int(1));
     engine
         .put(
@@ -889,7 +960,7 @@ fn a_candidate_holds_only_the_nodes_the_attempt_writes() {
         },
     );
     let loose = |labels: Vec<&str>| {
-        let mut record = NodeRecord::with_labels(labels.into_iter().map(String::from).collect());
+        let mut record = NodeRecord::with_labels(ids(&engine, &labels));
         record.set_extra("x", coordinode_core::graph::types::Value::Int(1));
         record.to_msgpack().expect("encode")
     };
@@ -1256,8 +1327,8 @@ mod unique_while_building {
         Value::String(v.into())
     }
 
-    fn record(label: &str, value: Value) -> Vec<u8> {
-        let mut record = NodeRecord::new(label);
+    fn record(engine: &StorageEngine, label: &str, value: Value) -> Vec<u8> {
+        let mut record = NodeRecord::new(bind(engine, label));
         record.set(EMAIL, value);
         record.to_msgpack().expect("encode")
     }
@@ -1267,7 +1338,7 @@ mod unique_while_building {
             .put(
                 Partition::Node,
                 &encode_node_key(SHARD, node(id)),
-                &record(label, value),
+                &record(engine, label, value),
             )
             .expect("put node");
     }
@@ -1377,7 +1448,7 @@ mod unique_while_building {
         points.insert((Partition::Node, encode_node_key(SHARD, node(1))), None);
         points.insert(
             (Partition::Node, encode_node_key(SHARD, node(3))),
-            Some(record("User", email("d@x"))),
+            Some(record(&engine, "User", email("d@x"))),
         );
         let deltas = vec![(encode_node_key(SHARD, node(5)), Vec::new())];
 
@@ -1410,7 +1481,7 @@ mod unique_while_building {
                 .put(
                     Partition::Node,
                     &encode_temporal_node_key(SHARD, node(4), valid_from),
-                    &record("User", email(value)),
+                    &record(&engine, "User", email(value)),
                 )
                 .expect("put version");
         }

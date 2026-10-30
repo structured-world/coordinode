@@ -9,17 +9,21 @@ use super::journal_stats;
 use crate::test_support::write_segment;
 
 fn node(status: i64, blob: &[u8]) -> Vec<u8> {
-    let mut record = NodeRecord::new("State");
+    let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
     record.set(1, Value::Int(status));
     record.set(2, Value::Blob(blob.to_vec()));
     record.to_msgpack().expect("encode")
 }
 
 fn record(index: u64, key: &[u8], value: Vec<u8>) -> OplogEntry {
+    put(index, PartitionId::Node, key, value)
+}
+
+fn put(index: u64, partition: PartitionId, key: &[u8], value: Vec<u8>) -> OplogEntry {
     let proposal = RaftProposal {
         id: ProposalId::from_raw(index),
         mutations: vec![Mutation::Put {
-            partition: PartitionId::Node,
+            partition,
             key: key.to_vec(),
             value,
         }],
@@ -73,7 +77,8 @@ fn rewrites_are_measured_against_what_changed() {
     assert_eq!((c.writes, c.distinct_keys, c.max_per_key), (3, 1, 3));
 
     let (label, r) = &stats.node_rewrites[0];
-    assert_eq!(label, "State");
+    // The journal holds no record issuing the label, so its id names it.
+    assert_eq!(label, "#1");
     assert_eq!(r.rewrites, 2);
     let field = |name: &str| {
         r.fields
@@ -89,4 +94,36 @@ fn rewrites_are_measured_against_what_changed() {
     assert_eq!(status_changes, 2);
     assert_eq!(r.changed_bytes, 2 * status_size);
     assert!(r.bytes > 2 * 4096, "the whole record was written each time");
+}
+
+/// A label is named by the record that issued its identity when the journal
+/// holds it, wherever in the journal that record lies.
+#[test]
+fn rewrites_are_named_by_the_issued_label() {
+    use coordinode_core::schema::label_id::{FIRST_LABEL_ID, label_id_key};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path();
+    let key = b"node:\x00\x01:\x00\x00\x00\x00\x00\x00\x00\x01";
+    write_segment(
+        &data.join("oplog/0/oplog-00000000000000000001.bin"),
+        &[
+            record(1, key, node(1, b"x")),
+            record(2, key, node(2, b"x")),
+            put(
+                3,
+                PartitionId::Schema,
+                &label_id_key(FIRST_LABEL_ID),
+                b"State".to_vec(),
+            ),
+        ],
+        true,
+    );
+
+    let stats = journal_stats(data, 5).expect("stats");
+    let labels: Vec<_> = stats
+        .node_rewrites
+        .iter()
+        .map(|(l, _)| l.as_str())
+        .collect();
+    assert_eq!(labels, ["State"]);
 }

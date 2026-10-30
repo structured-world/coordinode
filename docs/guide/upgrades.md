@@ -60,7 +60,9 @@ it no longer shares with the group.
 A data directory records the engine format that wrote it in an
 `ENGINE_FORMAT` file. A release opens only a directory of its own format; one
 written by any other format is refused by name and left untouched. A member
-whose directory is refused is removed from its group and added back empty.
+whose directory is refused is removed from its group and added back empty. An
+embedded store of an earlier format moves to a new release through a logical
+dump: export `json` with the release that wrote it, restore into the new one.
 
 ## Watching a move
 

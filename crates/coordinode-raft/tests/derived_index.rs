@@ -159,7 +159,9 @@ fn write_email(
     old: Option<&str>,
     ts: u64,
 ) -> RaftProposal {
-    let mut record = NodeRecord::new("U");
+    // The derived entry reads the record's properties, not its label's
+    // catalog binding.
+    let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
     record.set(1, Value::String(email.into()));
     RaftProposal {
         id: id_gen.next(),

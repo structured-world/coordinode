@@ -5,7 +5,21 @@ use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_NODE_RECORD, PathTarget
 use coordinode_core::graph::edge::PostingList;
 use coordinode_core::graph::node::NodeRecord;
 use coordinode_core::graph::types::Value;
+use coordinode_core::schema::label_id::LabelId;
 use tempfile::TempDir;
+
+/// The labels the records below store: the merge carries them through
+/// untouched, whatever they name.
+const DEVICE: LabelId = label(1);
+const OTHER: LabelId = label(2);
+
+/// The id `raw`, evaluated at compile time: every `raw` used is nonzero.
+const fn label(raw: u32) -> LabelId {
+    match LabelId::new(raw) {
+        Some(id) => id,
+        None => unreachable!(),
+    }
+}
 
 fn test_engine() -> (StorageEngine, TempDir) {
     let dir = TempDir::new().expect("failed to create temp dir");
@@ -577,7 +591,7 @@ fn nested_set_survives_a_compaction_that_does_not_see_the_record() {
     let engine = StorageEngine::open(&config).expect("open");
     let key = b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x05";
 
-    let record_bytes = |label: &str, serial: &str| {
+    let record_bytes = |label: LabelId, serial: &str| {
         let mut rec = NodeRecord::new(label);
         rec.set_extra("serial", Value::String(serial.into()));
         rec.set_extra("config", Value::Document(rmpv::Value::Map(vec![])));
@@ -605,7 +619,7 @@ fn nested_set_survives_a_compaction_that_does_not_see_the_record() {
                 .put(
                     Partition::Node,
                     other,
-                    &record_bytes("Other", &format!("SN-{round}")),
+                    &record_bytes(OTHER, &format!("SN-{round}")),
                 )
                 .expect("unrelated");
         }
@@ -613,7 +627,7 @@ fn nested_set_survives_a_compaction_that_does_not_see_the_record() {
 
     // The record itself, at the bottom level.
     engine
-        .put(Partition::Node, key, &record_bytes("Device", "SN-1"))
+        .put(Partition::Node, key, &record_bytes(DEVICE, "SN-1"))
         .expect("put the record");
     tree.flush_active_memtable(0).expect("flush");
     move_down(0, 6);
@@ -656,7 +670,7 @@ fn nested_set_survives_a_compaction_that_does_not_see_the_record() {
         .expect("the node exists");
     assert_eq!(merged[0], PREFIX_NODE_RECORD);
     let node = NodeRecord::from_msgpack(&merged[1..]).expect("decode");
-    assert!(node.has_label("Device"), "the label survives: {node:?}");
+    assert!(node.stores_label(DEVICE), "the label survives: {node:?}");
     assert_eq!(
         node.get_extra("serial"),
         Some(&Value::String("SN-1".into())),
@@ -1347,7 +1361,7 @@ fn doc_merge_through_storage_engine() {
     let key = b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01";
 
     // Write base NodeRecord with 0x00 prefix via PUT.
-    let mut rec = NodeRecord::new("Device");
+    let mut rec = NodeRecord::new(DEVICE);
     rec.set_extra("config", Value::Document(rmpv::Value::Map(vec![])));
     let base_msgpack = rec.to_msgpack().expect("encode");
     let mut base = Vec::with_capacity(1 + base_msgpack.len());
@@ -1377,7 +1391,7 @@ fn doc_merge_through_storage_engine() {
     let merged = NodeRecord::from_msgpack(&data[1..]).expect("decode merged");
 
     // Labels preserved.
-    assert!(merged.has_label("Device"));
+    assert!(merged.stores_label(DEVICE));
 
     // DocDelta applied: config.ssid = "home".
     let config = merged.get_extra("config").expect("config key");
@@ -1473,7 +1487,7 @@ fn doc_merge_survives_persist_and_reopen() {
         let engine = StorageEngine::open(&config).expect("open");
 
         // Write base + delta.
-        let rec = NodeRecord::new("Config");
+        let rec = NodeRecord::new(DEVICE);
         let base_msgpack = rec.to_msgpack().expect("encode");
         let mut base = Vec::with_capacity(1 + base_msgpack.len());
         base.push(PREFIX_NODE_RECORD);
@@ -1502,7 +1516,7 @@ fn doc_merge_survives_persist_and_reopen() {
 
         assert_eq!(data[0], PREFIX_NODE_RECORD);
         let rec = NodeRecord::from_msgpack(&data[1..]).expect("decode");
-        assert!(rec.has_label("Config"));
+        assert!(rec.stores_label(DEVICE));
         assert_eq!(rec.get_extra("version"), Some(&Value::Int(42)));
     }
 }
@@ -1660,7 +1674,7 @@ fn doc_merge_legacy_node_record_without_prefix() {
     let key = b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x06";
 
     // Write bare NodeRecord (legacy format, no prefix).
-    let mut rec = NodeRecord::new("Legacy");
+    let mut rec = NodeRecord::new(DEVICE);
     rec.set_extra("old_field", Value::String("preserved".into()));
     let bare = rec.to_msgpack().expect("encode");
     engine.put(Partition::Node, key, &bare).expect("put legacy");
@@ -1684,7 +1698,7 @@ fn doc_merge_legacy_node_record_without_prefix() {
     assert_eq!(data[0], PREFIX_NODE_RECORD);
     let merged = NodeRecord::from_msgpack(&data[1..]).expect("decode");
 
-    assert!(merged.has_label("Legacy"));
+    assert!(merged.stores_label(DEVICE));
     assert_eq!(
         merged.get_extra("old_field"),
         Some(&Value::String("preserved".into()))
@@ -1709,7 +1723,7 @@ fn doc_merge_concurrent_different_prop_field_paths() {
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
 
     // Create base node with a DOCUMENT property at field_id=10.
-    let mut base_rec = NodeRecord::new("Device");
+    let mut base_rec = NodeRecord::new(DEVICE);
     base_rec.set(10, Value::Document(rmpv::Value::Map(vec![])));
     let mut base = vec![PREFIX_NODE_RECORD];
     base.extend_from_slice(&base_rec.to_msgpack().expect("enc"));
@@ -1779,7 +1793,7 @@ fn doc_merge_concurrent_100_writers_array_push() {
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
 
     // Create base node with an empty array at field_id=20.
-    let mut base_rec = NodeRecord::new("Bag");
+    let mut base_rec = NodeRecord::new(DEVICE);
     base_rec.set(
         20,
         Value::Document(rmpv::Value::Map(vec![(

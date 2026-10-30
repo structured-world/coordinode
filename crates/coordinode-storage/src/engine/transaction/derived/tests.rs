@@ -34,7 +34,7 @@ fn s(v: &str) -> Value {
 }
 
 fn record(email: &str) -> Vec<u8> {
-    let mut record = NodeRecord::new("User");
+    let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
     record.set(1, s(email));
     record.to_msgpack().expect("record")
 }

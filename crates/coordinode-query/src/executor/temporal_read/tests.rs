@@ -1,4 +1,5 @@
 use super::*;
+use coordinode_core::schema::label_id::FIRST_LABEL_ID;
 
 const NAME: u32 = 1;
 const VALID_TO: u32 = 2;
@@ -10,7 +11,7 @@ const FIELDS: TimelineFields = TimelineFields {
 };
 
 fn version(name: &str, valid_to: Option<i64>) -> NodeRecord {
-    let mut record = NodeRecord::new("T");
+    let mut record = NodeRecord::new(FIRST_LABEL_ID);
     record.set(NAME, Value::String(name.into()));
     if let Some(to) = valid_to {
         record.set(VALID_TO, Value::Int(to));
@@ -19,7 +20,7 @@ fn version(name: &str, valid_to: Option<i64>) -> NodeRecord {
 }
 
 fn tombstone() -> NodeRecord {
-    let mut record = NodeRecord::new("T");
+    let mut record = NodeRecord::new(FIRST_LABEL_ID);
     record.set(DELETED, Value::Bool(true));
     record
 }

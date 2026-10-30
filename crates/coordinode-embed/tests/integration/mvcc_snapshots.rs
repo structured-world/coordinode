@@ -48,6 +48,7 @@ fn snapshot_at_10_timestamps_returns_correct_value() {
     }
 
     // Now verify: snapshot_at(seqno_N) sees val=vN for each N=0..10
+    let versioned = super::helpers::label_id(db.engine(), "Versioned").expect("bound");
     for (i, &seqno) in seqnos.iter().enumerate() {
         let snap = db
             .engine()
@@ -62,7 +63,7 @@ fn snapshot_at_10_timestamps_returns_correct_value() {
         let mut found = false;
         for (_key, value) in &nodes {
             if let Ok(record) = NodeRecord::from_msgpack(value)
-                && record.labels.contains(&"Versioned".to_string())
+                && record.stores_label(versioned)
             {
                 // Find the "val" property by scanning interned props
                 for prop_val in record.props.values() {
@@ -343,6 +344,7 @@ fn gc_with_oracle_snapshot_at_and_compaction_interaction() {
     db.execute_cypher("MATCH (n:GCTest {key: 'cfg'}) SET n.val = 'v3'")
         .expect("set v3");
     let seqno_v3 = db.engine().snapshot();
+    let gc_test = super::helpers::label_id(db.engine(), "GCTest").expect("bound");
 
     // Before GC: snapshot_at(v1) should see v1
     let snap_v1 = db
@@ -356,7 +358,7 @@ fn gc_with_oracle_snapshot_at_and_compaction_interaction() {
     let found_v1 = nodes_v1.iter().any(|(_k, v)| {
         NodeRecord::from_msgpack(v)
             .map(|r| {
-                r.labels.contains(&"GCTest".to_string())
+                r.stores_label(gc_test)
                     && r.props.values().any(|pv| *pv == Value::String("v1".into()))
             })
             .unwrap_or(false)
@@ -375,7 +377,7 @@ fn gc_with_oracle_snapshot_at_and_compaction_interaction() {
     let found_v3 = nodes_v3.iter().any(|(_k, v)| {
         NodeRecord::from_msgpack(v)
             .map(|r| {
-                r.labels.contains(&"GCTest".to_string())
+                r.stores_label(gc_test)
                     && r.props.values().any(|pv| *pv == Value::String("v3".into()))
             })
             .unwrap_or(false)
@@ -414,7 +416,7 @@ fn gc_with_oracle_snapshot_at_and_compaction_interaction() {
     let found_v3_after = nodes_v3_after.iter().any(|(_k, v)| {
         NodeRecord::from_msgpack(v)
             .map(|r| {
-                r.labels.contains(&"GCTest".to_string())
+                r.stores_label(gc_test)
                     && r.props.values().any(|pv| *pv == Value::String("v3".into()))
             })
             .unwrap_or(false)
@@ -446,7 +448,7 @@ fn gc_with_oracle_snapshot_at_and_compaction_interaction() {
     let found_v4 = nodes_v4.iter().any(|(_k, v)| {
         NodeRecord::from_msgpack(v)
             .map(|r| {
-                r.labels.contains(&"GCTest".to_string())
+                r.stores_label(gc_test)
                     && r.props.values().any(|pv| *pv == Value::String("v4".into()))
             })
             .unwrap_or(false)

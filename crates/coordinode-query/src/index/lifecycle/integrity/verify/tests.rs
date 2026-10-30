@@ -29,7 +29,7 @@ struct Store {
 
 fn put(env: &TestEnv, label: &str, id: u64, props: &[(&str, Value)]) {
     let fields = env.fields_now();
-    let mut record = NodeRecord::new(label);
+    let mut record = NodeRecord::new(env.label_id(label));
     for (name, value) in props {
         record.set(fields.lookup(name).expect("field"), value.clone());
     }

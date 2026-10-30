@@ -87,7 +87,7 @@ fn make_test_ctx<'a>(
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         label_schema_cache: HashMap::new(),
-        implied: Default::default(),
+        labels: Default::default(),
         index_deferred: Default::default(),
         node_columns: None,
         applied_watermark: None,
@@ -128,6 +128,14 @@ fn run_err(
     execute(&plan, &mut ctx).expect_err("expected execute to fail")
 }
 
+/// A record of `label`, bound in the catalog as a write binds it.
+fn new_record(engine: &StorageEngine, label: &str) -> NodeRecord {
+    let label = coordinode_modality::LocalSchemaStore::new(engine)
+        .bind_label(label)
+        .expect("bind label");
+    NodeRecord::new(label)
+}
+
 /// Insert a User node (id=1) with a nested address document and, optionally,
 /// other properties. Returns the node's shard_id/node_id.
 fn insert_user_with_address(
@@ -137,7 +145,7 @@ fn insert_user_with_address(
     name: &str,
     address: rmpv::Value,
 ) {
-    let mut record = NodeRecord::new("User");
+    let mut record = new_record(engine, "User");
     let name_fid = interner.intern("name");
     let addr_fid = interner.intern("address");
     record.set(name_fid, Value::String(name.into()));
@@ -321,7 +329,7 @@ fn detach_document_nested_path() {
         (rmpv::Value::String("billing".into()), billing.clone()),
     ]);
 
-    let mut record = NodeRecord::new("User");
+    let mut record = new_record(engine, "User");
     let fid = interner.intern("meta");
     record.set(fid, Value::Document(meta.clone()));
     put_node_committed(engine, 1, 1, &record);
@@ -447,7 +455,7 @@ fn detach_document_missing_property_errors() {
     let mut interner = FieldInterner::new();
 
     // User with no `address` field at all.
-    let mut record = NodeRecord::new("User");
+    let mut record = new_record(engine, "User");
     let fid = interner.intern("name");
     record.set(fid, Value::String("Alice".into()));
     put_node_committed(engine, 1, 1, &record);
@@ -475,7 +483,7 @@ fn detach_document_non_document_value_errors() {
     let mut interner = FieldInterner::new();
 
     // `address` is a plain string — not a document.
-    let mut record = NodeRecord::new("User");
+    let mut record = new_record(engine, "User");
     let fid = interner.intern("address");
     record.set(fid, Value::String("just a string".into()));
     put_node_committed(engine, 1, 1, &record);
@@ -515,7 +523,7 @@ fn detach_document_default_edge_type_from_camel_case() {
         rmpv::Value::String("firmware".into()),
         rmpv::Value::String("2.1".into()),
     )]);
-    let mut record = NodeRecord::new("Device");
+    let mut record = new_record(engine, "Device");
     let fid = interner.intern("sensorConfig");
     record.set(fid, Value::Document(cfg));
     put_node_committed(engine, 1, 1, &record);

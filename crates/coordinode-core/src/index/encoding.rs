@@ -15,6 +15,7 @@
 
 use super::identity::GenerationId;
 use crate::graph::types::Value;
+use crate::schema::label_id::LabelId;
 
 /// Type tags, in the order the types sort.
 const TAG_NULL: u8 = 0x05;
@@ -251,12 +252,12 @@ pub fn label_postings_prefix(generation: GenerationId) -> [u8; GENERATION_PREFIX
 pub fn label_range_prefix(
     generation: GenerationId,
     shard: u16,
-    label: u32,
+    label: LabelId,
 ) -> [u8; LABEL_RANGE_PREFIX_LEN] {
     let mut out = [0u8; LABEL_RANGE_PREFIX_LEN];
     out[..GENERATION_PREFIX_LEN].copy_from_slice(&label_postings_prefix(generation));
     out[GENERATION_PREFIX_LEN..GENERATION_PREFIX_LEN + 2].copy_from_slice(&shard.to_be_bytes());
-    out[GENERATION_PREFIX_LEN + 2..].copy_from_slice(&label.to_be_bytes());
+    out[GENERATION_PREFIX_LEN + 2..].copy_from_slice(&label.get().to_be_bytes());
     out
 }
 
@@ -266,7 +267,7 @@ pub fn label_range_prefix(
 pub fn encode_label_posting(
     generation: GenerationId,
     shard: u16,
-    label: u32,
+    label: LabelId,
     node_id: u64,
 ) -> [u8; LABEL_POSTING_LEN] {
     let mut out = [0u8; LABEL_POSTING_LEN];
@@ -277,13 +278,13 @@ pub fn encode_label_posting(
 
 /// The shard, label and node a label posting key of `generation` names.
 /// `None` for a key that is no posting of that generation.
-pub fn decode_label_posting(generation: GenerationId, key: &[u8]) -> Option<(u16, u32, u64)> {
+pub fn decode_label_posting(generation: GenerationId, key: &[u8]) -> Option<(u16, LabelId, u64)> {
     let rest = key.strip_prefix(label_postings_prefix(generation).as_slice())?;
     if rest.len() != LABEL_POSTING_LEN - GENERATION_PREFIX_LEN {
         return None;
     }
     let shard = u16::from_be_bytes(rest[..2].try_into().ok()?);
-    let label = u32::from_be_bytes(rest[2..6].try_into().ok()?);
+    let label = LabelId::new(u32::from_be_bytes(rest[2..6].try_into().ok()?))?;
     let node_id = u64::from_be_bytes(rest[6..].try_into().ok()?);
     Some((shard, label, node_id))
 }

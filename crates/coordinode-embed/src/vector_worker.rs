@@ -238,17 +238,17 @@ impl Worker {
         for def in &definitions {
             let property = def.property();
             // The index covers the nodes of every type implying its label.
-            let implying =
-                coordinode_query::index::membership::types_implying(&self.engine, &def.label)
-                    .map_err(|e| format!("read the types implying :{}: {e}", def.label))?;
+            let carriers =
+                coordinode_query::index::membership::label_carriers(&self.engine, &def.label)
+                    .map_err(|e| format!("read the carriers of :{}: {e}", def.label))?;
             let mut upserts: Vec<(NodeId, Vec<f32>)> = Vec::new();
             for (node_id, record) in ids.iter().copied().zip(&records) {
                 let vector = record
                     .as_ref()
                     .filter(|r| {
-                        coordinode_query::index::membership::carries_label(
-                            &r.labels, &def.label, &implying,
-                        )
+                        carriers
+                            .as_ref()
+                            .is_some_and(|carriers| carriers.carried_by(&r.labels))
                     })
                     .and_then(|r| r.props.get(&interner.lookup(property)?))
                     .and_then(crate::db::try_extract_vector);
@@ -294,17 +294,17 @@ impl Worker {
             ) else {
                 continue;
             };
-            let implying = match coordinode_query::index::membership::types_implying(
+            let carriers = match coordinode_query::index::membership::label_carriers(
                 &self.engine,
                 &def.label,
             ) {
-                Ok(implying) => implying,
+                Ok(carriers) => carriers,
                 Err(e) => {
-                    tracing::error!(index = %def, error = %e, "vector index worker cannot read the types implying its label");
+                    tracing::error!(index = %def, error = %e, "vector index worker cannot read the carriers of its label");
                     return None;
                 }
             };
-            members.push((def, hnsw, health, field_id, implying));
+            members.push((def, hnsw, health, field_id, carriers));
         }
         drop(interner);
         if members.is_empty() {
@@ -316,11 +316,10 @@ impl Worker {
         }
         let targets: Vec<BuildTarget<'_>> = members
             .iter()
-            .map(|(def, hnsw, health, field_id, implying)| BuildTarget {
+            .map(|(_, hnsw, health, field_id, carriers)| BuildTarget {
                 hnsw: hnsw.as_ref(),
                 health: health.as_ref(),
-                label: &def.label,
-                implying,
+                carriers: carriers.as_ref(),
                 field_id: *field_id,
             })
             .collect();

@@ -63,11 +63,10 @@ pub struct BuildTarget<'a> {
     pub hnsw: &'a RwLock<HnswIndex>,
     /// Where progress, readiness and freshness are published.
     pub health: &'a HealthSignal,
-    /// The indexed label.
-    pub label: &'a str,
-    /// The types that imply `label`
-    /// ([`crate::index::membership::types_implying`]).
-    pub implying: &'a [String],
+    /// The nodes carrying the indexed label
+    /// ([`crate::index::membership::label_carriers`]); `None` while it has
+    /// no identity, and no node carries it.
+    pub carriers: Option<&'a crate::index::membership::LabelCarriers>,
     /// The interned id of the indexed property.
     pub field_id: u32,
 }
@@ -77,7 +76,10 @@ impl BuildTarget<'_> {
     fn member(&self, record: &NodeRecord) -> Option<Vec<f32>> {
         // The index covers every node carrying its label, its type's
         // implied ones included.
-        if !crate::index::membership::carries_label(&record.labels, self.label, self.implying) {
+        if !self
+            .carriers
+            .is_some_and(|carriers| carriers.carried_by(&record.labels))
+        {
             return None;
         }
         record

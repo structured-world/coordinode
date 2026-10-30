@@ -54,7 +54,7 @@ fn seed_version(db: &Database, id: u64, name: &str, valid_from: i64, valid_to: O
 
     let interner = db.interner().expect("interner");
     let field = |name: &str| interner.lookup(name).expect("declared field");
-    let mut record = NodeRecord::new("Emp");
+    let mut record = NodeRecord::new(super::helpers::bind_label(db.engine(), "Emp"));
     record.set(field("name"), Value::String(name.into()));
     record.set(field("valid_from"), Value::Int(valid_from));
     if let Some(to) = valid_to {

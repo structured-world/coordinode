@@ -441,7 +441,7 @@ pub fn uncovered_holders(
             .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
         // The index covers every node carrying its label, in any role: its
         // type, implied by its type, or auxiliary.
-        if !closures.carries(&record.labels, &source.label)? {
+        if !closures.carries_named(&record.labels, &source.label)? {
             return Ok(None);
         }
         let Some(values) = source.interpretation.record_membership(&record) else {
@@ -564,25 +564,23 @@ fn label_schema_unchanged(
     };
 
     let pointer = encode_label_current_revision_key(label);
-    let now = engine.get(Partition::Schema, &pointer)?;
-    let Some(now) = now else {
-        // No schema now: the read stands only if it saw none either.
-        return Ok(if revision == 0 {
-            Verdict::Holds
-        } else {
-            Verdict::Broken
-        });
-    };
-    let named = <[u8; 8]>::try_from(now.as_ref())
-        .ok()
-        .map(u64::from_be_bytes);
-    if revision == 0 || named != Some(revision) {
+    let binding = engine
+        .get(Partition::Schema, &pointer)?
+        .map(|bytes| decode_binding(label, &bytes))
+        .transpose()?;
+    // No definition now (no binding, or one without a definition): the read
+    // stands only if it saw none either.
+    let named = binding.map_or(0, |b| b.declared_revision());
+    if named != revision {
         return Ok(Verdict::Broken);
     }
-    // The pointer names the same revision; a rewrite of it or of the body
+    let Some(binding) = binding.filter(|_| revision != 0) else {
+        return Ok(Verdict::Holds);
+    };
+    // The binding names the same revision; a rewrite of it or of the body
     // in place since the view is still a different schema. The body of the
-    // revision the pointer names is present, so neither probe reads history.
-    let body = encode_label_schema_key(label, revision);
+    // revision the binding names is present, so neither probe reads history.
+    let body = encode_label_schema_key(binding.id, revision);
     if engine.written_since_snapshot(Partition::Schema, &pointer, unseen_from)?
         || engine.written_since_snapshot(Partition::Schema, &body, unseen_from)?
     {
@@ -591,10 +589,69 @@ fn label_schema_unchanged(
     Ok(Verdict::Holds)
 }
 
+/// The binding of label `name` from its stored bytes.
+fn decode_binding(
+    name: &str,
+    bytes: &[u8],
+) -> StorageResult<coordinode_core::schema::label_id::LabelBinding> {
+    coordinode_core::schema::label_id::LabelBinding::decode(bytes).ok_or_else(|| {
+        crate::error::StorageError::Serialization(format!(
+            "label binding '{name}': {} bytes",
+            bytes.len()
+        ))
+    })
+}
+
+/// A Schema record as the attempt leaves it: its own staged write over the
+/// stored one.
+fn staged_schema_read(
+    engine: &StorageEngine,
+    staged_points: StagedPoints<'_>,
+    key: &[u8],
+) -> StorageResult<Option<Vec<u8>>> {
+    match staged_points.get(&(Partition::Schema, key.to_vec())) {
+        Some(value) => Ok(value.clone()),
+        None => Ok(engine.get(Partition::Schema, key)?.map(|b| b.to_vec())),
+    }
+}
+
+/// The binding of label `name` as the attempt leaves it.
+fn current_binding(
+    engine: &StorageEngine,
+    name: &str,
+    staged_points: StagedPoints<'_>,
+) -> StorageResult<Option<coordinode_core::schema::label_id::LabelBinding>> {
+    let key = coordinode_core::schema::definition::encode_label_current_revision_key(name);
+    staged_schema_read(engine, staged_points, &key)?
+        .map(|bytes| decode_binding(name, &bytes))
+        .transpose()
+}
+
+/// The definition of `label` at `revision`, as the attempt leaves it; `None`
+/// when the label has no identity or the revision is stored nowhere.
+fn label_body(
+    engine: &StorageEngine,
+    label: &str,
+    revision: u64,
+    staged_points: StagedPoints<'_>,
+) -> StorageResult<Option<coordinode_core::schema::definition::LabelSchema>> {
+    use coordinode_core::schema::definition::{LabelSchema, encode_label_schema_key};
+
+    let Some(binding) = current_binding(engine, label, staged_points)? else {
+        return Ok(None);
+    };
+    let key = encode_label_schema_key(binding.id, revision);
+    let Some(body) = staged_schema_read(engine, staged_points, &key)? else {
+        return Ok(None);
+    };
+    LabelSchema::from_msgpack(&body).map(Some).map_err(|e| {
+        crate::error::StorageError::Serialization(format!("label schema '{label}': {e}"))
+    })
+}
+
 /// Whether every stored node carrying `label` satisfies the schema the
-/// attempt activates at `revision`: its kind and implied labels, the whole
-/// definition for the nodes it types and the explicit constraints for the
-/// others.
+/// attempt activates at `revision`: its kind, the whole definition for the
+/// nodes it types and the explicit constraints for the others.
 ///
 /// The attempt's own staged node writes are part of the post-state and
 /// replace what is stored under the same key.
@@ -604,39 +661,23 @@ fn label_schema_admits_stored_nodes(
     revision: u64,
     staged_points: StagedPoints<'_>,
 ) -> StorageResult<Verdict> {
-    use coordinode_core::schema::definition::{LabelSchema, encode_label_schema_key};
-
     // Removing the schema admits everything.
     if revision == 0 {
         return Ok(Verdict::Holds);
     }
-    let body_key = encode_label_schema_key(label, revision);
-    let body = match staged_points.get(&(Partition::Schema, body_key.clone())) {
-        Some(Some(bytes)) => Some(bytes.clone()),
-        Some(None) => None,
-        None => engine
-            .get(Partition::Schema, &body_key)?
-            .map(|b| b.to_vec()),
-    };
-    let Some(body) = body else {
+    let Some(schema) = label_body(engine, label, revision, staged_points)? else {
         // An activation of a revision that is nowhere describes nothing the
         // nodes could be checked against.
         return Ok(Verdict::Undecidable);
     };
-    let schema = LabelSchema::from_msgpack(&body).map_err(|e| {
-        crate::error::StorageError::Serialization(format!("label schema '{label}': {e}"))
-    })?;
-    // The kind and the implied labels bind the stored nodes as the
-    // properties do: a node of the type written beside the declaration must
-    // carry every implied label, and none may have an auxiliary label as its
-    // type.
-    if schema.is_auxiliary() || !schema.implies().is_empty() {
-        let implied = implied_closure(engine, &schema, staged_points)?;
-        if first_node_breaking_label_kind(engine, label, schema.kind(), &implied, staged_points)?
-            .is_some()
-        {
-            return Ok(Verdict::Broken);
-        }
+    // The kind binds the stored nodes as the properties do: none may have an
+    // auxiliary label as its type. What a type implies is derived from its
+    // definition, so no stored node can lack it.
+    if schema.is_auxiliary()
+        && let Some(binding) = current_binding(engine, label, staged_points)?
+        && first_node_typed_by(engine, binding.id, staged_points)?.is_some()
+    {
+        return Ok(Verdict::Broken);
     }
     Ok(
         match first_label_schema_violation(engine, &schema, staged_points)? {
@@ -646,34 +687,15 @@ fn label_schema_admits_stored_nodes(
     )
 }
 
-/// Every label `schema` implies, transitively, without itself, under the
-/// definitions the attempt leaves.
-fn implied_closure(
-    engine: &StorageEngine,
-    schema: &coordinode_core::schema::definition::LabelSchema,
-    staged_points: StagedPoints<'_>,
-) -> StorageResult<Vec<String>> {
-    let mut closure: Vec<String> = Vec::new();
-    let mut pending: Vec<String> = schema.implies().to_vec();
-    while let Some(label) = pending.pop() {
-        if label == schema.name || closure.contains(&label) {
-            continue;
-        }
-        if let Some(implied) = current_label_schema(engine, &label, staged_points)? {
-            pending.extend(implied.implies().iter().cloned());
-        }
-        closure.push(label);
-    }
-    Ok(closure)
-}
-
 /// What each type met implies, under the definitions an attempt leaves (its
-/// own staged schema writes over the stored ones), compiled once per type:
-/// a judgement over many records reads no definition per record.
+/// own staged schema writes over the stored ones), compiled once per type,
+/// with the label identities it met: a judgement over many records reads no
+/// definition per record.
 pub(crate) struct Closures<'e> {
     engine: &'e StorageEngine,
     staged_points: StagedPoints<'e>,
     implied: coordinode_core::schema::labels::ImpliedCache,
+    ids: rustc_hash::FxHashMap<String, Option<coordinode_core::schema::label_id::LabelId>>,
 }
 
 impl<'e> Closures<'e> {
@@ -682,79 +704,126 @@ impl<'e> Closures<'e> {
             engine,
             staged_points,
             implied: coordinode_core::schema::labels::ImpliedCache::default(),
+            ids: rustc_hash::FxHashMap::default(),
         }
+    }
+
+    /// The identity label `name` is bound to now; `None` when it has none,
+    /// which no stored node can carry.
+    pub(crate) fn label_id(
+        &mut self,
+        name: &str,
+    ) -> StorageResult<Option<coordinode_core::schema::label_id::LabelId>> {
+        if let Some(id) = self.ids.get(name) {
+            return Ok(*id);
+        }
+        let id = current_binding(self.engine, name, self.staged_points)?.and_then(|b| b.live_id());
+        self.ids.insert(name.to_string(), id);
+        Ok(id)
     }
 
     /// What type `primary` implies, compiled on first use.
     pub(crate) fn implied(
         &mut self,
-        primary: &str,
+        primary: coordinode_core::schema::label_id::LabelId,
     ) -> StorageResult<&coordinode_core::schema::labels::ImpliedLabels> {
-        let (engine, staged_points) = (self.engine, self.staged_points);
-        self.implied
-            .compile(primary, |l| {
-                Ok::<_, crate::error::StorageError>(
-                    current_label_schema(engine, l, staged_points)?
-                        .as_ref()
-                        .map(coordinode_core::schema::labels::LabelFacts::of)
-                        .unwrap_or_default(),
-                )
-            })?
-            .map_err(|e| crate::error::StorageError::Serialization(e.to_string()))?;
+        let mut implied = core::mem::take(&mut self.implied);
+        let compiled = implied.compile(primary, |id| self.facts(id));
+        self.implied = implied;
+        compiled?.map_err(|e| {
+            crate::error::StorageError::Serialization(format!(
+                "labels imply one another in a cycle: {e:?}"
+            ))
+        })?;
         self.implied.implied(primary).ok_or_else(|| {
             crate::error::StorageError::Serialization(format!(
-                "what :{primary} implies was not compiled"
+                "what label {primary} implies was not compiled"
             ))
+        })
+    }
+
+    /// What the catalog the attempt leaves says about label `id`: the
+    /// definition its name is bound to while that binding is still `id`, and
+    /// nothing (a FLEXIBLE type) for an identity without one.
+    fn facts(
+        &mut self,
+        id: coordinode_core::schema::label_id::LabelId,
+    ) -> StorageResult<coordinode_core::schema::labels::LabelFacts> {
+        use coordinode_core::schema::labels::LabelFacts;
+
+        let name = self.name_of(id)?;
+        let Some(binding) = current_binding(self.engine, &name, self.staged_points)?
+            .filter(|b| b.live_id() == Some(id))
+        else {
+            return Ok(LabelFacts::default());
+        };
+        let revision = binding.declared_revision();
+        if revision == 0 {
+            return Ok(LabelFacts::default());
+        }
+        let Some(schema) = label_body(self.engine, &name, revision, self.staged_points)? else {
+            return Ok(LabelFacts::default());
+        };
+        let mut implies = Vec::with_capacity(schema.implies().len());
+        for implied in schema.implies() {
+            let Some(implied_id) = self.label_id(implied)? else {
+                return Err(crate::error::StorageError::Serialization(format!(
+                    ":{name} implies :{implied}, which has no identity"
+                )));
+            };
+            implies.push(implied_id);
+        }
+        Ok(LabelFacts {
+            kind: schema.kind(),
+            implies: implies.into(),
+        })
+    }
+
+    /// The name label `id` was allocated for. A stored record names only
+    /// allocated labels, so an id without a record is damage.
+    pub(crate) fn name_of(
+        &self,
+        id: coordinode_core::schema::label_id::LabelId,
+    ) -> StorageResult<String> {
+        let key = coordinode_core::schema::label_id::label_id_key(id);
+        let Some(name) = staged_schema_read(self.engine, self.staged_points, &key)? else {
+            return Err(crate::error::StorageError::Serialization(format!(
+                "label {id} has no identity record"
+            )));
+        };
+        String::from_utf8(name).map_err(|e| {
+            crate::error::StorageError::Serialization(format!("name of label {id}: {e}"))
         })
     }
 
     /// Whether a node storing `stored` carries `label`: stored, or implied
     /// by its type.
-    fn carries(&mut self, stored: &[String], label: &str) -> StorageResult<bool> {
-        if stored.iter().any(|l| l == label) {
+    fn carries(
+        &mut self,
+        stored: &[coordinode_core::schema::label_id::LabelId],
+        label: coordinode_core::schema::label_id::LabelId,
+    ) -> StorageResult<bool> {
+        if stored.contains(&label) {
             return Ok(true);
         }
         match stored.first() {
-            Some(primary) => Ok(self.implied(primary)?.contains(label)),
+            Some(primary) => Ok(self.implied(*primary)?.contains(label)),
             None => Ok(false),
         }
     }
-}
 
-/// The current definition of `label` as the attempt leaves it: its own
-/// staged pointer and body over the stored ones. `None` for a label without
-/// a definition.
-fn current_label_schema(
-    engine: &StorageEngine,
-    label: &str,
-    staged_points: StagedPoints<'_>,
-) -> StorageResult<Option<coordinode_core::schema::definition::LabelSchema>> {
-    use coordinode_core::schema::definition::{
-        LabelSchema, encode_label_current_revision_key, encode_label_schema_key,
-    };
-
-    let read = |key: Vec<u8>| -> StorageResult<Option<Vec<u8>>> {
-        match staged_points.get(&(Partition::Schema, key.clone())) {
-            Some(value) => Ok(value.clone()),
-            None => Ok(engine.get(Partition::Schema, &key)?.map(|b| b.to_vec())),
+    /// [`Self::carries`] for a label named `label`; a label without an
+    /// identity is carried by no node.
+    fn carries_named(
+        &mut self,
+        stored: &[coordinode_core::schema::label_id::LabelId],
+        label: &str,
+    ) -> StorageResult<bool> {
+        match self.label_id(label)? {
+            Some(id) => self.carries(stored, id),
+            None => Ok(false),
         }
-    };
-    let serialization = |what: String| crate::error::StorageError::Serialization(what);
-    let Some(pointer) = read(encode_label_current_revision_key(label))? else {
-        return Ok(None);
-    };
-    let revision: [u8; 8] = pointer.as_slice().try_into().map_err(|_| {
-        serialization(format!(
-            "label schema pointer '{label}': {} bytes",
-            pointer.len()
-        ))
-    })?;
-    let Some(body) = read(encode_label_schema_key(label, u64::from_be_bytes(revision)))? else {
-        return Ok(None);
-    };
-    LabelSchema::from_msgpack(&body)
-        .map(Some)
-        .map_err(|e| serialization(format!("label schema '{label}': {e}")))
+    }
 }
 
 /// Whether every node the attempt writes carrying `label` satisfies the
@@ -773,34 +842,28 @@ fn candidate_admits_written_nodes(
 ) -> StorageResult<Verdict> {
     use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_DOC_DELTA};
     use coordinode_core::graph::node::NodeRecord;
-    use coordinode_core::schema::definition::{LabelSchema, encode_label_schema_key};
 
     let serialization = |what: &str, e: &dyn core::fmt::Display| {
         crate::error::StorageError::Serialization(format!("{what}: {e}"))
     };
-    let body_key = encode_label_schema_key(label, revision);
-    let body = match staged_points.get(&(Partition::Schema, body_key.clone())) {
-        Some(Some(bytes)) => Some(bytes.clone()),
-        Some(None) => None,
-        None => engine
-            .get(Partition::Schema, &body_key)?
-            .map(|b| b.to_vec()),
-    };
-    let Some(body) = body else {
+    let Some(schema) = label_body(engine, label, revision, staged_points)? else {
         return Ok(Verdict::Undecidable);
     };
-    let schema = LabelSchema::from_msgpack(&body)
-        .map_err(|e| serialization(&format!("label schema '{label}'"), &e))?;
     let Some(candidate) = schema.candidate_schema() else {
         return Ok(Verdict::Holds);
     };
 
     let mut names: Option<(std::collections::HashMap<u32, String>, u32)> = None;
     let mut closures = Closures::new(engine, staged_points);
+    let Some(label_id) = closures.label_id(label)? else {
+        // A label without an identity is carried by no node.
+        return Ok(Verdict::Holds);
+    };
     let mut check = |key: &[u8], record: NodeRecord| -> StorageResult<Option<Verdict>> {
-        if !closures.carries(&record.labels, label)? {
+        if !closures.carries(&record.labels, label_id)? {
             return Ok(None);
         }
+        let typed = record.primary_label() == Some(label_id);
         if names.is_none() {
             let dictionary = crate::engine::metadata::load_field_dictionary(engine)?;
             names = Some((
@@ -817,7 +880,7 @@ fn candidate_admits_written_nodes(
         // A carrier answers to the candidate as the proof holds it: whole
         // as its type, by its explicit constraints otherwise.
         Ok(
-            carrier_violation(&candidate, record, true, names, *frontier).map(|reason| {
+            carrier_violation(&candidate, record, typed, true, names, *frontier).map(|reason| {
                 Verdict::Violates(LabelSchemaViolation {
                     node: node_of_record_key(key),
                     reason,
@@ -905,18 +968,27 @@ pub fn first_label_schema_violation(
         .map(|(name, id)| (id, name.to_string()))
         .collect();
     let mut closures = Closures::new(engine, staged_points);
+    let Some(label) = closures.label_id(&schema.name)? else {
+        // A label without an identity is carried by no node.
+        return Ok(None);
+    };
     let mut check = |key: &[u8], bytes: &[u8]| -> StorageResult<Option<LabelSchemaViolation>> {
         let record = NodeRecord::from_msgpack(bytes)
             .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
-        let carried = closures.carries(&record.labels, &schema.name)?;
-        Ok(
-            carrier_violation(schema, record, carried, &names, dictionary.frontier()).map(
-                |reason| LabelSchemaViolation {
-                    node: node_of_record_key(key),
-                    reason,
-                },
-            ),
+        let typed = record.primary_label() == Some(label);
+        let carried = closures.carries(&record.labels, label)?;
+        Ok(carrier_violation(
+            schema,
+            record,
+            typed,
+            carried,
+            &names,
+            dictionary.frontier(),
         )
+        .map(|reason| LabelSchemaViolation {
+            node: node_of_record_key(key),
+            reason,
+        }))
     };
 
     for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
@@ -942,10 +1014,10 @@ pub fn first_label_schema_violation(
     Ok(None)
 }
 
-/// The first stored node that declaring `label` as `kind`, implying the
-/// labels `implied` (the whole closure), would leave invalid: for an
-/// auxiliary label a node it types, for a type label a node it types that
-/// lacks one of the implied labels. `None` when every node stays valid.
+/// The first stored node whose type is `label`; `None` when it types none.
+/// What a declaration that no stored node of the type may predate asks: an
+/// auxiliary label types no node, and a type gains implied labels only
+/// through the reconciliation that covers its nodes.
 ///
 /// Only labels are decoded. `staged_points` are the asking attempt's own
 /// writes and replace what is stored under their keys.
@@ -953,26 +1025,17 @@ pub fn first_label_schema_violation(
 /// # Errors
 ///
 /// A stored record's labels do not decode.
-pub fn first_node_breaking_label_kind(
+pub fn first_node_typed_by(
     engine: &StorageEngine,
-    label: &str,
-    kind: coordinode_core::schema::definition::LabelKind,
-    implied: &[String],
+    label: coordinode_core::schema::label_id::LabelId,
     staged_points: StagedPoints<'_>,
 ) -> StorageResult<Option<NodeId>> {
     use coordinode_core::graph::node::NodeRecord;
-    use coordinode_core::schema::definition::LabelKind;
 
     let breaks = |bytes: &[u8]| -> StorageResult<bool> {
         let labels = NodeRecord::labels_from_msgpack(bytes)
             .map_err(|e| crate::error::StorageError::Serialization(format!("node labels: {e}")))?;
-        if labels.first().map(String::as_str) != Some(label) {
-            return Ok(false);
-        }
-        Ok(match kind {
-            LabelKind::Auxiliary => true,
-            LabelKind::Type => implied.iter().any(|l| !labels.contains(l)),
-        })
+        Ok(labels.first() == Some(&label))
     };
 
     for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
@@ -1013,14 +1076,18 @@ pub fn label_schema_violations(
     use coordinode_core::graph::node::NodeRecord;
 
     // Only definitions that can refuse a node are read for.
+    let nothing_staged = std::collections::HashMap::new();
+    let mut closures = Closures::new(engine, &nothing_staged);
+    // A label without an identity is carried by no node.
     let mut pending: rustc_hash::FxHashMap<
-        &str,
+        coordinode_core::schema::label_id::LabelId,
         &coordinode_core::schema::definition::LabelSchema,
-    > = schemas
-        .iter()
-        .filter(|s| s.can_refuse_nodes())
-        .map(|s| (s.name.as_str(), s))
-        .collect();
+    > = rustc_hash::FxHashMap::default();
+    for schema in schemas.iter().filter(|s| s.can_refuse_nodes()) {
+        if let Some(id) = closures.label_id(&schema.name)? {
+            pending.insert(id, schema);
+        }
+    }
     let mut found = Vec::new();
     if pending.is_empty() {
         return Ok(found);
@@ -1030,8 +1097,6 @@ pub fn label_schema_violations(
         .iter()
         .map(|(name, id)| (id, name.to_string()))
         .collect();
-    let nothing_staged = std::collections::HashMap::new();
-    let mut closures = Closures::new(engine, &nothing_staged);
     for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
         let (key, value) = guard.into_inner()?;
         if !is_node_record_key(&key) {
@@ -1041,16 +1106,25 @@ pub fn label_schema_violations(
             .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
         // Each pending label the node carries, its type's implied ones
         // included, judges it.
-        let mut carried: Vec<&coordinode_core::schema::definition::LabelSchema> = Vec::new();
-        for (name, schema) in &pending {
-            if closures.carries(&record.labels, name)? {
-                carried.push(schema);
+        let mut carried: Vec<(
+            coordinode_core::schema::label_id::LabelId,
+            &coordinode_core::schema::definition::LabelSchema,
+        )> = Vec::new();
+        for (id, schema) in &pending {
+            if closures.carries(&record.labels, *id)? {
+                carried.push((*id, schema));
             }
         }
-        for schema in carried {
-            let Some(reason) =
-                carrier_violation(schema, record.clone(), true, &names, dictionary.frontier())
-            else {
+        for (id, schema) in carried {
+            let typed = record.primary_label() == Some(id);
+            let Some(reason) = carrier_violation(
+                schema,
+                record.clone(),
+                typed,
+                true,
+                &names,
+                dictionary.frontier(),
+            ) else {
                 continue;
             };
             found.push((
@@ -1060,7 +1134,7 @@ pub fn label_schema_violations(
                     reason,
                 },
             ));
-            pending.remove(schema.name.as_str());
+            pending.remove(&id);
         }
         if pending.is_empty() {
             break;
@@ -1087,18 +1161,19 @@ fn is_node_record_key(key: &[u8]) -> bool {
 }
 
 /// What `record` breaks in `schema`: the whole definition when the label is
-/// the node's type, only the explicit constraints declared on the label when
-/// the node carries it implied or auxiliary (`carried`, which the caller
-/// judges with what the type implies). `None` for a node that does not carry
-/// the label or breaks nothing.
+/// the node's type (`typed`), only the explicit constraints declared on the
+/// label when the node carries it implied or auxiliary (`carried`, which the
+/// caller judges with what the type implies). `None` for a node that does
+/// not carry the label or breaks nothing.
 fn carrier_violation(
     schema: &coordinode_core::schema::definition::LabelSchema,
     record: coordinode_core::graph::node::NodeRecord,
+    typed: bool,
     carried: bool,
     names: &std::collections::HashMap<u32, String>,
     frontier: u32,
 ) -> Option<String> {
-    if record.labels.first() == Some(&schema.name) {
+    if typed {
         return record_violation(schema, record, names, frontier);
     }
     if !carried {

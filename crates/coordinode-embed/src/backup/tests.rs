@@ -598,6 +598,49 @@ fn binary_restore_rejects_newer_format_version() {
         .expect("force should bypass the version gate");
 }
 
+/// A dump of an older format holds records this build would misread (node
+/// records naming their labels instead of storing catalog identities): it is
+/// refused before any of it is interpreted, and force does not override that,
+/// since no migration reads the old layout.
+#[test]
+fn binary_restore_refuses_an_older_format_even_forced() {
+    let older = export::BINARY_FORMAT_VERSION - 1;
+    let dump = encode_dump(&[
+        export::BackupEntry::Manifest {
+            format_version: older,
+            producer: "coordinode-embed/0.8.0".to_string(),
+            schema_fingerprint: 0xcbf2_9ce4_8422_2325,
+        },
+        export::BackupEntry::Interner(empty_dictionary()),
+        export::BackupEntry::Node {
+            key: b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01".to_vec(),
+            value: Vec::new(),
+        },
+    ]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    for options in [RestoreOptions::default(), forced()] {
+        let err = db
+            .restore(BackupFormat::Binary, &dump, &options)
+            .unwrap_err();
+        assert!(
+            matches!(&err, restore::RestoreError::IncompatibleVersion(m) if m.contains(&format!("v{older}"))),
+            "an older format must be refused, got {err:?}"
+        );
+    }
+    let rows = db.engine().snapshot();
+    let nodes = db
+        .engine()
+        .snapshot_prefix_scan(
+            &rows,
+            coordinode_storage::engine::partition::Partition::Node,
+            b"node:",
+        )
+        .unwrap();
+    assert!(nodes.is_empty(), "nothing of the refused dump was written");
+}
+
 #[test]
 fn binary_restore_rejects_missing_manifest() {
     // A pre-versioned or truncated dump that does not lead with a

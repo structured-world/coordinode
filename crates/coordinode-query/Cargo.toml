@@ -34,6 +34,8 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
+# A node's label set kept inline on the write and build paths.
+smallvec = "1"
 rand = { workspace = true }
 chrono = { workspace = true }
 regex = "1"

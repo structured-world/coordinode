@@ -511,9 +511,45 @@ fn resolve_weight_from_config() {
     };
     let cache = TieredCache::open(&config).expect("open");
 
-    assert!((cache.resolve_weight("User") - 5.0).abs() < f32::EPSILON);
-    assert!((cache.resolve_weight("Log") - 0.1).abs() < f32::EPSILON);
-    assert!((cache.resolve_weight("Unknown") - 1.0).abs() < f32::EPSILON);
+    use coordinode_core::schema::label_id::LabelId;
+    let id = |raw| LabelId::new(raw).expect("nonzero");
+    let names = |label: LabelId| match label.get() {
+        1 => Some("User".to_string()),
+        2 => Some("Log".to_string()),
+        3 => Some("Unknown".to_string()),
+        _ => None,
+    };
+    assert!((cache.resolve_weight(id(1), names) - 5.0).abs() < f32::EPSILON);
+    assert!((cache.resolve_weight(id(2), names) - 0.1).abs() < f32::EPSILON);
+    assert!((cache.resolve_weight(id(3), names) - 1.0).abs() < f32::EPSILON);
+}
+
+/// A label's weight is resolved from its name once and kept, since an
+/// identity never changes its name; one that cannot be named yet weighs 1.0
+/// and is asked again rather than remembered as unweighted.
+#[test]
+fn resolve_weight_names_each_label_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut label_weights = std::collections::HashMap::new();
+    label_weights.insert("User".to_string(), 5.0);
+    let config = TieredCacheConfig {
+        layers: vec![CacheLayerConfig::new(dir.path().join("l0.cache"), 1024)],
+        compaction_interval_secs: 0,
+        label_weights,
+    };
+    let cache = TieredCache::open(&config).expect("open");
+    let user = coordinode_core::schema::label_id::LabelId::new(1).expect("nonzero");
+
+    let unnamed = |_| None;
+    assert!((cache.resolve_weight(user, unnamed) - 1.0).abs() < f32::EPSILON);
+    let asked = std::cell::Cell::new(0);
+    let named = |_| {
+        asked.set(asked.get() + 1);
+        Some("User".to_string())
+    };
+    assert!((cache.resolve_weight(user, named) - 5.0).abs() < f32::EPSILON);
+    assert!((cache.resolve_weight(user, named) - 5.0).abs() < f32::EPSILON);
+    assert_eq!(asked.get(), 1, "the name is read once");
 }
 
 /// Default put() uses weight 1.0 (backward compatibility).

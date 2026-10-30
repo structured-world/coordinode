@@ -35,7 +35,7 @@ fn seed_version(
 
     let interner = db.interner().expect("interner");
     let field = |name: &str| interner.lookup(name).expect("declared field");
-    let mut record = NodeRecord::new("Emp");
+    let mut record = NodeRecord::new(super::helpers::bind_label(db.engine(), "Emp"));
     for (name, value) in props {
         record.set(field(name), Value::String((*value).into()));
     }

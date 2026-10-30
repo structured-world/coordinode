@@ -9,10 +9,11 @@
 use std::collections::HashMap;
 
 use coordinode_core::graph::node::{NodeRecord, PropertyValue};
+use coordinode_core::schema::label_id::{FIRST_LABEL_ID, LabelId};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 fn record_with(props: u32) -> NodeRecord {
-    let mut record = NodeRecord::new("User");
+    let mut record = NodeRecord::new(FIRST_LABEL_ID);
     for id in 0..props {
         record.set(id, PropertyValue::Int(i64::from(id) * 7));
     }
@@ -28,7 +29,7 @@ fn bench_encode(c: &mut Criterion) {
         });
         // The same fields serialised as they lie in the hash map: the encoding
         // before keys were sorted.
-        let unsorted: (&Vec<String>, &HashMap<u32, PropertyValue>) =
+        let unsorted: (&Vec<LabelId>, &HashMap<u32, PropertyValue>) =
             (&record.labels, &record.props);
         group.bench_with_input(BenchmarkId::new("hash_order", props), &unsorted, |b, r| {
             b.iter(|| rmp_serde::to_vec(r).expect("encode"));

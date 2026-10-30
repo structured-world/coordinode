@@ -19,8 +19,9 @@ use coordinode_storage::engine::core::StorageEngine;
 
 use crate::planner::logical::{NumericCmp, VectorPredicate};
 
-/// For each label a predicate tests, the declared types that imply it.
-pub type Implying = std::collections::HashMap<String, Vec<String>>;
+/// For each label a predicate tests that has an identity, the nodes that
+/// carry it. A label absent from it has no identity, and no node carries it.
+pub type Implying = std::collections::HashMap<String, crate::index::membership::LabelCarriers>;
 
 /// Evaluate `predicate` against the node identified by `node_id`.
 ///
@@ -61,14 +62,9 @@ pub fn evaluate_against(
         // auxiliary; MATCH on the label finds it in each case. The record
         // stores its type and auxiliary labels; a type implying the label
         // carries it without storing it.
-        VectorPredicate::LabelEq(label) => {
-            record.labels.iter().any(|l| l == label)
-                || record.labels.first().is_some_and(|primary| {
-                    implying
-                        .get(label)
-                        .is_some_and(|types| types.iter().any(|t| t == primary))
-                })
-        }
+        VectorPredicate::LabelEq(label) => implying
+            .get(label)
+            .is_some_and(|carriers| carriers.carried_by(&record.labels)),
         VectorPredicate::PropertyEq { property, value } => {
             let Some(fid) = field_lookup(property) else {
                 return false;

@@ -1146,10 +1146,11 @@ fn snapshot_isolation_through_database() {
         .expect("prefix scan");
 
     // Count nodes visible at old seqno
+    let snap = super::helpers::label_id(db.engine(), "Snap").expect("bound");
     let mut old_count = 0;
     for (_key, value) in &old_nodes {
         if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value)
-            && record.labels.contains(&"Snap".to_string())
+            && record.stores_label(snap)
         {
             old_count += 1;
         }
@@ -1199,10 +1200,11 @@ fn snapshot_sees_old_version_after_set() {
         .snapshot_prefix_scan(&old_snap, Partition::Node, b"node:")
         .expect("scan");
 
+    let version_test = super::helpers::label_id(db.engine(), "VersionTest").expect("bound");
     let mut found_v1 = false;
     for (_key, value) in &old_nodes {
         if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value)
-            && record.labels.contains(&"VersionTest".to_string())
+            && record.stores_label(version_test)
         {
             // Check the val property (interned)
             for val in record.props.values() {
@@ -1249,10 +1251,11 @@ fn snapshot_before_delete_still_visible() {
         .snapshot_prefix_scan(&old_snap, Partition::Node, b"node:")
         .expect("scan");
 
+    let ephemeral = super::helpers::label_id(db.engine(), "Ephemeral").expect("bound");
     let mut found_ephemeral = false;
     for (_key, value) in &old_nodes {
         if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value)
-            && record.labels.contains(&"Ephemeral".to_string())
+            && record.stores_label(ephemeral)
         {
             found_ephemeral = true;
         }
@@ -1283,6 +1286,7 @@ fn multiple_snapshots_at_different_seqnos() {
 
     // Verify: snapshot at seqno[i] should see exactly i+1 Counter nodes
     // (but seqno[0] = after first write = 1 node, etc.)
+    let counter = super::helpers::label_id(db.engine(), "Counter").expect("bound");
     for (i, &seqno) in seqnos.iter().enumerate() {
         let snap = db
             .engine()
@@ -1297,7 +1301,7 @@ fn multiple_snapshots_at_different_seqnos() {
             .iter()
             .filter(|(_k, v)| {
                 coordinode_core::graph::node::NodeRecord::from_msgpack(v)
-                    .map(|r| r.labels.contains(&"Counter".to_string()))
+                    .map(|r| r.stores_label(counter))
                     .unwrap_or(false)
             })
             .count();

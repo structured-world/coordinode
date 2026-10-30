@@ -1021,7 +1021,7 @@ fn record_holds(
     tuple: &[u8],
     catalog: &mut CatalogMembership<'_>,
 ) -> Result<bool, StoreError> {
-    Ok(catalog.carries(record, &def.label)?
+    Ok(catalog.carries_named(record, &def.label)?
         && interpretation
             .record_membership(record)
             .is_some_and(|held| tuples(&held).iter().any(|t| t.as_slice() == tuple)))

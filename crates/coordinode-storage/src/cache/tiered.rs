@@ -532,8 +532,13 @@ pub struct TieredCache {
     wake: Arc<Wake>,
     /// Background compaction thread handle.
     compaction_thread: Option<std::thread::JoinHandle<()>>,
-    /// Per-label eviction priority weights. Used by `resolve_weight()`.
+    /// Per-label eviction priority weights, by label name. Used by
+    /// `resolve_weight()`.
     label_weights: Arc<HashMap<String, f32>>,
+    /// The weight of each label identity met, resolved from its name once:
+    /// an identity keeps the name it was allocated for.
+    resolved_weights:
+        parking_lot::RwLock<rustc_hash::FxHashMap<coordinode_core::schema::label_id::LabelId, f32>>,
     /// Invalidation generations by key stripe: bumped by every
     /// [`remove`](Self::remove) of a key of the stripe, after its write.
     key_generations: Box<[AtomicU64]>,
@@ -601,6 +606,7 @@ impl TieredCache {
             wake,
             compaction_thread,
             label_weights,
+            resolved_weights: parking_lot::RwLock::default(),
             key_generations: (0..stripes).map(|_| AtomicU64::new(0)).collect(),
             partition_generations: (0..=usize::from(u8::MAX))
                 .map(|_| AtomicU64::new(0))
@@ -682,10 +688,23 @@ impl TieredCache {
         self.drain_to_next(0, drained);
     }
 
-    /// Look up the eviction weight for a label.
-    /// Returns the configured weight, or 1.0 if the label is not in the map.
-    pub fn resolve_weight(&self, label: &str) -> f32 {
-        self.label_weights.get(label).copied().unwrap_or(1.0)
+    /// The eviction weight of label `label`: the one configured for its
+    /// name, or 1.0. `name_of` names the identity the first time it is met;
+    /// an identity it cannot name yet weighs 1.0 and is asked again later.
+    pub fn resolve_weight(
+        &self,
+        label: coordinode_core::schema::label_id::LabelId,
+        name_of: impl FnOnce(coordinode_core::schema::label_id::LabelId) -> Option<String>,
+    ) -> f32 {
+        if let Some(weight) = self.resolved_weights.read().get(&label) {
+            return *weight;
+        }
+        let Some(name) = name_of(label) else {
+            return 1.0;
+        };
+        let weight = self.label_weights.get(&name).copied().unwrap_or(1.0);
+        self.resolved_weights.write().insert(label, weight);
+        weight
     }
 
     /// Whether any label weights are configured.

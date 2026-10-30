@@ -39,12 +39,30 @@ fn insert_node(
     props: &[(&str, Value)],
     interner: &mut FieldInterner,
 ) {
-    let mut record = NodeRecord::new(label);
+    let mut record = NodeRecord::new(bind(engine, label));
     for (name, value) in props {
         let field_id = interner.intern(name);
         record.set(field_id, value.clone());
     }
     seed_node_record(engine, shard_id, NodeId::from_raw(node_id), &record);
+}
+
+/// The identity of label `name`, bound as a statement's first use of it
+/// binds it, so the records the tests seed directly are found by their
+/// label's name.
+fn bind(engine: &StorageEngine, name: &str) -> LabelId {
+    coordinode_modality::LocalSchemaStore::new(engine)
+        .bind_label(name)
+        .expect("bind label")
+}
+
+/// The identity label `name` is bound to in what `engine` committed; `None`
+/// when no write used it.
+fn bound(engine: &StorageEngine, name: &str) -> Option<LabelId> {
+    use coordinode_modality::SchemaStore as _;
+    coordinode_modality::LocalSchemaStore::new(engine)
+        .label_id(name)
+        .expect("read label binding")
 }
 
 /// Commit a built node record in its own MVCC transaction.
@@ -155,8 +173,9 @@ fn a_blocked_reader_is_served_once_the_build_hands_over() {
                 targets: &[crate::index::BuildTarget {
                     hnsw: hnsw.as_ref(),
                     health: health.as_ref(),
-                    label: "Doc",
-                    implying: &[],
+                    carriers: Some(&crate::index::membership::LabelCarriers::stored_only(bind(
+                        &engine, "Doc",
+                    ))),
                     field_id: field,
                 }],
             }
@@ -418,7 +437,7 @@ fn make_ctx<'a>(
         feedback_cache: None,
         schema_label_cache: std::collections::HashMap::new(),
         label_schema_cache: std::collections::HashMap::new(),
-        implied: Default::default(),
+        labels: Default::default(),
         index_deferred: Default::default(),
         node_columns: None,
         applied_watermark: None,
@@ -1195,7 +1214,11 @@ fn create_node_writes_to_storage() {
         .and_then(|v| v.as_int())
         .expect("node id");
     let record = read_node(&engine, 1, NodeId::from_raw(node_id as u64)).expect("node exists");
-    assert_eq!(record.primary_label(), "User");
+    assert_eq!(record.primary_label(), bound(&engine, "User"));
+    assert!(
+        record.primary_label().is_some(),
+        "the write bound the label"
+    );
 }
 
 #[test]
@@ -4067,7 +4090,7 @@ fn mvcc_get_node_temporal_leaves_no_occ_scope() {
     let id = NodeId::from_raw(77);
     // Seed a temporal version so the read returns Some, via the
     // typed Layer-4 `put_temporal` (raw-encoder-free fixture).
-    let rec = NodeRecord::new("E");
+    let rec = NodeRecord::new(bind(&engine, "E"));
     seed_node_temporal(&engine, 0, id, 1234567890, &rec);
 
     let mut interner = FieldInterner::new();
@@ -4114,7 +4137,7 @@ fn mvcc_put_node_temporal_does_not_track_in_occ_scope() {
     ctx.mvcc_read_ts = oracle.next();
 
     let id = NodeId::from_raw(88);
-    ctx.mvcc_put_node_temporal(0, id, 1000, &NodeRecord::new("E"))
+    ctx.mvcc_put_node_temporal(0, id, 1000, &NodeRecord::new(bind(&engine, "E")))
         .expect("put");
     match ctx.txn.occ_scope() {
         None => { /* fine — no scope materialised on pure write */ }
@@ -4193,14 +4216,15 @@ fn mvcc_temporal_handles_negative_valid_from_ms() {
 
     let id = NodeId::from_raw(99);
     let pre_epoch = -1_577_836_800_000_i64; // ~1920
-    let rec = NodeRecord::new("Hist");
+    let hist = bind(&engine, "Hist");
+    let rec = NodeRecord::new(hist);
     ctx.mvcc_put_node_temporal(0, id, pre_epoch, &rec)
         .expect("put pre-epoch");
     let back = ctx
         .mvcc_get_node_temporal(0, id, pre_epoch)
         .expect("get")
         .expect("Some");
-    assert_eq!(back.primary_label(), "Hist");
+    assert_eq!(back.primary_label(), Some(hist));
 }
 
 #[test]
@@ -4593,7 +4617,8 @@ fn upsert_on_match_concurrent_write_is_caught_by_layer3_occ() {
     .expect("open");
     // Seed a node so the simulated MATCH read returns Some.
     let id = NodeId::from_raw(700);
-    let seed = NodeRecord::new("U");
+    let user = bind(&engine, "U");
+    let seed = NodeRecord::new(user);
     seed_node_record(&engine, 0, id, &seed);
 
     let mut interner = FieldInterner::new();
@@ -4608,7 +4633,7 @@ fn upsert_on_match_concurrent_write_is_caught_by_layer3_occ() {
 
     // Concurrent writer modifies the same node out-of-band, stamping a fresh
     // seqno that is necessarily > mvcc_read_ts.
-    let mut altered = NodeRecord::new("U");
+    let mut altered = NodeRecord::new(user);
     altered.set(ctx.interner.intern("name"), Value::String("Bob".into()));
     seed_node_record(&engine, 0, id, &altered);
 
@@ -4619,7 +4644,7 @@ fn upsert_on_match_concurrent_write_is_caught_by_layer3_occ() {
     // unrelated keys would commit under the new model, as it does in every
     // mainstream engine; guarding read-then-elsewhere-write is FOR UPDATE's
     // job.)
-    let mut updated = NodeRecord::new("U");
+    let mut updated = NodeRecord::new(user);
     updated.set(ctx.interner.intern("name"), Value::String("Carol".into()));
     ctx.mvcc_put_node(0, id, &updated).expect("on-match set");
 
@@ -4664,8 +4689,9 @@ fn mvcc_get_node_either_dispatches_on_temporal_flag() {
     ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
 
     let id = NodeId::from_raw(150);
-    let nt = NodeRecord::new("NT");
-    let tmp = NodeRecord::new("T");
+    let (nt_label, t_label) = (bind(&engine, "NT"), bind(&engine, "T"));
+    let nt = NodeRecord::new(nt_label);
+    let tmp = NodeRecord::new(t_label);
     // Write non-temporal at id; write temporal at same id, vf=5000.
     ctx.mvcc_put_node_either(0, id, None, &nt).expect("put nt");
     ctx.mvcc_put_node_either(0, id, Some(5000), &tmp)
@@ -4676,13 +4702,13 @@ fn mvcc_get_node_either_dispatches_on_temporal_flag() {
         .mvcc_get_node_either(0, id, None)
         .expect("read nt")
         .expect("Some");
-    assert_eq!(read_nt.primary_label(), "NT");
+    assert_eq!(read_nt.primary_label(), Some(nt_label));
     // Temporal read at vf=5000 surfaces T.
     let read_t = ctx
         .mvcc_get_node_either(0, id, Some(5000))
         .expect("read t")
         .expect("Some");
-    assert_eq!(read_t.primary_label(), "T");
+    assert_eq!(read_t.primary_label(), Some(t_label));
     // Temporal read at a vf we did not write to is None.
     let read_miss = ctx
         .mvcc_get_node_either(0, id, Some(9999))
@@ -4711,7 +4737,7 @@ fn mvcc_delete_node_temporal_ryow_within_txn() {
     .expect("open");
     // Seed v@1000 outside of the transaction-under-test.
     let id = NodeId::from_raw(44);
-    let rec = NodeRecord::new("Tx");
+    let rec = NodeRecord::new(bind(&engine, "Tx"));
     seed_node_temporal(&engine, 0, id, 1000, &rec);
 
     let mut interner = FieldInterner::new();
@@ -4758,8 +4784,9 @@ fn mvcc_temporal_handles_i64_extreme_valid_from() {
     ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
 
     let id = NodeId::from_raw(45);
-    let min_rec = NodeRecord::new("MinEdge");
-    let max_rec = NodeRecord::new("MaxEdge");
+    let (min_label, max_label) = (bind(&engine, "MinEdge"), bind(&engine, "MaxEdge"));
+    let min_rec = NodeRecord::new(min_label);
+    let max_rec = NodeRecord::new(max_label);
 
     ctx.mvcc_put_node_temporal(0, id, i64::MIN, &min_rec)
         .expect("put MIN");
@@ -4774,8 +4801,8 @@ fn mvcc_temporal_handles_i64_extreme_valid_from() {
         .mvcc_get_node_temporal(0, id, i64::MAX)
         .expect("get MAX")
         .expect("Some");
-    assert_eq!(back_min.primary_label(), "MinEdge");
-    assert_eq!(back_max.primary_label(), "MaxEdge");
+    assert_eq!(back_min.primary_label(), Some(min_label));
+    assert_eq!(back_max.primary_label(), Some(max_label));
 }
 
 #[test]
@@ -4810,9 +4837,10 @@ fn mvcc_temporal_keys_isolated_per_node_id_at_same_valid_from() {
     let id_a = NodeId::from_raw(100);
     let id_b = NodeId::from_raw(200);
     let vf = 9999;
-    ctx.mvcc_put_node_temporal(0, id_a, vf, &NodeRecord::new("A"))
+    let (label_a, label_b) = (bind(&engine, "A"), bind(&engine, "B"));
+    ctx.mvcc_put_node_temporal(0, id_a, vf, &NodeRecord::new(label_a))
         .expect("put A");
-    ctx.mvcc_put_node_temporal(0, id_b, vf, &NodeRecord::new("B"))
+    ctx.mvcc_put_node_temporal(0, id_b, vf, &NodeRecord::new(label_b))
         .expect("put B");
 
     let back_a = ctx
@@ -4823,8 +4851,8 @@ fn mvcc_temporal_keys_isolated_per_node_id_at_same_valid_from() {
         .mvcc_get_node_temporal(0, id_b, vf)
         .expect("get B")
         .expect("Some");
-    assert_eq!(back_a.primary_label(), "A");
-    assert_eq!(back_b.primary_label(), "B");
+    assert_eq!(back_a.primary_label(), Some(label_a));
+    assert_eq!(back_b.primary_label(), Some(label_b));
 }
 
 #[test]
@@ -4855,7 +4883,7 @@ fn mvcc_get_node_temporal_round_trip() {
     ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
 
     let id = NodeId::from_raw(20);
-    let mut rec_v1 = NodeRecord::new("Event");
+    let mut rec_v1 = NodeRecord::new(bind(&engine, "Event"));
     let name_fid = ctx.interner.intern("name");
     rec_v1.set(name_fid, Value::String("v1".into()));
 
@@ -4909,7 +4937,8 @@ fn mvcc_temporal_close_then_open_two_versions() {
     let vt_fid = ctx.interner.intern("valid_to");
 
     // v1 open at 1000.
-    let mut rec_v1 = NodeRecord::new("Event");
+    let event = bind(&engine, "Event");
+    let mut rec_v1 = NodeRecord::new(event);
     rec_v1.set(vf_fid, Value::Int(1000));
     ctx.mvcc_put_node_temporal(0, id, 1000, &rec_v1)
         .expect("put v1");
@@ -4921,7 +4950,7 @@ fn mvcc_temporal_close_then_open_two_versions() {
         .expect("close v1");
 
     // Open v2 at fresh per-version key valid_from=2000.
-    let mut rec_v2 = NodeRecord::new("Event");
+    let mut rec_v2 = NodeRecord::new(event);
     rec_v2.set(vf_fid, Value::Int(2000));
     ctx.mvcc_put_node_temporal(0, id, 2000, &rec_v2)
         .expect("put v2");
@@ -4969,7 +4998,7 @@ fn mvcc_delete_node_temporal_tombstones_specific_version() {
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::new(0);
     let id = NodeId::from_raw(22);
-    let rec = NodeRecord::new("Event");
+    let rec = NodeRecord::new(bind(&engine, "Event"));
 
     // Seed two versions in a flush'd txn.
     {
@@ -5037,7 +5066,7 @@ fn mvcc_put_node_does_not_track_in_occ_scope() {
     ctx.mvcc_read_ts = oracle.next();
 
     let id = NodeId::from_raw(33);
-    let rec = NodeRecord::new("Probe");
+    let rec = NodeRecord::new(bind(&engine, "Probe"));
     ctx.mvcc_put_node(0, id, &rec).expect("put");
 
     match ctx.txn.occ_scope() {
@@ -5072,7 +5101,7 @@ fn mvcc_get_node_leaves_no_occ_scope() {
     .expect("open with oracle");
     // Seed a node via the typed Layer-4 store.
     let id = NodeId::from_raw(99);
-    let seed = NodeRecord::new("Probe");
+    let seed = NodeRecord::new(bind(&engine, "Probe"));
     seed_node_record(&engine, 0, id, &seed);
 
     let mut interner = FieldInterner::new();
@@ -5151,7 +5180,7 @@ fn mvcc_delete_node_then_get_returns_none_within_txn() {
     .expect("open");
     // Seed.
     let id = NodeId::from_raw(11);
-    let rec = NodeRecord::new("Item");
+    let rec = NodeRecord::new(bind(&engine, "Item"));
     seed_node_record(&engine, 0, id, &rec);
 
     let mut interner = FieldInterner::new();
@@ -5200,14 +5229,15 @@ fn mvcc_get_node_round_trip_through_put() {
     ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
 
     let id = NodeId::from_raw(7);
-    let mut rec = NodeRecord::new("User");
+    let user = bind(&engine, "User");
+    let mut rec = NodeRecord::new(user);
     let fid = ctx.interner.intern("name");
     rec.set(fid, Value::String("Alice".into()));
 
     ctx.mvcc_put_node(1, id, &rec).expect("put");
     // RYOW: same-txn read sees the buffered write.
     let fetched = ctx.mvcc_get_node(1, id).expect("get").expect("Some — RYOW");
-    assert_eq!(fetched.primary_label(), "User");
+    assert_eq!(fetched.primary_label(), Some(user));
     assert_eq!(
         fetched.get(fid),
         Some(&Value::String("Alice".into())),
@@ -5220,7 +5250,7 @@ fn mvcc_get_node_round_trip_through_put() {
     // the typed reader (legacy mode, no oracle).
     let mut ctx2 = make_ctx(&engine, &mut interner, &allocator);
     let post_flush = ctx2.mvcc_get_node(1, id).expect("get").expect("Some");
-    assert_eq!(post_flush.primary_label(), "User");
+    assert_eq!(post_flush.primary_label(), Some(user));
 }
 
 #[test]
@@ -5272,7 +5302,7 @@ fn mvcc_delete_node_tombstones_node_key() {
     ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
 
     let id = NodeId::from_raw(42);
-    let rec = NodeRecord::new("Tag");
+    let rec = NodeRecord::new(bind(&engine, "Tag"));
     ctx.mvcc_put_node(0, id, &rec).expect("put");
     ctx.mvcc_flush().expect("flush 1");
 
@@ -5580,7 +5610,7 @@ fn parallel_occ_detects_conflict_on_target_node() {
 
     // T2: Concurrent transaction modifies target node 5 (after T1's read_ts)
     let _write_ts = oracle.next();
-    let mut modified_record = NodeRecord::new("User");
+    let mut modified_record = NodeRecord::new(bound(&engine, "User").expect("User bound"));
     // Use field_id 0 directly — "name" was interned first by insert_node,
     // so it has id 0. Avoids borrowing interner while ctx is alive.
     modified_record.set(0, Value::String("T5-modified".into()));

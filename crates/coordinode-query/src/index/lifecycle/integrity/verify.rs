@@ -25,6 +25,7 @@ use coordinode_core::index::derive::{
     EntryOwner, IndexInterpretation, append_entry_key_of, tuples,
 };
 use coordinode_core::index::encoding::{decode_entry_parts, decode_unique_entry_tuple};
+use coordinode_core::schema::label_id::LabelId;
 use coordinode_modality::{LocalIndexStore, LocalNodeStore, Mismatch};
 use coordinode_storage::engine::core::StorageEngine;
 use xxhash_rust::xxh3::Xxh3;
@@ -518,6 +519,17 @@ pub(super) fn verify(
     let projections = Projection::of(targets);
     // What each type implies, as the pinned snapshot's catalog says.
     let mut catalog = crate::index::membership::CatalogMembership::at(engine, snapshot);
+    // Each projection's label by its identity; a label without one is
+    // carried by no node.
+    let mut labelled = Vec::with_capacity(projections.len());
+    for projection in &projections {
+        if let Some(id) = catalog
+            .label_id(projection.label)
+            .map_err(|e| VerifyError::Store(e.to_string()))?
+        {
+            labelled.push((projection, id));
+        }
+    }
 
     // The records, once.
     let scanning = Instant::now();
@@ -539,8 +551,8 @@ pub(super) fn verify(
         let membership = catalog
             .of_stored(&labels)
             .map_err(|e| VerifyError::Store(e.to_string()))?;
-        let carries = |p: &&Projection<'_>| membership.contains(p.label);
-        let mut carried = projections.iter().filter(carries);
+        let carries = |(_, id): &&(&Projection<'_>, LabelId)| membership.contains(*id);
+        let mut carried = labelled.iter().filter(carries).map(|(p, _)| *p);
         let Some(first) = carried.next() else {
             continue;
         };
@@ -553,7 +565,7 @@ pub(super) fn verify(
         .map_err(|e| VerifyError::Decode(e.to_string()))?;
         stats.decoded_rows += 1;
         stats.decoded_bytes += value.len() as u64;
-        for &i in projections.iter().filter(carries).flat_map(|p| &p.slots) {
+        for &i in labelled.iter().filter(carries).flat_map(|(p, _)| &p.slots) {
             let slot = &mut slots[i];
             slot.findings.checked += 1;
             let Some(values) = slot.target.interpretation.record_membership(&record) else {

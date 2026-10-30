@@ -430,53 +430,83 @@ fn key_starts_with_prefix() {
 
 // -- NodeRecord tests --
 
+/// Label ids the tests below store; their names live in a catalog these
+/// tests do not need.
+const USER: LabelId = label(1);
+const ADMIN: LabelId = label(2);
+const GUEST: LabelId = label(3);
+
+/// The id `raw`, evaluated at compile time: every `raw` used is nonzero.
+const fn label(raw: u32) -> LabelId {
+    match LabelId::new(raw) {
+        Some(id) => id,
+        None => unreachable!(),
+    }
+}
+
 #[test]
 fn record_new() {
-    let rec = NodeRecord::new("User");
-    assert_eq!(rec.primary_label(), "User");
-    assert_eq!(rec.labels, vec!["User"]);
+    let rec = NodeRecord::new(USER);
+    assert_eq!(rec.primary_label(), Some(USER));
+    assert_eq!(rec.labels, vec![USER]);
     assert!(rec.props.is_empty());
 }
 
 #[test]
 fn record_with_labels() {
-    let rec = NodeRecord::with_labels(vec!["User".into(), "Admin".into()]);
-    assert_eq!(rec.primary_label(), "User");
-    assert!(rec.has_label("User"));
-    assert!(rec.has_label("Admin"));
-    assert!(!rec.has_label("Guest"));
+    let rec = NodeRecord::with_labels(vec![USER, ADMIN]);
+    assert_eq!(rec.primary_label(), Some(USER));
+    assert!(rec.stores_label(USER));
+    assert!(rec.stores_label(ADMIN));
+    assert!(!rec.stores_label(GUEST));
 }
 
 #[test]
 fn record_add_remove_label() {
-    let mut rec = NodeRecord::new("User");
-    rec.add_label("Admin".into());
-    assert!(rec.has_label("Admin"));
+    let mut rec = NodeRecord::new(USER);
+    rec.add_label(ADMIN);
+    assert!(rec.stores_label(ADMIN));
     assert_eq!(rec.labels.len(), 2);
 
     // Duplicate add is no-op
-    rec.add_label("Admin".into());
+    rec.add_label(ADMIN);
     assert_eq!(rec.labels.len(), 2);
 
     // Remove label
-    assert!(rec.remove_label("Admin"));
-    assert!(!rec.has_label("Admin"));
+    assert!(rec.remove_label(ADMIN));
+    assert!(!rec.stores_label(ADMIN));
     assert_eq!(rec.labels.len(), 1);
 
     // Remove non-existent label
-    assert!(!rec.remove_label("Guest"));
+    assert!(!rec.remove_label(GUEST));
 }
 
 #[test]
-fn record_empty_label() {
-    let rec = NodeRecord::new("");
+fn record_without_labels() {
+    let rec = NodeRecord::with_labels(Vec::new());
     assert!(rec.labels.is_empty());
-    assert_eq!(rec.primary_label(), "");
+    assert_eq!(rec.primary_label(), None);
+}
+
+/// A record stores label ids, not names: a label renamed or dropped and
+/// recreated in the catalog never changes what an existing record means,
+/// and each label costs a byte or two whatever its name.
+#[test]
+fn record_stores_label_ids() {
+    let rec = NodeRecord::with_labels(vec![USER, label(300)]);
+    let decoded: rmpv::Value =
+        rmpv::decode::read_value(&mut rec.to_msgpack().expect("encode").as_slice())
+            .expect("valid msgpack");
+    let fields = decoded.as_array().expect("record is an array of fields");
+    assert_eq!(
+        fields[0],
+        rmpv::Value::Array(vec![rmpv::Value::from(1u32), rmpv::Value::from(300u32)])
+    );
 }
 
 #[test]
 fn record_set_get_remove() {
-    let mut rec = NodeRecord::new("User");
+    let mut rec = NodeRecord::new(USER);
     rec.set(1, PropertyValue::String("Alice".into()));
     rec.set(2, PropertyValue::Int(30));
 
@@ -491,7 +521,7 @@ fn record_set_get_remove() {
 
 #[test]
 fn record_msgpack_roundtrip() {
-    let mut rec = NodeRecord::new("Movie");
+    let mut rec = NodeRecord::new(USER);
     rec.set(1, PropertyValue::String("Inception".into()));
     rec.set(2, PropertyValue::Int(2010));
     rec.set(3, PropertyValue::Float(8.8));
@@ -513,7 +543,7 @@ fn record_msgpack_roundtrip() {
 
 #[test]
 fn record_empty_props_roundtrip() {
-    let rec = NodeRecord::new("Empty");
+    let rec = NodeRecord::new(USER);
     let bytes = rec.to_msgpack().expect("serialize");
     let restored = NodeRecord::from_msgpack(&bytes).expect("deserialize");
     assert_eq!(rec, restored);
@@ -521,7 +551,7 @@ fn record_empty_props_roundtrip() {
 
 #[test]
 fn record_msgpack_is_compact() {
-    let mut rec = NodeRecord::new("User");
+    let mut rec = NodeRecord::new(USER);
     // With interned IDs (u32 keys), the MessagePack output should be
     // significantly smaller than using string field names
     rec.set(1, PropertyValue::String("Alice".into()));
@@ -540,7 +570,7 @@ fn record_msgpack_is_compact() {
 
 #[test]
 fn extra_set_and_get() {
-    let mut rec = NodeRecord::new("User");
+    let mut rec = NodeRecord::new(USER);
     rec.set_extra("ad_hoc", PropertyValue::String("value".into()));
     assert_eq!(
         rec.get_extra("ad_hoc"),
@@ -551,14 +581,14 @@ fn extra_set_and_get() {
 
 #[test]
 fn extra_none_by_default() {
-    let rec = NodeRecord::new("User");
+    let rec = NodeRecord::new(USER);
     assert!(rec.extra.is_none());
     assert!(rec.get_extra("anything").is_none());
 }
 
 #[test]
 fn extra_roundtrip_msgpack() {
-    let mut rec = NodeRecord::new("Config");
+    let mut rec = NodeRecord::new(USER);
     rec.set(1, PropertyValue::String("declared".into()));
     rec.set_extra("dynamic_key", PropertyValue::Int(42));
     rec.set_extra("another", PropertyValue::Bool(true));
@@ -583,7 +613,7 @@ fn extra_roundtrip_msgpack() {
 #[test]
 fn extra_none_skipped_in_serialization() {
     // NodeRecord without extra should be backward compatible
-    let mut rec = NodeRecord::new("User");
+    let mut rec = NodeRecord::new(USER);
     rec.set(1, PropertyValue::String("Alice".into()));
     let bytes = rec.to_msgpack().expect("serialize");
 
@@ -596,7 +626,7 @@ fn extra_none_skipped_in_serialization() {
 fn backward_compat_roundtrip_without_extra() {
     // NodeRecord without extra should roundtrip cleanly.
     // This verifies backward compat with old format (no extra field).
-    let rec = NodeRecord::new("Test");
+    let rec = NodeRecord::new(USER);
     let bytes = rec.to_msgpack().expect("serialize");
     let decoded = NodeRecord::from_msgpack(&bytes).expect("deserialize");
     assert_eq!(rec, decoded);
@@ -710,8 +740,8 @@ fn node_write_key_picks_correct_form() {
 /// of different capacity, which gives them different iteration orders.
 #[test]
 fn equal_records_encode_to_equal_bytes() {
-    let mut forward = NodeRecord::new("User");
-    let mut backward = NodeRecord::new("User");
+    let mut forward = NodeRecord::new(USER);
+    let mut backward = NodeRecord::new(USER);
     backward.props.reserve(256);
     for id in 0..32u32 {
         forward.set(id, PropertyValue::Int(i64::from(id)));
@@ -734,7 +764,7 @@ fn equal_records_encode_to_equal_bytes() {
 /// codec uses, so the bytes are fixed and not merely stable per build.
 #[test]
 fn record_properties_encode_in_ascending_key_order() {
-    let mut record = NodeRecord::new("User");
+    let mut record = NodeRecord::new(USER);
     for id in [7u32, 1, 300, 42] {
         record.set(id, PropertyValue::Bool(true));
     }
@@ -770,24 +800,24 @@ fn record_properties_encode_in_ascending_key_order() {
 /// overflow map. A document delta is no record and is refused.
 #[test]
 fn labels_read_without_the_properties() {
-    let mut record = NodeRecord::with_labels(vec!["State".into(), "Cached".into()]);
+    let mut record = NodeRecord::with_labels(vec![USER, ADMIN]);
     record.set(1, crate::graph::types::Value::Blob(vec![7; 100_000]));
     let bare = record.to_msgpack().expect("encode");
     assert_eq!(
         NodeRecord::labels_from_msgpack(&bare).expect("labels"),
-        ["State", "Cached"]
+        [USER, ADMIN]
     );
     let mut prefixed = vec![crate::graph::doc_delta::PREFIX_NODE_RECORD];
     prefixed.extend_from_slice(&bare);
     assert_eq!(
         NodeRecord::labels_from_msgpack(&prefixed).expect("labels"),
-        ["State", "Cached"]
+        [USER, ADMIN]
     );
     record.set_extra("note", crate::graph::types::Value::Int(1));
     let with_extra = record.to_msgpack().expect("encode");
     assert_eq!(
         NodeRecord::labels_from_msgpack(&with_extra).expect("labels"),
-        ["State", "Cached"]
+        [USER, ADMIN]
     );
     assert!(
         NodeRecord::labels_from_msgpack(&[crate::graph::doc_delta::PREFIX_DOC_DELTA, 0x90])
@@ -871,7 +901,7 @@ fn a_skipped_value_ends_where_its_encoding_ends() {
 fn a_projection_holds_the_asked_properties_only() {
     use crate::graph::types::Value;
 
-    let mut record = NodeRecord::with_labels(vec!["User".into()]);
+    let mut record = NodeRecord::new(USER);
     record.set(1, Value::String("a@x".into()));
     record.set(2, Value::Blob(vec![7; 100_000]));
     record.set(3, Value::Array(vec![Value::Int(1), Value::Int(2)]));
@@ -896,7 +926,7 @@ fn a_projection_holds_the_asked_properties_only() {
     }
 
     // No overflow map at all, and no undeclared name asked for.
-    let plain = NodeRecord::with_labels(vec!["User".into()]);
+    let plain = NodeRecord::new(USER);
     let projected =
         NodeRecord::project_from_msgpack(&plain.to_msgpack().expect("encode"), &[1], &["nick"])
             .expect("project");

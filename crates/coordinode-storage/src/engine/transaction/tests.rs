@@ -399,7 +399,7 @@ fn node_deltas_on_one_record_conflict_like_whole_writes() {
         .encode()
         .expect("encode")
     };
-    let mut base = NodeRecord::new("Counter");
+    let mut base = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
     base.set(1, Value::Int(0));
     let mut create = mvcc_txn(&engine, &oracle);
     create
@@ -465,7 +465,7 @@ fn deltas_of_a_node_written_whole_in_the_same_attempt_fold_into_it() {
         .encode()
         .expect("encode")
     };
-    let mut record = NodeRecord::new("Thing");
+    let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
     record.set(1, Value::String("a".into()));
     let bytes = record.to_msgpack().expect("encode");
 
@@ -1834,7 +1834,7 @@ mod unique_while_building {
     }
 
     fn record(value: &str) -> Vec<u8> {
-        let mut record = NodeRecord::new("User");
+        let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
         record.set(EMAIL, email(value));
         record.to_msgpack().unwrap()
     }

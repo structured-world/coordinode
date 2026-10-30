@@ -17,6 +17,7 @@ use coordinode_core::schema::definition::{
     EdgeTypeSchema, LabelSchema, encode_edge_type_current_revision_key,
     encode_label_current_revision_key,
 };
+use coordinode_core::schema::label_id::{BindingState, LabelBinding};
 use coordinode_core::txn::proposal::{
     MetadataCommand, Mutation, ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
 };
@@ -113,31 +114,34 @@ fn a_label_schema_revision_and_its_pointer_publish_together() {
     let published = proposals_writing(&recording, &pointer);
     assert!(!published.is_empty(), "the pointer was published");
     for proposal in &published {
-        let pointed = proposal
+        let binding = proposal
             .iter()
             .find_map(|m| match m {
-                Mutation::Put { key, value, .. } if *key == pointer => {
-                    Some(u64::from_be_bytes(value.as_slice().try_into().unwrap()))
-                }
+                Mutation::Put { key, value, .. } if *key == pointer => LabelBinding::decode(value),
                 _ => None,
             })
-            .expect("the proposal writes the pointer");
-        let body = coordinode_core::schema::definition::encode_label_schema_key("Person", pointed);
+            .expect("the proposal writes the binding");
+        assert_eq!(binding.state, BindingState::Declared);
+        let pointed = binding.declared_revision();
+        let body =
+            coordinode_core::schema::definition::encode_label_schema_key(binding.id, pointed);
         assert!(
             put_keys(proposal).contains(&body),
             "the pointer to revision {pointed} travels with its body: {:?}",
             put_keys(proposal)
         );
     }
+    let stored = db
+        .engine()
+        .get(
+            coordinode_storage::engine::partition::Partition::Schema,
+            &pointer,
+        )
+        .unwrap()
+        .expect("the binding is stored");
     assert_eq!(
-        db.engine()
-            .get(
-                coordinode_storage::engine::partition::Partition::Schema,
-                &pointer
-            )
-            .unwrap()
-            .as_deref(),
-        Some(revision.to_be_bytes().as_slice())
+        LabelBinding::decode(&stored).map(|b| b.declared_revision()),
+        Some(revision)
     );
 }
 

@@ -131,7 +131,7 @@ fn binding() -> IndexBinding {
 /// The unit inserting user `n`, its index maintained as `derived` says.
 fn unit(id_gen: &ProposalIdGenerator, n: u64, derived: bool) -> RaftProposal {
     let email = format!("user-{n}@example.com");
-    let mut record = NodeRecord::new("User");
+    let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
     record.set(1, Value::String(email.clone()));
     let node = Mutation::Put {
         partition: PartitionId::Node,

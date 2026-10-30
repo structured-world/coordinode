@@ -39,6 +39,7 @@ use coordinode_core::index::encoding::{
     unique_entries_prefix,
 };
 use coordinode_core::index::identity::IdentityAllocator;
+use coordinode_core::schema::label_id::LabelId;
 use coordinode_core::txn::proposal::Mutation;
 use coordinode_storage::engine::core::{LocalSync, LocalWrite, StorageEngine};
 use coordinode_storage::engine::partition::Partition;
@@ -60,8 +61,8 @@ pub struct LabelScope<'a> {
     pub lookup: &'a IndexDefinition,
     /// The shard whose nodes are read.
     pub shard: u16,
-    /// The label, as the field dictionary binds its name.
-    pub label: u32,
+    /// The label's catalog identity.
+    pub label: LabelId,
 }
 
 const LABEL_LOOKUP_KEY: &[u8] = IndexDefinition::LABEL_LOOKUP_KEY;
@@ -367,9 +368,8 @@ pub trait IndexStore {
     ) -> StoreResult<Option<IndexDefinition>>;
 
     /// Stage node `node` of shard `shard` leaving the labels `removed` and
-    /// joining the labels `added` (dictionary ids) in the label lookup
-    /// `def`: one posting removed or put per label, nothing for a label in
-    /// both.
+    /// joining the labels `added` in the label lookup `def`: one posting
+    /// removed or put per label, nothing for a label in both.
     ///
     /// # Errors
     ///
@@ -380,12 +380,12 @@ pub trait IndexStore {
         def: &IndexDefinition,
         shard: u16,
         node: NodeId,
-        removed: &[u32],
-        added: &[u32],
+        removed: &[LabelId],
+        added: &[LabelId],
     ) -> StoreResult<()>;
 
     /// Stage the postings of node `node` of shard `shard` for the labels
-    /// `held` (dictionary ids) in the label lookup `def` that it does not
+    /// `held` in the label lookup `def` that it does not
     /// have yet, as `txn` sees it: what a version of a temporal node adds,
     /// whose earlier versions keep their labels in its history.
     ///
@@ -398,7 +398,7 @@ pub trait IndexStore {
         def: &IndexDefinition,
         shard: u16,
         node: NodeId,
-        held: &[u32],
+        held: &[LabelId],
     ) -> StoreResult<()>;
 
     /// The nodes `scope` names, as `txn` sees them, in NodeId order after
@@ -1346,8 +1346,8 @@ impl IndexStore for LocalIndexStore<'_> {
         def: &IndexDefinition,
         shard: u16,
         node: NodeId,
-        removed: &[u32],
-        added: &[u32],
+        removed: &[LabelId],
+        added: &[LabelId],
     ) -> StoreResult<()> {
         use coordinode_core::index::encoding::encode_label_posting;
         for &label in removed.iter().filter(|l| !added.contains(l)) {
@@ -1372,7 +1372,7 @@ impl IndexStore for LocalIndexStore<'_> {
         def: &IndexDefinition,
         shard: u16,
         node: NodeId,
-        held: &[u32],
+        held: &[LabelId],
     ) -> StoreResult<()> {
         use coordinode_core::index::encoding::encode_label_posting;
         for &label in held {

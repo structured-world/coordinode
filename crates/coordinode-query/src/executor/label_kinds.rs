@@ -18,7 +18,9 @@ use super::runner::ExecutionError;
 /// - Every other declared type implying it, directly or not, still declares
 ///   every property it declares.
 /// - When `created`, no stored node it types is left invalid: an auxiliary
-///   label types none, and a type's nodes carry every label it implies.
+///   label types none, and a type gains implied labels only while it types
+///   none, since its stored nodes would carry them without the indexes and
+///   constraints of those labels having covered them.
 ///
 /// `staged` answers for labels the same publication declares, ahead of the
 /// catalog. Each label read from the catalog is read in `txn`, so a change
@@ -64,48 +66,36 @@ pub fn admit_label_kind(
             .map_err(|e| ExecutionError::CatalogRefused(e.to_string()))?;
     }
 
-    if created && (schema.is_auxiliary() || !schema.implies().is_empty()) {
-        let implied = implied_closure(schema, |label| lookup(txn, label))?;
+    // A label without an identity yet types no stored node.
+    if created
+        && (schema.is_auxiliary() || !schema.implies().is_empty())
+        && let Some(id) = store.label_id_txn(txn, &schema.name)?
+    {
         let staged_writes = std::collections::HashMap::new();
-        if let Some(node) =
-            coordinode_storage::engine::claims::evaluate::first_node_breaking_label_kind(
-                engine,
-                &schema.name,
-                schema.kind(),
-                &implied,
-                &staged_writes,
-            )?
-        {
+        if let Some(node) = coordinode_storage::engine::claims::evaluate::first_node_typed_by(
+            engine,
+            id,
+            &staged_writes,
+        )? {
             let why = match schema.kind() {
-                LabelKind::Auxiliary => "it is the node's type".to_string(),
-                LabelKind::Type => format!("it lacks one of {implied:?}"),
+                LabelKind::Auxiliary => "an auxiliary label cannot be a node's type".to_string(),
+                LabelKind::Type => format!(
+                    "a type that has stored nodes cannot gain implied labels ({})",
+                    schema.implies().join(", ")
+                ),
             };
             return Err(ExecutionError::SchemaViolation(format!(
-                ":{} cannot be declared so: node {} carries it and {why}",
+                ":{} cannot be declared so: node {} has it as its type, and {why}",
                 schema.name,
                 node.as_raw()
             )));
         }
     }
-    Ok(())
-}
-
-/// Every label `schema` implies, transitively, without itself. A label
-/// without a definition implies nothing.
-fn implied_closure(
-    schema: &LabelSchema,
-    mut schema_of: impl FnMut(&str) -> Result<Option<LabelSchema>, ExecutionError>,
-) -> Result<Vec<String>, ExecutionError> {
-    let mut closure: Vec<String> = Vec::new();
-    let mut pending: Vec<String> = schema.implies().to_vec();
-    while let Some(label) = pending.pop() {
-        if label == schema.name || closure.contains(&label) {
-            continue;
-        }
-        if let Some(implied) = schema_of(&label)? {
-            pending.extend(implied.implies().iter().cloned());
-        }
-        closure.push(label);
+    // Every implied label is a type a node can carry, so each has an
+    // identity from the declaration on: lookup and indexes reach a node
+    // through it before any node stores it.
+    for implied in schema.implies() {
+        store.bind_label_txn(txn, implied)?;
     }
-    Ok(closure)
+    Ok(())
 }

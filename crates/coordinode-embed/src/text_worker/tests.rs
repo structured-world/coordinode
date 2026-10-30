@@ -115,7 +115,10 @@ impl coordinode_core::graph::intern::FieldRegistrar for FlakyFields {
 
 /// Apply node `id` of :Article on shard 1 with `body` as entry `index`.
 fn apply_article(engine: &StorageEngine, index: u64, id: u64, body_field: u32, body: &str) {
-    let mut record = coordinode_core::graph::node::NodeRecord::new("Article");
+    let article = coordinode_modality::LocalSchemaStore::new(engine)
+        .bind_label("Article")
+        .expect("bind label");
+    let mut record = coordinode_core::graph::node::NodeRecord::new(article);
     record.set(
         body_field,
         coordinode_core::graph::types::Value::String(body.into()),

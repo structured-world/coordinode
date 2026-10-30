@@ -41,9 +41,12 @@ const SHARD: u16 = 1;
 /// Store the `User` node `id` with `pairs` as its properties, kept by name,
 /// as a write stores the record its entries are derived from: a unique
 /// entry's holder is checked against it.
-fn put_record(t: &mut Transaction, id: u64, pairs: &[(&str, Value)]) {
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let mut record = coordinode_core::graph::node::NodeRecord::new("User");
+fn put_record(engine: &StorageEngine, t: &mut Transaction, id: u64, pairs: &[(&str, Value)]) {
+    use coordinode_modality::{LocalNodeStore, LocalSchemaStore, NodeStore as _, SchemaStore as _};
+    let user = LocalSchemaStore::new(engine)
+        .bind_label_txn(t, "User")
+        .expect("bind label");
+    let mut record = coordinode_core::graph::node::NodeRecord::new(user);
     for (name, value) in pairs {
         record.set_extra(*name, value.clone());
     }
@@ -61,7 +64,7 @@ fn create(
     let props = props(pairs);
     let lookup = props_lookup(&props);
     let mut t = txn(engine);
-    put_record(&mut t, id, pairs);
+    put_record(engine, &mut t, id, pairs);
     reg.on_node_created(
         engine,
         &mut t,
@@ -86,7 +89,7 @@ fn change(
     after: &[(&str, Value)],
 ) -> Result<(), IndexWriteError> {
     let mut t = txn(engine);
-    put_record(&mut t, id, after);
+    put_record(engine, &mut t, id, after);
     let (before, after) = (props(before), props(after));
     let (before, after) = (props_lookup(&before), props_lookup(&after));
     reg.on_property_changed(

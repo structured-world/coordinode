@@ -676,8 +676,21 @@ fn restore_binary<R: Read>(
                 producer,
                 schema_fingerprint,
             } => {
-                // Checked after the survey, once the load knows whether it
-                // resumes its own interrupted run.
+                // An older dump is refused before any record of it is read:
+                // its records are laid out for a format this build does not
+                // read (node records naming their labels rather than storing
+                // catalog identities), and no conversion exists, so not even
+                // a forced restore may interpret them.
+                if format_version < super::export::BINARY_FORMAT_VERSION {
+                    return Err(RestoreError::IncompatibleVersion(format!(
+                        "dump format v{format_version} from {producer} is older than supported \
+                         v{}; restore it with the release that wrote it and export a logical \
+                         dump (json or cypher), which this build reads",
+                        super::export::BINARY_FORMAT_VERSION
+                    )));
+                }
+                // The rest is checked after the survey, once the load knows
+                // whether it resumes its own interrupted run.
                 if let Some(survey) = load.survey.as_mut() {
                     survey.manifest = Some(Manifest {
                         format_version,
@@ -780,12 +793,14 @@ fn restore_binary<R: Read>(
     Ok(())
 }
 
-/// Validate a binary dump manifest against the target engine.
+/// Validate a binary dump manifest against the target engine. An older
+/// format never reaches here: it is refused as its manifest is read, before
+/// any record is interpreted.
 ///
 /// Two gates, both overridable with `force`:
 /// 1. **Format version**: refuse a dump whose `format_version` is newer
 ///    than this build understands (a newer producer may use encodings we
-///    cannot decode). Older dumps are accepted (we stay backward-readable).
+///    cannot decode).
 /// 2. **Schema fingerprint**: if the target database already holds schema
 ///    (non-empty fingerprint that differs from the dump's), merging risks
 ///    conflicting label / property-type definitions, so reject. Restoring
@@ -1249,9 +1264,24 @@ fn write_node(
     props: Vec<(String, Value)>,
 ) -> Result<(), RestoreError> {
     use coordinode_core::graph::node::NodeRecord;
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    use coordinode_modality::{LocalNodeStore, LocalSchemaStore, NodeStore as _, SchemaStore as _};
 
-    let mut record = NodeRecord::with_labels(labels);
+    // The dump names the labels a node stores, its type first. Each is bound
+    // to this database's identity for the name, allocated on its first use,
+    // and the auxiliary ones are stored in the order of those identities.
+    let store = LocalSchemaStore::new(target.engine);
+    let mut ids = Vec::with_capacity(labels.len());
+    for label in &labels {
+        ids.push(
+            store
+                .bind_label_txn(txn, label)
+                .map_err(|e| RestoreError::Storage(e.to_string()))?,
+        );
+    }
+    if let Some(auxiliary) = ids.get_mut(1..) {
+        auxiliary.sort_unstable();
+    }
+    let mut record = NodeRecord::with_labels(ids);
     let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
     let ids = field_ids(target.fields, &names)?;
     for ((_, value), field_id) in props.into_iter().zip(ids) {

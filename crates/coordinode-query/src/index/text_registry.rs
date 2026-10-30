@@ -94,25 +94,23 @@ pub struct NodeText {
 /// How a text index reads one property of one label off a node's rows.
 #[derive(Debug, Clone, Copy)]
 pub struct TextSource<'a> {
-    label: &'a str,
-    implying: &'a [String],
+    carriers: Option<&'a crate::index::membership::LabelCarriers>,
     field_id: Option<u32>,
     timeline: TimelineFields,
 }
 
 impl<'a> TextSource<'a> {
-    /// The text of `property` on `label`'s nodes, by the field ids of
-    /// `interner`; `implying` are the types that imply `label`
-    /// ([`crate::index::membership::types_implying`]).
+    /// The text of `property` on the nodes `carriers` names (the carriers of
+    /// the index's label, [`crate::index::membership::label_carriers`];
+    /// `None` while the label has no identity), by the field ids of
+    /// `interner`.
     pub fn new(
         interner: &FieldInterner,
-        label: &'a str,
+        carriers: Option<&'a crate::index::membership::LabelCarriers>,
         property: &str,
-        implying: &'a [String],
     ) -> Self {
         Self {
-            label,
-            implying,
+            carriers,
             field_id: interner.lookup(property),
             timeline: TimelineFields {
                 valid_to: interner.lookup("valid_to"),
@@ -123,7 +121,8 @@ impl<'a> TextSource<'a> {
 
     /// Whether `record` carries the index's label.
     fn carries(&self, record: &NodeRecord) -> bool {
-        crate::index::membership::carries_label(&record.labels, self.label, self.implying)
+        self.carriers
+            .is_some_and(|carriers| carriers.carried_by(&record.labels))
     }
 
     fn text(&self, record: &NodeRecord) -> Option<String> {
@@ -355,7 +354,7 @@ impl TextIndexRegistry {
         &self,
         label: &str,
         property: &str,
-        implying: &[String],
+        carriers: Option<&crate::index::membership::LabelCarriers>,
         read: &Transaction<'_>,
         shard_id: u16,
         interner: &FieldInterner,
@@ -385,7 +384,7 @@ impl TextIndexRegistry {
         }
         .union(also)
         .with_nodes(index.outside(at).into_iter().map(NodeId::from_raw));
-        let source = TextSource::new(interner, label, property, implying);
+        let source = TextSource::new(interner, carriers, property);
         let mut texts: Vec<(NodeId, String)> = Vec::new();
         let superseded = match &delta {
             IndexDelta::Nodes(nodes) if nodes.is_empty() => Some(Vec::new()),
@@ -759,9 +758,9 @@ pub fn stored_texts(
     property: &str,
     at: i64,
 ) -> Result<Vec<NodeText>, String> {
-    let implying =
-        crate::index::membership::types_implying(engine, label).map_err(|e| e.to_string())?;
-    let source = TextSource::new(interner, label, property, &implying);
+    let carriers =
+        crate::index::membership::label_carriers(engine, label).map_err(|e| e.to_string())?;
+    let source = TextSource::new(interner, carriers.as_ref(), property);
     let mut texts = Vec::new();
     for_each_node_latest(engine, shard_id, &mut |id, rows| {
         let held = source.at(id, &rows, at);

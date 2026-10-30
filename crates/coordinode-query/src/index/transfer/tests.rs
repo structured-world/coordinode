@@ -23,7 +23,7 @@ fn member() -> Member {
     fields.intern("email");
     env.set_fields(&fields);
     for (id, email) in [(1, "a@x"), (2, "b@x")] {
-        let mut record = NodeRecord::new("User");
+        let mut record = NodeRecord::new(env.label_id("User"));
         let field = env.fields_now().lookup("email").expect("email field");
         record.set(field, Value::String(email.into()));
         let mut txn = env.begin();

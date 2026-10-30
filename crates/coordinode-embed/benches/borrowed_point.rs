@@ -29,8 +29,12 @@ fn borrowed(engine: &StorageEngine, snapshot: u64, id: NodeId) -> NodeRecord {
         .expect("record")
 }
 
+/// The probe records' label: they are put raw, so no catalog binding is read.
+const PROBE: coordinode_core::schema::label_id::LabelId =
+    coordinode_core::schema::label_id::FIRST_LABEL_ID;
+
 fn check(record: &NodeRecord, expected: &str) {
-    assert_eq!(record.primary_label(), "PointProbe");
+    assert_eq!(record.primary_label(), Some(PROBE));
     assert_eq!(
         record.get_extra("payload").and_then(Value::as_str),
         Some(expected)
@@ -52,7 +56,7 @@ fn main() {
     let db = Database::open(dir.path()).expect("open");
     let mut profile_input = None;
     for length in [32, 32768] {
-        let mut record = NodeRecord::new("PointProbe");
+        let mut record = NodeRecord::new(PROBE);
         let expected = "x".repeat(length);
         record.set_extra("payload", Value::String(expected.clone()));
         // Explicit fixture identities: only used in this isolated benchmark.

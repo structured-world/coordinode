@@ -1,5 +1,9 @@
 use super::*;
 
+fn lid(raw: u32) -> LabelId {
+    LabelId::new(raw).expect("nonzero")
+}
+
 fn enc(value: Value) -> Vec<u8> {
     encode_tuple(&[value]).expect("indexable")
 }
@@ -175,7 +179,7 @@ fn generations_are_disjoint() {
     let entry = encode_entry_key(g, &value, 1);
     assert!(start <= entry && entry < end);
     assert!(ustart <= unique && unique < uend);
-    let posting = encode_label_posting(g, 1, 2, 3);
+    let posting = encode_label_posting(g, 1, lid(2), 3);
     assert!(lstart.as_slice() <= posting.as_slice() && posting.as_slice() < lend.as_slice());
     assert!(!(start.as_slice() <= posting.as_slice() && posting.as_slice() < end.as_slice()));
     assert!(!(ustart.as_slice() <= posting.as_slice() && posting.as_slice() < uend.as_slice()));
@@ -187,7 +191,11 @@ fn generations_are_disjoint() {
 #[test]
 fn label_postings_round_trip_and_sort_by_label_then_node() {
     let g = generation(0x3A00_0000_0000_00FF);
-    for (shard, label, node) in [(0, 0, 0), (1, 7, 42), (u16::MAX, u32::MAX, u64::MAX)] {
+    for (shard, label, node) in [
+        (0, lid(1), 0),
+        (1, lid(7), 42),
+        (u16::MAX, lid(u32::MAX), u64::MAX),
+    ] {
         let key = encode_label_posting(g, shard, label, node);
         assert_eq!(key.len(), LABEL_POSTING_LEN);
         assert_eq!(decode_label_posting(g, &key), Some((shard, label, node)));
@@ -199,23 +207,30 @@ fn label_postings_round_trip_and_sort_by_label_then_node() {
         assert!(key.starts_with(&label_range_prefix(g, shard, label)));
     }
     assert_eq!(
-        decode_label_posting(g, &label_range_prefix(g, 1, 7)),
+        decode_label_posting(g, &label_range_prefix(g, 1, lid(7))),
         None,
         "a prefix"
     );
-    let mut long = encode_label_posting(g, 1, 7, 42).to_vec();
+    let mut long = encode_label_posting(g, 1, lid(7), 42).to_vec();
     long.push(0);
     assert_eq!(decode_label_posting(g, &long), None, "a longer key");
+    let mut zero_label = encode_label_posting(g, 1, lid(7), 42);
+    zero_label[GENERATION_PREFIX_LEN + 2..GENERATION_PREFIX_LEN + 6].fill(0);
+    assert_eq!(
+        decode_label_posting(g, &zero_label),
+        None,
+        "label 0 is no label"
+    );
 
     let ordered = [
-        encode_label_posting(g, 0, u32::MAX, u64::MAX),
-        encode_label_posting(g, 1, 0, u64::MAX),
-        encode_label_posting(g, 1, 1, 0),
-        encode_label_posting(g, 1, 1, 0x100),
-        encode_label_posting(g, 1, 0x100, 0),
+        encode_label_posting(g, 0, lid(u32::MAX), u64::MAX),
+        encode_label_posting(g, 1, lid(1), u64::MAX),
+        encode_label_posting(g, 1, lid(2), 0),
+        encode_label_posting(g, 1, lid(2), 0x100),
+        encode_label_posting(g, 1, lid(0x100), 0),
     ];
     assert!(ordered.windows(2).all(|w| w[0] < w[1]));
-    let range = label_range_prefix(g, 1, 1);
+    let range = label_range_prefix(g, 1, lid(2));
     assert_eq!(
         ordered.iter().filter(|k| k.starts_with(&range)).count(),
         2,
@@ -258,13 +273,13 @@ fn scan_prefixes_follow_the_structure() {
     let prefixes: Vec<&[u8]> = entry_scan_prefixes(&unique).expect("an entry").collect();
     assert_eq!(prefixes, vec![&unique_entries_prefix(g)[..]]);
 
-    let posting = encode_label_posting(g, 0x3A00, 0x003A_3A00, 0x3A);
+    let posting = encode_label_posting(g, 0x3A00, lid(0x003A_3A00), 0x3A);
     let prefixes: Vec<&[u8]> = entry_scan_prefixes(&posting).expect("a posting").collect();
     assert_eq!(
         prefixes,
         vec![
             &label_postings_prefix(g)[..],
-            &label_range_prefix(g, 0x3A00, 0x003A_3A00)[..]
+            &label_range_prefix(g, 0x3A00, lid(0x003A_3A00))[..]
         ]
     );
 

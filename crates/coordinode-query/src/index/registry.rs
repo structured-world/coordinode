@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::EntryOwner;
+use coordinode_core::schema::label_id::LabelId;
 use coordinode_modality::{IndexStore as _, LocalCopy, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
@@ -1390,10 +1391,10 @@ impl IndexRegistry {
     }
 
     /// Stage node `node` of shard `shard` leaving the labels `removed` and
-    /// joining the labels `added` (dictionary ids) in the namespace's label
-    /// lookup, bound to its definition as this member read it: a building
-    /// lookup is maintained as a ready one is, so its build misses no write.
-    /// Nothing while the namespace has none.
+    /// joining the labels `added` in the namespace's label lookup, bound to
+    /// its definition as this member read it: a building lookup is
+    /// maintained as a ready one is, so its build misses no write. Nothing
+    /// while the namespace has none.
     ///
     /// # Errors
     ///
@@ -1404,8 +1405,8 @@ impl IndexRegistry {
         txn: &mut Transaction,
         shard: u16,
         node: NodeId,
-        removed: &[u32],
-        added: &[u32],
+        removed: &[LabelId],
+        added: &[LabelId],
     ) -> Result<(), StoreError> {
         let Some(Registered { def, version, .. }) = self.indexes.read().label_lookup().cloned()
         else {
@@ -1420,10 +1421,9 @@ impl IndexRegistry {
     }
 
     /// Stage the postings node `node` of shard `shard` does not have yet for
-    /// the labels `held` (dictionary ids), bound to the label lookup as this
-    /// member read it: a version of a temporal node, whose earlier versions
-    /// keep their labels in its history. Nothing while the namespace has no
-    /// lookup.
+    /// the labels `held`, bound to the label lookup as this member read it:
+    /// a version of a temporal node, whose earlier versions keep their labels
+    /// in its history. Nothing while the namespace has no lookup.
     ///
     /// # Errors
     ///
@@ -1434,7 +1434,7 @@ impl IndexRegistry {
         txn: &mut Transaction,
         shard: u16,
         node: NodeId,
-        held: &[u32],
+        held: &[LabelId],
     ) -> Result<(), StoreError> {
         let Some(Registered { def, version, .. }) = self.indexes.read().label_lookup().cloned()
         else {
@@ -1699,7 +1699,7 @@ pub fn holds_values(
     let mut membership = crate::index::membership::CatalogMembership::current(engine);
     let mut holds = |record: &coordinode_core::graph::node::NodeRecord| {
         Ok::<_, StoreError>(
-            membership.carries(record, &index.label)?
+            membership.carries_named(record, &index.label)?
                 && interpretation
                     .record_membership(record)
                     .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t))),

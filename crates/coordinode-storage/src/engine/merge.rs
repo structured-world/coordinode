@@ -215,7 +215,7 @@ impl MergeOperator for DocumentMerge {
 
                     // Ensure we have a base record. If the original PUT was compacted
                     // away but merge operands remain, create a minimal empty record.
-                    let rec = record.get_or_insert_with(|| NodeRecord::new(""));
+                    let rec = record.get_or_insert_with(|| NodeRecord::with_labels(Vec::new()));
 
                     apply_delta_to_record_batched(rec, &delta, &mut extra_doc);
                 }
@@ -237,7 +237,7 @@ impl MergeOperator for DocumentMerge {
         }
 
         // Encode the merged result with the 0x00 prefix.
-        let rec = record.unwrap_or_else(|| NodeRecord::new(""));
+        let rec = record.unwrap_or_else(|| NodeRecord::with_labels(Vec::new()));
         encode_node_record(&rec)
     }
 }

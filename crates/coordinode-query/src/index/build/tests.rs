@@ -42,8 +42,15 @@ fn commit(txn: &mut Transaction<'_>) -> Result<(), CommitError> {
     txn.commit(&ctx).map(|_| ())
 }
 
+/// The catalog identity of `label`, bound on first use as a write binds it.
+fn label_id(fx: &Fixture, label: &str) -> coordinode_core::schema::label_id::LabelId {
+    coordinode_modality::LocalSchemaStore::new(&fx.engine)
+        .bind_label(label)
+        .expect("bind label")
+}
+
 fn put_node(fx: &mut Fixture, node_id: u64, label: &str, props: &[(&str, Value)]) {
-    let mut record = NodeRecord::new(label);
+    let mut record = NodeRecord::new(label_id(fx, label));
     for (name, value) in props {
         let field = fx.interner.intern(name);
         record.set(field, value.clone());
@@ -67,7 +74,6 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
         covered: None,
         repair: None,
         stop: None,
-        labels: None,
         maintained_after: None,
     }
 }
@@ -274,6 +280,7 @@ fn a_page_that_read_a_changed_node_is_read_again() {
     let mut fx = fixture();
     put_node(&mut fx, 1, "User", &email("alice@x"));
     let field = fx.interner.intern("email");
+    let user = label_id(&fx, "User");
 
     let index = bound(crate::index::IndexDescriptor::btree(
         "user_email",
@@ -288,7 +295,7 @@ fn a_page_that_read_a_changed_node_is_read_again() {
             if std::mem::take(&mut first) {
                 // A writer changes the node between the page's read and its
                 // commit.
-                let mut record = NodeRecord::new("User");
+                let mut record = NodeRecord::new(user);
                 record.set(field, Value::String("changed@x".into()));
                 let mut writer = Transaction::begin(engine, Some(oracle), oracle.next());
                 LocalNodeStore

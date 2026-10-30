@@ -236,7 +236,8 @@ pub fn rebuild_node_counters(txn: &mut Transaction<'_>) -> StorageResult<()> {
     use crate::engine::merge::decode_node_record;
 
     let mut total: i64 = 0;
-    let mut label_counts: HashMap<String, i64> = HashMap::new();
+    let mut label_counts: rustc_hash::FxHashMap<coordinode_core::schema::label_id::LabelId, i64> =
+        rustc_hash::FxHashMap::default();
     let nothing_staged = HashMap::new();
     let engine = txn.engine();
     let mut closures = crate::engine::claims::evaluate::Closures::new(engine, &nothing_staged);
@@ -249,19 +250,21 @@ pub fn rebuild_node_counters(txn: &mut Transaction<'_>) -> StorageResult<()> {
         // Every label the node carries counts it, its type's implied ones
         // included.
         let implied = match record.labels.first() {
-            Some(primary) => closures.implied(primary)?.as_slice(),
+            Some(primary) => closures.implied(*primary)?.as_slice(),
             None => &[],
         };
         for label in record.labels.iter().chain(implied) {
-            *label_counts.entry(label.clone()).or_insert(0) += 1;
+            *label_counts.entry(*label).or_insert(0) += 1;
         }
     }
 
     txn.put(Partition::Counter, NODES_TOTAL_KEY, &total.to_le_bytes())?;
+    // The counters are kept by label name, as the planner asks for them.
     for (label, count) in label_counts {
+        let name = closures.name_of(label)?;
         txn.put(
             Partition::Counter,
-            &label_count_key(&label),
+            &label_count_key(&name),
             &count.to_le_bytes(),
         )?;
     }

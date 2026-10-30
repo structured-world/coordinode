@@ -131,12 +131,17 @@ pub fn journal_stats(data: &Path, hottest: usize) -> anyhow::Result<JournalStats
                         stats.proposals += 1;
                         for m in &proposal.mutations {
                             if let Mutation::Put {
-                                partition: coordinode_core::txn::proposal::PartitionId::Node,
+                                partition,
                                 key,
                                 value,
                             } = m
                             {
-                                nodes.put(key, value);
+                                use coordinode_core::txn::proposal::PartitionId;
+                                match partition {
+                                    PartitionId::Node => nodes.put(key, value),
+                                    PartitionId::Schema => nodes.name_label(key, value),
+                                    _ => {}
+                                }
                             }
                             let (class, key, value_len) = describe(m);
                             let c = classes.entry(class.clone()).or_default();
@@ -181,11 +186,22 @@ type FieldChanges = HashMap<String, (u64, u64)>;
 struct NodeTracker {
     /// Per key: the property encodings of the last version.
     last: HashMap<Vec<u8>, HashMap<String, Vec<u8>>>,
-    /// Per label: totals, and per field changes.
-    labels: HashMap<String, (NodeRewrites, FieldChanges)>,
+    /// Per primary label identity: totals, and per field changes.
+    labels: HashMap<u32, (NodeRewrites, FieldChanges)>,
+    /// The names of the label identities whose records the journal holds.
+    names: HashMap<u32, String>,
 }
 
 impl NodeTracker {
+    /// Note the name of a label identity from the record that issued it.
+    fn name_label(&mut self, key: &[u8], value: &[u8]) {
+        if let Some(id) = coordinode_core::schema::label_id::decode_label_id_key(key)
+            && let Ok(name) = std::str::from_utf8(value)
+        {
+            self.names.insert(id.get(), name.to_string());
+        }
+    }
+
     fn put(&mut self, key: &[u8], value: &[u8]) {
         let Some((label, props)) = node_props(value) else {
             return;
@@ -210,7 +226,10 @@ impl NodeTracker {
         }
     }
 
+    /// The rewrites per label, named by the identity records the journal
+    /// held, or `#<id>` for an identity issued before it.
     fn finish(self) -> Vec<(String, NodeRewrites)> {
+        let names = self.names;
         let mut out: Vec<_> = self
             .labels
             .into_iter()
@@ -222,7 +241,11 @@ impl NodeTracker {
                     .collect();
                 fields.sort_by_key(|a| core::cmp::Reverse(a.2));
                 totals.fields = fields;
-                (label, totals)
+                let name = names
+                    .get(&label)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{label}"));
+                (name, totals)
             })
             .collect();
         out.sort_by_key(|a| core::cmp::Reverse(a.1.bytes));
@@ -230,16 +253,16 @@ impl NodeTracker {
     }
 }
 
-/// A node record's primary label and the encoding of each property, keyed
-/// by field id (declared) or name (undeclared). `None` for a value that is
-/// not a node record.
-fn node_props(value: &[u8]) -> Option<(String, HashMap<String, Vec<u8>>)> {
+/// A node record's primary label identity and the encoding of each property,
+/// keyed by field id (declared) or name (undeclared). `None` for a value
+/// that is not a node record.
+fn node_props(value: &[u8]) -> Option<(u32, HashMap<String, Vec<u8>>)> {
     let record = rmpv::decode::read_value(&mut &value[..]).ok()?;
     let rmpv::Value::Array(parts) = record else {
         return None;
     };
     let label = match parts.first()? {
-        rmpv::Value::Array(labels) => labels.first()?.as_str()?.to_string(),
+        rmpv::Value::Array(labels) => u32::try_from(labels.first()?.as_u64()?).ok()?,
         _ => return None,
     };
     let mut props = HashMap::new();

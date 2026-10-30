@@ -3,13 +3,17 @@
 //!
 //! All schema state lives in [`Partition::Schema`]. The store hides:
 //!
-//! - Key format (`schema:label:<name>:<revision>`,
+//! - Key format (`schema:label:<id>:<revision>`,
 //!   `schema:current_revision:label:<name>`, mirrors for edge types).
+//! - Label identity: a name is bound to a catalog identity
+//!   ([`coordinode_core::schema::label_id`]), allocated on the label's first
+//!   use or declaration and retired when it is dropped; definitions live
+//!   under the identity.
 //! - Revision indirection: callers read "current schema" without
 //!   knowing the revision pointer trick.
 //! - Atomic write composition: saving a schema writes the body AND
-//!   updates the current-revision pointer in a single batch, so
-//!   readers never observe a pointer that names a missing revision.
+//!   updates the name binding in a single batch, so readers never
+//!   observe a binding that names a missing revision.
 //!
 //! Schema DDL is Raft-replicated above this layer; the store assumes
 //! the caller already holds the appropriate write authority (leader,
@@ -19,6 +23,10 @@ use coordinode_core::schema::definition::{
     EDGE_TYPE_SCHEMA_KEY_PREFIX, EdgeTypeSchema, LabelSchema, decode_edge_type_schema_key_name,
     encode_constraint_name_key, encode_edge_type_current_revision_key, encode_edge_type_schema_key,
     encode_label_current_revision_key, encode_label_schema_key,
+};
+use coordinode_core::schema::label_id::{
+    BindingState, FIRST_LABEL_ID, LABEL_ID_FRONTIER_KEY, LabelBinding, LabelId, decode_frontier,
+    encode_frontier, label_id_key,
 };
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
@@ -199,11 +207,37 @@ pub trait SchemaStore {
     fn publish_candidate_txn(&self, txn: &mut Transaction, schema: &LabelSchema)
     -> StoreResult<()>;
 
-    /// Drop a label (DROP TABLE / DROP label) by tombstoning its
-    /// current-revision pointer on the transaction. The body revisions are left
-    /// in place but become unreachable, so the label resolves to "not declared"
-    /// from the next read. Applied atomically at commit.
+    /// Drop a label (DROP TABLE / DROP label) by retiring its identity on the
+    /// transaction. The body revisions are left in place but become
+    /// unreachable, so the name resolves to "not declared" from the next read,
+    /// and a label created under it later gets a new identity. Applied
+    /// atomically at commit.
     fn drop_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
+
+    /// The identity `name` is bound to, read through the transaction; `None`
+    /// when no write or definition ever used the name, or the label was
+    /// dropped. Never allocates one.
+    fn label_id_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<Option<LabelId>>;
+
+    /// The identity `name` is bound to, allocating one when it has none: the
+    /// first use of a label a write stores, which makes it an implicit
+    /// FLEXIBLE type. Two attempts allocating for one name both write its
+    /// binding, so one commits and the other runs again and finds it.
+    fn bind_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<LabelId>;
+
+    /// The name identity `id` was allocated for, read through the
+    /// transaction; `None` when no label has that id. A dropped label's
+    /// identity keeps its name, so a record written before the drop still
+    /// reads with it.
+    fn label_name_txn(&self, txn: &mut Transaction, id: LabelId) -> StoreResult<Option<String>>;
+
+    /// [`Self::label_id_txn`] at the latest committed state, for readers
+    /// without a transaction.
+    fn label_id(&self, name: &str) -> StoreResult<Option<LabelId>>;
+
+    /// [`Self::label_name_txn`] at the latest committed state, for readers
+    /// without a transaction.
+    fn label_name(&self, id: LabelId) -> StoreResult<Option<String>>;
 
     /// Persist an edge type schema (body + pointer) on the transaction.
     fn save_edge_type_txn(&self, txn: &mut Transaction, schema: &EdgeTypeSchema)
@@ -295,27 +329,137 @@ impl<'a> LocalSchemaStore<'a> {
         name: &str,
     ) -> StoreResult<Option<LabelSchema>> {
         let pointer_key = encode_label_current_revision_key(name);
-        let Some(revision) =
-            self.load_revision_pointer(&snapshot, &pointer_key, "label revision pointer")?
+        let Some(binding) = self
+            .engine
+            .snapshot_get(&snapshot, Partition::Schema, &pointer_key)?
+            .map(|bytes| decode_binding(name, &bytes))
+            .transpose()?
         else {
             return Ok(None);
         };
-        let schema_key = encode_label_schema_key(name, revision);
+        let revision = binding.declared_revision();
+        if revision == 0 {
+            return Ok(None);
+        }
+        let schema_key = encode_label_schema_key(binding.id, revision);
         let Some(schema_bytes) =
             self.engine
                 .snapshot_get(&snapshot, Partition::Schema, &schema_key)?
         else {
+            return Err(missing_revision(name, revision));
+        };
+        decode_label_body(name, revision, &schema_bytes).map(Some)
+    }
+
+    /// The identity `name` is bound to as `snapshot` reads it; `None` when
+    /// it has none there.
+    pub fn label_id_at(
+        &self,
+        snapshot: coordinode_storage::engine::StorageSnapshot,
+        name: &str,
+    ) -> StoreResult<Option<LabelId>> {
+        Ok(self
+            .engine
+            .snapshot_get(
+                &snapshot,
+                Partition::Schema,
+                &encode_label_current_revision_key(name),
+            )?
+            .map(|bytes| decode_binding(name, &bytes))
+            .transpose()?
+            .and_then(|b| b.live_id()))
+    }
+
+    /// Label `id` as `snapshot` reads the catalog: the name it was allocated
+    /// for, and the definition that name is bound to while the binding is
+    /// still `id` (`None` for an implicit, retired or replaced identity).
+    ///
+    /// # Errors
+    ///
+    /// `Decode` for an id without an identity record: a stored record names
+    /// only allocated labels.
+    pub fn identity_at(
+        &self,
+        snapshot: coordinode_storage::engine::StorageSnapshot,
+        id: LabelId,
+    ) -> StoreResult<(String, Option<LabelSchema>)> {
+        // An identity record is written once, so the latest one is the one
+        // any view sees.
+        let Some(name) = self.label_name(id)? else {
             return Err(StoreError::Decode {
-                kind: "label schema",
-                message: format!("pointer for '{name}' references missing revision {revision}"),
+                kind: "label identity",
+                message: format!("label {id} has no identity record"),
             });
         };
-        LabelSchema::from_msgpack(&schema_bytes)
-            .map(Some)
-            .map_err(|e| StoreError::Decode {
-                kind: "label schema",
-                message: format!("decode failed for '{name}' rev {revision}: {e}"),
-            })
+        let schema = match self.label_id_at(snapshot, &name)? {
+            Some(bound) if bound == id => self.load_label_at(snapshot, &name)?,
+            _ => None,
+        };
+        Ok((name, schema))
+    }
+
+    /// The identity `name` is bound to, allocating an implicit one when it
+    /// has none, committed at once: for a single writer outside any
+    /// transaction (a test, a tool), as [`SchemaStore::save_label`] is. A
+    /// statement binds through [`SchemaStore::bind_label_txn`].
+    pub fn bind_label(&self, name: &str) -> StoreResult<LabelId> {
+        if let Some(id) = self.binding(name)?.and_then(|b| b.live_id()) {
+            return Ok(id);
+        }
+        let frontier = self.engine.get(Partition::Schema, LABEL_ID_FRONTIER_KEY)?;
+        let id = next_label_id(frontier.as_deref())?;
+        let mut batch = WriteBatch::new(self.engine);
+        batch.put(
+            Partition::Schema,
+            label_id_key(id).to_vec(),
+            name.as_bytes().to_vec(),
+        );
+        batch.put(
+            Partition::Schema,
+            LABEL_ID_FRONTIER_KEY.to_vec(),
+            encode_frontier(id).to_vec(),
+        );
+        let binding = LabelBinding {
+            id,
+            revision: 0,
+            state: BindingState::Implicit,
+        };
+        batch.put(
+            Partition::Schema,
+            encode_label_current_revision_key(name),
+            binding.encode().to_vec(),
+        );
+        batch.commit()?;
+        Ok(id)
+    }
+
+    /// Every label identity allocated so far with the name it was allocated
+    /// for, in id order: what a background pass that names many records'
+    /// labels reads once instead of once per label.
+    pub fn label_names(&self) -> StoreResult<Vec<(LabelId, String)>> {
+        let mut out = Vec::new();
+        for guard in self.engine.prefix_scan(
+            Partition::Schema,
+            coordinode_core::schema::label_id::LABEL_ID_KEY_PREFIX,
+        )? {
+            let (key, value) = guard.into_inner()?;
+            let Some(id) = coordinode_core::schema::label_id::decode_label_id_key(&key) else {
+                return Err(StoreError::Decode {
+                    kind: "label identity",
+                    message: format!("{} bytes past the identity prefix", key.len()),
+                });
+            };
+            out.push((id, decode_label_name(id, value.to_vec())?));
+        }
+        Ok(out)
+    }
+
+    /// The binding of `name` at the latest committed state.
+    fn binding(&self, name: &str) -> StoreResult<Option<LabelBinding>> {
+        self.engine
+            .get(Partition::Schema, &encode_label_current_revision_key(name))?
+            .map(|bytes| decode_binding(name, &bytes))
+            .transpose()
     }
 
     /// The revision the pointer at `key` names, as of `snapshot`.
@@ -364,6 +508,118 @@ fn claim_activation(txn: &mut Transaction, label: &str, revision: u64) {
         ClaimPredicate::SchemaActivated { revision },
         generation,
     ));
+}
+
+/// The binding of `name` from its stored bytes.
+fn decode_binding(name: &str, bytes: &[u8]) -> StoreResult<LabelBinding> {
+    LabelBinding::decode(bytes).ok_or_else(|| StoreError::Decode {
+        kind: "label binding",
+        message: format!("binding of '{name}' is not one ({} bytes)", bytes.len()),
+    })
+}
+
+/// A binding naming a definition revision that is not stored.
+fn missing_revision(name: &str, revision: u64) -> StoreError {
+    StoreError::Decode {
+        kind: "label schema",
+        message: format!("binding of '{name}' references missing revision {revision}"),
+    }
+}
+
+/// A stored label definition.
+fn decode_label_body(name: &str, revision: u64, bytes: &[u8]) -> StoreResult<LabelSchema> {
+    LabelSchema::from_msgpack(bytes).map_err(|e| StoreError::Decode {
+        kind: "label schema",
+        message: format!("decode failed for '{name}' rev {revision}: {e}"),
+    })
+}
+
+/// The encoded definition `schema`.
+fn encode_label_body(schema: &LabelSchema) -> StoreResult<Vec<u8>> {
+    schema.to_msgpack().map_err(|e| StoreError::Decode {
+        kind: "label schema",
+        message: format!("encode '{}': {e}", schema.name),
+    })
+}
+
+/// The binding of `name` as `txn` sees it.
+fn binding_txn(txn: &mut Transaction, name: &str) -> StoreResult<Option<LabelBinding>> {
+    txn.get(Partition::Schema, &encode_label_current_revision_key(name))?
+        .map(|bytes| decode_binding(name, &bytes))
+        .transpose()
+}
+
+/// The id after `frontier`, the largest handed out (`None` when none was).
+fn next_label_id(frontier: Option<&[u8]>) -> StoreResult<LabelId> {
+    match frontier {
+        None => Ok(FIRST_LABEL_ID),
+        Some(bytes) => decode_frontier(bytes)
+            .ok_or_else(|| StoreError::Decode {
+                kind: "label id frontier",
+                message: format!("expected 4 bytes naming an id, got {}", bytes.len()),
+            })?
+            .next()
+            .ok_or_else(|| StoreError::Invariant("the label id space is exhausted".into())),
+    }
+}
+
+/// Allocate a new identity for `name` on `txn`: the id after the frontier,
+/// its identity record and the moved frontier. Two attempts allocating at
+/// once both write the frontier and the same record, so one of them commits
+/// and the other is a write conflict its statement retries. A record already
+/// present under the next id means the frontier fell behind the ids issued:
+/// the id is refused rather than handed out twice.
+fn allocate_label_id_txn(txn: &mut Transaction, name: &str) -> StoreResult<LabelId> {
+    let frontier = txn.get(Partition::Schema, LABEL_ID_FRONTIER_KEY)?;
+    let id = next_label_id(frontier.as_deref())?;
+    let key = label_id_key(id);
+    if txn.get(Partition::Schema, &key)?.is_some() {
+        return Err(StoreError::Invariant(format!(
+            "label id {id} is already issued but lies past the frontier"
+        )));
+    }
+    txn.put(Partition::Schema, &key, name.as_bytes())?;
+    txn.put(
+        Partition::Schema,
+        LABEL_ID_FRONTIER_KEY,
+        &encode_frontier(id),
+    )?;
+    Ok(id)
+}
+
+/// Stage `schema` as the current definition of its label on `txn`: under
+/// the identity its name is bound to, or a new one when the name has none
+/// or was dropped.
+fn stage_label_definition(txn: &mut Transaction, schema: &LabelSchema) -> StoreResult<()> {
+    let body = encode_label_body(schema)?;
+    let id = match binding_txn(txn, &schema.name)?.and_then(|b| b.live_id()) {
+        Some(id) => id,
+        None => allocate_label_id_txn(txn, &schema.name)?,
+    };
+    txn.put(
+        Partition::Schema,
+        &encode_label_schema_key(id, schema.schema_revision),
+        &body,
+    )?;
+    let binding = LabelBinding {
+        id,
+        revision: schema.schema_revision,
+        state: BindingState::Declared,
+    };
+    txn.put(
+        Partition::Schema,
+        &encode_label_current_revision_key(&schema.name),
+        &binding.encode(),
+    )?;
+    Ok(())
+}
+
+/// The name an identity record holds.
+fn decode_label_name(id: LabelId, bytes: Vec<u8>) -> StoreResult<String> {
+    String::from_utf8(bytes).map_err(|e| StoreError::Decode {
+        kind: "label identity",
+        message: format!("name of label {id}: {e}"),
+    })
 }
 
 /// The stored body of edge type `schema`. A temporal type always resolves
@@ -449,20 +705,42 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn save_label(&self, schema: &LabelSchema) -> StoreResult<()> {
-        let body = schema.to_msgpack().map_err(|e| StoreError::Decode {
-            kind: "label schema",
-            message: format!("encode '{}': {e}", schema.name),
-        })?;
+        let body = encode_label_body(schema)?;
         let mut batch = WriteBatch::new(self.engine);
+        let id = match self.binding(&schema.name)?.and_then(|b| b.live_id()) {
+            Some(id) => id,
+            None => {
+                // The batch commits unconditionally: this path serves a
+                // single writer (a test, a tool) and is not raced.
+                let frontier = self.engine.get(Partition::Schema, LABEL_ID_FRONTIER_KEY)?;
+                let id = next_label_id(frontier.as_deref())?;
+                batch.put(
+                    Partition::Schema,
+                    label_id_key(id).to_vec(),
+                    schema.name.as_bytes().to_vec(),
+                );
+                batch.put(
+                    Partition::Schema,
+                    LABEL_ID_FRONTIER_KEY.to_vec(),
+                    encode_frontier(id).to_vec(),
+                );
+                id
+            }
+        };
         batch.put(
             Partition::Schema,
-            encode_label_schema_key(&schema.name, schema.schema_revision),
+            encode_label_schema_key(id, schema.schema_revision),
             body,
         );
+        let binding = LabelBinding {
+            id,
+            revision: schema.schema_revision,
+            state: BindingState::Declared,
+        };
         batch.put(
             Partition::Schema,
             encode_label_current_revision_key(&schema.name),
-            schema.schema_revision.to_be_bytes().to_vec(),
+            binding.encode().to_vec(),
         );
         batch.commit()?;
         Ok(())
@@ -598,27 +876,25 @@ impl SchemaStore for LocalSchemaStore<'_> {
         // A schema this attempt staged itself is covered by its own
         // activation; one it read from the store is what its writes are
         // validated under, and has to still be there when they land.
+        // A binding this attempt allocated itself conflicts with any other
+        // writer of it, a declaration included.
         let own_pointer = txn.buffered(Partition::Schema, &pointer_key).is_some();
-        let Some(revision) = Self::load_revision_pointer_txn(txn, &pointer_key, "label")? else {
+        let binding = binding_txn(txn, name)?;
+        let revision = binding.map_or(0, |b| b.declared_revision());
+        let Some(binding) = binding.filter(|_| revision != 0) else {
             if !own_pointer {
                 txn.note_label_schema_read(name, 0);
             }
             return Ok(None);
         };
-        let schema_key = encode_label_schema_key(name, revision);
+        let schema_key = encode_label_schema_key(binding.id, revision);
         if !own_pointer && txn.buffered(Partition::Schema, &schema_key).is_none() {
             txn.note_label_schema_read(name, revision);
         }
         let Some(schema_bytes) = txn.get(Partition::Schema, &schema_key)? else {
-            return Err(StoreError::Decode {
-                kind: "label schema",
-                message: format!("pointer for '{name}' references missing revision {revision}"),
-            });
+            return Err(missing_revision(name, revision));
         };
-        let schema = LabelSchema::from_msgpack(&schema_bytes).map_err(|e| StoreError::Decode {
-            kind: "label schema",
-            message: format!("decode failed for '{name}' rev {revision}: {e}"),
-        })?;
+        let schema = decode_label_body(name, revision, &schema_bytes)?;
         // A write under a schema whose candidate is being proved is held to
         // the candidate as well, since the proof never sees it.
         if !own_pointer && schema.candidate().is_some() {
@@ -672,18 +948,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn save_label_txn(&self, txn: &mut Transaction, schema: &LabelSchema) -> StoreResult<()> {
-        let body = schema.to_msgpack().map_err(|e| StoreError::Decode {
-            kind: "label schema",
-            message: format!("encode '{}': {e}", schema.name),
-        })?;
-        let schema_key = encode_label_schema_key(&schema.name, schema.schema_revision);
-        txn.put(Partition::Schema, &schema_key, &body)?;
-        let pointer_key = encode_label_current_revision_key(&schema.name);
-        txn.put(
-            Partition::Schema,
-            &pointer_key,
-            &schema.schema_revision.to_be_bytes(),
-        )?;
+        stage_label_definition(txn, schema)?;
         // A definition changed, so predicates other attempts evaluated under
         // the old one stop counting as evidence once this lands.
         txn.note_schema_change();
@@ -698,20 +963,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
         txn: &mut Transaction,
         schema: &LabelSchema,
     ) -> StoreResult<()> {
-        let body = schema.to_msgpack().map_err(|e| StoreError::Decode {
-            kind: "label schema",
-            message: format!("encode '{}': {e}", schema.name),
-        })?;
-        txn.put(
-            Partition::Schema,
-            &encode_label_schema_key(&schema.name, schema.schema_revision),
-            &body,
-        )?;
-        txn.put(
-            Partition::Schema,
-            &encode_label_current_revision_key(&schema.name),
-            &schema.schema_revision.to_be_bytes(),
-        )?;
+        stage_label_definition(txn, schema)?;
         txn.note_schema_change();
         Ok(())
     }
@@ -735,11 +987,61 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn drop_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
-        let pointer_key = encode_label_current_revision_key(name);
-        txn.delete(Partition::Schema, &pointer_key)?;
+        if let Some(binding) = binding_txn(txn, name)?.filter(|b| b.live_id().is_some()) {
+            let retired = LabelBinding {
+                state: BindingState::Retired,
+                ..binding
+            };
+            txn.put(
+                Partition::Schema,
+                &encode_label_current_revision_key(name),
+                &retired.encode(),
+            )?;
+        }
         txn.note_schema_change();
         claim_activation(txn, name, 0);
         Ok(())
+    }
+
+    fn label_id_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<Option<LabelId>> {
+        Ok(binding_txn(txn, name)?.and_then(|b| b.live_id()))
+    }
+
+    fn bind_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<LabelId> {
+        if let Some(id) = self.label_id_txn(txn, name)? {
+            return Ok(id);
+        }
+        // An implicit binding declares nothing, so it does not move the
+        // schema generation: it changes no predicate another attempt holds.
+        let id = allocate_label_id_txn(txn, name)?;
+        let binding = LabelBinding {
+            id,
+            revision: 0,
+            state: BindingState::Implicit,
+        };
+        txn.put(
+            Partition::Schema,
+            &encode_label_current_revision_key(name),
+            &binding.encode(),
+        )?;
+        Ok(id)
+    }
+
+    fn label_name_txn(&self, txn: &mut Transaction, id: LabelId) -> StoreResult<Option<String>> {
+        txn.get(Partition::Schema, &label_id_key(id))?
+            .map(|bytes| decode_label_name(id, bytes))
+            .transpose()
+    }
+
+    fn label_id(&self, name: &str) -> StoreResult<Option<LabelId>> {
+        Ok(self.binding(name)?.and_then(|b| b.live_id()))
+    }
+
+    fn label_name(&self, id: LabelId) -> StoreResult<Option<String>> {
+        self.engine
+            .get(Partition::Schema, &label_id_key(id))?
+            .map(|bytes| decode_label_name(id, bytes.to_vec()))
+            .transpose()
     }
 
     fn save_edge_type_txn(

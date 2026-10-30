@@ -934,7 +934,14 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
     // The earlier commit lands after the later one. No subsequent user write
     // may be needed to close its timestamp and publish index coverage.
     let fields = n1.db.interner().unwrap();
-    let mut record = NodeRecord::new("Item");
+    let item = {
+        use coordinode_modality::SchemaStore as _;
+        coordinode_modality::LocalSchemaStore::new(n1.db.engine())
+            .label_id("Item")
+            .unwrap()
+            .expect("the earlier writes bound Item")
+    };
+    let mut record = NodeRecord::new(item);
     record.set(fields.lookup("ext_id").unwrap(), Value::Int(2));
     record.set(
         fields.lookup("embedding").unwrap(),

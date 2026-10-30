@@ -1140,32 +1140,32 @@ impl EdgeTypeSchema {
 
 // -- Key encoding --
 
-/// Encode a revisioned schema key for a label:
-/// `schema:label:<name>:<revision>`.
+/// Encode a revisioned schema key for a label identity:
+/// `schema:label:<id>:<revision>`, both decimal.
 ///
-/// The schema partition is revision-prefixed from day one: each shard-key
-/// changing `ALTER LABEL` writes a new
-/// revision while older revisions remain as immutable snapshots. CE
-/// deployments only ever write revision 1 (no `ALTER LABEL SHARD BY` in CE),
-/// but the key format is final-state from the first commit.
+/// Each change of a label's definition writes a new revision while older
+/// revisions remain as immutable snapshots. The key names the identity, not
+/// the name: a label dropped and created again under the same name is a new
+/// identity whose revisions never meet the old one's.
 ///
 /// "Revision" (DDL-side) is intentionally distinct from "version" (data-side,
 /// e.g. MVCC `commit_ts` or future per-row OCC). See `schema_revision` field
 /// docs.
 ///
-/// Callers reading "current" schema must first read the pointer at
-/// [`encode_label_current_revision_key`] to learn which revision to load.
-pub fn encode_label_schema_key(name: &str, revision: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(13 + name.len() + 1 + 20);
+/// Callers reading "current" schema must first read the name binding at
+/// [`encode_label_current_revision_key`] to learn the identity and revision.
+pub fn encode_label_schema_key(id: crate::schema::label_id::LabelId, revision: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(13 + 10 + 1 + 20);
     key.extend_from_slice(b"schema:label:");
-    key.extend_from_slice(name.as_bytes());
+    key.extend_from_slice(id.get().to_string().as_bytes());
     key.push(b':');
     key.extend_from_slice(revision.to_string().as_bytes());
     key
 }
 
-/// Encode the pointer key naming the current revision for a label:
-/// `schema:current_revision:label:<name>`. Value: u64 BE.
+/// Encode the name binding key of a label:
+/// `schema:current_revision:label:<name>`. Value: a
+/// [`crate::schema::label_id::LabelBinding`].
 pub fn encode_label_current_revision_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(30 + name.len());
     key.extend_from_slice(b"schema:current_revision:label:");

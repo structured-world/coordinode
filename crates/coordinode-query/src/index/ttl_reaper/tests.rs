@@ -31,15 +31,22 @@ fn persist_schema(engine: &StorageEngine, schema: &LabelSchema) {
         .expect("persist schema");
 }
 
+/// The catalog identity of `name`, bound on first use as a write binds it.
+fn label(engine: &StorageEngine, name: &str) -> coordinode_core::schema::label_id::LabelId {
+    coordinode_modality::LocalSchemaStore::new(engine)
+        .bind_label(name)
+        .expect("bind label")
+}
+
 fn insert_node(
     engine: &StorageEngine,
     shard_id: u16,
     node_id: u64,
-    label: &str,
+    label_name: &str,
     timestamp_us: i64,
     interner: &mut FieldInterner,
 ) {
-    let mut record = NodeRecord::new(label);
+    let mut record = NodeRecord::new(label(engine, label_name));
     let ts_field = interner.intern("created_at");
     record.set(ts_field, Value::Timestamp(timestamp_us));
     seed_node_record(engine, shard_id, NodeId::from_raw(node_id), &record);
@@ -130,8 +137,8 @@ fn put_with(engine: &StorageEngine, oracle: &TimestampOracle, node: u64, record:
     commit_now(&mut txn).expect("commit node");
 }
 
-fn session(interner: &mut FieldInterner, created_at_us: i64) -> NodeRecord {
-    let mut record = NodeRecord::new("Session");
+fn session(engine: &StorageEngine, interner: &mut FieldInterner, created_at_us: i64) -> NodeRecord {
+    let mut record = NodeRecord::new(label(engine, "Session"));
     record.set(
         interner.intern("created_at"),
         Value::Timestamp(created_at_us),
@@ -153,9 +160,9 @@ fn a_committed_pass_deletes_what_expired() {
         &engine,
         &oracle,
         1,
-        &session(&mut interner, now - 2 * 3600 * 1_000_000),
+        &session(&engine, &mut interner, now - 2 * 3600 * 1_000_000),
     );
-    put_with(&engine, &oracle, 2, &session(&mut interner, now));
+    put_with(&engine, &oracle, 2, &session(&engine, &mut interner, now));
 
     let result = reap_computed_ttl_committed(&engine, 1, 1000, &interner, &oracle, &mut commit_now);
 
@@ -178,14 +185,15 @@ fn a_pass_reads_the_shard_once_and_decodes_only_ttl_labels() {
     persist_schema(&engine, &make_ttl_schema("Token", 3600, TtlScope::Node));
     let now = now_us();
     let old = now - 2 * 3600 * 1_000_000;
-    put_with(&engine, &oracle, 1, &session(&mut interner, old));
-    put_with(&engine, &oracle, 2, &session(&mut interner, now));
-    let mut token = NodeRecord::new("Token");
+    put_with(&engine, &oracle, 1, &session(&engine, &mut interner, old));
+    put_with(&engine, &oracle, 2, &session(&engine, &mut interner, now));
+    let mut token = NodeRecord::new(label(&engine, "Token"));
     token.set(interner.intern("created_at"), Value::Timestamp(old));
     put_with(&engine, &oracle, 3, &token);
     let blob = interner.intern("state");
+    let state = label(&engine, "State");
     for node in 10..60 {
-        let mut other = NodeRecord::new("State");
+        let mut other = NodeRecord::new(state);
         other.set(blob, Value::Blob(vec![7; 64 * 1024]));
         put_with(&engine, &oracle, node, &other);
     }
@@ -209,7 +217,7 @@ fn a_pass_without_targets_reads_nothing() {
     let engine = test_engine(dir.path());
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let mut interner = FieldInterner::new();
-    put_with(&engine, &oracle, 1, &session(&mut interner, 0));
+    put_with(&engine, &oracle, 1, &session(&engine, &mut interner, 0));
 
     let result = reap_computed_ttl_committed(&engine, 1, 1000, &interner, &oracle, &mut commit_now);
 
@@ -232,9 +240,9 @@ fn a_renewal_before_the_page_commits_keeps_the_record() {
         &engine,
         &oracle,
         1,
-        &session(&mut interner, now - 2 * 3600 * 1_000_000),
+        &session(&engine, &mut interner, now - 2 * 3600 * 1_000_000),
     );
-    let renewed = session(&mut interner, now);
+    let renewed = session(&engine, &mut interner, now);
 
     let mut renewed_once = false;
     let mut commit = |txn: &mut Transaction<'_>| {
@@ -265,9 +273,9 @@ fn a_renewal_before_the_page_commits_keeps_the_field() {
         &engine,
         &oracle,
         1,
-        &session(&mut interner, now - 2 * 3600 * 1_000_000),
+        &session(&engine, &mut interner, now - 2 * 3600 * 1_000_000),
     );
-    let renewed = session(&mut interner, now);
+    let renewed = session(&engine, &mut interner, now);
 
     let mut renewed_once = false;
     let mut commit = |txn: &mut Transaction<'_>| {
@@ -303,9 +311,14 @@ fn an_edge_attached_before_the_page_commits_is_removed_with_the_node() {
         &engine,
         &oracle,
         1,
-        &session(&mut interner, now - 2 * 3600 * 1_000_000),
+        &session(&engine, &mut interner, now - 2 * 3600 * 1_000_000),
     );
-    put_with(&engine, &oracle, 2, &NodeRecord::new("User"));
+    put_with(
+        &engine,
+        &oracle,
+        2,
+        &NodeRecord::new(label(&engine, "User")),
+    );
 
     let mut attached = false;
     let mut commit = |txn: &mut Transaction<'_>| {
@@ -514,7 +527,7 @@ fn reap_subtree_with_target_field_deletes_target_not_anchor() {
 
     // Insert node with expired anchor (created 2 minutes ago) + profile_data content.
     let old_ts = now_us() - 120 * 1_000_000;
-    let mut record = NodeRecord::new("Profile");
+    let mut record = NodeRecord::new(label(&engine, "Profile"));
     let ts_field = interner.intern("created_at");
     let pd_field = interner.intern("profile_data");
     record.set(ts_field, Value::Timestamp(old_ts));
@@ -578,7 +591,7 @@ fn reap_subtree_unresolved_target_field_records_error() {
     let old_ts = now_us() - 120 * 1_000_000;
     let ts_field = write_interner.intern("cached_at");
     let payload_field = write_interner.intern("payload");
-    let mut record = NodeRecord::new("Cache");
+    let mut record = NodeRecord::new(label(&engine, "Cache"));
     record.set(ts_field, Value::Timestamp(old_ts));
     record.set(payload_field, Value::String("stale data".into()));
     seed_node_record(&engine, 1, NodeId::from_raw(99), &record);
@@ -640,7 +653,7 @@ fn reap_subtree_second_pass_is_idempotent() {
     let old_ts = now_us() - 120 * 1_000_000;
     let ts_field = interner.intern("created_at");
     let bio_field = interner.intern("bio");
-    let mut record = NodeRecord::new("Profile");
+    let mut record = NodeRecord::new(label(&engine, "Profile"));
     record.set(ts_field, Value::Timestamp(old_ts));
     record.set(bio_field, Value::String("hello".into()));
     seed_node_record(&engine, 1, NodeId::from_raw(77), &record);
@@ -709,7 +722,7 @@ fn reap_node_scope_cleans_edges() {
     // Node 1 (expired) and node 100 (not TTL-managed, just a peer).
     insert_node(&engine, 1, 1, "Session", old_ts, &mut interner);
 
-    let mut peer_record = NodeRecord::new("User");
+    let mut peer_record = NodeRecord::new(label(&engine, "User"));
     let name_field = interner.intern("name");
     peer_record.set(name_field, Value::String("alice".into()));
     seed_node_record(&engine, 1, NodeId::from_raw(100), &peer_record);
@@ -757,7 +770,7 @@ fn reap_no_schemas_is_noop() {
 #[test]
 fn find_anchor_without_interner_may_pick_wrong_field() {
     let mut interner = FieldInterner::new();
-    let mut record = NodeRecord::new("Session");
+    let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
 
     // Intern 5 fields to make HashMap order unpredictable.
     let _f1 = interner.intern("field_a");
@@ -803,7 +816,7 @@ fn reap_multi_timestamp_uses_interner_for_correct_anchor() {
     let two_hours_ago = now - 2 * 3600 * 1_000_000;
 
     // Node with TWO Timestamp fields.
-    let mut record = NodeRecord::new("Session");
+    let mut record = NodeRecord::new(label(&engine, "Session"));
     let created_field = interner.intern("created_at");
     let updated_field = interner.intern("updated_at");
     record.set(created_field, Value::Timestamp(two_hours_ago));
@@ -867,7 +880,7 @@ fn reaping_a_table_row_frees_its_key() {
         (1u64, "old", 2 * 3600 * 1_000_000),
         (2, "new", 60 * 1_000_000),
     ] {
-        let mut record = NodeRecord::new("Session");
+        let mut record = NodeRecord::new(label(&engine, "Session"));
         record.set(content, Value::String(key.into()));
         record.set(created, Value::Timestamp(now - age_us));
         seed_node_record(&engine, 1, NodeId::from_raw(id), &record);
@@ -984,14 +997,17 @@ fn a_ready_anchor_index_supplies_the_candidates() {
     let now = now_us();
     let old = now - 2 * 3600 * 1_000_000;
     for node in 1..=3u64 {
-        seed_with_anchor_entry(&engine, &index, node, &session(&mut interner, old), old);
+        let record = session(&engine, &mut interner, old);
+        seed_with_anchor_entry(&engine, &index, node, &record, old);
     }
     for node in 4..=40u64 {
-        seed_with_anchor_entry(&engine, &index, node, &session(&mut interner, now), now);
+        let record = session(&engine, &mut interner, now);
+        seed_with_anchor_entry(&engine, &index, node, &record, now);
     }
     let blob = interner.intern("state");
+    let state = label(&engine, "State");
     for node in 100..120u64 {
-        let mut other = NodeRecord::new("State");
+        let mut other = NodeRecord::new(state);
         other.set(blob, Value::Blob(vec![7; 16 * 1024]));
         seed_node_record(&engine, 1, NodeId::from_raw(node), &other);
     }
@@ -1038,7 +1054,7 @@ fn an_anchor_index_being_built_is_not_trusted() {
         &engine,
         1,
         NodeId::from_raw(1),
-        &session(&mut interner, old),
+        &session(&engine, &mut interner, old),
     );
 
     let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
@@ -1068,7 +1084,7 @@ fn reaping_a_node_frees_its_unique_index_value() {
         (1u64, "old", 2 * 3600 * 1_000_000),
         (2, "new", 60 * 1_000_000),
     ] {
-        let mut record = NodeRecord::new("Session");
+        let mut record = NodeRecord::new(label(&engine, "Session"));
         record.set(content, Value::String(value.into()));
         record.set(created, Value::Timestamp(now - age_us));
         seed_node_record(&engine, 1, NodeId::from_raw(id), &record);
@@ -1102,7 +1118,8 @@ fn an_indexed_property_is_not_expired_by_field() {
     );
     // A ready index holds an entry for every node of its label.
     let old = now_us() - 2 * 3600 * 1_000_000;
-    seed_with_anchor_entry(&engine, &index, 1, &session(&mut interner, old), old);
+    let record = session(&engine, &mut interner, old);
+    seed_with_anchor_entry(&engine, &index, 1, &record, old);
 
     let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
     assert_eq!(result.fields_removed, 0);
@@ -1143,7 +1160,7 @@ fn a_keyed_table_is_not_reaped_without_its_key_columns() {
 #[test]
 fn find_anchor_with_interner_resolves_correct_field() {
     let mut interner = FieldInterner::new();
-    let mut record = NodeRecord::new("Session");
+    let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
 
     let created_field = interner.intern("created_at");
     let updated_field = interner.intern("updated_at");

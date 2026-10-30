@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::node::NodeId;
+use coordinode_core::schema::label_id::LabelId;
 use coordinode_core::txn::invariant::{Adjacency, Claim, ClaimPredicate, ClaimScope};
 use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_core::txn::write_concern::WriteConcern;
@@ -30,6 +31,16 @@ const COMMITS: usize = 4_000;
 
 /// Writer threads for the skew measurement.
 const WRITERS: usize = 8;
+
+/// The identities of the labels the measured nodes store.
+const DOC: LabelId = match LabelId::new(1) {
+    Some(id) => id,
+    None => unreachable!(),
+};
+const USER: LabelId = match LabelId::new(2) {
+    Some(id) => id,
+    None => unreachable!(),
+};
 
 fn open(dir: &tempfile::TempDir) -> (Arc<StorageEngine>, Arc<TimestampOracle>) {
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -185,24 +196,33 @@ fn one_label_writes(schema_read: bool) {
     use coordinode_core::schema::definition::{
         LabelSchema, encode_label_current_revision_key, encode_label_schema_key,
     };
+    use coordinode_core::schema::label_id::{BindingState, LabelBinding, label_id_key};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let (engine, oracle) = open(&dir);
     let schema = LabelSchema::new_node_id("Doc");
     engine
+        .put(Partition::Schema, &label_id_key(DOC), b"Doc")
+        .expect("identity record");
+    engine
         .put(
             Partition::Schema,
-            &encode_label_schema_key("Doc", schema.schema_revision),
+            &encode_label_schema_key(DOC, schema.schema_revision),
             &schema.to_msgpack().expect("encode"),
         )
         .expect("schema body");
+    let binding = LabelBinding {
+        id: DOC,
+        revision: schema.schema_revision,
+        state: BindingState::Declared,
+    };
     engine
         .put(
             Partition::Schema,
             &encode_label_current_revision_key("Doc"),
-            &schema.schema_revision.to_be_bytes(),
+            &binding.encode(),
         )
-        .expect("schema pointer");
+        .expect("schema binding");
 
     let started = Instant::now();
     let samples: Vec<Duration> = std::thread::scope(|scope| {
@@ -370,8 +390,26 @@ fn email_interpretation() -> coordinode_core::index::derive::IndexInterpretation
 fn store_users(engine: &StorageEngine, stored: u64) {
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
+    use coordinode_core::schema::definition::encode_label_current_revision_key;
+    use coordinode_core::schema::label_id::{BindingState, LabelBinding, label_id_key};
+    // The build's admission finds the users' label by its name.
+    engine
+        .put(Partition::Schema, &label_id_key(USER), b"User")
+        .expect("identity record");
+    let binding = LabelBinding {
+        id: USER,
+        revision: 0,
+        state: BindingState::Implicit,
+    };
+    engine
+        .put(
+            Partition::Schema,
+            &encode_label_current_revision_key("User"),
+            &binding.encode(),
+        )
+        .expect("binding");
     for id in 1..=stored {
-        let mut record = NodeRecord::new("User");
+        let mut record = NodeRecord::new(USER);
         record.set(EMAIL, Value::String(format!("{id}@stored")));
         let key = coordinode_core::graph::node::encode_node_key(
             engine.node_shard(),
@@ -405,7 +443,7 @@ fn take_free_email(
         Some(snap),
     );
     let email = Value::String(format!("{id}@new"));
-    let mut record = NodeRecord::new("User");
+    let mut record = NodeRecord::new(USER);
     record.set(EMAIL, email.clone());
     let shard = engine.node_shard();
     txn.put(
@@ -496,7 +534,7 @@ fn unique_values_in_one_commit(stored: u64, uncovered: u64, values: u64, commits
             for v in 0..values {
                 let id = 10 * stored + c * values + v;
                 let email = Value::String(format!("{id}@batch"));
-                let mut record = NodeRecord::new("User");
+                let mut record = NodeRecord::new(USER);
                 record.set(EMAIL, email.clone());
                 txn.put(
                     Partition::Node,
@@ -569,7 +607,7 @@ fn bystanders_beside_unique_reads(stored: u64, uncovered: u64) {
                     let wc = WriteConcern::default();
                     // A node of another label: the claimant reads it and
                     // passes over it.
-                    let doc = coordinode_core::graph::node::NodeRecord::new("Doc")
+                    let doc = coordinode_core::graph::node::NodeRecord::new(DOC)
                         .to_msgpack()
                         .expect("encode");
                     let mut local = Vec::with_capacity(COMMITS / WRITERS);

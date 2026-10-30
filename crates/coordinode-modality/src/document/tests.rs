@@ -2,7 +2,12 @@ use super::*;
 use crate::node::{LocalNodeStore, NodeStore};
 use coordinode_core::graph::node::NodeRecord;
 use coordinode_core::graph::types::Value;
+use coordinode_core::schema::label_id::{FIRST_LABEL_ID, LabelId};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+
+/// The label the seeded nodes store: the document operations below never
+/// read it.
+const LABEL: LabelId = FIRST_LABEL_ID;
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::{CommitContext, Transaction};
@@ -63,7 +68,7 @@ fn set_path_on_extra_visible_after_node_get() {
     // First seed a base node so the merge has something to merge
     // into.
     let id = NodeId::from_raw(1);
-    put_node(engine, id, &NodeRecord::new("User"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.set_path(
@@ -111,7 +116,7 @@ fn increment_accumulates_over_multiple_deltas() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(7);
-    put_node(engine, id, &NodeRecord::new("Counter"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         for _ in 0..3 {
@@ -149,7 +154,7 @@ fn delete_path_missing_is_idempotent() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(99);
-    put_node(engine, id, &NodeRecord::new("X"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     // Path doesn't exist — delete must succeed silently.
     commit_docs(engine, |docs, txn| {
@@ -192,7 +197,7 @@ fn array_push_creates_array_if_missing() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(20);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.array_push(
@@ -215,7 +220,7 @@ fn array_push_appends_in_order() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(21);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         for v in [1.0, 2.0, 3.0] {
@@ -240,7 +245,7 @@ fn array_pull_missing_value_is_noop() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(22);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.array_push(
@@ -271,7 +276,7 @@ fn array_pull_missing_path_is_noop() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(23);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.array_pull(
@@ -293,7 +298,7 @@ fn increment_accepts_negative_delta() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(24);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.increment(txn, 0, id, PathTarget::Extra, vec!["v".to_string()], 10.0)
@@ -310,7 +315,7 @@ fn increment_creates_value_if_missing() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(25);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     // No prior value — increment from scratch lands at delta.
     commit_docs(engine, |docs, txn| {
@@ -333,7 +338,7 @@ fn remove_property_missing_is_idempotent() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(26);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.remove_property(txn, 0, id, PathTarget::Extra, Some("never".to_string()))
@@ -349,7 +354,7 @@ fn set_path_deep_nesting_creates_intermediates() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(27);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.set_path(
@@ -401,7 +406,7 @@ fn delete_path_existing_path_removes_value() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(28);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.set_path(
@@ -435,7 +440,7 @@ fn array_pull_existing_value_removes_one() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(29);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         for s in ["a", "b", "c"] {
@@ -469,7 +474,7 @@ fn remove_property_existing_property_clears_it() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(30);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.set_path(
@@ -500,7 +505,7 @@ fn set_path_overwrites_leaf_with_different_type() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(31);
-    put_node(engine, id, &NodeRecord::new("L"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         docs.set_path(
@@ -542,7 +547,7 @@ fn set_path_on_propfield_target_uses_interned_id() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(32);
-    let mut base = NodeRecord::new("L");
+    let mut base = NodeRecord::new(LABEL);
     base.set_extra("placeholder", Value::Int(0));
     put_node(engine, id, &base);
 
@@ -588,7 +593,7 @@ fn concurrent_set_path_distinct_keys_converges() {
     let engine = Arc::clone(&fx.engine);
     let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1)));
     let id = NodeId::from_raw(100);
-    put_node(&engine, id, &NodeRecord::new("Multi"));
+    put_node(&engine, id, &NodeRecord::new(LABEL));
 
     let handles: Vec<_> = (0..4u64)
         .map(|t| {
@@ -642,7 +647,7 @@ fn array_add_to_set_deduplicates() {
     let fx = open_engine();
     let engine = &fx.engine;
     let id = NodeId::from_raw(5);
-    put_node(engine, id, &NodeRecord::new("Y"));
+    put_node(engine, id, &NodeRecord::new(LABEL));
 
     commit_docs(engine, |docs, txn| {
         for _ in 0..3 {

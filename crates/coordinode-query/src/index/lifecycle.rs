@@ -70,15 +70,6 @@ pub trait BuildEnvironment: Send + Sync {
     /// The dictionary could not be read.
     fn fields(&self) -> Result<FieldInterner, String>;
 
-    /// The dictionary ids of `names`, in order, each registered through the
-    /// deployment's ordered registration first if it has none: what a label
-    /// lookup build keys the labels of stored nodes by.
-    ///
-    /// # Errors
-    ///
-    /// The registration was refused or could not be published.
-    fn register_names(&self, names: &[&str]) -> Result<Vec<u32>, String>;
-
     /// The shard whose nodes are indexed.
     fn shard_id(&self) -> u16;
 
@@ -1143,7 +1134,6 @@ impl Shared {
         // below would live as long as the whole build, and a retune waiting
         // for it would hold up every reader of the configuration.
         let older_transactions_wait = self.config.read().older_transactions_wait;
-        let resolve_labels = |names: &[&str]| env.register_names(names);
         let maintained_after = self.maintained_after.lock().get(&generation).copied();
         Ok(Backfill {
             engine: env.engine(),
@@ -1156,7 +1146,6 @@ impl Shared {
             covered: Some(&covered),
             repair,
             stop: Some(&self.stopping),
-            labels: Some(&resolve_labels),
             maintained_after,
         }
         .run(&taken.def, &mut |txn| env.commit_page(txn)))

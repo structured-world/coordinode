@@ -80,7 +80,8 @@ fn document_property_storage_roundtrip() {
         ),
     ]);
 
-    let mut rec = NodeRecord::new("Device");
+    let device = super::helpers::bind_label(engine, "Device");
+    let mut rec = NodeRecord::new(device);
     rec.set(1, PropertyValue::String("sensor-001".into()));
     rec.set(2, PropertyValue::Document(doc.clone()));
 
@@ -89,7 +90,7 @@ fn document_property_storage_roundtrip() {
     // Read back
     let restored = read_node(engine, 0, NodeId::from_raw(1)).expect("key should exist");
 
-    assert_eq!(restored.primary_label(), "Device");
+    assert_eq!(restored.primary_label(), Some(device));
     assert_eq!(
         restored.get(1),
         Some(&PropertyValue::String("sensor-001".into()))
@@ -112,7 +113,7 @@ fn document_deep_nesting_storage_roundtrip() {
     let level2 = rmpv::Value::Map(vec![(rmpv::Value::String("b".into()), level3)]);
     let level1 = rmpv::Value::Map(vec![(rmpv::Value::String("a".into()), level2)]);
 
-    let mut rec = NodeRecord::new("Config");
+    let mut rec = NodeRecord::new(super::helpers::bind_label(engine, "Config"));
     rec.set(1, PropertyValue::Document(level1.clone()));
 
     seed_node_record(engine, 0, NodeId::from_raw(2), &rec);
@@ -139,7 +140,7 @@ fn document_heterogeneous_array_storage() {
         ]),
     )]);
 
-    let mut rec = NodeRecord::new("Test");
+    let mut rec = NodeRecord::new(super::helpers::bind_label(engine, "Test"));
     rec.set(1, PropertyValue::Document(doc.clone()));
 
     seed_node_record(engine, 0, NodeId::from_raw(3), &rec);
@@ -160,7 +161,7 @@ fn document_mixed_with_regular_properties() {
         rmpv::Value::Boolean(true),
     )]);
 
-    let mut rec = NodeRecord::new("User");
+    let mut rec = NodeRecord::new(super::helpers::bind_label(engine, "User"));
     rec.set(1, PropertyValue::String("Alice".into()));
     rec.set(2, PropertyValue::Int(30));
     rec.set(3, PropertyValue::Float(1.75));
@@ -197,6 +198,7 @@ fn document_persists_across_reopen() {
     )]);
 
     let id = NodeId::from_raw(5);
+    let persistent;
 
     // Write + close
     {
@@ -208,7 +210,8 @@ fn document_persists_across_reopen() {
             Tier::Warm,
         )]);
         let engine = StorageEngine::open(&config).expect("open");
-        let mut rec = NodeRecord::new("Persistent");
+        persistent = super::helpers::bind_label(&engine, "Persistent");
+        let mut rec = NodeRecord::new(persistent);
         rec.set(1, PropertyValue::Document(doc.clone()));
         seed_node_record(&engine, 0, id, &rec);
         // engine drops here (storage flush on drop)
@@ -225,7 +228,12 @@ fn document_persists_across_reopen() {
         )]);
         let engine = StorageEngine::open(&config).expect("reopen");
         let restored = read_node(&engine, 0, id).expect("key should exist after reopen");
-        assert_eq!(restored.primary_label(), "Persistent");
+        assert_eq!(restored.primary_label(), Some(persistent));
+        assert_eq!(
+            super::helpers::label_id(&engine, "Persistent"),
+            Some(persistent),
+            "the binding survives the reopen"
+        );
         assert_eq!(restored.get(1), Some(&PropertyValue::Document(doc)));
     }
 }

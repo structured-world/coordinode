@@ -67,9 +67,11 @@ fn save_label_is_atomic_pointer_and_body() {
         .expect("Some(schema)");
     assert_eq!(cur.schema_revision, 2);
 
-    // v1 body still readable through its revisioned key.
+    // v1 body still readable through its revisioned key, under the label's
+    // identity.
+    let id = store.label_id("User").expect("binding").expect("bound");
     let v1_bytes = engine
-        .get(Partition::Schema, &encode_label_schema_key("User", 1))
+        .get(Partition::Schema, &encode_label_schema_key(id, 1))
         .expect("get")
         .expect("v1 body");
     let v1_loaded = LabelSchema::from_msgpack(&v1_bytes).expect("decode v1");
@@ -156,12 +158,17 @@ fn pointer_naming_missing_revision_surfaces_as_decode_error() {
     let fx = open_engine();
     let engine = &fx.engine;
     let store = LocalSchemaStore::new(engine);
-    // Pointer says revision 7 exists, but no body at rev 7.
+    // The binding says revision 7 is declared, but no body is at rev 7.
+    let binding = coordinode_core::schema::label_id::LabelBinding {
+        id: coordinode_core::schema::label_id::FIRST_LABEL_ID,
+        revision: 7,
+        state: coordinode_core::schema::label_id::BindingState::Declared,
+    };
     engine
         .put(
             Partition::Schema,
             &encode_label_current_revision_key("Orphan"),
-            &7u64.to_be_bytes(),
+            &binding.encode(),
         )
         .expect("inject");
     let err = store.load_label("Orphan").expect_err("must error");
@@ -505,4 +512,198 @@ fn edge_type_saves_keep_the_cardinality_profile_and_drop_withdrawn_counts() {
             .expect("get")
             .is_none()
     );
+}
+
+// -- label identity --
+
+/// An MVCC transaction on a fresh oracle over `engine`, and the commit of
+/// one.
+fn identity_txn<'a>(
+    engine: &'a StorageEngine,
+    oracle: &'a coordinode_core::txn::timestamp::TimestampOracle,
+) -> Transaction<'a> {
+    Transaction::begin(engine, Some(oracle), oracle.next())
+}
+
+fn commit_identity(
+    txn: &mut Transaction<'_>,
+) -> Result<(), coordinode_storage::engine::transaction::CommitError> {
+    let wc = coordinode_core::txn::write_concern::WriteConcern::majority();
+    txn.commit(&coordinode_storage::engine::transaction::CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    })
+    .map(drop)
+}
+
+/// A label's first use allocates its identity, and every later use, read or
+/// write, finds the same one; a name never used has none, and a read never
+/// allocates one.
+#[test]
+fn a_label_is_bound_once_and_found_after() {
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = coordinode_core::txn::timestamp::TimestampOracle::new();
+    let store = LocalSchemaStore::new(engine);
+
+    let mut read = identity_txn(engine, &oracle);
+    assert_eq!(store.label_id_txn(&mut read, "Goal").expect("read"), None);
+    assert!(
+        read.buffered(
+            Partition::Schema,
+            &encode_label_current_revision_key("Goal")
+        )
+        .is_none()
+    );
+
+    let mut txn = identity_txn(engine, &oracle);
+    let goal = store.bind_label_txn(&mut txn, "Goal").expect("bind");
+    assert_eq!(store.bind_label_txn(&mut txn, "Goal").expect("again"), goal);
+    let thing = store.bind_label_txn(&mut txn, "Thing").expect("bind");
+    assert_ne!(goal, thing, "two names, two identities");
+    commit_identity(&mut txn).expect("commit");
+
+    assert_eq!(store.label_id("Goal").expect("read"), Some(goal));
+    assert_eq!(
+        store.label_name(goal).expect("read").as_deref(),
+        Some("Goal")
+    );
+    assert_eq!(
+        store.load_label("Goal").expect("read"),
+        None,
+        "implicit: no definition"
+    );
+    let mut later = identity_txn(engine, &oracle);
+    assert_eq!(
+        store.bind_label_txn(&mut later, "Goal").expect("bind"),
+        goal
+    );
+}
+
+/// Two attempts using a new label at once both write its binding, so one
+/// commits and the other is refused; run again, it finds the identity the
+/// first allocated. Neither name ends bound to two identities.
+#[test]
+fn concurrent_first_uses_of_a_label_converge_on_one_identity() {
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = coordinode_core::txn::timestamp::TimestampOracle::new();
+    let store = LocalSchemaStore::new(engine);
+
+    let mut first = identity_txn(engine, &oracle);
+    let mut second = identity_txn(engine, &oracle);
+    let won = store.bind_label_txn(&mut first, "Goal").expect("bind");
+    store.bind_label_txn(&mut second, "Goal").expect("bind");
+    commit_identity(&mut first).expect("the first commits");
+    assert!(
+        commit_identity(&mut second).is_err(),
+        "the second conflicts"
+    );
+
+    let mut retry = identity_txn(engine, &oracle);
+    assert_eq!(store.bind_label_txn(&mut retry, "Goal").expect("bind"), won);
+    commit_identity(&mut retry).expect("nothing new to write");
+    assert_eq!(store.label_id("Goal").expect("read"), Some(won));
+}
+
+/// Declaring a label used so far without a definition keeps its identity,
+/// and so does every later revision; dropping it retires the identity, and
+/// a label created again under the name gets a new one, whose definitions
+/// never meet the old one's. The retired identity keeps its name, so a
+/// record written before the drop still reads with it.
+#[test]
+fn a_label_keeps_its_identity_until_dropped_and_a_recreation_gets_a_new_one() {
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = coordinode_core::txn::timestamp::TimestampOracle::new();
+    let store = LocalSchemaStore::new(engine);
+
+    let mut txn = identity_txn(engine, &oracle);
+    let implicit = store.bind_label_txn(&mut txn, "User").expect("bind");
+    commit_identity(&mut txn).expect("commit");
+
+    let mut txn = identity_txn(engine, &oracle);
+    store
+        .save_label_txn(&mut txn, &sample_label())
+        .expect("declare");
+    commit_identity(&mut txn).expect("commit");
+    assert_eq!(store.label_id("User").expect("read"), Some(implicit));
+    let mut v2 = sample_label();
+    v2.schema_revision = 2;
+    let mut txn = identity_txn(engine, &oracle);
+    store.save_label_txn(&mut txn, &v2).expect("revise");
+    commit_identity(&mut txn).expect("commit");
+    assert_eq!(store.label_id("User").expect("read"), Some(implicit));
+
+    let mut txn = identity_txn(engine, &oracle);
+    store.drop_label_txn(&mut txn, "User").expect("drop");
+    commit_identity(&mut txn).expect("commit");
+    assert_eq!(store.label_id("User").expect("read"), None);
+    assert_eq!(store.load_label("User").expect("read"), None);
+
+    let mut txn = identity_txn(engine, &oracle);
+    store
+        .save_label_txn(&mut txn, &sample_label())
+        .expect("recreate");
+    commit_identity(&mut txn).expect("commit");
+    let recreated = store.label_id("User").expect("read").expect("bound");
+    assert_ne!(recreated, implicit, "a recreation is a new identity");
+    let current = store.load_label("User").expect("read").expect("declared");
+    assert_eq!(current.schema_revision, 1);
+    assert!(
+        engine
+            .get(Partition::Schema, &encode_label_schema_key(implicit, 2))
+            .expect("get")
+            .is_some(),
+        "the old identity's definitions stay under it"
+    );
+    assert_eq!(
+        store.label_name(implicit).expect("read").as_deref(),
+        Some("User")
+    );
+    let names = store.label_names().expect("list");
+    assert_eq!(
+        names,
+        vec![
+            (implicit, "User".to_string()),
+            (recreated, "User".to_string())
+        ]
+    );
+}
+
+/// An identity is never handed out twice: an allocation whose identity
+/// record is already there, past a frontier that fell behind, is refused
+/// rather than binding a second name to the id.
+#[test]
+fn an_allocation_never_reuses_an_identity() {
+    use coordinode_core::schema::label_id::{LABEL_ID_FRONTIER_KEY, label_id_key};
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = coordinode_core::txn::timestamp::TimestampOracle::new();
+    let store = LocalSchemaStore::new(engine);
+
+    let mut txn = identity_txn(engine, &oracle);
+    let first = store.bind_label_txn(&mut txn, "First").expect("bind");
+    commit_identity(&mut txn).expect("commit");
+    engine
+        .delete(Partition::Schema, LABEL_ID_FRONTIER_KEY)
+        .expect("damage the frontier");
+
+    let mut txn = identity_txn(engine, &oracle);
+    let refused = store
+        .bind_label_txn(&mut txn, "Second")
+        .expect_err("the frontier fell behind to an issued id");
+    assert!(
+        matches!(&refused, StoreError::Invariant(m) if m.contains(&first.to_string())),
+        "{refused:?}"
+    );
+    assert_eq!(
+        engine
+            .get(Partition::Schema, &label_id_key(first))
+            .expect("get")
+            .as_deref(),
+        Some(&b"First"[..])
+    );
+    assert_eq!(store.label_id("Second").expect("read"), None);
 }

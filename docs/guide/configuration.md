@@ -1114,8 +1114,14 @@ type and every version of a temporal node under its own discriminator or
   out earlier, including to a node that was deleted since. The error names the
   first identifiers found. A database that never created a node never refuses.
   `--force` relaxes
-  only the compatibility checks of a binary dump (format version, schema), never
-  this one.
+  only the compatibility checks of a binary dump (a newer format version, the
+  schema), never this one.
+- **A binary dump restores only into the release format that wrote it.** A
+  binary dump of an older format is refused before any of it is read, even
+  with `--force`: its records are laid out for a format this release does not
+  read, and no conversion exists. Restore it with the release that wrote it
+  and export a `json` or `cypher` dump, which name labels and properties and
+  restore into any release.
 - **Nodes created afterwards get fresh identifiers.** The target's identifier
   allocator is moved past every restored identifier before the first write.
 - **An interrupted restore finishes when rerun with the same input.** A restore

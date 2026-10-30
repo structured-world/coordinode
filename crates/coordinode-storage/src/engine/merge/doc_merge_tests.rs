@@ -1,10 +1,24 @@
 use super::*;
 use coordinode_core::graph::doc_delta::PathTarget;
 use coordinode_core::graph::types::Value;
+use coordinode_core::schema::label_id::LabelId;
+
+/// The labels the records below store: the merge carries them through
+/// untouched, whatever they name.
+const TYPE: LabelId = label(1);
+const OTHER: LabelId = label(2);
+
+/// The id `raw`, evaluated at compile time: every `raw` used is nonzero.
+const fn label(raw: u32) -> LabelId {
+    match LabelId::new(raw) {
+        Some(id) => id,
+        None => unreachable!(),
+    }
+}
 
 /// Helper: create a NodeRecord with a Document property in extra.
 fn make_record_with_doc(key: &str, doc: rmpv::Value) -> NodeRecord {
-    let mut rec = NodeRecord::new("TestLabel");
+    let mut rec = NodeRecord::new(TYPE);
     rec.set_extra(key, Value::Document(doc));
     rec
 }
@@ -201,7 +215,7 @@ fn doc_merge_delete_path() {
     let op = DocumentMerge;
 
     let rec = {
-        let mut r = NodeRecord::new("Test");
+        let mut r = NodeRecord::new(TYPE);
         r.set_extra("keep", Value::Int(1));
         r.set_extra("remove", Value::Int(2));
         r
@@ -287,8 +301,8 @@ fn doc_merge_preserves_labels_and_props() {
     // Merge must preserve existing labels and interned props.
     let op = DocumentMerge;
 
-    let mut rec = NodeRecord::new("User");
-    rec.add_label("Admin".into());
+    let mut rec = NodeRecord::new(TYPE);
+    rec.add_label(OTHER);
     rec.set(1, Value::String("Alice".into())); // interned prop
     rec.set_extra("doc_field", Value::Document(make_rmpv_map(vec![])));
     let base = encode_rec(&rec);
@@ -306,8 +320,7 @@ fn doc_merge_preserves_labels_and_props() {
     let merged = decode_node_record(&result).expect("decode");
 
     // Labels preserved.
-    assert!(merged.has_label("User"));
-    assert!(merged.has_label("Admin"));
+    assert_eq!(merged.labels, [TYPE, OTHER]);
     // Interned prop preserved.
     assert_eq!(merged.get(1), Some(&Value::String("Alice".into())));
     // Doc field updated.
@@ -333,7 +346,7 @@ fn doc_merge_empty_operand_returns_error() {
 fn doc_merge_prop_field_set_path() {
     // SetPath targeting props[42] creates nested document in interned props.
     let op = DocumentMerge;
-    let mut base = NodeRecord::new("Device");
+    let mut base = NodeRecord::new(TYPE);
     base.set(42, Value::Document(rmpv::Value::Map(vec![])));
     let base_bytes = encode_rec(&base);
 
@@ -388,7 +401,7 @@ fn doc_merge_prop_field_delete_path() {
         ("a", rmpv::Value::Integer(1.into())),
         ("b", rmpv::Value::Integer(2.into())),
     ]);
-    let mut base = NodeRecord::new("Test");
+    let mut base = NodeRecord::new(TYPE);
     base.set(7, Value::Document(doc));
     let base_bytes = encode_rec(&base);
 
@@ -422,7 +435,7 @@ fn doc_merge_prop_field_increment() {
     // Increment on a numeric field inside a Document in props.
     let op = DocumentMerge;
     let doc = make_rmpv_map(vec![("views", rmpv::Value::Integer(10.into()))]);
-    let mut base = NodeRecord::new("Stats");
+    let mut base = NodeRecord::new(TYPE);
     base.set(5, Value::Document(doc));
     let base_bytes = encode_rec(&base);
 
@@ -452,7 +465,7 @@ fn doc_merge_prop_field_increment() {
 fn doc_merge_prop_field_preserves_extra_and_other_props() {
     // PropField delta only touches its target field, not extra or other props.
     let op = DocumentMerge;
-    let mut base = NodeRecord::new("Mixed");
+    let mut base = NodeRecord::new(TYPE);
     base.set(1, Value::String("name_val".into()));
     base.set(2, Value::Document(rmpv::Value::Map(vec![])));
     base.set_extra("overflow_key", Value::Int(42));
@@ -489,7 +502,7 @@ fn doc_merge_prop_field_preserves_extra_and_other_props() {
 fn doc_merge_mixed_extra_and_prop_field() {
     // Extra delta and PropField delta in same merge call.
     let op = DocumentMerge;
-    let mut base = NodeRecord::new("Mixed");
+    let mut base = NodeRecord::new(TYPE);
     base.set(3, Value::Document(rmpv::Value::Map(vec![])));
     let base_bytes = encode_rec(&base);
 
@@ -530,7 +543,7 @@ fn doc_merge_legacy_bare_record_as_base() {
     // Legacy NodeRecord without the 0x00 prefix.
     let op = DocumentMerge;
 
-    let rec = NodeRecord::new("Legacy");
+    let rec = NodeRecord::new(TYPE);
     let bare_msgpack = rec.to_msgpack().expect("encode");
 
     let delta = DocDelta::SetPath {
@@ -545,7 +558,7 @@ fn doc_merge_legacy_bare_record_as_base() {
         .expect("merge with legacy base");
     let merged = decode_node_record(&result).expect("decode");
 
-    assert!(merged.has_label("Legacy"));
+    assert!(merged.stores_label(TYPE));
     assert_eq!(merged.get_extra("x"), Some(&Value::Int(1)));
 }
 
@@ -555,7 +568,7 @@ fn doc_merge_legacy_bare_record_as_base() {
 fn doc_merge_remove_property_prop_field() {
     // RemoveProperty with PropField removes entire props[field_id].
     let op = DocumentMerge;
-    let mut base = NodeRecord::new("Session");
+    let mut base = NodeRecord::new(TYPE);
     base.set(3, Value::Timestamp(1_000_000));
     base.set(5, Value::String("keep me".into()));
     let base_bytes = encode_rec(&base);
@@ -583,7 +596,7 @@ fn doc_merge_remove_property_prop_field() {
 fn doc_merge_remove_property_extra_key() {
     // RemoveProperty with Extra target removes a key from the extra map.
     let op = DocumentMerge;
-    let mut base = NodeRecord::new("Validated");
+    let mut base = NodeRecord::new(TYPE);
     base.set_extra("temp_field", Value::Int(42));
     base.set_extra("keep_field", Value::Int(99));
     let base_bytes = encode_rec(&base);
@@ -614,7 +627,7 @@ fn doc_merge_remove_property_extra_key() {
 fn doc_merge_remove_property_idempotent() {
     // Removing a non-existent property is a no-op.
     let op = DocumentMerge;
-    let mut base = NodeRecord::new("Test");
+    let mut base = NodeRecord::new(TYPE);
     base.set(1, Value::Int(100));
     let base_bytes = encode_rec(&base);
 
@@ -702,7 +715,7 @@ fn doc_merge_mixed_extra_and_propfield_deltas() {
 
     // Field 7 stores a Document-typed property (PropField target requires Document).
     let field7_doc = make_rmpv_map(vec![("inner", rmpv::Value::Integer(10.into()))]);
-    let mut base_rec = NodeRecord::new("Mixed");
+    let mut base_rec = NodeRecord::new(TYPE);
     base_rec.set(7, Value::Document(field7_doc));
     let initial_meta = make_rmpv_map(vec![("a", rmpv::Value::Integer(0.into()))]);
     base_rec.set_extra("meta", Value::Document(initial_meta));
@@ -829,7 +842,7 @@ fn doc_merge_setpath_then_remove_property_extra() {
 #[test]
 fn doc_merge_set_property_keeps_the_value_type() {
     let op = DocumentMerge;
-    let mut base = NodeRecord::new("Agent");
+    let mut base = NodeRecord::new(TYPE);
     base.set(1, Value::Timestamp(100));
     base.set(2, Value::Blob(vec![7; 64]));
     base.set_extra("note", Value::Timestamp(5));
@@ -926,7 +939,7 @@ fn doc_merge_base_reset_flushes_extra_doc() {
     };
 
     // Second base reset (new full NodeRecord with different label).
-    let mut base2_rec = NodeRecord::new("Replacement");
+    let mut base2_rec = NodeRecord::new(OTHER);
     base2_rec.set_extra("flag", Value::Bool(true));
     let base2 = encode_rec(&base2_rec);
 
@@ -946,12 +959,9 @@ fn doc_merge_base_reset_flushes_extra_doc() {
         .expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
-    // Final state should be base2 + d2 applied ("Replacement" label, flag=true, note="after reset").
+    // Final state should be base2 + d2 applied (base2's label, flag=true, note="after reset").
     // d1's effect should be gone (applied to base1 which was replaced).
-    assert!(
-        merged.has_label("Replacement"),
-        "label should be from base2 (Replacement)"
-    );
+    assert_eq!(merged.labels, [OTHER], "label should be from base2");
     assert_eq!(
         merged.get_extra("flag"),
         Some(&Value::Bool(true)),

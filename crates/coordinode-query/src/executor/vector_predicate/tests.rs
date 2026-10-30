@@ -1,7 +1,22 @@
 use super::*;
+use crate::index::membership::LabelCarriers;
 use coordinode_core::graph::node::NodeRecord;
+use coordinode_core::schema::label_id::LabelId;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use std::collections::HashMap;
+
+/// The id `raw`, evaluated at compile time: every `raw` used is nonzero.
+const fn label(raw: u32) -> LabelId {
+    match LabelId::new(raw) {
+        Some(id) => id,
+        None => unreachable!(),
+    }
+}
+
+const ITEM: LabelId = label(1);
+const GOAL: LabelId = label(2);
+const THING: LabelId = label(3);
+const TASK: LabelId = label(4);
 
 fn test_engine(dir: &std::path::Path) -> StorageEngine {
     let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -17,7 +32,7 @@ fn test_engine(dir: &std::path::Path) -> StorageEngine {
 /// Build a NodeRecord with a `category` String property whose field
 /// id is `2`. Returns the record (msgpack-serialised) ready for
 /// `engine.put(Partition::Node, key, bytes)`.
-fn make_record(label: &str, category: Option<&str>) -> NodeRecord {
+fn make_record(label: LabelId, category: Option<&str>) -> NodeRecord {
     let mut props: HashMap<u32, Value> = HashMap::new();
     if let Some(cat) = category {
         props.insert(2, Value::String(cat.into()));
@@ -31,26 +46,43 @@ fn lookup_category(name: &str) -> Option<u32> {
     if name == "category" { Some(2) } else { None }
 }
 
-/// No type implies any label.
+/// No predicate names a label.
 fn none() -> Implying {
     Implying::new()
 }
 
+/// The predicate's labels resolved to their catalog ids, none implied.
+fn resolved(labels: &[(&str, LabelId)]) -> Implying {
+    labels
+        .iter()
+        .map(|&(name, id)| (name.to_string(), LabelCarriers::stored_only(id)))
+        .collect()
+}
+
 #[test]
 fn label_eq_matches_primary_label() {
-    let r = make_record("Item", None);
+    let r = make_record(ITEM, None);
+    let catalog = resolved(&[("Item", ITEM), ("Other", GOAL)]);
     assert!(evaluate_against(
         &r,
         &VectorPredicate::LabelEq("Item".into()),
         &lookup_category,
-        &none(),
+        &catalog,
     ));
     assert!(!evaluate_against(
         &r,
         &VectorPredicate::LabelEq("Other".into()),
         &lookup_category,
-        &none(),
+        &catalog,
     ));
+}
+
+/// A label the catalog never bound matches no node.
+#[test]
+fn label_eq_on_an_unbound_label_matches_nothing() {
+    let r = make_record(ITEM, None);
+    let leaf = VectorPredicate::LabelEq("Item".into());
+    assert!(!evaluate_against(&r, &leaf, &lookup_category, &none()));
 }
 
 /// A node whose type implies the label carries it without storing it: the
@@ -58,18 +90,23 @@ fn label_eq_matches_primary_label() {
 /// through them.
 #[test]
 fn label_eq_matches_a_label_the_type_implies() {
-    let r = make_record("Goal", None);
+    let r = make_record(GOAL, None);
     let leaf = VectorPredicate::LabelEq("Thing".into());
-    assert!(!evaluate_against(&r, &leaf, &lookup_category, &none()));
-    let implying = Implying::from([("Thing".to_string(), vec!["Goal".to_string()])]);
+    let unimplied = resolved(&[("Thing", THING)]);
+    assert!(!evaluate_against(&r, &leaf, &lookup_category, &unimplied));
+    let carriers = |implying| LabelCarriers {
+        label: THING,
+        implying,
+    };
+    let implying = Implying::from([("Thing".to_string(), carriers(vec![GOAL]))]);
     assert!(evaluate_against(&r, &leaf, &lookup_category, &implying));
-    let other = Implying::from([("Thing".to_string(), vec!["Task".to_string()])]);
+    let other = Implying::from([("Thing".to_string(), carriers(vec![TASK]))]);
     assert!(!evaluate_against(&r, &leaf, &lookup_category, &other));
 }
 
 #[test]
 fn property_eq_matches_stored_value() {
-    let r = make_record("Item", Some("electronics"));
+    let r = make_record(ITEM, Some("electronics"));
     let pred = VectorPredicate::PropertyEq {
         property: "category".into(),
         value: Value::String("electronics".into()),
@@ -79,7 +116,7 @@ fn property_eq_matches_stored_value() {
 
 #[test]
 fn property_eq_rejects_mismatched_value() {
-    let r = make_record("Item", Some("books"));
+    let r = make_record(ITEM, Some("books"));
     let pred = VectorPredicate::PropertyEq {
         property: "category".into(),
         value: Value::String("electronics".into()),
@@ -89,7 +126,7 @@ fn property_eq_rejects_mismatched_value() {
 
 #[test]
 fn property_eq_absent_property_returns_false() {
-    let r = make_record("Item", None);
+    let r = make_record(ITEM, None);
     let pred = VectorPredicate::PropertyEq {
         property: "category".into(),
         value: Value::String("electronics".into()),
@@ -99,7 +136,7 @@ fn property_eq_absent_property_returns_false() {
 
 #[test]
 fn property_eq_unknown_property_returns_false() {
-    let r = make_record("Item", Some("electronics"));
+    let r = make_record(ITEM, Some("electronics"));
     let pred = VectorPredicate::PropertyEq {
         property: "unknown_property".into(),
         value: Value::String("electronics".into()),
@@ -111,7 +148,7 @@ fn property_eq_unknown_property_returns_false() {
 #[test]
 fn property_cmp_numeric_branches() {
     // category as numeric proxy: stored int 42, compared against 10/50.
-    let mut record = NodeRecord::new("Item");
+    let mut record = NodeRecord::new(ITEM);
     record.props.insert(2, Value::Int(42));
 
     let pred_ge_10 = VectorPredicate::PropertyCmp {
@@ -152,7 +189,7 @@ fn property_cmp_numeric_branches() {
 #[test]
 fn property_cmp_int_float_widening() {
     // Stored Int(42), threshold Float(41.5) — Int widens to f64.
-    let mut record = NodeRecord::new("Item");
+    let mut record = NodeRecord::new(ITEM);
     record.props.insert(2, Value::Int(42));
     let pred = VectorPredicate::PropertyCmp {
         property: "category".into(),
@@ -165,7 +202,7 @@ fn property_cmp_int_float_widening() {
 #[test]
 fn property_cmp_non_numeric_value_rejects() {
     // Stored Bool — cannot be cast to f64 → predicate fails closed.
-    let mut record = NodeRecord::new("Item");
+    let mut record = NodeRecord::new(ITEM);
     record.props.insert(2, Value::Bool(true));
     let pred = VectorPredicate::PropertyCmp {
         property: "category".into(),
@@ -177,7 +214,8 @@ fn property_cmp_non_numeric_value_rejects() {
 
 #[test]
 fn and_requires_both_branches() {
-    let r = make_record("Item", Some("electronics"));
+    let r = make_record(ITEM, Some("electronics"));
+    let catalog = resolved(&[("Item", ITEM)]);
     let pred = VectorPredicate::And(
         Box::new(VectorPredicate::LabelEq("Item".into())),
         Box::new(VectorPredicate::PropertyEq {
@@ -185,7 +223,7 @@ fn and_requires_both_branches() {
             value: Value::String("electronics".into()),
         }),
     );
-    assert!(evaluate_against(&r, &pred, &lookup_category, &none()));
+    assert!(evaluate_against(&r, &pred, &lookup_category, &catalog));
 
     // Right branch fails:
     let pred_fail = VectorPredicate::And(
@@ -195,7 +233,12 @@ fn and_requires_both_branches() {
             value: Value::String("books".into()),
         }),
     );
-    assert!(!evaluate_against(&r, &pred_fail, &lookup_category, &none()));
+    assert!(!evaluate_against(
+        &r,
+        &pred_fail,
+        &lookup_category,
+        &catalog
+    ));
 }
 
 #[test]
@@ -206,7 +249,7 @@ fn evaluate_predicate_via_engine_round_trip() {
     let shard_id: u16 = 1;
     let node_id = NodeId::from_raw(42);
 
-    let record = make_record("Item", Some("electronics"));
+    let record = make_record(ITEM, Some("electronics"));
     {
         use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
         use coordinode_core::txn::write_concern::WriteConcern;
@@ -241,7 +284,7 @@ fn evaluate_predicate_via_engine_round_trip() {
         node_id,
         &pred,
         &lookup_category,
-        &none(),
+        &resolved(&[("Item", ITEM)]),
     ));
 
     // Predicate that mismatches on the right branch.

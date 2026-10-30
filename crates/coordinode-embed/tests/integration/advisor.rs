@@ -1287,13 +1287,10 @@ fn stats_cache_ttl_zero_always_recomputes() {
         let engine = db.engine();
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
+        let label = super::helpers::bind_label(engine, "ZeroTTL");
         let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
         for raw_id in 9000..9005u64 {
-            let rec = NodeRecord {
-                labels: vec!["ZeroTTL".to_string()],
-                props: std::collections::HashMap::new(),
-                extra: None,
-            };
+            let rec = NodeRecord::new(label);
             LocalNodeStore
                 .put(&mut txn, 1, NodeId::from_raw(raw_id), &rec)
                 .expect("direct write");
@@ -1301,7 +1298,7 @@ fn stats_cache_ttl_zero_always_recomputes() {
             // (the executor does this for Cypher writes): cardinalities
             // are counter-maintained, not derived by scanning.
             use coordinode_modality::{LocalStatsStore, StatsStore as _};
-            LocalStatsStore.node_created(&mut txn, rec.labels.iter().map(String::as_str));
+            LocalStatsStore.node_created(&mut txn, ["ZeroTTL"]);
         }
         let wc = WriteConcern::majority();
         let ctx = CommitContext {
@@ -1352,20 +1349,17 @@ fn stats_cache_ttl_max_stays_stale_until_invalidation() {
         let engine = db.engine();
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
+        let label = super::helpers::bind_label(engine, "MaxTTL");
         let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
         for raw_id in 8000..8005u64 {
-            let rec = NodeRecord {
-                labels: vec!["MaxTTL".to_string()],
-                props: std::collections::HashMap::new(),
-                extra: None,
-            };
+            let rec = NodeRecord::new(label);
             LocalNodeStore
                 .put(&mut txn, 1, NodeId::from_raw(raw_id), &rec)
                 .expect("direct write");
             // A low-level writer stages the statistics counters itself
             // (the executor does this for Cypher writes).
             use coordinode_modality::{LocalStatsStore, StatsStore as _};
-            LocalStatsStore.node_created(&mut txn, rec.labels.iter().map(String::as_str));
+            LocalStatsStore.node_created(&mut txn, ["MaxTTL"]);
         }
         let wc = WriteConcern::majority();
         let ctx = CommitContext {

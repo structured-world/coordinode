@@ -21,6 +21,7 @@ use coordinode_core::schema::computed::{ComputedSpec, TtlScope};
 #[cfg(test)]
 use coordinode_core::schema::definition::LabelSchema;
 use coordinode_core::schema::definition::PropertyType;
+use coordinode_core::schema::label_id::LabelId;
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::wake::Wake;
@@ -84,6 +85,8 @@ impl ComputedTtlReapResult {
 /// A COMPUTED TTL property found in a label schema.
 struct TtlTarget {
     label: String,
+    /// The label's catalog identity, as records store it.
+    label_id: LabelId,
     _property_name: String,
     duration_secs: u64,
     anchor_field: String,
@@ -100,20 +103,26 @@ struct TtlTarget {
     /// How a deleted row frees its table key.
     key: RowKeyRelease,
     /// The labels `label` implies, which every node of it carries without
-    /// storing them.
+    /// storing them, by name.
     implied: Vec<String>,
+    /// The name of each label identity allocated when the pass began, to
+    /// name the auxiliary labels a record stores.
+    names: Arc<FxHashMap<LabelId, String>>,
     /// The B-tree indexes a reaped row's entries leave with it.
     indexes: Arc<BtreeIndexes>,
 }
 
 impl TtlTarget {
-    /// Every label `record`, a node of this target's type, carries.
-    fn carried<'r>(&'r self, record: &'r NodeRecord) -> impl Iterator<Item = &'r str> + 'r {
-        record
-            .labels
-            .iter()
-            .chain(&self.implied)
-            .map(String::as_str)
+    /// Every label `record`, a node of this target's type, carries, by name;
+    /// `None` when it stores a label allocated after the pass began, which
+    /// leaves the row to the next pass rather than its entries behind.
+    fn carried(&self, record: &NodeRecord) -> Option<Vec<&str>> {
+        let mut carried = Vec::with_capacity(record.labels.len() + self.implied.len());
+        for id in &record.labels {
+            carried.push(self.names.get(id)?.as_str());
+        }
+        carried.extend(self.implied.iter().map(String::as_str));
+        Some(carried)
     }
 }
 
@@ -406,18 +415,32 @@ fn discover_ttl_targets(
     }
     let indexes = Arc::new(BtreeIndexes::load(engine, interner)?);
     let mut catalog = super::membership::CatalogMembership::current(engine);
+    let names: Arc<FxHashMap<LabelId, String>> = Arc::new(
+        LocalSchemaStore::new(engine)
+            .label_names()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect(),
+    );
 
     let mut targets = Vec::new();
     for schema in schemas {
         let label_name = schema.name.clone();
-        let stored = [label_name.clone()];
-        let implied: Vec<String> = catalog
-            .of_stored(&stored)
+        // A declared label always has an identity.
+        let Some(label_id) = catalog.label_id(&label_name).map_err(|e| e.to_string())? else {
+            continue;
+        };
+        let implied_ids: Vec<LabelId> = catalog
+            .of_stored(&[label_id])
             .map_err(|e| e.to_string())?
             .iter()
             .skip(1)
-            .map(str::to_string)
             .collect();
+        let implied = implied_ids
+            .into_iter()
+            .map(|id| catalog.name_of(id))
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| e.to_string())?;
         let key = match schema.key_columns() {
             [] => RowKeyRelease::None,
             columns => columns
@@ -443,6 +466,7 @@ fn discover_ttl_targets(
                     interner.and_then(|int| target_field.as_deref().and_then(|tf| int.lookup(tf)));
                 targets.push(TtlTarget {
                     label: label_name.clone(),
+                    label_id,
                     _property_name: prop_name.clone(),
                     duration_secs: *duration_secs,
                     anchor_field: anchor_field.clone(),
@@ -456,6 +480,7 @@ fn discover_ttl_targets(
                         RowKeyRelease::Unresolved => RowKeyRelease::Unresolved,
                     },
                     implied: implied.clone(),
+                    names: Arc::clone(&names),
                     indexes: Arc::clone(&indexes),
                 });
             }
@@ -494,7 +519,7 @@ fn reap_shard<'a>(
     // expired. A Subtree target whose target field the dictionary does not
     // know is left out with one diagnostic: it cannot become known during the
     // pass, and every expired node would otherwise repeat the same error.
-    let mut by_label: FxHashMap<&str, Vec<(&TtlTarget, i64)>> = FxHashMap::default();
+    let mut by_label: FxHashMap<LabelId, Vec<(&TtlTarget, i64)>> = FxHashMap::default();
     for target in targets {
         if let (TtlScope::Subtree, Some(tf), None) = (
             target.scope,
@@ -528,7 +553,7 @@ fn reap_shard<'a>(
             continue;
         }
         by_label
-            .entry(target.label.as_str())
+            .entry(target.label_id)
             .or_default()
             .push((target, cutoff_us));
     }
@@ -589,7 +614,7 @@ fn reap_shard<'a>(
             let Ok(labels) = NodeRecord::labels_from_msgpack(bytes) else {
                 continue;
             };
-            if !labels.iter().any(|l| by_label.contains_key(l.as_str())) {
+            if !labels.iter().any(|l| by_label.contains_key(l)) {
                 continue;
             }
             let Ok(record) = NodeRecord::from_msgpack(bytes) else {
@@ -598,7 +623,7 @@ fn reap_shard<'a>(
             page_result.records_decoded += 1;
             let mut staged = false;
             'targets: for label in &labels {
-                for (target, cutoff_us) in by_label.get(label.as_str()).into_iter().flatten() {
+                for (target, cutoff_us) in by_label.get(label).into_iter().flatten() {
                     let deleted_before = page_result.nodes_deleted;
                     match stage_expired(
                         engine,
@@ -874,7 +899,7 @@ fn stage_expired(
     edge_types: &[String],
     result: &mut ComputedTtlReapResult,
 ) -> Result<bool, String> {
-    if !record.labels.contains(&target.label) {
+    if !record.stores_label(target.label_id) {
         return Ok(false);
     }
     result.nodes_checked += 1;
@@ -916,7 +941,15 @@ fn stage_expired(
                     Some(values)
                 }
             };
-            if !target.indexes.can_remove(target.carried(record)) {
+            let Some(carried) = target.carried(record) else {
+                result.errors.push(format!(
+                    "label {}: row {nid_raw} carries a label created since the pass \
+                     began; kept for the next pass",
+                    target.label
+                ));
+                return Ok(false);
+            };
+            if !target.indexes.can_remove(carried.iter().copied()) {
                 result.errors.push(format!(
                     "label {}: indexed values unreadable without the field \
                      dictionary; row {nid_raw} kept so its index entries are not left",
@@ -932,7 +965,7 @@ fn stage_expired(
             }
             target
                 .indexes
-                .stage_delete(engine, txn, node_id, record, target.carried(record))
+                .stage_delete(engine, txn, node_id, record, carried.iter().copied())
                 .map_err(|e| e.to_string())?;
             stage_detach(txn, node_id, edge_types)?;
             // Deleting through the node store states that the identity is
@@ -943,7 +976,7 @@ fn stage_expired(
                 .map_err(|e| e.to_string())?;
             use coordinode_modality::stats as stat_keys;
             txn.push_counter_delta(stat_keys::NODES_TOTAL_KEY, -1);
-            for label in target.carried(record) {
+            for label in carried {
                 txn.push_counter_delta(&stat_keys::label_count_key(label), -1);
             }
             result.nodes_deleted += 1;
@@ -1044,10 +1077,13 @@ fn property_is_indexed(
         // The key columns are unknown, so this may be one of them.
         RowKeyRelease::Unresolved => true,
     };
+    // A label the pass cannot name may be indexed: the property is kept.
     let indexed = key_column
-        || target
-            .carried(record)
-            .any(|l| target.indexes.registry.reads_property(l, property));
+        || target.carried(record).is_none_or(|carried| {
+            carried
+                .iter()
+                .any(|l| target.indexes.registry.reads_property(l, property))
+        });
     if indexed {
         result.errors.push(format!(
             "label {}: TTL would remove indexed property '{property}'; kept",

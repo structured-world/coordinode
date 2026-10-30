@@ -22,13 +22,13 @@ fn open_db() -> (Database, tempfile::TempDir) {
 }
 
 /// The members of `label` the lookup holds, in NodeId order: empty when the
-/// name has no dictionary id, which no posting can carry.
+/// name has no catalog identity, which no posting can carry.
 fn members(db: &Database, label: &str) -> Vec<i64> {
     let lookup = LocalIndexStore::new(db.engine())
         .label_lookup()
         .expect("read")
         .expect("every store has its label lookup");
-    let Some(id) = db.interner().expect("dictionary").lookup(label) else {
+    let Some(id) = super::helpers::label_id(db.engine(), label) else {
         return Vec::new();
     };
     let txn = Transaction::new(
@@ -150,11 +150,7 @@ fn property_edits_and_rollbacks_leave_postings_alone() {
         .label_lookup()
         .expect("read")
         .expect("lookup");
-    let user = db
-        .interner()
-        .expect("dictionary")
-        .lookup("User")
-        .expect("id");
+    let user = super::helpers::label_id(db.engine(), "User").expect("bound");
     let posting = coordinode_core::index::encoding::encode_label_posting(
         lookup.generation,
         SHARD,

@@ -103,7 +103,7 @@ fn filters_compare_with_their_declared_type() {
 /// outside the dictionary.
 #[test]
 fn a_record_answers_by_field_id_then_by_name() {
-    let mut record = NodeRecord::new("User");
+    let mut record = NodeRecord::new(crate::schema::label_id::FIRST_LABEL_ID);
     record.set(1, s("by-id"));
     record.set_extra("email", s("by-name"));
     let index = interp(false, false, None);
@@ -333,7 +333,7 @@ mod resolve {
     }
 
     fn record_put(node_id: u64, email: &str) -> Mutation {
-        let mut record = NodeRecord::new("User");
+        let mut record = NodeRecord::new(crate::schema::label_id::FIRST_LABEL_ID);
         record.set(1, s(email));
         Mutation::Put {
             partition: PartitionId::Node,

@@ -299,16 +299,23 @@ fn edge_type_schema_msgpack_roundtrip() {
     assert_eq!(schema, restored);
 }
 
+fn label_id(raw: u32) -> crate::schema::label_id::LabelId {
+    crate::schema::label_id::LabelId::new(raw).expect("nonzero")
+}
+
+/// A definition is keyed by its label's identity, so a label dropped and
+/// created again under the same name never reuses an old definition's key.
 #[test]
 fn label_schema_key_encoding() {
-    let key = encode_label_schema_key("User", 1);
-    assert_eq!(&key, b"schema:label:User:1");
+    let key = encode_label_schema_key(label_id(7), 1);
+    assert_eq!(&key, b"schema:label:7:1");
+    assert_ne!(key, encode_label_schema_key(label_id(8), 1));
 }
 
 #[test]
 fn label_schema_key_includes_version() {
-    let v1 = encode_label_schema_key("User", 1);
-    let v2 = encode_label_schema_key("User", 2);
+    let v1 = encode_label_schema_key(label_id(7), 1);
+    let v2 = encode_label_schema_key(label_id(7), 2);
     assert_ne!(v1, v2, "different versions must produce different keys");
     assert!(
         v1 < v2,
@@ -453,13 +460,6 @@ fn migration_state_entry_legacy_and_migrated_states_roundtrip() {
         let decoded: MigrationStateEntry = rmp_serde::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, entry);
     }
-}
-
-#[test]
-fn schema_keys_sort_alphabetically() {
-    let k1 = encode_label_schema_key("Actor", 1);
-    let k2 = encode_label_schema_key("User", 1);
-    assert!(k1 < k2);
 }
 
 #[test]

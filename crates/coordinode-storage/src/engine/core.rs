@@ -4081,7 +4081,7 @@ impl StorageEngine {
             Some(v) => {
                 let bytes = bytes::Bytes::copy_from_slice(&v);
                 if let (Some(cache), Some(ticket)) = (&self.tiered_cache, ticket) {
-                    let weight = Self::resolve_cache_weight(cache, part, &bytes);
+                    let weight = self.resolve_cache_weight(cache, part, &bytes);
                     cache.fill(part, key, &bytes, weight, ticket);
                 }
                 self.access_tracker.record(part, key);
@@ -4137,7 +4137,7 @@ impl StorageEngine {
             if let Some(v) = value {
                 let bytes = bytes::Bytes::copy_from_slice(&v);
                 if let (Some(cache), Some(ticket)) = (&self.tiered_cache, tickets.get(n)) {
-                    let weight = Self::resolve_cache_weight(cache, part, &bytes);
+                    let weight = self.resolve_cache_weight(cache, part, &bytes);
                     cache.fill(part, keys[slot], &bytes, weight, *ticket);
                 }
                 self.access_tracker.record(part, keys[slot]);
@@ -6092,20 +6092,26 @@ impl StorageEngine {
         }
     }
 
-    /// Resolve cache eviction weight for a value in a given partition.
-    fn resolve_cache_weight(cache: &TieredCache, part: Partition, value: &[u8]) -> f32 {
+    /// Resolve cache eviction weight for a value in a given partition: a
+    /// node record weighs what its type label's name is configured to.
+    fn resolve_cache_weight(&self, cache: &TieredCache, part: Partition, value: &[u8]) -> f32 {
         if part != Partition::Node {
             return 1.0;
         }
         if cache.label_weights_empty() {
             return 1.0;
         }
-        if let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(value)
-            && let Some(label) = record.labels.first()
-        {
-            return cache.resolve_weight(label);
-        }
-        1.0
+        let Some(label) = coordinode_core::graph::node::NodeRecord::labels_from_msgpack(value)
+            .ok()
+            .and_then(|labels| labels.first().copied())
+        else {
+            return 1.0;
+        };
+        cache.resolve_weight(label, |id| {
+            let key = coordinode_core::schema::label_id::label_id_key(id);
+            let name = self.get(Partition::Schema, &key).ok()??;
+            String::from_utf8(name.to_vec()).ok()
+        })
     }
 }
 

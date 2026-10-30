@@ -103,9 +103,9 @@ fn the_previous_format_migrates_through_its_step() {
 }
 
 /// The engine opens no directory of an earlier format: one from before the
-/// marker (format 0) and one of the format before this release's (whose
-/// index entries sit under generations, not installations) are both refused
-/// by name and left as their writer left them.
+/// marker (format 0) and one of the format before this release's (whose node
+/// records name their labels rather than store catalog identities) are both
+/// refused by name and left as their writer left them.
 #[test]
 fn the_engine_refuses_a_directory_of_an_earlier_format() {
     use crate::engine::config::{EndpointConfig, Media, Tier};

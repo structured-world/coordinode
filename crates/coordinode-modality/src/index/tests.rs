@@ -668,7 +668,8 @@ fn label_members_follow_staged_postings() {
         IndexDescriptor::label_lookup().bind(IndexId::from_raw(1), GenerationId::from_raw(4));
     let other_generation =
         IndexDescriptor::label_lookup().bind(IndexId::from_raw(1), GenerationId::from_raw(5));
-    let (user, admin) = (10u32, 11u32);
+    let label = |raw| coordinode_core::schema::label_id::LabelId::new(raw).expect("nonzero");
+    let (user, admin) = (label(10), label(11));
 
     let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
     for n in [3, 1, 2] {
@@ -687,7 +688,10 @@ fn label_members_follow_staged_postings() {
         .unwrap();
     commit(&mut t).unwrap();
 
-    let members = |txn: &Transaction, label: u32, after: Option<u64>, stop: usize| {
+    let members = |txn: &Transaction,
+                   label: coordinode_core::schema::label_id::LabelId,
+                   after: Option<u64>,
+                   stop: usize| {
         let mut out = Vec::new();
         store
             .label_members(
@@ -719,7 +723,7 @@ fn label_members_follow_staged_postings() {
     );
     assert_eq!(members(&t, admin, None, usize::MAX), vec![2]);
     assert_eq!(
-        members(&t, 99, None, usize::MAX),
+        members(&t, label(99), None, usize::MAX),
         Vec::<u64>::new(),
         "an empty label"
     );

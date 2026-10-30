@@ -621,7 +621,7 @@ impl LocalNodeStore {
                 message: e.to_string(),
             })?,
             None if deltas.is_empty() => return Ok(None),
-            None => NodeRecord::new(""),
+            None => NodeRecord::with_labels(Vec::new()),
         };
         coordinode_storage::engine::merge::apply_doc_deltas_to_record(&mut record, &deltas);
         Ok(Some(record))

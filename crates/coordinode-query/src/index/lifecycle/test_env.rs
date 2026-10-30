@@ -158,6 +158,14 @@ impl TestEnv {
         self.fields.lock().clone()
     }
 
+    /// The catalog identity of `label`, bound on first use as a write binds it.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn label_id(&self, label: &str) -> coordinode_core::schema::label_id::LabelId {
+        coordinode_modality::LocalSchemaStore::new(&self.engine)
+            .bind_label(label)
+            .expect("bind label")
+    }
+
     /// A build service over this member.
     pub(crate) fn service(self: &Arc<Self>, max_running: usize) -> IndexBuildService {
         self.service_with(IndexBuildConfig {
@@ -210,12 +218,6 @@ impl BuildEnvironment for TestEnv {
             return Err("field dictionary unavailable".into());
         }
         Ok(self.fields_now())
-    }
-
-    fn register_names(&self, names: &[&str]) -> Result<Vec<u32>, String> {
-        // A member without a deployment dictionary: names bind in its own.
-        let mut fields = self.fields.lock();
-        Ok(names.iter().map(|name| fields.intern(name)).collect())
     }
 
     fn shard_id(&self) -> u16 {

@@ -15,7 +15,9 @@ use coordinode_modality::{LocalNodeStore, NodeStore as _};
 use coordinode_storage::engine::tap::Tapped;
 
 use super::{BuildOutcome, BuildTarget, VectorBuild};
+use crate::index::membership::LabelCarriers;
 use crate::index::{VectorIndexConfig, VectorIndexRegistry};
+use coordinode_core::schema::label_id::LabelId;
 
 struct Fixture {
     engine: Arc<StorageEngine>,
@@ -84,10 +86,23 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
+    /// The catalog identity of `name`, bound on first use as a write binds it.
+    fn label(&self, name: &str) -> LabelId {
+        coordinode_modality::LocalSchemaStore::new(&self.engine)
+            .bind_label(name)
+            .expect("bind label")
+    }
+
+    /// The carriers of `name`, which no type implies here.
+    fn carriers(&self, name: &str) -> LabelCarriers {
+        LabelCarriers::stored_only(self.label(name))
+    }
+
     /// Apply a `Doc` node with `vector` at `commit_ts`, as a Raft apply or a
     /// commit that reserved its timestamp early would.
     fn apply_doc_at(&self, id: u64, vector: [f32; 3], commit_ts: u64) {
-        self.apply_at(put(0, id, &record("Doc", self.field, vector)), commit_ts);
+        let doc = record(self.label("Doc"), self.field, vector);
+        self.apply_at(put(0, id, &doc), commit_ts);
     }
 
     /// Apply `record` as node `id` of `shard`, at a fresh commit timestamp.
@@ -142,6 +157,7 @@ impl Fixture {
         health: &HealthSignal,
         token: &crate::index::BuildToken,
     ) -> Result<BuildOutcome, String> {
+        let doc = self.carriers("Doc");
         VectorBuild {
             engine: &self.engine,
             token,
@@ -149,8 +165,7 @@ impl Fixture {
             targets: &[BuildTarget {
                 hnsw,
                 health,
-                label: "Doc",
-                implying: &[],
+                carriers: Some(&doc),
                 field_id: self.field,
             }],
         }
@@ -176,9 +191,10 @@ impl Fixture {
             .flatten();
         for def in self.registry.all_definitions() {
             let property = def.property();
+            let label = self.label(&def.label);
             let vector = record
                 .as_ref()
-                .filter(|r| r.primary_label() == def.label)
+                .filter(|r| r.primary_label() == Some(label))
                 .and_then(|r| r.props.get(&fields.lookup(property)?))
                 .and_then(coordinode_core::graph::types::try_extract_vector);
             match vector {
@@ -237,6 +253,7 @@ impl Fixture {
     fn build_doc_with_snapshot_held(&self, during: impl FnOnce()) -> Result<BuildOutcome, String> {
         let hnsw = self.registry.get("Doc", "embedding").expect("hnsw");
         let health = self.health();
+        let doc = self.carriers("Doc");
         let token = self.registry.new_build_token();
         let (taken, snapshot) = std::sync::mpsc::sync_channel(1);
         let (go, release) = std::sync::mpsc::channel();
@@ -254,8 +271,7 @@ impl Fixture {
                         targets: &[BuildTarget {
                             hnsw: &hnsw,
                             health: &health,
-                            label: "Doc",
-                            implying: &[],
+                            carriers: Some(&doc),
                             field_id: self.field,
                         }],
                     }
@@ -275,13 +291,13 @@ impl Fixture {
     fn build_doc_with_scan_held(&self, during: impl FnOnce()) -> Result<BuildOutcome, String> {
         let hnsw = self.registry.get("Doc", "embedding").expect("hnsw");
         let health = self.health();
+        let doc = self.carriers("Doc");
         self.build_with_scan_held(
             &hnsw,
             &[BuildTarget {
                 hnsw: &hnsw,
                 health: &health,
-                label: "Doc",
-                implying: &[],
+                carriers: Some(&doc),
                 field_id: self.field,
             }],
             during,
@@ -359,7 +375,7 @@ impl tracing::Subscriber for SnapshotTaken {
 }
 
 /// A node of `label` carrying `vector` in `field`.
-fn record(label: &str, field: u32, vector: [f32; 3]) -> NodeRecord {
+fn record(label: LabelId, field: u32, vector: [f32; 3]) -> NodeRecord {
     let mut record = NodeRecord::new(label);
     record.set(field, Value::Vector(vector.to_vec()));
     record
@@ -489,6 +505,7 @@ fn a_scan_refused_for_released_history_starts_over_without_the_tap() {
 
     let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
     let health = fx.health();
+    let doc = fx.carriers("Doc");
     let token = fx.registry.new_build_token();
     let outcome = VectorBuild {
         engine: &fx.engine,
@@ -497,8 +514,7 @@ fn a_scan_refused_for_released_history_starts_over_without_the_tap() {
         targets: &[BuildTarget {
             hnsw: &hnsw,
             health: &health,
-            label: "Doc",
-            implying: &[],
+            carriers: Some(&doc),
             field_id: fx.field,
         }],
     }
@@ -519,8 +535,9 @@ fn a_scan_refused_for_released_history_starts_over_without_the_tap() {
 #[test]
 fn a_build_that_scans_again_ends_ready() {
     let fx = fixture();
+    let doc = fx.label("Doc");
     let nodes: Vec<Mutation> = (1..=1_500u64)
-        .map(|id| put(0, id, &record("Doc", fx.field, [id as f32, 1.0, 0.0])))
+        .map(|id| put(0, id, &record(doc, fx.field, [id as f32, 1.0, 0.0])))
         .collect();
     fx.engine
         .apply_proposal_at(&nodes, fx.oracle.next().as_raw())
@@ -727,10 +744,11 @@ fn a_node_leaving_the_index_during_the_build_is_removed() {
         fx.apply_doc_at(id, [0.0, 1.0, id as f32], fx.oracle.next().as_raw());
     }
 
+    let (other, doc) = (fx.label("Other"), fx.label("Doc"));
     let outcome = fx.build_doc_with_scan_held(|| {
         fx.delete_node(1);
-        fx.apply_record(0, 2, &record("Other", fx.field, [0.0, 1.0, 2.0]));
-        fx.apply_record(0, 3, &NodeRecord::new("Doc"));
+        fx.apply_record(0, 2, &record(other, fx.field, [0.0, 1.0, 2.0]));
+        fx.apply_record(0, 3, &NodeRecord::new(doc));
         for id in 1..=3 {
             fx.maintain(&fx.fields, id);
         }
@@ -754,8 +772,9 @@ fn a_vector_rewritten_during_the_build_is_indexed_at_its_new_value() {
     fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
     fx.apply_doc_at(2, [0.0, 0.0, 1.0], fx.oracle.next().as_raw());
 
+    let doc = fx.label("Doc");
     let outcome = fx.build_doc_with_scan_held(|| {
-        fx.apply_record(0, 1, &record("Doc", fx.field, [1.0, 0.0, 0.0]));
+        fx.apply_record(0, 1, &record(doc, fx.field, [1.0, 0.0, 0.0]));
         fx.maintain(&fx.fields, 1);
     });
 
@@ -772,8 +791,9 @@ fn a_write_to_another_shard_is_not_folded() {
     let fx = fixture();
     fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
 
+    let doc = fx.label("Doc");
     let outcome = fx.build_doc_with_scan_held(|| {
-        fx.apply_record(1, 5, &record("Doc", fx.field, [1.0, 0.0, 0.0]));
+        fx.apply_record(1, 5, &record(doc, fx.field, [1.0, 0.0, 0.0]));
     });
 
     assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 1 }));
@@ -838,7 +858,9 @@ fn one_build_fills_every_index_of_the_shard() {
         )
     );
     fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
-    fx.apply_record(0, 2, &record("Img", pixels, [0.0, 0.0, 1.0]));
+    let img = fx.label("Img");
+    fx.apply_record(0, 2, &record(img, pixels, [0.0, 0.0, 1.0]));
+    let (doc_carriers, img_carriers) = (fx.carriers("Doc"), fx.carriers("Img"));
 
     let docs = fx.registry.get("Doc", "embedding").expect("docs");
     let imgs = fx.registry.get("Img", "pixels").expect("imgs");
@@ -852,20 +874,18 @@ fn one_build_fills_every_index_of_the_shard() {
             BuildTarget {
                 hnsw: &docs,
                 health: &doc_health,
-                label: "Doc",
-                implying: &[],
+                carriers: Some(&doc_carriers),
                 field_id: fx.field,
             },
             BuildTarget {
                 hnsw: &imgs,
                 health: &img_health,
-                label: "Img",
-                implying: &[],
+                carriers: Some(&img_carriers),
                 field_id: pixels,
             },
         ],
         || {
-            fx.apply_record(0, 3, &record("Img", pixels, [1.0, 0.0, 0.0]));
+            fx.apply_record(0, 3, &record(img, pixels, [1.0, 0.0, 0.0]));
             fx.maintain(&interner, 3);
         },
     );
@@ -890,8 +910,9 @@ fn one_build_fills_every_index_of_the_shard() {
 #[test]
 fn a_stored_vector_the_index_cannot_take_fails_the_build() {
     let fx = fixture();
-    fx.apply_record(0, 1, &record("Doc", fx.field, [1.0, 0.0, 0.0]));
-    fx.apply_record(0, 2, &record("Doc", fx.field, [0.0, 0.0, 0.0]));
+    let doc = fx.label("Doc");
+    fx.apply_record(0, 1, &record(doc, fx.field, [1.0, 0.0, 0.0]));
+    fx.apply_record(0, 2, &record(doc, fx.field, [0.0, 0.0, 0.0]));
     let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
     let health = fx.health();
     let token = fx.registry.new_build_token();

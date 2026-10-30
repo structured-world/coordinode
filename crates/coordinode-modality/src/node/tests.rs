@@ -53,8 +53,19 @@ impl TestDb {
     }
 }
 
-fn rec(label: &str) -> NodeRecord {
-    NodeRecord::new(label)
+/// A record whose type label marks it with `marker`, so a test can tell
+/// which write it reads back.
+fn rec(marker: &str) -> NodeRecord {
+    NodeRecord::new(mark(marker))
+}
+
+/// The label id a marker is stored as: distinct for the markers the tests
+/// name (FNV-1a of the name, never 0).
+fn mark(marker: &str) -> coordinode_core::schema::label_id::LabelId {
+    let hash = marker.bytes().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    });
+    coordinode_core::schema::label_id::LabelId::new(hash.max(1)).expect("nonzero")
 }
 
 /// Typed stateless reads preserve snapshot selection, absence and decode
@@ -71,11 +82,14 @@ fn read_record_at_snapshot_keeps_visibility_and_decode_errors() {
         .read_record_at_snapshot(&db.engine, Some(snapshot), 0, id)
         .expect("old");
     assert_eq!(key, encode_node_key(0, id));
-    assert_eq!(old.expect("record").primary_label(), "Before");
+    assert_eq!(old.expect("record").primary_label(), Some(mark("Before")));
     let (_, current) = store
         .read_record_at_snapshot(&db.engine, None, 0, id)
         .expect("latest");
-    assert_eq!(current.expect("record").primary_label(), "After");
+    assert_eq!(
+        current.expect("record").primary_label(),
+        Some(mark("After"))
+    );
     assert!(
         store
             .read_record_at_snapshot(&db.engine, Some(snapshot), 0, NodeId::from_raw(54))
@@ -216,7 +230,7 @@ fn non_temporal_round_trip() {
     assert!(store.get(&db.read(), 0, id).expect("none").is_none());
     db.write(|s, t| s.put(t, 0, id, &rec("User")).expect("put"));
     let got = store.get(&db.read(), 0, id).expect("some").expect("Some");
-    assert_eq!(got.primary_label(), "User");
+    assert_eq!(got.primary_label(), Some(mark("User")));
 }
 
 #[test]
@@ -236,18 +250,15 @@ fn get_many_batches_and_preserves_order() {
 
     let got = store.get_many(&db.read(), 0, &ids).expect("get_many");
     assert_eq!(got.len(), 3);
-    let label = |r: &Option<NodeRecord>| r.as_ref().map(|x| x.primary_label().to_string());
-    assert_eq!(label(&got[0]).as_deref(), Some("A"));
+    let label = |r: &Option<NodeRecord>| r.as_ref().and_then(NodeRecord::primary_label);
+    assert_eq!(label(&got[0]), Some(mark("A")));
     assert!(got[1].is_none(), "absent id must be None in its slot");
-    assert_eq!(label(&got[2]).as_deref(), Some("C"));
+    assert_eq!(label(&got[2]), Some(mark("C")));
 
     // Each batch slot agrees with an individual get.
     for (i, id) in ids.iter().enumerate() {
         let single = store.get(&db.read(), 0, *id).expect("get");
-        assert_eq!(
-            label(&got[i]),
-            single.map(|r| r.primary_label().to_string())
-        );
+        assert_eq!(label(&got[i]), label(&single));
     }
 }
 
@@ -262,11 +273,8 @@ fn get_many_sees_read_your_own_writes() {
     store.put(&mut t, 0, id, &rec("Fresh")).expect("put");
     let got = store.get_many(&t, 0, &[id]).expect("get_many");
     assert_eq!(
-        got[0]
-            .as_ref()
-            .map(|r| r.primary_label().to_string())
-            .as_deref(),
-        Some("Fresh")
+        got[0].as_ref().and_then(NodeRecord::primary_label),
+        Some(mark("Fresh"))
     );
 }
 
@@ -280,7 +288,7 @@ fn put_overwrites_existing_record() {
         .get(&db.read(), 0, id)
         .expect("ok")
         .expect("Some");
-    assert_eq!(got.primary_label(), "B");
+    assert_eq!(got.primary_label(), Some(mark("B")));
 }
 
 #[test]
@@ -318,7 +326,7 @@ fn shards_isolated_by_key_prefix() {
             .expect("ok")
             .expect("Some")
             .primary_label(),
-        "ShardZero"
+        Some(mark("ShardZero"))
     );
     assert_eq!(
         store
@@ -326,7 +334,7 @@ fn shards_isolated_by_key_prefix() {
             .expect("ok")
             .expect("Some")
             .primary_label(),
-        "ShardOne"
+        Some(mark("ShardOne"))
     );
 }
 
@@ -342,10 +350,13 @@ fn temporal_versions_round_trip() {
     let versions = LocalNodeStore
         .scan_versions(&db.read(), 0, id)
         .expect("scan");
-    let labels: Vec<&str> = versions.iter().map(|(_, r)| r.primary_label()).collect();
+    let labels: Vec<_> = versions.iter().map(|(_, r)| r.primary_label()).collect();
     let times: Vec<i64> = versions.iter().map(|(t, _)| *t).collect();
     assert_eq!(times, vec![100, 200, 300]);
-    assert_eq!(labels, vec!["V1", "V2", "V3"]);
+    assert_eq!(
+        labels,
+        vec![Some(mark("V1")), Some(mark("V2")), Some(mark("V3"))]
+    );
 }
 
 #[test]
@@ -373,7 +384,7 @@ fn get_at_returns_largest_valid_from_le_query() {
             .expect("ok")
             .expect("Some")
             .primary_label(),
-        "V1",
+        Some(mark("V1")),
     );
     assert_eq!(
         store
@@ -381,7 +392,7 @@ fn get_at_returns_largest_valid_from_le_query() {
             .expect("ok")
             .expect("Some")
             .primary_label(),
-        "V1",
+        Some(mark("V1")),
     );
     assert_eq!(
         store
@@ -389,7 +400,7 @@ fn get_at_returns_largest_valid_from_le_query() {
             .expect("ok")
             .expect("Some")
             .primary_label(),
-        "V2",
+        Some(mark("V2")),
     );
     assert_eq!(
         store
@@ -397,7 +408,7 @@ fn get_at_returns_largest_valid_from_le_query() {
             .expect("ok")
             .expect("Some")
             .primary_label(),
-        "V3",
+        Some(mark("V3")),
     );
 }
 
@@ -420,7 +431,7 @@ fn get_at_isolated_per_node_id() {
             .expect("ok")
             .expect("Some")
             .primary_label(),
-        "A50",
+        Some(mark("A50")),
     );
     assert_eq!(
         store
@@ -428,7 +439,7 @@ fn get_at_isolated_per_node_id() {
             .expect("ok")
             .expect("Some")
             .primary_label(),
-        "B70",
+        Some(mark("B70")),
     );
 }
 
@@ -486,7 +497,7 @@ fn get_at_boundary_i64_min_max() {
     assert_eq!(versions[1].0, i64::MAX);
     // Query at 0 picks the MIN-version (largest valid_from <= 0).
     let active = store.get_at(&r, 0, id, 0).expect("ok").expect("Some");
-    assert_eq!(active.primary_label(), "min");
+    assert_eq!(active.primary_label(), Some(mark("min")));
 }
 
 #[test]
@@ -502,9 +513,9 @@ fn get_at_seqno_returns_version_visible_at_snapshot() {
         .get_at_seqno(&r, 0, id, snap)
         .expect("ok")
         .expect("Some");
-    assert_eq!(at_snap.primary_label(), "v1");
+    assert_eq!(at_snap.primary_label(), Some(mark("v1")));
     let latest = store.get(&r, 0, id).expect("ok").expect("Some");
-    assert_eq!(latest.primary_label(), "v2");
+    assert_eq!(latest.primary_label(), Some(mark("v2")));
 }
 
 #[test]
@@ -634,7 +645,7 @@ fn read_raw_at_snapshot_latest_round_trip() {
         NodeRecord::from_msgpack(&bytes)
             .expect("decode")
             .primary_label(),
-        "User"
+        Some(mark("User"))
     );
 }
 
@@ -692,7 +703,7 @@ fn for_each_in_shard_at_snapshot_visits_in_key_order_and_breaks_early() {
     LocalNodeStore
         .for_each_in_shard_at_snapshot(&db.engine, None, 1, &mut |id, key, record| {
             assert_eq!(key, encode_node_key(1, id));
-            assert_eq!(record.primary_label(), "User");
+            assert_eq!(record.primary_label(), Some(mark("User")));
             seen.push(id.as_raw());
             Ok(core::ops::ControlFlow::Continue(()))
         })

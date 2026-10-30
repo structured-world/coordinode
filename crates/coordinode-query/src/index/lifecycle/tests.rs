@@ -26,7 +26,7 @@ trait Users {
 
 impl Users for TestEnv {
     fn put_user(&self, id: u64, email: &str) {
-        let mut record = NodeRecord::new("User");
+        let mut record = NodeRecord::new(self.label_id("User"));
         let field = self.fields_now().lookup("email").expect("email field");
         record.set(field, Value::String(email.into()));
         let mut txn = self.begin();
@@ -1551,7 +1551,7 @@ fn take_while_building(
     use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, UncoveredSource};
 
     let fields = env.fields_now();
-    let mut record = NodeRecord::new("User");
+    let mut record = NodeRecord::new(env.label_id("User"));
     record.set(
         fields.lookup("email").expect("email field"),
         Value::String(email.into()),
@@ -1857,7 +1857,7 @@ fn a_duplicate_that_is_not_a_string_fails_a_repairing_build() {
     let env = env();
     let field = env.fields_now().lookup("email").expect("email field");
     for id in [1, 2] {
-        let mut record = NodeRecord::new("User");
+        let mut record = NodeRecord::new(env.label_id("User"));
         record.set(field, Value::Int(7));
         let mut txn = env.begin();
         LocalNodeStore
@@ -2062,7 +2062,7 @@ fn a_build_failing_after_a_repair_keeps_the_repair() {
     env.put_user(1, "same@x");
     env.put_user(2, "same@x");
     for id in [3, 4] {
-        let mut record = NodeRecord::new("User");
+        let mut record = NodeRecord::new(env.label_id("User"));
         record.set(field, Value::Int(7));
         let mut txn = env.begin();
         LocalNodeStore

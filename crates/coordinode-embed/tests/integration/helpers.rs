@@ -18,6 +18,29 @@ use coordinode_query::executor::runner::{AdaptiveConfig, ExecutionContext, Write
 use coordinode_storage::engine::StorageSnapshot;
 use coordinode_storage::engine::core::StorageEngine;
 
+/// The catalog identity of `label`, bound on first use as a write binds it.
+#[allow(clippy::expect_used)]
+pub fn bind_label(
+    engine: &StorageEngine,
+    label: &str,
+) -> coordinode_core::schema::label_id::LabelId {
+    coordinode_modality::LocalSchemaStore::new(engine)
+        .bind_label(label)
+        .expect("bind label")
+}
+
+/// The catalog identity `label` holds now, `None` when it was never bound.
+#[allow(clippy::expect_used)]
+pub fn label_id(
+    engine: &StorageEngine,
+    label: &str,
+) -> Option<coordinode_core::schema::label_id::LabelId> {
+    use coordinode_modality::SchemaStore as _;
+    coordinode_modality::LocalSchemaStore::new(engine)
+        .label_id(label)
+        .expect("read label binding")
+}
+
 /// Every stored version of every temporal node labelled `label`, in key order
 /// (by node, then by `valid_from`): the history a bare MATCH, which projects
 /// each node's state valid now, does not show. Each row holds `id`,
@@ -45,12 +68,15 @@ pub fn temporal_versions(
         .prefix_scan_tracked(&mut txn, &LocalNodeStore.shard_scan_prefix(SHARD))
         .expect("scan nodes");
     let mut out = Vec::new();
+    let Some(label) = label_id(db.engine(), label) else {
+        return out;
+    };
     for (key, bytes) in scanned {
         let Some((_, id, valid_from)) = decode_temporal_node_key(&key) else {
             continue;
         };
         let record = NodeRecord::from_msgpack(&bytes).expect("decode version");
-        if !record.has_label(label) {
+        if !record.stores_label(label) {
             continue;
         }
         let mut row = std::collections::BTreeMap::new();
@@ -210,7 +236,7 @@ pub fn make_ctx_legacy<'a>(
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         label_schema_cache: HashMap::new(),
-        implied: Default::default(),
+        labels: Default::default(),
         index_deferred: Default::default(),
         applied_watermark: None,
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
@@ -288,7 +314,7 @@ pub fn make_ctx_mvcc<'a>(
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         label_schema_cache: HashMap::new(),
-        implied: Default::default(),
+        labels: Default::default(),
         index_deferred: Default::default(),
         applied_watermark: None,
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
@@ -367,7 +393,7 @@ pub fn make_ctx_with_pipeline<'a>(
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         label_schema_cache: HashMap::new(),
-        implied: Default::default(),
+        labels: Default::default(),
         index_deferred: Default::default(),
         applied_watermark: None,
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
