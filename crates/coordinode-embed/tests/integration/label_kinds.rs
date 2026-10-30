@@ -247,22 +247,28 @@ fn a_declaration_keeps_stored_nodes_valid() {
         .expect("unused label");
 }
 
-/// The kind and the implied labels are fixed when a label is created: the
-/// typed catalog calls refuse a definition that changes either, and refuse
-/// an auxiliary label with properties.
+/// The kind is fixed when a label is created: the typed catalog calls
+/// refuse a definition that changes it, and refuse an auxiliary label with
+/// properties. What a type implies changes through them as ALTER changes
+/// it, reconciled before it is in force.
 #[test]
 fn the_typed_catalog_keeps_kinds_fixed() {
-    let db = Database::open_in_memory().expect("open");
+    let mut db = Database::open_in_memory().expect("open");
     let mut goal = LabelSchema::new_node_id("Goal");
     goal.add_property(PropertyDef::new("title", PropertyType::String));
     db.define_label(goal.clone()).expect("define");
+    db.execute_cypher("CREATE (:Goal {title: 'g'})")
+        .expect("a stored goal");
 
     let mut implying = goal.clone();
     implying.set_implies(vec!["Thing".to_string()]);
-    let err = db
-        .create_label_schema(implying)
-        .expect_err("implied labels changed");
-    assert!(err.to_string().contains("implies"), "{err}");
+    db.create_label_schema(implying)
+        .expect("the implication changes");
+    assert_eq!(
+        count(&mut db, "MATCH (n:Thing) RETURN n"),
+        1,
+        "the stored goal carries what it now implies"
+    );
 
     let mut auxiliary = LabelSchema::new_node_id("Goal");
     auxiliary.set_auxiliary();

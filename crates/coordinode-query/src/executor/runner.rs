@@ -20760,71 +20760,7 @@ fn execute_alter_node_type_implies(
         }
         let indexes = LocalIndexStore::new(engine);
         let op = indexes.allocate_generation_txn(txn)?;
-        // The label lookup keeps each affected label's difference apart, in
-        // parts proposed with the candidate, in the same commit: every
-        // writer from then on keeps both interpretations, and one still
-        // holding the lookup as it was is refused at its commit.
-        if !affected.is_empty()
-            && let Some(mut lookup) = indexes.label_lookup()?
-        {
-            let version = indexes.definition_version_as(&lookup)?.ok_or_else(|| {
-                StoreError::Invariant(
-                    "the label lookup changed while the implication was being changed; retry \
-                     the statement"
-                        .into(),
-                )
-            })?;
-            indexes.expect_definition_txn(txn, lookup.id, Some(version))?;
-            for &(affected_label, ref name) in &affected {
-                if lookup.proposed_operation(affected_label).is_some() {
-                    return Err(StoreError::Invariant(format!(
-                        "another change moving the carriers of :{name} is being certified; \
-                         retry once it ends"
-                    )));
-                }
-                let gained = indexes.allocate_generation_txn(txn)?;
-                let retired = indexes.allocate_generation_txn(txn)?;
-                lookup.propose_parts(affected_label, op, gained, retired);
-            }
-            indexes.put_definition_txn(txn, &lookup)?;
-        }
-        // Every declared index on a label whose carriers move keeps its
-        // difference apart the same way, in the same commit.
-        for mut def in indexes.list_definitions()? {
-            let Some(&(affected_label, ref name)) =
-                affected.iter().find(|(_, name)| *name == def.label)
-            else {
-                continue;
-            };
-            match def.index_type {
-                coordinode_modality::IndexType::BTree => {}
-                coordinode_modality::IndexType::Labels => continue,
-                other => {
-                    return Err(StoreError::Invariant(format!(
-                        "the change moves the carriers of :{name}, which the {other:?} index \
-                         {} covers; an index of that kind does not take moved carriers",
-                        def.name.as_deref().unwrap_or("(unnamed)")
-                    )));
-                }
-            }
-            if def.proposed_operation(affected_label).is_some() {
-                return Err(StoreError::Invariant(format!(
-                    "another change moving the carriers of :{name} is being certified; retry \
-                     once it ends"
-                )));
-            }
-            let version = indexes.definition_version_as(&def)?.ok_or_else(|| {
-                StoreError::Invariant(format!(
-                    "the index on :{name} changed while the implication was being changed; \
-                     retry the statement"
-                ))
-            })?;
-            indexes.expect_definition_txn(txn, def.id, Some(version))?;
-            let gained = indexes.allocate_generation_txn(txn)?;
-            let retired = indexes.allocate_generation_txn(txn)?;
-            def.propose_parts(affected_label, op, gained, retired);
-            indexes.put_definition_txn(txn, &def)?;
-        }
+        crate::index::reconcile::propose_parts_txn(engine, txn, op, &affected)?;
         // The facts stay in force; the candidate is the implication.
         next.set_candidate(LabelCandidate {
             properties: next.properties.clone(),

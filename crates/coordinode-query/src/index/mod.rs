@@ -7,7 +7,7 @@ pub mod definition;
 pub mod lifecycle;
 pub mod membership;
 pub mod ops;
-pub(crate) mod reconcile;
+pub mod reconcile;
 pub mod registry;
 mod repair;
 pub mod transfer;

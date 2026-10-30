@@ -432,6 +432,72 @@ fn stored_owner(key: &[u8]) -> Option<EntryOwner> {
     }
 }
 
+/// Stage, in the commit publishing the candidates of certification
+/// `operation`, a gained and a retired part for each label of `affected`
+/// (with its name) in the label lookup and in every B-tree index on it,
+/// each conditioned on its record as read: from that commit every writer
+/// keeps both interpretations, and one still holding an index as it was is
+/// refused at its commit.
+///
+/// # Errors
+///
+/// [`StoreError::Invariant`] for a label another change is certified for,
+/// for an index on an affected label of a kind that does not take moved
+/// carriers, or for an index record that moved meanwhile; a storage
+/// failure.
+pub fn propose_parts_txn(
+    engine: &StorageEngine,
+    txn: &mut Transaction<'_>,
+    operation: GenerationId,
+    affected: &[(LabelId, String)],
+) -> Result<(), StoreError> {
+    if affected.is_empty() {
+        return Ok(());
+    }
+    let indexes = LocalIndexStore::new(engine);
+    for mut def in indexes.list_definitions()? {
+        let labels: Vec<&(LabelId, String)> = match def.index_type {
+            IndexType::Labels => affected.iter().collect(),
+            _ => affected
+                .iter()
+                .filter(|(_, name)| *name == def.label)
+                .collect(),
+        };
+        let Some((_, name)) = labels.first().copied() else {
+            continue;
+        };
+        match def.index_type {
+            IndexType::Labels | IndexType::BTree => {}
+            other => {
+                return Err(StoreError::Invariant(format!(
+                    "the change moves the carriers of :{name}, which the {other:?} index {} \
+                     covers; an index of that kind does not take moved carriers",
+                    def.name.as_deref().unwrap_or("(unnamed)")
+                )));
+            }
+        }
+        let version = indexes.definition_version_as(&def)?.ok_or_else(|| {
+            StoreError::Invariant(format!(
+                "an index on :{name} changed while the change was being published; retry it"
+            ))
+        })?;
+        indexes.expect_definition_txn(txn, def.id, Some(version))?;
+        for &(label, ref name) in labels {
+            if def.proposed_operation(label).is_some() {
+                return Err(StoreError::Invariant(format!(
+                    "another change moving the carriers of :{name} is being certified; retry \
+                     once it ends"
+                )));
+            }
+            let gained = indexes.allocate_generation_txn(txn)?;
+            let retired = indexes.allocate_generation_txn(txn)?;
+            def.propose_parts(label, operation, gained, retired);
+        }
+        indexes.put_definition_txn(txn, &def)?;
+    }
+    Ok(())
+}
+
 /// Register every index with parts of the certification `operation` with
 /// this member's writers as its record now stands: after a commit that
 /// proposed or concluded them.
@@ -439,7 +505,7 @@ fn stored_owner(key: &[u8]) -> Option<EntryOwner> {
 /// # Errors
 ///
 /// A catalog read failure.
-pub(crate) fn register_parts_of(
+pub fn register_parts_of(
     engine: &StorageEngine,
     registry: &super::IndexRegistry,
     operation: GenerationId,

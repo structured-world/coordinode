@@ -262,6 +262,22 @@ struct StagedLabel {
     /// definition, as for a new node key, whose index build activates it
     /// and so cannot wait for a proof of its presence part.
     checked_at_commit: bool,
+    /// What the package makes an existing type imply, when it changes it:
+    /// published as the candidate's implication while `schema` keeps the
+    /// one in force, the carriers it moves reconciled before it is.
+    implies_change: Option<Vec<String>>,
+}
+
+impl StagedLabel {
+    /// The definition as the package declares it, its implication included:
+    /// what its kind and its implication are admitted as.
+    fn declared(&self) -> LabelSchema {
+        let mut declared = self.schema.clone();
+        if let Some(implies) = &self.implies_change {
+            declared.set_implies(implies.clone());
+        }
+        declared
+    }
 }
 
 impl Database {
@@ -457,6 +473,7 @@ impl Database {
                         dirty: read_revision.is_none(),
                         proved_over: None,
                         checked_at_commit: false,
+                        implies_change: None,
                     })
                 }
             };
@@ -472,15 +489,19 @@ impl Database {
         // What each created or changed label is to its nodes, judged with
         // every label the package declares in place.
         for label in staged.values().filter(|l| l.dirty) {
-            let declared = |name: &str| staged.get(name).map(|l| l.schema.clone());
+            let declared = |name: &str| staged.get(name).map(StagedLabel::declared);
             coordinode_query::executor::label_kinds::admit_label_kind(
                 &self.engine,
                 txn,
-                &label.schema,
+                &label.declared(),
                 label.read_revision.is_none(),
                 &declared,
             )?;
         }
+        // The labels whose carriers the package's implication changes move,
+        // judged with every one of them in place at once: they are put in
+        // force together, so their moves are one change.
+        let affected = moved_labels(&store, txn, &staged)?;
 
         let changes = staged.values().any(|l| l.dirty) || !edge_writes.is_empty();
         if !changes {
@@ -498,12 +519,24 @@ impl Database {
         let indexes = coordinode_modality::LocalIndexStore::new(&self.engine);
         // One certification proves every label the package publishes a
         // candidate for, in one pass over the stored nodes.
-        let operation = if staged.values().any(|l| l.dirty && l.proved_over.is_some()) {
+        let operation = if staged
+            .values()
+            .any(|l| l.dirty && (l.proved_over.is_some() || l.implies_change.is_some()))
+        {
             use coordinode_modality::IndexStore as _;
             Some(indexes.allocate_generation_txn(txn)?)
         } else {
             None
         };
+        if let Some(operation) = operation {
+            coordinode_query::index::reconcile::propose_parts_txn(
+                &self.engine,
+                txn,
+                operation,
+                &affected,
+            )
+            .map_err(ExecutionError::from)?;
+        }
         let mut certifications = Vec::new();
         for label in staged.values_mut().filter(|l| l.dirty) {
             if let Some(read) = label.read_revision {
@@ -514,18 +547,25 @@ impl Database {
                     ))
                 })?;
             }
-            // Declared facts that could refuse a stored node are published
-            // as a candidate, proved in the background; the facts in force
-            // stay until the proof puts it in force.
-            if let (Some((properties, mode)), Some(operation)) =
-                (label.proved_over.take(), operation)
+            // Declared facts that could refuse a stored node, or a changed
+            // implication, are published as a candidate, proved and
+            // reconciled in the background; the facts in force stay until
+            // the proof puts it in force.
+            let implies = label.implies_change.take();
+            if let Some(operation) = operation
+                && (label.proved_over.is_some() || implies.is_some())
             {
-                let declared = core::mem::replace(&mut label.schema.properties, properties);
-                let declared_mode = core::mem::replace(&mut label.schema.mode, mode);
+                let (declared, declared_mode) = match label.proved_over.take() {
+                    Some((properties, mode)) => (
+                        core::mem::replace(&mut label.schema.properties, properties),
+                        core::mem::replace(&mut label.schema.mode, mode),
+                    ),
+                    None => (label.schema.properties.clone(), label.schema.mode),
+                };
                 label.schema.set_candidate(LabelCandidate {
                     properties: declared,
                     mode: declared_mode,
-                    implies: None,
+                    implies,
                     operation,
                 });
                 certifications.push((label.schema.name.clone(), operation));
@@ -651,6 +691,14 @@ impl Database {
                 .map_err(DatabaseError::Other)?;
         }
         for operation in certifications {
+            // This member's writers keep the parts the publication proposed
+            // from the next write on.
+            coordinode_query::index::reconcile::register_parts_of(
+                &self.engine,
+                &self.index_registry,
+                operation,
+            )
+            .map_err(ExecutionError::from)?;
             self.index_builds
                 .submit_certification(operation)
                 .map_err(DatabaseError::Other)?;
@@ -1044,6 +1092,7 @@ fn stage_label(
                 dirty: true,
                 proved_over,
                 checked_at_commit,
+                implies_change: None,
             },
             object(Disposition::Created, revision),
         ));
@@ -1065,6 +1114,7 @@ fn stage_label(
                 dirty: false,
                 proved_over: None,
                 checked_at_commit: false,
+                implies_change: None,
             },
             retained,
         ));
@@ -1087,18 +1137,20 @@ fn stage_label(
             "whether :{name} is temporal is fixed when it is created"
         )));
     }
-    // Stored nodes carry what the label was when they were written: its
-    // kind and the labels it implies stay as created.
+    // Stored nodes carry what the label was when they were written: its kind
+    // stays as created. What a type implies may change: the carriers it
+    // moves are reconciled before the change is put in force, so the
+    // implication in force stays until then.
     if current.kind() != schema.kind() {
         return Err(refused(format!(
             "whether :{name} is a type or an auxiliary label is fixed when it is created"
         )));
     }
-    if current.implies() != schema.implies() {
-        return Err(refused(format!(
-            "the labels :{name} implies are fixed when it is created"
-        )));
-    }
+    let implies_change = (current.implies() != schema.implies()).then(|| {
+        let declared = schema.implies().to_vec();
+        schema.set_implies(current.implies().to_vec());
+        declared
+    });
     if let Some(candidate) = current.candidate() {
         return Err(refused(format!(
             "the definition of :{name} declared by operation {} is still being certified; \
@@ -1127,9 +1179,76 @@ fn stage_label(
             dirty: true,
             proved_over,
             checked_at_commit: false,
+            implies_change,
         },
         object(Disposition::Changed, read),
     ))
+}
+
+/// The labels whose carriers the package's implication changes move, with
+/// their names, in identity order: for each type it makes imply other
+/// labels, what the type carries through its implication before and after,
+/// each implied label bringing its own closure, every label the package
+/// declares judged as it declares it.
+fn moved_labels(
+    store: &LocalSchemaStore<'_>,
+    txn: &mut Transaction<'_>,
+    staged: &BTreeMap<String, StagedLabel>,
+) -> Result<Vec<(coordinode_core::schema::label_id::LabelId, String)>, DatabaseError> {
+    use coordinode_modality::SchemaStore as _;
+    let mut moved: BTreeMap<String, ()> = BTreeMap::new();
+    for (name, label) in staged {
+        let Some(after) = &label.implies_change else {
+            continue;
+        };
+        let before = closure(store, txn, staged, label.schema.implies(), false)?;
+        let after = closure(store, txn, staged, after, true)?;
+        for label in before.symmetric_difference(&after) {
+            if label != name {
+                moved.insert(label.clone(), ());
+            }
+        }
+    }
+    let mut named = Vec::with_capacity(moved.len());
+    for name in moved.into_keys() {
+        let id = store
+            .label_id_txn(txn, &name)?
+            .ok_or_else(|| refused(format!(":{name} is implied but has no identity")))?;
+        named.push((id, name));
+    }
+    named.sort_unstable_by_key(|(id, _)| *id);
+    Ok(named)
+}
+
+/// The labels `implies` reaches, transitively, each label read as the
+/// package declares it (`changed`: with the implication it changes to).
+fn closure(
+    store: &LocalSchemaStore<'_>,
+    txn: &mut Transaction<'_>,
+    staged: &BTreeMap<String, StagedLabel>,
+    implies: &[String],
+    changed: bool,
+) -> Result<std::collections::BTreeSet<String>, DatabaseError> {
+    use coordinode_modality::SchemaStore as _;
+    let mut reached = std::collections::BTreeSet::new();
+    let mut pending: Vec<String> = implies.to_vec();
+    while let Some(name) = pending.pop() {
+        if !reached.insert(name.clone()) {
+            continue;
+        }
+        let next = match staged.get(&name) {
+            Some(label) if changed && label.implies_change.is_some() => {
+                label.implies_change.clone().unwrap_or_default()
+            }
+            Some(label) => label.schema.implies().to_vec(),
+            None => store
+                .load_label_txn(txn, &name)?
+                .map(|s| s.implies().to_vec())
+                .unwrap_or_default(),
+        };
+        pending.extend(next);
+    }
+    Ok(reached)
 }
 
 /// Stage edge type `declaration` against the catalog `txn` reads,

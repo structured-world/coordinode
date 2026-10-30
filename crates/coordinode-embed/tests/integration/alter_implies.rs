@@ -235,6 +235,71 @@ fn a_concluded_change_is_folded_into_one_scope() {
     }
 }
 
+/// One schema package moving a value's holder out of a label and another
+/// into it: Chore stops implying Thing while Task starts, a Chore and a Task
+/// holding the same title under a uniqueness on Thing. Each interpretation
+/// holds the title once, so the change goes through although both holders
+/// stand in the index while it is certified; then the uniqueness binds the
+/// Task and no longer the Chore.
+#[test]
+fn a_coupled_change_moves_a_unique_value_between_holders() {
+    use coordinode_embed::{Intent, LabelDeclaration, SchemaPackage};
+    let mut db = things();
+    db.execute_cypher("CREATE NODE TYPE Chore IMPLIES (Thing) WITH (title: STRING)")
+        .expect("chore");
+    db.execute_cypher("CREATE CONSTRAINT thing_title FOR (n:Thing) REQUIRE n.title IS UNIQUE")
+        .expect("constraint");
+    db.execute_cypher("CREATE (:Chore {title: 'v'}), (:Task {title: 'v'})")
+        .expect("nodes");
+    let declared = |name: &str, implies: &[&str]| {
+        let current = db
+            .label_schemas()
+            .expect("schemas")
+            .into_iter()
+            .find(|s| s.name == name)
+            .expect("declared");
+        let revision = current.schema_revision;
+        let mut schema = current;
+        schema.set_implies(implies.iter().map(|l| (*l).to_string()).collect());
+        LabelDeclaration {
+            schema,
+            intent: Intent::Change {
+                expected_revision: revision,
+            },
+        }
+    };
+    let package = SchemaPackage {
+        labels: vec![declared("Chore", &[]), declared("Task", &["Thing"])],
+        constraints: Vec::new(),
+        edge_types: Vec::new(),
+    };
+    let published = db.publish_schema(package).expect("publish");
+    db.await_schema(&published, std::time::Duration::from_secs(30))
+        .expect("await");
+    let titles = |db: &mut Database, query: &str| {
+        db.execute_cypher(query)
+            .expect(query)
+            .iter()
+            .filter_map(|row| match row.get("l") {
+                Some(Value::Array(labels)) => labels.first().cloned(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        titles(
+            &mut db,
+            "MATCH (n:Thing {title: 'v'}) RETURN labels(n) AS l"
+        ),
+        [Value::String("Task".into())],
+        "the Task holds the title under Thing now"
+    );
+    db.execute_cypher("CREATE (:Chore {title: 'v'})")
+        .expect("a Chore is no Thing any more");
+    let err = refused(&mut db, "CREATE (:Thing {title: 'v'})");
+    assert!(err.contains('v') || err.contains("unique"), "{err}");
+}
+
 /// Setting the implication a type already has changes nothing.
 #[test]
 fn the_implication_in_force_is_unchanged() {
