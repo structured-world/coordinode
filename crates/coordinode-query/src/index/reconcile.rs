@@ -404,6 +404,10 @@ pub fn propose_parts_txn(
         };
         match def.index_type {
             IndexType::Labels | IndexType::BTree => {}
+            // A text index keeps the documents of both interpretations in
+            // scopes and learns where the change stands from the label
+            // lookup's parts: it keeps no parts of its own.
+            IndexType::Text => continue,
             other => {
                 return Err(StoreError::Invariant(format!(
                     "the change moves the carriers of :{name}, which the {other:?} index {} \
@@ -419,10 +423,13 @@ pub fn propose_parts_txn(
         })?;
         indexes.expect_definition_txn(txn, def.id, Some(version))?;
         for &(label, ref name) in labels {
-            if def.proposed_operation(label).is_some() {
+            // An earlier change keeps parts until its fold brings them back
+            // to the index's own entries, whether it is still certified or
+            // already concluded: a change intersecting it waits for that.
+            if def.has_parts_for(label) {
                 return Err(StoreError::Invariant(format!(
-                    "another change moving the carriers of :{name} is being certified; retry \
-                     once it ends"
+                    "an earlier change moving the carriers of :{name} is not folded yet; retry \
+                     once it is"
                 )));
             }
             let gained = indexes.allocate_generation_txn(txn)?;
@@ -455,3 +462,7 @@ pub fn register_parts_of(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests;
