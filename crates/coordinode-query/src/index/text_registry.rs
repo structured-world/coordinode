@@ -57,8 +57,19 @@ impl core::fmt::Display for FindError {
 
 impl std::error::Error for FindError {}
 
-/// Thread-safe handle to a multi-language text index.
-pub type TextHandle = Arc<RwLock<MultiLanguageTextIndex>>;
+/// One installed text index with the interpretations its documents hold:
+/// both change under one lock, and a step on an index dropped or replaced
+/// since changes that installation alone, never the one registered after.
+struct Installed {
+    index: MultiLanguageTextIndex,
+    held: Held,
+    /// Moves whenever `held` changes or the documents are replaced; drawn
+    /// from the registry's sequence, so no two installations share one.
+    revision: u64,
+}
+
+/// Thread-safe handle to one installed text index.
+type TextHandle = Arc<RwLock<Installed>>;
 
 /// Registry of active tantivy text indexes.
 ///
@@ -75,9 +86,8 @@ pub struct TextIndexRegistry {
     /// The writes the indexes have not folded, when a worker maintains them
     /// from the applied entries; a registry without one serves what it holds.
     coverage: RwLock<Option<Arc<IndexCoverage>>>,
-    /// The interpretations each index's documents hold, changed only under
-    /// that index's write lock (see [`Self::with_index`]).
-    held: RwLock<HashMap<TextIndexKey, (Held, u64)>>,
+    /// The last revision given to an installation's interpretations.
+    revisions: core::sync::atomic::AtomicU64,
     /// The owned footprints the index files are charged to.
     footprints: coordinode_storage::engine::footprint::Footprints,
 }
@@ -389,9 +399,17 @@ impl TextIndexRegistry {
             definitions: RwLock::new(HashMap::new()),
             base_dir: base_dir.into(),
             coverage: RwLock::new(None),
-            held: RwLock::new(HashMap::new()),
+            revisions: core::sync::atomic::AtomicU64::new(0),
             footprints: Default::default(),
         }
+    }
+
+    /// A revision no installation was given before.
+    fn next_revision(&self) -> u64 {
+        // Never wraps: one per change of an index, far below u64::MAX.
+        self.revisions
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            + 1
     }
 
     /// Charge the index files to `footprints`: the store's owned footprint,
@@ -470,11 +488,11 @@ impl TextIndexRegistry {
             TextSearchError::Budget(stop) => FindError::Budget(stop),
             other => failed(&other),
         };
-        let index = handle.read().map_err(|_| failed(&"lock poisoned"))?;
+        let installed = handle.read().map_err(|_| failed(&"lock poisoned"))?;
         // Read under the index's lock, which every change of what it holds
         // takes too: the documents and the interpretations they hold agree.
-        let interpretation = self.held(label, property).unwrap_or_default();
-        let (exclude, held) = match answer(carriers, &interpretation) {
+        let index = &installed.index;
+        let (exclude, held) = match answer(carriers, &installed.held) {
             Answer::Whole => (None, true),
             Answer::Without(scope) => (Some(scope), true),
             Answer::Unable => (None, false),
@@ -550,7 +568,7 @@ impl TextIndexRegistry {
         let indexes = self.indexes.read().ok()?;
         indexes
             .values()
-            .filter_map(|handle| handle.read().ok()?.first_end())
+            .filter_map(|handle| handle.read().ok()?.index.first_end())
             .min()
     }
 
@@ -558,7 +576,7 @@ impl TextIndexRegistry {
     /// not hold at `at`.
     pub fn outside(&self, label: &str, property: &str, at: i64) -> Vec<NodeId> {
         self.get(label, property)
-            .and_then(|handle| Some(handle.read().ok()?.outside(at)))
+            .and_then(|handle| Some(handle.read().ok()?.index.outside(at)))
             .unwrap_or_default()
             .into_iter()
             .map(NodeId::from_raw)
@@ -579,9 +597,10 @@ impl TextIndexRegistry {
             return Ok(());
         };
         let (upserts, removals) = split_changes(property, changes);
-        let mut idx = handle
+        let mut installed = handle
             .write()
             .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
+        let idx = &mut installed.index;
         idx.apply_scoped_changes(&upserts, &removals)
             .map_err(|e| format!("text index :{label}({property}): {e}"))?;
         for change in changes {
@@ -670,11 +689,9 @@ impl TextIndexRegistry {
     /// interpretations change: a step bound to one revision is refused once
     /// another changed them, even back to equal ones.
     pub fn held_at(&self, label: &str, property: &str) -> Option<(Held, u64)> {
-        self.held
-            .read()
-            .ok()?
-            .get(&(label.to_string(), property.to_string()))
-            .cloned()
+        let handle = self.get(label, property)?;
+        let installed = handle.read().ok()?;
+        Some((installed.held.clone(), installed.revision))
     }
 
     /// Run `step` on the index of `(label, property)` and the
@@ -722,29 +739,25 @@ impl TextIndexRegistry {
         };
         let failed =
             |what: &dyn std::fmt::Display| format!("text index :{label}({property}): {what}");
-        let mut index = handle.write().map_err(|_| failed(&"lock poisoned"))?;
-        // Changed on a copy, and stored while the index is still locked: the
-        // registry-wide map is held for the store alone, never for a step.
-        let (before, revision) = self.held_at(label, property).unwrap_or_default();
-        if guard.is_some_and(|guard| guard != revision) {
+        let mut installed = handle.write().map_err(|_| failed(&"lock poisoned"))?;
+        if guard.is_some_and(|guard| guard != installed.revision) {
             return Ok(None);
         }
-        let mut interpretation = before.clone();
-        let outcome = step(&mut index, &mut interpretation).map_err(|e| failed(&e))?;
-        let revision = if interpretation == before && !rewrites {
-            revision
-        } else {
-            // Never wraps: one change per step, far below u64::MAX.
-            revision + 1
-        };
-        self.held
-            .write()
-            .map_err(|_| failed(&"lock poisoned"))?
-            .insert(
-                (label.to_string(), property.to_string()),
-                (interpretation, revision),
-            );
-        Ok(Some((outcome, revision)))
+        // What the installation holds changes with its documents, under its
+        // lock: a step on one dropped or replaced meanwhile changes only it.
+        let Installed {
+            index,
+            held,
+            revision,
+        } = &mut *installed;
+        // Changed on a copy: a failed step leaves what it holds as it was.
+        let mut after = held.clone();
+        let outcome = step(index, &mut after).map_err(|e| failed(&e))?;
+        if after != *held || rewrites {
+            *held = after;
+            *revision = self.next_revision();
+        }
+        Ok(Some((outcome, *revision)))
     }
 
     /// Rebuild the index of `(label, property)` from `scan`, the nodes'
@@ -879,16 +892,16 @@ impl TextIndexRegistry {
             };
 
             let key = (def.label.clone(), prop.clone());
-            // A new index holds no interpretation until it is built; its
-            // revision keeps growing, so a step bound to the old one is
-            // refused rather than mistaken for one on the new.
-            if let Ok(mut held) = self.held.write() {
-                let (interpretation, revision) = held.entry(key.clone()).or_default();
-                *interpretation = Held::default();
-                *revision += 1;
-            }
+            // A new index holds no interpretation until it is built, under a
+            // revision no other installation had: a step bound to a dropped
+            // one is refused rather than mistaken for one on this.
+            let installed = Installed {
+                index: text_index,
+                held: Held::default(),
+                revision: self.next_revision(),
+            };
             if let Ok(mut indexes) = self.indexes.write() {
-                indexes.insert(key, Arc::new(RwLock::new(text_index)));
+                indexes.insert(key, Arc::new(RwLock::new(installed)));
             }
         }
 
@@ -916,23 +929,13 @@ impl TextIndexRegistry {
                 indexes.remove(&(label.to_string(), prop.clone()));
             }
         }
-        // Kept with a grown revision rather than forgotten, so a step bound
-        // to the dropped index never matches one registered after it.
-        if let Ok(mut held) = self.held.write() {
-            for prop in &all_properties {
-                let (interpretation, revision) =
-                    held.entry((label.to_string(), prop.clone())).or_default();
-                *interpretation = Held::default();
-                *revision += 1;
-            }
-        }
         if let Ok(mut defs) = self.definitions.write() {
             defs.remove(&canonical_key);
         }
     }
 
     /// Get a handle to the text index for a (label, property) pair.
-    pub fn get(&self, label: &str, property: &str) -> Option<TextHandle> {
+    fn get(&self, label: &str, property: &str) -> Option<TextHandle> {
         let indexes = self.indexes.read().ok()?;
         indexes
             .get(&(label.to_string(), property.to_string()))
@@ -973,11 +976,11 @@ impl TextIndexRegistry {
     /// match the query-time tokenization in `search()`/`search_with_language()`.
     pub fn on_text_written(&self, label: &str, node_id: NodeId, property: &str, text: &str) {
         if let Some(handle) = self.get(label, property)
-            && let Ok(mut idx) = handle.write()
+            && let Ok(mut installed) = handle.write()
         {
             let mut props = HashMap::new();
             props.insert(property.to_string(), text.to_string());
-            if let Err(e) = idx.add_node(node_id.as_raw(), &props) {
+            if let Err(e) = installed.index.add_node(node_id.as_raw(), &props) {
                 tracing::warn!(
                     label,
                     property,
@@ -991,8 +994,8 @@ impl TextIndexRegistry {
     /// Remove a document from applicable text indexes.
     pub fn on_text_deleted(&self, label: &str, node_id: NodeId, property: &str) {
         if let Some(handle) = self.get(label, property)
-            && let Ok(mut idx) = handle.write()
-            && let Err(e) = idx.delete_document(node_id.as_raw())
+            && let Ok(mut installed) = handle.write()
+            && let Err(e) = installed.index.delete_document(node_id.as_raw())
         {
             tracing::warn!(
                 label,
@@ -1012,8 +1015,8 @@ impl TextIndexRegistry {
         limit: usize,
     ) -> Option<Vec<TextSearchResult>> {
         let handle = self.get(label, property)?;
-        let idx = handle.read().ok()?;
-        idx.search(query, limit).ok()
+        let installed = handle.read().ok()?;
+        installed.index.search(query, limit).ok()
     }
 
     /// Get the base directory.

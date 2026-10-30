@@ -247,3 +247,58 @@ fn indexes_for_label() {
     assert!(reg.has_index("User", "bio"));
     assert_eq!(reg.len(), 3);
 }
+
+/// A step on an index that is dropped and recreated while the step runs
+/// changes the dropped installation alone: the step holds the old index's
+/// lock, the drop and the new registration go through meanwhile, and once
+/// the step returns the new index still holds no interpretation, under a
+/// revision the step's never equals. Before, the interpretation lived in a
+/// map by name beside the index, and the returning step wrote its own over
+/// the new installation's.
+#[test]
+fn a_step_on_a_dropped_index_never_writes_over_the_new_one() {
+    use crate::index::membership::LabelCarriers;
+    use crate::index::selection::Held;
+    use std::sync::Barrier;
+    let dir = TempDir::new().unwrap();
+    let reg = TextIndexRegistry::new(dir.path());
+    let def = |raw| {
+        text(
+            raw,
+            "thing_title",
+            "Thing",
+            vec!["title".into()],
+            test_config(),
+        )
+    };
+    reg.register(def(1)).unwrap();
+    let thing = coordinode_core::schema::label_id::LabelId::new(7).expect("nonzero");
+    let stepped = Held::built(Some(LabelCarriers::stored_only(thing)));
+    let (inside, resume) = (Barrier::new(2), Barrier::new(2));
+
+    let old_revision = std::thread::scope(|s| {
+        let step = s.spawn(|| {
+            reg.with_index_at("Thing", "title", None, |_, held| {
+                inside.wait();
+                resume.wait();
+                *held = stepped.clone();
+                Ok(())
+            })
+            .unwrap()
+            .expect("the old index was registered when the step began")
+            .1
+        });
+        inside.wait();
+        reg.unregister("Thing", "title");
+        assert!(reg.register(def(2)).unwrap(), "recreated");
+        resume.wait();
+        step.join().unwrap()
+    });
+
+    let (held, revision) = reg.held_at("Thing", "title").expect("the new index");
+    assert_eq!(held, Held::default(), "the new index holds nothing yet");
+    assert_ne!(
+        revision, old_revision,
+        "no step bound to the old one matches"
+    );
+}
