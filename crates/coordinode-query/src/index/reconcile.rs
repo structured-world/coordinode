@@ -94,9 +94,11 @@ impl Reconcile<'_> {
             {
                 return Err(BackfillError::Stopped);
             }
+            // Both arms read at a pinned snapshot: the page's nodes and the
+            // catalog it judges them by are read at it.
             let mut txn = match self.oracle {
                 Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
-                None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
+                None => Transaction::begin(self.engine, None, Timestamp::ZERO),
             };
             // Read for each page, each bound to the record as read: one the
             // conclusion moved refuses the page.
@@ -128,15 +130,9 @@ impl Reconcile<'_> {
             // Both interpretations of the catalog as the page's own snapshot
             // reads it, the one its nodes are read at: every fact a node is
             // judged by is of one committed state, never a mix.
-            let (view, _pin) = match txn.snapshot() {
-                Some(view) => (view, None),
-                // A direct-mode transaction reads the latest state: both
-                // views take one snapshot of it, held while they are built.
-                None => {
-                    let (view, pin) = self.engine.pin_latest_snapshot();
-                    (view, pin)
-                }
-            };
+            let view = txn.snapshot().ok_or_else(|| {
+                StoreError::Invariant("a reconciliation page reads at no snapshot".into())
+            })?;
             let mut in_force = CatalogMembership::at(self.engine, view);
             let mut candidate = CatalogMembership::candidates_at(self.engine, view);
             let page =

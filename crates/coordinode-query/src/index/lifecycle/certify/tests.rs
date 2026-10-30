@@ -30,10 +30,10 @@ fn commit(txn: &mut Transaction<'_>) -> Result<(), CommitError> {
 /// The label lookup keeps parts of two changes: one put in force earlier,
 /// whose fold is about to drop its parts, and one being concluded now. The
 /// fold commits after the conclusion has listed the definitions and before
-/// it reads them. The conclusion then never writes back the folded parts:
-/// it either rewrites the record the fold left, or is refused and tried
-/// again. Before, it wrote the record it had listed under the version read
-/// after the fold, and the folded parts came back.
+/// it reads them. The conclusion's commit is refused as a write conflict,
+/// and its retry, as the certification runs it, concludes the record the
+/// fold left: the folded parts stay dropped and the concluded ones are in
+/// force, nothing else.
 #[test]
 fn a_conclusion_never_brings_back_parts_a_fold_dropped() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -94,25 +94,29 @@ fn a_conclusion_never_brings_back_parts_a_fold_dropped() {
     stage_selection_conclusion(&engine, &mut txn, concluded, PartState::InForce)
         .expect("stage the conclusion");
     assert!(AFTER_LISTING.lock().is_none(), "the fold ran in the window");
-    let concluded_now = commit(&mut txn).is_ok();
+    assert!(
+        matches!(commit(&mut txn), Err(CommitError::Conflict(_))),
+        "the fold's commit after this one's snapshot refuses it"
+    );
+    // The retry, as the certification runs it.
+    let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+    stage_selection_conclusion(&engine, &mut txn, concluded, PartState::InForce)
+        .expect("stage the conclusion again");
+    commit(&mut txn).expect("the retry commits");
 
     let def = indexes
         .load_definition(id)
         .expect("load")
         .expect("the lookup");
-    assert!(
-        def.selection.iter().all(|p| p.operation != folded),
-        "the folded parts stay dropped: {:?}",
-        def.selection
+    let mut parts: Vec<(u64, PartState)> = def
+        .selection
+        .iter()
+        .map(|p| (p.part.as_raw(), p.state))
+        .collect();
+    parts.sort_unstable_by_key(|(part, _)| *part);
+    assert_eq!(
+        parts,
+        [(2_001, PartState::InForce), (2_002, PartState::InForce)],
+        "exactly the concluded parts, in force"
     );
-    if concluded_now {
-        assert!(
-            def.selection
-                .iter()
-                .filter(|p| p.operation == concluded)
-                .all(|p| p.state == PartState::InForce),
-            "{:?}",
-            def.selection
-        );
-    }
 }
