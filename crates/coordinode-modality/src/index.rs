@@ -1412,6 +1412,12 @@ impl IndexStore for LocalIndexStore<'_> {
         let empty = page.len() <= limit;
         page.truncate(limit);
         let base = base.as_raw().to_be_bytes();
+        // The page is read without tracking, as the commit conflicts on the
+        // keys it writes: every writer changing an entry of the label after
+        // the change clears it from every scope, writing the source key too,
+        // so a move read before that write is refused at whichever commit
+        // comes second. The caller binds the definition version, which every
+        // step of the change and every later one moves.
         for (key, value) in page {
             txn.delete(Partition::Idx, &key)?;
             let mut moved = key;

@@ -972,6 +972,99 @@ fn a_label_change_keeps_only_its_difference_apart() {
     );
 }
 
+/// A fold moving a gained posting into the lookup's own scope races a writer
+/// that takes the node out of the label after the change was put in force.
+/// The writer clears the posting from every scope of the label, so both
+/// write the gained key: whichever commits second is refused, and the node
+/// never comes back under the label from a posting the fold read before.
+/// Run in both commit orders.
+#[test]
+fn a_fold_never_brings_back_a_posting_a_writer_removed() {
+    use core::ops::ControlFlow;
+    let label = |raw| coordinode_core::schema::label_id::LabelId::new(raw).expect("nonzero");
+    let thing = label(10);
+    let operation = GenerationId::from_raw(20);
+    let (gained, retired) = (GenerationId::from_raw(21), GenerationId::from_raw(22));
+    for writer_first in [true, false] {
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let store = LocalIndexStore::new(engine);
+        let mut lookup =
+            IndexDescriptor::label_lookup().bind(IndexId::from_raw(1), GenerationId::from_raw(4));
+        lookup.propose_parts(thing, operation, gained, retired);
+        let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+        store
+            .stage_label_postings_txn(&mut t, &lookup, 0, id(7), settled(&[]), both(&[], &[thing]))
+            .unwrap();
+        commit(&mut t).unwrap();
+        assert!(lookup.conclude_parts(operation, PartState::InForce));
+
+        let mut fold = Transaction::begin(engine, Some(&oracle), oracle.next());
+        assert!(
+            store
+                .move_scope_page_txn(&mut fold, gained, lookup.generation, 16)
+                .unwrap(),
+            "one posting, moved in one page"
+        );
+        let mut writer = Transaction::begin(engine, Some(&oracle), oracle.next());
+        store
+            .stage_label_postings_txn(
+                &mut writer,
+                &lookup,
+                0,
+                id(7),
+                settled(&[thing]),
+                settled(&[]),
+            )
+            .unwrap();
+        let (first, second) = if writer_first {
+            (&mut writer, &mut fold)
+        } else {
+            (&mut fold, &mut writer)
+        };
+        commit(first).unwrap();
+        assert!(
+            commit(second).is_err(),
+            "writer first: {writer_first}: the second of the two must be refused"
+        );
+
+        let mut folded = lookup.clone();
+        folded.drop_part(gained);
+        folded.drop_part(retired);
+        let read = Transaction::begin(engine, Some(&oracle), oracle.next());
+        let mut found = Vec::new();
+        for def in [&lookup, &folded] {
+            store
+                .label_members(
+                    &read,
+                    LabelScope {
+                        lookup: def,
+                        shard: 0,
+                        label: thing,
+                        interpretation: Interpretation::InForce,
+                    },
+                    None,
+                    &budget(),
+                    |node| {
+                        found.push(node.as_raw());
+                        Ok::<_, StoreError>(ControlFlow::Continue(()))
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            found,
+            if writer_first {
+                Vec::<u64>::new()
+            } else {
+                vec![7, 7]
+            },
+            "writer first: {writer_first}"
+        );
+    }
+}
+
 /// A description is catalog metadata: editing it rewrites the definition
 /// record only, never the generation or an entry.
 #[test]
