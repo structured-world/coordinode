@@ -454,6 +454,10 @@ pub struct ServerConfig {
     /// Index entries one commit moves back into an index's own entries once
     /// such a change concluded (`None` = 512).
     pub index_fold_page: Option<std::num::NonZeroUsize>,
+    /// Memory, in MiB, one commit of such placement or folding may hold: the
+    /// rows it reads and the writes it stages (`None` = 64). A page that does
+    /// not fit is halved and tried again.
+    pub index_maintenance_page_mb: Option<std::num::NonZeroU64>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
     pub nofile: Option<u64>,
     /// Max concurrent connections (`None` = unbounded).
@@ -716,6 +720,7 @@ impl Default for ServerConfig {
             index_check_max_repairs: None,
             index_implication_page: None,
             index_fold_page: None,
+            index_maintenance_page_mb: None,
             nofile: None,
             max_connections: None,
             max_request_size_mb: 16,

@@ -184,6 +184,7 @@ impl Shared {
             stop: Some(&self.stopping),
             registry: Some(env.registry()),
             page: self.config.read().fold_page,
+            page_bytes: self.config.read().maintenance_page_bytes,
         }
         .run(&mut |txn| env.commit_page(txn));
         match folded {
@@ -226,6 +227,7 @@ impl Shared {
             shard_id: env.shard_id(),
             operation: generation,
             page: self.config.read().reconcile_page,
+            page_bytes: self.config.read().maintenance_page_bytes,
             stop: Some(&self.stopping),
         }
         .run(&mut |txn| env.commit_page(txn));

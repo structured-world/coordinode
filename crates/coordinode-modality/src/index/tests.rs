@@ -298,9 +298,13 @@ fn a_unique_entry_is_removed_only_by_its_holder() {
 /// Two versions of one temporal node hold one unique value. One version
 /// leaving it keeps the value held by the other, and keeps the value's
 /// ownership revision: a transaction taking the value for another node from
-/// a view without that change meets it at commit, whichever of the two
-/// commits first, in both profiles. Removing the revision with the leaving
-/// owner would let the second commit through.
+/// a view without that change meets it at commit as a write conflict,
+/// whichever of the two commits first, in both profiles. Removing the
+/// revision with the leaving owner left the value held with no revision.
+///
+/// Store level only: the takers stage their entries directly, without the
+/// statement's check that refuses a value another owner holds, which is
+/// what lets the taker commit first here.
 #[test]
 fn one_of_several_owners_leaving_keeps_the_values_revision() {
     use coordinode_core::index::encoding::{encode_tuple, encode_unique_claim_key};
@@ -371,8 +375,8 @@ fn one_of_several_owners_leaving_keeps_the_values_revision() {
         };
         commit(first).unwrap();
         assert!(
-            commit(second).is_err(),
-            "{what}: the second commit is refused"
+            matches!(commit(second), Err(CommitError::Conflict(_))),
+            "{what}: the second commit is refused as a write conflict"
         );
 
         let claim = encode_unique_claim_key(1, &encode_tuple(&s("v")).unwrap());

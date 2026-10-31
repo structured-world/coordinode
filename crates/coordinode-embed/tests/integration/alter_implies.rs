@@ -598,6 +598,76 @@ fn a_vector_index_drops_what_a_refused_change_kept() {
     assert_eq!(nearest_things(&mut db, 5, None), ["same", "thing"]);
 }
 
+/// The placement and folding of a change keep within the bytes a page may
+/// hold. Long titles under a B-tree index, with pages far larger than the
+/// bytes allow, are placed in halved pages and the change goes through,
+/// every task found through the index. One task whose title alone does not
+/// fit stops the work instead of growing past the bound: the change is
+/// refused, and nothing it would have placed is left; with room for the
+/// title, the same change goes through.
+#[test]
+fn an_implication_change_keeps_within_its_page_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    let bytes = 16 * 1024;
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        reconcile_page: 512,
+        fold_page: 512,
+        maintenance_page_bytes: bytes,
+        ..db.index_build_config()
+    });
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE INDEX thing_title ON :Thing(title)",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    let long = |n: usize| format!("{n:04}{}", "x".repeat(1000));
+    for n in 0..60 {
+        db.execute_cypher(&format!("CREATE (:Task {{title: '{}'}})", long(n)))
+            .expect("task");
+    }
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("placed in pages that fit");
+    await_folded(&db);
+    for n in [0, 31, 59] {
+        assert_eq!(
+            count(
+                &mut db,
+                &format!("MATCH (n:Thing {{title: '{}'}}) RETURN n", long(n))
+            ),
+            1,
+            "task {n} through the index"
+        );
+    }
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES ()")
+        .expect("dropped again");
+    await_folded(&db);
+
+    let huge = "y".repeat(2 * bytes as usize);
+    db.execute_cypher(&format!("CREATE (:Task {{title: '{huge}'}})"))
+        .expect("a task whose title alone does not fit a page");
+    let err = refused(&mut db, "ALTER NODE TYPE Task SET IMPLIES (Thing)");
+    assert!(err.contains("memory") || err.contains("page"), "{err}");
+    await_folded(&db);
+    assert_eq!(
+        count(&mut db, "MATCH (n:Thing) RETURN n"),
+        0,
+        "nothing of the refused change is left"
+    );
+
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        maintenance_page_bytes: 16 * bytes,
+        ..db.index_build_config()
+    });
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("with room for the title, the same change goes through");
+    await_folded(&db);
+    assert_eq!(count(&mut db, "MATCH (n:Thing) RETURN n"), 61);
+}
+
 /// One schema package moving a value's holder out of a label and another
 /// into it: Chore stops implying Thing while Task starts, a Chore and a Task
 /// holding the same title under a uniqueness on Thing. Each interpretation

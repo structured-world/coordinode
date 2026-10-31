@@ -241,6 +241,7 @@ pub(crate) async fn serve(
         index_check_max_repairs,
         index_implication_page,
         index_fold_page,
+        index_maintenance_page_mb,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -783,6 +784,13 @@ pub(crate) async fn serve(
                 .checked_mul(1 << 20)
                 .ok_or_else(|| format!("index_check_memory_mb = {mib} does not fit in bytes"))?,
         };
+        let maintenance_page_bytes = match index_maintenance_page_mb {
+            None => defaults.maintenance_page_bytes,
+            // Refused at start rather than clamped, as the check memory is.
+            Some(mib) => mib.get().checked_mul(1 << 20).ok_or_else(|| {
+                format!("index_maintenance_page_mb = {mib} does not fit in bytes")
+            })?,
+        };
         database.set_index_build_config(coordinode_query::index::IndexBuildConfig {
             max_running: index_build_max_running.map_or(defaults.max_running, |n| n.get()),
             older_transactions_wait: index_build_older_transactions_wait_secs.map_or(
@@ -806,6 +814,7 @@ pub(crate) async fn serve(
             },
             reconcile_page: index_implication_page.map_or(defaults.reconcile_page, |n| n.get()),
             fold_page: index_fold_page.map_or(defaults.fold_page, |n| n.get()),
+            maintenance_page_bytes,
         });
         // What a statement executes under when neither it nor its session names a
         // concern.

@@ -115,6 +115,31 @@ pub enum BackfillError {
     /// pages, leaving the build to whoever opens the storage next.
     #[error("the index backfill stopped because its process is closing")]
     Stopped,
+    /// One node's or entry's maintenance needs more memory than a page of
+    /// maintenance may take, so not even a page of one fits. Nothing of the
+    /// page was committed; the work stays to be done.
+    #[error("index maintenance needs more memory than a page may take: {0}")]
+    Budget(coordinode_core::budget::BudgetStop),
+}
+
+impl From<coordinode_core::budget::BudgetStop> for BackfillError {
+    fn from(stop: coordinode_core::budget::BudgetStop) -> Self {
+        Self::Budget(stop)
+    }
+}
+
+impl BackfillError {
+    /// The budget refusal behind this error, when that is what it is: a
+    /// page whose maintenance did not fit its memory.
+    pub(crate) fn budget_stop(&self) -> Option<coordinode_core::budget::BudgetStop> {
+        match self {
+            Self::Budget(stop) | Self::Store(StoreError::Budget(stop)) => Some(*stop),
+            Self::Store(StoreError::Storage(coordinode_storage::error::StorageError::Budget(
+                stop,
+            ))) => Some(*stop),
+            _ => None,
+        }
+    }
 }
 
 impl From<IndexWriteError> for BackfillError {

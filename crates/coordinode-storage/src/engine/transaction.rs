@@ -731,6 +731,21 @@ impl<'a> Transaction<'a> {
         self.write_budget = budget;
     }
 
+    /// Charge `bytes` of scratch the caller is about to allocate for the
+    /// writes it stages to the budget [`Self::charge_writes_to`] set, for
+    /// the rest of the statement, as a staged write is charged; nothing
+    /// without one.
+    ///
+    /// # Errors
+    ///
+    /// The budget's refusal, after which every later write is refused too.
+    pub fn charge_scratch(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), coordinode_core::budget::BudgetStop> {
+        self.admit_staged(bytes)
+    }
+
     /// The refusal that stopped staging, when a write did not fit the
     /// statement's budget. Nothing was staged after it; commit refuses.
     pub fn budget_refusal(&self) -> Option<coordinode_core::budget::BudgetStop> {

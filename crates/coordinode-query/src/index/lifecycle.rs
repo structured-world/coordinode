@@ -301,7 +301,15 @@ pub struct IndexBuildConfig {
     /// Index entries one commit moves back into an index's own entries
     /// once such a change concluded.
     pub fold_page: usize,
+    /// Bytes one commit of placement or folding may hold: the writes it
+    /// stages and the rows it reads. A page that does not fit is halved and
+    /// tried again; one node or entry that alone does not fit stops the work
+    /// with a refusal, and nothing of it is committed.
+    pub maintenance_page_bytes: u64,
 }
+
+/// Bytes one placement or fold commit may hold by default.
+pub const DEFAULT_MAINTENANCE_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Stored node rows one placement commit of an implication change reads
 /// by default.
@@ -342,6 +350,7 @@ impl Default for IndexBuildConfig {
             check_interval: Some(DEFAULT_CHECK_INTERVAL),
             reconcile_page: DEFAULT_RECONCILE_PAGE,
             fold_page: DEFAULT_FOLD_PAGE,
+            maintenance_page_bytes: DEFAULT_MAINTENANCE_PAGE_BYTES,
         }
     }
 }

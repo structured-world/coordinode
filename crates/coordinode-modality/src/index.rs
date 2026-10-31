@@ -1412,6 +1412,12 @@ impl IndexStore for LocalIndexStore<'_> {
                 }
                 let (key, value) = guard.into_inner()?;
                 txn.delete(Partition::Idx, &key)?;
+                // The rewritten key's buffer grows only to the longest key,
+                // each growth charged before it happens.
+                if let Some(more) = key.len().checked_sub(target.capacity()).filter(|m| *m > 0) {
+                    txn.charge_scratch(more)?;
+                    target.reserve_exact(key.len());
+                }
                 target.clear();
                 target.extend_from_slice(&key);
                 // The shape tag, then the generation: the rest names the same

@@ -51,8 +51,39 @@ pub(crate) struct Reconcile<'a> {
     pub operation: GenerationId,
     /// Stored node rows one commit reads (at least one).
     pub page: usize,
+    /// Bytes one commit may hold: the rows it reads, the writes it stages
+    /// and the label scratch it grows.
+    pub page_bytes: u64,
     /// Set when the process is closing.
     pub stop: Option<&'a core::sync::atomic::AtomicBool>,
+}
+
+/// The size of a page that did not fit: half of it, or `None` when it was a
+/// single row already, which nothing smaller can hold.
+fn halved(page: usize) -> Option<usize> {
+    (page > 1).then_some(page / 2)
+}
+
+/// Bytes a page of `rows` holds once read.
+fn rows_bytes(rows: &[(Vec<u8>, Vec<u8>)]) -> u64 {
+    rows.iter()
+        .map(|(k, v)| (k.len() + v.len() + 2 * core::mem::size_of::<Vec<u8>>()) as u64)
+        .sum()
+}
+
+/// Make room in `labels` for `wanted` labels, charging any growth of its
+/// capacity to `scratch` before it happens.
+fn reserve_labels(
+    labels: &mut Vec<LabelId>,
+    wanted: usize,
+    scratch: &mut coordinode_core::budget::MemoryCharge<'_>,
+) -> Result<(), coordinode_core::budget::BudgetStop> {
+    if let Some(more) = wanted.checked_sub(labels.capacity()).filter(|m| *m > 0) {
+        // `more` labels of memory about to exist: the product fits in u64.
+        scratch.grow((more * core::mem::size_of::<LabelId>()) as u64)?;
+        labels.reserve_exact(wanted - labels.len());
+    }
+    Ok(())
 }
 
 /// An index with parts of the certification, as one page reads it.
@@ -86,9 +117,15 @@ impl Reconcile<'_> {
         let mut start_after: Option<Vec<u8>> = None;
         let mut placed = 0u64;
         let mut conflicts = 0u32;
+        // Rows one page reads: halved while a page does not fit its bytes,
+        // grown back towards the configured size once one does.
+        let mut size = self.page.max(1);
         // The labels a node carries under each interpretation, reused from
         // node to node: they grow to the widest closure once and allocate
-        // nothing after.
+        // nothing after, every growth charged before it happens and held
+        // for the whole pass.
+        let scratch_budget = coordinode_core::budget::QueryBudget::new(self.page_bytes);
+        let mut scratch = scratch_budget.empty_charge();
         let mut now: Vec<LabelId> = Vec::new();
         let mut then: Vec<LabelId> = Vec::new();
         loop {
@@ -139,88 +176,121 @@ impl Reconcile<'_> {
             })?;
             let mut in_force = CatalogMembership::at(self.engine, view);
             let mut candidate = CatalogMembership::candidates_at(self.engine, view);
-            let page = nodes.prefix_scan_paged_tracked(
-                &mut txn,
-                &prefix,
-                start_after.as_deref(),
-                self.page.max(1),
-            )?;
-            let mut read = Vec::with_capacity(page.rows.len());
-            let mut page_placed = 0u64;
-            for (key, bytes) in &page.rows {
-                let Some(owner) = stored_owner(key) else {
-                    continue;
-                };
-                let node = NodeId::from_raw(owner.node_id);
-                let stored =
-                    NodeRecord::labels_from_msgpack(bytes).map_err(|e| StoreError::Decode {
-                        kind: "node labels",
-                        message: format!("node {}: {e}", node.as_raw()),
-                    })?;
-                now.clear();
-                now.extend(in_force.of_stored(&stored)?.iter());
-                then.clear();
-                then.extend(candidate.of_stored(&stored)?.iter());
-                if now.len() == then.len() && now.iter().all(|l| then.contains(l)) {
-                    continue;
-                }
-                let mut record = None;
-                for Placing { def, label } in &placing {
-                    let carried = Carried {
-                        in_force: now.contains(label),
-                        candidate: then.contains(label),
+            // What the page reads and stages is charged to its own bytes,
+            // each write before it is buffered.
+            let page_budget =
+                std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(self.page_bytes));
+            txn.charge_writes_to(Some(std::sync::Arc::clone(&page_budget)));
+            let mut staged = || -> Result<_, BackfillError> {
+                let page = nodes.prefix_scan_paged_tracked(
+                    &mut txn,
+                    &prefix,
+                    start_after.as_deref(),
+                    size,
+                )?;
+                page_budget
+                    .reserve(rows_bytes(&page.rows))?
+                    .keep_until_query_ends();
+                let mut read = Vec::with_capacity(page.rows.len());
+                let mut page_placed = 0u64;
+                for (key, bytes) in &page.rows {
+                    let Some(owner) = stored_owner(key) else {
+                        continue;
                     };
-                    // The lookup moves the postings of every label the two
-                    // interpretations disagree on; a B-tree index only its
-                    // own label's entry.
-                    if def.index_type != IndexType::Labels && carried.in_force == carried.candidate
-                    {
+                    let node = NodeId::from_raw(owner.node_id);
+                    let stored =
+                        NodeRecord::labels_from_msgpack(bytes).map_err(|e| StoreError::Decode {
+                            kind: "node labels",
+                            message: format!("node {}: {e}", node.as_raw()),
+                        })?;
+                    let carried_now = in_force.of_stored(&stored)?;
+                    reserve_labels(&mut now, carried_now.len(), &mut scratch)?;
+                    now.clear();
+                    now.extend(carried_now.iter());
+                    let carried_then = candidate.of_stored(&stored)?;
+                    reserve_labels(&mut then, carried_then.len(), &mut scratch)?;
+                    then.clear();
+                    then.extend(carried_then.iter());
+                    if now.len() == then.len() && now.iter().all(|l| then.contains(l)) {
                         continue;
                     }
-                    match def.index_type {
-                        IndexType::Labels => store.stage_label_postings_txn(
-                            &mut txn,
-                            def,
-                            self.shard_id,
-                            node,
-                            LabelMembership::settled(&now),
-                            LabelMembership {
-                                in_force: &now,
-                                candidate: &then,
-                            },
-                        )?,
-                        IndexType::BTree => {
-                            if record.is_none() {
-                                record = Some(NodeRecord::from_msgpack(bytes).map_err(|e| {
-                                    StoreError::Decode {
-                                        kind: "node record",
-                                        message: format!("node {}: {e}", node.as_raw()),
-                                    }
-                                })?);
-                            }
-                            let Some(record) = record.as_ref() else {
-                                continue;
-                            };
-                            let value_of = record_lookup(record, self.interner);
-                            place_entry(
-                                self.engine,
-                                &mut txn,
-                                self.shard_id,
-                                def,
-                                carried,
-                                owner,
-                                &value_of,
-                                &field_of,
-                            )?;
+                    let mut record = None;
+                    for Placing { def, label } in &placing {
+                        let carried = Carried {
+                            in_force: now.contains(label),
+                            candidate: then.contains(label),
+                        };
+                        // The lookup moves the postings of every label the two
+                        // interpretations disagree on; a B-tree index only its
+                        // own label's entry.
+                        if def.index_type != IndexType::Labels
+                            && carried.in_force == carried.candidate
+                        {
+                            continue;
                         }
-                        // Publication refuses a change moving the carriers
-                        // of any other kind of index.
-                        _ => {}
+                        match def.index_type {
+                            IndexType::Labels => store.stage_label_postings_txn(
+                                &mut txn,
+                                def,
+                                self.shard_id,
+                                node,
+                                LabelMembership::settled(&now),
+                                LabelMembership {
+                                    in_force: &now,
+                                    candidate: &then,
+                                },
+                            )?,
+                            IndexType::BTree => {
+                                if record.is_none() {
+                                    record =
+                                        Some(NodeRecord::from_msgpack(bytes).map_err(|e| {
+                                            StoreError::Decode {
+                                                kind: "node record",
+                                                message: format!("node {}: {e}", node.as_raw()),
+                                            }
+                                        })?);
+                                }
+                                let Some(record) = record.as_ref() else {
+                                    continue;
+                                };
+                                let value_of = record_lookup(record, self.interner);
+                                place_entry(
+                                    self.engine,
+                                    &mut txn,
+                                    self.shard_id,
+                                    def,
+                                    carried,
+                                    owner,
+                                    &value_of,
+                                    &field_of,
+                                )?;
+                            }
+                            // Publication refuses a change moving the carriers
+                            // of any other kind of index.
+                            _ => {}
+                        }
                     }
+                    page_placed += 1;
+                    read.push(key.clone());
                 }
-                page_placed += 1;
-                read.push(key.clone());
-            }
+                Ok((read, page_placed, page.exhausted, page.last_key))
+            };
+            let (read, page_placed, exhausted, last_key) = match staged() {
+                Ok(page) => page,
+                Err(error) => match error.budget_stop() {
+                    // A page that did not fit commits nothing: half of it is
+                    // tried from the same row; a single row that does not
+                    // fit stops the pass.
+                    Some(stop) => match halved(size) {
+                        Some(half) => {
+                            size = half;
+                            continue;
+                        }
+                        None => return Err(BackfillError::Budget(stop)),
+                    },
+                    None => return Err(error),
+                },
+            };
             let unchanged = nodes.condition_unchanged(&mut txn, &read)?;
             let committed = unchanged
                 && match commit(&mut txn) {
@@ -237,10 +307,11 @@ impl Reconcile<'_> {
             }
             conflicts = 0;
             placed += page_placed;
-            if page.exhausted {
+            if exhausted {
                 return Ok(placed);
             }
-            start_after = page.last_key;
+            start_after = last_key;
+            size = size.saturating_mul(2).min(self.page.max(1));
         }
     }
 }
@@ -264,6 +335,8 @@ pub(crate) struct Fold<'a> {
     pub registry: Option<&'a super::IndexRegistry>,
     /// Entries one fold transaction moves (at least one).
     pub page: usize,
+    /// Bytes one fold transaction may stage, scratch included.
+    pub page_bytes: u64,
 }
 
 impl Fold<'_> {
@@ -282,6 +355,9 @@ impl Fold<'_> {
         let store = LocalIndexStore::new(self.engine);
         let mut dropped = 0u64;
         let mut conflicts = 0u32;
+        // Entries one step moves: halved while a step does not fit its
+        // bytes, grown back towards the configured size once one does.
+        let mut size = self.page.max(1);
         loop {
             if self
                 .stop
@@ -308,6 +384,11 @@ impl Fold<'_> {
             };
             txn.bind_index_definition(&def.schema_key(), Some(version))
                 .map_err(StoreError::from)?;
+            // What the step stages is charged to its own bytes, each write
+            // before it is buffered.
+            txn.charge_writes_to(Some(std::sync::Arc::new(
+                coordinode_core::budget::QueryBudget::new(self.page_bytes),
+            )));
             // Gained in force and retired withdrawn hold members: moved into
             // the index's own entries. The others are read by nobody now.
             let keep = matches!(
@@ -316,7 +397,25 @@ impl Fold<'_> {
                     | (PartState::Withdrawn, coordinode_modality::PartRole::Retired)
             );
             let empty = if keep {
-                store.move_scope_page_txn(&mut txn, part.part, def.generation, self.page.max(1))?
+                match store.move_scope_page_txn(&mut txn, part.part, def.generation, size) {
+                    Ok(empty) => empty,
+                    Err(error) => {
+                        let failure = BackfillError::from(error);
+                        match failure.budget_stop() {
+                            // A step that did not fit commits nothing: half
+                            // of it is tried; a single entry that does not
+                            // fit stops.
+                            Some(stop) => match halved(size) {
+                                Some(half) => {
+                                    size = half;
+                                    continue;
+                                }
+                                None => return Err(BackfillError::Budget(stop)),
+                            },
+                            None => return Err(failure),
+                        }
+                    }
+                }
             } else {
                 store.clear_txn(&mut txn, part.part)?;
                 true
@@ -335,6 +434,7 @@ impl Fold<'_> {
                 Ok(()) => {
                     conflicts = 0;
                     dropped += u64::from(empty);
+                    size = size.saturating_mul(2).min(self.page.max(1));
                     if let (Some(registry), Some(folded)) = (self.registry, next_def) {
                         registry
                             .register_published(self.engine, folded)
