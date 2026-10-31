@@ -298,10 +298,11 @@ struct BinCheck {
 /// decodes as a string does when it is UTF-8, both ways, and is refused
 /// both ways when it is not.
 ///
-/// The variants are numbered by matches over the types themselves, which do
-/// not compile once a variant is added, and the cases must cover every
-/// number: a new variant fails here until its case is written, so the
-/// shapes the state is read through cannot fall behind unseen.
+/// The variants are numbered by matches over the types themselves, which
+/// stop compiling when a variant is added: that is the point where a new
+/// variant must be noticed here. The cases are checked to cover the counts
+/// written beside those matches, which are kept in step by hand; a variant
+/// added with no count raised and no case written is not caught.
 #[test]
 fn an_integrity_state_agrees_with_the_record_on_every_shape() {
     const MISMATCHES: usize = 3;
