@@ -235,6 +235,82 @@ fn a_concluded_change_is_folded_into_one_scope() {
     }
 }
 
+/// The label counters answer every count exactly, as a scan of the label
+/// does, at each transition a label's carriers go through: a type coming to
+/// imply a label (checked while its parts are still kept apart, then after
+/// they are folded on a reopen), a diamond of implications reaching a label
+/// twice (counted once), an auxiliary label beside them, a node retyped,
+/// one deleted, and an implication dropped; and again after a reopen.
+#[test]
+fn counts_agree_with_scans_across_every_transition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE NODE TYPE Sub IMPLIES (Task) WITH (title: STRING)",
+        "CREATE LABEL Tag AUXILIARY",
+        "CREATE (:Thing {title: 'a'}), (:Task {title: 'b'}), (:Task:Tag {title: 'c'}), \
+         (:Sub {title: 'd'})",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    let exact = |db: &mut Database, what: &str, [thing, task, sub, tag]: [i64; 4]| {
+        for (label, want) in [("Thing", thing), ("Task", task), ("Sub", sub), ("Tag", tag)] {
+            let counted = db
+                .execute_cypher(&format!("MATCH (n:{label}) RETURN count(n) AS c"))
+                .expect("count");
+            assert_eq!(
+                counted[0].get("c"),
+                Some(&Value::Int(want)),
+                "{what}: the counter of :{label}"
+            );
+            assert_eq!(
+                count(db, &format!("MATCH (n:{label}) RETURN n")) as i64,
+                want,
+                "{what}: a scan of :{label}"
+            );
+        }
+    };
+    exact(&mut db, "declared", [1, 3, 1, 1]);
+
+    // The fold stops after its first step: the change is in force with its
+    // parts still kept apart.
+    *coordinode_query::index::lifecycle::AFTER_FOLD_STEP.lock() = Some(Box::new(|_| true));
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("gain");
+    assert!(!folded(&db), "the parts are still kept apart");
+    exact(&mut db, "gained, unfolded", [4, 3, 1, 1]);
+    *coordinode_query::index::lifecycle::AFTER_FOLD_STEP.lock() = None;
+    drop(db);
+    let mut db = Database::open(dir.path()).expect("reopen");
+    await_folded(&db);
+    exact(&mut db, "gained, folded", [4, 3, 1, 1]);
+
+    db.execute_cypher("ALTER NODE TYPE Sub SET IMPLIES (Task, Thing)")
+        .expect("diamond");
+    await_folded(&db);
+    exact(&mut db, "a diamond", [4, 3, 1, 1]);
+
+    db.execute_cypher("MATCH (n:Task {title: 'c'}) RETYPE NODE n TO Thing")
+        .expect("retype");
+    exact(&mut db, "retyped", [4, 2, 1, 1]);
+
+    db.execute_cypher("MATCH (n:Task {title: 'b'}) DELETE n")
+        .expect("delete");
+    exact(&mut db, "deleted", [3, 1, 1, 1]);
+
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES ()")
+        .expect("loss");
+    await_folded(&db);
+    exact(&mut db, "lost", [3, 1, 1, 1]);
+
+    drop(db);
+    let mut db = Database::open(dir.path()).expect("reopen");
+    exact(&mut db, "reopened", [3, 1, 1, 1]);
+}
+
 /// Run `statement` in its own transaction and return its commit timestamp.
 fn commit(db: &mut Database, statement: &str) -> u64 {
     let tx = db.begin_transaction().expect("begin");

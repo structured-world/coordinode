@@ -133,6 +133,8 @@ impl Reconcile<'_> {
         let mut start_after: Option<Vec<u8>> = None;
         let mut placed = 0u64;
         let mut conflicts = 0u32;
+        // Whether a page found parts of the certification to place into.
+        let mut proposed_any = false;
         // Rows one page reads: halved while a page does not fit its bytes,
         // grown back towards the configured size once one does.
         let mut size = self.page.max(1);
@@ -202,8 +204,16 @@ impl Reconcile<'_> {
                 continue;
             }
             if placing.is_empty() {
+                // A change moving no label's carriers (an implication
+                // already reached through another) was published with no
+                // parts: nothing is to be placed. Parts gone after a page
+                // committed were concluded or withdrawn meanwhile.
+                if !proposed_any {
+                    return Ok(0);
+                }
                 return Err(BackfillError::Superseded);
             }
+            proposed_any = true;
             // Both interpretations of the catalog as the page's own snapshot
             // reads it, the one its nodes are read at: every fact a node is
             // judged by is of one committed state, never a mix.

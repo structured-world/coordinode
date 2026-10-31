@@ -17910,11 +17910,11 @@ fn execute_delete(
             // First snapshot the pre-mutation state so we can both clean up
             // index entries AND build the `$before` map for any BEFORE
             // COMMIT DELETE trigger that fires on the node's labels.
-            let pre_snapshot: Option<NodeSnapshot> =
-                match ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-                    Some(rec) => Some(snapshot_node_record(&rec, ctx)?),
-                    None => None,
-                };
+            let pre_record = ctx.mvcc_get_node(ctx.shard_id, node_id)?;
+            let pre_snapshot: Option<NodeSnapshot> = match &pre_record {
+                Some(rec) => Some(snapshot_node_record(rec, ctx)?),
+                None => None,
+            };
 
             // The node's B-tree entries go with it, so its unique values are
             // free for a new node. Vector and text indexes follow the
@@ -17929,11 +17929,12 @@ fn execute_delete(
             }
             ctx.mvcc_delete_node(ctx.shard_id, node_id)?;
             ctx.write_stats.nodes_deleted += 1;
-            // Statistics counters: decrement by the pre-delete labels. A
-            // delete of an absent node removes no row, so no decrement.
-            if let Some((labels, _)) = &pre_snapshot {
-                use coordinode_modality::{LocalStatsStore, StatsStore as _};
-                LocalStatsStore.node_deleted(&mut ctx.txn, labels.iter().map(String::as_str));
+            // Statistics counters: decrement every label the node carried,
+            // its type's implied ones included, as its creation counted
+            // them. A delete of an absent node removes no row, so no
+            // decrement.
+            if let Some(record) = &pre_record {
+                ctx.stat_node_deleted(record)?;
             }
 
             // Fire BEFORE COMMIT DELETE triggers on each of the deleted
@@ -19098,12 +19099,13 @@ fn detach_delete_node(
     // trigger. Mirrors the `execute_delete` / `cascade_delete_source_node`
     // wiring so that MERGE NODES' source-cleanup fires the same triggers as
     // DETACH DELETE on the same node.
-    let node_pre_snapshot: Option<NodeSnapshot> = match ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-        Some(rec) => Some(snapshot_node_record(&rec, ctx)?),
+    let node_pre_record = ctx.mvcc_get_node(ctx.shard_id, node_id)?;
+    let node_pre_snapshot: Option<NodeSnapshot> = match &node_pre_record {
+        Some(rec) => Some(snapshot_node_record(rec, ctx)?),
         None => None,
     };
-    if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-        ctx.index_node_deleted(node_id, &record)?;
+    if let Some(record) = &node_pre_record {
+        ctx.index_node_deleted(node_id, record)?;
     }
 
     let edge_types = ctx.list_edge_types()?;
@@ -19205,11 +19207,11 @@ fn detach_delete_node(
     }
     ctx.mvcc_delete_node(ctx.shard_id, node_id)?;
     ctx.write_stats.nodes_deleted += 1;
-    // Statistics counters: decrement by the pre-delete labels (no row
-    // removed when the node was already absent).
-    if let Some((labels, _)) = &node_pre_snapshot {
-        use coordinode_modality::{LocalStatsStore, StatsStore as _};
-        LocalStatsStore.node_deleted(&mut ctx.txn, labels.iter().map(String::as_str));
+    // Statistics counters: decrement every label the node carried, its
+    // type's implied ones included (no row removed when the node was
+    // already absent).
+    if let Some(record) = &node_pre_record {
+        ctx.stat_node_deleted(record)?;
     }
 
     // Fire BEFORE COMMIT DELETE triggers on the deleted node's labels —
@@ -20609,25 +20611,24 @@ fn cascade_delete_source_node(
     // behaviour in `execute_delete`).
     // Snapshot the pre-mutation node record once: re-used for both the
     // BEFORE COMMIT DELETE trigger firing and (where present) index cleanup.
-    let pre_snapshot: Option<NodeSnapshot> = match ctx.mvcc_get_node(ctx.shard_id, source_id)? {
-        Some(rec) => Some(snapshot_node_record(&rec, ctx)?),
+    let pre_record = ctx.mvcc_get_node(ctx.shard_id, source_id)?;
+    let pre_snapshot: Option<NodeSnapshot> = match &pre_record {
+        Some(rec) => Some(snapshot_node_record(rec, ctx)?),
         None => None,
     };
-    if ctx.btree_index_registry.is_some()
-        && let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)?
-    {
-        ctx.index_node_deleted(source_id, &record)?;
-    }
-    if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {
-        ctx.release_table_key(&record)?;
+    if let Some(record) = &pre_record {
+        if ctx.btree_index_registry.is_some() {
+            ctx.index_node_deleted(source_id, record)?;
+        }
+        ctx.release_table_key(record)?;
     }
     ctx.mvcc_delete_node(ctx.shard_id, source_id)?;
     ctx.write_stats.nodes_deleted += 1;
-    // Statistics counters: decrement by the pre-delete labels (no row
-    // removed when the node was already absent).
-    if let Some((labels, _)) = &pre_snapshot {
-        use coordinode_modality::{LocalStatsStore, StatsStore as _};
-        LocalStatsStore.node_deleted(&mut ctx.txn, labels.iter().map(String::as_str));
+    // Statistics counters: decrement every label the node carried, its
+    // type's implied ones included (no row removed when the node was
+    // already absent).
+    if let Some(record) = &pre_record {
+        ctx.stat_node_deleted(record)?;
     }
 
     // Fire BEFORE COMMIT DELETE triggers on the source node's labels —
