@@ -407,6 +407,17 @@ impl FsFile for MeteredFile {
         self.inner.read_many(regions)
     }
 
+    // Reads into a possibly uninitialized buffer go to the inner file, which
+    // knows whether its read only writes: the trait's default would zero the
+    // buffer on every read, which the backends this wraps spare.
+    fn read_at_buf(&self, buf: &mut lsm_tree::fs::ReadBuf<'_>, offset: u64) -> io::Result<()> {
+        self.inner.read_at_buf(buf, offset)
+    }
+
+    fn read_many_buf(&self, regions: &mut [(u64, lsm_tree::fs::ReadBuf<'_>)]) -> io::Result<()> {
+        self.inner.read_many_buf(regions)
+    }
+
     fn backing_fd(&self) -> Option<i32> {
         self.inner.backing_fd()
     }
