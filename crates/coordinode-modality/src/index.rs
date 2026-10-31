@@ -1047,9 +1047,14 @@ impl<'a> LocalIndexStore<'a> {
 /// owner moving from `old` to `new` takes or leaves. The owners of one value
 /// write different entry keys; this key is the one two transactions changing
 /// who holds the value both write, so one of them is refused at its commit
-/// whatever parts, generations or owners each wrote through. A taken value's
-/// revision is written, a left one's removed: no record of a value nobody
-/// holds is kept, and a removal meets a concurrent taking all the same.
+/// whatever parts, generations or owners each wrote through.
+///
+/// Always a write, never a removal: the key stays as long as the index, so
+/// no owner leaving can take away the revision another owner of the value
+/// still depends on (another version of the node, or the entry another
+/// interpretation keeps), and no removal of a key never written passes
+/// unseen by a concurrent commit. Dropping the index takes every revision
+/// with it.
 fn advance_ownership(
     txn: &mut Transaction,
     index: &IndexDefinition,
@@ -1058,23 +1063,30 @@ fn advance_ownership(
 ) -> StoreResult<()> {
     let before = old.map(tuples).unwrap_or_default();
     let after = new.map(tuples).unwrap_or_default();
-    for tuple in &after {
-        if before.binary_search(tuple).is_err() {
-            txn.put(
-                Partition::Idx,
-                &encode_unique_claim_key(index.id.as_raw(), tuple),
-                &[],
-            )?;
-        }
-    }
     for tuple in &before {
         if after.binary_search(tuple).is_err() {
-            txn.delete(
-                Partition::Idx,
-                &encode_unique_claim_key(index.id.as_raw(), tuple),
-            )?;
+            advance_revision(txn, index, tuple)?;
         }
     }
+    for tuple in &after {
+        if before.binary_search(tuple).is_err() {
+            advance_revision(txn, index, tuple)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write the ownership revision of `tuple` in the unique `index`.
+fn advance_revision(
+    txn: &mut Transaction,
+    index: &IndexDefinition,
+    tuple: &[u8],
+) -> StoreResult<()> {
+    txn.put(
+        Partition::Idx,
+        &encode_unique_claim_key(index.id.as_raw(), tuple),
+        &[],
+    )?;
     Ok(())
 }
 
@@ -1688,6 +1700,13 @@ impl IndexStore for LocalIndexStore<'_> {
         def: &IndexDefinition,
     ) -> StoreResult<()> {
         txn.delete(Partition::Schema, &def.schema_key())?;
+        // The values' ownership revisions go with the index: an identity is
+        // never handed out again, so no later index meets them.
+        if def.unique {
+            use coordinode_core::index::encoding::{prefix_end, unique_claims_prefix};
+            let prefix = unique_claims_prefix(def.id.as_raw());
+            txn.remove_range(Partition::Idx, &prefix, &prefix_end(&prefix))?;
+        }
         if let Some(name) = &def.name {
             let key = IndexDefinition::name_key_of(name);
             // The binding goes only while it is this index's: a name it no
@@ -2310,22 +2329,16 @@ impl IndexStore for LocalIndexStore<'_> {
         // The condition before the write it guards: a direct-mode engine
         // decides a condition when it is stated.
         txn.expect_version(Partition::Idx, &key, version)?;
+        if present {
+            txn.put(Partition::Idx, &key, &value)?;
+        } else {
+            txn.delete(Partition::Idx, &key)?;
+        }
         // An entry a repair gives back or takes out changes who holds the
         // value, as a writer's would: it meets a writer taking the value at
         // the value's ownership revision.
-        let claim = index
-            .unique
-            .then(|| encode_unique_claim_key(index.id.as_raw(), tuple));
-        if present {
-            txn.put(Partition::Idx, &key, &value)?;
-            if let Some(claim) = &claim {
-                txn.put(Partition::Idx, claim, &[])?;
-            }
-        } else {
-            txn.delete(Partition::Idx, &key)?;
-            if let Some(claim) = &claim {
-                txn.delete(Partition::Idx, claim)?;
-            }
+        if index.unique {
+            advance_revision(txn, index, tuple)?;
         }
         Ok(())
     }

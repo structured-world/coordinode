@@ -295,6 +295,102 @@ fn a_unique_entry_is_removed_only_by_its_holder() {
     );
 }
 
+/// Two versions of one temporal node hold one unique value. One version
+/// leaving it keeps the value held by the other, and keeps the value's
+/// ownership revision: a transaction taking the value for another node from
+/// a view without that change meets it at commit, whichever of the two
+/// commits first, in both profiles. Removing the revision with the leaving
+/// owner would let the second commit through.
+#[test]
+fn one_of_several_owners_leaving_keeps_the_values_revision() {
+    use coordinode_core::index::encoding::{encode_tuple, encode_unique_claim_key};
+    let version = |valid_from| EntryOwner::version(1, valid_from);
+    for (index, taker_first) in [
+        (
+            bound(IndexDescriptor::btree("e", "User", "email").unique(), 1),
+            false,
+        ),
+        (
+            bound(IndexDescriptor::btree("e", "User", "email").unique(), 1),
+            true,
+        ),
+        (
+            derived(bound(
+                IndexDescriptor::btree("e", "User", "email").unique(),
+                1,
+            )),
+            false,
+        ),
+        (
+            derived(bound(
+                IndexDescriptor::btree("e", "User", "email").unique(),
+                1,
+            )),
+            true,
+        ),
+    ] {
+        let what = format!(
+            "{:?}, taker first: {taker_first}",
+            index.maintenance.profile
+        );
+        let fx = open_engine();
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let store = LocalIndexStore::new(&fx.engine);
+        let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+        for valid_from in [100, 200] {
+            store
+                .stage_membership(
+                    &mut t,
+                    &index,
+                    &no_fields,
+                    version(valid_from),
+                    None,
+                    Some(&s("v")),
+                )
+                .unwrap();
+        }
+        commit(&mut t).unwrap();
+
+        let mut leaving = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+        let mut taking = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+        store
+            .stage_membership(
+                &mut leaving,
+                &index,
+                &no_fields,
+                version(100),
+                Some(&s("v")),
+                Some(&s("w")),
+            )
+            .unwrap();
+        enter(&store, &mut taking, &index, &s("v"), id(2));
+        let (first, second) = if taker_first {
+            (&mut taking, &mut leaving)
+        } else {
+            (&mut leaving, &mut taking)
+        };
+        commit(first).unwrap();
+        assert!(
+            commit(second).is_err(),
+            "{what}: the second commit is refused"
+        );
+
+        let claim = encode_unique_claim_key(1, &encode_tuple(&s("v")).unwrap());
+        assert!(
+            fx.engine.get(Partition::Idx, &claim).unwrap().is_some(),
+            "{what}: the value's revision stays while it is held"
+        );
+        let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+        assert_eq!(
+            store
+                .unique_conflict(&mut t, &index, &s("v"), id(2))
+                .unwrap(),
+            Some(id(1)),
+            "{what}: the other version still holds the value"
+        );
+    }
+}
+
 /// A list indexes each element; a value with no key indexes nothing and a
 /// lookup of it reports that the index cannot answer.
 #[test]
