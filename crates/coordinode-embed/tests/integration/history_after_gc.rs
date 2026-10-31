@@ -227,6 +227,92 @@ fn later_facts_leave_what_was_known_before() {
     }
 }
 
+/// The holder of a unique code at valid time `at`, as known at `as_of`.
+fn holder(db: &mut Database, at: i64, as_of: u64) -> Vec<String> {
+    let rows = db
+        .execute_cypher(&format!(
+            "MATCH (n:Thing) WHERE temporal_active_at(n, {at}) AND n.code = 'k' \
+             RETURN n.name AS name AS OF TIMESTAMP {as_of}"
+        ))
+        .unwrap_or_else(|e| panic!("as of {as_of} at {at}: {e}"));
+    rows.iter()
+        .map(|row| match row.get("name") {
+            Some(Value::String(name)) => name.clone(),
+            other => panic!("name {other:?}"),
+        })
+        .collect()
+}
+
+/// A unique code handed from one node to another at valid time `t`: a read
+/// known before the handover sees the first holder after `t`, one known
+/// after it sees the second, past the operational retention and after a
+/// reopen. Admission of the code is the same before and after: refused over
+/// either holder's time, admitted before the first.
+#[test]
+fn unique_ownership_and_its_history_survive_collection() {
+    let t: i64 = 1_000_000;
+    let take = |from: i64, to: i64| {
+        format!("CREATE (:Thing {{name: 'z', code: 'k', valid_from: {from}, valid_to: {to}}})")
+    };
+    // An admitted probe stays, so round `r` probes the free time before the
+    // first holder at an interval no earlier round took.
+    let admission = |db: &mut Database, r: i64| -> Vec<bool> {
+        [
+            take(t - 1, t + 1),
+            take(2 * t, 3 * t),
+            take(-(r + 1) * t, -r * t),
+        ]
+        .iter()
+        .map(|statement| match db.execute_cypher(statement) {
+            Ok(_) => true,
+            Err(DatabaseError::UniqueViolation { .. }) => false,
+            Err(e) => panic!("{statement}: {e}"),
+        })
+        .collect()
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (before, after, admitted) = {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.set_retention_window(Duration::from_secs(2));
+        for statement in [
+            "CREATE NODE TYPE Thing TEMPORAL WITH \
+             (name: STRING, code: STRING, valid_from: INT, valid_to: INT)",
+            "CREATE UNIQUE INDEX thing_code ON :Thing(code)",
+            "CREATE (:Thing {name: 'a', code: 'k', valid_from: 0})",
+        ] {
+            db.execute_cypher(statement)
+                .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        }
+        let before = mark(&mut db);
+        let tx = db.begin_transaction().expect("begin");
+        db.execute_in_transaction(tx, &format!("MATCH (n:Thing) SET n.valid_to = {t}"), None)
+            .expect("end the first holding");
+        db.execute_in_transaction(
+            tx,
+            &format!("CREATE (:Thing {{name: 'b', code: 'k', valid_from: {t}}})"),
+            None,
+        )
+        .expect("the second takes it");
+        db.commit_transaction(tx).expect("handover");
+        let after = mark(&mut db);
+        let admitted = admission(&mut db, 0);
+        assert_eq!(admitted, [false, false, true], "within the retention");
+        collect_history(&mut db);
+        assert!(
+            db.oldest_readable_timestamp().as_raw() > after,
+            "every read below is past the operational retention"
+        );
+        assert_eq!(admission(&mut db, 1), admitted, "after the collection");
+        (before, after, admitted)
+    };
+    let mut db = Database::open(dir.path()).expect("reopen");
+    db.set_retention_window(Duration::from_secs(2));
+    assert_eq!(holder(&mut db, 2 * t, before), ["a"], "known before");
+    assert_eq!(holder(&mut db, 2 * t, after), ["b"], "known after");
+    assert_eq!(holder(&mut db, t - 1, after), ["a"], "a until t");
+    assert_eq!(admission(&mut db, 2), admitted, "after the reopen");
+}
+
 /// A read past the operational retention of a label whose carriers are not
 /// all temporal is refused as past the retention: their past was in the
 /// collected row versions only, and part of the answer is no answer. So is
