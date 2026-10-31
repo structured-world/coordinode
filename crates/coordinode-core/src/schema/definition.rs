@@ -846,6 +846,104 @@ impl LabelSchema {
     pub fn from_msgpack(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
         rmp_serde::from_slice(data)
     }
+
+    /// The kind and the implied labels of the definition encoded in `data`,
+    /// with its candidate in force when `candidate`, as
+    /// [`Self::from_msgpack`] followed by [`Self::candidate_schema`] would
+    /// give them: every other field is skipped unread, nothing of it
+    /// allocated.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded definition.
+    pub fn implication_facts_from_msgpack(
+        data: &[u8],
+        candidate: bool,
+    ) -> Result<ImplicationFacts, rmp_serde::decode::Error> {
+        let view: ImplicationView = rmp_serde::from_slice(data)?;
+        let implies = match view.candidate {
+            Some(CandidateView {
+                implies: Some(mut implies),
+                ..
+            }) if candidate => {
+                // As putting the candidate in force declares them.
+                implies.sort_unstable();
+                implies.dedup();
+                implies
+            }
+            _ => view.implies,
+        };
+        Ok(ImplicationFacts {
+            kind: view.kind,
+            implies,
+        })
+    }
+
+    /// An upper bound of the heap bytes
+    /// [`Self::implication_facts_from_msgpack`] takes for `len` encoded
+    /// bytes: each implied name is a string of at least one encoded byte,
+    /// so the names take at most the bytes and a slot each.
+    pub const fn implication_facts_bound(len: usize) -> usize {
+        len * (1 + core::mem::size_of::<String>())
+    }
+}
+
+/// What decides the labels a node of a label carries besides its stored
+/// ones, as [`LabelSchema::implication_facts_from_msgpack`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplicationFacts {
+    /// The label's kind.
+    pub kind: LabelKind,
+    /// The labels it implies, as declared.
+    pub implies: Vec<String>,
+}
+
+/// [`LabelSchema`] as encoded, every field but the implication's skipped.
+/// The fields carry the definition's names and order, so either encoding
+/// of a struct, as a list or as a map, reads the same fields.
+#[derive(Deserialize)]
+struct ImplicationView {
+    #[serde(rename = "name")]
+    _name: serde::de::IgnoredAny,
+    #[serde(rename = "properties")]
+    _properties: serde::de::IgnoredAny,
+    #[serde(rename = "mode")]
+    _mode: serde::de::IgnoredAny,
+    #[serde(rename = "placement")]
+    _placement: serde::de::IgnoredAny,
+    #[serde(rename = "shard_keys")]
+    _shard_keys: serde::de::IgnoredAny,
+    #[serde(rename = "schema_revision")]
+    _schema_revision: serde::de::IgnoredAny,
+    #[serde(rename = "temporal")]
+    _temporal: serde::de::IgnoredAny,
+    #[serde(rename = "primary_key", default)]
+    _primary_key: serde::de::IgnoredAny,
+    #[serde(rename = "storage_layout", default)]
+    _storage_layout: serde::de::IgnoredAny,
+    #[serde(rename = "keyed_by_row_id", default)]
+    _keyed_by_row_id: serde::de::IgnoredAny,
+    #[serde(rename = "constraints", default)]
+    _constraints: serde::de::IgnoredAny,
+    #[serde(default)]
+    candidate: Option<CandidateView>,
+    #[serde(default)]
+    kind: LabelKind,
+    #[serde(default)]
+    implies: Vec<String>,
+}
+
+/// [`LabelCandidate`] as encoded, all but its implications skipped.
+#[derive(Deserialize)]
+struct CandidateView {
+    #[serde(rename = "properties")]
+    _properties: serde::de::IgnoredAny,
+    #[serde(rename = "mode")]
+    _mode: serde::de::IgnoredAny,
+    #[serde(default)]
+    implies: Option<Vec<String>>,
+    #[serde(rename = "operation")]
+    _operation: serde::de::IgnoredAny,
 }
 
 /// Placement policy for edges relative to their endpoint nodes.

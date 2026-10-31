@@ -189,8 +189,9 @@ impl<'a> CatalogMembership<'a> {
             return Ok(*id);
         }
         let id = LocalSchemaStore::new(self.engine).label_id_at(self.view(), name)?;
-        // The name, and its entry with room for the map to double.
-        self.charge(name.len() + 2 * core::mem::size_of::<(String, Option<LabelId>)>())?;
+        // The name, and its entry three times over with its control byte:
+        // a hash map holds a little over twice the room its entries take.
+        self.charge(name.len() + 3 * (core::mem::size_of::<(String, Option<LabelId>)>() + 1))?;
         self.ids.insert(name.to_string(), id);
         Ok(id)
     }
@@ -211,20 +212,37 @@ impl<'a> CatalogMembership<'a> {
 
     /// What the catalog says about label `id` under the view.
     fn facts(&mut self, id: LabelId) -> Result<LabelFacts, StoreError> {
-        let (name, schema) = LocalSchemaStore::new(self.engine).identity_at(self.view(), id)?;
-        let Some(mut schema) = schema else {
+        // The name and the implied names live while the facts are read:
+        // charged before each is decoded and released after.
+        let mut read = self.budget.map(|b| b.empty_charge());
+        let (name, facts) = LocalSchemaStore::new(self.engine).implication_facts_at(
+            self.view(),
+            id,
+            self.candidates,
+            &mut |bytes| {
+                if let Some(read) = read.as_mut() {
+                    // Bytes of memory about to exist: fits in u64.
+                    read.grow(bytes as u64)?;
+                }
+                Ok(())
+            },
+        )?;
+        let Some(facts) = facts else {
             return Ok(LabelFacts::default());
         };
-        if self.candidates
-            && let Some(candidate) = schema.candidate_schema()
-        {
-            schema = candidate;
-        }
-        // The implications kept for the walk, and the label's slot in the
-        // closure it builds, with room for that to double.
-        self.charge((schema.implies().len() + 2) * core::mem::size_of::<LabelId>())?;
-        let mut implies = Vec::with_capacity(schema.implies().len());
-        for implied in schema.implies() {
+        // Kept for the rest of the pass, each `n` implications: the list
+        // built here and its shared copy (2n); the walk's pending stack,
+        // which takes each of them once and grows to at most twice what it
+        // holds (2n); and the label's own slot in the closure, which also
+        // grows to at most twice what it holds and is copied once into the
+        // compiled slice (3). Every label the walk visits is read here once,
+        // so this covers the whole walk.
+        let n = facts.implies.len();
+        self.charge(
+            (4 * n + 3) * core::mem::size_of::<LabelId>() + 2 * core::mem::size_of::<usize>(),
+        )?;
+        let mut implies = Vec::with_capacity(n);
+        for implied in &facts.implies {
             let Some(implied_id) = self.label_id(implied)? else {
                 return Err(StoreError::Invariant(format!(
                     ":{name} implies :{implied}, which has no identity"
@@ -232,8 +250,9 @@ impl<'a> CatalogMembership<'a> {
             };
             implies.push(implied_id);
         }
+        drop(read);
         Ok(LabelFacts {
-            kind: schema.kind(),
+            kind: facts.kind,
             implies: implies.into(),
         })
     }
@@ -259,13 +278,14 @@ impl<'a> CatalogMembership<'a> {
     ) -> Result<Membership<'r>, StoreError> {
         if let Some(&primary) = stored.first() {
             if self.implied.implied(primary).is_none() {
-                // The compiled type's entry, with room for the map to double;
-                // its labels are charged as the walk reads them.
+                // The compiled type's entry three times over with its control
+                // byte, as a hash map holds it; its labels are charged as the
+                // walk reads them.
                 self.charge(
-                    2 * core::mem::size_of::<(
+                    3 * (core::mem::size_of::<(
                         LabelId,
                         coordinode_core::schema::labels::ImpliedLabels,
-                    )>(),
+                    )>() + 1),
                 )?;
             }
             let mut implied = core::mem::take(&mut self.implied);

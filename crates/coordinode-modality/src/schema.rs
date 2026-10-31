@@ -408,6 +408,70 @@ impl<'a> LocalSchemaStore<'a> {
         Ok((name, schema))
     }
 
+    /// What label `id` makes its nodes carry as `snapshot` reads the
+    /// catalog: the name it was allocated for and, while that name is bound
+    /// to `id` with a definition, its kind and implied labels, in force or
+    /// with its candidate in force (`candidate`); as
+    /// [`Self::identity_at`] would give them, without the rest of the
+    /// definition. Every byte decoded is passed to `charge` before it is
+    /// decoded: the name record's, and a bound of what the implications take.
+    ///
+    /// # Errors
+    ///
+    /// A storage or decode failure, an id without an identity record, or
+    /// what `charge` returns.
+    pub fn implication_facts_at(
+        &self,
+        snapshot: coordinode_storage::engine::StorageSnapshot,
+        id: LabelId,
+        candidate: bool,
+        charge: &mut dyn FnMut(usize) -> StoreResult<()>,
+    ) -> StoreResult<(
+        String,
+        Option<coordinode_core::schema::definition::ImplicationFacts>,
+    )> {
+        let Some(name) = self.engine.get(Partition::Schema, &label_id_key(id))? else {
+            return Err(StoreError::Decode {
+                kind: "label identity",
+                message: format!("label {id} has no identity record"),
+            });
+        };
+        charge(name.len())?;
+        let name = decode_label_name(id, name.to_vec())?;
+        if self.label_id_at(snapshot, &name)? != Some(id) {
+            return Ok((name, None));
+        }
+        let pointer_key = encode_label_current_revision_key(&name);
+        let Some(binding) = self
+            .engine
+            .snapshot_get(&snapshot, Partition::Schema, &pointer_key)?
+            .map(|bytes| decode_binding(&name, &bytes))
+            .transpose()?
+        else {
+            return Ok((name, None));
+        };
+        let revision = binding.declared_revision();
+        if revision == 0 {
+            return Ok((name, None));
+        }
+        let Some(body) = self.engine.snapshot_get(
+            &snapshot,
+            Partition::Schema,
+            &encode_label_schema_key(binding.id, revision),
+        )?
+        else {
+            return Err(missing_revision(&name, revision));
+        };
+        charge(LabelSchema::implication_facts_bound(body.len()))?;
+        let facts = LabelSchema::implication_facts_from_msgpack(&body, candidate).map_err(|e| {
+            StoreError::Decode {
+                kind: "label schema",
+                message: format!("decode failed for '{name}' rev {revision}: {e}"),
+            }
+        })?;
+        Ok((name, Some(facts)))
+    }
+
     /// The identity `name` is bound to, binding an implicit one when it has
     /// none, committed at once: for an engine written without a proposal
     /// pipeline (a test, a tool, a direct-mode statement), deciding exactly as

@@ -32,7 +32,9 @@
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::derive::{EntryOwner, entry, membership_effects, tuples};
+use coordinode_core::index::derive::{
+    EntryOwner, KeyTooLong, MAX_INDEX_KEY_LEN, effects_of, entry, tuples, tuples_within,
+};
 use coordinode_core::index::encoding::{
     decode_entry, decode_entry_parts, encode_element, encode_tuple, encode_unique_claim_key,
     entries_prefix, entry_value_prefix, generation_ranges,
@@ -49,7 +51,7 @@ use crate::error::{StoreError, StoreResult};
 use crate::index_def::{
     CopyQualification, DuplicateRepairRecord, GenerationId, IndexBuildRecord, IndexDefinition,
     IndexDescriptor, IndexId, IndexIntegrityRecord, IndexProfile, LabelCertificationRecord,
-    NamespaceIndexPolicy,
+    NamespaceIndexPolicy, SelectionPart,
 };
 
 /// One label's members in one shard of a label lookup: what
@@ -1075,17 +1077,15 @@ fn fit_buffer<E>(
 fn advance_ownership(
     txn: &mut Transaction,
     index: &IndexDefinition,
-    old: Option<&[Value]>,
-    new: Option<&[Value]>,
+    before: &[Vec<u8>],
+    after: &[Vec<u8>],
 ) -> StoreResult<()> {
-    let before = old.map(tuples).unwrap_or_default();
-    let after = new.map(tuples).unwrap_or_default();
-    for tuple in &before {
+    for tuple in before {
         if after.binary_search(tuple).is_err() {
             advance_revision(txn, index, tuple)?;
         }
     }
-    for tuple in &after {
+    for tuple in after {
         if before.binary_search(tuple).is_err() {
             advance_revision(txn, index, tuple)?;
         }
@@ -1186,6 +1186,56 @@ fn decode_index_id(bytes: &[u8]) -> StoreResult<IndexId> {
 }
 
 impl LocalIndexStore<'_> {
+    /// The definitions holding a part that `wanted` picks, in identity
+    /// order, read for placement
+    /// ([`IndexDefinition::for_placement_from_msgpack`]): of every other
+    /// definition only its parts are decoded. Each decode is charged to
+    /// `charge` before it is made, with its bound, as is the list.
+    ///
+    /// # Errors
+    ///
+    /// A storage or decode failure, or what `charge` returns.
+    pub fn definitions_with_part(
+        &self,
+        wanted: impl Fn(&SelectionPart) -> bool,
+        charge: &mut dyn FnMut(usize) -> StoreResult<()>,
+    ) -> StoreResult<Vec<IndexDefinition>> {
+        let mut out: Vec<IndexDefinition> = Vec::new();
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, IndexDefinition::SCHEMA_PREFIX)?
+        {
+            let (key, value) = guard.into_inner()?;
+            charge(IndexDefinition::selection_bound(value.len()))?;
+            let parts = IndexDefinition::selection_from_msgpack(&value).map_err(|e| {
+                StoreError::Storage(StorageError::UnreadableCatalog {
+                    kind: "index definition",
+                    key: coordinode_storage::error::printable_key(&key),
+                    detail: e.to_string(),
+                })
+            })?;
+            if !parts.iter().any(&wanted) {
+                continue;
+            }
+            charge(IndexDefinition::for_placement_bound(value.len()))?;
+            if out.len() == out.capacity() {
+                let more = out.len().max(4);
+                charge(more * core::mem::size_of::<IndexDefinition>())?;
+                out.reserve_exact(more);
+            }
+            out.push(
+                IndexDefinition::for_placement_from_msgpack(&value).map_err(|e| {
+                    StoreError::Storage(StorageError::UnreadableCatalog {
+                        kind: "index definition",
+                        key: coordinode_storage::error::printable_key(&key),
+                        detail: e.to_string(),
+                    })
+                })?,
+            );
+        }
+        Ok(out)
+    }
+
     /// The allocator as this transaction sees it, conditioning the
     /// transaction on the record it read. A transaction that already
     /// allocated reads its own staged record, which is conditioned already.
@@ -1226,9 +1276,26 @@ impl IndexStore for LocalIndexStore<'_> {
         old: Option<&[Value]>,
         new: Option<&[Value]>,
     ) -> StoreResult<usize> {
-        let effects = membership_effects(index.generation, owner, old, new);
+        // The tuples and effects live while the writes are staged: charged
+        // to the transaction's budget before each is built, and released
+        // with them. The charge holds the budget's handle only when there is
+        // a budget.
+        let budget = txn.write_budget();
+        let mut held = budget.as_deref().map(|b| b.empty_charge());
+        let mut charge = |bytes: usize| -> StoreResult<()> {
+            if let Some(held) = held.as_mut() {
+                // Bytes of memory about to exist: fits in u64.
+                held.grow(bytes as u64)?;
+            }
+            Ok(())
+        };
+        let before = old.map(|v| tuples_within(v, &mut charge)).transpose()?;
+        let after = new.map(|v| tuples_within(v, &mut charge)).transpose()?;
+        let before = before.as_deref().unwrap_or_default();
+        let after = after.as_deref().unwrap_or_default();
+        let effects = effects_of(index.generation, owner, before, after, &mut charge)?;
         if index.unique {
-            advance_ownership(txn, index, old, new)?;
+            advance_ownership(txn, index, before, after)?;
         }
         let puts = effects.iter().filter(|e| e.value.is_some()).count();
         match index.maintenance.profile {
@@ -2299,15 +2366,40 @@ impl IndexStore for LocalIndexStore<'_> {
         tuple: &[u8],
     ) -> StoreResult<Vec<NodeId>> {
         let prefix = entry_value_prefix(index.generation, tuple);
-        let mut out: Vec<NodeId> = Vec::new();
-        for (key, _) in txn.prefix_scan(Partition::Idx, &prefix)? {
-            // A node's versions sort together, so one node is one run.
-            if let Some((id, _)) = decode_entry(index.generation, &key)
-                && out.last().map(|n| n.as_raw()) != Some(id)
-            {
-                out.push(NodeId::from_raw(id));
+        // Streamed, never copied: the holders alone are kept, each growth of
+        // the list charged to the transaction's budget before it is taken.
+        let write_budget = txn.write_budget();
+        let unbounded;
+        let budget = match write_budget.as_deref() {
+            Some(budget) => budget,
+            None => {
+                unbounded = coordinode_core::budget::QueryBudget::new(u64::MAX);
+                &unbounded
             }
-        }
+        };
+        let mut out: Vec<NodeId> = Vec::new();
+        txn.prefix_for_each(
+            Partition::Idx,
+            &prefix,
+            budget,
+            |key, _| -> StoreResult<()> {
+                // A node's versions sort together, so one node is one run.
+                if let Some((id, _)) = decode_entry(index.generation, key)
+                    && out.last().map(|n| n.as_raw()) != Some(id)
+                {
+                    if out.len() == out.capacity() {
+                        let more = out.len().max(4);
+                        // Bytes of memory about to exist: fits in u64.
+                        budget
+                            .reserve((more * core::mem::size_of::<NodeId>()) as u64)?
+                            .keep_until_query_ends();
+                        out.reserve_exact(more);
+                    }
+                    out.push(NodeId::from_raw(id));
+                }
+                Ok(())
+            },
+        )?;
         Ok(out)
     }
 
@@ -2345,6 +2437,11 @@ impl IndexStore for LocalIndexStore<'_> {
         version: Option<u64>,
     ) -> StoreResult<()> {
         let (key, value) = entry(index.generation, tuple, owner);
+        // An entry too long to store was never stored, and cannot be given
+        // back: the record holding its value cannot be indexed.
+        if key.len() > MAX_INDEX_KEY_LEN {
+            return Err(KeyTooLong { len: key.len() }.into());
+        }
         // The condition before the write it guards: a direct-mode engine
         // decides a condition when it is stated.
         txn.expect_version(Partition::Idx, &key, version)?;

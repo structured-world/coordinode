@@ -205,6 +205,12 @@ pub fn append_entry_key(
     }
 }
 
+/// The length of the key [`append_entry_key`] writes for a tuple of
+/// `tuple_len` bytes, of a node version when `versioned`.
+pub const fn entry_key_len(tuple_len: usize, versioned: bool) -> usize {
+    GENERATION_PREFIX_LEN + tuple_len + 1 + 8 + if versioned { 8 } else { 0 }
+}
+
 /// Entry of the version of temporal node `node_id` that starts at
 /// `valid_from` under `tuple` in the non-unique `generation`:
 /// `<prefix><tuple>:<node_id u64 BE><valid_from>`, empty value, with

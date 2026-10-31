@@ -238,7 +238,9 @@ fn a_commit_journals_the_work_and_applies_the_entry() {
     let oracle = Arc::new(TimestampOracle::new());
     let engine = StorageEngine::open_embedded(&config, oracle.clone()).expect("open");
     let index = binding().interpretation;
-    let effects = index.membership_effects(node(5), None, Some(&[s("a")]));
+    let effects = index
+        .membership_effects(node(5), None, Some(&[s("a")]))
+        .expect("fits");
     let entry = effects[0].key.clone();
 
     let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());

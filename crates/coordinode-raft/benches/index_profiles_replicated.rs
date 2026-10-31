@@ -154,6 +154,7 @@ fn unit(id_gen: &ProposalIdGenerator, n: u64, derived: bool) -> RaftProposal {
                 None,
                 Some(&[Value::String(email)]),
             )
+            .expect("a short email fits a key")
             .pop()
             .expect("one entry");
         Mutation::Put {

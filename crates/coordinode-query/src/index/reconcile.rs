@@ -138,11 +138,29 @@ impl Reconcile<'_> {
                 Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
                 None => Transaction::begin(self.engine, None, Timestamp::ZERO),
             };
+            // One budget per page, of the configured bytes: the definitions
+            // the page places under, the label scratch and the cursor the pass
+            // still holds, then what the page reads, keeps, decodes and
+            // stages, and the catalog facts it learns, each before the memory
+            // is taken.
+            let page_budget =
+                std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(self.page_bytes));
+            txn.charge_writes_to(Some(std::sync::Arc::clone(&page_budget)));
+            let charge = |bytes: usize| -> Result<(), coordinode_core::budget::BudgetStop> {
+                // Bytes of memory about to exist: fits in u64.
+                page_budget.reserve(bytes as u64)?.keep_until_query_ends();
+                Ok(())
+            };
             // Read for each page, each bound to the record as read: one the
             // conclusion moved refuses the page.
-            let mut placing: Vec<Placing> = Vec::new();
+            let defs = store.definitions_with_part(
+                |p| p.operation == self.operation && p.state == PartState::Proposed,
+                &mut |bytes| Ok(charge(bytes)?),
+            )?;
+            charge(defs.len() * core::mem::size_of::<Placing>())?;
+            let mut placing: Vec<Placing> = Vec::with_capacity(defs.len());
             let mut moved = false;
-            for def in store.list_definitions()? {
+            for def in defs {
                 let Some(part) = def
                     .selection
                     .iter()
@@ -171,20 +189,8 @@ impl Reconcile<'_> {
             let view = txn.snapshot().ok_or_else(|| {
                 StoreError::Invariant("a reconciliation page reads at no snapshot".into())
             })?;
-            // One budget per page, of the configured bytes: the label scratch
-            // the pass still holds first, then what the page reads, keeps,
-            // decodes and stages, and the catalog facts it learns, each
-            // before the memory is taken.
-            let page_budget =
-                std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(self.page_bytes));
-            txn.charge_writes_to(Some(std::sync::Arc::clone(&page_budget)));
-            let charge = |bytes: usize| -> Result<(), coordinode_core::budget::BudgetStop> {
-                // Bytes of memory about to exist: fits in u64.
-                page_budget.reserve(bytes as u64)?.keep_until_query_ends();
-                Ok(())
-            };
             let mut staged = || -> Result<_, BackfillError> {
-                charge(scratch_held)?;
+                charge(scratch_held + start_after.as_ref().map_or(0, Vec::capacity))?;
                 let mut in_force =
                     CatalogMembership::at(self.engine, view).charged_to(&page_budget);
                 let mut candidate =

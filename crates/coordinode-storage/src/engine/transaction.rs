@@ -746,6 +746,13 @@ impl<'a> Transaction<'a> {
         self.admit_staged(bytes)
     }
 
+    /// The budget [`Self::charge_writes_to`] set, for memory a caller holds
+    /// only while it stages writes: it charges that memory there and releases
+    /// the charge when the memory is freed.
+    pub fn write_budget(&self) -> Option<std::sync::Arc<coordinode_core::budget::QueryBudget>> {
+        self.write_budget.clone()
+    }
+
     /// The refusal that stopped staging, when a write did not fit the
     /// statement's budget. Nothing was staged after it; commit refuses.
     pub fn budget_refusal(&self) -> Option<coordinode_core::budget::BudgetStop> {

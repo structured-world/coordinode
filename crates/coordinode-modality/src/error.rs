@@ -62,6 +62,11 @@ pub enum StoreError {
     #[error(transparent)]
     Budget(#[from] coordinode_core::budget::BudgetStop),
 
+    /// An index entry the write would enter has a key longer than a key may
+    /// be; nothing of the write was staged.
+    #[error(transparent)]
+    KeyTooLong(#[from] coordinode_core::index::derive::KeyTooLong),
+
     /// A vector index refused a vector its metric cannot evaluate; nothing
     /// was indexed.
     #[error(transparent)]

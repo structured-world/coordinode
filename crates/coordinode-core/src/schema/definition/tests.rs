@@ -836,6 +836,46 @@ fn a_candidate_replaces_the_implications_only_when_activated() {
     );
 }
 
+/// The implication facts read from an encoded definition are the full
+/// decode's: its kind and implications in force, or with its candidate in
+/// force, falling back to those in force for a candidate leaving them as
+/// they are and for a definition without one; for a type and an auxiliary
+/// label, with properties and constraints skipped.
+#[test]
+fn the_implication_facts_read_alone_match_the_full_definition() {
+    let mut base = LabelSchema::new_node_id("Goal");
+    for n in 0..50 {
+        base.add_property(PropertyDef::new(format!("p{n}"), PropertyType::String));
+    }
+    base.set_implies(vec!["Thing".into()]);
+    let candidate = |implies: Option<Vec<String>>| super::LabelCandidate {
+        properties: std::collections::BTreeMap::new(),
+        mode: base.mode,
+        implies,
+        operation: crate::index::identity::GenerationId::from_raw(4),
+    };
+    let mut leaving = base.clone();
+    leaving.set_candidate(candidate(None));
+    let mut changing = base.clone();
+    changing.set_candidate(candidate(Some(vec!["Work".into(), "Thing".into()])));
+    let mut auxiliary = LabelSchema::new_node_id("Tag");
+    auxiliary.kind = LabelKind::Auxiliary;
+
+    for schema in [base, leaving, changing, auxiliary] {
+        let bytes = schema.to_msgpack().expect("encode");
+        for candidate in [false, true] {
+            let full = match candidate {
+                true => schema.candidate_schema().unwrap_or_else(|| schema.clone()),
+                false => schema.clone(),
+            };
+            let facts =
+                LabelSchema::implication_facts_from_msgpack(&bytes, candidate).expect("facts");
+            assert_eq!(facts.kind, full.kind());
+            assert_eq!(facts.implies, full.implies(), "{} {candidate}", schema.name);
+        }
+    }
+}
+
 /// The kinds tell apart what each one checks: presence, per-node checking
 /// and index ownership.
 #[test]

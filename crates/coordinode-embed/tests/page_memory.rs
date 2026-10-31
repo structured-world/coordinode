@@ -211,6 +211,64 @@ fn the_projection_bound_covers_its_decode() {
     }
 }
 
+/// The combinations of a compound key over two lists are refused before
+/// any is built: two lists of three hundred strings make ninety thousand
+/// tuples of megabytes, and a budget refusing the combinations leaves only
+/// the encoding of the six hundred elements allocated. Building them and
+/// charging afterwards would allocate them all first.
+#[test]
+fn compound_combinations_are_refused_before_they_are_built() {
+    use coordinode_core::index::derive::tuples_within;
+    let list = |p: &str| {
+        Value::Array(
+            (0..300)
+                .map(|n| Value::String(format!("{p}{n:05}{}", "x".repeat(20))))
+                .collect(),
+        )
+    };
+    let values = [list("a"), list("b")];
+    let limit = 64 * 1024;
+    let budget = QueryBudget::new(limit);
+    let (refused, allocated) = allocated_by(|| {
+        tuples_within(&values, |bytes| {
+            budget.reserve(bytes as u64)?.keep_until_query_ends();
+            Ok::<(), coordinode_core::budget::BudgetStop>(())
+        })
+    });
+    assert!(refused.is_err(), "the combinations fit {limit} bytes");
+    assert!(
+        allocated < 2 * limit as usize,
+        "{allocated} bytes allocated before the refusal"
+    );
+    assert!(budget.memory_peak() <= budget.memory_limit());
+}
+
+/// Reading what a label implies from its stored definition allocates the
+/// implied names alone, within the bound charged for it, whatever else the
+/// definition declares: a thousand properties are skipped unread.
+#[test]
+fn the_implication_facts_skip_the_rest_of_the_definition() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+    let mut schema = LabelSchema::new_node_id("Wide");
+    for n in 0..1000 {
+        schema.add_property(PropertyDef::new(
+            format!("property_{n:04}_{}", "x".repeat(40)),
+            PropertyType::String,
+        ));
+    }
+    schema.set_implies(vec!["Thing".into(), "Work".into()]);
+    let bytes = schema.to_msgpack().expect("encode");
+    let bound = LabelSchema::implication_facts_bound(bytes.len());
+    let (facts, allocated) =
+        allocated_by(|| LabelSchema::implication_facts_from_msgpack(&bytes, false).expect("facts"));
+    assert_eq!(facts.implies, ["Thing", "Work"]);
+    assert!(allocated <= bound, "{allocated} allocated, {bound} bound");
+    assert!(
+        allocated < 1024,
+        "{allocated} bytes allocated for two names: the properties were decoded"
+    );
+}
+
 /// The labels a record's header counts are what decoding them allocates.
 #[test]
 fn the_labels_length_covers_their_decode() {

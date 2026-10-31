@@ -31,6 +31,7 @@ mod integration {
     mod historical_index;
     mod hnsw;
     mod index_builds;
+    mod index_key_length;
     mod index_profiles;
     mod index_repair;
     mod interactive_txn;

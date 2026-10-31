@@ -181,6 +181,54 @@ impl core::fmt::Display for IndexDefinition {
     }
 }
 
+/// [`IndexDefinition`] as encoded, all but its parts skipped.
+#[derive(Deserialize)]
+struct SelectionView {
+    #[serde(rename = "id")]
+    _id: serde::de::IgnoredAny,
+    #[serde(rename = "generation")]
+    _generation: serde::de::IgnoredAny,
+    #[serde(rename = "descriptor")]
+    _descriptor: serde::de::IgnoredAny,
+    selection: Vec<SelectionPart>,
+}
+
+/// [`IndexDefinition`] as encoded, its descriptor read as
+/// [`PlacementDescriptor`]. The fields carry the definition's names and
+/// order, so either encoding of a struct reads the same fields.
+#[derive(Deserialize)]
+struct PlacementView {
+    id: IndexId,
+    generation: GenerationId,
+    descriptor: PlacementDescriptor,
+    selection: Vec<SelectionPart>,
+}
+
+/// [`IndexDescriptor`] as encoded, its vector and text configurations
+/// skipped.
+#[derive(Deserialize)]
+struct PlacementDescriptor {
+    name: Option<String>,
+    description: Option<String>,
+    label: String,
+    properties: Vec<String>,
+    index_type: IndexType,
+    unique: bool,
+    sparse: bool,
+    multikey: bool,
+    filter: Option<PartialFilter>,
+    ttl_seconds: Option<u64>,
+    #[serde(rename = "vector_config")]
+    _vector_config: serde::de::IgnoredAny,
+    #[serde(rename = "text_config")]
+    _text_config: serde::de::IgnoredAny,
+    state: IndexState,
+    online_during_build: OnlineDuringBuild,
+    layout: u32,
+    maintenance: IndexMaintenance,
+    owner: Option<String>,
+}
+
 /// What an index is, as DDL declares it and its catalog record keeps it:
 /// everything but the identities the catalog gives it at publication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,7 +609,81 @@ impl IndexDescriptor {
     }
 }
 
+/// A vector decoded from a list of `n` elements holds at most twice `n`
+/// slots: its decoder sets room for the whole list up to a cap, and grows by
+/// doubling past it.
+const LIST_ROOM: usize = 2;
+
 impl IndexDefinition {
+    /// The parts of the definition encoded in `bytes`, nothing else of it
+    /// decoded: what a pass looking for the indexes a certification touches
+    /// reads of every index.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded definition.
+    pub fn selection_from_msgpack(
+        bytes: &[u8],
+    ) -> Result<Vec<SelectionPart>, rmp_serde::decode::Error> {
+        let view: SelectionView = rmp_serde::from_slice(bytes)?;
+        Ok(view.selection)
+    }
+
+    /// An upper bound of the heap bytes [`Self::selection_from_msgpack`]
+    /// takes for `len` encoded bytes: each part takes at least a byte.
+    pub const fn selection_bound(len: usize) -> usize {
+        LIST_ROOM * len * core::mem::size_of::<SelectionPart>()
+    }
+
+    /// The definition encoded in `bytes` without its vector and text
+    /// configurations, which are skipped unread: all a label lookup or a
+    /// B-tree index holds, so for those it is the definition as stored.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded definition.
+    pub fn for_placement_from_msgpack(bytes: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+        let view: PlacementView = rmp_serde::from_slice(bytes)?;
+        let d = view.descriptor;
+        Ok(Self {
+            id: view.id,
+            generation: view.generation,
+            descriptor: IndexDescriptor {
+                name: d.name,
+                description: d.description,
+                label: d.label,
+                properties: d.properties,
+                index_type: d.index_type,
+                unique: d.unique,
+                sparse: d.sparse,
+                multikey: d.multikey,
+                filter: d.filter,
+                ttl_seconds: d.ttl_seconds,
+                vector_config: None,
+                text_config: None,
+                state: d.state,
+                online_during_build: d.online_during_build,
+                layout: d.layout,
+                maintenance: d.maintenance,
+                owner: d.owner,
+            },
+            selection: view.selection,
+        })
+    }
+
+    /// An upper bound of the heap bytes [`Self::for_placement_from_msgpack`]
+    /// takes for `len` encoded bytes. What it decodes holds strings, whose
+    /// bytes are encoded bytes, and lists of names and of parts, each element
+    /// at least a byte: so no more than the bytes and a slot per byte.
+    pub const fn for_placement_bound(len: usize) -> usize {
+        let slot = if core::mem::size_of::<String>() > core::mem::size_of::<SelectionPart>() {
+            core::mem::size_of::<String>()
+        } else {
+            core::mem::size_of::<SelectionPart>()
+        };
+        len * (1 + LIST_ROOM * slot)
+    }
+
     /// The key scopes holding the entries of `label` under `interpretation`:
     /// the index's own, then each part that interpretation reads. Disjoint
     /// by construction, so a node is in at most one of them, and the label's

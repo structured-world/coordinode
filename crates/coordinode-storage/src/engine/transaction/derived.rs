@@ -114,7 +114,9 @@ impl DerivedLedger {
                 .binding
                 .interpretation
                 .membership_effects(change.owner, change.old.as_deref(), change.new.as_deref())
-                .len();
+                // Staging derived these effects already and refused a key
+                // too long to store, so none is left to refuse here.
+                .map_or(0, |effects| effects.len());
             if sealed > max {
                 return Err(max);
             }

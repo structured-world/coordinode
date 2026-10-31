@@ -130,6 +130,115 @@ fn lists_index_each_distinct_element() {
     assert!(tuples(&[Value::Float(f64::NAN)]).is_empty());
 }
 
+/// An entry whose key is exactly as long as a key may be is entered; one a
+/// byte longer is refused, whether the length comes from plain bytes or from
+/// zero bytes the encoding escapes to two. Leaving an entry too long to be
+/// stored removes nothing.
+#[test]
+fn an_entry_key_past_the_longest_key_is_refused() {
+    use super::super::encoding::entry_key_len;
+    let index = interp(false, false, None);
+    let node = EntryOwner::node(7);
+    let overhead = encode_tuple(&[s("")]).expect("empty").len();
+    let fitting = MAX_INDEX_KEY_LEN - entry_key_len(0, false) - overhead;
+    let at_limit = [s(&"k".repeat(fitting))];
+    let effects = index
+        .membership_effects(node, None, Some(&at_limit))
+        .expect("a key of the longest length is held");
+    assert_eq!(effects[0].key.len(), MAX_INDEX_KEY_LEN);
+
+    let past = [s(&"k".repeat(fitting + 1))];
+    assert_eq!(
+        index.membership_effects(node, None, Some(&past)),
+        Err(KeyTooLong {
+            len: MAX_INDEX_KEY_LEN + 1
+        })
+    );
+    // Zero bytes encode as two bytes each.
+    let zeros = [s(&"\0".repeat(fitting / 2 + 1))];
+    assert!(matches!(
+        index.membership_effects(node, None, Some(&zeros)),
+        Err(KeyTooLong { len }) if len > MAX_INDEX_KEY_LEN
+    ));
+    // A compound of two values each within the limit, together past it.
+    let half = [
+        s(&"a".repeat(fitting / 2 + 1)),
+        s(&"b".repeat(fitting / 2 + 1)),
+    ];
+    assert!(index.membership_effects(node, None, Some(&half)).is_err());
+
+    assert_eq!(
+        index.membership_effects(node, Some(&past), None),
+        Ok(Vec::new()),
+        "an entry that cannot be stored is not removed"
+    );
+    assert_eq!(
+        index.membership_effects(node, Some(&past), Some(&at_limit)),
+        Ok(effects)
+    );
+}
+
+/// The combinations of several lists are charged before any of them is
+/// built: two lists of a hundred elements refused at ten thousand
+/// combinations take only what encoding their two hundred elements took;
+/// granted, every byte the tuples hold was charged first. The tuples are
+/// those of the plain product.
+#[test]
+fn the_combinations_of_lists_are_charged_before_they_are_built() {
+    let list = |p: &str| Value::Array((0..100).map(|n| s(&format!("{p}{n:03}"))).collect());
+    let values = [list("a"), Value::Int(5), list("b")];
+
+    let mut charged = 0usize;
+    let refused = tuples_within(&values, |bytes| {
+        if bytes >= 10_000 * core::mem::size_of::<Vec<u8>>() {
+            return Err(charged);
+        }
+        charged += bytes;
+        Ok(())
+    });
+    let before_refusal = refused.expect_err("refused at the combinations");
+    assert!(
+        before_refusal < 20_000,
+        "{before_refusal} charged before the refusal"
+    );
+
+    let mut charged = 0usize;
+    let granted = tuples_within(&values, |bytes| {
+        charged += bytes;
+        Ok::<(), ()>(())
+    })
+    .expect("granted");
+    let held: usize = granted.iter().map(Vec::capacity).sum();
+    assert!(charged >= held, "{charged} charged for {held} held");
+
+    // The plain product, built value by value.
+    let mut product: Vec<Vec<Value>> = vec![Vec::new()];
+    for value in &values {
+        let items = match value {
+            Value::Array(items) => items.clone(),
+            other => vec![other.clone()],
+        };
+        product = product
+            .iter()
+            .flat_map(|combo| {
+                items.iter().map(move |item| {
+                    let mut next = combo.clone();
+                    next.push(item.clone());
+                    next
+                })
+            })
+            .collect();
+    }
+    let mut expected: Vec<Vec<u8>> = product
+        .iter()
+        .filter_map(|c| encode_tuple(c).ok())
+        .collect();
+    expected.sort_unstable();
+    expected.dedup();
+    assert_eq!(granted, expected);
+    assert_eq!(tuples(&values), expected);
+}
+
 /// Entering puts every tuple, leaving deletes every tuple, and a change
 /// touches only the tuples that differ.
 #[test]
@@ -140,7 +249,9 @@ fn membership_effects_are_the_difference_of_the_two_states() {
     let key = |t: &[u8]| encode_entry_key(GEN, t, 7);
     let node = EntryOwner::node(7);
 
-    let enter = index.membership_effects(node, None, Some(&[s("a")]));
+    let enter = index
+        .membership_effects(node, None, Some(&[s("a")]))
+        .expect("fits");
     assert_eq!(
         enter,
         vec![EntryEffect {
@@ -149,7 +260,9 @@ fn membership_effects_are_the_difference_of_the_two_states() {
         }]
     );
 
-    let leave = index.membership_effects(node, Some(&[s("a")]), None);
+    let leave = index
+        .membership_effects(node, Some(&[s("a")]), None)
+        .expect("fits");
     assert_eq!(
         leave,
         vec![EntryEffect {
@@ -160,7 +273,9 @@ fn membership_effects_are_the_difference_of_the_two_states() {
 
     let old = [Value::Array(vec![s("a"), s("b")])];
     let new = [Value::Array(vec![s("b"), s("c")])];
-    let change = index.membership_effects(node, Some(&old), Some(&new));
+    let change = index
+        .membership_effects(node, Some(&old), Some(&new))
+        .expect("fits");
     assert_eq!(
         change,
         vec![
@@ -177,6 +292,7 @@ fn membership_effects_are_the_difference_of_the_two_states() {
     assert!(
         index
             .membership_effects(node, Some(&[s("b")]), Some(&[s("b")]))
+            .expect("fits")
             .is_empty()
     );
 }
@@ -188,7 +304,9 @@ fn membership_effects_are_the_difference_of_the_two_states() {
 fn a_unique_entry_is_keyed_by_its_owner() {
     let index = interp(true, false, None);
     let a = encode_tuple(&[s("a")]).expect("a");
-    let nine = index.membership_effects(EntryOwner::node(9), None, Some(&[s("a")]));
+    let nine = index
+        .membership_effects(EntryOwner::node(9), None, Some(&[s("a")]))
+        .expect("fits");
     assert_eq!(
         nine,
         vec![EntryEffect {
@@ -196,7 +314,9 @@ fn a_unique_entry_is_keyed_by_its_owner() {
             value: Some(Vec::new()),
         }]
     );
-    let ten = index.membership_effects(EntryOwner::node(10), None, Some(&[s("a")]));
+    let ten = index
+        .membership_effects(EntryOwner::node(10), None, Some(&[s("a")]))
+        .expect("fits");
     assert_ne!(nine[0].key, ten[0].key);
 }
 
@@ -208,8 +328,12 @@ fn a_version_entry_carries_its_valid_from() {
     use crate::index::encoding::encode_version_entry_key;
     let index = interp(false, false, None);
     let a = encode_tuple(&[s("a")]).expect("a");
-    let first = index.membership_effects(EntryOwner::version(7, 100), None, Some(&[s("a")]));
-    let second = index.membership_effects(EntryOwner::version(7, 200), None, Some(&[s("a")]));
+    let first = index
+        .membership_effects(EntryOwner::version(7, 100), None, Some(&[s("a")]))
+        .expect("fits");
+    let second = index
+        .membership_effects(EntryOwner::version(7, 200), None, Some(&[s("a")]))
+        .expect("fits");
     assert_eq!(
         first,
         vec![EntryEffect {
@@ -219,7 +343,9 @@ fn a_version_entry_carries_its_valid_from() {
     );
     assert_ne!(first[0].key, second[0].key, "one entry per version");
     assert_eq!(
-        index.membership_effects(EntryOwner::version(7, 100), Some(&[s("a")]), None),
+        index
+            .membership_effects(EntryOwner::version(7, 100), Some(&[s("a")]), None)
+            .expect("fits"),
         vec![EntryEffect {
             key: encode_version_entry_key(GEN, &a, 7, 100),
             value: None,
@@ -237,11 +363,13 @@ fn a_version_leaving_a_unique_value_removes_only_its_entry() {
     let a = encode_tuple(&[s("a")]).expect("a");
     let b = encode_tuple(&[s("b")]).expect("b");
     assert_eq!(
-        index.membership_effects(
-            EntryOwner::version(9, 100),
-            Some(&[s("a")]),
-            Some(&[s("b")])
-        ),
+        index
+            .membership_effects(
+                EntryOwner::version(9, 100),
+                Some(&[s("a")]),
+                Some(&[s("b")])
+            )
+            .expect("fits"),
         vec![
             EntryEffect {
                 key: encode_version_entry_key(GEN, &a, 9, 100),
