@@ -256,6 +256,48 @@ fn a_uniqueness_check_returns_what_it_held() {
     assert_eq!(budget.memory_used(), 0, "a check kept what it held");
 }
 
+/// Looking for the definitions that keep parts of one operation charges each
+/// definition looked at only while it is looked at: three hundred
+/// definitions carrying parts of other operations are passed over within a
+/// budget of 64 KiB, and the budget holds nothing after. Charged for the
+/// rest of the call instead, the parts passed over would exceed it many
+/// times.
+#[test]
+fn definitions_passed_over_hold_nothing() {
+    let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    for n in 0..300u64 {
+        let mut def = bound(
+            IndexDescriptor::btree(format!("idx_{n}"), "Thing", "name"),
+            n + 1,
+        );
+        for label in 1..=20u32 {
+            def.propose_parts(
+                LabelId::new(label).unwrap(),
+                GenerationId::from_raw(10_000 + n),
+                GenerationId::from_raw(20_000 + n * 64 + u64::from(label) * 2),
+                GenerationId::from_raw(20_001 + n * 64 + u64::from(label) * 2),
+            );
+        }
+        store.put_definition_txn(&mut t, &def).unwrap();
+    }
+    commit(&mut t).unwrap();
+
+    let budget = coordinode_core::budget::QueryBudget::new(64 * 1024);
+    let wanted = GenerationId::from_raw(1);
+    let picked = store
+        .definitions_with_part(|p| p.operation == wanted, &budget)
+        .expect("passed over within the budget");
+    assert!(picked.is_empty());
+    assert_eq!(
+        budget.memory_used(),
+        0,
+        "a definition passed over stayed charged"
+    );
+}
+
 /// A unique value too long to have an entry, which its owner leaves for a
 /// short one, was never held: leaving it writes no ownership revision (whose
 /// key would be too long to store as well), and the short value is taken.
