@@ -98,6 +98,7 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::WriteBackpressure,
         Reason::NotLeader,
         Reason::OutsideRetention,
+        Reason::HistoryUncovered,
         Reason::InvalidWriteConcern,
         Reason::ReadNotReady,
         Reason::TextIndexNotReady,

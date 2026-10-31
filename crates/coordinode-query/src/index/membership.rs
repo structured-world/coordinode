@@ -83,12 +83,22 @@ pub fn label_carriers_in(
     Ok(Some(LabelCarriers { label, implying }))
 }
 
+/// Which state of the catalog a membership judges by.
+#[derive(Debug, Clone, Copy)]
+enum CatalogView {
+    /// The catalog as an operational snapshot reads it.
+    Snapshot(StorageSnapshot),
+    /// The catalog as it stood at a system time, read from its retained
+    /// binding history.
+    KnownAt(coordinode_core::txn::timestamp::Timestamp),
+}
+
 /// The membership of the records one pass reads, under one view of the
 /// catalog, pinned for the whole pass: every fact it judges by is of one
 /// committed state, never a mix of several.
 pub struct CatalogMembership<'a> {
     engine: &'a StorageEngine,
-    snapshot: StorageSnapshot,
+    view: CatalogView,
     /// Keeps the catalog of `snapshot` readable for the whole pass: no
     /// compaction collects a version it still judges by. `None` when the
     /// snapshot was already below the collection watermark, which the reads
@@ -127,6 +137,26 @@ impl<'a> CatalogMembership<'a> {
         Self::pinned(engine, snapshot, engine.pin_snapshot_at(snapshot))
     }
 
+    /// Membership under the catalog as it stood at system time `known_at`,
+    /// read from the retained binding history: it holds however long ago
+    /// `known_at` is, where an operational snapshot that old may be gone.
+    /// The facts in force then; a candidate published but not yet in force
+    /// was not the interpretation.
+    pub fn known_at(
+        engine: &'a StorageEngine,
+        known_at: coordinode_core::txn::timestamp::Timestamp,
+    ) -> Self {
+        Self {
+            engine,
+            view: CatalogView::KnownAt(known_at),
+            _pin: None,
+            implied: ImpliedCache::default(),
+            ids: rustc_hash::FxHashMap::default(),
+            candidates: false,
+            budget: None,
+        }
+    }
+
     fn pinned(
         engine: &'a StorageEngine,
         snapshot: StorageSnapshot,
@@ -134,7 +164,7 @@ impl<'a> CatalogMembership<'a> {
     ) -> Self {
         Self {
             engine,
-            snapshot,
+            view: CatalogView::Snapshot(snapshot),
             _pin: pin,
             implied: ImpliedCache::default(),
             ids: rustc_hash::FxHashMap::default(),
@@ -173,11 +203,6 @@ impl<'a> CatalogMembership<'a> {
         }
     }
 
-    /// The snapshot the catalog is read at.
-    fn view(&self) -> StorageSnapshot {
-        self.snapshot
-    }
-
     /// The identity label `name` is bound to under the view; `None` when it
     /// has none, which no node can carry.
     ///
@@ -188,7 +213,13 @@ impl<'a> CatalogMembership<'a> {
         if let Some(id) = self.ids.get(name) {
             return Ok(*id);
         }
-        let id = LocalSchemaStore::new(self.engine).label_id_at(self.view(), name)?;
+        let store = LocalSchemaStore::new(self.engine);
+        let id = match self.view {
+            CatalogView::Snapshot(snapshot) => store.label_id_at(snapshot, name)?,
+            CatalogView::KnownAt(known_at) => store
+                .binding_known_at(name, known_at)?
+                .and_then(|binding| binding.live_id()),
+        };
         // The name, and its entry three times over with its control byte:
         // a hash map holds a little over twice the room its entries take.
         self.charge(name.len() + 3 * (core::mem::size_of::<(String, Option<LabelId>)>() + 1))?;
@@ -215,18 +246,22 @@ impl<'a> CatalogMembership<'a> {
         // The name and the implied names live while the facts are read:
         // charged before each is decoded and released after.
         let mut read = self.budget.map(|b| b.empty_charge());
-        let (name, facts) = LocalSchemaStore::new(self.engine).implication_facts_at(
-            self.view(),
-            id,
-            self.candidates,
-            &mut |bytes| {
-                if let Some(read) = read.as_mut() {
-                    // Bytes of memory about to exist: fits in u64.
-                    read.grow(bytes as u64)?;
-                }
-                Ok(())
-            },
-        )?;
+        let mut charge = |bytes: usize| {
+            if let Some(read) = read.as_mut() {
+                // Bytes of memory about to exist: fits in u64.
+                read.grow(bytes as u64)?;
+            }
+            Ok(())
+        };
+        let store = LocalSchemaStore::new(self.engine);
+        let (name, facts) = match self.view {
+            CatalogView::Snapshot(snapshot) => {
+                store.implication_facts_at(snapshot, id, self.candidates, &mut charge)?
+            }
+            CatalogView::KnownAt(known_at) => {
+                store.implication_facts_known_at(known_at, id, &mut charge)?
+            }
+        };
         let Some(facts) = facts else {
             return Ok(LabelFacts::default());
         };

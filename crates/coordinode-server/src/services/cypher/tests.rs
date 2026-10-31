@@ -2616,6 +2616,26 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
     assert_eq!(latest.rows.len(), 1);
 }
 
+/// A time-travel read of history never retained, from the store layer up,
+/// is FAILED_PRECONDITION / HISTORY_UNCOVERED, terminal: no retry advice.
+#[test]
+fn history_uncovered_maps_to_failed_precondition() {
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::from(
+        coordinode_modality::StoreError::HistoryUncovered {
+            what: "nodes carrying :Plain at 5".into(),
+        },
+    )));
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "HISTORY_UNCOVERED");
+    assert!(status.message().contains(":Plain"), "{status:?}");
+    assert!(details.retry_info().is_none());
+}
+
 /// The executor's own `AS OF TIMESTAMP` refusal and the engine's snapshot
 /// guard map to the same OUT_OF_RANGE / OUTSIDE_RETENTION status, each
 /// naming the oldest readable timestamp so a caller can clamp.

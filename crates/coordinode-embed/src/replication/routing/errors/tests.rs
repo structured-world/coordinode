@@ -349,6 +349,9 @@ fn every_variant() -> Vec<DatabaseError> {
             requested: 5,
             oldest_readable: 99,
         },
+        E::HistoryUncovered {
+            what: "nodes carrying :Plain at 5".into(),
+        },
         E::ReadNotReady {
             requested: 50,
             ready_through: Some(40),

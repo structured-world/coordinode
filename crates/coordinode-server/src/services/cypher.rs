@@ -765,6 +765,17 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [("oldest_readable_ts", oldest_readable.to_string())],
             );
         }
+        // A time-travel read of history that was never retained. FAILED_
+        // PRECONDITION: the request is well formed, the store does not hold
+        // what it asks, and no later attempt at the same time changes that.
+        DatabaseError::HistoryUncovered { .. } => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::HistoryUncovered,
+                [] as [(&str, String); 0],
+            );
+        }
         // A read at a timestamp whose commits have not landed or are not
         // durable yet. UNAVAILABLE: the same read succeeds shortly, and the
         // server does not wait for it on the caller's behalf.

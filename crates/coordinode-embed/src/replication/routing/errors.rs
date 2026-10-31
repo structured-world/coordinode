@@ -116,6 +116,7 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::SettingsRefused(_) => "SettingsRefused",
         E::ReadFence { .. } => "ReadFence",
         E::OutsideRetention { .. } => "OutsideRetention",
+        E::HistoryUncovered { .. } => "HistoryUncovered",
         E::ReadNotReady { .. } => "ReadNotReady",
         E::OperationSettled { .. } => "OperationSettled",
         E::ForeignOperation { .. } => "ForeignOperation",
@@ -600,6 +601,7 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             requested,
             oldest_readable,
         }),
+        E::HistoryUncovered { what } => Kind::HistoryUncovered(text(what)),
         E::ReadNotReady {
             requested,
             ready_through,
@@ -975,6 +977,7 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             requested: o.requested,
             oldest_readable: o.oldest_readable,
         },
+        Kind::HistoryUncovered(t) => E::HistoryUncovered { what: t.message },
         Kind::ReadNotReady(r) => E::ReadNotReady {
             requested: r.requested,
             ready_through: r.ready_through,

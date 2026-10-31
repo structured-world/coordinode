@@ -45,6 +45,7 @@ fn make_test_ctx<'a>(
         valid_now: coordinode_query::executor::runner::wall_clock_us(),
         temporal_instants: Vec::new(),
         snapshot_pin: None,
+        history_at: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
         key_claims: Default::default(),

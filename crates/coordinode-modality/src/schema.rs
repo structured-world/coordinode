@@ -21,8 +21,10 @@
 
 use coordinode_core::schema::definition::{
     EDGE_TYPE_SCHEMA_KEY_PREFIX, EdgeTypeSchema, LabelSchema, decode_edge_type_schema_key_name,
-    encode_constraint_name_key, encode_edge_type_current_revision_key, encode_edge_type_schema_key,
-    encode_label_current_revision_key, encode_label_schema_key,
+    decode_label_binding_history_commit, encode_constraint_name_key,
+    encode_edge_type_current_revision_key, encode_edge_type_schema_key,
+    encode_label_binding_history_prefix, encode_label_current_revision_key,
+    encode_label_schema_key,
 };
 use coordinode_core::schema::label_id::{BindingState, LabelBinding, LabelId, label_id_key};
 use coordinode_storage::engine::batch::WriteBatch;
@@ -60,7 +62,11 @@ pub trait SchemaStore {
 
     /// Persist a label schema as the current revision. Body and
     /// pointer are written in a single atomic batch — readers never
-    /// observe a pointer naming a missing revision.
+    /// observe a pointer naming a missing revision. The batch commits at no
+    /// transaction timestamp, so it keeps no binding history: a retained
+    /// system time reports the binding as uncovered rather than reading it.
+    /// Writers whose history matters stage the definition in a transaction
+    /// ([`Self::save_label_txn`]).
     ///
     /// # Examples
     ///
@@ -477,6 +483,136 @@ impl<'a> LocalSchemaStore<'a> {
         Ok((name, Some(facts)))
     }
 
+    /// What label name `name` was bound to at system time `known_at`: the
+    /// last binding its history holds from a commit at or before it; `None`
+    /// when no commit had bound the name by then.
+    ///
+    /// One seek from `known_at` down, at the newest view: neither the bindings
+    /// before the one found nor those after `known_at` are read.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or a history record that does not decode.
+    pub fn binding_known_at(
+        &self,
+        name: &str,
+        known_at: coordinode_core::txn::timestamp::Timestamp,
+    ) -> StoreResult<Option<LabelBinding>> {
+        let prefix = encode_label_binding_history_prefix(name);
+        let mut last = prefix.clone();
+        last.extend_from_slice(&known_at.as_raw().to_be_bytes());
+        let Some(guard) = self
+            .engine
+            .range_scan_rev(Partition::Schema, &prefix, &last)?
+            .next()
+        else {
+            return Ok(None);
+        };
+        let (key, value) = guard
+            .into_inner()
+            .map_err(coordinode_storage::error::StorageError::from)?;
+        let undecodable = || StoreError::Decode {
+            kind: "label binding history",
+            message: format!("a binding of '{name}' in its history does not decode"),
+        };
+        decode_label_binding_history_commit(name, &key).ok_or_else(undecodable)?;
+        LabelBinding::decode(&value)
+            .map(Some)
+            .ok_or_else(undecodable)
+    }
+
+    /// The definition label name `name` was bound to at system time
+    /// `known_at`, read from its binding history and the revision that names:
+    /// `None` when the name was bound to no definition then (an implicit or
+    /// retired binding), and `Ok(None)` too when no commit had bound it.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, a history record or body that does not decode, or
+    /// a binding naming a revision whose body is missing.
+    pub fn load_label_known_at(
+        &self,
+        name: &str,
+        known_at: coordinode_core::txn::timestamp::Timestamp,
+    ) -> StoreResult<Option<LabelSchema>> {
+        let Some(binding) = self.binding_known_at(name, known_at)? else {
+            return Ok(None);
+        };
+        let revision = binding.declared_revision();
+        if revision == 0 {
+            return Ok(None);
+        }
+        // A revision's body is written once and kept.
+        let Some(body) = self.engine.get(
+            Partition::Schema,
+            &encode_label_schema_key(binding.id, revision),
+        )?
+        else {
+            return Err(missing_revision(name, revision));
+        };
+        decode_label_body(name, revision, &body).map(Some)
+    }
+
+    /// [`Self::implication_facts_at`] as the catalog stood at system time
+    /// `known_at`, read from the retained binding history and the revision it
+    /// names rather than from an operational snapshot: it answers however
+    /// long ago `known_at` is. The facts in force only: a candidate published
+    /// then was not yet the interpretation.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::implication_facts_at`]; and
+    /// [`StoreError::HistoryUncovered`] when the name of `id` had no binding
+    /// in its history by `known_at` although `id` was allocated for it: the
+    /// interpretation then was never retained, and is not guessed.
+    pub fn implication_facts_known_at(
+        &self,
+        known_at: coordinode_core::txn::timestamp::Timestamp,
+        id: LabelId,
+        charge: &mut dyn FnMut(usize) -> StoreResult<()>,
+    ) -> StoreResult<(
+        String,
+        Option<coordinode_core::schema::definition::ImplicationFacts>,
+    )> {
+        let Some(name) = self.engine.get(Partition::Schema, &label_id_key(id))? else {
+            return Err(StoreError::Decode {
+                kind: "label identity",
+                message: format!("label {id} has no identity record"),
+            });
+        };
+        charge(name.len())?;
+        let name = decode_label_name(id, name.to_vec())?;
+        let Some(binding) = self.binding_known_at(&name, known_at)? else {
+            return Err(StoreError::HistoryUncovered {
+                what: format!("the binding of label '{name}' at {}", known_at.as_raw()),
+            });
+        };
+        if binding.live_id() != Some(id) {
+            return Ok((name, None));
+        }
+        let revision = binding.declared_revision();
+        if revision == 0 {
+            return Ok((name, None));
+        }
+        // A revision's body is written once and kept, so the newest view
+        // holds the one bound then.
+        let Some(body) = self.engine.get(
+            Partition::Schema,
+            &encode_label_schema_key(binding.id, revision),
+        )?
+        else {
+            return Err(missing_revision(&name, revision));
+        };
+        let decode_error = |e: rmp_serde::decode::Error| StoreError::Decode {
+            kind: "label schema",
+            message: format!("decode failed for '{name}' rev {revision}: {e}"),
+        };
+        charge(LabelSchema::implication_facts_bound(&body).map_err(decode_error)?)?;
+        let facts =
+            LabelSchema::implication_facts_from_msgpack(&body, false).map_err(decode_error)?;
+        Ok((name, Some(facts)))
+    }
+
     /// The identity `name` is bound to, binding an implicit one when it has
     /// none, committed at once: for an engine written without a proposal
     /// pipeline (a test, a tool, a direct-mode statement), deciding exactly as
@@ -678,10 +814,23 @@ fn stage_label_definition(
         revision: schema.schema_revision,
         state: BindingState::Declared,
     };
+    bind_name_txn(txn, &schema.name, binding)
+}
+
+/// Stage `binding` as what label name `name` is bound to, and keep it in the
+/// name's binding history under the commit: the interpretation a retained
+/// system time reads is the one bound then, not the one bound now.
+fn bind_name_txn(txn: &mut Transaction, name: &str, binding: LabelBinding) -> StoreResult<()> {
+    let encoded = binding.encode();
     txn.put(
         Partition::Schema,
-        &encode_label_current_revision_key(&schema.name),
-        &binding.encode(),
+        &encode_label_current_revision_key(name),
+        &encoded,
+    )?;
+    txn.put_stamped(
+        Partition::Schema,
+        &encode_label_binding_history_prefix(name),
+        &encoded,
     )?;
     Ok(())
 }
@@ -1059,11 +1208,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
                 state: BindingState::Retired,
                 ..binding
             };
-            txn.put(
-                Partition::Schema,
-                &encode_label_current_revision_key(name),
-                &retired.encode(),
-            )?;
+            bind_name_txn(txn, name, retired)?;
         }
         txn.note_schema_change();
         claim_activation(txn, name, 0);
@@ -1089,11 +1234,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
             revision: 0,
             state: BindingState::Implicit,
         };
-        txn.put(
-            Partition::Schema,
-            &encode_label_current_revision_key(name),
-            &binding.encode(),
-        )?;
+        bind_name_txn(txn, name, binding)?;
         Ok(id)
     }
 

@@ -29,6 +29,7 @@ mod integration {
     mod fsync_budget;
     mod helpers;
     mod historical_index;
+    mod history_after_gc;
     mod hnsw;
     mod index_builds;
     mod index_key_length;

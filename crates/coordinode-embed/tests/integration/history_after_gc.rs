@@ -1,0 +1,186 @@
+//! `AS OF TIMESTAMP` on temporal types older than the operational retention:
+//! answered from the retained history of the nodes and of the catalog that
+//! interprets them, after the row versions of that time are collected and
+//! the database is reopened, never from what holds now.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::time::Duration;
+
+use coordinode_core::graph::types::Value;
+use coordinode_core::txn::timestamp::Timestamp;
+use coordinode_embed::{Database, DatabaseError};
+use coordinode_storage::engine::partition::Partition;
+
+/// `Thing`, `X` and `Y`, temporal types with a name; `X` and `Y` hold one
+/// node each, valid since the epoch.
+fn types(db: &mut Database) {
+    for statement in [
+        "CREATE NODE TYPE Thing TEMPORAL WITH (name: STRING, valid_from: INT)",
+        "CREATE NODE TYPE X TEMPORAL WITH (name: STRING, valid_from: INT)",
+        "CREATE NODE TYPE Y TEMPORAL WITH (name: STRING, valid_from: INT)",
+        "CREATE (:X {name: 'x', valid_from: 0}), (:Y {name: 'y', valid_from: 0})",
+    ] {
+        db.execute_cypher(statement)
+            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+}
+
+/// Whether no index keeps a change's parts apart any more.
+fn folded(db: &Database) -> bool {
+    use coordinode_modality::IndexStore as _;
+    coordinode_modality::LocalIndexStore::new(db.engine())
+        .list_definitions()
+        .expect("definitions")
+        .iter()
+        .all(|def| def.selection.is_empty())
+}
+
+/// Run `alter`, wait for its parts to be folded, and return a system time
+/// at which it is in force: the commit of a write after it.
+fn settled(db: &mut Database, alter: &str) -> u64 {
+    db.execute_cypher(alter)
+        .unwrap_or_else(|e| panic!("{alter}: {e}"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !folded(db) {
+        assert!(std::time::Instant::now() < deadline, "{alter}: unfolded");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    mark(db)
+}
+
+/// The commit timestamp of a write of an unrelated node.
+fn mark(db: &mut Database) -> u64 {
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(tx, "CREATE (:Mark)", None)
+        .expect("mark");
+    db.commit_transaction(tx)
+        .expect("commit")
+        .commit_ts
+        .as_raw()
+}
+
+/// The names of the things at `as_of`, in order.
+fn things(db: &mut Database, as_of: u64) -> Result<Vec<String>, DatabaseError> {
+    let rows = db.execute_cypher(&format!(
+        "MATCH (n:Thing) RETURN n.name AS name ORDER BY name AS OF TIMESTAMP {as_of}"
+    ))?;
+    Ok(rows
+        .iter()
+        .map(|row| match row.get("name") {
+            Some(Value::String(name)) => name.clone(),
+            other => panic!("name {other:?}"),
+        })
+        .collect())
+}
+
+/// Move the clock past the retention window and collect every row version
+/// older than it, in every partition the reads touch.
+fn collect_history(db: &mut Database) {
+    let oracle = db.engine().oracle().expect("embedded engine has an oracle");
+    oracle.advance_to(Timestamp::from_raw(oracle.current().as_raw() + 10_000_000));
+    mark(db);
+    for part in [
+        Partition::Node,
+        Partition::Schema,
+        Partition::Idx,
+        Partition::NodeHistory,
+    ] {
+        db.engine().force_compaction(part).expect("compact");
+    }
+}
+
+/// Three interpretations of `Thing` over unchanged nodes: `X` implies it,
+/// then `Y` too, then only `Y`. After the row versions of all three times
+/// are collected, and again after a reopen, a read at each answers exactly
+/// the things of its interpretation: the catalog and the nodes of that time
+/// are read from their retained history, not from the current state.
+#[test]
+fn each_interpretation_answers_after_collection_and_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (before, x_only, both, y_only) = {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.set_retention_window(Duration::from_secs(2));
+        types(&mut db);
+        let before = mark(&mut db);
+        let x_only = settled(&mut db, "ALTER NODE TYPE X SET IMPLIES (Thing)");
+        let both = settled(&mut db, "ALTER NODE TYPE Y SET IMPLIES (Thing)");
+        let y_only = settled(&mut db, "ALTER NODE TYPE X SET IMPLIES ()");
+        collect_history(&mut db);
+        assert!(
+            db.oldest_readable_timestamp().as_raw() > y_only,
+            "every read below is past the operational retention"
+        );
+        (before, x_only, both, y_only)
+    };
+    let expected: [(u64, &[&str]); 4] = [
+        (before, &[]),
+        (x_only, &["x"]),
+        (both, &["x", "y"]),
+        (y_only, &["y"]),
+    ];
+    let mut db = Database::open(dir.path()).expect("reopen");
+    db.set_retention_window(Duration::from_secs(2));
+    for (as_of, names) in expected {
+        assert_eq!(
+            things(&mut db, as_of).unwrap_or_else(|e| panic!("as of {as_of}: {e}")),
+            names,
+            "as of {as_of}"
+        );
+    }
+    assert_eq!(
+        db.execute_cypher("MATCH (n:Thing) RETURN n")
+            .expect("current")
+            .len(),
+        1,
+        "the current interpretation is the last one"
+    );
+}
+
+/// A read past the operational retention of a label whose carriers are not
+/// all temporal is refused as past the retention: their past was in the
+/// collected row versions only, and part of the answer is no answer. So is
+/// a label not bound then, whose absence nothing proves.
+#[test]
+fn a_label_with_carriers_without_history_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.set_retention_window(Duration::from_secs(2));
+    db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
+        .expect("type");
+    db.execute_cypher("CREATE (:Plain {name: 'p'})")
+        .expect("node");
+    let then = mark(&mut db);
+    collect_history(&mut db);
+    let read = db.execute_cypher(&format!(
+        "MATCH (n:Plain) RETURN n.name AS name AS OF TIMESTAMP {then}"
+    ));
+    assert!(
+        matches!(&read, Err(DatabaseError::OutsideRetention { .. })),
+        "{read:?}"
+    );
+    let read = db.execute_cypher(&format!("MATCH (n:Unseen) RETURN n AS OF TIMESTAMP {then}"));
+    assert!(
+        matches!(&read, Err(DatabaseError::OutsideRetention { .. })),
+        "{read:?}"
+    );
+}
+
+/// A read that also reads what only the operational snapshot holds (here
+/// an edge) is refused as before, not answered from the history in part.
+#[test]
+fn a_read_beyond_the_history_keeps_the_retention_refusal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.set_retention_window(Duration::from_secs(2));
+    types(&mut db);
+    let then = mark(&mut db);
+    collect_history(&mut db);
+    let read = db.execute_cypher(&format!(
+        "MATCH (a:X)-[:R]->(b) RETURN b AS OF TIMESTAMP {then}"
+    ));
+    assert!(
+        matches!(read, Err(DatabaseError::OutsideRetention { .. })),
+        "{read:?}"
+    );
+}

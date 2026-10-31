@@ -530,37 +530,92 @@ impl LocalNodeStore {
             + From<coordinode_core::budget::BudgetStop>
             + From<StoreError>,
     {
+        Self::known_at_under(
+            engine,
+            &coordinode_core::graph::node::node_history_id_prefix(shard_id, node_id),
+            |a| a.shard_id == shard_id && a.node_id == node_id,
+            known_at,
+            budget,
+            |_, valid_from, bounds, record| visit(valid_from, bounds, record),
+        )
+    }
+
+    /// [`Self::versions_known_at`] for every temporal node of shard
+    /// `shard_id` with history, one after another in NodeId order: `visit`
+    /// receives each node's versions known at `known_at` with the node, and
+    /// every version of one node before any of the next. A node whose every
+    /// version was removed by then, or first written after it, is not visited.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::versions_known_at`].
+    pub fn shard_versions_known_at<E>(
+        engine: &StorageEngine,
+        shard_id: u16,
+        known_at: coordinode_core::txn::timestamp::Timestamp,
+        budget: &coordinode_core::budget::QueryBudget,
+        visit: impl FnMut(NodeId, i64, VersionBounds, &[u8]) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<coordinode_storage::error::StorageError>
+            + From<coordinode_core::budget::BudgetStop>
+            + From<StoreError>,
+    {
+        Self::known_at_under(
+            engine,
+            &coordinode_core::graph::node::node_history_shard_prefix(shard_id),
+            |a| a.shard_id == shard_id,
+            known_at,
+            budget,
+            visit,
+        )
+    }
+
+    /// The assertions under `prefix`, each of which `owns` must accept,
+    /// reduced to the versions known at `known_at`: the shared walk of
+    /// [`Self::versions_known_at`] and [`Self::shard_versions_known_at`].
+    fn known_at_under<E>(
+        engine: &StorageEngine,
+        prefix: &[u8],
+        owns: impl Fn(&coordinode_core::graph::node::AssertionId) -> bool,
+        known_at: coordinode_core::txn::timestamp::Timestamp,
+        budget: &coordinode_core::budget::QueryBudget,
+        mut visit: impl FnMut(NodeId, i64, VersionBounds, &[u8]) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<coordinode_storage::error::StorageError>
+            + From<coordinode_core::budget::BudgetStop>
+            + From<StoreError>,
+    {
         let undecodable = |message: &str| StoreError::Decode {
             kind: "node history",
             message: message.to_owned(),
         };
         // The last assertion known at `known_at` of the version being read:
-        // its valid start and encoded assertion.
-        let mut latest: Option<i64> = None;
+        // its node, valid start and encoded assertion.
+        let mut latest: Option<(NodeId, i64)> = None;
         let mut held_assertion: Vec<u8> = Vec::new();
         let mut held = budget.empty_charge();
-        let mut flush = |valid_from: i64, assertion: &[u8]| -> Result<(), E> {
+        let mut flush = |(node, valid_from): (NodeId, i64), assertion: &[u8]| -> Result<(), E> {
             match NodeAssertion::decode(assertion).map_err(|e| undecodable(&e.to_string()))? {
-                NodeAssertion::State { bounds, record } => visit(valid_from, bounds, record),
+                NodeAssertion::State { bounds, record } => visit(node, valid_from, bounds, record),
                 NodeAssertion::Removed => Ok(()),
             }
         };
         let view = engine.snapshot();
-        let prefix = coordinode_core::graph::node::node_history_id_prefix(shard_id, node_id);
-        for guard in engine.snapshot_prefix_iter(&view, Partition::NodeHistory, &prefix)? {
+        for guard in engine.snapshot_prefix_iter(&view, Partition::NodeHistory, prefix)? {
             budget.work(1)?;
             let (key, value) = guard
                 .into_inner()
                 .map_err(coordinode_storage::error::StorageError::from)?;
             let assertion = coordinode_core::graph::node::decode_node_history_key(&key)
-                .filter(|a| a.shard_id == shard_id && a.node_id == node_id)
-                .ok_or_else(|| {
-                    undecodable("a key under a node's history names no assertion of it")
-                })?;
+                .filter(&owns)
+                .ok_or_else(|| undecodable("a key under a history names no assertion of it"))?;
             // The previous version ends where another starts: what was known
             // of it is settled.
-            if let Some(valid_from) = latest.take_if(|vf| *vf != assertion.valid_from) {
-                flush(valid_from, &held_assertion)?;
+            let version = (assertion.node_id, assertion.valid_from);
+            if let Some(previous) = latest.take_if(|v| *v != version) {
+                flush(previous, &held_assertion)?;
             }
             // Assertions of one version come in commit order: those committed
             // after `known_at` were not known then, and neither is any later.
@@ -576,10 +631,10 @@ impl LocalNodeStore {
             }
             held_assertion.clear();
             held_assertion.extend_from_slice(&value);
-            latest = Some(assertion.valid_from);
+            latest = Some(version);
         }
         match latest {
-            Some(valid_from) => flush(valid_from, &held_assertion),
+            Some(version) => flush(version, &held_assertion),
             None => Ok(()),
         }
     }

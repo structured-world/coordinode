@@ -1394,6 +1394,34 @@ pub fn encode_label_current_revision_key(name: &str) -> Vec<u8> {
     key
 }
 
+/// Prefix of the retained history of a label name's bindings.
+pub const LABEL_BINDING_HISTORY_PREFIX: &[u8] = b"schema:binding_history:label:";
+
+/// The key of the retained bindings of label name `name`, all but the commit
+/// that wrote each, which the commit appends:
+/// `schema:binding_history:label:<name length u64 BE><name>`. Value: the
+/// [`crate::schema::label_id::LabelBinding`] the commit bound the name to.
+/// Each commit binding the name keeps its own record, so the binding in force
+/// at any retained system time is the last one written at or before it,
+/// however long ago the current binding replaced it. The length keeps one
+/// name's records apart from those of a name it is a prefix of.
+pub fn encode_label_binding_history_prefix(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(LABEL_BINDING_HISTORY_PREFIX.len() + 8 + name.len() + 8);
+    key.extend_from_slice(LABEL_BINDING_HISTORY_PREFIX);
+    // A length in memory fits u64 on every supported target.
+    key.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+/// The commit a key of the binding history of `name` was written by; `None`
+/// for a key of another name or of no binding history.
+pub fn decode_label_binding_history_commit(name: &str, key: &[u8]) -> Option<u64> {
+    let prefix = encode_label_binding_history_prefix(name);
+    let commit = key.strip_prefix(prefix.as_slice())?;
+    Some(u64::from_be_bytes(commit.try_into().ok()?))
+}
+
 /// Encode the key naming the label that holds a constraint:
 /// `schema:constraint:<name>`. Value: the label name, UTF-8. One key per
 /// name keeps constraint names unique across labels.

@@ -483,6 +483,16 @@ pub enum DatabaseError {
         oldest_readable: u64,
     },
 
+    /// A read older than the operational retention asked for history that
+    /// was never retained: nodes of a type that keeps no history, or a
+    /// catalog binding not kept. Refused rather than answered from what holds
+    /// now or from part of what held then.
+    #[error("history not retained: {what}")]
+    HistoryUncovered {
+        /// What was asked for, with the system time.
+        what: String,
+    },
+
     /// The settings a statement names cannot be served together, or not on
     /// the path it took; refused before anything waited or ran.
     #[error("{0}")]
@@ -752,6 +762,7 @@ impl From<StoreError> for DatabaseError {
             StoreError::IndexEntry(entry) => Self::IndexEntry(entry),
             StoreError::VectorSearch(VectorSearchError::Domain(e)) => Self::VectorDomain(e),
             StoreError::VectorAdmission(refused) => Self::VectorDomain(refused.error),
+            StoreError::HistoryUncovered { what } => Self::HistoryUncovered { what },
             other => Self::Other(other.to_string()),
         }
     }

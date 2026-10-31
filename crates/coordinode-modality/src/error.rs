@@ -79,6 +79,14 @@ pub enum StoreError {
     /// A blob could not be uploaded, published, released or read.
     #[error(transparent)]
     Blob(#[from] coordinode_storage::blob::BlobError),
+
+    /// A retained system time asked for history that was never kept: what
+    /// held then is unknown here, and is not answered from what holds now.
+    #[error("history not retained: {what}")]
+    HistoryUncovered {
+        /// What was asked for, with the system time.
+        what: String,
+    },
 }
 
 // Convenience: `iter_guard.into_inner()?` inside store scan loops

@@ -1292,6 +1292,12 @@ pub struct ExecutionContext<'a> {
     /// statement so compaction cannot collect the history it reads. `None`
     /// for reads at the current snapshot (never below the watermark).
     pub snapshot_pin: Option<coordinode_storage::engine::coordinator::SnapshotPin>,
+    /// The system time an `AS OF TIMESTAMP` statement reads from the retained
+    /// history rather than an operational snapshot, which that far back may
+    /// be collected: its temporal nodes are the versions known then, and the
+    /// catalog interpreting them the one bound then. `None` for every other
+    /// statement.
+    pub history_at: Option<coordinode_core::txn::timestamp::Timestamp>,
     /// Warnings collected during execution (e.g., fan-out capping).
     pub warnings: Vec<String>,
     /// Write statistics accumulated during this statement.
@@ -1904,6 +1910,9 @@ impl<'a> ExecutionContext<'a> {
         name: &str,
     ) -> Result<Option<LabelSchema>, ExecutionError> {
         use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        if let Some(known_at) = self.history_at {
+            return Ok(LocalSchemaStore::new(self.engine).load_label_known_at(name, known_at)?);
+        }
         self.sync_txn_state();
         Ok(LocalSchemaStore::new(self.engine).load_label_txn(&mut self.txn, name)?)
     }
@@ -1956,8 +1965,15 @@ impl<'a> ExecutionContext<'a> {
         if let Some(id) = self.labels.id(name) {
             return Ok(id);
         }
-        self.sync_txn_state();
-        let id = LocalSchemaStore::new(self.engine).label_id_txn(&mut self.txn, name)?;
+        let id = match self.history_at {
+            Some(known_at) => LocalSchemaStore::new(self.engine)
+                .binding_known_at(name, known_at)?
+                .and_then(|binding| binding.live_id()),
+            None => {
+                self.sync_txn_state();
+                LocalSchemaStore::new(self.engine).label_id_txn(&mut self.txn, name)?
+            }
+        };
         self.labels.learn_id(name, id);
         Ok(id)
     }
@@ -2068,6 +2084,19 @@ impl<'a> ExecutionContext<'a> {
         id: LabelId,
     ) -> Result<Option<Arc<LabelSchema>>, ExecutionError> {
         let name = self.label_name(id)?.to_string();
+        if self.label_id(&name)? != Some(id)
+            && let Some(known_at) = self.history_at
+            && coordinode_modality::LocalSchemaStore::new(self.engine)
+                .binding_known_at(&name, known_at)?
+                .is_none()
+        {
+            // A record stored `id` by `known_at`, so its name was bound by
+            // then: a history without that binding never retained it.
+            return Err(coordinode_modality::StoreError::HistoryUncovered {
+                what: format!("the binding of label '{name}' at {}", known_at.as_raw()),
+            }
+            .into());
+        }
         if self.label_id(&name)? != Some(id) {
             return Ok(None);
         }
@@ -4323,13 +4352,31 @@ impl<'a> ExecutionContext<'a> {
         at: i64,
     ) -> Result<crate::executor::temporal_read::StateAt, ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        let prefix = LocalNodeStore.version_prefix(self.shard_id, node_id);
         self.sync_txn_state();
         let fields = self.timeline_fields();
         // The node's history is held, and charged, only while its state at
         // `at` is chosen from it.
         let mut held = self.budget.empty_charge();
         let mut versions: Vec<(i64, NodeRecord)> = Vec::new();
+        if let Some(known_at) = self.history_at {
+            LocalNodeStore::versions_known_at(
+                self.engine,
+                self.shard_id,
+                node_id,
+                known_at,
+                &self.budget,
+                |valid_from, _, record| {
+                    let record = decode_version(record)?;
+                    held.grow(record.held_bytes())?;
+                    versions.push((valid_from, record));
+                    Ok::<(), ExecutionError>(())
+                },
+            )?;
+            return Ok(crate::executor::temporal_read::state_at(
+                versions, at, fields,
+            ));
+        }
+        let prefix = LocalNodeStore.version_prefix(self.shard_id, node_id);
         LocalNodeStore.prefix_for_each(&self.txn, &prefix, &self.budget, |key, value| {
             let Some((_, _, valid_from)) = decode_temporal_node_key(key) else {
                 return Ok(());
@@ -5508,23 +5555,44 @@ pub fn execute_no_commit(
             // collected, and a read there would answer from whatever survived
             // (a newer version, or nothing). Refusing under the watermark's
             // own lock means a granted pin always protects live history.
-            let Some(pin) = ctx.engine.pin_snapshot_at(seqno) else {
-                return Err(ExecutionError::OutsideRetention {
-                    // `seqno` is the timestamp plus one, so at least 1.
-                    requested: seqno - 1,
-                    // A read at T is served from snapshot T + 1, so the oldest
-                    // readable timestamp is one below the first readable seqno.
-                    // The clamp is the bottom of the timestamp domain, not an
-                    // overflow guard: a horizon of zero means nothing has been
-                    // collected and there is no timestamp below zero to name.
-                    oldest_readable: ctx.engine.oldest_readable_seqno().saturating_sub(1),
-                });
-            };
-            ctx.snapshot_pin = Some(pin);
-            if let Some(snap) = ctx.engine.snapshot_at(seqno) {
-                ctx.mvcc_snapshot = Some(snap);
-                ctx.txn.set_adj_snapshot(Some(snap));
-                ctx.txn.set_snapshot(Some(snap));
+            match ctx.engine.pin_snapshot_at(seqno) {
+                Some(pin) => {
+                    ctx.snapshot_pin = Some(pin);
+                    if let Some(snap) = ctx.engine.snapshot_at(seqno) {
+                        ctx.mvcc_snapshot = Some(snap);
+                        ctx.txn.set_adj_snapshot(Some(snap));
+                        ctx.txn.set_snapshot(Some(snap));
+                    }
+                }
+                // Temporal nodes keep their history apart from the row
+                // versions collected under the horizon: a statement reading
+                // nothing else answers from it, at the statement's own newest
+                // view. Which labels are temporal is the catalog's at `ts`,
+                // checked as each scan resolves them.
+                None if reads_only_history(&plan.root) => {
+                    // A system time before the epoch knows no commit.
+                    let known_at = u64::try_from(ts).unwrap_or(0);
+                    ctx.history_at = Some(coordinode_core::txn::timestamp::Timestamp::from_raw(
+                        known_at,
+                    ));
+                    // What the statement learned of the catalog so far is
+                    // the current one's; from here it reads the one of `ts`.
+                    ctx.labels = Default::default();
+                    ctx.label_schema_cache.clear();
+                }
+                None => {
+                    return Err(ExecutionError::OutsideRetention {
+                        // `seqno` is the timestamp plus one, so at least 1.
+                        requested: seqno - 1,
+                        // A read at T is served from snapshot T + 1, so the
+                        // oldest readable timestamp is one below the first
+                        // readable seqno. The clamp is the bottom of the
+                        // timestamp domain, not an overflow guard: a horizon
+                        // of zero means nothing has been collected and there
+                        // is no timestamp below zero to name.
+                        oldest_readable: ctx.engine.oldest_readable_seqno().saturating_sub(1),
+                    });
+                }
             }
         }
     }
@@ -7602,6 +7670,9 @@ fn execute_node_scan(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let cap = ctx.scan_row_cap.take();
+    if let Some(known_at) = ctx.history_at {
+        return scan_history(variable, labels, property_filters, known_at, cap, ctx);
+    }
     // The pattern's labels by identity: a label without one is carried by
     // no node, and the pattern matches none.
     let Some(label_ids) = ctx.pattern_label_ids(labels)? else {
@@ -7723,6 +7794,171 @@ fn execute_node_scan(
         })?;
     }
     fold.finish(ctx)
+}
+
+/// [`execute_node_scan`] for a statement reading the retained history at
+/// `known_at`: the nodes carrying `labels` as their versions were known
+/// then, interpreted by the catalog bound then, built into rows by the same
+/// fold as a scan of the rows.
+///
+/// Answered only where the history covers every node that can carry the
+/// labels then: each is bound then to a temporal type, and so is every type
+/// implying it. A label any other node may carry (an auxiliary one, an
+/// implicit or non-temporal type, or one a non-temporal type implies) is an
+/// operational scope whose past only the collected row versions held; and a
+/// label not bound then cannot be proved absent, as no record of when the
+/// history began says it was kept. Either way the read is past the
+/// operational retention, and is refused as such rather than answered with
+/// part of the carriers or none.
+fn scan_history(
+    variable: &str,
+    labels: &[String],
+    property_filters: &[(String, crate::plan::expr::Expr)],
+    known_at: coordinode_core::txn::timestamp::Timestamp,
+    cap: Option<ScanRowCap>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_modality::LocalNodeStore;
+    if ctx.scan_paging.is_some() {
+        return Err(ExecutionError::Unsupported(
+            "a cursor does not page the retained history of an AS OF TIMESTAMP \
+             read older than the operational retention; read it in one statement"
+                .into(),
+        ));
+    }
+    let outside = |ctx: &ExecutionContext<'_>| ExecutionError::OutsideRetention {
+        requested: known_at.as_raw(),
+        // As the operational refusal names it: one below the first readable
+        // seqno, the bottom of the domain when nothing was collected.
+        oldest_readable: ctx.engine.oldest_readable_seqno().saturating_sub(1),
+    };
+    let Some(label_ids) = ctx.pattern_label_ids(labels)? else {
+        return Err(outside(ctx));
+    };
+    let budget = Arc::clone(&ctx.budget);
+    // Every type a carrier of a pattern label can have then: the label
+    // itself, and the types implying it then.
+    let mut carriers = crate::index::membership::CatalogMembership::known_at(ctx.engine, known_at)
+        .charged_to(&budget);
+    let mut types: Vec<LabelId> = Vec::new();
+    for (name, &id) in labels.iter().zip(&label_ids) {
+        types.push(id);
+        if let Some(found) =
+            crate::index::membership::label_carriers_in(ctx.engine, name, &mut carriers)?
+        {
+            types.extend(found.implying);
+        }
+    }
+    for id in types {
+        let schema = ctx.label_schema_of(id)?;
+        if !schema
+            .as_ref()
+            .is_some_and(|s| s.temporal && !s.is_auxiliary())
+        {
+            return Err(outside(ctx));
+        }
+    }
+    let label_ids = &label_ids[..];
+    // The schemas the pattern's rows are built from are read before the
+    // scan starts.
+    for &label in label_ids {
+        ctx.compile_implied(label)?;
+    }
+    let mut fold = NodeScanFold::new(
+        (variable, label_ids, property_filters),
+        (ctx.instant_for(variable), ctx.timeline_fields()),
+        &budget,
+    );
+    if let Some(cap) = &cap {
+        fold.residual = &cap.residual;
+    }
+    let (engine, shard_id) = (ctx.engine, ctx.shard_id);
+    let env = NodeRowEnv::of(ctx);
+    LocalNodeStore::shard_versions_known_at(
+        engine,
+        shard_id,
+        known_at,
+        &budget,
+        |node_id, valid_from, _, record| {
+            let key = coordinode_core::graph::node::encode_temporal_node_key(
+                shard_id, node_id, valid_from,
+            );
+            fold.row(&key, record, &env)
+        },
+    )?;
+    fold.finish(ctx)
+}
+
+/// Whether every read `op` makes is one the retained history of temporal
+/// nodes answers: scans of labeled nodes, and the operators that only shape
+/// their rows, through every subquery its expressions hold. An edge, a
+/// search, a write or an unlabeled scan reads what only the operational
+/// snapshot holds.
+fn reads_only_history(op: &crate::planner::logical::LogicalOp) -> bool {
+    use crate::planner::logical::LogicalOp as Op;
+    fn exprs<'e>(mut exprs: impl Iterator<Item = &'e crate::plan::expr::Expr>) -> bool {
+        exprs.all(expr_reads_only_history)
+    }
+    match op {
+        Op::NodeScan {
+            labels,
+            property_filters,
+            ..
+        } => !labels.is_empty() && exprs(&mut property_filters.iter().map(|(_, e)| e)),
+        // Its entries are operational; the scan it stands for is not.
+        Op::IndexScan { value_expr, .. } => expr_reads_only_history(value_expr),
+        Op::NodeCountFromCounter { fallback, .. } => reads_only_history(fallback),
+        Op::Filter { input, predicate } => {
+            reads_only_history(input) && expr_reads_only_history(predicate)
+        }
+        Op::Project { input, items, .. } => {
+            reads_only_history(input) && exprs(&mut items.iter().map(|i| &i.expr))
+        }
+        Op::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            reads_only_history(input)
+                && exprs(&mut group_by.iter())
+                && exprs(
+                    &mut aggregates
+                        .iter()
+                        .flat_map(|a| core::iter::once(&a.arg).chain(&a.percentile_expr)),
+                )
+        }
+        Op::Sort { input, items } => {
+            reads_only_history(input) && exprs(&mut items.iter().map(|i| &i.expr))
+        }
+        Op::Limit { input, count } | Op::Skip { input, count } => {
+            reads_only_history(input) && expr_reads_only_history(count)
+        }
+        Op::Unwind { input, expr, .. } => {
+            reads_only_history(input) && expr_reads_only_history(expr)
+        }
+        Op::CartesianProduct { left, right } => {
+            reads_only_history(left) && reads_only_history(right)
+        }
+        Op::Empty => true,
+        _ => false,
+    }
+}
+
+/// Whether `expr` reads only what [`reads_only_history`] allows: a value of
+/// the row, or a subquery that does.
+fn expr_reads_only_history(expr: &crate::plan::expr::Expr) -> bool {
+    use crate::plan::expr::ExprChild;
+    // The child walk is the one every expression pass recurses through, so
+    // no subquery escapes it; it lends its children mutably, hence the copy.
+    let mut expr = expr.clone();
+    let mut answers = true;
+    expr.for_each_child_mut(&mut |child| {
+        answers &= match child {
+            ExprChild::Expr(e) => expr_reads_only_history(e),
+            ExprChild::Plan(plan) => reads_only_history(&plan.root),
+        };
+    });
+    answers
 }
 
 /// A label scan answered from the namespace's label lookup: the generation
@@ -8838,6 +9074,26 @@ fn execute_btree_index_scan(
     value_expr: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    // An index's entries are operational: a read of the retained history
+    // finds the value by the exact scan the index stands for.
+    if ctx.history_at.is_some() {
+        let lookup_val = match &ctx.correlated_row {
+            Some(corr) => eval_neutral(value_expr, corr)?,
+            None => eval_neutral(value_expr, &Row::new())?,
+        };
+        if lookup_val.is_null() {
+            return Ok(Vec::new());
+        }
+        return execute_node_scan(
+            variable,
+            &[label.to_string()],
+            &[(
+                property.to_string(),
+                crate::plan::expr::Expr::Literal(lookup_val),
+            )],
+            ctx,
+        );
+    }
     // A label without an identity is carried by no node.
     let Some(label_id) = ctx.label_id(label)? else {
         return Ok(Vec::new());

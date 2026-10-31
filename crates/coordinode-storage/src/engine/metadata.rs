@@ -25,7 +25,9 @@ use coordinode_core::graph::node::{
 use coordinode_core::group::{
     DEPLOYMENT_KEY, DeploymentId, ENROLLED_DEPLOYMENT_KEY, retired_identity_key,
 };
-use coordinode_core::schema::definition::encode_label_current_revision_key;
+use coordinode_core::schema::definition::{
+    encode_label_binding_history_prefix, encode_label_current_revision_key,
+};
 use coordinode_core::schema::label_id::{
     BindingState, FIRST_LABEL_ID, LABEL_ID_KEY_PREFIX, LabelBinding, LabelId, decode_label_id_key,
     label_id_key,
@@ -511,6 +513,11 @@ pub fn label_binding_effects(
             revision: 0,
             state: BindingState::Implicit,
         };
+        // The name's binding history keeps the binding under this commit,
+        // which every member applies at the same timestamp.
+        let mut history = encode_label_binding_history_prefix(name);
+        history.extend_from_slice(&commit_ts.to_be_bytes());
+        effects.push(schema_put(history, binding.encode().to_vec()));
         effects.push(schema_put(key, binding.encode().to_vec()));
     }
     Ok(effects)

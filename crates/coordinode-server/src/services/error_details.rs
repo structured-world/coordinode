@@ -159,6 +159,11 @@ pub enum Reason {
     /// read succeeds at. Terminal for that timestamp: the horizon only moves
     /// forward.
     OutsideRetention,
+    /// A time-travel read older than the MVCC retention horizon asked for
+    /// history that was never retained: nodes of a type that keeps no
+    /// history, or a catalog binding not kept. Nothing was answered. Terminal
+    /// for that read: the message names what was missing and at which time.
+    HistoryUncovered,
     /// A write concern the server cannot honour: an unknown mode or journal
     /// value, a member count above the group's size, or a volatile journal
     /// level asked of more than one member. Terminal for that request; the
@@ -318,6 +323,7 @@ impl Reason {
             Reason::NotLeader => "NOT_LEADER",
             Reason::MemberReadOnly => "MEMBER_READ_ONLY",
             Reason::OutsideRetention => "OUTSIDE_RETENTION",
+            Reason::HistoryUncovered => "HISTORY_UNCOVERED",
             Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
             Reason::ReadNotReady => "READ_NOT_READY",
             Reason::DuplicateKey => "DUPLICATE_KEY",
