@@ -71,7 +71,7 @@ const FLAG_BYPASS_RATE_LIMITER: u8 = 1;
 
 /// Every partition in its frame number, the same numbering the snapshot and
 /// the write buffer use.
-const PARTITIONS: [PartitionId; 10] = [
+const PARTITIONS: [PartitionId; 11] = [
     PartitionId::Node,
     PartitionId::Adj,
     PartitionId::EdgeProp,
@@ -82,6 +82,7 @@ const PARTITIONS: [PartitionId; 10] = [
     PartitionId::Counter,
     PartitionId::VectorF32,
     PartitionId::Registry,
+    PartitionId::NodeHistory,
 ];
 
 fn partition_number(partition: PartitionId) -> u8 {
@@ -96,6 +97,7 @@ fn partition_number(partition: PartitionId) -> u8 {
         PartitionId::Counter => 7,
         PartitionId::VectorF32 => 8,
         PartitionId::Registry => 9,
+        PartitionId::NodeHistory => 10,
     }
 }
 

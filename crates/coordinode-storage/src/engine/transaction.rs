@@ -239,6 +239,7 @@ fn partition_to_id(p: Partition) -> PartitionId {
         Partition::Counter => PartitionId::Counter,
         Partition::VectorF32 => PartitionId::VectorF32,
         Partition::Registry => PartitionId::Registry,
+        Partition::NodeHistory => PartitionId::NodeHistory,
     }
 }
 
@@ -385,6 +386,10 @@ pub struct Transaction<'a> {
     /// Key ranges this attempt removes, `(partition, start, end)`, applied in
     /// the commit's unit ahead of its point writes ([`Self::remove_range`]).
     range_removals: Vec<(Partition, Vec<u8>, Vec<u8>)>,
+    /// Writes keyed by this attempt's commit timestamp, by partition and key
+    /// prefix: the commit appends its timestamp to each key
+    /// ([`Self::put_stamped`]). A prefix written twice keeps its last value.
+    stamped: HashMap<(Partition, Vec<u8>), Vec<u8>>,
     /// Node keys whose state as this attempt leaves them its writer checks
     /// before the commit ([`Self::note_post_state_check`]).
     post_state_checks: Vec<Vec<u8>>,
@@ -445,6 +450,8 @@ pub struct TransactionState {
     derived: derived::DerivedLedger,
     /// Parked with the write buffer: the removals commit with its writes.
     range_removals: Vec<(Partition, Vec<u8>, Vec<u8>)>,
+    /// Parked with the write buffer: they commit with its writes.
+    stamped: HashMap<(Partition, Vec<u8>), Vec<u8>>,
     /// Parked: a node one statement wrote is checked as the last one leaves
     /// it.
     post_state_checks: Vec<Vec<u8>>,
@@ -628,6 +635,7 @@ impl<'a> Transaction<'a> {
             open: Some(engine.open_transaction()),
             derived: derived::DerivedLedger::default(),
             range_removals: Vec::new(),
+            stamped: HashMap::new(),
             post_state_checks: Vec::new(),
             pressure_exempt: false,
             overlap_wait: None,
@@ -830,6 +838,7 @@ impl<'a> Transaction<'a> {
             open: self.open,
             derived: self.derived,
             range_removals: self.range_removals,
+            stamped: self.stamped,
             post_state_checks: self.post_state_checks,
             budget_refusal: self.budget_refusal,
         }
@@ -862,6 +871,7 @@ impl<'a> Transaction<'a> {
             open: self.open.take(),
             derived: std::mem::take(&mut self.derived),
             range_removals: std::mem::take(&mut self.range_removals),
+            stamped: std::mem::take(&mut self.stamped),
             post_state_checks: std::mem::take(&mut self.post_state_checks),
             budget_refusal: self.budget_refusal.take(),
         }
@@ -902,6 +912,7 @@ impl<'a> Transaction<'a> {
             open: state.open,
             derived: state.derived,
             range_removals: state.range_removals,
+            stamped: state.stamped,
             post_state_checks: state.post_state_checks,
             pressure_exempt: false,
             overlap_wait: None,
@@ -970,6 +981,33 @@ impl<'a> Transaction<'a> {
         } else {
             self.engine.put(part, key, value)
         }
+    }
+
+    /// Stage `value` under `prefix` followed by this attempt's commit
+    /// timestamp, big-endian, which the commit appends: a record keyed by
+    /// the commit that wrote it, unique to it and never written again by
+    /// another. Staging `prefix` again replaces the value: one commit
+    /// writes one record under it. The record is not read back by this
+    /// attempt, and its key is not a write conflict: no other commit can
+    /// write it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NoCommitTimestamp`] for a transaction writing
+    /// straight to the engine, which commits at no timestamp; the budget's
+    /// refusal.
+    pub fn put_stamped(
+        &mut self,
+        part: Partition,
+        prefix: &[u8],
+        value: &[u8],
+    ) -> StorageResult<()> {
+        if self.oracle.is_none() {
+            return Err(StorageError::NoCommitTimestamp);
+        }
+        self.admit_staged(STAGED_WRITE + prefix.len() + value.len())?;
+        self.stamped.insert((part, prefix.to_vec()), value.to_vec());
+        Ok(())
     }
 
     /// MVCC-aware delete: buffers a tombstone for atomic flush. Legacy mode
@@ -1522,6 +1560,7 @@ impl<'a> Transaction<'a> {
     fn stages_writes(&self) -> bool {
         !self.write_buffer.is_empty()
             || !self.range_removals.is_empty()
+            || !self.stamped.is_empty()
             || !self.merge_adj_ops.is_empty()
             || !self.merge_node_deltas.is_empty()
             || !self.merge_counter_deltas.is_empty()
@@ -1797,7 +1836,8 @@ impl<'a> Transaction<'a> {
     pub fn release_from_schema_waits(&mut self) -> bool {
         let staged = !self.write_buffer.is_empty()
             || self.has_pending_merges()
-            || !self.range_removals.is_empty();
+            || !self.range_removals.is_empty()
+            || !self.stamped.is_empty();
         if staged {
             return false;
         }
@@ -1915,6 +1955,7 @@ impl<'a> Transaction<'a> {
         // committed entries are never gated.
         let has_writes = !self.write_buffer.is_empty()
             || !self.range_removals.is_empty()
+            || !self.stamped.is_empty()
             || self.has_pending_merges();
         if has_writes && !self.pressure_exempt {
             match self.engine.write_pressure() {
@@ -1998,7 +2039,11 @@ impl<'a> Transaction<'a> {
         };
 
         let has_merge_ops = self.has_pending_merges();
-        if self.write_buffer.is_empty() && self.range_removals.is_empty() && !has_merge_ops {
+        if self.write_buffer.is_empty()
+            && self.range_removals.is_empty()
+            && self.stamped.is_empty()
+            && !has_merge_ops
+        {
             // Read-only: nothing to admit or apply, but a condition the
             // caller stated is still the answer it asked for. Checked against
             // committed state now, which is where a commit with no writes
@@ -2245,6 +2290,22 @@ impl<'a> Transaction<'a> {
         // One mutation list for both application paths below: proposed
         // through the pipeline, or applied directly at commit_ts.
         let mut mutations = self.seal_unit(wb);
+        // The records keyed by this commit, now that it has its timestamp,
+        // after the sealed work whose record sources name earlier positions,
+        // in a fixed order.
+        let stamp = commit_ts.as_raw().to_be_bytes();
+        let mut stamped: Vec<_> = std::mem::take(&mut self.stamped).into_iter().collect();
+        stamped.sort_unstable_by(|((a, ak), _), ((b, bk), _)| {
+            (a.position(), ak).cmp(&(b.position(), bk))
+        });
+        for ((part, mut key), value) in stamped {
+            key.extend_from_slice(&stamp);
+            mutations.push(Mutation::Put {
+                partition: partition_to_id(part),
+                key,
+                value,
+            });
+        }
         // The binding goes last, after the sealed DERIVED work whose record
         // sources name positions of the list before it.
         let bind = |mutations: &mut Vec<Mutation>, attempt: u64| {

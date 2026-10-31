@@ -58,7 +58,8 @@ impl SegmentDataType {
             | Partition::Idx
             | Partition::Raft
             | Partition::Counter
-            | Partition::Registry => Self::PropertyDoc,
+            | Partition::Registry
+            | Partition::NodeHistory => Self::PropertyDoc,
         }
     }
 }
@@ -84,6 +85,7 @@ pub fn partition_wire_tag(partition: Partition) -> u8 {
         Partition::Counter => 8,
         Partition::VectorF32 => 9,
         Partition::Registry => 10,
+        Partition::NodeHistory => 11,
     }
 }
 
@@ -103,6 +105,7 @@ pub fn partition_from_wire_tag(tag: u8) -> Option<Partition> {
         8 => Partition::Counter,
         9 => Partition::VectorF32,
         10 => Partition::Registry,
+        11 => Partition::NodeHistory,
         _ => return None,
     })
 }

@@ -212,6 +212,12 @@ pub enum StorageError {
     /// or lists making too many entries. Nothing of the write was staged.
     #[error(transparent)]
     IndexEntry(#[from] coordinode_core::index::derive::EntryError),
+
+    /// A write keyed by its commit timestamp, staged by a transaction that
+    /// commits at none: one writing straight to the engine has no commit to
+    /// name it. Nothing was written.
+    #[error("a write keyed by its commit needs a transaction that commits at a timestamp")]
+    NoCommitTimestamp,
 }
 
 /// `key` as text for a message: printable ASCII as it is, every other byte

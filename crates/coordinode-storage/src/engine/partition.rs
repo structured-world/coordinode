@@ -60,6 +60,12 @@ pub enum Partition {
     /// records replicated through this shard's Raft group; the minimum
     /// checkpoint over the keyspace is the shard's retention floor.
     Registry,
+
+    /// `nodehist:` — the canonical history of temporal nodes: one
+    /// independent full record per assertion, keyed by the version it states
+    /// and the commit that stated it. Application data, kept past the
+    /// time-travel window.
+    NodeHistory,
 }
 
 impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
@@ -76,6 +82,7 @@ impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
             PartitionId::Counter => Self::Counter,
             PartitionId::VectorF32 => Self::VectorF32,
             PartitionId::Registry => Self::Registry,
+            PartitionId::NodeHistory => Self::NodeHistory,
         }
     }
 }
@@ -97,6 +104,7 @@ impl Partition {
             Self::Counter => PartitionId::Counter,
             Self::VectorF32 => PartitionId::VectorF32,
             Self::Registry => PartitionId::Registry,
+            Self::NodeHistory => PartitionId::NodeHistory,
         })
     }
 
@@ -114,6 +122,7 @@ impl Partition {
             Self::Counter => "counter",
             Self::VectorF32 => "vec",
             Self::Registry => "registry",
+            Self::NodeHistory => "nodehist",
         }
     }
 
@@ -183,11 +192,12 @@ impl Partition {
             Self::Counter => 8,
             Self::VectorF32 => 9,
             Self::Registry => 10,
+            Self::NodeHistory => 11,
         }
     }
 
     /// The number of partitions.
-    pub(crate) const COUNT: usize = 11;
+    pub(crate) const COUNT: usize = 12;
 
     /// All partitions in creation order.
     pub fn all() -> &'static [Partition] {
@@ -203,6 +213,7 @@ impl Partition {
             Self::Counter,
             Self::VectorF32,
             Self::Registry,
+            Self::NodeHistory,
         ]
     }
 }

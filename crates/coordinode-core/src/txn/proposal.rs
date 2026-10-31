@@ -369,6 +369,11 @@ pub enum PartitionId {
     /// retention floor consumed by LSM compaction, oplog retention, and the
     /// tiering validator.
     Registry,
+
+    /// The canonical history of temporal nodes: one independent full
+    /// record per assertion, keyed by the version it states and the commit
+    /// that stated it.
+    NodeHistory,
 }
 
 /// A batch of mutations to be proposed through Raft.

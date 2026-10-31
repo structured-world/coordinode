@@ -133,6 +133,7 @@ fn partition_tag(p: Partition) -> u8 {
         Partition::Counter => 8,
         Partition::VectorF32 => 9,
         Partition::Registry => 10,
+        Partition::NodeHistory => 11,
     }
 }
 
@@ -150,6 +151,7 @@ fn tag_to_partition(tag: u8) -> Option<Partition> {
         8 => Some(Partition::Counter),
         9 => Some(Partition::VectorF32),
         10 => Some(Partition::Registry),
+        11 => Some(Partition::NodeHistory),
         _ => None,
     }
 }

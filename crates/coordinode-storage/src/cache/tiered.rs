@@ -488,7 +488,12 @@ impl CacheLayer {
         let mut header = [0u8; ENTRY_HEADER_SIZE];
         file.read_exact(&mut header)?;
 
-        let partition = partition_from_byte(header[8]);
+        let partition = partition_from_byte(header[8]).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("a cache entry of unknown partition {}", header[8]),
+            )
+        })?;
 
         let mut key_buf = vec![0u8; meta.key_len as usize];
         file.read_exact(&mut key_buf)?;
@@ -837,21 +842,13 @@ impl TieredCache {
     }
 }
 
-fn partition_from_byte(b: u8) -> Partition {
-    match b {
-        0 => Partition::Node,
-        1 => Partition::Adj,
-        2 => Partition::EdgeProp,
-        3 => Partition::Blob,
-        4 => Partition::BlobRef,
-        5 => Partition::Schema,
-        6 => Partition::Idx,
-        7 => Partition::Raft,
-        8 => Partition::Counter,
-        9 => Partition::VectorF32,
-        10 => Partition::Registry,
-        _ => Partition::Node,
-    }
+/// The partition an entry header names by its discriminant (`part as u8`),
+/// which is its position in [`Partition::all`]; `None` for none.
+fn partition_from_byte(b: u8) -> Option<Partition> {
+    Partition::all()
+        .iter()
+        .copied()
+        .find(|&part| part as u8 == b)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

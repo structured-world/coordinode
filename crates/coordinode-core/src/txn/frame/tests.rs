@@ -175,7 +175,8 @@ fn unknown_flags_and_tags_are_refused() {
 
     for tag in [
         7u8,
-        KIND_PUT | (10 << 3),
+        // One past the last partition a frame numbers.
+        KIND_PUT | ((PARTITIONS.len() as u8) << 3),
         KIND_COMMAND | (1 << 3),
         KIND_DERIVE | (1 << 3),
         KIND_OPERATION | (1 << 3),

@@ -45,6 +45,7 @@ pub fn to_partition(id: PartitionId) -> Partition {
         PartitionId::Counter => Partition::Counter,
         PartitionId::VectorF32 => Partition::VectorF32,
         PartitionId::Registry => Partition::Registry,
+        PartitionId::NodeHistory => Partition::NodeHistory,
     }
 }
 
@@ -65,6 +66,7 @@ pub fn to_partition_id(p: Partition) -> PartitionId {
         Partition::Counter => PartitionId::Counter,
         Partition::VectorF32 => PartitionId::VectorF32,
         Partition::Registry => PartitionId::Registry,
+        Partition::NodeHistory => PartitionId::NodeHistory,
     }
 }
 

@@ -1160,6 +1160,110 @@ fn a_commit_of_only_a_range_removal_writes() {
     assert!(engine.get(Partition::Idx, b"idx:a:1").unwrap().is_none());
 }
 
+/// The keys and values a partition holds under `prefix`, in key order.
+fn stored_under(engine: &StorageEngine, part: Partition, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    engine
+        .prefix_scan(part, prefix)
+        .unwrap()
+        .map(|guard| {
+            let (key, value) = guard.into_inner().unwrap();
+            (key.to_vec(), value.to_vec())
+        })
+        .collect()
+}
+
+/// A write keyed by its commit lands under its prefix followed by the
+/// commit's timestamp, with the commit and not before, and survives the
+/// transaction being parked between statements. A prefix written twice by
+/// one attempt is one record holding the last value: one commit states one
+/// thing under it. A commit of nothing else is a writing commit.
+#[test]
+fn a_stamped_write_lands_under_its_commit() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put_stamped(Partition::NodeHistory, b"h:1:", b"first")
+        .unwrap();
+    txn.put_stamped(Partition::NodeHistory, b"h:2:", b"other")
+        .unwrap();
+    txn.put_stamped(Partition::NodeHistory, b"h:1:", b"last")
+        .unwrap();
+    assert!(
+        stored_under(&engine, Partition::NodeHistory, b"h:").is_empty(),
+        "nothing lands before the commit"
+    );
+    let mut txn = Transaction::resume(&engine, Some(&oracle), txn.into_state());
+    let committed = txn
+        .commit(&ctx)
+        .expect("commit")
+        .commit_ts
+        .expect("a commit timestamp")
+        .as_raw()
+        .to_be_bytes();
+
+    let stamped = |prefix: &[u8]| [prefix, &committed[..]].concat();
+    assert_eq!(
+        stored_under(&engine, Partition::NodeHistory, b"h:"),
+        [
+            (stamped(b"h:1:"), b"last".to_vec()),
+            (stamped(b"h:2:"), b"other".to_vec()),
+        ]
+    );
+}
+
+/// Two commits writing one prefix keyed by their commits never conflict,
+/// even while both are open at once, and leave one record each: what each
+/// stated stays apart from what the other did.
+#[test]
+fn stamped_writes_of_one_prefix_keep_each_commit() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    let mut first = mvcc_txn(&engine, &oracle);
+    let mut second = mvcc_txn(&engine, &oracle);
+    first
+        .put_stamped(Partition::NodeHistory, b"h:1:", b"a")
+        .unwrap();
+    second
+        .put_stamped(Partition::NodeHistory, b"h:1:", b"b")
+        .unwrap();
+    let a = first.commit(&ctx).expect("first").commit_ts.unwrap();
+    let b = second.commit(&ctx).expect("second").commit_ts.unwrap();
+    assert_ne!(a, b);
+    let stored = stored_under(&engine, Partition::NodeHistory, b"h:1:");
+    assert_eq!(stored.len(), 2, "{stored:?}");
+    let value_at = |ts: Timestamp| {
+        stored
+            .iter()
+            .find(|(key, _)| key.ends_with(&ts.as_raw().to_be_bytes()))
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(value_at(a), Some(b"a".to_vec()));
+    assert_eq!(value_at(b), Some(b"b".to_vec()));
+}
+
+/// A transaction writing straight to the engine commits at no timestamp,
+/// so a write keyed by its commit is refused and nothing is written.
+#[test]
+fn a_stamped_write_needs_a_commit_timestamp() {
+    let (engine, _oracle, _d) = test_engine();
+    let mut txn = Transaction::new(&engine, None, Timestamp::ZERO, None);
+    assert!(matches!(
+        txn.put_stamped(Partition::NodeHistory, b"h:1:", b"a"),
+        Err(StorageError::NoCommitTimestamp)
+    ));
+    assert!(stored_under(&engine, Partition::NodeHistory, b"h:").is_empty());
+}
+
 /// Keys recorded for a post-state check survive parking and are handed out
 /// once.
 #[test]
