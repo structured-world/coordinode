@@ -297,10 +297,28 @@ struct BinCheck {
 /// the other gives the same state for. A failure's reason stored as `bin`
 /// decodes as a string does when it is UTF-8, both ways, and is refused
 /// both ways when it is not.
+///
+/// The variants are numbered by matches over the types themselves, which do
+/// not compile once a variant is added, and the cases must cover every
+/// number: a new variant fails here until its case is written, so the
+/// shapes the state is read through cannot fall behind unseen.
 #[test]
 fn an_integrity_state_agrees_with_the_record_on_every_shape() {
-    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
-    for found in [
+    const MISMATCHES: usize = 3;
+    const CHECK_STATES: usize = 5;
+    let mismatch_variant = |m: &Mismatch| match m {
+        Mismatch::Missing { .. } => 0,
+        Mismatch::Extra { .. } => 1,
+        Mismatch::SourceDuplicate { .. } => 2,
+    };
+    let check_variant = |s: &CheckState| match s {
+        CheckState::Accepted => 0,
+        CheckState::Running { .. } => 1,
+        CheckState::Done => 2,
+        CheckState::Failed { .. } => 3,
+        CheckState::Cancelled => 4,
+    };
+    let mismatches = [
         Mismatch::Missing {
             node: 1,
             valid_from: Some(-4),
@@ -315,11 +333,8 @@ fn an_integrity_state_agrees_with_the_record_on_every_shape() {
             nodes: [5, 6],
             tuple: vec![],
         },
-    ] {
-        record.report(&found);
-    }
-    record.trusted_from = Some(9);
-    for state in [
+    ];
+    let check_states = [
         CheckState::Accepted,
         CheckState::Running { executor: 3 },
         CheckState::Done,
@@ -327,7 +342,27 @@ fn an_integrity_state_agrees_with_the_record_on_every_shape() {
             reason: "stopped".into(),
         },
         CheckState::Cancelled,
-    ] {
+    ];
+    let mut seen = [false; MISMATCHES];
+    for found in &mismatches {
+        seen[mismatch_variant(found)] = true;
+    }
+    assert!(
+        seen.iter().all(|s| *s),
+        "a disagreement of some kind is untested"
+    );
+    let mut seen = [false; CHECK_STATES];
+    for state in &check_states {
+        seen[check_variant(state)] = true;
+    }
+    assert!(seen.iter().all(|s| *s), "a check state is untested");
+
+    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
+    for found in &mismatches {
+        record.report(found);
+    }
+    record.trusted_from = Some(9);
+    for state in check_states {
         record.check = Some(IndexCheck {
             state,
             rebuilt_into: Some(GenerationId::from_raw(8)),
