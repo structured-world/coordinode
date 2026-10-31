@@ -600,6 +600,70 @@ fn concurrent_takers_of_one_value_are_held_to_their_times() {
     }
 }
 
+/// A taker racing the holder's release is decided by the state the commits
+/// leave, whichever commits first: taking the value while the holder still
+/// has it is refused, and after it ended the holding (a deletion, then the
+/// holder taking the value back over a later time) the taker is held to the
+/// time the holder left free.
+#[test]
+fn a_taker_racing_a_release_is_decided_by_the_committed_state() {
+    let mut db = open_db();
+    let now = now_us();
+    db.execute_cypher("CREATE UNIQUE INDEX emp_name_u ON :Emp(name)")
+        .expect("unique index");
+    let (a, b, c) = (now - 2 * YEAR, now - YEAR, now + YEAR);
+    create(&mut db, "ada", a, None);
+    let release = format!("MATCH (n:Emp) WHERE temporal_active_at(n, {a}) SET n.valid_to = {b}");
+    let take = |from: i64, to: i64| {
+        format!("CREATE (n:Emp {{name: 'ada', valid_from: {from}, valid_to: {to}}})")
+    };
+
+    // The taker commits first: the holder still holds [b, c).
+    let holder = db.begin_transaction().expect("begin");
+    let taker = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(holder, &release, None)
+        .expect("release staged");
+    db.execute_in_transaction(taker, &take(b, c), None)
+        .expect("take staged");
+    refused_as_unique(db.commit_transaction(taker), "taken before the release");
+    db.commit_transaction(holder).expect("the release lands");
+
+    // Released: the holder takes the value back from c, and a taker staged
+    // against the released state is admitted over [b, c) only.
+    let back = db.begin_transaction().expect("begin");
+    let taker = db.begin_transaction().expect("begin");
+    let late = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(
+        back,
+        &format!("CREATE (n:Emp {{name: 'ada', valid_from: {c}}})"),
+        None,
+    )
+    .expect("back staged");
+    db.execute_in_transaction(taker, &take(b, c), None)
+        .expect("take staged");
+    db.execute_in_transaction(late, &take(b, c + 1), None)
+        .expect("late staged");
+    db.commit_transaction(back)
+        .expect("the value is taken back from c");
+    // Writers of one value meet on its revision: a writer that loses that
+    // race is retried whole, and the retry is decided by the state it then
+    // sees.
+    let retried = |db: &mut Database, txn, statement: &str| match db.commit_transaction(txn) {
+        Err(coordinode_embed::DatabaseError::TransactionConflict { .. }) => {
+            db.execute_cypher(statement).map(|_| ())
+        }
+        other => other.map(|_| ()),
+    };
+    retried(&mut db, taker, &take(b, c)).expect("the gap is free");
+    refused_as_unique(
+        retried(&mut db, late, &take(b, c + 1)),
+        "one instant past the gap",
+    );
+    for t in [a, b, c] {
+        assert_eq!(held_at(&mut db, t), ["ada"], "at {t}");
+    }
+}
+
 /// A label carried by an ordinary type and by a temporal type implying it:
 /// the ordinary node holds its value at every instant, so a temporal node
 /// cannot take it over any interval, and an ordinary node cannot take a
