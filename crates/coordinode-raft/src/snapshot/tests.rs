@@ -21,6 +21,151 @@ fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
     Ok(buf.into_inner())
 }
 
+/// Bind `engine` to deployment `id` and give it one history record, as a
+/// store that founded its domain with its first history holds them.
+fn with_history(engine: &StorageEngine, id: u8) {
+    engine
+        .put(
+            Partition::Schema,
+            coordinode_core::group::DEPLOYMENT_KEY,
+            &[id; 16],
+        )
+        .unwrap();
+    engine
+        .put(Partition::NodeHistory, b"nhist:history", b"state")
+        .unwrap();
+}
+
+fn domain_of(engine: &StorageEngine) -> Option<coordinode_core::group::DeploymentId> {
+    coordinode_storage::engine::metadata::bound_deployment(engine).unwrap()
+}
+
+/// A snapshot names the domain of its history. A receiver bound to another
+/// one refuses it and keeps what it held; one bound to the same installs it;
+/// one bound to none adopts the domain with the history, in both install
+/// paths (the serialized snapshot and the stream).
+#[test]
+fn a_snapshot_installs_history_only_into_its_domain() {
+    use coordinode_core::group::DeploymentId;
+    let dir = tempdir().unwrap();
+    let source = open_engine(dir.path());
+    with_history(&source, 1);
+    let data = build_full_snapshot(&source).unwrap();
+
+    let other_dir = tempdir().unwrap();
+    let other = open_engine(other_dir.path());
+    other
+        .put(
+            Partition::Schema,
+            coordinode_core::group::DEPLOYMENT_KEY,
+            &[2; 16],
+        )
+        .unwrap();
+    other.put(Partition::Node, b"node:mine", b"kept").unwrap();
+    let refused = install_full_snapshot(&other, &data).expect_err("another domain");
+    assert!(
+        refused.to_string().contains("belongs to deployment"),
+        "{refused}"
+    );
+    assert!(other.get(Partition::Node, b"node:mine").unwrap().is_some());
+    assert!(
+        other
+            .get(Partition::NodeHistory, b"nhist:history")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(domain_of(&other), Some(DeploymentId([2; 16])));
+
+    let same_dir = tempdir().unwrap();
+    let same = open_engine(same_dir.path());
+    same.put(
+        Partition::Schema,
+        coordinode_core::group::DEPLOYMENT_KEY,
+        &[1; 16],
+    )
+    .unwrap();
+    install_full_snapshot(&same, &data).expect("the same domain");
+    assert!(
+        same.get(Partition::NodeHistory, b"nhist:history")
+            .unwrap()
+            .is_some()
+    );
+
+    let fresh_dir = tempdir().unwrap();
+    let fresh = open_engine(fresh_dir.path());
+    install_full_snapshot_from_reader(&fresh, &mut io::Cursor::new(&data)).expect("unbound");
+    assert_eq!(domain_of(&fresh), Some(DeploymentId([1; 16])));
+    assert!(
+        fresh
+            .get(Partition::NodeHistory, b"nhist:history")
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Replacing a whole database replaces its domain with the image's, bound
+/// with the image's records; history the image names no domain for is still
+/// refused, and the receiver left as it was.
+#[test]
+fn a_replaced_database_takes_the_images_domain() {
+    use coordinode_core::group::DeploymentId;
+    let dir = tempdir().unwrap();
+    let source = open_engine(dir.path());
+    with_history(&source, 1);
+    let data = build_full_snapshot(&source).unwrap();
+    let target_dir = tempdir().unwrap();
+    let target = open_engine(target_dir.path());
+    target
+        .put(
+            Partition::Schema,
+            coordinode_core::group::DEPLOYMENT_KEY,
+            &[2; 16],
+        )
+        .unwrap();
+    replace_database_from_reader(&target, &mut io::Cursor::new(&data)).expect("replace");
+    assert_eq!(domain_of(&target), Some(DeploymentId([1; 16])));
+    assert!(
+        target
+            .get(Partition::NodeHistory, b"nhist:history")
+            .unwrap()
+            .is_some()
+    );
+
+    let unbound_dir = tempdir().unwrap();
+    let unbound_source = open_engine(unbound_dir.path());
+    unbound_source
+        .put(Partition::NodeHistory, b"nhist:history", b"state")
+        .unwrap();
+    let data = build_full_snapshot(&unbound_source).unwrap();
+    let refused = replace_database_from_reader(&target, &mut io::Cursor::new(&data))
+        .expect_err("history without a domain");
+    assert!(refused.to_string().contains("names no domain"), "{refused}");
+    assert_eq!(domain_of(&target), Some(DeploymentId([1; 16])));
+}
+
+/// History a snapshot names no domain for is refused: a receiver cannot
+/// tell whose it is, and adopting none would leave it unbound.
+#[test]
+fn a_snapshot_of_history_without_a_domain_is_refused() {
+    let dir = tempdir().unwrap();
+    let source = open_engine(dir.path());
+    source
+        .put(Partition::NodeHistory, b"nhist:history", b"state")
+        .unwrap();
+    let data = build_full_snapshot(&source).unwrap();
+    let fresh_dir = tempdir().unwrap();
+    let fresh = open_engine(fresh_dir.path());
+    let refused = install_full_snapshot(&fresh, &data).expect_err("no domain");
+    assert!(refused.to_string().contains("names no domain"), "{refused}");
+    assert!(
+        fresh
+            .get(Partition::NodeHistory, b"nhist:history")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(domain_of(&fresh), None);
+}
+
 #[test]
 fn test_snapshot_roundtrip_empty_db() {
     let dir = tempdir().unwrap();

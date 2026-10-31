@@ -313,20 +313,25 @@ pub(crate) fn run_restore(
             // image must not reopen what that history closed or retired.
             let surviving = coordinode_storage::engine::operations::admission_fences(db.engine())
                 .map_err(|e| format!("read the operation fences: {e}"))?;
-            coordinode_raft::snapshot::install_full_snapshot_from_reader(db.engine(), &mut reader)
+            coordinode_raft::snapshot::replace_database_from_reader(db.engine(), &mut reader)
                 .map_err(|e| format!("restore failed: {e}"))?;
             coordinode_storage::engine::operations::fence_restored(db.engine(), &surviving)
                 .map_err(|e| format!("fence the restored operation records: {e}"))?;
-            // The store continues the image's domain: a descriptor issued
-            // before the backup resolves to its recorded outcome here.
-            if let Some(id) = deployment {
-                db.engine()
-                    .put(
-                        coordinode_storage::engine::partition::Partition::Schema,
-                        coordinode_core::group::DEPLOYMENT_KEY,
-                        id.as_bytes(),
-                    )
-                    .map_err(|e| format!("record the restored deployment identity: {e}"))?;
+            // The store continues the image's domain, bound in the install's
+            // batch with the image's records: the replaced database's domain
+            // goes with it, and its descriptors are fenced above. A
+            // descriptor issued before the backup resolves to its recorded
+            // outcome here.
+            let bound = coordinode_storage::engine::metadata::bound_deployment(db.engine())
+                .map_err(|e| format!("read the restored deployment identity: {e}"))?;
+            if let Some(id) = deployment
+                && bound != Some(id)
+            {
+                return Err(format!(
+                    "the backup's frame names deployment {id}, but its image bound this \
+                     store to {bound:?}; the backup is inconsistent"
+                )
+                .into());
             }
             db.engine()
                 .persist()

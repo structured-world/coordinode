@@ -241,6 +241,18 @@ where
         }
         None => w.write_all(&[0])?,
     }
+    // The domain the history above belongs to, read after the history was:
+    // a store binds its domain before any of its history is visible, so a
+    // history the scan found has its domain bound by now.
+    let domain = coordinode_storage::engine::metadata::bound_deployment(engine)
+        .map_err(|e| io::Error::other(format!("snapshot history domain: {e}")))?;
+    match domain {
+        Some(domain) => {
+            w.write_all(&[1])?;
+            w.write_all(domain.as_bytes())?;
+        }
+        None => w.write_all(&[0])?,
+    }
     w.flush()?;
     drop(w);
     let end = out.stream_position()?;
@@ -302,7 +314,7 @@ where
 /// **Important:** Raft keys (`raft:*`) in the Schema partition are
 /// always preserved — they're managed by openraft, not application data.
 pub fn install_full_snapshot(engine: &StorageEngine, data: &[u8]) -> io::Result<()> {
-    apply_full(engine, parse_verified_slice(data)?)
+    apply_full(engine, parse_verified_slice(data)?, Install::SameDomain)
 }
 
 /// A parsed snapshot, checksum already verified, with the entries a
@@ -315,6 +327,9 @@ struct ParsedSnapshot {
     /// The sender's inventory of the index copies; `None` when it sent
     /// none, which leaves every copy unknown.
     index_inventory: Option<Vec<u8>>,
+    /// The deployment the sender's history belongs to; `None` when the
+    /// sender had none bound, which a snapshot carrying history never has.
+    domain: Option<coordinode_core::group::DeploymentId>,
 }
 
 /// Whether a receiver installs `key` of `partition` from a snapshot. Raft
@@ -429,10 +444,32 @@ fn parse_body(reader: &mut impl IoRead) -> io::Result<ParsedSnapshot> {
     } else {
         None
     };
+    // The history domain, the last section of the current version; earlier
+    // versions carried no history.
+    let domain = if version >= INVENTORY_SINCE {
+        let mut present = [0u8; 1];
+        reader.read_exact(&mut present)?;
+        match present[0] {
+            0 => None,
+            1 => {
+                let mut id = [0u8; 16];
+                reader.read_exact(&mut id)?;
+                Some(coordinode_core::group::DeploymentId(id))
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "snapshot history domain flag {other}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
     Ok(ParsedSnapshot {
         partitions,
         tables,
         index_inventory,
+        domain,
     })
 }
 
@@ -522,7 +559,75 @@ fn verify_field_dictionary<'a>(
     Ok(())
 }
 
-fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
+/// Check, before anything is installed, that the history a snapshot carries
+/// belongs to the receiver's domain: the snapshot names the domain its
+/// history was bound to, and the receiver's binding (its record, or the
+/// deployment it was enrolled in) must be that one. History a snapshot names
+/// no domain for is refused, as is history of another domain; the receiver
+/// is left as it was. A receiver bound to nothing yet adopts the snapshot's
+/// domain with its history.
+fn verify_history_domain(
+    engine: &StorageEngine,
+    parsed: &ParsedSnapshot,
+    install: Install,
+) -> io::Result<()> {
+    let carries_history = parsed
+        .partitions
+        .iter()
+        .any(|(partition, entries)| *partition == Partition::NodeHistory && !entries.is_empty());
+    match install {
+        Install::SameDomain => {
+            check_history_domain(engine, parsed.domain, carries_history).map(drop)
+        }
+        // The whole database is replaced, its binding with it; only history
+        // with no domain to bind it to is refused.
+        Install::ReplaceDatabase if parsed.domain.is_none() && carries_history => Err(
+            io::Error::other("the snapshot carries history but names no domain for it"),
+        ),
+        Install::ReplaceDatabase => Ok(()),
+    }
+}
+
+/// How an install treats the receiver's history domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Install {
+    /// The receiver keeps its domain: a snapshot of another is refused, and
+    /// a receiver bound to none takes the snapshot's. A member catching up
+    /// with its group installs this way.
+    SameDomain,
+    /// The receiver is replaced by the snapshot's database as a whole, the
+    /// snapshot's domain included, bound in the same batch as its data. An
+    /// explicit offline restore installs this way.
+    ReplaceDatabase,
+}
+
+/// The check of [`verify_history_domain`] for a source naming `source` as
+/// its history's domain and carrying history or not: `Ok(Some(domain))` when
+/// the receiver, bound to nothing yet, is to adopt `domain` before any of the
+/// history lands; `Ok(None)` when its binding already is the source's, or
+/// the source brings no domain and no history.
+fn check_history_domain(
+    engine: &StorageEngine,
+    source: Option<coordinode_core::group::DeploymentId>,
+    carries_history: bool,
+) -> io::Result<Option<coordinode_core::group::DeploymentId>> {
+    let bound = coordinode_storage::engine::metadata::bound_deployment(engine)
+        .map_err(|e| io::Error::other(format!("the receiver's history domain: {e}")))?;
+    match (source, bound) {
+        (None, _) if carries_history => Err(io::Error::other(
+            "the snapshot carries history but names no domain for it",
+        )),
+        (Some(source), Some(bound)) if source != bound => Err(io::Error::other(format!(
+            "the snapshot's history belongs to deployment {source}, \
+             and this store to deployment {bound}"
+        ))),
+        (Some(source), None) => Ok(Some(source)),
+        _ => Ok(None),
+    }
+}
+
+fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot, install: Install) -> io::Result<()> {
+    verify_history_domain(engine, &parsed, install)?;
     verify_field_dictionary(
         parsed
             .partitions
@@ -532,10 +637,14 @@ fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> 
     )?;
     // The install replaces dictionary records in two steps; a dictionary read
     // between them would see the old and the new mixed.
-    engine.with_metadata_exclusive(|| install_verified(engine, parsed))
+    engine.with_metadata_exclusive(|| install_verified(engine, parsed, install))
 }
 
-fn install_verified(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
+fn install_verified(
+    engine: &StorageEngine,
+    parsed: ParsedSnapshot,
+    install: Install,
+) -> io::Result<()> {
     let transfer = |e| io::Error::other(format!("snapshot index copies: {e}"));
     // The index copies the snapshot brings are qualified only by its
     // inventory, taken once they are in place.
@@ -547,6 +656,21 @@ fn install_verified(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Resul
         engine.begin_index_transfer().map_err(transfer)?;
     }
     let mut batch = WriteBatch::new(engine);
+    // A receiver bound to no domain yet takes the snapshot's with its
+    // history, and a replaced database takes it whatever it was bound to, in
+    // the same batch: the history never lands unbound or under another.
+    if let Some(domain) = parsed.domain
+        && (install == Install::ReplaceDatabase
+            || coordinode_storage::engine::metadata::bound_deployment(engine)
+                .map_err(|e| io::Error::other(format!("the receiver's history domain: {e}")))?
+                .is_none())
+    {
+        batch.put(
+            Partition::Schema,
+            coordinode_core::group::DEPLOYMENT_KEY.to_vec(),
+            domain.as_bytes().to_vec(),
+        );
+    }
     let mut total_written = 0usize;
     // Values move into the batch; only the keys are kept, for the cleanup.
     let mut snapshot_keys = Vec::with_capacity(parsed.partitions.len());
@@ -699,11 +823,37 @@ pub fn install_full_snapshot_from_reader(
     engine: &StorageEngine,
     reader: &mut impl IoRead,
 ) -> io::Result<()> {
+    install_from_reader(engine, reader, Install::SameDomain)
+}
+
+/// Replace the whole database with the snapshot `reader` holds: its data and
+/// the domain its history and operations belong to, bound in the same batch
+/// as the data, whatever domain the receiver held. For an explicit offline
+/// restore, which also fences the operations the replaced database admitted;
+/// a member catching up with its group installs with
+/// [`install_full_snapshot_from_reader`], which keeps its domain.
+///
+/// # Errors
+///
+/// As [`install_full_snapshot_from_reader`]; history the snapshot names no
+/// domain for is refused before anything is written.
+pub fn replace_database_from_reader(
+    engine: &StorageEngine,
+    reader: &mut impl IoRead,
+) -> io::Result<()> {
+    install_from_reader(engine, reader, Install::ReplaceDatabase)
+}
+
+fn install_from_reader(
+    engine: &StorageEngine,
+    reader: &mut impl IoRead,
+    install: Install,
+) -> io::Result<()> {
     let parsed = parse_verified_stream(reader)?;
     if reader.read(&mut [0u8; 1])? != 0 {
         return Err(io::Error::other("snapshot has bytes past its checksum"));
     }
-    apply_full(engine, parsed)
+    apply_full(engine, parsed, install)
 }
 
 /// Install `received`, a Raft snapshot standing at log position `next`
@@ -735,8 +885,28 @@ pub fn install_received(
         .map_err(|e| storage("read the snapshot's schema", e))?;
     verify_field_dictionary(&schema)?;
     drop(schema);
+    // The received store is the source's whole copy, its own binding
+    // included: its history's domain is that binding.
+    let source_domain = coordinode_storage::engine::metadata::bound_deployment(&source)
+        .map_err(|e| storage("read the snapshot's history domain", e))?;
+    let carries_history = source
+        .prefix_scan(Partition::NodeHistory, &[])
+        .map_err(|e| storage("read the snapshot's history", e))?
+        .next()
+        .is_some();
+    let adopt = check_history_domain(engine, source_domain, carries_history)?;
     let partitions: Vec<Partition> = snapshot_partitions().collect();
     engine.with_metadata_exclusive(|| {
+        // Bound before the history lands, so it never stands unbound.
+        if let Some(domain) = adopt {
+            engine
+                .put(
+                    Partition::Schema,
+                    coordinode_core::group::DEPLOYMENT_KEY,
+                    domain.as_bytes(),
+                )
+                .map_err(|e| storage("bind the snapshot's history domain", e))?;
+        }
         let mut total_written = 0usize;
         engine
             .install_raft_image(

@@ -5,7 +5,7 @@
 //! interner alongside the snapshot and restores it separately. These tests run
 //! the `coordinode` binary, and check that property names resolve in a
 //! freshly restored database, i.e. the interner survived the round trip.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
@@ -21,6 +21,125 @@ fn coordinode(args: &[&std::ffi::OsStr]) {
         "coordinode {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The commit timestamp of a write of an unrelated node.
+fn mark(db: &mut Database) -> u64 {
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(tx, "CREATE (:Mark)", None)
+        .expect("mark");
+    db.commit_transaction(tx)
+        .expect("commit")
+        .commit_ts
+        .as_raw()
+}
+
+/// Run `alter`, wait for its parts to be folded, and return a system time
+/// at which it is in force.
+fn settled(db: &mut Database, alter: &str) -> u64 {
+    use coordinode_modality::IndexStore as _;
+    db.execute_cypher(alter).expect("alter");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !coordinode_modality::LocalIndexStore::new(db.engine())
+        .list_definitions()
+        .expect("definitions")
+        .iter()
+        .all(|def| def.selection.is_empty())
+    {
+        assert!(std::time::Instant::now() < deadline, "{alter}: unfolded");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    mark(db)
+}
+
+/// The names of the things at `as_of`, in order.
+fn things(db: &mut Database, as_of: u64) -> Vec<String> {
+    db.execute_cypher(&format!(
+        "MATCH (n:Thing) RETURN n.name AS name ORDER BY name AS OF TIMESTAMP {as_of}"
+    ))
+    .unwrap_or_else(|e| panic!("as of {as_of}: {e}"))
+    .iter()
+    .map(|row| match row.get("name") {
+        Some(Value::String(name)) => name.clone(),
+        other => panic!("name {other:?}"),
+    })
+    .collect()
+}
+
+/// The same history restored into a fresh store keeps its domain and every
+/// interpretation it retained: three interpretations of an implied label
+/// over unchanged nodes, backed up, restored and read after the restored
+/// store's row versions of those times are collected, answer exactly as the
+/// source did, under the source's deployment.
+#[test]
+fn a_restored_history_keeps_its_domain_and_interpretations() {
+    use coordinode_storage::engine::partition::Partition;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let (src_dir, dst_dir) = (dir.path().join("src"), dir.path().join("dst"));
+    let backup = dir.path().join("db.snap");
+    let (times, domain) = {
+        let mut src = Database::open(&src_dir).expect("open src");
+        for statement in [
+            "CREATE NODE TYPE Thing TEMPORAL WITH (name: STRING, valid_from: INT)",
+            "CREATE NODE TYPE X TEMPORAL WITH (name: STRING, valid_from: INT)",
+            "CREATE NODE TYPE Y TEMPORAL WITH (name: STRING, valid_from: INT)",
+            "CREATE (:X {name: 'x', valid_from: 0}), (:Y {name: 'y', valid_from: 0})",
+        ] {
+            src.execute_cypher(statement).expect(statement);
+        }
+        let before = mark(&mut src);
+        let x_only = settled(&mut src, "ALTER NODE TYPE X SET IMPLIES (Thing)");
+        let both = settled(&mut src, "ALTER NODE TYPE Y SET IMPLIES (Thing)");
+        let y_only = settled(&mut src, "ALTER NODE TYPE X SET IMPLIES ()");
+        let domain = coordinode_storage::engine::metadata::bound_deployment(src.engine())
+            .expect("binding")
+            .expect("the history founded a domain");
+        ([before, x_only, both, y_only], domain)
+    };
+    let format = std::ffi::OsStr::new("raft-snapshot");
+    coordinode(&[
+        "backup".as_ref(),
+        "--data".as_ref(),
+        src_dir.as_os_str(),
+        "--output".as_ref(),
+        backup.as_os_str(),
+        "--format".as_ref(),
+        format,
+    ]);
+    coordinode(&[
+        "restore".as_ref(),
+        "--data".as_ref(),
+        dst_dir.as_os_str(),
+        "--input".as_ref(),
+        backup.as_os_str(),
+        "--format".as_ref(),
+        format,
+    ]);
+    let mut dst = Database::open(&dst_dir).expect("open dst");
+    assert_eq!(
+        coordinode_storage::engine::metadata::bound_deployment(dst.engine()).expect("binding"),
+        Some(domain),
+        "the restored store continues the source's domain"
+    );
+    dst.set_retention_window(std::time::Duration::from_secs(2));
+    let oracle = dst.engine().oracle().expect("oracle");
+    oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(
+        oracle.current().as_raw() + 10_000_000,
+    ));
+    mark(&mut dst);
+    for part in [
+        Partition::Node,
+        Partition::Schema,
+        Partition::Idx,
+        Partition::NodeHistory,
+    ] {
+        dst.engine().force_compaction(part).expect("compact");
+    }
+    assert!(dst.oldest_readable_timestamp().as_raw() > times[3]);
+    let expected: [&[&str]; 4] = [&[], &["x"], &["x", "y"], &["y"]];
+    for (as_of, names) in times.into_iter().zip(expected) {
+        assert_eq!(things(&mut dst, as_of), names, "as of {as_of}");
+    }
 }
 
 #[test]
