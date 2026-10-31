@@ -103,6 +103,12 @@ pub struct Evaluation<'a> {
     /// in flight under the view as it was taken.
     unseen_from: u64,
     edge_types: core::cell::OnceCell<Vec<String>>,
+    /// The index entries the attempt puts, in key order, built on first use:
+    /// each unique value finds its own by a range, not by reading them all.
+    staged_entries: core::cell::OnceCell<Vec<&'a [u8]>>,
+    /// The attempt's document deltas in key order, a key's own in the order
+    /// they were made, built on first use.
+    deltas_by_key: core::cell::OnceCell<Vec<(&'a [u8], &'a [u8])>>,
 }
 
 impl<'a> Evaluation<'a> {
@@ -122,7 +128,38 @@ impl<'a> Evaluation<'a> {
             read_ts,
             unseen_from: read_ts,
             edge_types: core::cell::OnceCell::new(),
+            staged_entries: core::cell::OnceCell::new(),
+            deltas_by_key: core::cell::OnceCell::new(),
         }
+    }
+
+    /// The index entries the attempt puts, in key order.
+    fn staged_entries(&self) -> &[&'a [u8]] {
+        self.staged_entries.get_or_init(|| {
+            let mut keys: Vec<&'a [u8]> = self
+                .staged_points
+                .iter()
+                .filter(|((part, _), value)| *part == Partition::Idx && value.is_some())
+                .map(|((_, key), _)| key.as_slice())
+                .collect();
+            keys.sort_unstable();
+            keys
+        })
+    }
+
+    /// The attempt's document deltas in key order, a key's own in the order
+    /// they were made.
+    fn deltas_by_key(&self) -> &[(&'a [u8], &'a [u8])] {
+        self.deltas_by_key.get_or_init(|| {
+            let mut deltas: Vec<(&'a [u8], &'a [u8])> = self
+                .node_deltas
+                .iter()
+                .map(|(key, operand)| (key.as_slice(), operand.as_slice()))
+                .collect();
+            // Stable: a record's deltas apply in the order they were made.
+            deltas.sort_by(|a, b| a.0.cmp(b.0));
+            deltas
+        })
     }
 
     /// The first sequence number the attempt could not have seen, when
@@ -387,7 +424,11 @@ impl<'a> Evaluation<'a> {
                     *generation,
                     tuple,
                     (*node, timeline.as_ref()),
-                    (staged_points, node_deltas),
+                    Staged {
+                        points: staged_points,
+                        entries: self.staged_entries(),
+                        deltas: self.deltas_by_key(),
+                    },
                 ),
                 Some(source) => uncovered_holders(
                     engine,
@@ -425,11 +466,12 @@ fn entry_holders(
         NodeId,
         Option<&coordinode_core::txn::invariant::OwnerTimeline>,
     ),
-    (staged_points, node_deltas): (StagedPoints<'_>, NodeDeltas<'_>),
+    staged: Staged<'_, '_>,
 ) -> StorageResult<Verdict> {
     use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_DOC_DELTA};
     use coordinode_core::graph::node::ValidSpan;
     use coordinode_core::index::encoding::{decode_entry, entry_value_prefix};
+    let staged_points = staged.points;
     let prefix = entry_value_prefix(generation, tuple);
     // Every owner of the value as the attempt leaves it, each once.
     let mut owners: Vec<(u64, Option<i64>)> = Vec::new();
@@ -443,11 +485,14 @@ fn entry_holders(
             owners.push(owner);
         }
     }
-    for ((part, key), value) in staged_points.iter() {
-        if *part == Partition::Idx
-            && value.is_some()
-            && key.starts_with(&prefix)
-            && let Some(owner) = decode_entry(generation, key)
+    // The attempt's own entries of this value: their range of the ordered
+    // keys, not every key the attempt staged.
+    let from = staged.entries.partition_point(|k| *k < prefix.as_slice());
+    for key in staged.entries[from..]
+        .iter()
+        .take_while(|k| k.starts_with(&prefix))
+    {
+        if let Some(owner) = decode_entry(generation, key)
             && !owners.contains(&owner)
         {
             owners.push(owner);
@@ -509,7 +554,11 @@ fn entry_holders(
                     let mut record = crate::engine::merge::decode_node_record(&stored)
                         .map_err(|e| serialization(&e))?;
                     let mut deltas = Vec::new();
-                    for (_, operand) in node_deltas.iter().filter(|(k, _)| *k == key) {
+                    let from = staged.deltas.partition_point(|(k, _)| *k < key.as_slice());
+                    for (_, operand) in staged.deltas[from..]
+                        .iter()
+                        .take_while(|(k, _)| *k == key.as_slice())
+                    {
                         let Some((&PREFIX_DOC_DELTA, body)) = operand.split_first() else {
                             return Err(serialization(&"an operand that is not a document delta"));
                         };
@@ -547,6 +596,15 @@ fn entry_holders(
 /// The document deltas an attempt adds to stored node records, each with
 /// the key of the record it applies to, in the order they were made.
 type NodeDeltas<'a> = &'a [(Vec<u8>, Vec<u8>)];
+
+/// What an attempt staged, as a unique value's owners are read from it:
+/// its point writes, the index entries it puts in key order and its
+/// document deltas in key order.
+struct Staged<'s, 'a> {
+    points: StagedPoints<'a>,
+    entries: &'s [&'a [u8]],
+    deltas: &'s [(&'a [u8], &'a [u8])],
+}
 
 /// The unique values an attempt takes in one index generation while it is
 /// being built, each keyed by its encoded tuple and naming the node taking it.
