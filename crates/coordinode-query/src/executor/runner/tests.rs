@@ -5932,75 +5932,62 @@ fn a_unique_write_charges_the_claims_it_keeps() {
     );
 }
 
-/// A claim stated again over a value its node already claimed in this
-/// transaction is dropped, and so is its charge: a Member whose name list
-/// of two thousand values moves away and back keeps one claim per value,
-/// and the move back charges less than the move away by at least the
-/// tuples it did not keep. Nor is the list that carried the tuples kept
-/// charged once it is gone.
+/// The claims of a unique value list keep charged exactly what they keep:
+/// the set's room for them, each claim's tuple and the one source they
+/// share, not the list that carried the tuples. Stated again, the same
+/// claims are dropped and so is everything charged for them: the budget
+/// holds what it held.
 #[test]
 fn a_claim_stated_again_returns_its_charge() {
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
     let (env, builds) = btree_member(engine, &interner);
-    env.registry.register_in_memory(
-        crate::index::IndexDescriptor::btree("m_name", "Member", "name")
-            .unique()
-            .bind(
-                crate::index::IndexId::from_raw(1),
-                crate::index::GenerationId::from_raw(1),
-            ),
-    );
     let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
     ctx.txn
         .charge_writes_to(Some(std::sync::Arc::clone(&ctx.budget)));
-    let names = |p: &str| {
-        Value::Array(
-            (0..2000)
-                .map(|i| Value::String(format!("{p}{i:05}")))
-                .collect(),
-        )
-    };
-    execute_op(
-        &LogicalOp::CreateNode {
-            input: None,
-            variable: None,
-            labels: vec!["Member".to_string()],
-            properties: vec![("name".to_string(), nx(Expr::Literal(names("v"))))],
-        },
-        &mut ctx,
-    )
-    .expect("create");
-    let set_names = |ctx: &mut ExecutionContext<'_>, p: &str| {
-        let before = ctx.budget.memory_used();
-        execute_op(
-            &LogicalOp::Update {
-                input: Box::new(LogicalOp::NodeScan {
-                    variable: "n".into(),
-                    labels: vec!["Member".into()],
-                    property_filters: Vec::new(),
-                }),
-                items: vec![crate::plan::SetItem::Property {
-                    variable: "n".into(),
-                    property: "name".into(),
-                    expr: nx(Expr::Literal(names(p))),
-                }],
-                violation_mode: crate::plan::ViolationMode::Fail,
-            },
-            ctx,
-        )
-        .expect("set");
-        ctx.budget.memory_used() - before
-    };
-    let away = set_names(&mut ctx, "w");
-    let back = set_names(&mut ctx, "v");
-    let kept_tuples = (2000 * "v00000".len()) as u64;
-    assert!(
-        back + kept_tuples <= away,
-        "moving back charged {back}, moving away {away}: the claims stated \
-         again kept their tuples charged"
+    let index = crate::index::IndexDescriptor::btree("m_name", "Member", "name")
+        .unique()
+        .bind(
+            crate::index::IndexId::from_raw(1),
+            crate::index::GenerationId::from_raw(1),
+        );
+    let names = Value::Array(
+        (0..2000)
+            .map(|i| Value::String(format!("v{i:05}")))
+            .collect(),
     );
-    assert_eq!(ctx.txn.claims().len(), 4000, "one claim per value taken");
+    let claim = crate::index::UniqueClaim {
+        index: index.clone(),
+        values: vec![names],
+        node_id: NodeId::from_raw(7),
+        needs_source_proof: true,
+    };
+    // The set's room, the tuples as encoded and the shared source.
+    let tuples: usize = coordinode_core::index::derive::tuples(&claim.values)
+        .expect("tuples")
+        .iter()
+        .map(Vec::len)
+        .sum();
+    let expected = (ctx.txn.claims().room_for(2000) + tuples) as u64
+        + (2 * core::mem::size_of::<usize>()
+            + core::mem::size_of::<coordinode_core::txn::invariant::UncoveredSource>()
+            + "Member".len()
+            + index.interpretation_bytes()) as u64;
+
+    ctx.key_claims.indexes.push(claim.clone());
+    ctx.claim_uniques(0).expect("claimed");
+    let first = ctx.budget.memory_used();
+    assert_eq!(first, expected, "charged beyond what the claims keep");
+    assert_eq!(ctx.txn.claims().len(), 2000);
+
+    ctx.key_claims.indexes.push(claim);
+    ctx.claim_uniques(1).expect("claimed again");
+    assert_eq!(
+        ctx.budget.memory_used(),
+        first,
+        "the claims stated again kept a charge"
+    );
+    assert_eq!(ctx.txn.claims().len(), 2000, "one claim per value");
 }
 
 #[test]

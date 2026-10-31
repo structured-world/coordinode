@@ -2756,25 +2756,39 @@ impl<'a> ExecutionContext<'a> {
             } else {
                 None
             };
+            let predicate = ClaimPredicate::UniqueHolder {
+                node: claim.node_id,
+                uncovered: uncovered.clone(),
+            };
+            // Room for the claims not held yet only: one stated again adds
+            // nothing, so it neither grows the set nor charges it.
+            let held_already = |txn: &coordinode_storage::engine::transaction::Transaction<'_>,
+                                tuple: &[u8]| {
+                txn.claims()
+                    .holds_unique(generation, tuple, &predicate, revision)
+            };
+            let new = tuples
+                .iter()
+                .filter(|tuple| !held_already(&self.txn, tuple))
+                .count();
             self.txn
-                .reserve_claims(tuples.len())
+                .reserve_claims(new)
                 .map_err(ExecutionError::Budget)?;
             // The tuples a claim takes stay charged; the list carrying them
             // and the tuple of a claim already held go with this loop.
             let mut retained = 0usize;
             for tuple in tuples {
-                let len = tuple.len();
-                if self.txn.claim(Claim::new(
-                    ClaimScope::UniqueValue { generation, tuple },
-                    ClaimPredicate::UniqueHolder {
-                        node: claim.node_id,
-                        uncovered: uncovered.clone(),
-                    },
-                    revision,
-                )) {
-                    retained += len;
+                if held_already(&self.txn, &tuple) {
+                    continue;
                 }
+                retained += tuple.len();
+                self.txn.claim(Claim::new(
+                    ClaimScope::UniqueValue { generation, tuple },
+                    predicate.clone(),
+                    revision,
+                ));
             }
+            drop(predicate);
             held.shrink(held.bytes() - retained as u64);
             held.keep_until_query_ends();
             // The source stays charged while a claim holds it.

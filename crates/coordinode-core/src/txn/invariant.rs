@@ -656,6 +656,25 @@ impl Eq for ClaimSet {}
 /// One entry of [`ClaimSet`]'s index, as its table holds it.
 type ScopeSlot = (u64, smallvec::SmallVec<[u32; 1]>);
 
+/// The key [`ClaimSet`] indexes a claim's scope by. A unique value's is
+/// computed from its parts, so a value can be looked up from a borrowed
+/// tuple ([`ClaimSet::holds_unique`]); any other scope's is its hash.
+fn scope_key(scope: &ClaimScope) -> u64 {
+    match scope {
+        ClaimScope::UniqueValue { generation, tuple } => unique_key(*generation, tuple),
+        other => {
+            use core::hash::BuildHasher;
+            rustc_hash::FxBuildHasher.hash_one(other)
+        }
+    }
+}
+
+/// [`scope_key`] of the unique value `tuple` in `generation`.
+fn unique_key(generation: GenerationId, tuple: &[u8]) -> u64 {
+    use core::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one((generation, tuple))
+}
+
 impl ClaimSet {
     /// An empty set.
     pub fn new() -> Self {
@@ -666,11 +685,7 @@ impl ClaimSet {
     /// condition stated twice by two statements of one attempt is one
     /// condition; the copy stated again is dropped.
     pub fn insert(&mut self, claim: Claim) -> bool {
-        use core::hash::BuildHasher;
-        let slots = self
-            .by_scope
-            .entry(rustc_hash::FxBuildHasher.hash_one(&claim.scope))
-            .or_default();
+        let slots = self.by_scope.entry(scope_key(&claim.scope)).or_default();
         if slots.iter().any(|&at| self.claims[at as usize] == claim) {
             return false;
         }
@@ -716,6 +731,31 @@ impl ClaimSet {
         &self.claims
     }
 
+    /// Whether the set holds the claim on the unique value `tuple` of
+    /// `generation` with `predicate`, under `revision`: what stating it
+    /// would add nothing to, asked without building the claim.
+    pub fn holds_unique(
+        &self,
+        generation: GenerationId,
+        tuple: &[u8],
+        predicate: &ClaimPredicate,
+        revision: u64,
+    ) -> bool {
+        self.by_scope
+            .get(&unique_key(generation, tuple))
+            .is_some_and(|slots| {
+                slots.iter().any(|&at| {
+                    let claim = &self.claims[at as usize];
+                    matches!(
+                        &claim.scope,
+                        ClaimScope::UniqueValue { generation: g, tuple: t }
+                            if *g == generation && t.as_slice() == tuple
+                    ) && claim.predicate == *predicate
+                        && claim.schema_revision == revision
+                })
+            })
+    }
+
     /// Change each claim's predicate in place by `restate`, which sees the
     /// scope it covers and cannot move it, then drop a claim that became
     /// equal to one stated before it: one of each stays held, in the order
@@ -750,9 +790,8 @@ impl ClaimSet {
         // Positions moved: the index is rebuilt over the capacity it has.
         self.by_scope.clear();
         for (at, claim) in self.claims.iter().enumerate() {
-            use core::hash::BuildHasher;
             self.by_scope
-                .entry(rustc_hash::FxBuildHasher.hash_one(&claim.scope))
+                .entry(scope_key(&claim.scope))
                 .or_default()
                 // Fewer claims than before: the position fits.
                 .push(at as u32);
