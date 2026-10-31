@@ -290,9 +290,12 @@ impl EmbeddedOplog {
             // next entry, and the journal holds no gap.
             Err(refused @ StorageError::CapacityExhausted { .. }) => return Err(refused),
             Err(e) => {
-                // Part of the entry may be in the file; its index is spent.
+                // Part of the entry may be in the file: an entry written past
+                // it would land behind a hole once the disk drops the tail, so
+                // the journal takes no more writes until reopened, as after a
+                // failed sync.
                 self.next_index += 1;
-                return Err(e);
+                return Err(self.fail(e));
             }
         }
         if level != Journal::Journal {

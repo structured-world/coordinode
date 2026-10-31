@@ -871,6 +871,73 @@ fn reopen_after_crash_recovers_the_unsealed_tail() {
         .expect("every segment verifies after recovery");
 }
 
+/// A segment that cannot be sealed, as on a full disk, stops the log: the
+/// next append, which would open a new segment past the one whose tail may
+/// be lost, is refused, and so is every flush and rotation after it, so no
+/// entry lands past a hole and is acknowledged there. A reopen recovers the
+/// log to what is durable and takes appends again, with no hole.
+#[test]
+fn a_failed_seal_stops_the_log_instead_of_skipping_past_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        // Two entries a segment: the third append rotates.
+        let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 2, 7 * 24 * 3600)
+            .expect("open manager");
+        mgr.append(&make_entry(1, 1001)).expect("append 1");
+        mgr.flush().expect("flush 1");
+        mgr.append(&make_entry(2, 1002)).expect("append 2");
+        // The disk fills before the segment holding entry 2 is sealed.
+        mgr.fail_writes();
+        let refused = mgr.append(&make_entry(3, 1003));
+        assert!(refused.is_err(), "the rotation's seal failed");
+        assert!(mgr.is_stopped());
+        assert!(
+            matches!(
+                mgr.append(&make_entry(3, 1003)),
+                Err(StorageError::LogStopped { .. })
+            ),
+            "no segment opens past the one that failed"
+        );
+        assert!(matches!(mgr.flush(), Err(StorageError::LogStopped { .. })));
+        assert!(matches!(mgr.rotate(), Err(StorageError::LogStopped { .. })));
+    }
+    let mut mgr = test_manager(dir.path());
+    let held = indexes_of(&mgr.read_range(0, u64::MAX).expect("read"));
+    assert!(
+        held == [1] || held == [1, 2],
+        "the log ends at what is durable, with no hole: {held:?}"
+    );
+    let next = held.last().copied().expect("entry 1 was synced") + 1;
+    mgr.append(&make_entry(next, 1000 + next))
+        .expect("append after reopen");
+    mgr.flush().expect("flush");
+    let mut after: Vec<u64> = held.clone();
+    after.push(next);
+    assert_eq!(
+        indexes_of(&mgr.read_range(0, u64::MAX).expect("read")),
+        after
+    );
+}
+
+/// An append whose write fails part way stops the log; one refused before
+/// it wrote anything does not.
+#[test]
+fn a_failed_write_stops_the_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = test_manager(dir.path());
+    mgr.append(&make_entry(1, 1001)).expect("append 1");
+    // An index out of order is refused before any byte is written.
+    assert!(mgr.append(&make_entry(1, 1001)).is_err());
+    assert!(!mgr.is_stopped(), "a refusal that wrote nothing");
+    mgr.fail_writes();
+    assert!(mgr.append(&make_entry(2, 1002)).is_err());
+    assert!(mgr.is_stopped());
+    assert!(matches!(
+        mgr.flush_to_os(),
+        Err(StorageError::LogStopped { .. })
+    ));
+}
+
 /// The recovered tail is sealed, so writes after the restart go to a new
 /// segment and everything reads back in order, across restarts.
 #[test]

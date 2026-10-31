@@ -526,6 +526,13 @@ pub struct SegmentWriter {
     /// the endpoint has a hard limit: each frame, and the footer the seal
     /// writes, is charged before it is written.
     charge: Option<std::sync::Arc<crate::engine::footprint::FileCharge>>,
+    /// A write, flush or sync of this segment failed: what reached the file
+    /// and what the buffer still holds are unknown, so nothing more is
+    /// written to it and the log it belongs to stops.
+    broken: bool,
+    /// Every write from now on fails, as a full disk makes it.
+    #[cfg(any(test, feature = "test-faults"))]
+    fail_writes: bool,
 }
 
 /// Create `path`, which must not exist, for writing under `sync`.
@@ -648,6 +655,58 @@ impl SegmentWriter {
             sync,
             sync_handle: None,
             charge: None,
+            broken: false,
+            #[cfg(any(test, feature = "test-faults"))]
+            fail_writes: false,
+        })
+    }
+
+    /// Whether a write, flush or sync of this segment failed. A refused
+    /// append that wrote nothing (an index out of order, a value that does
+    /// not encode, a charge the endpoint refused) leaves it whole.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Make every later write of this segment fail, as a full disk does.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn fail_writes(&mut self) {
+        self.fail_writes = true;
+    }
+
+    /// The writes of an append or a seal, failing as injected; any failure
+    /// marks the segment broken.
+    fn write_bytes(&mut self, parts: &[&[u8]]) -> StorageResult<()> {
+        #[cfg(any(test, feature = "test-faults"))]
+        if self.fail_writes {
+            self.broken = true;
+            return Err(StorageError::Io(format!(
+                "write segment {:?}: no space left on device (injected)",
+                self.path
+            )));
+        }
+        for part in parts {
+            if let Err(e) = self.file.write_all(part) {
+                self.broken = true;
+                return Err(io_err(e));
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush the buffer to the kernel; a failure marks the segment broken.
+    fn flush_buffer(&mut self) -> StorageResult<()> {
+        #[cfg(any(test, feature = "test-faults"))]
+        if self.fail_writes {
+            self.broken = true;
+            return Err(StorageError::Io(format!(
+                "flush segment {:?}: no space left on device (injected)",
+                self.path
+            )));
+        }
+        self.file.flush().map_err(|e| {
+            self.broken = true;
+            StorageError::Io(format!("flush segment: {e}"))
         })
     }
 
@@ -891,11 +950,7 @@ impl SegmentWriter {
             // a seal never needs room it was not given.
             charge.charge_appending(HEADER_SIZE + self.total_bytes + frame_bytes + FOOTER_SIZE)?;
         }
-        self.file.write_all(&varint_buf).map_err(io_err)?;
-        self.file.write_all(&payload).map_err(io_err)?;
-        self.file
-            .write_all(&checksum.to_le_bytes())
-            .map_err(io_err)?;
+        self.write_bytes(&[&varint_buf, &payload, &checksum.to_le_bytes()])?;
 
         self.frames
             .push((entry.index, HEADER_SIZE + self.total_bytes));
@@ -1004,12 +1059,15 @@ impl SegmentWriter {
     /// here; it is written during [`seal`](Self::seal) at rotation time.
     pub fn flush_and_sync(&mut self) -> StorageResult<()> {
         // Step 1: flush BufWriter's user-space buffer to the kernel buffer.
-        self.file
-            .flush()
-            .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
+        self.flush_buffer()?;
         // Step 2: make the written bytes durable under the configured method.
-        sync_file(self.file.get_ref(), self.sync)
-            .map_err(|e| StorageError::Io(format!("sync segment: {e}")))?;
+        // A failed sync leaves unknown what reached the medium, and a later
+        // one may succeed without it (the kernel drops the dirty pages): the
+        // segment is broken from here.
+        sync_file(self.file.get_ref(), self.sync).map_err(|e| {
+            self.broken = true;
+            StorageError::Io(format!("sync segment: {e}"))
+        })?;
         self.settle_charge();
         Ok(())
     }
@@ -1033,9 +1091,7 @@ impl SegmentWriter {
     ///
     /// The flush fails, or the file cannot be duplicated for the handle.
     pub fn flush_to_os(&mut self) -> StorageResult<SyncHandle> {
-        self.file
-            .flush()
-            .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
+        self.flush_buffer()?;
         // What the kernel allocated past the allowance is counted at once.
         if let Some(charge) = &self.charge
             && let Some(allocated) = crate::engine::footprint::allocated_at(&self.path)
@@ -1067,11 +1123,16 @@ impl SegmentWriter {
             last_ts: self.last_ts,
             total_bytes: self.total_bytes,
         };
+        #[cfg(any(test, feature = "test-faults"))]
+        if self.fail_writes {
+            return Err(StorageError::Io(format!(
+                "write footer of {:?}: no space left on device (injected)",
+                self.path
+            )));
+        }
         write_footer(&mut self.file, &footer)
             .map_err(|e| StorageError::Io(format!("write footer: {e}")))?;
-        self.file
-            .flush()
-            .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
+        self.flush_buffer()?;
         // Also sync on seal — the footer must be durable before we remove
         // the active-writer reference and add the path to sealed[].
         sync_file(self.file.get_ref(), self.sync)

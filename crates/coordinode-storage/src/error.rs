@@ -229,6 +229,17 @@ pub enum StorageError {
     )]
     HistoryDomainMissing,
 
+    /// The log stopped at its first failed write, flush or sync, for
+    /// instance on a full disk. What reached the medium after that point is
+    /// unknown, so nothing more is appended or acknowledged after it: a later
+    /// write landing past a lost one would leave a hole under entries already
+    /// acknowledged. Reopening the store recovers the log to what is durable.
+    #[error("the log stopped at a failed write ({cause}); reopen the store to recover")]
+    LogStopped {
+        /// The failure the log stopped at.
+        cause: String,
+    },
+
     /// The store's deployment record and the deployment it was enrolled in
     /// disagree: which domain its history and operations belong to has no
     /// single answer. Refused, never settled by preferring one record.

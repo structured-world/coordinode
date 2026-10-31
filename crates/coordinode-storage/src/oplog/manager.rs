@@ -255,6 +255,11 @@ pub struct OplogManager {
     floor: RetainedFloor,
     /// The owned footprints the segments are charged to.
     footprints: crate::engine::footprint::Footprints,
+    /// The failure the log stopped at: after a write, flush, seal or sync
+    /// fails, every later append, flush and rotation is refused, so nothing
+    /// is written or acknowledged past an entry that may be lost. Cleared
+    /// only by reopening, whose recovery cuts the log to what is durable.
+    stopped: Option<String>,
     /// Directory syncs made for created segments, for the tests that check
     /// a new segment's name is durable before its entries are.
     #[cfg(test)]
@@ -376,9 +381,50 @@ impl OplogManager {
             sealed: paths,
             sync: SyncMethod::default(),
             footprints: crate::engine::footprint::Footprints::default(),
+            stopped: None,
             #[cfg(test)]
             dir_syncs: 0,
         })
+    }
+
+    /// Refused once the log stopped.
+    fn check_running(&self) -> StorageResult<()> {
+        match &self.stopped {
+            Some(cause) => Err(StorageError::LogStopped {
+                cause: cause.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Stop the log at `result`'s failure when `stops` says it left the
+    /// log's state unknown; pass `result` on either way.
+    fn stop_on<T>(&mut self, result: StorageResult<T>, stops: bool) -> StorageResult<T> {
+        if let Err(e) = &result
+            && stops
+        {
+            tracing::error!(
+                error = %e,
+                dir = %self.dir.display(),
+                "oplog: a write failed; the log stops here and appends nothing more until reopened"
+            );
+            self.stopped = Some(e.to_string());
+        }
+        result
+    }
+
+    /// Whether the log stopped at a failed write.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.is_some()
+    }
+
+    /// Make every later write of the active segment fail, as a full disk
+    /// does.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn fail_writes(&mut self) {
+        if let Some(writer) = &mut self.current {
+            writer.fail_writes();
+        }
     }
 
     /// Charge the segments to `footprints` from here on. The segments open
@@ -441,6 +487,7 @@ impl OplogManager {
     /// Rotates to a new segment automatically when either `max_bytes` or
     /// `max_entries` is reached.
     pub fn append(&mut self, entry: &OplogEntry) -> StorageResult<()> {
+        self.check_running()?;
         // Auto-rotate if the current segment is over limit
         if let Some(ref w) = self.current
             && (w.total_bytes() >= self.max_bytes || w.entry_count() >= self.max_entries)
@@ -488,7 +535,8 @@ impl OplogManager {
             // fsync(2)): without its directory synced, a power cut could
             // take the segment and every entry already acknowledged from
             // it. Once per segment, before any of its entries is synced.
-            sync_dir(&self.dir)?;
+            let synced = sync_dir(&self.dir);
+            self.stop_on(synced, true)?;
             #[cfg(test)]
             {
                 self.dir_syncs += 1;
@@ -508,7 +556,11 @@ impl OplogManager {
             .current
             .as_mut()
             .ok_or_else(|| StorageError::Io("no active segment writer after create".to_string()))?;
-        writer.append(entry)
+        let appended = writer.append(entry);
+        // A refusal that wrote nothing leaves the log running; a write that
+        // failed part way stops it.
+        let broken = writer.is_broken();
+        self.stop_on(appended, broken)
     }
 
     /// Flush user-space buffer and fsync the active segment to storage.
@@ -518,11 +570,12 @@ impl OplogManager {
     ///
     /// If there is no active segment (nothing appended yet), this is a no-op.
     pub fn flush(&mut self) -> StorageResult<()> {
-        if let Some(ref mut writer) = self.current {
-            writer.flush_and_sync()
-        } else {
-            Ok(())
-        }
+        self.check_running()?;
+        let flushed = match self.current.as_mut() {
+            Some(writer) => writer.flush_and_sync(),
+            None => Ok(()),
+        };
+        self.stop_on(flushed, true)
     }
 
     /// [`flush`](Self::flush) split in two: hand the active segment's
@@ -535,10 +588,13 @@ impl OplogManager {
     ///
     /// The flush fails, or the segment cannot be duplicated for the handle.
     pub fn flush_to_os(&mut self) -> StorageResult<Option<crate::oplog::SyncHandle>> {
-        self.current
+        self.check_running()?;
+        let flushed = self
+            .current
             .as_mut()
             .map(crate::oplog::SegmentWriter::flush_to_os)
-            .transpose()
+            .transpose();
+        self.stop_on(flushed, true)
     }
 
     /// The active segment's path and the length a power cut leaves it at
@@ -562,6 +618,7 @@ impl OplogManager {
     /// The sealed file is added to the manager's sealed list. The next
     /// [`append`](Self::append) will create a fresh segment.
     pub fn rotate(&mut self) -> StorageResult<()> {
+        self.check_running()?;
         let Some(writer) = self.current.take() else {
             return Ok(());
         };
@@ -569,8 +626,11 @@ impl OplogManager {
         let path = match writer.seal() {
             Ok(path) => path,
             Err(e) => {
+                // The segment's tail may be lost: a next segment opened past
+                // it would leave a hole under the entries written there. The
+                // log stops; reopening seals what of it is durable.
                 self.publish_floor();
-                return Err(e);
+                return self.stop_on(Err(e), true);
             }
         };
         if let Some(idx) = parse_first_index(&path) {

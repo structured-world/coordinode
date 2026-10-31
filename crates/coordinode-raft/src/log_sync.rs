@@ -32,6 +32,11 @@ struct Queue {
     handle: Option<SyncHandle>,
     syncing: bool,
     closed: bool,
+    /// The first sync that failed. A later sync can succeed without the
+    /// bytes the failed one covered (the kernel may drop dirty pages after
+    /// reporting the failure), so from here every append is answered with
+    /// this failure, never as durable.
+    failed: Option<String>,
 }
 
 struct Shared {
@@ -114,7 +119,7 @@ impl Drop for LogSync {
 impl Shared {
     fn run(&self) {
         loop {
-            let (appends, handle) = {
+            let (appends, handle, failed) = {
                 let mut queue = self.queue.lock();
                 while queue.appends.is_empty() && !queue.closed {
                     self.queued.wait(&mut queue);
@@ -124,14 +129,28 @@ impl Shared {
                     return;
                 }
                 queue.syncing = true;
-                (std::mem::take(&mut queue.appends), queue.handle.clone())
+                (
+                    std::mem::take(&mut queue.appends),
+                    queue.handle.clone(),
+                    queue.failed.clone(),
+                )
             };
-            let synced = match &handle {
-                Some(handle) => handle.sync().map_err(|e| e.to_string()),
-                None => Ok(()),
+            let synced = match (failed, &handle) {
+                (Some(failed), _) => Err(failed),
+                (None, Some(handle)) => handle.sync().map_err(|e| e.to_string()),
+                (None, None) => Ok(()),
             };
             self.answer(appends, &synced);
             let mut queue = self.queue.lock();
+            if let Err(e) = &synced
+                && queue.failed.is_none()
+            {
+                tracing::error!(
+                    error = %e,
+                    "raft log sync failed; no append is acknowledged from here until the log is reopened"
+                );
+                queue.failed = Some(e.clone());
+            }
             queue.syncing = false;
             if queue.appends.is_empty() {
                 self.idle.notify_all();

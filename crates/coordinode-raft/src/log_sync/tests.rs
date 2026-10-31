@@ -89,6 +89,35 @@ async fn a_failed_sync_answers_every_queued_append_with_the_error() {
     );
 }
 
+/// After a sync fails, a later one that succeeds proves nothing of what the
+/// failed one covered: the kernel may have dropped those pages. Every later
+/// append is answered with the failure, even over a file that syncs, and no
+/// writer is told its proposal is durable.
+#[cfg(unix)]
+#[tokio::test]
+async fn after_a_failed_sync_no_append_is_acknowledged() {
+    use std::os::fd::OwnedFd;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let notifier = Arc::new(AppendNotifier::default());
+    let sync = LogSync::start(Arc::clone(&notifier)).expect("start");
+    let mut later_told = notifier.subscribe(ProposalId::from_raw(11), LogReach::Durable);
+
+    let (_reader, writer) = std::io::pipe().expect("pipe");
+    let failing = SyncHandle::new(std::fs::File::from(OwnedFd::from(writer)), SyncMethod::Full);
+    let (a, a_rx) = append(Vec::new());
+    sync.submit(Some(failing), a);
+    assert!(answer(a_rx).await.is_err(), "the failed sync's append");
+
+    let (b, b_rx) = append(vec![(ProposalId::from_raw(11), 2)]);
+    sync.submit(Some(file_handle(dir.path())), b);
+    assert!(
+        answer(b_rx).await.is_err(),
+        "an append after the failure is not acknowledged"
+    );
+    assert!(later_told.try_recv().is_err(), "no writer hears durable");
+}
+
 /// A writer under a volatile `j` is answered at the write, before any sync;
 /// a durable waiter beside it is not, and the sync answers it later.
 #[tokio::test]
