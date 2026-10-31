@@ -2487,6 +2487,15 @@ impl RaftNode {
         }
     }
 
+    /// Make every later write of this node's Raft log fail, as a full disk
+    /// does.
+    #[cfg(feature = "test-faults")]
+    pub fn fail_log_writes(&self) {
+        if let Ok(mut oplog) = self.oplog.lock() {
+            oplog.fail_writes();
+        }
+    }
+
     /// Transfer leadership to a specific peer node.
     ///
     /// Sends a `TimeoutNow` message to the target, triggering an immediate

@@ -2484,6 +2484,65 @@ fn default_config_values() {
 
 // -- Purge persistence tests --
 
+/// A Raft log whose write fails, as on a full disk, appends nothing more:
+/// the batch that failed is refused, and so is every batch after it, so no
+/// entry is written or acknowledged past one that may be lost. Reopened,
+/// the log holds an unbroken run of entries ending at what is durable.
+#[tokio::test]
+async fn a_failed_log_write_stops_the_raft_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let config = || {
+        StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            &path,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )])
+    };
+    {
+        let engine = Arc::new(StorageEngine::open(&config()).expect("open"));
+        let mut store = LogStore::open(Arc::clone(&engine)).expect("open log");
+        store
+            .append(
+                vec![make_entry(1, 1, "a"), make_entry(2, 1, "b")],
+                IOFlushed::noop(),
+            )
+            .await
+            .expect("append 1..2");
+        store
+            .oplog
+            .lock()
+            .expect("oplog")
+            .flush()
+            .expect("sync 1..2");
+        store.oplog.lock().expect("oplog").fail_writes();
+        assert!(
+            store
+                .append(vec![make_entry(3, 1, "c")], IOFlushed::noop())
+                .await
+                .is_err(),
+            "the write fails"
+        );
+        assert!(
+            store
+                .append(vec![make_entry(4, 1, "d")], IOFlushed::noop())
+                .await
+                .is_err(),
+            "nothing is appended past the failure"
+        );
+    }
+    let engine = Arc::new(StorageEngine::open(&config()).expect("reopen"));
+    let mut store = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    let entries = store.try_get_log_entries(1..).await.expect("read");
+    let indexes: Vec<u64> = entries.iter().map(|e| e.log_id.index).collect();
+    assert!(
+        indexes == [1, 2] || indexes == [1, 2, 3],
+        "an unbroken log ending at what is durable: {indexes:?}"
+    );
+}
+
 #[tokio::test]
 async fn log_store_purge_persists_last_purged_log_id() {
     let (_dir, engine) = test_engine();
