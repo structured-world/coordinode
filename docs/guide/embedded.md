@@ -385,6 +385,12 @@ from histories that have diverged. Results acknowledged after the backup
 about effects it already performed outside the database after the backup is
 its own recovery policy.
 
+The history temporal types keep past the retention horizon (see `AS OF
+TIMESTAMP` in the Cypher extensions) belongs to the database's deployment.
+A physical backup opens as the same deployment and answers the same reads
+past the horizon; a database refuses to install a snapshot recording another
+deployment's history, or history without the deployment that recorded it.
+
 A logical export is for moving data into a new database, on another version
 or with another layout. The restored database issues descriptors of its own
 and refuses the old ones. See [Transactions](./transactions) for operation
