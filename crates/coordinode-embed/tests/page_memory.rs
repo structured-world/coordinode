@@ -334,6 +334,33 @@ fn a_derived_unit_past_its_budget_is_refused_before_expanding() {
 /// combinations, tuples alone, would take more than this beside the noise.
 const ENGINE_NOISE: usize = 16 << 20;
 
+/// Reporting a disagreement to an integrity record copies it only when the
+/// record keeps it: one already held, or one past the evidence the record
+/// keeps, allocates nothing, though the latter still moves the revision.
+#[test]
+fn a_report_the_record_does_not_keep_allocates_nothing() {
+    use coordinode_modality::index_def::{GenerationId, IndexId, IndexIntegrityRecord, Mismatch};
+    let extra = |node: u64| Mismatch::Extra {
+        node,
+        valid_from: None,
+        tuple: vec![b'x'; 4096],
+    };
+    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
+    for node in 0..IndexIntegrityRecord::MAX_EVIDENCE as u64 {
+        assert!(record.report(&extra(node)));
+    }
+    let held = extra(0);
+    let (again, allocated) = allocated_by(|| record.report(&held));
+    assert!(!again);
+    assert_eq!(allocated, 0, "a disagreement held already was copied");
+    let past = extra(u64::MAX);
+    let revision = record.evidence_revision;
+    let (new, allocated) = allocated_by(|| record.report(&past));
+    assert!(new);
+    assert_eq!(allocated, 0, "a disagreement past the evidence was copied");
+    assert_eq!(record.evidence_revision, revision + 1);
+}
+
 /// Restating an attempt's claims at commit allocates nothing, whatever it
 /// drops: six scopes each holding two bounds whose trends become one (more
 /// dropped than any inline list of positions would hold), and a scope held
