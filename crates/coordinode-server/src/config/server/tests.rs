@@ -973,14 +973,25 @@ fn peer_timeouts_parse_from_the_config_file() {
             connect: std::time::Duration::from_millis(1500),
             call: defaults.call,
             handshake: std::time::Duration::from_millis(2500),
+            keepalive: defaults.keepalive,
         }
     );
     let c = parse("peer_call_timeout_ms: 120000\n").expect("parse");
     assert_eq!(c.peer_timeouts().call, std::time::Duration::from_secs(120));
+    let c = parse("tcp_keepalive_idle_secs: 60\ntcp_keepalive_interval_secs: 5\n").expect("parse");
+    assert_eq!(
+        c.peer_timeouts().keepalive,
+        coordinode_wire::peer::Keepalive {
+            idle: std::time::Duration::from_secs(60),
+            interval: std::time::Duration::from_secs(5),
+        }
+    );
     for key in [
         "peer_connect_timeout_ms",
         "peer_call_timeout_ms",
         "peer_handshake_timeout_ms",
+        "tcp_keepalive_idle_secs",
+        "tcp_keepalive_interval_secs",
     ] {
         assert!(parse(&format!("{key}: 0\n")).is_err(), "{key} = 0");
     }

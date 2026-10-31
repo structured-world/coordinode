@@ -16,6 +16,52 @@ async fn bind() -> (TcpListener, String) {
     (listener, addr)
 }
 
+/// A session socket sends small messages at once and is probed by TCP
+/// keepalive within the bounds given: lowered from the system's two hours to
+/// them, and a bound above the system's own leaves the system's in place.
+#[tokio::test]
+async fn a_session_socket_sends_at_once_and_probes_an_idle_peer() {
+    let (listener, addr) = bind().await;
+    let dialed = TcpStream::connect(&addr).await.expect("connect");
+    let (accepted, _) = listener.accept().await.expect("accept");
+    let tight = Keepalive {
+        idle: Duration::from_secs(30),
+        interval: Duration::from_secs(2),
+    };
+    session_options(&dialed, tight).expect("options");
+    assert!(dialed.nodelay().expect("nodelay"), "no Nagle delay");
+    let sock = socket2::SockRef::from(&dialed);
+    assert!(sock.keepalive().expect("keepalive"), "keepalive on");
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        assert_eq!(sock.tcp_keepalive_time().expect("idle"), tight.idle);
+        assert_eq!(
+            sock.tcp_keepalive_interval().expect("interval"),
+            tight.interval
+        );
+        // A bound above what the socket already has changes nothing.
+        let loose = Keepalive {
+            idle: Duration::from_secs(3600),
+            interval: Duration::from_secs(3600),
+        };
+        let accepted_sock = socket2::SockRef::from(&accepted);
+        accepted_sock
+            .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(45)))
+            .expect("system-like setting");
+        let before = accepted_sock.tcp_keepalive_interval().expect("interval");
+        session_options(&accepted, loose).expect("options");
+        assert_eq!(
+            accepted_sock.tcp_keepalive_time().expect("idle"),
+            Duration::from_secs(45),
+            "a sooner setting is kept"
+        );
+        assert_eq!(
+            accepted_sock.tcp_keepalive_interval().expect("interval"),
+            before
+        );
+    }
+}
+
 /// Dial `addr` as `from`, expecting `expected`, and exchange one byte with
 /// whatever `server` accepted. Returns the dialer's error, if any.
 async fn exchange(
@@ -27,7 +73,7 @@ async fn exchange(
     let config = Arc::new(from.client_config(expected).expect("client"));
     // The listener's side of the handshake runs in its own task; the
     // stream hands over only what completed it.
-    let mut stream = connect_tls(Arc::clone(from), config, addr)
+    let mut stream = connect_tls(Arc::clone(from), config, addr, Keepalive::default())
         .await
         .map_err(|e| e.to_string())?;
     stream.write_all(&[7]).await.map_err(|e| e.to_string())?;
@@ -51,6 +97,7 @@ fn node_only() -> Accept {
         inbound: InboundAuth::NodeOnly,
         plaintext_clients: false,
         handshake_timeout: PeerTimeouts::default().handshake,
+        keepalive: PeerTimeouts::default().keepalive,
     }
 }
 
@@ -103,6 +150,7 @@ async fn plain_text_is_a_client_where_allowed_and_refused_elsewhere() {
         inbound: InboundAuth::Shared { clients: None },
         plaintext_clients: true,
         handshake_timeout: PeerTimeouts::default().handshake,
+        keepalive: PeerTimeouts::default().keepalive,
     };
     let mut server = incoming(listener, &a, shared).expect("incoming");
     let mut client = TcpStream::connect(&addr).await.expect("connect");
@@ -144,6 +192,7 @@ async fn an_ordinary_client_certificate_is_never_a_node() {
         },
         plaintext_clients: false,
         handshake_timeout: PeerTimeouts::default().handshake,
+        keepalive: PeerTimeouts::default().keepalive,
     };
     let mut server = incoming(listener, &a, shared).expect("incoming");
 
@@ -212,6 +261,7 @@ async fn shared_port_trusting(node_ca: &Ca, client_ca: &Ca) -> (Incoming, String
         },
         plaintext_clients: false,
         handshake_timeout: PeerTimeouts::default().handshake,
+        keepalive: PeerTimeouts::default().keepalive,
     };
     (incoming(listener, &a, shared).expect("incoming"), addr)
 }

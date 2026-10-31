@@ -1310,6 +1310,7 @@ dependencies = [
  "rustls-webpki",
  "sec1",
  "sid-crypto",
+ "socket2",
  "structured-zstd",
  "thiserror 2.0.21",
  "tokio",

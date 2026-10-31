@@ -1272,6 +1272,7 @@ impl RaftNode {
                         inbound: coordinode_wire::peer::InboundAuth::NodeOnly,
                         plaintext_clients: false,
                         handshake_timeout: connections.timeouts().handshake,
+                        keepalive: connections.timeouts().keepalive,
                     },
                 )
                 .map_err(|e| RaftNodeError::Init(format!("listener TLS: {e}")))?;

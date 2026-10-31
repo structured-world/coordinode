@@ -354,6 +354,7 @@ pub async fn serve_member_port(
             inbound: coordinode_wire::peer::InboundAuth::Shared { clients: None },
             plaintext_clients: true,
             handshake_timeout: coordinode_wire::peer::PeerTimeouts::default().handshake,
+            keepalive: coordinode_wire::peer::PeerTimeouts::default().keepalive,
         },
     )
     .expect("the port's TLS configuration");

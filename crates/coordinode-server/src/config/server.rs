@@ -589,6 +589,13 @@ pub struct ServerConfig {
     /// How long a connection accepted on the gRPC port has to complete its
     /// TLS handshake, in milliseconds (`None` = 10000).
     pub peer_handshake_timeout_ms: Option<NonZeroU64>,
+    /// The longest a client or peer connection sits idle before TCP
+    /// keepalive probes it, in seconds (`None` = 300). Lowers the system's
+    /// setting, never raises it.
+    pub tcp_keepalive_idle_secs: Option<NonZeroU64>,
+    /// The longest between TCP keepalive probes once they start, in seconds
+    /// (`None` = 1). Lowers the system's setting, never raises it.
+    pub tcp_keepalive_interval_secs: Option<NonZeroU64>,
     /// Whether the background integrity scrub runs. Each node scrubs its own
     /// local storage independently (no leader election). Default false: a
     /// full pass reads every block, which an operator schedules deliberately.
@@ -768,6 +775,8 @@ impl Default for ServerConfig {
             peer_connect_timeout_ms: None,
             peer_call_timeout_ms: None,
             peer_handshake_timeout_ms: None,
+            tcp_keepalive_idle_secs: None,
+            tcp_keepalive_interval_secs: None,
             scrub_enabled: false,
             scrub_interval_secs: 7 * 24 * 3600,
             scrub_throttle_ms: Some(50),
@@ -1061,10 +1070,17 @@ impl ServerConfig {
         let ms = |v: Option<NonZeroU64>, default| {
             v.map_or(default, |v| std::time::Duration::from_millis(v.get()))
         };
+        let secs = |v: Option<NonZeroU64>, default| {
+            v.map_or(default, |v| std::time::Duration::from_secs(v.get()))
+        };
         coordinode_wire::peer::PeerTimeouts {
             connect: ms(self.peer_connect_timeout_ms, d.connect),
             call: ms(self.peer_call_timeout_ms, d.call),
             handshake: ms(self.peer_handshake_timeout_ms, d.handshake),
+            keepalive: coordinode_wire::peer::Keepalive {
+                idle: secs(self.tcp_keepalive_idle_secs, d.keepalive.idle),
+                interval: secs(self.tcp_keepalive_interval_secs, d.keepalive.interval),
+            },
         }
     }
 

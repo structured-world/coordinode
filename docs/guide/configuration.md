@@ -146,6 +146,8 @@ the key is unset.
 | `peer_connect_timeout_ms` | `5000` | restart | How long a member's dial to a peer may take, the TCP connection and the TLS handshake together, in ms. A dial that runs out fails, and the call that needed it fails with it; the next call dials again. Raise it on distant or lossy links where a handshake takes longer. Zero is refused. |
 | `peer_call_timeout_ms` | `30000` | restart | How long one call from a member to a peer (a consensus message, a version handshake, a segment piece, a client's BEGIN, COMMIT or ROLLBACK passed to the member that runs it) may take, in ms, before it fails. A client's statement passed on streams its answer back, so the bound covers only the wait for it to start; the client's own deadline bounds the rest. Zero is refused. |
 | `peer_handshake_timeout_ms` | `10000` | restart | How long a connection accepted on a member's gRPC port has to complete its TLS handshake, in ms. A connection that opens one and stalls is dropped at this bound, freeing what it held. Zero is refused. |
+| `tcp_keepalive_idle_secs` | `300` | restart | TCP keepalive on every connection the server accepts or makes, to clients and to peers: the longest a connection sits idle before it is probed, in seconds. A peer or client that vanished without closing (a crash, a dropped route) is found within minutes instead of the system's default two hours. It only lowers the system's setting: a host configured to probe sooner keeps its own. Every connection also sends small messages at once, without the Nagle delay. Zero is refused. |
+| `tcp_keepalive_interval_secs` | `1` | restart | The longest between TCP keepalive probes once they start, in seconds; the system's probe count decides how many go unanswered before the connection is closed. Only lowers the system's setting. Zero is refused. |
 | `wire_compression_level` | `3` | restart | Inter-node gRPC transport zstd compression level (C-zstd `1`..=`22`). Default `3` is zstd's standard default (~9x reduction on Raft batches); raise on a bandwidth-constrained link. Independent of the on-disk codec. |
 | `scrub_enabled` | `false` | restart | Whether the background integrity scrub runs (each node verifies its own on-disk block checksums). A pass reads every block, so it is off unless enabled. |
 | `scrub_interval_secs` | `604800` (7 days) | restart | Seconds between background scrub cycles. |
@@ -511,6 +513,9 @@ wire_compression_level: 3
 # peer_connect_timeout_ms: 5000
 # peer_call_timeout_ms: 30000
 # peer_handshake_timeout_ms: 10000
+# TCP keepalive on client and peer connections (s): idle before probing, between probes.
+# tcp_keepalive_idle_secs: 300
+# tcp_keepalive_interval_secs: 1
 
 # Background integrity scrub (per-node, verifies on-disk block checksums).
 scrub_enabled: false

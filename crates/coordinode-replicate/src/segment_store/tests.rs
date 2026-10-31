@@ -61,6 +61,7 @@ async fn serve(engine: &Arc<StorageEngine>) -> PeerTarget {
         inbound: InboundAuth::NodeOnly,
         plaintext_clients: false,
         handshake_timeout: PeerTimeouts::default().handshake,
+        keepalive: PeerTimeouts::default().keepalive,
     };
     let addr = serve_with(engine, &PKI.context(node), accept).await;
     PKI.target(node, addr)
@@ -379,6 +380,7 @@ async fn a_caller_without_a_node_identity_is_refused() {
         inbound: InboundAuth::Shared { clients: None },
         plaintext_clients: true,
         handshake_timeout: PeerTimeouts::default().handshake,
+        keepalive: PeerTimeouts::default().keepalive,
     };
     let addr = serve_with(&engine, &PKI.context(9), accept).await;
     let mut client = SegmentTransferServiceClient::connect(format!("http://{addr}"))

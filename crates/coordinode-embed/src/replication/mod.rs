@@ -567,6 +567,7 @@ impl ReplicatedDatabase {
                     inbound: coordinode_wire::peer::InboundAuth::NodeOnly,
                     plaintext_clients: false,
                     handshake_timeout: timeouts.handshake,
+                    keepalive: timeouts.keepalive,
                 },
             )
             .map_err(|e| ReplicationError::Listener {

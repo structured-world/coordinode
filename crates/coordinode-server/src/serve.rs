@@ -254,6 +254,8 @@ pub(crate) async fn serve(
         peer_connect_timeout_ms: _,
         peer_call_timeout_ms: _,
         peer_handshake_timeout_ms: _,
+        tcp_keepalive_idle_secs: _,
+        tcp_keepalive_interval_secs: _,
         // Already captured above via scrub_cfg before the move.
         scrub_enabled: _,
         scrub_interval_secs: _,
@@ -1380,6 +1382,11 @@ pub(crate) async fn serve(
     if let Some(secs) = http2_keepalive_secs {
         server = server.http2_keepalive_interval(Some(std::time::Duration::from_secs(secs)));
     }
+    // TCP keepalive on the standalone listener, as on the shared port, whose
+    // own accept loop applies it.
+    server = server
+        .tcp_keepalive(Some(peer_timeouts.keepalive.idle))
+        .tcp_keepalive_interval(Some(peer_timeouts.keepalive.interval));
 
     // Client TLS. A standalone node serves TLS when a cert+key are
     // configured; the crypto provider was installed above so tonic's rustls
@@ -1417,6 +1424,7 @@ pub(crate) async fn serve(
                     inbound: coordinode_wire::peer::InboundAuth::Shared { clients },
                     plaintext_clients: !tls_require_client_auth,
                     handshake_timeout: peer_timeouts.handshake,
+                    keepalive: peer_timeouts.keepalive,
                 },
             ))
         }

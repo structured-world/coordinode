@@ -223,6 +223,27 @@ pub enum DialError {
     Tls(#[from] rustls::Error),
 }
 
+/// How TCP keepalive probes an idle session socket: the longest it sits
+/// idle before the first probe (300 s by default) and the longest between
+/// probes after (1 s by default). Each only lowers what the system is
+/// configured with; see [`session_options`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keepalive {
+    /// Idle time before the first probe.
+    pub idle: Duration,
+    /// Time between probes once they start.
+    pub interval: Duration,
+}
+
+impl Default for Keepalive {
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(300),
+            interval: Duration::from_secs(1),
+        }
+    }
+}
+
 /// The bounds of the inter-node channel; what overruns one fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerTimeouts {
@@ -232,6 +253,8 @@ pub struct PeerTimeouts {
     pub call: Duration,
     /// The TLS handshake of an accepted connection (10 s by default).
     pub handshake: Duration,
+    /// Keepalive probing of a dialed connection that sits idle.
+    pub keepalive: Keepalive,
 }
 
 impl Default for PeerTimeouts {
@@ -240,6 +263,7 @@ impl Default for PeerTimeouts {
             connect: Duration::from_secs(5),
             call: Duration::from_secs(30),
             handshake: Duration::from_secs(10),
+            keepalive: Keepalive::default(),
         }
     }
 }
@@ -344,6 +368,7 @@ impl PeerConnections {
             context: Arc::clone(&self.context),
             config,
             authority,
+            keepalive: self.timeouts.keepalive,
         }))
     }
 }
@@ -369,6 +394,7 @@ struct Connector {
     context: Arc<SecurityContext>,
     config: Arc<rustls::ClientConfig>,
     authority: String,
+    keepalive: Keepalive,
 }
 
 /// An outbound connection as hyper reads and writes it.
@@ -386,7 +412,7 @@ impl tower_service::Service<http::Uri> for Connector {
     fn call(&mut self, _uri: http::Uri) -> Self::Future {
         let this = self.clone();
         Box::pin(async move {
-            connect_tls(this.context, this.config, &this.authority)
+            connect_tls(this.context, this.config, &this.authority, this.keepalive)
                 .await
                 .map(hyper_util::rt::TokioIo::new)
         })
@@ -400,9 +426,10 @@ async fn connect_tls(
     context: Arc<SecurityContext>,
     config: Arc<rustls::ClientConfig>,
     authority: &str,
+    keepalive: Keepalive,
 ) -> io::Result<Guarded<tokio_rustls::client::TlsStream<TcpStream>>> {
     let tcp = TcpStream::connect(authority).await?;
-    tcp.set_nodelay(true)?;
+    session_options(&tcp, keepalive)?;
     // The name is a hint for a listener that serves several names; the
     // identity check does not read it.
     let host = authority
@@ -550,6 +577,8 @@ pub struct Accept {
     pub plaintext_clients: bool,
     /// How long an accepted connection has to complete its TLS handshake.
     pub handshake_timeout: Duration,
+    /// Keepalive probing of an accepted connection that sits idle.
+    pub keepalive: Keepalive,
 }
 
 /// Connections whose handshake has completed and the server has not taken
@@ -559,6 +588,34 @@ const ACCEPT_QUEUE: usize = 64;
 /// The first byte of a TLS handshake record (RFC 8446 5.1, ContentType
 /// handshake(22)).
 const TLS_HANDSHAKE: u8 = 22;
+
+/// Options every session socket gets, accepted or dialed: no Nagle delay on
+/// small requests and replies, and TCP keepalive, so a peer that vanished
+/// without closing (a crash, a dropped route) is found within minutes rather
+/// than the system's default two hours. Probing starts after at most
+/// `keepalive.idle` and repeats at most every `keepalive.interval`; a system
+/// configured to probe sooner keeps its own timing.
+///
+/// # Errors
+///
+/// An option the socket refuses.
+pub fn session_options(tcp: &TcpStream, keepalive: Keepalive) -> io::Result<()> {
+    tcp.set_nodelay(true)?;
+    let sock = socket2::SockRef::from(tcp);
+    sock.set_keepalive(true)?;
+    let probing = socket2::TcpKeepalive::new();
+    // Where the system's timing can be read it is only lowered; elsewhere
+    // the bounds are set as they are.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let probing = probing
+        .with_time(sock.tcp_keepalive_time()?.min(keepalive.idle))
+        .with_interval(sock.tcp_keepalive_interval()?.min(keepalive.interval));
+    #[cfg(windows)]
+    let probing = probing
+        .with_time(keepalive.idle)
+        .with_interval(keepalive.interval);
+    sock.set_tcp_keepalive(&probing)
+}
 
 /// The connections arriving on `listener`, each authenticated under
 /// `context` as `accept` says, for `Server::serve_with_incoming`. A
@@ -599,8 +656,10 @@ pub fn incoming(
             let context = Arc::clone(&context);
             let plaintext = accept.plaintext_clients;
             let bound = accept.handshake_timeout;
+            let keepalive = accept.keepalive;
             tokio::spawn(async move {
-                let handshake = authenticate(tcp, remote, &acceptor, context, plaintext);
+                let handshake =
+                    authenticate(tcp, (remote, keepalive), &acceptor, context, plaintext);
                 match tokio::time::timeout(bound, handshake).await {
                     Ok(Ok(stream)) => {
                         // A closed queue means the server stopped.
@@ -621,12 +680,12 @@ pub fn incoming(
 /// Authenticate one accepted connection.
 async fn authenticate(
     tcp: TcpStream,
-    remote: SocketAddr,
+    (remote, keepalive): (SocketAddr, Keepalive),
     acceptor: &tokio_rustls::TlsAcceptor,
     context: Arc<SecurityContext>,
     plaintext_clients: bool,
 ) -> io::Result<InboundStream> {
-    tcp.set_nodelay(true)?;
+    session_options(&tcp, keepalive)?;
     if plaintext_clients {
         let mut first = [0u8; 1];
         let read = tcp.peek(&mut first).await?;

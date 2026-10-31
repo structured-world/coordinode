@@ -36,6 +36,8 @@ thiserror = { workspace = true }
 # the default aws-lc-rs provider would link C.
 tokio = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false }
+# TCP keepalive timing on session sockets, which tokio does not expose.
+socket2 = { version = "0.6", features = ["all"] }
 # A dialed TLS connection handed to tonic's HTTP/2 client.
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower-service = "0.3"
