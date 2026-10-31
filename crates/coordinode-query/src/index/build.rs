@@ -140,6 +140,20 @@ impl BackfillError {
             _ => None,
         }
     }
+
+    /// The refusal a build or certification record keeps typed, when this
+    /// error is one: values an index cannot hold, or a page that does not
+    /// fit its memory.
+    pub(crate) fn cause(&self) -> Option<coordinode_modality::FailureCause> {
+        use coordinode_modality::FailureCause;
+        match self {
+            Self::Store(StoreError::IndexEntry(entry))
+            | Self::Store(StoreError::Storage(
+                coordinode_storage::error::StorageError::IndexEntry(entry),
+            )) => Some(FailureCause::IndexEntry(*entry)),
+            _ => self.budget_stop().map(FailureCause::Budget),
+        }
+    }
 }
 
 impl From<IndexWriteError> for BackfillError {

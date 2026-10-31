@@ -1077,11 +1077,19 @@ fn fit_buffer<E>(
 fn advance_ownership(
     txn: &mut Transaction,
     index: &IndexDefinition,
+    owner: EntryOwner,
     before: &[Vec<u8>],
     after: &[Vec<u8>],
 ) -> StoreResult<()> {
     for tuple in before {
-        if after.binary_search(tuple).is_err() {
+        // An entry too long to store was never held, so leaving it changes
+        // who holds nothing; its revision key would be too long as well.
+        // Entering one was refused before this.
+        let held = coordinode_core::index::encoding::entry_key_len(
+            tuple.len(),
+            owner.valid_from.is_some(),
+        ) <= MAX_INDEX_KEY_LEN;
+        if held && after.binary_search(tuple).is_err() {
             advance_revision(txn, index, tuple)?;
         }
     }
@@ -1091,6 +1099,24 @@ fn advance_ownership(
         }
     }
     Ok(())
+}
+
+/// The tuples of `values`, every byte charged to `txn`'s budget before it
+/// is allocated and kept charged for the rest of the transaction, as what
+/// the caller keeps may outlive this call; refused past the fan-out.
+///
+/// # Errors
+///
+/// [`StoreError::IndexEntry`] past the fan-out, or the budget's refusal.
+pub fn charged_tuples(txn: &Transaction, values: &[Value]) -> StoreResult<Vec<Vec<u8>>> {
+    let budget = txn.write_budget();
+    tuples_within(values, |bytes| -> StoreResult<()> {
+        if let Some(budget) = budget.as_deref() {
+            // Bytes of memory about to exist: fits in u64.
+            budget.reserve(bytes as u64)?.keep_until_query_ends();
+        }
+        Ok(())
+    })
 }
 
 /// Write the ownership revision of `tuple` in the unique `index`.
@@ -1189,48 +1215,59 @@ impl LocalIndexStore<'_> {
     /// The definitions holding a part that `wanted` picks, in identity
     /// order, read for placement
     /// ([`IndexDefinition::for_placement_from_msgpack`]): of every other
-    /// definition only its parts are decoded. Each decode is charged to
-    /// `charge` before it is made, with its bound, as is the list.
+    /// definition only its parts are decoded. Every decode is charged to
+    /// `budget` before it is made: a definition's parts with their measured
+    /// bound, released once they are looked at, so the definitions passed
+    /// over hold nothing; a definition kept, and the list, for as long as
+    /// the budget lives.
     ///
     /// # Errors
     ///
-    /// A storage or decode failure, or what `charge` returns.
+    /// A storage or decode failure, or the budget's refusal.
     pub fn definitions_with_part(
         &self,
         wanted: impl Fn(&SelectionPart) -> bool,
-        charge: &mut dyn FnMut(usize) -> StoreResult<()>,
+        budget: &coordinode_core::budget::QueryBudget,
     ) -> StoreResult<Vec<IndexDefinition>> {
+        let unreadable = |key: &[u8], e: rmp_serde::decode::Error| {
+            StoreError::Storage(StorageError::UnreadableCatalog {
+                kind: "index definition",
+                key: coordinode_storage::error::printable_key(key),
+                detail: e.to_string(),
+            })
+        };
         let mut out: Vec<IndexDefinition> = Vec::new();
         for guard in self
             .engine
             .prefix_scan(Partition::Schema, IndexDefinition::SCHEMA_PREFIX)?
         {
             let (key, value) = guard.into_inner()?;
-            charge(IndexDefinition::selection_bound(value.len()))?;
-            let parts = IndexDefinition::selection_from_msgpack(&value).map_err(|e| {
-                StoreError::Storage(StorageError::UnreadableCatalog {
-                    kind: "index definition",
-                    key: coordinode_storage::error::printable_key(&key),
-                    detail: e.to_string(),
-                })
-            })?;
-            if !parts.iter().any(&wanted) {
+            let bound =
+                IndexDefinition::selection_bound(&value).map_err(|e| unreadable(&key, e))?;
+            // Bytes of memory about to exist: fits in u64.
+            let looked_at = budget.reserve(bound as u64)?;
+            let parts =
+                IndexDefinition::selection_from_msgpack(&value).map_err(|e| unreadable(&key, e))?;
+            let picked = parts.iter().any(&wanted);
+            drop(parts);
+            drop(looked_at);
+            if !picked {
                 continue;
             }
-            charge(IndexDefinition::for_placement_bound(value.len()))?;
+            let kept =
+                IndexDefinition::for_placement_bound(&value).map_err(|e| unreadable(&key, e))?;
+            // Bytes of memory about to exist: fits in u64.
+            budget.reserve(kept as u64)?.keep_until_query_ends();
             if out.len() == out.capacity() {
                 let more = out.len().max(4);
-                charge(more * core::mem::size_of::<IndexDefinition>())?;
+                budget
+                    .reserve((more * core::mem::size_of::<IndexDefinition>()) as u64)?
+                    .keep_until_query_ends();
                 out.reserve_exact(more);
             }
             out.push(
-                IndexDefinition::for_placement_from_msgpack(&value).map_err(|e| {
-                    StoreError::Storage(StorageError::UnreadableCatalog {
-                        kind: "index definition",
-                        key: coordinode_storage::error::printable_key(&key),
-                        detail: e.to_string(),
-                    })
-                })?,
+                IndexDefinition::for_placement_from_msgpack(&value)
+                    .map_err(|e| unreadable(&key, e))?,
             );
         }
         Ok(out)
@@ -1295,7 +1332,7 @@ impl IndexStore for LocalIndexStore<'_> {
         let after = after.as_deref().unwrap_or_default();
         let effects = effects_of(index.generation, owner, before, after, &mut charge)?;
         if index.unique {
-            advance_ownership(txn, index, before, after)?;
+            advance_ownership(txn, index, owner, before, after)?;
         }
         let puts = effects.iter().filter(|e| e.value.is_some()).count();
         match index.maintenance.profile {
@@ -1325,7 +1362,7 @@ impl IndexStore for LocalIndexStore<'_> {
         values: &[Value],
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>> {
-        for tuple in tuples(values) {
+        for tuple in charged_tuples(txn, values)? {
             if let Some(holder) = self
                 .holders(txn, index, &tuple)?
                 .into_iter()
@@ -1343,7 +1380,7 @@ impl IndexStore for LocalIndexStore<'_> {
         values: &[Value],
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>> {
-        for tuple in tuples(values) {
+        for tuple in tuples(values)? {
             let prefix = entry_value_prefix(index.generation, &tuple);
             for guard in self.engine.prefix_scan(Partition::Idx, &prefix)? {
                 let (key, _) = guard.into_inner()?;
@@ -2436,12 +2473,17 @@ impl IndexStore for LocalIndexStore<'_> {
         present: bool,
         version: Option<u64>,
     ) -> StoreResult<()> {
-        let (key, value) = entry(index.generation, tuple, owner);
         // An entry too long to store was never stored, and cannot be given
-        // back: the record holding its value cannot be indexed.
-        if key.len() > MAX_INDEX_KEY_LEN {
-            return Err(KeyTooLong { len: key.len() }.into());
+        // back: the record holding its value cannot be indexed. Measured
+        // before the key is built.
+        let len = coordinode_core::index::encoding::entry_key_len(
+            tuple.len(),
+            owner.valid_from.is_some(),
+        );
+        if len > MAX_INDEX_KEY_LEN {
+            return Err(KeyTooLong { len }.into());
         }
+        let (key, value) = entry(index.generation, tuple, owner);
         // The condition before the write it guards: a direct-mode engine
         // decides a condition when it is stated.
         txn.expect_version(Partition::Idx, &key, version)?;

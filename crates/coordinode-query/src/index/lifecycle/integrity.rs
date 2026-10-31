@@ -1021,10 +1021,13 @@ fn record_holds(
     tuple: &[u8],
     catalog: &mut CatalogMembership<'_>,
 ) -> Result<bool, StoreError> {
-    Ok(catalog.carries_named(record, &def.label)?
-        && interpretation
-            .record_membership(record)
-            .is_some_and(|held| tuples(&held).iter().any(|t| t.as_slice() == tuple)))
+    if !catalog.carries_named(record, &def.label)? {
+        return Ok(false);
+    }
+    let Some(held) = interpretation.record_membership(record) else {
+        return Ok(false);
+    };
+    Ok(tuples(&held)?.iter().any(|t| t.as_slice() == tuple))
 }
 
 /// [`record_holds`] for a record that may be absent: an absent one holds

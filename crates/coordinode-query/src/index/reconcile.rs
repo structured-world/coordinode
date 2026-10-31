@@ -151,11 +151,14 @@ impl Reconcile<'_> {
                 page_budget.reserve(bytes as u64)?.keep_until_query_ends();
                 Ok(())
             };
+            // What the pass still holds, first: the label scratch and the
+            // cursor carried from the page before.
+            charge(scratch_held + start_after.as_ref().map_or(0, Vec::capacity))?;
             // Read for each page, each bound to the record as read: one the
             // conclusion moved refuses the page.
             let defs = store.definitions_with_part(
                 |p| p.operation == self.operation && p.state == PartState::Proposed,
-                &mut |bytes| Ok(charge(bytes)?),
+                &page_budget,
             )?;
             charge(defs.len() * core::mem::size_of::<Placing>())?;
             let mut placing: Vec<Placing> = Vec::with_capacity(defs.len());
@@ -190,7 +193,6 @@ impl Reconcile<'_> {
                 StoreError::Invariant("a reconciliation page reads at no snapshot".into())
             })?;
             let mut staged = || -> Result<_, BackfillError> {
-                charge(scratch_held + start_after.as_ref().map_or(0, Vec::capacity))?;
                 let mut in_force =
                     CatalogMembership::at(self.engine, view).charged_to(&page_budget);
                 let mut candidate =
@@ -406,16 +408,33 @@ impl Fold<'_> {
             {
                 return Err(BackfillError::Stopped);
             }
-            let next = store.list_definitions()?.into_iter().find_map(|def| {
-                let part = *def
-                    .selection
-                    .iter()
-                    .find(|p| p.state != PartState::Proposed)?;
-                Some((def, part))
-            });
+            // One budget per step, before anything is read: the definitions
+            // it reads, then what it stages and the scratch it grows.
+            let step_budget =
+                std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(self.page_bytes));
+            let next = store
+                .definitions_with_part(|p| p.state != PartState::Proposed, &step_budget)?
+                .into_iter()
+                .find_map(|def| {
+                    let part = *def
+                        .selection
+                        .iter()
+                        .find(|p| p.state != PartState::Proposed)?;
+                    Some((def, part))
+                });
             let Some((def, part)) = next else {
                 return Ok(dropped);
             };
+            // Read without its vector and text configurations, and written
+            // back below: only a label lookup or a B-tree index, which have
+            // none, keeps parts.
+            if !matches!(def.index_type, IndexType::Labels | IndexType::BTree) {
+                return Err(StoreError::Invariant(format!(
+                    "index {} of kind {:?} keeps parts of a label's implication change",
+                    def.id, def.index_type
+                ))
+                .into());
+            }
             let Some(version) = store.definition_version_as(&def)? else {
                 continue;
             };
@@ -425,11 +444,9 @@ impl Fold<'_> {
             };
             txn.bind_index_definition(&def.schema_key(), Some(version))
                 .map_err(StoreError::from)?;
-            // What the step stages is charged to its own bytes, each write
+            // What the step stages is charged to the same bytes, each write
             // before it is buffered.
-            txn.charge_writes_to(Some(std::sync::Arc::new(
-                coordinode_core::budget::QueryBudget::new(self.page_bytes),
-            )));
+            txn.charge_writes_to(Some(step_budget));
             // Gained in force and retired withdrawn hold members: moved into
             // the index's own entries. The others are read by nobody now.
             let keep = matches!(

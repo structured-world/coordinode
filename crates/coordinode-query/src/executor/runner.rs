@@ -2709,8 +2709,7 @@ impl<'a> ExecutionContext<'a> {
     /// the backfill covered through; an index whose entries were found
     /// disagreeing with their records proves nothing, so the commit reads
     /// every node of the label.
-    fn claim_uniques(&mut self, from: usize) {
-        use coordinode_core::index::derive::tuples;
+    fn claim_uniques(&mut self, from: usize) -> Result<(), ExecutionError> {
         use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, UncoveredSource};
         let limit = self.index_builds.map_or(
             crate::index::DEFAULT_UNIQUE_ADMISSION_READ_LIMIT,
@@ -2738,7 +2737,7 @@ impl<'a> ExecutionContext<'a> {
                     read_limit: limit,
                 })
             });
-            for tuple in tuples(&claim.values) {
+            for tuple in coordinode_modality::index::charged_tuples(&self.txn, &claim.values)? {
                 stated.push(Claim::new(
                     ClaimScope::UniqueValue { generation, tuple },
                     ClaimPredicate::UniqueHolder {
@@ -2752,6 +2751,7 @@ impl<'a> ExecutionContext<'a> {
         for claim in stated {
             self.txn.claim(claim);
         }
+        Ok(())
     }
 
     /// Stage the B-tree index entries of `record`, a node being created, or
@@ -2899,8 +2899,7 @@ impl<'a> ExecutionContext<'a> {
                     .map_err(index_write_error)?;
             }
         }
-        self.claim_uniques(from);
-        Ok(())
+        self.claim_uniques(from)
     }
 
     /// Stage the removal of the B-tree entries `record` holds in the indexes
@@ -3064,8 +3063,7 @@ impl<'a> ExecutionContext<'a> {
                     .map_err(index_write_error)?;
             }
         }
-        self.claim_uniques(from);
-        Ok(())
+        self.claim_uniques(from)
     }
 
     /// Name each of `labels` and say whether one has a B-tree index.
@@ -3144,8 +3142,7 @@ impl<'a> ExecutionContext<'a> {
                     .map_err(index_write_error)?;
             }
         }
-        self.claim_uniques(from);
-        Ok(())
+        self.claim_uniques(from)
     }
 
     /// Whether a node of `label` has B-tree index entries to keep, so a
@@ -3233,8 +3230,7 @@ impl<'a> ExecutionContext<'a> {
                     .map_err(index_write_error)?;
             }
         }
-        self.claim_uniques(from);
-        Ok(())
+        self.claim_uniques(from)
     }
 
     /// Move the B-tree index entries of a node storing `labels`, under every
@@ -3296,8 +3292,7 @@ impl<'a> ExecutionContext<'a> {
                 )
                 .map_err(index_write_error)?;
         }
-        self.claim_uniques(from);
-        Ok(())
+        self.claim_uniques(from)
     }
 
     /// The nodes whose entry in the B-tree index `id` holds exactly `value`,
@@ -3483,7 +3478,8 @@ impl<'a> ExecutionContext<'a> {
         let Some(index) = registry.get_by_id(id) else {
             return Ok(false);
         };
-        let wanted = tuples(std::slice::from_ref(value));
+        use coordinode_modality::StoreError;
+        let wanted = tuples(std::slice::from_ref(value)).map_err(StoreError::from)?;
         if let Some(record) = record {
             self.bind_membership(&record.labels)?;
         }
@@ -3503,13 +3499,21 @@ impl<'a> ExecutionContext<'a> {
                     .is_none_or(|m| m.contains(label))
             })
         };
-        let holds = |record: &NodeRecord| {
-            carries(record)
-                && interpretation
-                    .record_membership(record)
-                    .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t)))
+        let holds = |record: &NodeRecord| -> Result<bool, ExecutionError> {
+            if !carries(record) {
+                return Ok(false);
+            }
+            let Some(held) = interpretation.record_membership(record) else {
+                return Ok(false);
+            };
+            Ok(tuples(&held)
+                .map_err(StoreError::from)?
+                .iter()
+                .any(|t| wanted.contains(t)))
         };
-        if record.is_some_and(holds) {
+        if let Some(record) = record
+            && holds(record)?
+        {
             return Ok(false);
         }
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
@@ -3522,7 +3526,7 @@ impl<'a> ExecutionContext<'a> {
             &self.budget,
             |key, value| {
                 if !held_before && decode_temporal_node_key(key).is_some() {
-                    held_before = holds(&decode_version(value)?);
+                    held_before = holds(&decode_version(value)?)?;
                 }
                 Ok::<(), ExecutionError>(())
             },
@@ -20898,6 +20902,12 @@ fn execute_alter_node_type_implies(
                 "cannot change what :{label} implies: {reason}"
             )));
         }
+        Some(IndexBuildOutcome::Failed(BuildError::IndexEntry(entry))) => {
+            return Err(coordinode_modality::StoreError::IndexEntry(entry).into());
+        }
+        Some(IndexBuildOutcome::Failed(BuildError::Budget(stop))) => {
+            return Err(ExecutionError::Budget(stop));
+        }
         Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => return Err(v.into()),
         Some(IndexBuildOutcome::Cancelled) => {
             return Err(ExecutionError::CatalogRefused(format!(
@@ -22552,6 +22562,12 @@ fn await_index_build(
         Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
             return Err(ExecutionError::Unsupported(reason));
         }
+        Some(IndexBuildOutcome::Failed(BuildError::IndexEntry(entry))) => {
+            return Err(coordinode_modality::StoreError::IndexEntry(entry).into());
+        }
+        Some(IndexBuildOutcome::Failed(BuildError::Budget(stop))) => {
+            return Err(ExecutionError::Budget(stop));
+        }
         Some(IndexBuildOutcome::Cancelled) => {
             return Err(ExecutionError::Unsupported(format!(
                 "the build of index '{def}' was cancelled"
@@ -23177,6 +23193,12 @@ fn create_proved_constraint(
             )));
         }
         Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => return Err(v.into()),
+        Some(IndexBuildOutcome::Failed(BuildError::IndexEntry(entry))) => {
+            return Err(coordinode_modality::StoreError::IndexEntry(entry).into());
+        }
+        Some(IndexBuildOutcome::Failed(BuildError::Budget(stop))) => {
+            return Err(ExecutionError::Budget(stop));
+        }
         Some(IndexBuildOutcome::Cancelled) => {
             return Err(ExecutionError::CatalogRefused(format!(
                 "the proof of constraint '{}' was cancelled",

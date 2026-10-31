@@ -3307,6 +3307,12 @@ impl Database {
             Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
                 Err(DatabaseError::Other(reason))
             }
+            Some(IndexBuildOutcome::Failed(BuildError::IndexEntry(entry))) => {
+                Err(DatabaseError::IndexEntry(entry))
+            }
+            Some(IndexBuildOutcome::Failed(BuildError::Budget(stop))) => {
+                Err(DatabaseError::Budget(stop))
+            }
             Some(IndexBuildOutcome::Cancelled) => Err(DatabaseError::Other(format!(
                 "the build of index '{def}' was cancelled"
             ))),

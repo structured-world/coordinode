@@ -105,6 +105,10 @@ pub(super) enum VerifyError {
     /// A scratch file could not be written or read back.
     #[error("scratch file: {0}")]
     Scratch(#[from] std::io::Error),
+    /// A record holds values the index cannot hold, which no write could
+    /// have entered: lists making too many entries.
+    #[error(transparent)]
+    FanOut(#[from] coordinode_core::index::derive::FanOut),
 }
 
 /// One expected entry: its key and the node holding it, with the version
@@ -571,7 +575,7 @@ pub(super) fn verify(
             let Some(values) = slot.target.interpretation.record_membership(&record) else {
                 continue;
             };
-            for tuple in tuples(&values) {
+            for tuple in tuples(&values)? {
                 slot.memory.push_entry(slot.target.def, &tuple, owner);
                 stats.expected_entries += 1;
             }

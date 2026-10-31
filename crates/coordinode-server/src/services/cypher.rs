@@ -437,6 +437,24 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [("label", label.clone()), ("property", property.clone())],
             );
         }
+        // The values themselves cannot be indexed, whatever the state: the
+        // request's argument, not a precondition (AIP-193).
+        DatabaseError::IndexEntry(entry) => {
+            use coordinode_core::index::derive::EntryError;
+            let detail = match entry {
+                EntryError::KeyTooLong(key) => ("key_length", key.len.to_string()),
+                EntryError::FanOut(_) => (
+                    "fan_out",
+                    coordinode_core::index::derive::MAX_ENTRY_FAN_OUT.to_string(),
+                ),
+            };
+            return status_with_reason(
+                Code::InvalidArgument,
+                rendered,
+                Reason::IndexEntryRefused,
+                [(detail.0, detail.1)],
+            );
+        }
         DatabaseError::SessionSetting { setting, reason } => {
             return super::error_details::invalid_field(setting, reason.clone());
         }

@@ -165,7 +165,7 @@ impl IndexInterpretation {
         owner: EntryOwner,
         old: Option<&[Value]>,
         new: Option<&[Value]>,
-    ) -> Result<Vec<EntryEffect>, KeyTooLong> {
+    ) -> Result<Vec<EntryEffect>, EntryError> {
         membership_effects(self.generation, owner, old, new)
     }
 }
@@ -228,7 +228,7 @@ pub const MAX_INDEX_KEY_LEN: usize = u16::MAX as usize;
 /// An index entry whose key is longer than [`MAX_INDEX_KEY_LEN`]: the value
 /// it would hold cannot be indexed, and nothing of the write holding it is
 /// staged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[error(
     "an index entry of {len} bytes is longer than the {MAX_INDEX_KEY_LEN} bytes a key may take"
 )]
@@ -237,20 +237,31 @@ pub struct KeyTooLong {
     pub len: usize,
 }
 
+/// Why values cannot be held in an index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+pub enum EntryError {
+    /// An entry's key is longer than a key may be.
+    #[error(transparent)]
+    KeyTooLong(#[from] KeyTooLong),
+    /// The values' lists make too many entries.
+    #[error(transparent)]
+    FanOut(#[from] FanOut),
+}
+
 /// The entry effects in the index generation `generation` of `owner`'s
 /// membership moving from `old` to `new`: a delete for each tuple it leaves,
 /// a put for each it enters. A tuple in both is untouched.
 ///
 /// # Errors
 ///
-/// [`KeyTooLong`] for an entry it enters whose key the index cannot hold.
+/// [`EntryError`] for values an index cannot hold.
 pub fn membership_effects(
     generation: GenerationId,
     owner: EntryOwner,
     old: Option<&[Value]>,
     new: Option<&[Value]>,
-) -> Result<Vec<EntryEffect>, KeyTooLong> {
-    let unbounded = |_| Ok::<(), KeyTooLong>(());
+) -> Result<Vec<EntryEffect>, EntryError> {
+    let unbounded = |_| Ok::<(), EntryError>(());
     let before = old.map(|v| tuples_within(v, unbounded)).transpose()?;
     let after = new.map(|v| tuples_within(v, unbounded)).transpose()?;
     effects_of(
@@ -308,29 +319,58 @@ pub fn effects_of<E: From<KeyTooLong>>(
     Ok(effects)
 }
 
+/// Most entries the values of one node may take in one index: their lists'
+/// combinations multiply, and one write, build page or derivation never
+/// expands past this many.
+pub const MAX_ENTRY_FAN_OUT: usize = 1 << 22;
+
+/// Values whose lists make more combinations than [`MAX_ENTRY_FAN_OUT`]:
+/// they cannot be indexed, and nothing of the write holding them is staged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[error("the values' lists make more than {MAX_ENTRY_FAN_OUT} index entries")]
+pub struct FanOut;
+
+/// How many combinations the lists among `values` make, a value that is no
+/// list counting once; `None` past [`MAX_ENTRY_FAN_OUT`].
+pub fn combinations(values: &[Value]) -> Option<usize> {
+    values
+        .iter()
+        .try_fold(1usize, |n, value| {
+            let choices = match value {
+                Value::Array(items) => items.len(),
+                _ => 1,
+            };
+            n.checked_mul(choices)
+        })
+        .filter(|n| *n <= MAX_ENTRY_FAN_OUT)
+}
+
 /// The key tuples `values` index under, sorted and distinct: one per
 /// combination of list elements (multikey), none for a combination that has
 /// no key.
-pub fn tuples(values: &[Value]) -> Vec<Vec<u8>> {
-    match tuples_within(values, |_| Ok::<(), core::convert::Infallible>(())) {
-        Ok(tuples) => tuples,
-        Err(never) => match never {},
-    }
+///
+/// # Errors
+///
+/// [`FanOut`] when the lists make more combinations than an index takes.
+pub fn tuples(values: &[Value]) -> Result<Vec<Vec<u8>>, FanOut> {
+    tuples_within(values, |_| Ok::<(), FanOut>(()))
 }
 
 /// [`tuples`], passing `charge` the bytes it is about to allocate before it
 /// allocates them: the encoding of each value and list element (linear in
 /// the values), the list of combinations, and each tuple at its exact
-/// length. The combinations of several lists multiply, so a refusal comes
-/// before any of them is built; nothing is cloned.
+/// length. The combinations are counted, and refused past
+/// [`MAX_ENTRY_FAN_OUT`], before anything is allocated; nothing is cloned.
 ///
 /// # Errors
 ///
-/// What `charge` returns.
-pub fn tuples_within<E>(
+/// [`FanOut`], or what `charge` returns.
+pub fn tuples_within<E: From<FanOut>>(
     values: &[Value],
     mut charge: impl FnMut(usize) -> Result<(), E>,
 ) -> Result<Vec<Vec<u8>>, E> {
+    // Within the cap, so every product below fits a usize.
+    let count = combinations(values).ok_or(FanOut)?;
     // Each value, or each element of a list, encoded once: a segment, or
     // `None` for one that has no key. A tuple is one segment per value.
     let elements: usize = values
@@ -372,14 +412,7 @@ pub fn tuples_within<E>(
         }
         segments.push(choices);
     }
-    // How many combinations the lists make, each made below.
-    let Some(count) = segments
-        .iter()
-        .try_fold(1usize, |n, choices| n.checked_mul(choices.len()))
-    else {
-        charge(usize::MAX)?;
-        return Ok(Vec::new());
-    };
+    // `count` combinations, each made below.
     charge(
         count * core::mem::size_of::<Vec<u8>>() + segments.len() * core::mem::size_of::<usize>(),
     )?;
@@ -449,11 +482,12 @@ pub enum DeriveError {
     /// The unit derives more entry effects than it is allowed.
     #[error("the unit derives more than {0} index entry effects")]
     FanOut(usize),
-    /// The work enters an entry whose key the index cannot hold. The member
-    /// that sealed it refused such a write before logging it, so a logged
-    /// unit meets this only if it was sealed elsewhere without that check.
+    /// The work holds values the index cannot hold: a key too long, or lists
+    /// making too many entries. The member that sealed it refused such a
+    /// write before logging it under the same limits, so a logged unit meets
+    /// this only if it was sealed elsewhere without them.
     #[error(transparent)]
-    KeyTooLong(#[from] KeyTooLong),
+    Entry(#[from] EntryError),
 }
 
 /// Resolve a unit into the mutations it applies: every mutation that is not

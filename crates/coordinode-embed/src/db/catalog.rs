@@ -138,6 +138,12 @@ impl Database {
             Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => {
                 Err(ExecutionError::from(v).into())
             }
+            Some(IndexBuildOutcome::Failed(BuildError::IndexEntry(entry))) => {
+                Err(DatabaseError::IndexEntry(entry))
+            }
+            Some(IndexBuildOutcome::Failed(BuildError::Budget(stop))) => {
+                Err(DatabaseError::Budget(stop))
+            }
             Some(IndexBuildOutcome::Cancelled) => Err(refused(format!(
                 "the certification of the definition of :{name} was cancelled"
             ))),

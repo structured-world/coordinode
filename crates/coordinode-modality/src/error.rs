@@ -62,10 +62,10 @@ pub enum StoreError {
     #[error(transparent)]
     Budget(#[from] coordinode_core::budget::BudgetStop),
 
-    /// An index entry the write would enter has a key longer than a key may
-    /// be; nothing of the write was staged.
+    /// Values an index cannot hold: an entry key longer than a key may be,
+    /// or lists making too many entries. Nothing of the write was staged.
     #[error(transparent)]
-    KeyTooLong(#[from] coordinode_core::index::derive::KeyTooLong),
+    IndexEntry(#[from] coordinode_core::index::derive::EntryError),
 
     /// A vector index refused a vector its metric cannot evaluate; nothing
     /// was indexed.
@@ -85,6 +85,18 @@ pub enum StoreError {
 // produces `lsm_tree::Error`. Route through [`StorageError`] so the
 // rest of the chain (capacity-exhausted, checksum, …) still drills
 // through correctly.
+impl From<coordinode_core::index::derive::KeyTooLong> for StoreError {
+    fn from(e: coordinode_core::index::derive::KeyTooLong) -> Self {
+        Self::IndexEntry(e.into())
+    }
+}
+
+impl From<coordinode_core::index::derive::FanOut> for StoreError {
+    fn from(e: coordinode_core::index::derive::FanOut) -> Self {
+        Self::IndexEntry(e.into())
+    }
+}
+
 impl From<lsm_tree::Error> for StoreError {
     fn from(e: lsm_tree::Error) -> Self {
         StoreError::Storage(StorageError::from(e))

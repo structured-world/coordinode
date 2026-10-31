@@ -480,6 +480,20 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
   be refused as unresolved for that while.
   A transaction that wrote to the label before a partial unique index existed
   is refused at its commit and retried under the new index.
+- **Values an index cannot hold.** An entry's key holds the indexed
+  values, escaped (each zero byte takes two bytes), with the index and the
+  node it belongs to, and is at most 65535 bytes long; the lists among the
+  values of a node make one entry per combination of their elements, at
+  most 4194304 per node and index. A write that would give an index an
+  entry past either limit fails before anything of it is written, with gRPC
+  `INVALID_ARGUMENT`, reason `INDEX_ENTRY_REFUSED` and metadata
+  `key_length` (the entry's length) or `fan_out` (the limit);
+  `DatabaseError::IndexEntry` in the embedded API. A `CREATE INDEX`, a
+  constraint's index or an `ALTER NODE TYPE ... SET IMPLIES` that would place
+  such a stored value fails the same way and leaves the stored nodes, and
+  what the type implies, as they were; the build or certification record
+  keeps the refusal. The same limits apply on every member. A value no index
+  reads is not bound by them.
 - **An entry found wrong.** A lookup checks every node its index names
   against that node's record. An entry naming a node that does not hold the
   value shows the index wrong: the lookup answers from the records of the

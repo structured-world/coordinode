@@ -80,6 +80,7 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::Procedure(_) => "Procedure",
         E::Unsupported(_) => "Unsupported",
         E::Budget(_) => "Budget",
+        E::IndexEntry(_) => "IndexEntry",
         E::IndexUnresolved { .. } => "IndexUnresolved",
         E::TextIndexNotReady { .. } => "TextIndexNotReady",
         E::CascadeOverflow { .. } => "CascadeOverflow",
@@ -382,6 +383,17 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
                 BudgetStop::Cancelled => wire::budget_spent::Stop::Cancelled(wire::Empty {}),
             }),
         }),
+        E::IndexEntry(entry) => {
+            use coordinode_core::index::derive::EntryError;
+            use wire::index_entry_refused::Refusal;
+            Kind::IndexEntry(wire::IndexEntryRefused {
+                refusal: Some(match entry {
+                    // usize is at most 64 bits on every supported target.
+                    EntryError::KeyTooLong(key) => Refusal::KeyLength(key.len as u64),
+                    EntryError::FanOut(_) => Refusal::FanOut(wire::Empty {}),
+                }),
+            })
+        }
         E::IndexUnresolved {
             label,
             property,
@@ -794,6 +806,17 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             wire::budget_spent::Stop::Deadline(_) => BudgetStop::Deadline,
             wire::budget_spent::Stop::Cancelled(_) => BudgetStop::Cancelled,
         }),
+        Kind::IndexEntry(r) => {
+            use coordinode_core::index::derive::{EntryError, FanOut, KeyTooLong};
+            use wire::index_entry_refused::Refusal;
+            E::IndexEntry(match r.refusal.ok_or("an index refusal of no reason")? {
+                Refusal::KeyLength(len) => EntryError::KeyTooLong(KeyTooLong {
+                    len: usize::try_from(len)
+                        .map_err(|_| format!("a key length of {len} bytes"))?,
+                }),
+                Refusal::FanOut(_) => EntryError::FanOut(FanOut),
+            })
+        }
         Kind::IndexUnresolved(i) => E::IndexUnresolved {
             label: i.label,
             property: i.property,

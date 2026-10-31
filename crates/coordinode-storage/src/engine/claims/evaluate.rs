@@ -496,7 +496,8 @@ pub fn uncovered_holders(
             return Ok(None);
         };
         // A node taking a value it already holds holds it still.
-        if !tuples(&values).iter().any(|t| {
+        let held = tuples(&values).map_err(coordinode_core::index::derive::EntryError::from)?;
+        if !held.iter().any(|t| {
             wanted
                 .get(t.as_slice())
                 .is_some_and(|taker| *taker != holder)

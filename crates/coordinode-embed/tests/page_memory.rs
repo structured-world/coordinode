@@ -231,8 +231,11 @@ fn compound_combinations_are_refused_before_they_are_built() {
     let budget = QueryBudget::new(limit);
     let (refused, allocated) = allocated_by(|| {
         tuples_within(&values, |bytes| {
-            budget.reserve(bytes as u64)?.keep_until_query_ends();
-            Ok::<(), coordinode_core::budget::BudgetStop>(())
+            budget
+                .reserve(bytes as u64)
+                .map_err(coordinode_modality::StoreError::from)?
+                .keep_until_query_ends();
+            Ok::<(), coordinode_modality::StoreError>(())
         })
     });
     assert!(refused.is_err(), "the combinations fit {limit} bytes");
@@ -243,9 +246,141 @@ fn compound_combinations_are_refused_before_they_are_built() {
     assert!(budget.memory_peak() <= budget.memory_limit());
 }
 
+/// Under a compound uniqueness, a change placing a node whose two lists make
+/// ninety thousand combinations is refused by a small page budget before
+/// the combinations are built: the uniqueness checks that run ahead of the
+/// staging count them against the same budget. Building them first would
+/// allocate megabytes before the refusal.
+///
+/// A change allocates far more than the combinations in its own machinery
+/// (catalog, certification, engine threads, each halved page tried again),
+/// all of it the same whatever the lists hold. So the measure is a
+/// difference: lists of three hundred elements (ninety thousand
+/// combinations) against lists of a hundred and fifty (a quarter as many),
+/// both refused at the count. Built, the extra combinations alone would
+/// take over ten megabytes.
+#[test]
+fn a_unique_change_refuses_compound_combinations_before_building_them() {
+    let refused_as_budget = |outcome: &Result<_, coordinode_embed::DatabaseError>| {
+        assert!(
+            matches!(outcome, Err(coordinode_embed::DatabaseError::Budget(_))),
+            "not the page's memory refusal: {:?}",
+            outcome.as_ref().err()
+        );
+    };
+    let (quarter, quarter_allocated) = compound_change(150, 256 * 1024);
+    refused_as_budget(&quarter);
+    let (refused, allocated) = compound_change(300, 256 * 1024);
+    refused_as_budget(&refused);
+    let grown = allocated.saturating_sub(quarter_allocated);
+    assert!(
+        grown < 2 << 20,
+        "{grown} more bytes for four times the combinations \
+         ({allocated} against {quarter_allocated})"
+    );
+}
+
+/// The change of what Task implies over one Task whose lists hold `n`
+/// elements each, under a compound uniqueness on what it comes to imply,
+/// with pages of `page_bytes`, and the bytes it allocated.
+fn compound_change(
+    n: usize,
+    page_bytes: u64,
+) -> (
+    Result<Vec<std::collections::BTreeMap<String, Value>>, coordinode_embed::DatabaseError>,
+    usize,
+) {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+    let mut db = coordinode_embed::Database::open_in_memory().expect("open");
+    for name in ["Thing", "Task"] {
+        let mut schema = LabelSchema::new_node_id(name);
+        schema.set_mode(SchemaMode::Flexible);
+        for property in ["a", "b"] {
+            schema.add_property(PropertyDef::new(
+                property,
+                PropertyType::Array(Box::new(PropertyType::String)),
+            ));
+        }
+        db.create_label_schema(schema).expect(name);
+    }
+    db.execute_cypher("CREATE CONSTRAINT thing_ab FOR (n:Thing) REQUIRE (n.a, n.b) IS UNIQUE")
+        .expect("uniqueness");
+    let list = |p: &str| {
+        (0..n)
+            .map(|n| format!("'{p}{n:05}{}'", "x".repeat(20)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    db.execute_cypher(&format!(
+        "CREATE (:Task {{a: [{}], b: [{}]}})",
+        list("a"),
+        list("b")
+    ))
+    .expect("task");
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        maintenance_page_bytes: page_bytes,
+        ..db.index_build_config()
+    });
+
+    allocated_by(|| db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)"))
+}
+
+/// The bounds charged before an index definition is read cover what reading
+/// it allocates, measured from the fields read and not from the record's
+/// length: a definition with six hundred parts and a long text
+/// configuration's worth of bytes skipped. Reading only its parts, and
+/// reading it for placement, each allocate within their bound, and a large
+/// skipped configuration adds nothing to either.
+#[test]
+fn the_definition_bounds_cover_their_decodes() {
+    use coordinode_core::schema::label_id::LabelId;
+    use coordinode_modality::index_def::{GenerationId, IndexDefinition, IndexDescriptor, IndexId};
+    let mut def = IndexDescriptor::compound(
+        "wide",
+        "Thing",
+        (0..40).map(|n| format!("property_{n:03}")).collect(),
+    )
+    .bind(IndexId::from_raw(7), GenerationId::from_raw(9));
+    for n in 1..=300u32 {
+        def.propose_parts(
+            LabelId::new(n).unwrap(),
+            GenerationId::from_raw(11),
+            GenerationId::from_raw(u64::from(n) * 2 + 100),
+            GenerationId::from_raw(u64::from(n) * 2 + 101),
+        );
+    }
+    let bytes = rmp_serde::to_vec(&def).unwrap();
+
+    let parts_bound = IndexDefinition::selection_bound(&bytes).unwrap();
+    let (parts, allocated) =
+        allocated_by(|| IndexDefinition::selection_from_msgpack(&bytes).unwrap());
+    assert_eq!(parts.len(), 600);
+    assert!(
+        allocated <= parts_bound,
+        "{allocated} allocated, {parts_bound} bound"
+    );
+
+    let (kept_bound, measuring) =
+        allocated_by(|| IndexDefinition::for_placement_bound(&bytes).unwrap());
+    assert_eq!(measuring, 0, "measuring allocated");
+    let (kept, allocated) =
+        allocated_by(|| IndexDefinition::for_placement_from_msgpack(&bytes).unwrap());
+    assert_eq!(kept, def);
+    assert!(
+        allocated <= kept_bound,
+        "{allocated} allocated, {kept_bound} bound"
+    );
+    assert!(
+        kept_bound < bytes.len() * 4,
+        "the bound is not measured from the fields: {kept_bound} for {} bytes",
+        bytes.len()
+    );
+}
+
 /// Reading what a label implies from its stored definition allocates the
 /// implied names alone, within the bound charged for it, whatever else the
-/// definition declares: a thousand properties are skipped unread.
+/// definition declares: a thousand properties are skipped unread, both by
+/// the decode and by the bound, which measuring allocates nothing.
 #[test]
 fn the_implication_facts_skip_the_rest_of_the_definition() {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
@@ -258,7 +393,10 @@ fn the_implication_facts_skip_the_rest_of_the_definition() {
     }
     schema.set_implies(vec!["Thing".into(), "Work".into()]);
     let bytes = schema.to_msgpack().expect("encode");
-    let bound = LabelSchema::implication_facts_bound(bytes.len());
+    let (bound, measuring) =
+        allocated_by(|| LabelSchema::implication_facts_bound(&bytes).expect("bound"));
+    assert_eq!(measuring, 0, "measuring allocated");
+    assert!(bound < 1024, "the bound counts the properties: {bound}");
     let (facts, allocated) =
         allocated_by(|| LabelSchema::implication_facts_from_msgpack(&bytes, false).expect("facts"));
     assert_eq!(facts.implies, ["Thing", "Work"]);

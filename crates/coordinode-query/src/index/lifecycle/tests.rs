@@ -255,7 +255,7 @@ fn a_duplicate_withdraws_a_new_unique_index() {
     // after the waiter is gone.
     let state = env.record(&def).expect("record").state;
     assert!(
-        matches!(&state, BuildState::Failed { reason } if reason.contains("same@x")),
+        matches!(&state, BuildState::Failed { reason, cause: None } if reason.contains("same@x")),
         "{state:?}"
     );
     assert!(env.stored(&def).is_none());
@@ -1581,7 +1581,7 @@ fn take_while_building(
         .map_err(|e| e.to_string())?;
     let revision = txn.schema_generation();
     for claim in claims {
-        for tuple in tuples(&claim.values) {
+        for tuple in tuples(&claim.values).expect("one value") {
             txn.claim(Claim::new(
                 ClaimScope::UniqueValue {
                     generation: def.generation,

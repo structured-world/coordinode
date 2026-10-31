@@ -800,6 +800,12 @@ impl Database {
                 Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
                     Readiness::Failed(reason)
                 }
+                Some(IndexBuildOutcome::Failed(BuildError::IndexEntry(entry))) => {
+                    Readiness::Failed(entry.to_string())
+                }
+                Some(IndexBuildOutcome::Failed(error @ BuildError::Budget(_))) => {
+                    Readiness::Failed(error.to_string())
+                }
                 Some(IndexBuildOutcome::Cancelled) => Readiness::Failed(format!(
                     "operation {} was cancelled, or is not known here",
                     operation.as_raw()

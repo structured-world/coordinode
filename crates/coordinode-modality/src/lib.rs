@@ -94,7 +94,7 @@ pub use index::{
 };
 pub use index_def::{
     BuildFailure, BuildState, CheckState, CopyQualification, DuplicateRepair,
-    DuplicateRepairRecord, ENTRY_LAYOUT, GenerationId, IndexBuildRecord, IndexCheck,
+    DuplicateRepairRecord, ENTRY_LAYOUT, FailureCause, GenerationId, IndexBuildRecord, IndexCheck,
     IndexDefinition, IndexDescriptor, IndexId, IndexIntegrityRecord, IndexMaintenance,
     IndexProfile, IndexState, IndexType, Integrity, Interpretation, LabelCertificationRecord,
     Mismatch, NamespaceIndexPolicy, OnlineDuringBuild, PartRole, PartState, PartialFilter,

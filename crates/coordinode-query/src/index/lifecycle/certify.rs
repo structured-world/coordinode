@@ -23,6 +23,14 @@ use super::{
     begin, cannot_move_here, is_contention, move_attempts, next_token, terminal_outcome, text,
 };
 
+/// The labels a certification refuses, each with why, and the typed refusal
+/// that refused them all, when there is one.
+#[derive(Default)]
+struct Refusals {
+    labels: Vec<(String, String)>,
+    cause: Option<coordinode_modality::FailureCause>,
+}
+
 impl IndexBuildService {
     /// Run the certification `generation` on an executor of this process,
     /// unless one already has it. [`Self::wait`] reports its outcome:
@@ -155,10 +163,13 @@ impl Shared {
         // (`CandidatePublished`), and a later one is held to the candidate.
         // Every node the proof must see is in the store already.
         self.set_phase(generation, BuildPhase::Indexing { indexed: None });
-        let mut refused = self.prove(generation, &labels)?;
+        let mut refused = Refusals {
+            labels: self.prove(generation, &labels)?,
+            cause: None,
+        };
         #[cfg(any(test, feature = "test-hooks"))]
         super::after_proof();
-        if refused.is_empty() {
+        if refused.labels.is_empty() {
             match self.reconcile(generation, &labels)? {
                 Some(not_reconciled) => refused = not_reconciled,
                 // The process is closing: the record stays running, and the
@@ -206,7 +217,7 @@ impl Shared {
         &self,
         generation: GenerationId,
         labels: &[String],
-    ) -> Result<Option<Vec<(String, String)>>, String> {
+    ) -> Result<Option<Refusals>, String> {
         let env = self.env.as_ref();
         let store = LocalSchemaStore::new(env.engine());
         let mut moves = false;
@@ -217,7 +228,7 @@ impl Shared {
                 .is_some_and(|s| s.candidate_changes_implies());
         }
         if !moves {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(Refusals::default()));
         }
         let fields = env.fields()?;
         let placed = crate::index::reconcile::Reconcile {
@@ -232,10 +243,11 @@ impl Shared {
         }
         .run(&mut |txn| env.commit_page(txn));
         match placed {
-            Ok(_) => Ok(Some(Vec::new())),
+            Ok(_) => Ok(Some(Refusals::default())),
             Err(crate::index::build::BackfillError::Stopped) => Ok(None),
-            Err(e) => Ok(Some(
-                labels
+            Err(e) => Ok(Some(Refusals {
+                cause: e.cause(),
+                labels: labels
                     .iter()
                     .map(|label| {
                         (
@@ -244,7 +256,7 @@ impl Shared {
                         )
                     })
                     .collect(),
-            )),
+            })),
         }
     }
 
@@ -370,8 +382,12 @@ impl Shared {
         generation: GenerationId,
         token: u64,
         labels: &[String],
-        mut refused: Vec<(String, String)>,
+        refusals: Refusals,
     ) -> Result<Executed, String> {
+        let Refusals {
+            labels: mut refused,
+            cause,
+        } = refusals;
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
         let schemas = LocalSchemaStore::new(env.engine());
@@ -458,8 +474,9 @@ impl Shared {
                         .join("; ");
                     record.state = BuildState::Failed {
                         reason: reason.clone(),
+                        cause,
                     };
-                    IndexBuildOutcome::Failed(BuildError::Other(reason))
+                    IndexBuildOutcome::Failed(BuildError::of(cause, reason))
                 };
                 record.refused = withdrawn;
                 store

@@ -120,14 +120,43 @@ fn a_record_answers_by_field_id_then_by_name() {
 #[test]
 fn lists_index_each_distinct_element() {
     let list = Value::Array(vec![s("b"), s("a"), s("b")]);
-    let got = tuples(&[list]);
+    let got = tuples(&[list]).expect("two");
     let mut want = vec![
         encode_tuple(&[s("a")]).expect("a"),
         encode_tuple(&[s("b")]).expect("b"),
     ];
     want.sort();
     assert_eq!(got, want);
-    assert!(tuples(&[Value::Float(f64::NAN)]).is_empty());
+    assert!(
+        tuples(&[Value::Float(f64::NAN)])
+            .expect("one combination")
+            .is_empty()
+    );
+}
+
+/// Lists whose combinations pass the limit are refused before any is
+/// counted into memory: sixty-one two-element lists make 2^61
+/// combinations, a product that would overflow once multiplied by a slot's
+/// size, and sixty-four make more than a usize counts; both are refused with
+/// the typed error, nothing charged. At the limit the count passes.
+#[test]
+fn lists_past_the_fan_out_are_refused_before_anything_is_counted() {
+    let pair = Value::Array(vec![Value::Int(0), Value::Int(1)]);
+    for lists in [61usize, 64] {
+        let values = vec![pair.clone(); lists];
+        let mut charged = 0usize;
+        let refused = tuples_within(&values, |bytes| {
+            charged += bytes;
+            Ok::<(), FanOut>(())
+        });
+        assert_eq!(refused, Err(FanOut), "{lists} lists");
+        assert_eq!(charged, 0, "{lists} lists: charged before the refusal");
+        assert_eq!(combinations(&values), None);
+    }
+    let at_limit = vec![pair.clone(); MAX_ENTRY_FAN_OUT.trailing_zeros() as usize];
+    assert_eq!(combinations(&at_limit), Some(MAX_ENTRY_FAN_OUT));
+    let past_limit = vec![pair; MAX_ENTRY_FAN_OUT.trailing_zeros() as usize + 1];
+    assert_eq!(combinations(&past_limit), None);
 }
 
 /// An entry whose key is exactly as long as a key may be is entered; one a
@@ -150,15 +179,15 @@ fn an_entry_key_past_the_longest_key_is_refused() {
     let past = [s(&"k".repeat(fitting + 1))];
     assert_eq!(
         index.membership_effects(node, None, Some(&past)),
-        Err(KeyTooLong {
+        Err(EntryError::KeyTooLong(KeyTooLong {
             len: MAX_INDEX_KEY_LEN + 1
-        })
+        }))
     );
     // Zero bytes encode as two bytes each.
     let zeros = [s(&"\0".repeat(fitting / 2 + 1))];
     assert!(matches!(
         index.membership_effects(node, None, Some(&zeros)),
-        Err(KeyTooLong { len }) if len > MAX_INDEX_KEY_LEN
+        Err(EntryError::KeyTooLong(KeyTooLong { len })) if len > MAX_INDEX_KEY_LEN
     ));
     // A compound of two values each within the limit, together past it.
     let half = [
@@ -188,15 +217,23 @@ fn the_combinations_of_lists_are_charged_before_they_are_built() {
     let list = |p: &str| Value::Array((0..100).map(|n| s(&format!("{p}{n:03}"))).collect());
     let values = [list("a"), Value::Int(5), list("b")];
 
+    // A refusal carrying what was charged before it.
+    #[derive(Debug)]
+    struct Refused(usize);
+    impl From<FanOut> for Refused {
+        fn from(_: FanOut) -> Self {
+            Self(usize::MAX)
+        }
+    }
     let mut charged = 0usize;
     let refused = tuples_within(&values, |bytes| {
         if bytes >= 10_000 * core::mem::size_of::<Vec<u8>>() {
-            return Err(charged);
+            return Err(Refused(charged));
         }
         charged += bytes;
         Ok(())
     });
-    let before_refusal = refused.expect_err("refused at the combinations");
+    let before_refusal = refused.expect_err("refused at the combinations").0;
     assert!(
         before_refusal < 20_000,
         "{before_refusal} charged before the refusal"
@@ -205,7 +242,7 @@ fn the_combinations_of_lists_are_charged_before_they_are_built() {
     let mut charged = 0usize;
     let granted = tuples_within(&values, |bytes| {
         charged += bytes;
-        Ok::<(), ()>(())
+        Ok::<(), FanOut>(())
     })
     .expect("granted");
     let held: usize = granted.iter().map(Vec::capacity).sum();
@@ -236,7 +273,7 @@ fn the_combinations_of_lists_are_charged_before_they_are_built() {
     expected.sort_unstable();
     expected.dedup();
     assert_eq!(granted, expected);
-    assert_eq!(tuples(&values), expected);
+    assert_eq!(tuples(&values).expect("within the fan-out"), expected);
 }
 
 /// Entering puts every tuple, leaving deletes every tuple, and a change

@@ -207,6 +207,11 @@ pub enum StorageError {
     /// memory, deadline or cancellation. Nothing past the refusal was done.
     #[error(transparent)]
     Budget(#[from] coordinode_core::budget::BudgetStop),
+
+    /// Values an index cannot hold: an entry key longer than a key may be,
+    /// or lists making too many entries. Nothing of the write was staged.
+    #[error(transparent)]
+    IndexEntry(#[from] coordinode_core::index::derive::EntryError),
 }
 
 /// `key` as text for a message: printable ASCII as it is, every other byte

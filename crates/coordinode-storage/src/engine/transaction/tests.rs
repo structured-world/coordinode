@@ -1863,7 +1863,7 @@ mod unique_while_building {
         Claim::new(
             ClaimScope::UniqueValue {
                 generation: interpretation.generation,
-                tuple: tuples(&[email(value)]).pop().unwrap(),
+                tuple: tuples(&[email(value)]).unwrap().pop().unwrap(),
             },
             ClaimPredicate::UniqueHolder {
                 node: NodeId::from_raw(id),

@@ -454,7 +454,7 @@ fn take_free_email(
     .expect("put");
     let interpretation = email_interpretation();
     let generation = txn.schema_generation();
-    for tuple in tuples(&[email]) {
+    for tuple in tuples(&[email]).expect("one value") {
         txn.claim(Claim::new(
             ClaimScope::UniqueValue {
                 generation: interpretation.generation,
@@ -542,7 +542,7 @@ fn unique_values_in_one_commit(stored: u64, uncovered: u64, values: u64, commits
                     &record.to_msgpack().expect("encode"),
                 )
                 .expect("put");
-                for tuple in tuples(&[email]) {
+                for tuple in tuples(&[email]).expect("one value") {
                     txn.claim(Claim::new(
                         ClaimScope::UniqueValue {
                             generation: interpretation.generation,

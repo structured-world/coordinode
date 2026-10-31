@@ -193,6 +193,182 @@ struct SelectionView {
     selection: Vec<SelectionPart>,
 }
 
+/// [`IndexDefinition`] as encoded, its parts counted and nothing kept.
+#[derive(Deserialize)]
+struct SelectionLenView {
+    #[serde(rename = "id")]
+    _id: serde::de::IgnoredAny,
+    #[serde(rename = "generation")]
+    _generation: serde::de::IgnoredAny,
+    #[serde(rename = "descriptor")]
+    _descriptor: serde::de::IgnoredAny,
+    selection: ListLen,
+}
+
+/// [`IndexDefinition`] as encoded, measured as
+/// [`IndexDefinition::for_placement_from_msgpack`] decodes it.
+#[derive(Deserialize)]
+struct PlacementSizeView {
+    #[serde(rename = "id")]
+    _id: serde::de::IgnoredAny,
+    #[serde(rename = "generation")]
+    _generation: serde::de::IgnoredAny,
+    descriptor: DescriptorSizeView,
+    selection: ListLen,
+}
+
+/// [`IndexDescriptor`] as encoded, its kept strings and names measured.
+#[derive(Deserialize)]
+struct DescriptorSizeView {
+    name: StrBytes,
+    description: StrBytes,
+    label: StrBytes,
+    properties: NamesSize,
+    #[serde(rename = "index_type")]
+    _index_type: serde::de::IgnoredAny,
+    #[serde(rename = "unique")]
+    _unique: serde::de::IgnoredAny,
+    #[serde(rename = "sparse")]
+    _sparse: serde::de::IgnoredAny,
+    #[serde(rename = "multikey")]
+    _multikey: serde::de::IgnoredAny,
+    filter: StrBytes,
+    #[serde(rename = "ttl_seconds")]
+    _ttl_seconds: serde::de::IgnoredAny,
+    #[serde(rename = "vector_config")]
+    _vector_config: serde::de::IgnoredAny,
+    #[serde(rename = "text_config")]
+    _text_config: serde::de::IgnoredAny,
+    state: StrBytes,
+    #[serde(rename = "online_during_build")]
+    _online_during_build: serde::de::IgnoredAny,
+    #[serde(rename = "layout")]
+    _layout: serde::de::IgnoredAny,
+    #[serde(rename = "maintenance")]
+    _maintenance: serde::de::IgnoredAny,
+    owner: StrBytes,
+}
+
+/// The bytes of every string a value holds, however nested, read without
+/// keeping any.
+struct StrBytes(usize);
+
+impl<'de> Deserialize<'de> for StrBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Sum;
+        impl<'de> serde::de::Visitor<'de> for Sum {
+            type Value = StrBytes;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<StrBytes, E> {
+                Ok(StrBytes(v.len()))
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<StrBytes, E> {
+                Ok(StrBytes(0))
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<StrBytes, E> {
+                Ok(StrBytes(0))
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<StrBytes, E> {
+                Ok(StrBytes(0))
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<StrBytes, E> {
+                Ok(StrBytes(0))
+            }
+            fn visit_bytes<E: serde::de::Error>(self, _: &[u8]) -> Result<StrBytes, E> {
+                Ok(StrBytes(0))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<StrBytes, E> {
+                Ok(StrBytes(0))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<StrBytes, E> {
+                Ok(StrBytes(0))
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<StrBytes, D::Error> {
+                StrBytes::deserialize(d)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<StrBytes, A::Error> {
+                let mut n = 0usize;
+                while let Some(StrBytes(bytes)) = seq.next_element()? {
+                    n += bytes;
+                }
+                Ok(StrBytes(n))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<StrBytes, A::Error> {
+                let mut n = 0usize;
+                while let Some((StrBytes(k), StrBytes(v))) = map.next_entry()? {
+                    n += k + v;
+                }
+                Ok(StrBytes(n))
+            }
+        }
+        deserializer.deserialize_any(Sum)
+    }
+}
+
+/// How many names a list holds and their bytes, read without keeping any.
+struct NamesSize {
+    names: usize,
+    bytes: usize,
+}
+
+impl<'de> Deserialize<'de> for NamesSize {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Sum;
+        impl<'de> serde::de::Visitor<'de> for Sum {
+            type Value = NamesSize;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a list of names")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<NamesSize, A::Error> {
+                let mut size = NamesSize { names: 0, bytes: 0 };
+                while let Some(StrBytes(bytes)) = seq.next_element()? {
+                    size.names += 1;
+                    size.bytes += bytes;
+                }
+                Ok(size)
+            }
+        }
+        deserializer.deserialize_seq(Sum)
+    }
+}
+
+/// A list read for its length alone, its elements skipped unread.
+struct ListLen(usize);
+
+impl<'de> Deserialize<'de> for ListLen {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Counter;
+        impl<'de> serde::de::Visitor<'de> for Counter {
+            type Value = ListLen;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a list")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ListLen, A::Error> {
+                let mut n = 0usize;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    n += 1;
+                }
+                Ok(ListLen(n))
+            }
+        }
+        deserializer.deserialize_seq(Counter)
+    }
+}
+
 /// [`IndexDefinition`] as encoded, its descriptor read as
 /// [`PlacementDescriptor`]. The fields carry the definition's names and
 /// order, so either encoding of a struct reads the same fields.
@@ -630,9 +806,15 @@ impl IndexDefinition {
     }
 
     /// An upper bound of the heap bytes [`Self::selection_from_msgpack`]
-    /// takes for `len` encoded bytes: each part takes at least a byte.
-    pub const fn selection_bound(len: usize) -> usize {
-        LIST_ROOM * len * core::mem::size_of::<SelectionPart>()
+    /// takes for the definition encoded in `bytes`, read from the length of
+    /// its parts' list alone: nothing allocated, every other field skipped.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded definition.
+    pub fn selection_bound(bytes: &[u8]) -> Result<usize, rmp_serde::decode::Error> {
+        let view: SelectionLenView = rmp_serde::from_slice(bytes)?;
+        Ok(LIST_ROOM * view.selection.0 * core::mem::size_of::<SelectionPart>())
     }
 
     /// The definition encoded in `bytes` without its vector and text
@@ -672,16 +854,28 @@ impl IndexDefinition {
     }
 
     /// An upper bound of the heap bytes [`Self::for_placement_from_msgpack`]
-    /// takes for `len` encoded bytes. What it decodes holds strings, whose
-    /// bytes are encoded bytes, and lists of names and of parts, each element
-    /// at least a byte: so no more than the bytes and a slot per byte.
-    pub const fn for_placement_bound(len: usize) -> usize {
-        let slot = if core::mem::size_of::<String>() > core::mem::size_of::<SelectionPart>() {
-            core::mem::size_of::<String>()
-        } else {
-            core::mem::size_of::<SelectionPart>()
-        };
-        len * (1 + LIST_ROOM * slot)
+    /// takes for the definition encoded in `bytes`, measured from the fields
+    /// it decodes, nothing allocated: the bytes of every string it keeps, a
+    /// slot for each indexed property and each part, and room for those
+    /// lists to grow. The configurations it skips count for nothing.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded definition.
+    pub fn for_placement_bound(bytes: &[u8]) -> Result<usize, rmp_serde::decode::Error> {
+        let view: PlacementSizeView = rmp_serde::from_slice(bytes)?;
+        let d = view.descriptor;
+        let strings = d.name.0
+            + d.description.0
+            + d.label.0
+            + d.properties.bytes
+            + d.filter.0
+            + d.state.0
+            + d.owner.0;
+        Ok(strings
+            + LIST_ROOM
+                * (d.properties.names * core::mem::size_of::<String>()
+                    + view.selection.0 * core::mem::size_of::<SelectionPart>()))
     }
 
     /// The key scopes holding the entries of `label` under `interpretation`:
@@ -947,9 +1141,24 @@ pub enum BuildState {
     Failed {
         /// Why the build failed.
         reason: String,
+        /// What failed it, when that is a refusal a caller tells apart
+        /// without reading `reason`.
+        #[serde(default)]
+        cause: Option<FailureCause>,
     },
     /// Cancelled before it finished; its candidate entries are cleared.
     Cancelled,
+}
+
+/// A refusal that failed a build or a certification, kept with its record
+/// so whoever reads the outcome later gets it as the statement did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailureCause {
+    /// The stored data holds values the index cannot hold.
+    IndexEntry(coordinode_core::index::derive::EntryError),
+    /// A page of the work did not fit the memory a page may take, even one
+    /// node or entry at a time.
+    Budget(coordinode_core::budget::BudgetStop),
 }
 
 impl BuildState {

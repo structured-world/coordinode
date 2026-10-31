@@ -1364,7 +1364,10 @@ mod unique_while_building {
 
     fn claim(claimant: u64, value: Value, covered: Option<u64>, limit: u64) -> Claim {
         let interpretation = interpretation();
-        let tuple = tuples(&[value]).pop().expect("one tuple");
+        let tuple = tuples(&[value])
+            .expect("one combination")
+            .pop()
+            .expect("one tuple");
         Claim::new(
             ClaimScope::UniqueValue {
                 generation: interpretation.generation,

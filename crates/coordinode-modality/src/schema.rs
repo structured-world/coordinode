@@ -462,7 +462,12 @@ impl<'a> LocalSchemaStore<'a> {
         else {
             return Err(missing_revision(&name, revision));
         };
-        charge(LabelSchema::implication_facts_bound(body.len()))?;
+        let bound =
+            LabelSchema::implication_facts_bound(&body).map_err(|e| StoreError::Decode {
+                kind: "label schema",
+                message: format!("decode failed for '{name}' rev {revision}: {e}"),
+            })?;
+        charge(bound)?;
         let facts = LabelSchema::implication_facts_from_msgpack(&body, candidate).map_err(|e| {
             StoreError::Decode {
                 kind: "label schema",

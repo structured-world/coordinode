@@ -90,6 +90,12 @@ pub enum DatabaseError {
     #[error("{0}")]
     Budget(BudgetStop),
 
+    /// Values an index cannot hold: an entry whose key is longer than a key
+    /// may be, or lists making too many entries. Nothing of the write, build
+    /// or change of what a type implies holding them took effect.
+    #[error("{0}")]
+    IndexEntry(coordinode_core::index::derive::EntryError),
+
     /// An index cannot answer, and reading the records instead would run
     /// `operator` outside the statement's budget. Nothing was read or
     /// written; the same statement succeeds once the index is verified or
@@ -729,6 +735,7 @@ impl From<StorageError> for DatabaseError {
                 requested: snapshot.saturating_sub(1),
                 oldest_readable: watermark - 1,
             },
+            StorageError::IndexEntry(entry) => Self::IndexEntry(entry),
             other => Self::Storage(StorageFailure {
                 message: other.to_string(),
                 cause: Some(Box::new(other)),
@@ -742,6 +749,7 @@ impl From<StoreError> for DatabaseError {
         match e {
             StoreError::Storage(storage) => storage.into(),
             StoreError::Budget(stop) => Self::Budget(stop),
+            StoreError::IndexEntry(entry) => Self::IndexEntry(entry),
             StoreError::VectorSearch(VectorSearchError::Domain(e)) => Self::VectorDomain(e),
             StoreError::VectorAdmission(refused) => Self::VectorDomain(refused.error),
             other => Self::Other(other.to_string()),

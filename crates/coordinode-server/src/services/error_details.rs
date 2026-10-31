@@ -250,6 +250,12 @@ pub enum Reason {
     /// until the index is opened again. Nothing was answered. Metadata
     /// carries `label` and `property`. Retry after the advised delay.
     TextIndexNotReady,
+    /// An index cannot hold the values a write, an index build or a change
+    /// of what a type implies would give it: an entry key longer than a key
+    /// may be (metadata `key_length`), or lists making more entries than one
+    /// node may take in one index (metadata `fan_out`). Nothing took effect.
+    /// Terminal: the same values are refused again.
+    IndexEntryRefused,
     /// The client operation the write carries out already stands settled, or
     /// cannot be admitted: this attempt ran and applied nothing. Metadata
     /// carries `outcome` (COMMITTED, ABORTED, UNKNOWN or RETIRED,
@@ -331,6 +337,7 @@ impl Reason {
             Reason::QueryCancelled => "QUERY_CANCELLED",
             Reason::IndexUnresolved => "INDEX_UNRESOLVED",
             Reason::TextIndexNotReady => "TEXT_INDEX_NOT_READY",
+            Reason::IndexEntryRefused => "INDEX_ENTRY_REFUSED",
             Reason::OperationSettled => "OPERATION_SETTLED",
             Reason::ForeignOperation => "FOREIGN_OPERATION",
             Reason::MemberUnreachable => "MEMBER_UNREACHABLE",

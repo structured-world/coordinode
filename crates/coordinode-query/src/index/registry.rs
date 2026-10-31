@@ -1956,11 +1956,24 @@ fn other_holders(
     values: &[Value],
     node_id: NodeId,
 ) -> Result<Vec<NodeId>, StoreError> {
-    use coordinode_core::index::derive::tuples;
+    // The tuples and the holders found are charged to the transaction's
+    // budget before they are kept.
+    let budget = txn.write_budget();
     let mut out: Vec<NodeId> = Vec::new();
-    for tuple in tuples(values) {
+    for tuple in coordinode_modality::index::charged_tuples(txn, values)? {
         for holder in store.holders(txn, index, &tuple)? {
             if holder != node_id && !out.contains(&holder) {
+                if out.len() == out.capacity()
+                    && let Some(budget) = budget.as_deref()
+                {
+                    // Bytes of memory about to exist: fits in u64.
+                    budget
+                        .reserve((out.len().max(4) * core::mem::size_of::<NodeId>()) as u64)?
+                        .keep_until_query_ends();
+                }
+                if out.len() == out.capacity() {
+                    out.reserve_exact(out.len().max(4));
+                }
                 out.push(holder);
             }
         }
@@ -1977,25 +1990,42 @@ fn stale_entries(
     values: &[Value],
     holder: NodeId,
 ) -> Result<Vec<Mismatch>, StoreError> {
-    use coordinode_core::index::derive::tuples;
     use coordinode_core::index::encoding::{decode_entry, entry_value_prefix};
+    // The entries are streamed, not copied; each kept one is charged to the
+    // transaction's budget before it is kept.
+    let write_budget = txn.write_budget();
+    let unbounded;
+    let budget = match write_budget.as_deref() {
+        Some(budget) => budget,
+        None => {
+            unbounded = coordinode_core::budget::QueryBudget::new(u64::MAX);
+            &unbounded
+        }
+    };
     let mut out = Vec::new();
-    for tuple in tuples(values) {
+    for tuple in coordinode_modality::index::charged_tuples(txn, values)? {
         let prefix = entry_value_prefix(index.generation, &tuple);
-        for (key, _) in txn.prefix_scan(
+        txn.prefix_for_each(
             coordinode_storage::engine::partition::Partition::Idx,
             &prefix,
-        )? {
-            if let Some((node, valid_from)) = decode_entry(index.generation, &key)
-                && node == holder.as_raw()
-            {
-                out.push(Mismatch::Extra {
-                    node,
-                    valid_from,
-                    tuple: tuple.clone(),
-                });
-            }
-        }
+            budget,
+            |key, _| -> Result<(), StoreError> {
+                if let Some((node, valid_from)) = decode_entry(index.generation, key)
+                    && node == holder.as_raw()
+                {
+                    // Bytes of memory about to exist: fits in u64.
+                    budget
+                        .reserve((core::mem::size_of::<Mismatch>() + tuple.len()) as u64 * 2)?
+                        .keep_until_query_ends();
+                    out.push(Mismatch::Extra {
+                        node,
+                        valid_from,
+                        tuple: tuple.clone(),
+                    });
+                }
+                Ok(())
+            },
+        )?;
     }
     Ok(out)
 }
@@ -2042,9 +2072,8 @@ pub fn holds_values_as(
     values: &[Value],
     candidate: bool,
 ) -> Result<bool, StoreError> {
-    use coordinode_core::index::derive::tuples;
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let wanted = tuples(values);
+    let wanted = coordinode_modality::index::charged_tuples(txn, values)?;
     let interpretation = index.interpretation(field_of);
     let mut membership = if candidate {
         crate::index::membership::CatalogMembership::candidates(engine)
@@ -2052,12 +2081,15 @@ pub fn holds_values_as(
         crate::index::membership::CatalogMembership::current(engine)
     };
     let mut holds = |record: &coordinode_core::graph::node::NodeRecord| {
-        Ok::<_, StoreError>(
-            membership.carries_named(record, &index.label)?
-                && interpretation
-                    .record_membership(record)
-                    .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t))),
-        )
+        if !membership.carries_named(record, &index.label)? {
+            return Ok::<_, StoreError>(false);
+        }
+        let Some(held) = interpretation.record_membership(record) else {
+            return Ok(false);
+        };
+        Ok(coordinode_modality::index::charged_tuples(txn, &held)?
+            .iter()
+            .any(|t| wanted.contains(t)))
     };
     if let Some(record) = LocalNodeStore.get(txn, shard_id, holder)?
         && holds(&record)?

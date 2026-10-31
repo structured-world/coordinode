@@ -880,11 +880,23 @@ impl LabelSchema {
     }
 
     /// An upper bound of the heap bytes
-    /// [`Self::implication_facts_from_msgpack`] takes for `len` encoded
-    /// bytes: each implied name is a string of at least one encoded byte,
-    /// so the names take at most the bytes and a slot each.
-    pub const fn implication_facts_bound(len: usize) -> usize {
-        len * (1 + core::mem::size_of::<String>())
+    /// [`Self::implication_facts_from_msgpack`] takes for the definition
+    /// encoded in `data`, read from the lengths of its implied names alone:
+    /// nothing allocated, every other field skipped, so properties or
+    /// constraints however large count for nothing.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded definition.
+    pub fn implication_facts_bound(data: &[u8]) -> Result<usize, rmp_serde::decode::Error> {
+        let view: ImplicationSizeView = rmp_serde::from_slice(data)?;
+        let candidate = view.candidate.and_then(|c| c.implies).unwrap_or_default();
+        // The lists as decoded: each name's bytes, and twice a slot per name
+        // for a list grown past what its decoder sets room for.
+        Ok([view.implies, candidate]
+            .iter()
+            .map(|list| list.bytes + 2 * list.names * core::mem::size_of::<String>())
+            .sum())
     }
 }
 
@@ -931,6 +943,100 @@ struct ImplicationView {
     kind: LabelKind,
     #[serde(default)]
     implies: Vec<String>,
+}
+
+/// [`LabelSchema`] as encoded, its implied names measured and nothing kept.
+#[derive(Deserialize)]
+struct ImplicationSizeView {
+    #[serde(rename = "name")]
+    _name: serde::de::IgnoredAny,
+    #[serde(rename = "properties")]
+    _properties: serde::de::IgnoredAny,
+    #[serde(rename = "mode")]
+    _mode: serde::de::IgnoredAny,
+    #[serde(rename = "placement")]
+    _placement: serde::de::IgnoredAny,
+    #[serde(rename = "shard_keys")]
+    _shard_keys: serde::de::IgnoredAny,
+    #[serde(rename = "schema_revision")]
+    _schema_revision: serde::de::IgnoredAny,
+    #[serde(rename = "temporal")]
+    _temporal: serde::de::IgnoredAny,
+    #[serde(rename = "primary_key", default)]
+    _primary_key: serde::de::IgnoredAny,
+    #[serde(rename = "storage_layout", default)]
+    _storage_layout: serde::de::IgnoredAny,
+    #[serde(rename = "keyed_by_row_id", default)]
+    _keyed_by_row_id: serde::de::IgnoredAny,
+    #[serde(rename = "constraints", default)]
+    _constraints: serde::de::IgnoredAny,
+    #[serde(default)]
+    candidate: Option<CandidateSizeView>,
+    #[serde(rename = "kind", default)]
+    _kind: serde::de::IgnoredAny,
+    #[serde(default)]
+    implies: NamesSize,
+}
+
+/// [`LabelCandidate`] as encoded, its implied names measured.
+#[derive(Deserialize)]
+struct CandidateSizeView {
+    #[serde(rename = "properties")]
+    _properties: serde::de::IgnoredAny,
+    #[serde(rename = "mode")]
+    _mode: serde::de::IgnoredAny,
+    #[serde(default)]
+    implies: Option<NamesSize>,
+    #[serde(rename = "operation")]
+    _operation: serde::de::IgnoredAny,
+}
+
+/// How many names a list holds and their bytes, read without keeping any.
+#[derive(Default, Clone, Copy)]
+struct NamesSize {
+    names: usize,
+    bytes: usize,
+}
+
+impl<'de> Deserialize<'de> for NamesSize {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// One name, measured.
+        struct NameLen(usize);
+        impl<'de> Deserialize<'de> for NameLen {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct Len;
+                impl serde::de::Visitor<'_> for Len {
+                    type Value = NameLen;
+                    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                        f.write_str("a name")
+                    }
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<NameLen, E> {
+                        Ok(NameLen(v.len()))
+                    }
+                }
+                d.deserialize_str(Len)
+            }
+        }
+        struct Sum;
+        impl<'de> serde::de::Visitor<'de> for Sum {
+            type Value = NamesSize;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a list of names")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<NamesSize, A::Error> {
+                let mut size = NamesSize::default();
+                while let Some(NameLen(len)) = seq.next_element()? {
+                    size.names += 1;
+                    size.bytes += len;
+                }
+                Ok(size)
+            }
+        }
+        deserializer.deserialize_seq(Sum)
+    }
 }
 
 /// [`LabelCandidate`] as encoded, all but its implications skipped.

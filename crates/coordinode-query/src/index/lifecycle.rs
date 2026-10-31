@@ -106,9 +106,39 @@ pub enum BuildError {
     /// The stored data holds a value of the unique index twice.
     #[error(transparent)]
     Duplicate(UniqueViolation),
+    /// The stored data holds values the index cannot hold: an entry key
+    /// longer than a key may be, or lists making too many entries.
+    #[error(transparent)]
+    IndexEntry(coordinode_core::index::derive::EntryError),
+    /// A page of the work did not fit the memory a page may take, even one
+    /// node or entry at a time.
+    #[error("index maintenance needs more memory than a page may take: {0}")]
+    Budget(coordinode_core::budget::BudgetStop),
     /// Any other failure, as the build record keeps it.
     #[error("{0}")]
     Other(String),
+}
+
+impl BuildError {
+    /// The refusal the record keeps typed, when this is one.
+    pub fn cause(&self) -> Option<coordinode_modality::FailureCause> {
+        use coordinode_modality::FailureCause;
+        match self {
+            Self::IndexEntry(entry) => Some(FailureCause::IndexEntry(*entry)),
+            Self::Budget(stop) => Some(FailureCause::Budget(*stop)),
+            _ => None,
+        }
+    }
+
+    /// The typed refusal `cause` names, or `reason` as it was recorded.
+    pub fn of(cause: Option<coordinode_modality::FailureCause>, reason: String) -> Self {
+        use coordinode_modality::FailureCause;
+        match cause {
+            Some(FailureCause::IndexEntry(entry)) => Self::IndexEntry(entry),
+            Some(FailureCause::Budget(stop)) => Self::Budget(stop),
+            None => Self::Other(reason),
+        }
+    }
 }
 
 /// The outcome of a build, as a waiter receives it.
@@ -418,7 +448,19 @@ impl BuildStatus {
     /// Why the build failed, once it has.
     pub fn failure(&self) -> Option<&str> {
         match self.record.as_ref().map(|r| &r.state) {
-            Some(BuildState::Failed { reason }) => Some(reason),
+            Some(BuildState::Failed { reason, .. }) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// The values the index could not hold, when that is why the build
+    /// failed.
+    pub fn index_entry_refusal(&self) -> Option<coordinode_core::index::derive::EntryError> {
+        match self.record.as_ref().map(|r| &r.state) {
+            Some(BuildState::Failed {
+                cause: Some(coordinode_modality::FailureCause::IndexEntry(entry)),
+                ..
+            }) => Some(*entry),
             _ => None,
         }
     }
@@ -1126,11 +1168,17 @@ impl Shared {
             Ok(Ok(Err(BackfillError::Duplicate(v)))) => {
                 self.fail(generation, &taken, BuildError::Duplicate(v))
             }
-            Ok(Ok(Err(other))) => self.fail(
-                generation,
-                &taken,
-                BuildError::Other(format!("build index '{def}': {other}")),
-            ),
+            Ok(Ok(Err(other))) => match other.cause() {
+                Some(cause) => {
+                    let reason = format!("build index '{def}': {other}");
+                    self.fail(generation, &taken, BuildError::of(Some(cause), reason))
+                }
+                None => self.fail(
+                    generation,
+                    &taken,
+                    BuildError::Other(format!("build index '{def}': {other}")),
+                ),
+            },
             Ok(Err(e)) => self.fail(
                 generation,
                 &taken,
@@ -1349,6 +1397,7 @@ impl Shared {
         let concluded = self.conclude(generation, taken, |txn, record| {
             record.state = BuildState::Failed {
                 reason: reason.clone(),
+                cause: error.cause(),
             };
             on_failure = record.on_failure;
             stage_failure(env, txn, def, record.on_failure, &reason)
@@ -1551,9 +1600,10 @@ fn cannot_move_here(e: &CommitError) -> bool {
 fn terminal_outcome(state: &BuildState) -> Option<IndexBuildOutcome> {
     match state {
         BuildState::Published => Some(IndexBuildOutcome::Published { indexed: None }),
-        BuildState::Failed { reason } => {
-            Some(IndexBuildOutcome::Failed(BuildError::Other(reason.clone())))
-        }
+        BuildState::Failed { reason, cause } => Some(IndexBuildOutcome::Failed(BuildError::of(
+            *cause,
+            reason.clone(),
+        ))),
         BuildState::Cancelled => Some(IndexBuildOutcome::Cancelled),
         BuildState::Accepted | BuildState::Running { .. } => None,
     }

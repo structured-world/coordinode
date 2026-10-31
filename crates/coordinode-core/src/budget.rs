@@ -102,7 +102,7 @@ pub const CHECK_EVERY: u64 = 1024;
 pub type MonotonicNanos = fn() -> u64;
 
 /// Why a query was stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BudgetStop {
     /// Reserving `requested` bytes on top of `used` would pass `limit`.
     Memory {
