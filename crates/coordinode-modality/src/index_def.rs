@@ -1531,13 +1531,14 @@ impl IndexIntegrityRecord {
 
     /// Record `found`: the generation becomes suspect and the revision
     /// moves, unless the disagreement is one already reported. Returns
-    /// whether it was new.
-    pub fn report(&mut self, found: Mismatch) -> bool {
-        if self.evidence.contains(&found) {
+    /// whether it was new. A copy of `found` is made only when the evidence
+    /// keeps it.
+    pub fn report(&mut self, found: &Mismatch) -> bool {
+        if self.evidence.contains(found) {
             return false;
         }
         if self.evidence.len() < Self::MAX_EVIDENCE {
-            self.evidence.push(found);
+            self.evidence.push(found.clone());
         }
         self.integrity = Integrity::Suspect;
         // A count of reports, bounded by the evidence a deployment can

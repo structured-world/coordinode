@@ -142,12 +142,12 @@ fn a_fresh_integrity_record_is_unchecked() {
 #[test]
 fn a_report_is_kept_once_and_moves_the_revision() {
     let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
-    assert!(record.report(extra(7)));
+    assert!(record.report(&extra(7)));
     assert_eq!(record.integrity, Integrity::Suspect);
     assert_eq!(record.evidence_revision, 1);
-    assert!(!record.report(extra(7)), "the same disagreement again");
+    assert!(!record.report(&extra(7)), "the same disagreement again");
     assert_eq!(record.evidence_revision, 1);
-    assert!(record.report(extra(8)));
+    assert!(record.report(&extra(8)));
     assert_eq!(record.evidence, vec![extra(7), extra(8)]);
     assert_eq!(record.evidence_revision, 2);
 }
@@ -158,7 +158,7 @@ fn a_report_is_kept_once_and_moves_the_revision() {
 fn reports_past_the_cap_still_move_the_revision() {
     let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
     for node in 0..IndexIntegrityRecord::MAX_EVIDENCE as u64 + 5 {
-        assert!(record.report(extra(node)));
+        assert!(record.report(&extra(node)));
     }
     assert_eq!(record.evidence.len(), IndexIntegrityRecord::MAX_EVIDENCE);
     assert_eq!(
@@ -192,7 +192,7 @@ fn a_check_is_pending_until_its_outcome() {
 #[test]
 fn integrity_record_roundtrip_and_key() {
     let mut record = IndexIntegrityRecord::new(IndexId::from_raw(4), GenerationId::from_raw(9));
-    record.report(Mismatch::SourceDuplicate {
+    record.report(&Mismatch::SourceDuplicate {
         nodes: [1, 2],
         tuple: vec![9],
     });

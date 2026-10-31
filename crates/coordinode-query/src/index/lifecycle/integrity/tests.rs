@@ -56,12 +56,12 @@ fn a_finished_check_reports_its_record() {
         nodes: [1, 2],
         tuple: vec![7],
     };
-    conflicted.report(Mismatch::Extra {
+    conflicted.report(&Mismatch::Extra {
         node: 4,
         valid_from: None,
         tuple: vec![8],
     });
-    conflicted.report(duplicate.clone());
+    conflicted.report(&duplicate);
     assert_eq!(
         terminal_outcome(&conflicted),
         Some(CheckOutcome::SourceConflicts {

@@ -31,7 +31,6 @@ use coordinode_modality::{
     LocalNodeStore, Mismatch, NodeStore as _, StoreError,
 };
 use coordinode_storage::engine::transaction::Transaction;
-use rustc_hash::FxHashMap;
 
 use super::{
     IndexBuildService, Shared, begin, cannot_move_here, is_contention, move_attempts, next_token,
@@ -353,17 +352,19 @@ impl IndexBuildService {
     /// Record `reports` in the integrity records of their generations, and
     /// admit and run a check of each. A member that takes no writes records
     /// nothing; its own reads keep answering from the records.
-    pub(super) fn record_reports(&self, reports: Vec<IntegrityReport>) {
-        let mut by_generation: FxHashMap<GenerationId, (IndexId, Vec<Mismatch>)> =
-            FxHashMap::default();
-        for report in reports {
-            by_generation
-                .entry(report.generation)
-                .or_insert_with(|| (report.index, Vec::new()))
-                .1
-                .push(report.found);
-        }
-        for (generation, (index, found)) in by_generation {
+    pub(super) fn record_reports(&self, mut reports: Vec<IntegrityReport>) {
+        // Grouped by generation where they lie, sorted in place: the batch
+        // is not copied into groups.
+        reports.sort_unstable_by_key(|report| report.generation);
+        let mut rest = reports.as_mut_slice();
+        while let Some(first) = rest.first() {
+            let (index, generation) = (first.index, first.generation);
+            let len = rest
+                .iter()
+                .take_while(|report| report.generation == generation)
+                .count();
+            let (found, tail) = core::mem::take(&mut rest).split_at_mut(len);
+            rest = tail;
             match self.record(index, generation, found) {
                 Ok(ReportFate::Recorded) => {
                     if let Err(e) = self.submit_check(generation) {
@@ -394,7 +395,7 @@ impl IndexBuildService {
                 // to check.
                 continue;
             };
-            match self.record(index, generation, Vec::new()) {
+            match self.record(index, generation, &mut []) {
                 Ok(ReportFate::Recorded) => {
                     if let Err(e) = self.submit_check(generation) {
                         tracing::warn!(generation = generation.as_raw(), error = %e,
@@ -413,9 +414,11 @@ impl IndexBuildService {
         }
     }
 
-    /// Record `found` against `generation` of `index` and admit a check
-    /// unless one is pending. With nothing in `found`, the generation is
-    /// recorded suspect on this member's mark alone.
+    /// Record the disagreements `found` reports against `generation` of
+    /// `index` and admit a check unless one is pending. With nothing in
+    /// `found`, the generation is recorded suspect on this member's mark
+    /// alone. Those still disagreeing are moved to the front of `found`,
+    /// where they lie; the record copies only those its evidence keeps.
     ///
     /// A reported disagreement is what a read saw earlier; one a check or a
     /// writer has resolved since no longer counts, or a check that verified
@@ -425,7 +428,7 @@ impl IndexBuildService {
         &self,
         index: IndexId,
         generation: GenerationId,
-        found: Vec<Mismatch>,
+        found: &mut [IntegrityReport],
     ) -> Result<ReportFate, String> {
         let env = self.shared.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
@@ -436,25 +439,26 @@ impl IndexBuildService {
         else {
             return Ok(ReportFate::NotHere);
         };
-        let found = if found.is_empty() {
+        let found: &[IntegrityReport] = if found.is_empty() {
             found
         } else {
             let fields = env.fields()?;
             let field_of = |name: &str| fields.lookup(name);
             let interpretation = def.interpretation(&field_of);
-            let mut live = Vec::with_capacity(found.len());
-            for mismatch in found {
+            let mut live = 0;
+            for at in 0..found.len() {
                 if self
                     .shared
-                    .still_disagrees(&def, &interpretation, &mismatch)?
+                    .still_disagrees(&def, &interpretation, &found[at].found)?
                 {
-                    live.push(mismatch);
+                    found.swap(live, at);
+                    live += 1;
                 }
             }
-            if live.is_empty() {
+            if live == 0 {
                 return Ok(ReportFate::Resolved);
             }
-            live
+            &found[..live]
         };
         for () in move_attempts() {
             let (mut record, version) = match store.load_integrity(generation).map_err(text)? {
@@ -462,8 +466,8 @@ impl IndexBuildService {
                 None => (IndexIntegrityRecord::new(index, generation), None),
             };
             let mut new = false;
-            for mismatch in &found {
-                new |= record.report(mismatch.clone());
+            for report in found {
+                new |= record.report(&report.found);
             }
             if found.is_empty() && record.integrity != Integrity::Suspect {
                 // This member's mark alone: the revision moves, so a check
@@ -1726,7 +1730,7 @@ impl Shared {
             held.mismatches += found_count;
             held.repaired += repaired;
             for conflict in &conflicts {
-                rec.report(conflict.clone());
+                rec.report(conflict);
             }
             held.passes += 1;
             passes = held.passes;
