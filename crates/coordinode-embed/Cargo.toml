@@ -106,6 +106,10 @@ name = "index_write"
 harness = false
 
 [[bench]]
+name = "temporal_unique"
+harness = false
+
+[[bench]]
 name = "label_kinds"
 harness = false
 
