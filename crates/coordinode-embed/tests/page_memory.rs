@@ -280,6 +280,65 @@ fn a_unique_change_refuses_compound_combinations_before_building_them() {
     );
 }
 
+/// A write under a compound uniqueness whose two lists make ninety thousand
+/// combinations is refused by the statement's memory before they are
+/// built, its uniqueness checks counting them against the same budget as
+/// its writes. Measured, as the change above, against lists a quarter as
+/// many combinations.
+#[test]
+fn a_unique_write_refuses_compound_combinations_before_building_them() {
+    let refused_as_budget = |outcome: &Result<_, coordinode_embed::DatabaseError>| {
+        assert!(
+            matches!(outcome, Err(coordinode_embed::DatabaseError::Budget(_))),
+            "not the statement's memory refusal: {:?}",
+            outcome.as_ref().err()
+        );
+    };
+    let (quarter, quarter_allocated) = compound_write(150);
+    refused_as_budget(&quarter);
+    let (refused, allocated) = compound_write(300);
+    refused_as_budget(&refused);
+    let grown = allocated.saturating_sub(quarter_allocated);
+    assert!(
+        grown < 2 << 20,
+        "{grown} more bytes for four times the combinations \
+         ({allocated} against {quarter_allocated})"
+    );
+}
+
+/// A write of a Thing whose lists hold `n` elements each under a compound
+/// uniqueness, with a statement memory of 256 KiB, and the bytes it
+/// allocated.
+fn compound_write(
+    n: usize,
+) -> (
+    Result<Vec<std::collections::BTreeMap<String, Value>>, coordinode_embed::DatabaseError>,
+    usize,
+) {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+    let mut db = coordinode_embed::Database::open_in_memory().expect("open");
+    let mut schema = LabelSchema::new_node_id("Thing");
+    schema.set_mode(SchemaMode::Flexible);
+    for property in ["a", "b"] {
+        schema.add_property(PropertyDef::new(
+            property,
+            PropertyType::Array(Box::new(PropertyType::String)),
+        ));
+    }
+    db.create_label_schema(schema).expect("thing");
+    db.execute_cypher("CREATE CONSTRAINT thing_ab FOR (n:Thing) REQUIRE (n.a, n.b) IS UNIQUE")
+        .expect("uniqueness");
+    db.set_query_memory_limit(256 * 1024).expect("limit");
+    let list = |p: &str| {
+        (0..n)
+            .map(|i| format!("'{p}{i:05}{}'", "x".repeat(20)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let write = format!("CREATE (:Thing {{a: [{}], b: [{}]}})", list("a"), list("b"));
+    allocated_by(|| db.execute_cypher(&write))
+}
+
 /// The change of what Task implies over one Task whose lists hold `n`
 /// elements each, under a compound uniqueness on what it comes to imply,
 /// with pages of `page_bytes`, and the bytes it allocated.
