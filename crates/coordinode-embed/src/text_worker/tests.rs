@@ -655,6 +655,84 @@ fn a_rebuild_to_equal_interpretations_refuses_a_step_decided_before() {
     assert_eq!(rig.held(), (rebuilt, revision), "nothing was begun");
 }
 
+/// A member that applied a change of what a type implies before its worker
+/// followed it (a commit replicated from the member that certified it) holds
+/// the facts the catalog has left. While the worker follows the change from
+/// what the index holds, a search by a reader of the facts now in force is
+/// refused as not ready instead of being answered by reading every node;
+/// the worker then settles the change, the task's document in. Before, the
+/// index answered that reader by reading the whole store.
+#[test]
+fn a_change_applied_before_it_was_followed_refuses_its_readers_until_followed() {
+    use coordinode_core::schema::definition::{LabelSchema, PlacementPolicy};
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    use coordinode_query::index::selection::Held;
+    use coordinode_query::index::text_registry::FindError;
+    use coordinode_search::tantivy::multi_lang::TextRequest;
+    use coordinode_search::tantivy::pending::Matches;
+
+    let rig = Rig::new();
+    let (_, after) = rig.carriers.clone();
+    let mut task = LabelSchema::new("Task", PlacementPolicy::NodeId);
+    task.set_implies(vec!["Thing".into()]);
+    task.schema_revision = 2;
+    LocalSchemaStore::new(&rig.engine)
+        .save_label(&task)
+        .expect("put in force");
+
+    let (engine, registry) = (
+        std::sync::Arc::clone(&rig.engine),
+        std::sync::Arc::clone(&rig.registry),
+    );
+    let interner = rig.worker.fields.view().expect("fields");
+    let reader = after.clone();
+    let (searched, search) = std::sync::mpsc::channel();
+    *super::WHILE_PREPARING.lock() = Some(Box::new(move || {
+        let read = coordinode_storage::engine::transaction::Transaction::new(
+            &engine,
+            None,
+            coordinode_core::txn::timestamp::Timestamp::ZERO,
+            None,
+        );
+        let budget = coordinode_core::budget::QueryBudget::new(1 << 30);
+        let mut meter = coordinode_core::budget::BatchedWork::new(&budget);
+        let found = registry.find(
+            "Thing",
+            "title",
+            reader.as_ref(),
+            &read,
+            1,
+            &interner,
+            coordinode_query::index::IndexDelta::Nodes(Default::default()),
+            0,
+            TextRequest::Terms {
+                query: "rust",
+                language: None,
+                snippets: false,
+            },
+            Matches::Top(10),
+            &mut meter,
+        );
+        let _ = searched.send(matches!(found, Err(FindError::NotReady { .. })));
+    }));
+    rig.worker.sync_selections().expect("follow");
+    assert_eq!(
+        search.try_recv(),
+        Ok(true),
+        "a reader of the facts in force is refused as not ready while the index follows them"
+    );
+
+    assert_eq!(rig.held().0, Held::built(after), "the change is settled");
+    let (thing, task) = rig
+        .registry
+        .with_index("Thing", "title", |index, _| {
+            Ok((index.contains(1)?, index.contains(7)?))
+        })
+        .expect("read")
+        .expect("registered");
+    assert!(thing && task, "both carriers are in the index");
+}
+
 /// The index is dropped and created again under the same label and
 /// property; a step decided against the dropped one is refused on the new
 /// one, whose interpretations start their own revision above it.

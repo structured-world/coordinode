@@ -49,7 +49,7 @@ fn a_followed_change_answers_both_interpretations() {
         answer(old.as_ref(), &preparing),
         Answer::Without(Scope::Gained)
     );
-    assert_eq!(answer(new.as_ref(), &preparing), Answer::Unable);
+    assert_eq!(answer(new.as_ref(), &preparing), Answer::Preparing);
     let prepared = Held {
         candidate: Some((new.clone(), true)),
         ..preparing

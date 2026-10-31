@@ -9338,9 +9338,12 @@ fn execute_hnsw_scan(
         )));
     };
     let registry = indexes.registry;
+    // The index answers with this statement's interpretation of the label.
+    let carriers = view_carriers(ctx, label)?;
+    let reader = crate::index::vector_registry::Reader::Of(carriers.as_ref());
     // Honour the online-during-build policy exactly like the
     // scan-then-rank path does.
-    gate_vector_index_read(indexes, label, property)?;
+    gate_vector_index_read(indexes, label, property, reader)?;
 
     // A query that is not a vector gives every node a NULL key: the order is
     // the scan's, which the index cannot give, or nothing when the query
@@ -9384,9 +9387,6 @@ fn execute_hnsw_scan(
             })?;
         // A label without an identity is carried by no node.
         let label_id = ctx.label_id(label)?;
-        // The index answers with this statement's interpretation of the label.
-        let carriers = view_carriers(ctx, label)?;
-        let reader = crate::index::vector_registry::Reader::Of(carriers.as_ref());
         loop {
             let mut search = coordinode_core::budget::BatchedWork::new(&budget);
             let Some(hits) = registry.search((label, property), reader, &qv, want, &mut search)?
@@ -11235,7 +11235,10 @@ fn try_hnsw_vector_top_k(
     // Capped at 10_000 to prevent excessive memory for massive result sets.
     let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
 
-    gate_vector_index_read(indexes, &label_str, &property_str)?;
+    // The index answers with this statement's interpretation of the label.
+    let carriers = view_carriers(ctx, &label_str)?;
+    let reader = crate::index::vector_registry::Reader::Of(carriers.as_ref());
+    gate_vector_index_read(indexes, &label_str, &property_str, reader)?;
     // The commits the index has not folded yet, and the transaction's own
     // writes or (at a named timestamp) the nodes written since, are answered
     // from the rows, which hold this statement's view of every node; with no
@@ -11251,9 +11254,6 @@ fn try_hnsw_vector_top_k(
     // Either runs against the statement's budget.
     let budget = Arc::clone(&ctx.budget);
     let mut search = coordinode_core::budget::BatchedWork::new(&budget);
-    // The index answers with this statement's interpretation of the label.
-    let carriers = view_carriers(ctx, &label_str)?;
-    let reader = crate::index::vector_registry::Reader::Of(carriers.as_ref());
     let search_results = if let Some(pred) = predicate {
         // Resolve property names referenced by the predicate once, outside
         // the closure, so the search hot path never re-enters the interner
@@ -15317,6 +15317,7 @@ fn gate_vector_index_read(
     indexes: VectorIndexes<'_>,
     label: &str,
     property: &str,
+    reader: crate::index::vector_registry::Reader<'_>,
 ) -> Result<(), ExecutionError> {
     let registry = indexes.registry;
     let Some(def) = registry.get_definition(label, property) else {
@@ -15330,23 +15331,26 @@ fn gate_vector_index_read(
         return Ok(());
     }
     // A graph without a health signal is not being built.
-    let Some(health) = registry.health_handle(label, property) else {
-        return Ok(());
-    };
+    let health = registry.health_handle(label, property);
 
     // The health turns ready once the build has handed maintenance to the
     // worker and folded what the worker left to it during the scan, which is
-    // where the build ends: a reader waits for the scan and that fold.
+    // where the build ends: a reader waits for the scan and that fold. A
+    // graph still being prepared for the reader's interpretation of the
+    // label (on a member that put a change of what a type implies in force
+    // before its worker followed it) is not ready for it either.
     let wait = indexes.build_wait;
     // A wait too long to add to the clock is no bound at all.
     let deadline = std::time::Instant::now().checked_add(wait);
     let poll_step = std::time::Duration::from_millis(25);
     loop {
-        let state = health.snapshot();
-        if state.is_ready() {
+        let state = health.as_ref().map(|h| h.snapshot());
+        if state.as_ref().is_none_or(|s| s.is_ready())
+            && !registry.preparing_for((label, property), reader)
+        {
             return Ok(());
         }
-        if state.is_offline() {
+        if state.as_ref().is_some_and(|s| s.is_offline()) {
             return Err(ExecutionError::Unsupported(format!(
                 "vector index '{def}' failed to build on this node"
             )));
@@ -15361,9 +15365,9 @@ fn gate_vector_index_read(
                 let Some(step) = build_poll_step(deadline, std::time::Instant::now(), poll_step)
                 else {
                     return Err(ExecutionError::Unsupported(format!(
-                        "vector index '{def}' still building after {wait:?}; wait longer \
-                         with /*+ vector_build_wait('...') */ or the session's \
-                         vector_build_wait"
+                        "vector index '{def}' still building or following a change of \
+                         what a type implies after {wait:?}; wait longer with \
+                         /*+ vector_build_wait('...') */ or the session's vector_build_wait"
                     )));
                 };
                 std::thread::sleep(step);

@@ -545,8 +545,30 @@ impl Worker {
                         in_force,
                     );
                 }
-                // The index holds neither: a rebuild writes it afresh.
-                _ => rebuild = true,
+                // The index holds facts the catalog has left, as on a member
+                // that applied the change before following it: it follows
+                // the change to the facts now in force from what it holds,
+                // a read of those answering to the index's build policy
+                // meanwhile, and settles it in the same pass.
+                _ => match held.base.clone() {
+                    Some(base) => {
+                        self.prepare(def, revision, (&base, &in_force))?;
+                        if let Some((followed, revision)) =
+                            self.registry.held_at(&def.label, property)
+                            && followed.candidate == Some((in_force.clone(), true))
+                        {
+                            self.registry.settle_change(
+                                (&def.label, property),
+                                revision,
+                                Scope::Retired,
+                                in_force,
+                            );
+                        }
+                    }
+                    // The index holds nothing whole: a rebuild writes it
+                    // afresh.
+                    None => rebuild = true,
+                },
             }
         }
         Ok(rebuild)

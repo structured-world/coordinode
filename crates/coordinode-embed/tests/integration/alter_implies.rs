@@ -414,7 +414,7 @@ fn a_change_waits_for_the_text_index_to_follow_it() {
     let (steps, step) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let preparing = steps.clone();
-    *coordinode_embed::text_worker::BEFORE_PREPARE.lock() = Some(Box::new(move || {
+    *coordinode_embed::text_worker::WHILE_PREPARING.lock() = Some(Box::new(move || {
         let _ = preparing.send(Step::Preparing);
         let _ = released.recv();
     }));
@@ -447,9 +447,12 @@ fn a_change_waits_for_the_text_index_to_follow_it() {
         .text_index_registry()
         .held("Thing", "title")
         .expect("the index");
-    assert_ne!(
-        coordinode_query::index::selection::answer(carriers.as_ref(), &held),
-        coordinode_query::index::selection::Answer::Unable,
+    assert!(
+        matches!(
+            coordinode_query::index::selection::answer(carriers.as_ref(), &held),
+            coordinode_query::index::selection::Answer::Whole
+                | coordinode_query::index::selection::Answer::Without(_)
+        ),
         "right after the change the index answers its readers itself: {held:?}"
     );
     let mut now = things_holding(dirs.1.path(), &["rust graph", "rust rust tools"]);

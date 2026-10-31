@@ -257,6 +257,20 @@ impl VectorIndexRegistry {
             .unwrap_or_default()
     }
 
+    /// Whether the index of `(label, property)` is still being prepared for
+    /// `reader`'s interpretation of the label: until it holds it whole, a
+    /// read answers to the index's build policy, as during a build.
+    pub fn preparing_for(&self, (label, property): (&str, &str), reader: Reader<'_>) -> bool {
+        let Reader::Of(carriers) = reader else {
+            return false;
+        };
+        self.selections
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(label.to_string(), property.to_string()))
+            .is_some_and(|s| answer(carriers, &s.held) == Answer::Preparing)
+    }
+
     /// Run `search` with the admission `reader` is answered with in the index
     /// of `(label, property)`, its record read-locked throughout, so the
     /// graph and the members it leaves out are of one state. `Ok(None)` when
@@ -278,6 +292,12 @@ impl VectorIndexRegistry {
             Reader::Of(carriers) => match answer(carriers, &selection.held) {
                 Answer::Whole => return search(None),
                 Answer::Without(scope) => scope,
+                // Still being prepared for the reader's interpretation:
+                // the members only the facts it left carry are kept out,
+                // and the ones it gains not inserted yet are what a reader
+                // admitted under the index's build policy misses, as during
+                // a build.
+                Answer::Preparing => Scope::Retired,
                 Answer::Unable => return Ok(None),
             },
         };

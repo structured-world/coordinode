@@ -186,6 +186,7 @@ fn a_blocked_reader_is_served_once_the_build_hands_over() {
             vector_indexes(&engine, &registry, std::time::Duration::from_secs(30)),
             "Doc",
             "embedding",
+            crate::index::vector_registry::Reader::Any,
         )
         .expect("the reader is served once the index is handed over");
         assert!(
@@ -195,6 +196,68 @@ fn a_blocked_reader_is_served_once_the_build_hands_over() {
         drop(reader);
         build.join().expect("build thread").expect("build");
     });
+}
+
+/// A built index still being prepared for a reader's interpretation of its
+/// label (a member that put a change of what a type implies in force before
+/// its worker followed it) is not ready for that reader: under the `Block`
+/// policy the read waits its bound and is refused, naming the wait, while a
+/// reader of the facts the index holds is served at once; once prepared, the
+/// first reader is served too.
+#[test]
+fn a_blocked_reader_waits_for_an_index_following_its_interpretation() {
+    use crate::index::vector_registry::Reader;
+    use coordinode_core::schema::label_id::LabelId;
+    let (_dir, _oracle, engine, building) = building_vector_index();
+    let def = building
+        .get_definition("Doc", "embedding")
+        .expect("definition");
+    let registry = crate::index::VectorIndexRegistry::new();
+    registry.register(def);
+    let id = |raw| LabelId::new(raw).expect("label id");
+    let base = Some(crate::index::membership::LabelCarriers::stored_only(id(1)));
+    let candidate = Some(crate::index::membership::LabelCarriers {
+        label: id(1),
+        implying: vec![id(2)],
+    });
+    registry.record_built("Doc", "embedding", base.clone());
+    let (_, revision) = registry.held_at("Doc", "embedding").expect("recorded");
+    let guard = registry
+        .begin_change(
+            ("Doc", "embedding"),
+            revision,
+            base.clone(),
+            candidate.clone(),
+        )
+        .expect("begun");
+    let bound = std::time::Duration::from_millis(50);
+
+    let refused = gate_vector_index_read(
+        vector_indexes(&engine, &registry, bound),
+        "Doc",
+        "embedding",
+        Reader::Of(candidate.as_ref()),
+    )
+    .expect_err("not ready for the candidate's reader");
+    assert!(
+        refused.to_string().contains("vector_build_wait"),
+        "{refused}"
+    );
+    gate_vector_index_read(
+        vector_indexes(&engine, &registry, bound),
+        "Doc",
+        "embedding",
+        Reader::Of(base.as_ref()),
+    )
+    .expect("the facts the index holds are served");
+    assert!(registry.finish_change(("Doc", "embedding"), guard));
+    gate_vector_index_read(
+        vector_indexes(&engine, &registry, bound),
+        "Doc",
+        "embedding",
+        Reader::Of(candidate.as_ref()),
+    )
+    .expect("served once prepared");
 }
 
 /// A blocked reader waits as long as its caller allows and no longer: with no
@@ -210,6 +273,7 @@ fn a_blocked_reader_waits_no_longer_than_its_bound() {
         vector_indexes(&engine, &registry, bound),
         "Doc",
         "embedding",
+        crate::index::vector_registry::Reader::Any,
     )
     .expect_err("the index never finishes, so the bound runs out");
     let waited = started.elapsed();
@@ -238,6 +302,7 @@ fn a_zero_bound_refuses_a_building_index_at_once() {
         vector_indexes(&engine, &registry, std::time::Duration::ZERO),
         "Doc",
         "embedding",
+        crate::index::vector_registry::Reader::Any,
     );
     assert!(result.is_err(), "a building index with no wait is refused");
 

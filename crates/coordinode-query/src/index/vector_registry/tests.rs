@@ -627,12 +627,21 @@ fn a_reader_is_answered_with_its_own_interpretation_while_a_change_is_kept() {
         [200, 201, 202],
         "the facts in force skip the gained"
     );
-    assert_eq!(
-        answered(&reg, Reader::Of(candidate.as_ref()), 3),
-        None,
-        "not answered under the candidate before every member is written"
+    // Before every member is written, a reader under the candidate answers
+    // to the index's build policy, as during a build: admitted, it gets
+    // what the graph holds, never a member only the facts in force carry.
+    assert!(
+        reg.preparing_for(("Doc", "embedding"), Reader::Of(candidate.as_ref())),
+        "the candidate is being prepared"
+    );
+    assert!(!reg.preparing_for(("Doc", "embedding"), Reader::Of(base.as_ref())));
+    let preparing = answered(&reg, Reader::Of(candidate.as_ref()), 12).expect("answered");
+    assert!(
+        preparing.iter().all(|id| !(200..205).contains(id)),
+        "the candidate skips the retired while prepared: {preparing:?}"
     );
     assert!(reg.finish_change(("Doc", "embedding"), guard));
+    assert!(!reg.preparing_for(("Doc", "embedding"), Reader::Of(candidate.as_ref())));
     let as_candidate = answered(&reg, Reader::Of(candidate.as_ref()), 12).expect("answered");
     assert_eq!(&as_candidate[..10], &(100..110).collect::<Vec<_>>()[..]);
     assert!(

@@ -393,8 +393,26 @@ impl Worker {
                     Some(_) if base_holds => {
                         self.settle(def, property, (false, &in_force), revision)?;
                     }
-                    // The index holds neither: it is written afresh.
-                    _ => self.rebuild_plain(def, property, &interner)?,
+                    // The index holds facts the catalog has left, as on a
+                    // member that applied the change before following it:
+                    // it follows the change to the facts now in force from
+                    // what it holds, refusing their readers as not ready
+                    // rather than answering them from the store, and
+                    // settles it in the same pass.
+                    _ => match held.base.clone() {
+                        Some(base) => {
+                            self.prepare(def, property, (&base, &in_force), revision, &interner)?;
+                            if let Some((followed, revision)) =
+                                self.registry.held_at(&def.label, property)
+                                && followed.candidate == Some((in_force.clone(), true))
+                            {
+                                self.settle(def, property, (true, &in_force), revision)?;
+                            }
+                        }
+                        // The index holds nothing whole: it is written
+                        // afresh.
+                        None => self.rebuild_plain(def, property, &interner)?,
+                    },
                 }
             }
         }
@@ -443,8 +461,6 @@ impl Worker {
         interner: &coordinode_core::graph::intern::FieldInterner,
     ) -> Result<(), String> {
         use coordinode_query::index::text_registry::for_each_rows_batch;
-        #[cfg(any(test, feature = "test-hooks"))]
-        before_prepare();
         // Not prepared until the pass below wrote every node.
         let begun =
             self.registry
@@ -458,6 +474,8 @@ impl Worker {
         let Some(((), guard)) = begun else {
             return Ok(());
         };
+        #[cfg(any(test, feature = "test-hooks"))]
+        while_preparing();
         let mut interrupted = false;
         let now = wall_clock_us();
         let batch = self.engine.text_index_batch();
@@ -565,18 +583,19 @@ impl Worker {
     }
 }
 
-/// A step a test runs in the worker before it prepares an index for a
-/// change: what a test holding the preparation back installs.
+/// A step a test runs in the worker once it began preparing an index for a
+/// change and before it wrote any node: what a test holding the
+/// preparation back, or reading the index meanwhile, installs.
 #[cfg(any(test, feature = "test-hooks"))]
 pub type PrepareHook = Box<dyn FnOnce() + Send>;
 
 /// The step [`PrepareHook`] names, taken by the next preparation.
 #[cfg(any(test, feature = "test-hooks"))]
-pub static BEFORE_PREPARE: parking_lot::Mutex<Option<PrepareHook>> = parking_lot::Mutex::new(None);
+pub static WHILE_PREPARING: parking_lot::Mutex<Option<PrepareHook>> = parking_lot::Mutex::new(None);
 
 #[cfg(any(test, feature = "test-hooks"))]
-fn before_prepare() {
-    let hook = BEFORE_PREPARE.lock().take();
+fn while_preparing() {
+    let hook = WHILE_PREPARING.lock().take();
     if let Some(hook) = hook {
         hook();
     }

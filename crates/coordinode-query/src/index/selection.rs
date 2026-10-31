@@ -23,6 +23,10 @@ pub enum Answer {
     /// Its documents of this scope do not belong to the reader's
     /// interpretation and are left out.
     Without(Scope),
+    /// It is being prepared for the reader's interpretation and does not
+    /// hold it whole yet: the reader is refused as not ready, never
+    /// answered by reading every node instead.
+    Preparing,
     /// It does not hold the reader's interpretation: every node is read
     /// from the store instead.
     Unable,
@@ -115,6 +119,7 @@ pub fn answer(reader: Option<&LabelCarriers>, held: &Held) -> Answer {
         (Some(base), None) if is(base) => Answer::Whole,
         (Some(base), Some(_)) if is(base) => Answer::Without(Scope::Gained),
         (_, Some((candidate, true))) if is(candidate) => Answer::Without(Scope::Retired),
+        (_, Some((candidate, false))) if is(candidate) => Answer::Preparing,
         _ => Answer::Unable,
     }
 }

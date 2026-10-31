@@ -554,6 +554,14 @@ impl TextIndexRegistry {
         let (exclude, held) = match answer(carriers, &installed.held) {
             Answer::Whole => (None, true),
             Answer::Without(scope) => (Some(scope), true),
+            Answer::Preparing => {
+                return Err(FindError::NotReady {
+                    label: label.to_owned(),
+                    property: property.to_owned(),
+                    reason: "the index is still following a change of what a type implies"
+                        .to_owned(),
+                });
+            }
             Answer::Unable => (None, false),
         };
         let delta = if held {
