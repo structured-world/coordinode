@@ -1601,7 +1601,8 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Checked<T> {
     }
 }
 
-/// A string, as a `String` decodes it, with nothing kept.
+/// A string, as a `String` decodes it, with nothing kept: text, or bytes
+/// that are UTF-8.
 struct CheckedStr;
 
 impl<'de> Deserialize<'de> for CheckedStr {
@@ -1614,6 +1615,12 @@ impl<'de> Deserialize<'de> for CheckedStr {
             }
             fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<CheckedStr, E> {
                 Ok(CheckedStr)
+            }
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<CheckedStr, E> {
+                match core::str::from_utf8(bytes) {
+                    Ok(_) => Ok(CheckedStr),
+                    Err(_) => Err(E::invalid_value(serde::de::Unexpected::Bytes(bytes), &self)),
+                }
             }
         }
         deserializer.deserialize_string(Text)

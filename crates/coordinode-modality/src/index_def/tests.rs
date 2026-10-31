@@ -258,6 +258,127 @@ fn an_integrity_state_refuses_what_the_record_refuses() {
     );
 }
 
+/// Bytes encoded as MessagePack `bin`, for records written with a string
+/// stored as bytes.
+struct Bin(&'static [u8]);
+
+impl serde::Serialize for Bin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+/// [`CheckState`] with a failure's reason written as `bin`.
+#[derive(serde::Serialize)]
+#[allow(dead_code)]
+enum BinCheckState {
+    Accepted,
+    Running { executor: u64 },
+    Done,
+    Failed { reason: Bin },
+    Cancelled,
+}
+
+/// [`IndexCheck`] with its state written as [`BinCheckState`].
+#[derive(serde::Serialize)]
+struct BinCheck {
+    state: BinCheckState,
+    started_revision: u64,
+    passes: u32,
+    checked: u64,
+    mismatches: u64,
+    repaired: u64,
+    rebuilt_into: Option<u64>,
+    finished_at_ms: Option<u64>,
+}
+
+/// The state read without the evidence agrees with the whole record's
+/// decode on every disagreement and check of every kind: what one decodes
+/// the other gives the same state for. A failure's reason stored as `bin`
+/// decodes as a string does when it is UTF-8, both ways, and is refused
+/// both ways when it is not.
+#[test]
+fn an_integrity_state_agrees_with_the_record_on_every_shape() {
+    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
+    for found in [
+        Mismatch::Missing {
+            node: 1,
+            valid_from: Some(-4),
+            tuple: vec![1, 2],
+        },
+        Mismatch::Extra {
+            node: 2,
+            valid_from: None,
+            tuple: vec![3],
+        },
+        Mismatch::SourceDuplicate {
+            nodes: [5, 6],
+            tuple: vec![],
+        },
+    ] {
+        record.report(&found);
+    }
+    record.trusted_from = Some(9);
+    for state in [
+        CheckState::Accepted,
+        CheckState::Running { executor: 3 },
+        CheckState::Done,
+        CheckState::Failed {
+            reason: "stopped".into(),
+        },
+        CheckState::Cancelled,
+    ] {
+        record.check = Some(IndexCheck {
+            state,
+            rebuilt_into: Some(GenerationId::from_raw(8)),
+            finished_at_ms: Some(10),
+            ..IndexCheck::accepted(1)
+        });
+        let bytes = rmp_serde::to_vec(&record).expect("encode");
+        let whole: IndexIntegrityRecord = rmp_serde::from_slice(&bytes).expect("decode");
+        assert_eq!(
+            IndexIntegrityRecord::state_from_msgpack(&bytes).expect("state"),
+            whole.state()
+        );
+    }
+
+    let with_reason = |reason: &'static [u8]| {
+        rmp_serde::to_vec(&(
+            2u64,
+            1u64,
+            Integrity::Verified,
+            Vec::<u8>::new(),
+            0u64,
+            Some(BinCheck {
+                state: BinCheckState::Failed {
+                    reason: Bin(reason),
+                },
+                started_revision: 0,
+                passes: 0,
+                checked: 0,
+                mismatches: 0,
+                repaired: 0,
+                rebuilt_into: None,
+                finished_at_ms: None,
+            }),
+            Some(9u64),
+        ))
+        .expect("encode")
+    };
+    let utf8 = with_reason(b"x");
+    let whole: IndexIntegrityRecord = rmp_serde::from_slice(&utf8).expect("a UTF-8 bin decodes");
+    assert_eq!(
+        IndexIntegrityRecord::state_from_msgpack(&utf8).expect("a UTF-8 bin is read"),
+        whole.state()
+    );
+    let not_utf8 = with_reason(&[0xff]);
+    assert!(rmp_serde::from_slice::<IndexIntegrityRecord>(&not_utf8).is_err());
+    assert!(
+        IndexIntegrityRecord::state_from_msgpack(&not_utf8).is_err(),
+        "a bin that is no UTF-8 was read"
+    );
+}
+
 /// A check is pending until it reaches an outcome.
 #[test]
 fn a_check_is_pending_until_its_outcome() {
