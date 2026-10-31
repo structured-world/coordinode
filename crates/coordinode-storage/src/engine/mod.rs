@@ -40,10 +40,13 @@ pub mod vector_keys;
 
 pub use compaction::CompactionStrategyKind;
 
-/// Most index entry effects one unit's DERIVED work may derive, on apply and
-/// on journal replay alike: a small unit cannot fan out without bound on
-/// every member.
-pub(crate) const MAX_DERIVED_EFFECTS: usize = 1 << 22;
+/// Most index entry effects one unit's DERIVED work may derive, counted by
+/// `change_bound` before anything is derived, at sealing, on apply and on
+/// journal replay alike: a small unit cannot fan out without bound on every
+/// member. Room for one change between two memberships each at the most
+/// combinations a value set may make, so a write admitted by that limit is
+/// never refused by this one.
+pub(crate) const MAX_DERIVED_EFFECTS: usize = 2 * coordinode_core::index::derive::MAX_ENTRY_FAN_OUT;
 
 /// Snapshot type: a sequence number used as a read visibility bound.
 ///

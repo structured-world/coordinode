@@ -10,7 +10,7 @@
 
 use coordinode_core::graph::node::{NodeRecord, decode_node_key, decode_temporal_node_key};
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::derive::EntryOwner;
+use coordinode_core::index::derive::{EntryOwner, change_bound};
 use coordinode_core::index::identity::GenerationId;
 use coordinode_core::txn::proposal::{
     DerivedIndexWork, DerivedSource, IndexBinding, Mutation, PartitionId,
@@ -40,11 +40,6 @@ pub(crate) struct DerivedLedger {
     /// The index definitions this transaction's effects are bound to, in
     /// either profile: each is conditioned once on its version.
     bound: FxHashSet<Vec<u8>>,
-    /// Entry effects staged over all statements: an upper bound of those the
-    /// sealed changes derive, since a change's effects are the difference of
-    /// its first and last memberships and each statement staged the
-    /// difference of its own step. Each addend counts effects held in memory.
-    staged_effects: usize,
 }
 
 impl DerivedLedger {
@@ -59,10 +54,7 @@ impl DerivedLedger {
         new: Option<Vec<Value>>,
         keys: impl IntoIterator<Item = Vec<u8>>,
     ) {
-        for key in keys {
-            self.staged_effects += 1;
-            self.keys.insert(key);
-        }
+        self.keys.extend(keys);
         let target = (binding.interpretation.generation, owner);
         match self.by_target.get(&target) {
             Some(&at) => self.changes[at].new = new,
@@ -100,26 +92,19 @@ impl DerivedLedger {
         self.changes.is_empty()
     }
 
-    /// Refuse, with the bound, work whose sealed changes derive more than
-    /// `max` entry effects: every member would refuse the unit when it
-    /// derives it. The staged count settles the common case; only past the
-    /// bound are the sealed changes derived to count them exactly.
+    /// Refuse, with the bound, work whose sealed changes may derive more than
+    /// `max` entry effects, counted as every member counts the unit before
+    /// deriving it ([`change_bound`] summed over the changes it seals), so a
+    /// unit sealed here is never refused when it is applied or replayed.
+    /// Nothing is derived to count.
     pub(crate) fn check_fan_out(&self, max: usize) -> Result<(), usize> {
-        if self.staged_effects <= max {
-            return Ok(());
-        }
         let mut sealed = 0usize;
         for change in self.changes.iter().filter(|c| c.old != c.new) {
-            sealed += change
-                .binding
-                .interpretation
-                .membership_effects(change.owner, change.old.as_deref(), change.new.as_deref())
-                // Staging derived these effects already and refused a key
-                // too long to store, so none is left to refuse here.
-                .map_or(0, |effects| effects.len());
-            if sealed > max {
-                return Err(max);
-            }
+            // Staging expanded both sides already, so each is within the
+            // cap; one past it counts as past `max`.
+            let bound =
+                change_bound(change.old.as_deref(), change.new.as_deref()).map_err(|_| max)?;
+            sealed = sealed.checked_add(bound).filter(|n| *n <= max).ok_or(max)?;
         }
         Ok(())
     }

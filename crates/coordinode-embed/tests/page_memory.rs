@@ -280,6 +280,55 @@ fn a_unique_change_refuses_compound_combinations_before_building_them() {
     );
 }
 
+/// A unit whose DERIVED work names lists making four million combinations,
+/// past what the unit may derive, is refused before any is built, on apply
+/// and on replay alike: the count is taken from the lists' lengths. Building
+/// them first would allocate hundreds of megabytes before the refusal.
+#[test]
+fn a_derived_unit_past_its_budget_is_refused_before_expanding() {
+    use coordinode_core::index::derive::{
+        DeriveError, IndexInterpretation, KEY_CODEC, PropertyRef, resolve_unit,
+    };
+    use coordinode_core::index::identity::GenerationId;
+    use coordinode_core::txn::proposal::{DerivedIndexWork, DerivedSource, IndexBinding, Mutation};
+    let list = |p: &str| {
+        Value::Array(
+            (0..2048)
+                .map(|n| Value::String(format!("{p}{n:05}")))
+                .collect(),
+        )
+    };
+    let unit = vec![Mutation::Derive(DerivedIndexWork {
+        binding: IndexBinding {
+            epoch: 1,
+            interpretation: IndexInterpretation {
+                codec: KEY_CODEC,
+                generation: GenerationId::from_raw(3),
+                unique: false,
+                sparse: false,
+                properties: ["a", "b"]
+                    .into_iter()
+                    .map(|name| PropertyRef {
+                        field: None,
+                        name: name.into(),
+                    })
+                    .collect(),
+                filter: None,
+            },
+        },
+        node_id: 1,
+        valid_from: None,
+        old: None,
+        new: DerivedSource::Values(Some(vec![list("a"), list("b")])),
+    })];
+    let (refused, allocated) = allocated_by(|| resolve_unit(&unit, 1 << 10));
+    assert_eq!(refused.err(), Some(DeriveError::FanOut(1 << 10)));
+    assert!(
+        allocated < 64 * 1024,
+        "{allocated} bytes allocated before the refusal"
+    );
+}
+
 /// A write under a compound uniqueness whose two lists make ninety thousand
 /// combinations is refused by the statement's memory before they are
 /// built, its uniqueness checks counting them against the same budget as

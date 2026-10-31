@@ -345,6 +345,19 @@ pub fn combinations(values: &[Value]) -> Option<usize> {
         .filter(|n| *n <= MAX_ENTRY_FAN_OUT)
 }
 
+/// Most entry effects a change of membership from `old` to `new` derives,
+/// counted from the lengths of their lists and nothing built: every
+/// combination of either side. Within twice [`MAX_ENTRY_FAN_OUT`].
+///
+/// # Errors
+///
+/// [`FanOut`] when either side makes more combinations than an index takes.
+pub fn change_bound(old: Option<&[Value]>, new: Option<&[Value]>) -> Result<usize, FanOut> {
+    let side = |values: Option<&[Value]>| values.map_or(Some(0), combinations).ok_or(FanOut);
+    // Each side within the cap: the sum fits a usize.
+    Ok(side(old)? + side(new)?)
+}
+
 /// The key tuples `values` index under, sorted and distinct: one per
 /// combination of list elements (multikey), none for a combination that has
 /// no key.
@@ -479,8 +492,9 @@ pub enum DeriveError {
         /// The decode failure.
         message: String,
     },
-    /// The unit derives more entry effects than it is allowed.
-    #[error("the unit derives more than {0} index entry effects")]
+    /// The unit's changes may derive more entry effects than it is allowed,
+    /// counted by [`change_bound`] before any is built.
+    #[error("the unit's changes may derive more than {0} index entry effects")]
     FanOut(usize),
     /// The work holds values the index cannot hold: a key too long, or lists
     /// making too many entries. The member that sealed it refused such a
@@ -497,8 +511,11 @@ pub enum DeriveError {
 ///
 /// # Errors
 ///
-/// [`DeriveError`] when the work cannot be derived as sealed, or derives more
-/// than `max_effects` entry effects.
+/// [`DeriveError`] when the work cannot be derived as sealed, or its changes
+/// may derive more than `max_effects` entry effects. That bound is
+/// [`change_bound`]'s, summed over the work and checked before each change
+/// is expanded: the member sealing a unit applies the same count, so a unit
+/// sealed under it is never refused here.
 pub fn resolve_unit(
     mutations: &[crate::txn::proposal::Mutation],
     max_effects: usize,
@@ -510,6 +527,8 @@ pub fn resolve_unit(
     }
     let mut resolved = Vec::with_capacity(mutations.len());
     let mut effects = Vec::new();
+    // The effects the work may derive, counted before each change expands.
+    let mut admitted = 0usize;
     for mutation in mutations {
         let Mutation::Derive(work) = mutation else {
             resolved.push(mutation.clone());
@@ -517,8 +536,10 @@ pub fn resolve_unit(
         };
         let interpretation = &work.binding.interpretation;
         interpretation.check_supported()?;
-        let new = match &work.new {
-            DerivedSource::Values(values) => values.clone(),
+        // Sealed values are read where they lie; a record's are decoded.
+        let decoded;
+        let new: Option<&[Value]> = match &work.new {
+            DerivedSource::Values(values) => values.as_deref(),
             DerivedSource::UnitRecord(ordinal) => {
                 let Some(Mutation::Put {
                     partition: PartitionId::Node,
@@ -532,18 +553,20 @@ pub fn resolve_unit(
                     ordinal: *ordinal,
                     message: e.to_string(),
                 })?;
-                interpretation.record_membership(&record)
+                decoded = interpretation.record_membership(&record);
+                decoded.as_deref()
             }
         };
         let owner = EntryOwner {
             node_id: work.node_id,
             valid_from: work.valid_from,
         };
-        let derived =
-            interpretation.membership_effects(owner, work.old.as_deref(), new.as_deref())?;
-        if effects.len() + derived.len() > max_effects {
-            return Err(DeriveError::FanOut(max_effects));
-        }
+        let bound = change_bound(work.old.as_deref(), new).map_err(EntryError::from)?;
+        admitted = admitted
+            .checked_add(bound)
+            .filter(|n| *n <= max_effects)
+            .ok_or(DeriveError::FanOut(max_effects))?;
+        let derived = interpretation.membership_effects(owner, work.old.as_deref(), new)?;
         effects.extend(derived);
     }
     resolved.extend(

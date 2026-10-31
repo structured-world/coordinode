@@ -622,6 +622,31 @@ mod resolve {
         assert_eq!(resolve_unit(&unit, 9), Err(DeriveError::FanOut(9)));
         assert_eq!(resolve_unit(&unit, 10).expect("resolve").len(), 10);
     }
+
+    /// The budget counts every combination of both sides of a change, as
+    /// the sealing member counts it, not the effects the change turns out to
+    /// derive: a list of ten changed in one element derives two effects but
+    /// counts twenty, so a unit is admitted or refused before it expands, and
+    /// alike wherever it is applied.
+    #[test]
+    fn the_fan_out_counts_both_sides_before_expanding() {
+        let index = interp(false, false, None);
+        let list = |last: &str| {
+            let mut items: Vec<Value> = (0..9).map(|i| s(&format!("v{i}"))).collect();
+            items.push(s(last));
+            Value::Array(items)
+        };
+        let unit = vec![work(
+            &index,
+            1,
+            Some(vec![list("before")]),
+            DerivedSource::Values(Some(vec![list("after")])),
+        )];
+        assert_eq!(resolve_unit(&unit, 19), Err(DeriveError::FanOut(19)));
+        assert_eq!(resolve_unit(&unit, 20).expect("resolve").len(), 2);
+        assert_eq!(change_bound(Some(&[list("a")]), Some(&[list("b")])), Ok(20));
+        assert_eq!(change_bound(None, None), Ok(0));
+    }
 }
 
 /// An interpretation of another key codec is refused, not derived.
