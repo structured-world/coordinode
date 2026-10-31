@@ -415,6 +415,111 @@ fn an_integrity_state_agrees_with_the_record_on_every_shape() {
     );
 }
 
+/// A definition read for its kind, label and parts refuses whatever the
+/// definition's own decode refuses: a field of the wrong type anywhere, in
+/// the descriptor's strings, lists, filter, configurations, state or
+/// owner, as well as in the identities. A sound definition with every
+/// optional field set gives the same head both ways, and a label stored as
+/// bytes is taken when it is UTF-8 and refused when not, both ways.
+#[test]
+fn a_definition_head_refuses_what_the_definition_refuses() {
+    let mut def = IndexDescriptor::compound("thing_ab", "Thing", vec!["a".into(), "b".into()])
+        .bind(IndexId::from_raw(3), GenerationId::from_raw(4));
+    def.descriptor.description = Some("described".into());
+    def.descriptor.filter = Some(PartialFilter::PropertyEquals {
+        property: "kind".into(),
+        value: "x".into(),
+    });
+    def.descriptor.vector_config = Some(VectorIndexConfig::default());
+    let mut text = TextIndexConfig::default();
+    text.fields.insert(
+        "a".into(),
+        TextFieldConfig {
+            analyzer: "english".into(),
+        },
+    );
+    def.descriptor.text_config = Some(text);
+    def.descriptor.state = IndexState::Failed {
+        reason: "stopped".into(),
+    };
+    def.descriptor.owner = Some("thing_ab_unique".into());
+    def.propose_parts(
+        coordinode_core::schema::label_id::LabelId::new(2).unwrap(),
+        GenerationId::from_raw(9),
+        GenerationId::from_raw(10),
+        GenerationId::from_raw(11),
+    );
+    let bytes = rmp_serde::to_vec(&def).expect("encode");
+    let head = |bytes: &[u8]| {
+        IndexDefinition::with_head(bytes, |h| {
+            (h.index_type, h.label.to_owned(), h.parts.to_vec())
+        })
+    };
+    assert_eq!(
+        head(&bytes).expect("head"),
+        (IndexType::BTree, "Thing".to_owned(), def.selection.clone())
+    );
+
+    // The record as a MessagePack value: [id, generation, descriptor, parts],
+    // the descriptor its fields in order.
+    let value: rmpv::Value = rmpv::decode::read_value(&mut bytes.as_slice()).expect("value");
+    let with = |path: &[usize], replacement: rmpv::Value| {
+        let mut value = value.clone();
+        let mut at = &mut value;
+        for &i in path {
+            let items = match at {
+                rmpv::Value::Array(items) => Some(items),
+                _ => None,
+            };
+            at = &mut items.expect("an array on the path")[i];
+        }
+        *at = replacement;
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &value).expect("encode");
+        out
+    };
+    use rmpv::Value as V;
+    let malformed = [
+        ("an id that is no number", with(&[0], V::Boolean(true))),
+        ("a generation that is no number", with(&[1], V::from("x"))),
+        ("a name that is no string", with(&[2, 0], V::from(5))),
+        (
+            "properties that are no strings",
+            with(&[2, 3], V::Array(vec![V::from(1)])),
+        ),
+        ("a flag that is no boolean", with(&[2, 5], V::from("x"))),
+        ("a filter of no shape", with(&[2, 8], V::from("x"))),
+        (
+            "a vector configuration of no shape",
+            with(&[2, 10], V::Boolean(true)),
+        ),
+        (
+            "a text configuration of no shape",
+            with(&[2, 11], V::from(1)),
+        ),
+        ("a state of no kind", with(&[2, 12], V::from("Gone"))),
+        ("a layout that is no number", with(&[2, 14], V::from("x"))),
+        ("an owner that is no string", with(&[2, 16], V::from(1))),
+    ];
+    for (what, bytes) in malformed {
+        assert!(
+            rmp_serde::from_slice::<IndexDefinition>(&bytes).is_err(),
+            "{what}: the definition decodes"
+        );
+        assert!(head(&bytes).is_err(), "{what}: the head was read");
+    }
+
+    let label_utf8 = with(&[2, 2], V::Binary(b"Thing".to_vec()));
+    let whole: IndexDefinition = rmp_serde::from_slice(&label_utf8).expect("a UTF-8 bin label");
+    assert_eq!(head(&label_utf8).expect("head").1, whole.label);
+    let label_not_utf8 = with(&[2, 2], V::Binary(vec![0xff]));
+    assert!(rmp_serde::from_slice::<IndexDefinition>(&label_not_utf8).is_err());
+    assert!(
+        head(&label_not_utf8).is_err(),
+        "a label that is no UTF-8 was read"
+    );
+}
+
 /// A check is pending until it reaches an outcome.
 #[test]
 fn a_check_is_pending_until_its_outcome() {

@@ -849,3 +849,34 @@ fn a_carrier_breaking_a_gained_constraint_refuses_the_change() {
         .expect("nothing implied");
     assert_eq!(rows[0].get("changed"), Some(&Value::Bool(false)));
 }
+
+/// What publishing a change reads of the catalog and stages for it counts
+/// against the statement's own memory: in a statement too small for it the
+/// change is refused before anything of it is published, so the same change
+/// in a statement with room succeeds afterwards, however many unrelated
+/// indexes the catalog holds.
+#[test]
+fn an_implication_change_publishes_within_the_statement_memory() {
+    let mut db = things();
+    db.execute_cypher("CREATE INDEX thing_title ON :Thing(title)")
+        .expect("index");
+    db.execute_cypher("CREATE NODE TYPE Other WITH (title: STRING)")
+        .expect("other");
+    for n in 0..50 {
+        db.execute_cypher(&format!(
+            "CREATE INDEX other_title_{n}_{} ON :Other(title)",
+            "x".repeat(60)
+        ))
+        .expect("unrelated index");
+    }
+    db.set_query_memory_limit(512).expect("limit");
+    match db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)") {
+        Err(coordinode_embed::DatabaseError::Budget(_)) => {}
+        other => panic!("not refused by the statement's memory: {other:?}"),
+    }
+    db.set_query_memory_limit(256 * 1024).expect("limit");
+    let rows = db
+        .execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("the change, nothing of the refused one published");
+    assert_eq!(implies_of(rows[0].get("implies")), ["Thing"]);
+}

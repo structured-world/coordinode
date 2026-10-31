@@ -3641,6 +3641,9 @@ impl<'a> ExecutionContext<'a> {
             Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
             None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
         };
+        // What the change reads and stages is the statement's: charged to its
+        // memory, so a change that does not fit is refused before its commit.
+        txn.charge_writes_to(Some(std::sync::Arc::clone(&self.budget)));
         stage(&mut txn)?;
         // Every writer of a catalogued object conditions its commit on the
         // record a change rewrites, so a change refused by them would lose

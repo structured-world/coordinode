@@ -205,54 +205,164 @@ pub struct DefinitionHead<'a> {
     pub parts: &'a [SelectionPart],
 }
 
-/// [`IndexDefinition`] as encoded, all but its kind, label and parts
-/// skipped.
+/// [`IndexDefinition`] as encoded, every field checked as the definition's
+/// own decode checks it, but nothing built except its parts and nothing
+/// kept of its descriptor but its kind and borrowed label: a record the
+/// definition's decode refuses is refused here too.
 #[derive(Deserialize)]
 struct HeadView<'a> {
     #[serde(rename = "id")]
-    _id: serde::de::IgnoredAny,
+    _id: IndexId,
     #[serde(rename = "generation")]
-    _generation: serde::de::IgnoredAny,
+    _generation: GenerationId,
     #[serde(borrow)]
     descriptor: DescriptorHeadView<'a>,
     selection: Vec<SelectionPart>,
 }
 
-/// [`IndexDescriptor`] as encoded, all but its label and kind skipped.
+/// [`IndexDescriptor`] as encoded, each field checked, its label borrowed.
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct DescriptorHeadView<'a> {
-    #[serde(rename = "name")]
-    _name: serde::de::IgnoredAny,
-    #[serde(rename = "description")]
-    _description: serde::de::IgnoredAny,
-    label: &'a str,
-    #[serde(rename = "properties")]
-    _properties: serde::de::IgnoredAny,
+    name: Option<CheckedStr>,
+    description: Option<CheckedStr>,
+    #[serde(borrow)]
+    label: BorrowedStr<'a>,
+    properties: Checked<CheckedStr>,
     index_type: IndexType,
-    #[serde(rename = "unique")]
-    _unique: serde::de::IgnoredAny,
-    #[serde(rename = "sparse")]
-    _sparse: serde::de::IgnoredAny,
-    #[serde(rename = "multikey")]
-    _multikey: serde::de::IgnoredAny,
-    #[serde(rename = "filter")]
-    _filter: serde::de::IgnoredAny,
-    #[serde(rename = "ttl_seconds")]
-    _ttl_seconds: serde::de::IgnoredAny,
-    #[serde(rename = "vector_config")]
-    _vector_config: serde::de::IgnoredAny,
-    #[serde(rename = "text_config")]
-    _text_config: serde::de::IgnoredAny,
-    #[serde(rename = "state")]
-    _state: serde::de::IgnoredAny,
-    #[serde(rename = "online_during_build")]
-    _online_during_build: serde::de::IgnoredAny,
-    #[serde(rename = "layout")]
-    _layout: serde::de::IgnoredAny,
-    #[serde(rename = "maintenance")]
-    _maintenance: serde::de::IgnoredAny,
-    #[serde(rename = "owner")]
-    _owner: serde::de::IgnoredAny,
+    unique: bool,
+    sparse: bool,
+    multikey: bool,
+    filter: Option<PartialFilterShape>,
+    ttl_seconds: Option<u64>,
+    vector_config: Option<VectorConfigShape>,
+    text_config: Option<TextConfigShape>,
+    state: IndexStateShape,
+    online_during_build: OnlineDuringBuild,
+    layout: u32,
+    maintenance: IndexMaintenance,
+    owner: Option<CheckedStr>,
+}
+
+/// [`PartialFilter`] as its decode checks it, its strings read and dropped.
+/// Its variants are named as the filter's are, which a variant is decoded
+/// by.
+#[derive(Deserialize)]
+#[allow(dead_code, clippy::enum_variant_names)]
+enum PartialFilterShape {
+    PropertyEquals {
+        property: CheckedStr,
+        value: CheckedStr,
+    },
+    PropertyEqualsInt {
+        property: CheckedStr,
+        value: i64,
+    },
+    PropertyEqualsBool {
+        property: CheckedStr,
+        value: bool,
+    },
+    PropertyExists {
+        property: CheckedStr,
+    },
+}
+
+/// [`VectorIndexConfig`] as its decode checks it.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct VectorConfigShape {
+    dimensions: u32,
+    metric: coordinode_core::graph::types::VectorMetric,
+    m: usize,
+    ef_construction: usize,
+    quantization: coordinode_vector::hnsw::QuantizationCodec,
+    offload_vectors: bool,
+    #[serde(default)]
+    ef_search: Option<usize>,
+    #[serde(default)]
+    rerank_candidates: Option<usize>,
+}
+
+/// [`TextIndexConfig`] as its decode checks it, its strings read and
+/// dropped.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct TextConfigShape {
+    fields: CheckedMap<CheckedStr, TextFieldShape>,
+    default_language: CheckedStr,
+    language_override_property: CheckedStr,
+}
+
+/// [`TextFieldConfig`] as its decode checks it.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct TextFieldShape {
+    analyzer: CheckedStr,
+}
+
+/// [`IndexState`] as its decode checks it, a failure's reason read and
+/// dropped.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum IndexStateShape {
+    Building { written: u64, estimated_total: u64 },
+    Ready,
+    Failed { reason: CheckedStr },
+}
+
+/// A map whose every key and value decode as `K` and `V`, as a map of them
+/// would, with nothing kept.
+struct CheckedMap<K, V>(core::marker::PhantomData<(K, V)>);
+
+impl<'de, K: Deserialize<'de>, V: Deserialize<'de>> Deserialize<'de> for CheckedMap<K, V> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Each<K, V>(core::marker::PhantomData<(K, V)>);
+        impl<'de, K: Deserialize<'de>, V: Deserialize<'de>> serde::de::Visitor<'de> for Each<K, V> {
+            type Value = CheckedMap<K, V>;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a map")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<CheckedMap<K, V>, A::Error> {
+                while map.next_entry::<K, V>()?.is_some() {}
+                Ok(CheckedMap(core::marker::PhantomData))
+            }
+        }
+        deserializer.deserialize_map(Each(core::marker::PhantomData))
+    }
+}
+
+/// A string borrowed from the encoded record, as a `String` decodes it:
+/// text, or bytes that are UTF-8.
+struct BorrowedStr<'a>(&'a str);
+
+impl<'de: 'a, 'a> Deserialize<'de> for BorrowedStr<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Text;
+        impl<'de> serde::de::Visitor<'de> for Text {
+            type Value = BorrowedStr<'de>;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a string borrowed from the record")
+            }
+            fn visit_borrowed_str<E: serde::de::Error>(
+                self,
+                v: &'de str,
+            ) -> Result<BorrowedStr<'de>, E> {
+                Ok(BorrowedStr(v))
+            }
+            fn visit_borrowed_bytes<E: serde::de::Error>(
+                self,
+                v: &'de [u8],
+            ) -> Result<BorrowedStr<'de>, E> {
+                core::str::from_utf8(v)
+                    .map(BorrowedStr)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Bytes(v), &self))
+            }
+        }
+        deserializer.deserialize_string(Text)
+    }
 }
 
 impl IndexDefinition {
@@ -270,7 +380,7 @@ impl IndexDefinition {
         let view: HeadView<'_> = rmp_serde::from_slice(bytes)?;
         Ok(look(&DefinitionHead {
             index_type: view.descriptor.index_type,
-            label: view.descriptor.label,
+            label: view.descriptor.label.0,
             parts: &view.selection,
         }))
     }
