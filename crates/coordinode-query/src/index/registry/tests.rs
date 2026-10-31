@@ -721,31 +721,61 @@ fn a_full_report_queue_drops_reports_but_keeps_marks() {
     assert_eq!(marked(&engine), vec![index.generation, other.generation]);
 }
 
-/// The report queue is bounded by its bytes as well as its count: a report's
-/// tuple can be as long as an index key, so a hundred reports of 60 KiB
-/// tuples reach the byte bound long before the count. Past it a report is
-/// dropped and flagged like one past the count; taking the queue frees its
-/// room for new ones.
+/// The bytes the report queue of `reg` holds as allocated: its slots and the
+/// buffers of its tuples.
+fn queue_held(reg: &IndexRegistry) -> usize {
+    let view = reg.integrity.lock();
+    view.reports.capacity() * core::mem::size_of::<IntegrityReport>()
+        + view.reports.iter().map(report_bytes).sum::<usize>()
+}
+
+/// The report queue is bounded by the memory it holds as well as its count:
+/// its slots as grown, and each tuple's buffer as allocated, which can be far
+/// longer than the tuple. Reports whose 40-byte tuples sit in 60 KiB buffers
+/// reach the bound long before the count; after every report the queue
+/// holds no more than the bound, a report stated again adds nothing, the
+/// last one that fits is kept and the next one dropped and flagged like one
+/// past the count. Taking the queue frees its room for new ones.
 #[test]
 fn a_report_queue_holding_its_bytes_drops_reports_but_keeps_marks() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
-    let long = |node: u64| Mismatch::Extra {
-        node,
-        valid_from: None,
-        tuple: vec![b'x'; 60 * 1024],
+    let long = |node: u64| {
+        let mut tuple = Vec::with_capacity(60 * 1024);
+        tuple.extend_from_slice(&[b'x'; 40]);
+        Mismatch::Extra {
+            node,
+            valid_from: None,
+            tuple,
+        }
     };
-    let fits = MAX_PENDING_REPORT_BYTES / (60 * 1024 + core::mem::size_of::<IntegrityReport>());
-    for node in 0..fits as u64 {
+    let mut node = 0u64;
+    while !reg.take_overflow() {
         reg.report_mismatch(&engine, &index, long(node));
+        assert!(
+            queue_held(&reg) <= MAX_PENDING_REPORT_BYTES,
+            "past the bound"
+        );
+        node += 1;
     }
-    assert!(!reg.take_overflow());
-    reg.report_mismatch(&engine, &index, long(fits as u64));
-    assert!(reg.take_overflow(), "the drop is flagged");
-    assert_eq!(reg.take_reports(core::time::Duration::ZERO).len(), fits);
-    reg.report_mismatch(&engine, &index, long(fits as u64));
+    let queued = reg.integrity.lock().reports.len();
+    assert_eq!(queued as u64, node - 1, "the last report that fit was kept");
+    assert!(
+        queued < 70,
+        "{queued} reports: the buffers were not counted"
+    );
+    let held = queue_held(&reg);
+    reg.report_mismatch(&engine, &index, long(0));
+    assert_eq!(
+        queue_held(&reg),
+        held,
+        "a report stated again added to the queue"
+    );
+    assert!(!reg.take_overflow(), "nor was it dropped as past the bound");
+    assert_eq!(reg.take_reports(core::time::Duration::ZERO).len(), queued);
+    reg.report_mismatch(&engine, &index, long(node));
     assert!(!reg.take_overflow(), "taking the queue freed its room");
     assert_eq!(marked(&engine), vec![index.generation]);
 }

@@ -76,7 +76,7 @@ struct IntegrityView {
     trusted_from: FxHashMap<GenerationId, u64>,
     /// Disagreements found here, waiting to be recorded.
     reports: Vec<IntegrityReport>,
-    /// The bytes `reports` holds, each report with its tuple.
+    /// The bytes the tuples of `reports` hold, as allocated.
     report_bytes: usize,
     /// A report was dropped at the bound: the maintenance finds the
     /// generations it would have named from the marks instead.
@@ -163,19 +163,21 @@ pub struct LocalCopyStatus {
 /// they would have started from this member's marks.
 const MAX_PENDING_REPORTS: usize = 1024;
 
-/// The most bytes the reports waiting to be recorded hold, their tuples
-/// included: a report's tuple can be as long as an index key, so the count
-/// alone does not bound them. Past it new ones are dropped as past the count.
+/// The most bytes the queue of reports waiting to be recorded holds, as
+/// allocated: its slots and the buffers of the reports' tuples. A tuple can
+/// be as long as an index key, so the count alone does not bound them. Past
+/// it new ones are dropped as past the count. The maintenance takes the
+/// queue whole, so the batch it is recording holds at most this as well:
+/// the reports hold at most twice this at once.
 const MAX_PENDING_REPORT_BYTES: usize = 4 << 20;
 
-/// The bytes a queued report holds.
+/// The bytes the tuple of a report holds, as allocated.
 fn report_bytes(report: &IntegrityReport) -> usize {
-    let tuple = match &report.found {
+    match &report.found {
         Mismatch::Missing { tuple, .. }
         | Mismatch::Extra { tuple, .. }
-        | Mismatch::SourceDuplicate { tuple, .. } => tuple.len(),
-    };
-    core::mem::size_of::<IntegrityReport>() + tuple
+        | Mismatch::SourceDuplicate { tuple, .. } => tuple.capacity(),
+    }
 }
 
 /// The indexes in force, by identity, and the names that bind them.
@@ -498,11 +500,18 @@ impl IndexRegistry {
                 found,
             };
             let bytes = report_bytes(&report);
+            // The queue's slots once this report is in: grown here, by as
+            // many as it holds (four at least), so the growth is known
+            // before it is made.
+            let (len, capacity) = (view.reports.len(), view.reports.capacity());
+            let grow = if len == capacity { len.max(4) } else { 0 };
+            let slots = (capacity + grow) * core::mem::size_of::<IntegrityReport>();
             if view.reports.contains(&report) {
                 // Already queued; this copy is dropped.
-            } else if view.reports.len() < MAX_PENDING_REPORTS
-                && view.report_bytes + bytes <= MAX_PENDING_REPORT_BYTES
+            } else if len < MAX_PENDING_REPORTS
+                && slots + view.report_bytes + bytes <= MAX_PENDING_REPORT_BYTES
             {
+                view.reports.reserve_exact(grow);
                 view.report_bytes += bytes;
                 view.reports.push(report);
             } else {

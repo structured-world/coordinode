@@ -334,6 +334,60 @@ fn a_derived_unit_past_its_budget_is_refused_before_expanding() {
 /// combinations, tuples alone, would take more than this beside the noise.
 const ENGINE_NOISE: usize = 16 << 20;
 
+/// Restating an attempt's claims at commit allocates nothing, whatever it
+/// drops: six scopes each holding two bounds whose trends become one (more
+/// dropped than any inline list of positions would hold), and a scope held
+/// under three revisions, whose positions stay several, keep one of each,
+/// and the set still finds every claim it kept.
+#[test]
+fn restating_claims_allocates_nothing() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_core::txn::invariant::{
+        CardinalityBound, CardinalityMeasure, Claim, ClaimPredicate, ClaimScope, ClaimSet,
+        CountTrend, Direction,
+    };
+    let scope = |node: u64| ClaimScope::Incident {
+        node: NodeId::from_raw(node),
+        edge_type: "OWNS".into(),
+        direction: Direction::Outgoing,
+    };
+    let bound = |trend| ClaimPredicate::CardinalityBound {
+        measure: CardinalityMeasure::EdgeInstances,
+        bound: CardinalityBound::AtMostOne,
+        trend,
+    };
+    let mut claims = ClaimSet::new();
+    for node in 0..6 {
+        claims.insert(Claim::new(scope(node), bound(CountTrend::Grows), 1));
+        claims.insert(Claim::new(scope(node), bound(CountTrend::Shrinks), 1));
+    }
+    for revision in 1..=3 {
+        claims.insert(Claim::new(scope(9), bound(CountTrend::Grows), revision));
+    }
+    assert_eq!(claims.len(), 15);
+
+    let ((), allocated) = allocated_by(|| {
+        claims.restate(|_, predicate| {
+            if let ClaimPredicate::CardinalityBound { trend, .. } = predicate {
+                *trend = CountTrend::Changes;
+            }
+        });
+    });
+    assert_eq!(allocated, 0, "restating allocated");
+    assert_eq!(
+        claims.len(),
+        9,
+        "one of each of six scopes, three revisions"
+    );
+    for node in 0..6 {
+        assert!(!claims.insert(Claim::new(scope(node), bound(CountTrend::Changes), 1)));
+    }
+    for revision in 1..=3 {
+        assert!(!claims.insert(Claim::new(scope(9), bound(CountTrend::Changes), revision)));
+    }
+    assert_eq!(claims.len(), 9);
+}
+
 /// A write under a compound uniqueness whose two lists make three hundred
 /// sixty thousand combinations is refused by the statement's memory before
 /// they are built, its uniqueness checks counting them against the same

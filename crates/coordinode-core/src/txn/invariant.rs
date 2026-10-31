@@ -759,43 +759,39 @@ impl ClaimSet {
     /// Change each claim's predicate in place by `restate`, which sees the
     /// scope it covers and cannot move it, then drop a claim that became
     /// equal to one stated before it: one of each stays held, in the order
-    /// first stated. Nothing is allocated unless two claims became one.
+    /// first stated. Nothing is allocated: the claims kept are moved down
+    /// over those dropped, and each position the index holds is rewritten
+    /// or removed where it stands.
     pub fn restate(&mut self, mut restate: impl FnMut(&ClaimScope, &mut ClaimPredicate)) {
         for claim in &mut self.claims {
             restate(&claim.scope, &mut claim.predicate);
         }
-        // Equal claims share their scope, so only positions of one scope
-        // are compared; most scopes hold one claim.
-        let mut dropped: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
-        for slots in self.by_scope.values() {
-            for (i, &at) in slots.iter().enumerate() {
-                if slots[..i]
-                    .iter()
-                    .any(|&before| self.claims[before as usize] == self.claims[at as usize])
-                {
-                    dropped.push(at);
+        // Positions below `kept` hold the claims kept so far, already moved
+        // there and so named in the index; positions from `read` on are not
+        // looked at yet. Equal claims share their scope, so a duplicate is
+        // looked for among one scope's positions alone.
+        let mut kept = 0usize;
+        for read in 0..self.claims.len() {
+            // Every claim is indexed by its scope where it stands, as
+            // `insert` put it; a claim is never dropped for missing there.
+            let slots = self.by_scope.get_mut(&scope_key(&self.claims[read].scope));
+            debug_assert!(slots.is_some(), "a claim missing from the index");
+            if let Some(slots) = slots
+                && let Some(slot) = slots.iter().position(|&at| at as usize == read)
+            {
+                if slots.iter().any(|&at| {
+                    (at as usize) < kept && self.claims[at as usize] == self.claims[read]
+                }) {
+                    slots.remove(slot);
+                    continue;
                 }
+                // Fewer claims than were stated: the position fits.
+                slots[slot] = kept as u32;
             }
+            self.claims.swap(kept, read);
+            kept += 1;
         }
-        if dropped.is_empty() {
-            return;
-        }
-        dropped.sort_unstable();
-        let mut at = 0u32;
-        self.claims.retain(|_| {
-            let keep = dropped.binary_search(&at).is_err();
-            at += 1;
-            keep
-        });
-        // Positions moved: the index is rebuilt over the capacity it has.
-        self.by_scope.clear();
-        for (at, claim) in self.claims.iter().enumerate() {
-            self.by_scope
-                .entry(scope_key(&claim.scope))
-                .or_default()
-                // Fewer claims than before: the position fits.
-                .push(at as u32);
-        }
+        self.claims.truncate(kept);
     }
 
     /// Whether the set holds nothing.
