@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::encoding::{encode_tuple, encode_unique_entry_key};
+use coordinode_core::index::encoding::{encode_tuple, entry_value_prefix};
 use coordinode_embed::Database;
 use coordinode_modality::{IndexStore as _, LocalIndexStore};
 use coordinode_query::index::{CheckOutcome, IndexSelector};
@@ -184,12 +184,20 @@ fn main() {
     let index = store.load_definition(id).unwrap().unwrap();
     for i in (USERS / LOST..=USERS).step_by(USERS / LOST) {
         let tuple = encode_tuple(&[Value::String(format!("u{i}@x"))]).expect("tuple");
-        db.engine()
-            .delete(
+        let lost: Vec<Vec<u8>> = db
+            .engine()
+            .prefix_scan(
                 Partition::Idx,
-                &encode_unique_entry_key(index.generation, &tuple),
+                &entry_value_prefix(index.generation, &tuple),
             )
-            .expect("lose an entry");
+            .expect("scan")
+            .map(|guard| guard.into_inner().expect("entry").0.to_vec())
+            .collect();
+        for key in lost {
+            db.engine()
+                .delete(Partition::Idx, &key)
+                .expect("lose an entry");
+        }
     }
     db.engine().persist().expect("persist");
 

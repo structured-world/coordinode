@@ -1499,13 +1499,13 @@ fn copy_tree(from: &Path, to: &Path) {
 /// entries the checkpoint lacks.
 #[test]
 fn a_rebuild_of_the_index_partition_keeps_every_family() {
-    use coordinode_core::index::encoding::encode_unique_entry_key;
+    use coordinode_core::index::encoding::encode_entry_key;
     use coordinode_core::index::identity::GenerationId;
     let dir = TempDir::new().expect("tempdir");
     let engine = open(&dir);
     let root = checkpoint_root(dir.path());
-    let entry = encode_unique_entry_key(GenerationId::from_raw(7), b"\x40a\x00");
-    let late = encode_unique_entry_key(GenerationId::from_raw(7), b"\x40b\x00");
+    let entry = encode_entry_key(GenerationId::from_raw(7), b"\x40a\x00", 1);
+    let late = encode_entry_key(GenerationId::from_raw(7), b"\x40b\x00", 2);
     put(&engine, 1, PartitionId::Idx, &entry, b"holder");
     put(&engine, 2, PartitionId::Idx, b"tkey:1", b"table");
     put(&engine, 3, PartitionId::Idx, b"idx:spatial:1", b"point");

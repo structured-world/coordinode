@@ -153,7 +153,7 @@ pub enum ClaimScope {
     /// The schema of one node label: what a node whose primary label it is
     /// must satisfy.
     LabelSchema(String),
-    /// One value of a unique index generation, as its entry key encodes it.
+    /// One value of a unique index generation, as its entries encode it.
     /// Every attempt that gives a node this value claims it, whatever
     /// representation or maintenance epoch it writes through.
     UniqueValue {
@@ -287,11 +287,14 @@ pub enum ClaimPredicate {
     /// The attempt gives `node` the unique value its scope names, and its
     /// result depends on no other node holding it in the post-state. Two
     /// attempts giving one value to the same node agree; to different nodes
-    /// they cannot both be admitted.
+    /// they cannot both be admitted. Decided from the value's entries, each
+    /// naming its owner, and while the index is being built or its entries
+    /// are suspect, from the stored nodes too.
     UniqueHolder {
         /// The node taking the value.
         node: NodeId,
-        /// The stored nodes still to be read, while the index is being built.
+        /// The stored nodes still to be read, while the index is being built
+        /// or its entries cannot prove the value free.
         uncovered: Option<alloc::boxed::Box<UncoveredSource>>,
     },
 }

@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::index::derive::{EntryOwner, IndexInterpretation, tuples};
 use coordinode_modality::{
-    CheckState, IndexCheck, IndexIntegrityRecord, IndexStore as _, Integrity, LatestEntry,
-    LocalIndexStore, LocalNodeStore, Mismatch, NodeStore as _, StoreError,
+    CheckState, IndexCheck, IndexIntegrityRecord, IndexStore as _, Integrity, LocalIndexStore,
+    LocalNodeStore, Mismatch, NodeStore as _, StoreError,
 };
 use coordinode_storage::engine::transaction::Transaction;
 use rustc_hash::FxHashMap;
@@ -1065,6 +1065,28 @@ fn node_holds(
     Ok(false)
 }
 
+/// A node other than `node` with an entry holding `tuple` in the unique
+/// `def` whose own record holds it too, as `txn` sees them: a pair of
+/// records breaking the constraint. An owner whose entry is stale is passed
+/// over.
+fn other_holder(
+    store: &LocalIndexStore<'_>,
+    txn: &Transaction<'_>,
+    def: &IndexDefinition,
+    interpretation: &IndexInterpretation,
+    (node, tuple): (u64, &[u8]),
+    (shard_id, catalog): (u16, &mut CatalogMembership<'_>),
+) -> Result<Option<u64>, StoreError> {
+    for holder in store.holders(txn, def, tuple)? {
+        if holder.as_raw() != node
+            && node_holds(txn, shard_id, def, interpretation, holder, tuple, catalog)?
+        {
+            return Ok(Some(holder.as_raw()));
+        }
+    }
+    Ok(None)
+}
+
 /// The owner a mismatch names.
 fn owner_of(node: u64, valid_from: Option<i64>) -> EntryOwner {
     EntryOwner {
@@ -1106,11 +1128,10 @@ impl Shared {
                 )
                 .map_err(text)?;
                 holds
-                    && match store.latest_entry(def, tuple, owner).map_err(text)? {
-                        None => true,
-                        Some(_) if !def.unique => false,
-                        Some(entry) => entry.holder.map(NodeId::as_raw) != Some(*node),
-                    }
+                    && store
+                        .latest_entry(def, tuple, owner)
+                        .map_err(text)?
+                        .is_none()
             }
             Mismatch::Extra {
                 node,
@@ -1120,43 +1141,18 @@ impl Shared {
                 let owner = owner_of(*node, *valid_from);
                 match store.latest_entry(def, tuple, owner).map_err(text)? {
                     None => false,
-                    Some(entry)
-                        if def.unique && entry.holder.map_or(u64::MAX, NodeId::as_raw) != *node =>
-                    {
-                        false
-                    }
                     Some(_) => {
-                        let holds = if def.unique {
-                            let latest = Transaction::new(
-                                engine,
-                                None,
-                                coordinode_core::txn::timestamp::Timestamp::ZERO,
-                                None,
-                            );
-                            node_holds(
-                                &latest,
-                                shard_id,
-                                def,
-                                interpretation,
-                                NodeId::from_raw(*node),
-                                tuple,
-                                &mut catalog,
-                            )
-                            .map_err(text)?
-                        } else {
-                            let row = LocalNodeStore
-                                .latest_row(engine, shard_id, owner)
-                                .map_err(text)?;
-                            maybe_holds(
-                                def,
-                                interpretation,
-                                row.as_ref().map(|(r, _)| r),
-                                tuple,
-                                &mut catalog,
-                            )
-                            .map_err(text)?
-                        };
-                        !holds
+                        let row = LocalNodeStore
+                            .latest_row(engine, shard_id, owner)
+                            .map_err(text)?;
+                        !maybe_holds(
+                            def,
+                            interpretation,
+                            row.as_ref().map(|(r, _)| r),
+                            tuple,
+                            &mut catalog,
+                        )
+                        .map_err(text)?
                     }
                 }
             }
@@ -1854,32 +1850,28 @@ impl Shared {
                         continue;
                     }
                     let current = store.latest_entry(def, tuple, owner).map_err(text)?;
-                    match current {
-                        // The entry is there by now: nothing to repair.
-                        Some(_) if !def.unique => continue,
-                        Some(LatestEntry {
-                            holder: Some(h), ..
-                        }) if h.as_raw() == *node => continue,
-                        Some(LatestEntry {
-                            holder: Some(h), ..
-                        }) if node_holds(
+                    // The entry is there by now: nothing to repair.
+                    if current.is_some() {
+                        continue;
+                    }
+                    // A unique value another record holds is the records'
+                    // conflict, which no entry resolves.
+                    if def.unique
+                        && let Some(h) = other_holder(
+                            &store,
                             &latest,
-                            shard_id,
                             def,
                             interpretation,
-                            h,
-                            tuple,
-                            &mut catalog,
+                            (*node, tuple),
+                            (shard_id, &mut catalog),
                         )
-                        .map_err(text)? =>
-                        {
-                            conflicts.push(Mismatch::SourceDuplicate {
-                                nodes: [h.as_raw().min(*node), h.as_raw().max(*node)],
-                                tuple: tuple.clone(),
-                            });
-                            continue;
-                        }
-                        _ => {}
+                        .map_err(text)?
+                    {
+                        conflicts.push(Mismatch::SourceDuplicate {
+                            nodes: [h.min(*node), h.max(*node)],
+                            tuple: tuple.clone(),
+                        });
+                        continue;
                     }
                     LocalNodeStore
                         .expect_row_txn(&mut txn, shard_id, owner, Some(row_version))
@@ -1905,35 +1897,17 @@ impl Shared {
                     let Some(current) = store.latest_entry(def, tuple, owner).map_err(text)? else {
                         continue;
                     };
-                    // Still the entry the check found: naming the same node,
-                    // or still naming none it can decode.
-                    if def.unique && current.holder.map_or(u64::MAX, NodeId::as_raw) != *node {
-                        continue;
-                    }
-                    let holds = if def.unique {
-                        node_holds(
-                            &latest,
-                            shard_id,
-                            def,
-                            interpretation,
-                            NodeId::from_raw(*node),
-                            tuple,
-                            &mut catalog,
-                        )
-                        .map_err(text)?
-                    } else {
-                        let row = LocalNodeStore
-                            .latest_row(engine, shard_id, owner)
-                            .map_err(text)?;
-                        maybe_holds(
-                            def,
-                            interpretation,
-                            row.as_ref().map(|(r, _)| r),
-                            tuple,
-                            &mut catalog,
-                        )
-                        .map_err(text)?
-                    };
+                    let row = LocalNodeStore
+                        .latest_row(engine, shard_id, owner)
+                        .map_err(text)?;
+                    let holds = maybe_holds(
+                        def,
+                        interpretation,
+                        row.as_ref().map(|(r, _)| r),
+                        tuple,
+                        &mut catalog,
+                    )
+                    .map_err(text)?;
                     if holds {
                         continue;
                     }

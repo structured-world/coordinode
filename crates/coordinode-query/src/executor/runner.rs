@@ -2701,14 +2701,15 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
-    /// State the unique values claimed since the `from`th claim whose index
-    /// entries cannot prove them free as conditions of the commit, decided
-    /// by reading the stored nodes as they stand when it is decided. An
-    /// index still being built has not reached every stored node, so the
-    /// commit reads the nodes past the key the backfill covered through; an
-    /// index whose entries were found disagreeing with their records proves
-    /// nothing, so the commit reads every node of the label.
-    fn claim_building_uniques(&mut self, from: usize) {
+    /// State every unique value claimed since the `from`th claim as a
+    /// condition of the commit, decided by the common evaluator at the
+    /// commit against the value's owners as they stand then. A published
+    /// index answers through its entries. An index still being built has not
+    /// reached every stored node, so the commit reads the nodes past the key
+    /// the backfill covered through; an index whose entries were found
+    /// disagreeing with their records proves nothing, so the commit reads
+    /// every node of the label.
+    fn claim_uniques(&mut self, from: usize) {
         use coordinode_core::index::derive::tuples;
         use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, UncoveredSource};
         let limit = self.index_builds.map_or(
@@ -2721,29 +2722,28 @@ impl<'a> ExecutionContext<'a> {
         let mut stated = Vec::new();
         for claim in &self.key_claims.indexes[from..] {
             let building = matches!(claim.index.state, IndexState::Building { .. });
-            if !building && !claim.needs_source_proof {
-                continue;
-            }
             let generation = claim.index.generation;
-            let covered_through = if claim.needs_source_proof {
-                None
-            } else {
-                self.index_builds
-                    .and_then(|builds| builds.covered_through(generation))
-            };
-            let source = UncoveredSource {
-                shard_id: self.shard_id,
-                label: claim.index.label.clone(),
-                interpretation: claim.index.interpretation(&field_of),
-                covered_through,
-                read_limit: limit,
-            };
+            let uncovered = (building || claim.needs_source_proof).then(|| {
+                let covered_through = if claim.needs_source_proof {
+                    None
+                } else {
+                    self.index_builds
+                        .and_then(|builds| builds.covered_through(generation))
+                };
+                Box::new(UncoveredSource {
+                    shard_id: self.shard_id,
+                    label: claim.index.label.clone(),
+                    interpretation: claim.index.interpretation(&field_of),
+                    covered_through,
+                    read_limit: limit,
+                })
+            });
             for tuple in tuples(&claim.values) {
                 stated.push(Claim::new(
                     ClaimScope::UniqueValue { generation, tuple },
                     ClaimPredicate::UniqueHolder {
                         node: claim.node_id,
-                        uncovered: Some(Box::new(source.clone())),
+                        uncovered: uncovered.clone(),
                     },
                     revision,
                 ));
@@ -2899,7 +2899,7 @@ impl<'a> ExecutionContext<'a> {
                     .map_err(index_write_error)?;
             }
         }
-        self.claim_building_uniques(from);
+        self.claim_uniques(from);
         Ok(())
     }
 
@@ -3064,7 +3064,7 @@ impl<'a> ExecutionContext<'a> {
                     .map_err(index_write_error)?;
             }
         }
-        self.claim_building_uniques(from);
+        self.claim_uniques(from);
         Ok(())
     }
 
@@ -3144,7 +3144,7 @@ impl<'a> ExecutionContext<'a> {
                     .map_err(index_write_error)?;
             }
         }
-        self.claim_building_uniques(from);
+        self.claim_uniques(from);
         Ok(())
     }
 
@@ -3233,7 +3233,7 @@ impl<'a> ExecutionContext<'a> {
                     .map_err(index_write_error)?;
             }
         }
-        self.claim_building_uniques(from);
+        self.claim_uniques(from);
         Ok(())
     }
 
@@ -3296,7 +3296,7 @@ impl<'a> ExecutionContext<'a> {
                 )
                 .map_err(index_write_error)?;
         }
-        self.claim_building_uniques(from);
+        self.claim_uniques(from);
         Ok(())
     }
 
@@ -3739,6 +3739,13 @@ impl<'a> ExecutionContext<'a> {
                 .iter()
                 .find(|claim| claim.index.generation == *generation)
                 .map(|claim| {
+                    // A holder found through its entry is reported without
+                    // values: the ones the claim took are what it holds.
+                    let values = if values.is_empty() {
+                        &claim.values
+                    } else {
+                        values
+                    };
                     unique_violation(crate::index::UniqueViolation::new(
                         &claim.index,
                         values,

@@ -2,7 +2,7 @@
 //! maintenance profiles share.
 
 use super::*;
-use crate::index::encoding::{encode_entry_key, encode_tuple, encode_unique_entry_key};
+use crate::index::encoding::{encode_entry_key, encode_tuple};
 
 /// The generation of the index the tests derive entries of.
 const GEN: GenerationId = GenerationId::from_raw(41);
@@ -181,18 +181,23 @@ fn membership_effects_are_the_difference_of_the_two_states() {
     );
 }
 
-/// A unique entry is keyed by the value alone and holds the node.
+/// A unique entry is keyed by value and owner, as any entry is: two nodes
+/// holding one value are two entries, and admission, not the key, decides
+/// whether both may.
 #[test]
-fn a_unique_entry_holds_its_node() {
+fn a_unique_entry_is_keyed_by_its_owner() {
     let index = interp(true, false, None);
     let a = encode_tuple(&[s("a")]).expect("a");
+    let nine = index.membership_effects(EntryOwner::node(9), None, Some(&[s("a")]));
     assert_eq!(
-        index.membership_effects(EntryOwner::node(9), None, Some(&[s("a")])),
+        nine,
         vec![EntryEffect {
-            key: encode_unique_entry_key(GEN, &a),
-            value: Some(9u64.to_be_bytes().to_vec()),
+            key: encode_entry_key(GEN, &a, 9),
+            value: Some(Vec::new()),
         }]
     );
+    let ten = index.membership_effects(EntryOwner::node(10), None, Some(&[s("a")]));
+    assert_ne!(nine[0].key, ten[0].key);
 }
 
 /// A version of a temporal node has entries of its own, keyed by node and
@@ -222,11 +227,12 @@ fn a_version_entry_carries_its_valid_from() {
     );
 }
 
-/// A unique claim is the node's, whichever version holds the value: a
-/// version leaving the value keeps the claim, so another version of the
-/// node holding it, or the node's history, is not left unprotected.
+/// A version of a temporal node holds a unique value through its own entry:
+/// a correction of that version leaving the value removes only its entry,
+/// and another version holding the value keeps its own.
 #[test]
-fn a_version_leaving_a_unique_value_keeps_the_claim() {
+fn a_version_leaving_a_unique_value_removes_only_its_entry() {
+    use crate::index::encoding::encode_version_entry_key;
     let index = interp(true, false, None);
     let a = encode_tuple(&[s("a")]).expect("a");
     let b = encode_tuple(&[s("b")]).expect("b");
@@ -236,62 +242,35 @@ fn a_version_leaving_a_unique_value_keeps_the_claim() {
             Some(&[s("a")]),
             Some(&[s("b")])
         ),
-        vec![EntryEffect {
-            key: encode_unique_entry_key(GEN, &b),
-            value: Some(9u64.to_be_bytes().to_vec()),
-        }]
-    );
-    // A node that is not temporal releases what it leaves.
-    assert_eq!(
-        index.membership_effects(EntryOwner::node(9), Some(&[s("a")]), None),
-        vec![EntryEffect {
-            key: encode_unique_entry_key(GEN, &a),
-            value: None,
-        }]
+        vec![
+            EntryEffect {
+                key: encode_version_entry_key(GEN, &a, 9, 100),
+                value: None,
+            },
+            EntryEffect {
+                key: encode_version_entry_key(GEN, &b, 9, 100),
+                value: Some(Vec::new()),
+            },
+        ]
     );
 }
 
-fn unit(unique: bool, node_id: u64, key: &[u8], value: Option<Vec<u8>>) -> UnitEffect {
-    UnitEffect {
-        unique,
-        node_id,
-        effect: EntryEffect {
-            key: key.to_vec(),
-            value,
-        },
+fn unit(key: &[u8], value: Option<Vec<u8>>) -> EntryEffect {
+    EntryEffect {
+        key: key.to_vec(),
+        value,
     }
 }
 
-/// A unique value handed from one node to another in one unit ends held by
-/// the receiver, whichever change came first.
+/// For one key the later effect wins; keys keep the order they were first
+/// touched in.
 #[test]
-fn a_unique_value_handed_over_in_one_unit_stays_claimed() {
-    let claim = Some(2u64.to_be_bytes().to_vec());
-    let receive_then_release = combine_unit_effects([
-        unit(true, 2, b"k", claim.clone()),
-        unit(true, 1, b"k", None),
-    ]);
-    let release_then_receive = combine_unit_effects([
-        unit(true, 1, b"k", None),
-        unit(true, 2, b"k", claim.clone()),
-    ]);
-    let held = vec![EntryEffect {
-        key: b"k".to_vec(),
-        value: claim,
-    }];
-    assert_eq!(receive_then_release, held);
-    assert_eq!(release_then_receive, held);
-}
-
-/// A node releasing its own claim removes it, and for any other key the
-/// later effect wins; keys keep the order they were first touched in.
-#[test]
-fn later_effects_replace_earlier_ones_otherwise() {
+fn later_effects_replace_earlier_ones() {
     let got = combine_unit_effects([
-        unit(true, 1, b"u", Some(vec![1])),
-        unit(false, 1, b"n", Some(Vec::new())),
-        unit(true, 1, b"u", None),
-        unit(false, 1, b"n", None),
+        unit(b"u", Some(Vec::new())),
+        unit(b"n", Some(Vec::new())),
+        unit(b"u", None),
+        unit(b"n", None),
     ]);
     assert_eq!(
         got,
@@ -415,22 +394,25 @@ mod resolve {
     }
 
     /// A unique value one node releases and another takes in the same unit
-    /// stays claimed by the taker.
+    /// ends held by the taker alone, whichever change came first.
     #[test]
-    fn a_unique_value_changing_hands_stays_claimed() {
+    fn a_unique_value_changing_hands_ends_with_the_taker() {
         let index = interp(true, false, None);
-        let unit = vec![
-            work(&index, 2, None, DerivedSource::Values(Some(vec![s("v")]))),
-            work(&index, 1, Some(vec![s("v")]), DerivedSource::Values(None)),
-        ];
         let tuple = encode_tuple(&[s("v")]).expect("v");
-        assert_eq!(
-            resolve_unit(&unit, 16).expect("resolve").as_ref(),
-            &[idx_put(
-                encode_unique_entry_key(GEN, &tuple),
-                2u64.to_be_bytes().to_vec()
-            )]
-        );
+        let take = work(&index, 2, None, DerivedSource::Values(Some(vec![s("v")])));
+        let release = work(&index, 1, Some(vec![s("v")]), DerivedSource::Values(None));
+        for unit in [
+            vec![take.clone(), release.clone()],
+            vec![release.clone(), take.clone()],
+        ] {
+            let resolved = resolve_unit(&unit, 16).expect("resolve");
+            assert!(resolved.contains(&idx_put(encode_entry_key(GEN, &tuple, 2), Vec::new())));
+            assert!(resolved.contains(&Mutation::Delete {
+                partition: PartitionId::Idx,
+                key: encode_entry_key(GEN, &tuple, 1),
+            }));
+            assert_eq!(resolved.len(), 2);
+        }
     }
 
     /// Work whose source is not a node record put, or whose record does not

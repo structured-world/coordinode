@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::encoding::{append_entry_key, append_unique_entry_key, encode_tuple};
+use super::encoding::{append_entry_key, encode_tuple};
 use super::identity::GenerationId;
 use crate::graph::node::NodeRecord;
 use crate::graph::types::Value;
@@ -162,7 +162,7 @@ impl IndexInterpretation {
         old: Option<&[Value]>,
         new: Option<&[Value]>,
     ) -> Vec<EntryEffect> {
-        membership_effects(self.generation, self.unique, owner, old, new)
+        membership_effects(self.generation, owner, old, new)
     }
 }
 
@@ -195,22 +195,15 @@ impl EntryOwner {
 }
 
 /// The entry of `owner` under `tuple` in the index generation `generation`:
-/// keyed by the value alone and holding the node when `unique`, keyed by
-/// value and owner with an empty value otherwise.
-pub fn entry(
-    generation: GenerationId,
-    unique: bool,
-    tuple: &[u8],
-    owner: EntryOwner,
-) -> (Vec<u8>, Vec<u8>) {
+/// keyed by value and owner, with an empty value. A unique index keys its
+/// entries the same way: who may hold a value is decided at admission, so
+/// several owners of one value (two versions of a node, or the holders two
+/// interpretations of a label keep while one replaces the other) each keep
+/// their own entry.
+pub fn entry(generation: GenerationId, tuple: &[u8], owner: EntryOwner) -> (Vec<u8>, Vec<u8>) {
     let mut key = Vec::new();
-    append_entry_key_of(&mut key, generation, unique, tuple, owner);
-    let value = if unique {
-        owner.node_id.to_be_bytes().to_vec()
-    } else {
-        Vec::new()
-    };
-    (key, value)
+    append_entry_key_of(&mut key, generation, tuple, owner);
+    (key, Vec::new())
 }
 
 /// The key of [`entry`] appended to `out`: what a caller building many entry
@@ -218,28 +211,17 @@ pub fn entry(
 pub fn append_entry_key_of(
     out: &mut Vec<u8>,
     generation: GenerationId,
-    unique: bool,
     tuple: &[u8],
     owner: EntryOwner,
 ) {
-    if unique {
-        append_unique_entry_key(out, generation, tuple);
-    } else {
-        append_entry_key(out, generation, tuple, owner.node_id, owner.valid_from);
-    }
+    append_entry_key(out, generation, tuple, owner.node_id, owner.valid_from);
 }
 
-/// The entry effects in the index generation `generation` of `owner`'s membership moving from
-/// `old` to `new`: a delete for each tuple it leaves, a put for each it
-/// enters. A tuple in both is untouched.
-///
-/// A unique entry is keyed by the value alone and claims it for the node,
-/// whichever of its versions holds it. A version of a temporal node leaving a
-/// value therefore keeps the claim: another version of the node may hold the
-/// value too, and the node holds it in its history either way.
+/// The entry effects in the index generation `generation` of `owner`'s
+/// membership moving from `old` to `new`: a delete for each tuple it leaves,
+/// a put for each it enters. A tuple in both is untouched.
 pub fn membership_effects(
     generation: GenerationId,
-    unique: bool,
     owner: EntryOwner,
     old: Option<&[Value]>,
     new: Option<&[Value]>,
@@ -247,18 +229,17 @@ pub fn membership_effects(
     let before = old.map(tuples).unwrap_or_default();
     let after = new.map(tuples).unwrap_or_default();
     let mut effects = Vec::with_capacity(before.len() + after.len());
-    let releases = !(unique && owner.valid_from.is_some());
     for tuple in &before {
-        if releases && after.binary_search(tuple).is_err() {
+        if after.binary_search(tuple).is_err() {
             effects.push(EntryEffect {
-                key: entry(generation, unique, tuple, owner).0,
+                key: entry(generation, tuple, owner).0,
                 value: None,
             });
         }
     }
     for tuple in &after {
         if before.binary_search(tuple).is_err() {
-            let (key, value) = entry(generation, unique, tuple, owner);
+            let (key, value) = entry(generation, tuple, owner);
             effects.push(EntryEffect {
                 key,
                 value: Some(value),
@@ -303,49 +284,21 @@ pub fn tuples(values: &[Value]) -> Vec<Vec<u8>> {
     out
 }
 
-/// One entry effect of a unit, with what [`combine_unit_effects`] needs to
-/// order it against the unit's other effects on the same key.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnitEffect {
-    /// Whether the entry belongs to a unique index.
-    pub unique: bool,
-    /// The node whose membership produced the effect.
-    pub node_id: u64,
-    /// The effect.
-    pub effect: EntryEffect,
-}
-
 /// Combine the entry effects of one application unit into one effect per
-/// key, in first-touched order.
-///
-/// Within a unit a later effect on a key replaces an earlier one, with one
-/// exception that keeps a unique claim: a unique entry put for one node is
-/// not removed by another node leaving the same value in that unit (a value
-/// handed from one node to another), whatever order the two changes were
-/// staged in. A node releasing its own claim does remove it.
-pub fn combine_unit_effects(effects: impl IntoIterator<Item = UnitEffect>) -> Vec<EntryEffect> {
+/// key, in first-touched order: a later effect on a key replaces an earlier
+/// one. An entry is keyed by its owner, so two owners' effects never meet on
+/// one key, a value handed from one node to another included.
+pub fn combine_unit_effects(effects: impl IntoIterator<Item = EntryEffect>) -> Vec<EntryEffect> {
     let mut order: Vec<Vec<u8>> = Vec::new();
-    let mut last: rustc_hash::FxHashMap<Vec<u8>, UnitEffect> = rustc_hash::FxHashMap::default();
-    for item in effects {
-        match last.get(&item.effect.key) {
-            None => {
-                order.push(item.effect.key.clone());
-                last.insert(item.effect.key.clone(), item);
-            }
-            Some(held) => {
-                let keeps_other_claim = item.unique
-                    && item.effect.value.is_none()
-                    && held.effect.value.is_some()
-                    && held.node_id != item.node_id;
-                if !keeps_other_claim {
-                    last.insert(item.effect.key.clone(), item);
-                }
-            }
+    let mut last: rustc_hash::FxHashMap<Vec<u8>, EntryEffect> = rustc_hash::FxHashMap::default();
+    for effect in effects {
+        if last.insert(effect.key.clone(), effect.clone()).is_none() {
+            order.push(effect.key);
         }
     }
     order
         .into_iter()
-        .filter_map(|key| last.remove(&key).map(|item| item.effect))
+        .filter_map(|key| last.remove(&key))
         .collect()
 }
 
@@ -424,11 +377,7 @@ pub fn resolve_unit(
         if effects.len() + derived.len() > max_effects {
             return Err(DeriveError::FanOut(max_effects));
         }
-        effects.extend(derived.into_iter().map(|effect| UnitEffect {
-            unique: interpretation.unique,
-            node_id: work.node_id,
-            effect,
-        }));
+        effects.extend(derived);
     }
     resolved.extend(
         combine_unit_effects(effects)

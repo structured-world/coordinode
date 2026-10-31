@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::encoding::{entries_prefix, unique_entries_prefix};
+use coordinode_core::index::encoding::entries_prefix;
 use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
 use coordinode_embed::Database;
 use coordinode_query::index::{BuildPhase, CheckOutcome, IndexSelector};
@@ -432,18 +432,10 @@ fn entry_count(db: &Database, name: &str) -> usize {
     let generation = index_named(db.engine(), name)
         .unwrap_or_else(|| panic!("index {name}"))
         .generation;
-    [
-        entries_prefix(generation),
-        unique_entries_prefix(generation),
-    ]
-    .iter()
-    .map(|prefix| {
-        db.engine()
-            .prefix_scan(Partition::Idx, prefix)
-            .expect("scan")
-            .count()
-    })
-    .sum()
+    db.engine()
+        .prefix_scan(Partition::Idx, &entries_prefix(generation))
+        .expect("scan")
+        .count()
 }
 
 /// A check of the index `name` against its records finds every entry the

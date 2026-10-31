@@ -369,16 +369,16 @@ impl<'a> Evaluation<'a> {
                 )
             }
 
-            // A published index answers for the value through its entry key:
-            // every holder writes it, and the attempt writes it too, so a
-            // holder committed since the attempt's view meets it there. While
-            // the index is being built, a node the build has not reached holds
-            // its value without an entry, and only reading those nodes tells.
+            // A published index answers for the value through its entries,
+            // one per owner, as they stand committed now and as the attempt
+            // leaves them: another owner there holds it. While the index is
+            // being built, a node the build has not reached holds its value
+            // without an entry, and only reading those nodes tells.
             (
-                ClaimScope::UniqueValue { tuple, .. },
+                ClaimScope::UniqueValue { generation, tuple },
                 ClaimPredicate::UniqueHolder { node, uncovered },
             ) => match uncovered {
-                None => Ok(Verdict::Holds),
+                None => entry_holders(engine, *generation, tuple, *node, staged_points),
                 Some(source) => uncovered_holders(
                     engine,
                     &core::iter::once((tuple.as_slice(), *node)).collect(),
@@ -393,6 +393,54 @@ impl<'a> Evaluation<'a> {
             _ => Ok(Verdict::Undecidable),
         }
     }
+}
+
+/// The verdict on `node` taking `tuple` in the published unique index
+/// generation `generation`: `HeldBy` an owner other than `node` with an entry
+/// holding it, committed and not removed by the attempt, or staged by the
+/// attempt itself; `Holds` when none has one. The entry names its owner, so
+/// no record is read; the values reported are left to the caller, who knows
+/// which it took.
+fn entry_holders(
+    engine: &StorageEngine,
+    generation: coordinode_core::index::identity::GenerationId,
+    tuple: &[u8],
+    node: NodeId,
+    staged_points: StagedPoints<'_>,
+) -> StorageResult<Verdict> {
+    use coordinode_core::index::encoding::{decode_entry, entry_value_prefix};
+    let prefix = entry_value_prefix(generation, tuple);
+    let other = |key: &[u8]| {
+        decode_entry(generation, key)
+            .map(|(owner, _)| owner)
+            .filter(|owner| *owner != node.as_raw())
+    };
+    for guard in engine.prefix_scan(Partition::Idx, &prefix)? {
+        let (key, _) = guard.into_inner()?;
+        let removed = matches!(
+            staged_points.get(&(Partition::Idx, key.to_vec())),
+            Some(None)
+        );
+        if !removed && let Some(holder) = other(&key) {
+            return Ok(Verdict::HeldBy {
+                holder: NodeId::from_raw(holder),
+                values: Vec::new(),
+            });
+        }
+    }
+    for ((part, key), value) in staged_points.iter() {
+        if *part == Partition::Idx
+            && value.is_some()
+            && key.starts_with(&prefix)
+            && let Some(holder) = other(key)
+        {
+            return Ok(Verdict::HeldBy {
+                holder: NodeId::from_raw(holder),
+                values: Vec::new(),
+            });
+        }
+    }
+    Ok(Verdict::Holds)
 }
 
 /// The unique values an attempt takes in one index generation while it is

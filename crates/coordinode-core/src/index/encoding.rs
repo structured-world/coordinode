@@ -27,18 +27,17 @@ const TAG_STRING: u8 = 0x40;
 const TAG_TIMESTAMP: u8 = 0x50;
 const TAG_BINARY: u8 = 0x60;
 
-/// First byte of an entry of an index that allows several nodes per value.
+/// First byte of an index entry: one per value and owner, in a unique index
+/// as in any other.
 const TAG_ENTRIES: u8 = 0x01;
-/// First byte of an entry of a unique index: one entry per value.
-const TAG_UNIQUE_ENTRIES: u8 = 0x02;
 /// First byte of a label membership posting: one per node and label.
-const TAG_LABEL_POSTINGS: u8 = 0x03;
+const TAG_LABEL_POSTINGS: u8 = 0x02;
 /// First byte of the logical claim on a value of a unique index, shared by
 /// every part and generation of the index. Outside [`GENERATION_TAGS`], so
 /// clearing a generation never touches it.
-const TAG_UNIQUE_CLAIMS: u8 = 0x04;
-/// Ends the tuple of a non-unique entry. No element starts with it, so it
-/// marks where the tuple ends and the owner begins.
+const TAG_UNIQUE_CLAIMS: u8 = 0x03;
+/// Ends the tuple of an entry. No element starts with it, so it marks where
+/// the tuple ends and the owner begins.
 const TUPLE_END: u8 = b':';
 /// Length of a generation prefix: the shape tag and the generation, u64 BE.
 pub const GENERATION_PREFIX_LEN: usize = 9;
@@ -47,7 +46,7 @@ pub const GENERATION_PREFIX_LEN: usize = 9;
 /// family of the index partition starts with these bytes. Contiguous and
 /// ascending, so the keys of every generation lie between the first tag and
 /// the one past the last.
-pub const GENERATION_TAGS: [u8; 3] = [TAG_ENTRIES, TAG_UNIQUE_ENTRIES, TAG_LABEL_POSTINGS];
+pub const GENERATION_TAGS: [u8; 2] = [TAG_ENTRIES, TAG_LABEL_POSTINGS];
 
 /// Length of a label posting key: the generation prefix, the shard (u16 BE),
 /// the label (u32 BE) and the node (u64 BE).
@@ -222,35 +221,11 @@ pub fn encode_version_entry_key(
     out
 }
 
-/// Prefix of every entry of the unique index generation `generation`.
-pub fn unique_entries_prefix(generation: GenerationId) -> [u8; GENERATION_PREFIX_LEN] {
-    generation_prefix(TAG_UNIQUE_ENTRIES, generation)
-}
-
-/// Entry of `tuple` in the unique `generation`: `<prefix><tuple>`, whose
-/// value is the holder's node id (u64 BE).
-///
-/// Keyed by the value alone, the entry is its own uniqueness claim: two
-/// transactions inserting one value write one key, and write-write conflict
-/// detection lets one of them commit.
-pub fn encode_unique_entry_key(generation: GenerationId, tuple: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(GENERATION_PREFIX_LEN + tuple.len());
-    append_unique_entry_key(&mut out, generation, tuple);
-    out
-}
-
-/// [`encode_unique_entry_key`] appended to `out`.
-pub fn append_unique_entry_key(out: &mut Vec<u8>, generation: GenerationId, tuple: &[u8]) {
-    out.extend_from_slice(&unique_entries_prefix(generation));
-    out.extend_from_slice(tuple);
-}
-
-/// The logical claim on `tuple` in the unique index `index`: one key per
-/// value whatever part or generation of the index holds it. A write taking
-/// the value while the index keeps entries apart in several scopes writes
-/// this key too, so two writes taking it in different scopes, each from a
-/// view without the other, meet here and one of them is refused, as two
-/// writes of one scope meet on its entry key.
+/// The ownership revision of `tuple` in the unique index `index`: one key per
+/// value, whatever part, generation or owner holds it. Every write changing
+/// who holds the value writes it, so two writes changing it, each from a view
+/// without the other, meet here and one of them is refused at its commit:
+/// the owners' own entry keys differ and would not meet.
 pub fn encode_unique_claim_key(index: u64, tuple: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(9 + tuple.len());
     out.extend_from_slice(&unique_claims_prefix(index));
@@ -316,10 +291,9 @@ pub fn decode_label_posting(generation: GenerationId, key: &[u8]) -> Option<(u16
 
 /// The key ranges, `[start, end)`, holding every key of `generation` in any
 /// shape: what removing a generation's entries removes.
-pub fn generation_ranges(generation: GenerationId) -> [(Vec<u8>, Vec<u8>); 3] {
+pub fn generation_ranges(generation: GenerationId) -> [(Vec<u8>, Vec<u8>); 2] {
     [
         entries_prefix(generation),
-        unique_entries_prefix(generation),
         label_postings_prefix(generation),
     ]
     .map(|prefix| (prefix.to_vec(), prefix_end(&prefix)))
@@ -387,12 +361,6 @@ pub fn decode_entry_parts(
         _ => return None,
     };
     Some((&rest[..len], node_id, valid_from))
-}
-
-/// The tuple a unique entry key of `generation` holds. `None` for a key that
-/// is no unique entry of that generation.
-pub fn decode_unique_entry_tuple(generation: GenerationId, key: &[u8]) -> Option<&[u8]> {
-    key.strip_prefix(unique_entries_prefix(generation).as_slice())
 }
 
 /// Length of the encoded tuple `bytes` starts with: the elements up to the

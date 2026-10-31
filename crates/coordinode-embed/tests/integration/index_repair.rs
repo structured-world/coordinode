@@ -11,7 +11,7 @@
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::encoding::{encode_entry_key, encode_tuple, encode_unique_entry_key};
+use coordinode_core::index::encoding::{encode_entry_key, encode_tuple};
 use coordinode_embed::Database;
 use coordinode_modality::index::{IndexStore, LocalIndexStore};
 use coordinode_query::index::{CheckOutcome, CheckStatus, IndexSelector, Integrity};
@@ -57,16 +57,40 @@ fn found(db: &mut Database, email: &str) -> Vec<i64> {
     ids
 }
 
-/// Overwrite the unique entry of `email` in the index `name` so it names
+/// Replace every entry of `email` in the index `name` with one owned by
 /// `holder`, as a defect that wrote the wrong node would have left it.
 fn misattribute(db: &Database, name: &str, email: &str, holder: i64) {
     let index = index_named(db.engine(), name).expect("index");
     let tuple = encode_tuple(&[Value::String(email.into())]).expect("tuple");
-    let key = encode_unique_entry_key(index.generation, &tuple);
-    let holder = u64::try_from(holder).expect("id").to_be_bytes();
+    drop_entries(db, index.generation, &tuple);
+    let holder = u64::try_from(holder).expect("id");
     db.engine()
-        .put(Partition::Idx, &key, &holder)
-        .expect("overwrite the entry");
+        .put(
+            Partition::Idx,
+            &encode_entry_key(index.generation, &tuple, holder),
+            b"",
+        )
+        .expect("write the wrong owner's entry");
+}
+
+/// Remove every entry holding `tuple` in `generation`, whoever owns it.
+fn drop_entries(
+    db: &Database,
+    generation: coordinode_core::index::identity::GenerationId,
+    tuple: &[u8],
+) {
+    use coordinode_core::index::encoding::entry_value_prefix;
+    let keys: Vec<Vec<u8>> = db
+        .engine()
+        .prefix_scan(Partition::Idx, &entry_value_prefix(generation, tuple))
+        .expect("scan")
+        .map(|guard| guard.into_inner().expect("entry").0.to_vec())
+        .collect();
+    for key in keys {
+        db.engine()
+            .delete(Partition::Idx, &key)
+            .expect("drop the entry");
+    }
 }
 
 /// A unique entry names node B while node A is the one holding the value: a
@@ -247,17 +271,22 @@ fn entry_key(db: &Database, name: &str, value: &str, node: i64) -> Vec<u8> {
     encode_entry_key(index.generation, &tuple, u64::try_from(node).expect("id"))
 }
 
-/// The node the unique entry of `value` in the index `name` names.
-fn unique_holder(db: &Database, name: &str, value: &str) -> Option<u64> {
+/// The owners of the entries of `value` in the index `name`, in id order.
+fn holders(db: &Database, name: &str, value: &str) -> Vec<u64> {
+    use coordinode_core::index::encoding::{decode_entry, entry_value_prefix};
     let index = index_named(db.engine(), name).expect("index");
     let tuple = encode_tuple(&[Value::String(value.into())]).expect("tuple");
     db.engine()
-        .get(
+        .prefix_scan(
             Partition::Idx,
-            &encode_unique_entry_key(index.generation, &tuple),
+            &entry_value_prefix(index.generation, &tuple),
         )
-        .expect("read the entry")
-        .map(|bytes| u64::from_be_bytes(bytes[..].try_into().expect("8 bytes")))
+        .expect("scan")
+        .filter_map(|guard| {
+            let (key, _) = guard.into_inner().expect("entry");
+            decode_entry(index.generation, &key).map(|(node, _)| node)
+        })
+        .collect()
 }
 
 /// A record whose entry is missing gives no sign on any read: the lookup
@@ -325,8 +354,8 @@ fn a_check_removes_an_entry_that_no_record_holds() {
     );
 }
 
-/// A unique entry naming the wrong node is rewritten to name the real
-/// holder, and the generation is verified again.
+/// A unique value held by the wrong node's entry gets the real holder's
+/// entry back and loses the wrong one, and the generation is verified again.
 #[test]
 fn a_check_rewrites_a_misattributed_unique_entry() {
     let (mut db, _dir) = open_db();
@@ -345,8 +374,8 @@ fn a_check_rewrites_a_misattributed_unique_entry() {
     );
     assert_eq!(status.record.integrity, Integrity::Verified);
     assert_eq!(
-        unique_holder(&db, "u_email", "a@x"),
-        Some(u64::try_from(owner).expect("id"))
+        holders(&db, "u_email", "a@x"),
+        [u64::try_from(owner).expect("id")]
     );
     assert_eq!(found(&mut db, "a@x"), vec![owner]);
 }
@@ -416,12 +445,7 @@ fn records_breaking_a_unique_index_are_reported_and_left_alone() {
     // generation answers c from the records.
     let index = index_named(db.engine(), "u_email").expect("index");
     let tuple = encode_tuple(&[Value::String("c@x".into())]).expect("tuple");
-    db.engine()
-        .delete(
-            Partition::Idx,
-            &encode_unique_entry_key(index.generation, &tuple),
-        )
-        .expect("lose c's entry");
+    drop_entries(&db, index.generation, &tuple);
     assert_eq!(found(&mut db, "c@x"), vec![c]);
 }
 
@@ -446,9 +470,7 @@ fn a_copy_found_unfit_here_stays_unfit_across_a_restart() {
             .generation;
         // c's entry lost and this member's copy marked, with no report made.
         let tuple = encode_tuple(&[Value::String("c@x".into())]).expect("tuple");
-        db.engine()
-            .delete(Partition::Idx, &encode_unique_entry_key(generation, &tuple))
-            .expect("lose c's entry");
+        drop_entries(&db, generation, &tuple);
         let store = LocalIndexStore::new(db.engine());
         let copy = store.local_copy(generation).expect("c's copy is here");
         store
@@ -1798,8 +1820,9 @@ fn a_check_repairs_partial_sparse_and_derived_indexes_by_their_rules() {
 }
 
 /// A compound unique index is checked by its combinations: an entry lost
-/// for one combination and one naming the wrong holder for another are both
-/// repaired, and afterwards a combination is held by its record alone.
+/// for one combination, and the wrong owner's entry in place of the right
+/// one for another, are repaired (the lost entries written back, the wrong
+/// one removed), and afterwards a combination is held by its record alone.
 #[test]
 fn a_check_repairs_a_compound_unique_index_by_its_combinations() {
     let (mut db, _dir) = open_db();
@@ -1815,43 +1838,50 @@ fn a_check_repairs_a_compound_unique_index_by_its_combinations() {
     let q = scan_id(&mut db, "name", "q");
     let r = scan_id(&mut db, "name", "r");
     let index = index_named(db.engine(), "u_key").expect("the constraint's index");
-    let key = |a: &str, b: &str| {
-        let tuple =
-            encode_tuple(&[Value::String(a.into()), Value::String(b.into())]).expect("tuple");
-        encode_unique_entry_key(index.generation, &tuple)
+    let tuple = |a: &str, b: &str| {
+        encode_tuple(&[Value::String(a.into()), Value::String(b.into())]).expect("tuple")
     };
-    let holder = |db: &Database, a: &str, b: &str| {
+    let holders = |db: &Database, a: &str, b: &str| {
+        use coordinode_core::index::encoding::{decode_entry, entry_value_prefix};
         db.engine()
-            .get(Partition::Idx, &key(a, b))
-            .expect("read")
-            .map(|bytes| u64::from_be_bytes(bytes[..].try_into().expect("8 bytes")))
+            .prefix_scan(
+                Partition::Idx,
+                &entry_value_prefix(index.generation, &tuple(a, b)),
+            )
+            .expect("scan")
+            .filter_map(|guard| {
+                let (key, _) = guard.into_inner().expect("entry");
+                decode_entry(index.generation, &key).map(|(node, _)| node)
+            })
+            .collect::<Vec<u64>>()
     };
+    let id = |node: i64| u64::try_from(node).expect("id");
     assert_eq!(
-        holder(&db, "x", "z"),
-        Some(u64::try_from(q).expect("id")),
+        holders(&db, "x", "z"),
+        [id(q)],
         "precondition: the entry is keyed by the combination"
     );
-    db.engine()
-        .delete(Partition::Idx, &key("x", "y"))
-        .expect("lose p's combination");
+    drop_entries(&db, index.generation, &tuple("x", "y"));
+    drop_entries(&db, index.generation, &tuple("w", "y"));
     db.engine()
         .put(
             Partition::Idx,
-            &key("w", "y"),
-            &u64::try_from(q).expect("id").to_be_bytes(),
+            &encode_entry_key(index.generation, &tuple("w", "y"), id(q)),
+            b"",
         )
-        .expect("name q for r's combination");
+        .expect("q's entry for r's combination");
 
     let (status, outcome) = check(&db, "u_key");
+    // p's and r's entries written back, q's wrong one removed.
     assert!(
-        matches!(outcome, CheckOutcome::Verified { repaired: 2, .. }),
+        matches!(outcome, CheckOutcome::Verified { repaired: 3, .. }),
         "{outcome:?}"
     );
     assert_eq!(status.record.integrity, Integrity::Verified);
     for (a, b, node) in [("x", "y", p), ("x", "z", q), ("w", "y", r)] {
         assert_eq!(
-            holder(&db, a, b),
-            Some(u64::try_from(node).expect("id")),
+            holders(&db, a, b),
+            [id(node)],
             "({a}, {b}) is held by its record"
         );
     }

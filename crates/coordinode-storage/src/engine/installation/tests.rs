@@ -78,11 +78,14 @@ fn a_generation_key_is_stored_under_its_installation() {
     assert_eq!(b.locate(&logical, &mut buf), Located::Bound(&physical));
     assert_eq!(b.logical(&physical).expect("logical"), Some(40));
 
-    let unique = key(0x02, 40, b"v");
+    let posting = key(0x02, 40, b"v");
     assert_eq!(
-        b.locate(&unique, &mut buf),
+        b.locate(&posting, &mut buf),
         Located::Bound(&key(0x02, 7, b"v"))
     );
+    // A value's ownership revision is keyed by index, not generation.
+    let claim = coordinode_core::index::encoding::encode_unique_claim_key(40, b"v");
+    assert_eq!(b.locate(&claim, &mut buf), Located::Raw(&claim[..]));
 
     assert_eq!(
         b.locate(b"idx:spatial:1", &mut buf),
@@ -140,18 +143,10 @@ fn a_range_over_the_partition_comes_apart_in_logical_order() {
             lo: Bound::Included(prefix(0x02, 2)),
             hi: Bound::Excluded(prefix(0x02, 3)),
         },
-        Piece::Domain {
-            generation: 5,
-            lo: Bound::Included(prefix(0x03, 30)),
-            hi: Bound::Excluded(prefix(0x03, 31)),
-        },
-        Piece::Domain {
-            generation: 9,
-            lo: Bound::Included(prefix(0x03, 2)),
-            hi: Bound::Excluded(prefix(0x03, 3)),
-        },
+        // Past the generation tags: the values' ownership revisions among
+        // others, keyed by index, not by generation.
         Piece::Raw {
-            lo: Bound::Included(vec![0x04]),
+            lo: Bound::Included(vec![0x03]),
             hi: Bound::Unbounded,
         },
     ];
@@ -174,7 +169,7 @@ fn a_range_inside_one_generation_keeps_its_bounds() {
             hi: Bound::Included(key(0x01, 30, b"m")),
         }]
     );
-    let [(start, end), _, _] = coordinode_core::index::encoding::generation_ranges(
+    let [(start, end), _] = coordinode_core::index::encoding::generation_ranges(
         coordinode_core::index::identity::GenerationId::from_raw(5),
     );
     assert_eq!(

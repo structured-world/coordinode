@@ -24,7 +24,7 @@ use coordinode_core::graph::node::NodeRecord;
 use coordinode_core::index::derive::{
     EntryOwner, IndexInterpretation, append_entry_key_of, tuples,
 };
-use coordinode_core::index::encoding::{decode_entry_parts, decode_unique_entry_tuple};
+use coordinode_core::index::encoding::decode_entry_parts;
 use coordinode_core::schema::label_id::LabelId;
 use coordinode_modality::{LocalIndexStore, LocalNodeStore, Mismatch};
 use coordinode_storage::engine::core::StorageEngine;
@@ -135,7 +135,7 @@ impl Run {
         // Keys are at most a record's values long, and a run is spilled
         // long before its bytes reach u32::MAX (the budget is far below).
         let start = self.bytes.len() as u32;
-        append_entry_key_of(&mut self.bytes, def.generation, def.unique, tuple, owner);
+        append_entry_key_of(&mut self.bytes, def.generation, tuple, owner);
         self.items.push(Item {
             start,
             len: self.bytes.len() as u32 - start,
@@ -148,8 +148,8 @@ impl Run {
         &self.bytes[item.start as usize..(item.start + item.len) as usize]
     }
 
-    /// Sort by key, then node, and drop repeats: a node whose versions hold
-    /// one unique value expects one entry for it.
+    /// Sort by key, then node, and drop repeats: one record read twice
+    /// expects its entries once.
     fn sort(&mut self) {
         let bytes = &self.bytes;
         let key = |i: &Item| &bytes[i.start as usize..(i.start + i.len) as usize];
@@ -645,17 +645,21 @@ fn compare(
         .stored_entries_at(snapshot, def)
         .map_err(|e| VerifyError::Store(e.to_string()))?
         .map(|pair| pair.map_err(|e| VerifyError::Store(e.to_string())));
-    if def.unique {
-        compare_unique(generation, &mut stored, expected, findings, stats)
-    } else {
-        compare_plain(generation, &mut stored, expected, findings, stats)
-    }
+    compare_entries(
+        (generation, def.unique),
+        &mut stored,
+        expected,
+        findings,
+        stats,
+    )
 }
 
-/// A non-unique generation: one entry per value and owner, the key is the
-/// whole membership.
-fn compare_plain<I, K, V>(
-    generation: coordinode_core::index::identity::GenerationId,
+/// One entry per value and owner, the key is the whole membership, in a
+/// unique generation as in any other. A unique generation also expects no
+/// two nodes holding one value: two such records break the constraint, which
+/// is the records' doing, never an entry's damage.
+fn compare_entries<I, K, V>(
+    (generation, unique): (coordinode_core::index::identity::GenerationId, bool),
     stored: &mut I,
     expected: &mut Expected,
     findings: &mut Findings,
@@ -668,7 +672,13 @@ where
     let next_stored = |stored: &mut I| stored.next().transpose();
     let mut want = Want::first(expected)?;
     let mut have = next_stored(stored)?;
+    // The value and node the last expected entry held, reused from entry to
+    // entry: expected entries of one value are adjacent, by node.
+    let mut last: Option<(Vec<u8>, u64)> = None;
     loop {
+        if unique && let Some(w) = want.get() {
+            note_holder(generation, w, &mut last, findings);
+        }
         // A stored key that is no entry of this generation's shape names no
         // owner a repair could act on: it is skipped, as it is skipped when
         // read entry by entry.
@@ -750,99 +760,30 @@ fn push_missing(
     }
 }
 
-/// A unique generation: one entry per value, naming its holder. Every node
-/// whose record holds a value expects to be its holder; two such nodes are
-/// records breaking the constraint, never an entry's damage.
-fn compare_unique<I, K, V>(
+/// Note the node the expected entry `want` of a unique generation holds a
+/// value for, after `last`: a second node expecting the value the previous
+/// one did is a pair of records breaking the constraint. Called again for the
+/// same entry, it notes nothing.
+fn note_holder(
     generation: coordinode_core::index::identity::GenerationId,
-    stored: &mut I,
-    expected: &mut Expected,
+    want: &Owned,
+    last: &mut Option<(Vec<u8>, u64)>,
     findings: &mut Findings,
-    stats: &mut VerifyStats,
-) -> Result<(), VerifyError>
-where
-    I: Iterator<Item = Result<(K, V), VerifyError>>,
-    K: core::ops::Deref<Target = [u8]>,
-    V: core::ops::Deref<Target = [u8]>,
-{
-    let next_stored = |stored: &mut I| stored.next().transpose();
-    let mut want = Want::first(expected)?;
-    let mut have = next_stored(stored)?;
-    // The value both sides are at, reused from value to value.
-    let mut key: Vec<u8> = Vec::new();
-    let mut holders: Vec<(u64, Option<i64>)> = Vec::new();
-    loop {
-        // The smaller of the two keys.
-        let at: &[u8] = match (want.get(), &have) {
-            (None, None) => return Ok(()),
-            (Some(w), None) => &w.key,
-            (None, Some((k, _))) => k,
-            (Some(w), Some((k, _))) => {
-                if w.key.as_slice() <= &**k {
-                    &w.key
-                } else {
-                    k
-                }
-            }
-        };
-        key.clear();
-        key.extend_from_slice(at);
-        // Copied out only for a disagreement, which a repair names it in.
-        let Some(tuple) = decode_unique_entry_tuple(generation, &key) else {
-            // No value of this generation's shape: nothing a repair can name.
-            if want.get().is_some_and(|w| w.key == key) {
-                want.advance(expected)?;
-            }
-            if have.as_ref().is_some_and(|(k, _)| **k == *key) {
-                have = next_stored(stored)?;
-            }
-            continue;
-        };
-        // Every node expecting this value, with the version that holds it.
-        holders.clear();
-        while let Some(w) = want.get().filter(|w| w.key == key) {
-            holders.push((w.node, w.valid_from));
-            want.advance(expected)?;
-        }
-        // The stored holder: `Some(None)` for one that does not decode.
-        let stored_holder = match have.as_ref().filter(|(k, _)| **k == *key) {
-            Some((_, value)) => {
-                stats.stored_entries += 1;
-                findings.checked += 1;
-                let holder = <[u8; 8]>::try_from(&**value).ok().map(u64::from_be_bytes);
-                have = next_stored(stored)?;
-                Some(holder)
-            }
-            None => None,
-        };
-        let holds = |node: u64| holders.iter().any(|(n, _)| *n == node);
-        for &(node, valid_from) in &holders {
-            match stored_holder {
-                Some(Some(h)) if h == node => {}
-                Some(Some(h)) if holds(h) => findings.mismatches.push(Mismatch::SourceDuplicate {
-                    nodes: [h.min(node), h.max(node)],
+) {
+    let Some((tuple, node, _)) = decode_entry_parts(generation, &want.key) else {
+        return;
+    };
+    match last {
+        Some((held, by)) if held.as_slice() == tuple => {
+            if *by != node {
+                findings.mismatches.push(Mismatch::SourceDuplicate {
+                    nodes: [(*by).min(node), (*by).max(node)],
                     tuple: tuple.to_vec(),
-                }),
-                _ => findings.mismatches.push(Mismatch::Missing {
-                    node,
-                    valid_from,
-                    tuple: tuple.to_vec(),
-                }),
+                });
+                *by = node;
             }
         }
-        match stored_holder {
-            Some(None) => findings.mismatches.push(Mismatch::Extra {
-                node: u64::MAX,
-                valid_from: None,
-                tuple: tuple.to_vec(),
-            }),
-            Some(Some(h)) if !holds(h) => findings.mismatches.push(Mismatch::Extra {
-                node: h,
-                valid_from: None,
-                tuple: tuple.to_vec(),
-            }),
-            _ => {}
-        }
+        _ => *last = Some((tuple.to_vec(), node)),
     }
 }
 

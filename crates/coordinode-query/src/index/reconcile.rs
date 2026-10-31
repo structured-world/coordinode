@@ -323,12 +323,6 @@ impl Fold<'_> {
                 if def.index_type == IndexType::Labels && !folded.has_parts_for(part.label) {
                     settle_count(self.engine, &mut txn, part)?;
                 }
-                // Values are claimed only while the index keeps parts: with
-                // the last one gone, no writer claims, and one bound to the
-                // definition before is refused at its commit.
-                if def.unique && folded.selection.is_empty() {
-                    store.clear_unique_claims_txn(&mut txn, def.id)?;
-                }
                 store.put_definition_txn(&mut txn, &folded)?;
                 next_def = Some(folded);
             }

@@ -10,7 +10,7 @@ use std::time::Duration;
 use coordinode_core::graph::node::NodeRecord;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::{IndexInterpretation, KEY_CODEC, PropertyRef, entry};
-use coordinode_core::index::encoding::{encode_tuple, unique_entries_prefix};
+use coordinode_core::index::encoding::{encode_tuple, entries_prefix};
 use coordinode_core::index::identity::GenerationId;
 use coordinode_core::txn::proposal::{
     DerivedIndexWork, DerivedSource, IndexBinding, Mutation, PartitionId, ProposalError,
@@ -144,7 +144,6 @@ fn claim(node_id: u64, email: &str) -> (Vec<u8>, Vec<u8>) {
     let tuple = encode_tuple(&[Value::String(email.into())]).expect("tuple");
     entry(
         EMAIL,
-        true,
         &tuple,
         coordinode_core::index::derive::EntryOwner::node(node_id),
     )
@@ -187,7 +186,7 @@ fn write_email(
 
 /// Every entry of the index a member holds.
 fn entries(engine: &StorageEngine) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let prefix = unique_entries_prefix(EMAIL);
+    let prefix = entries_prefix(EMAIL);
     engine
         .prefix_scan(Partition::Idx, &prefix)
         .expect("scan")

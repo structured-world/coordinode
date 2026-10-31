@@ -360,9 +360,10 @@ fn compound_entries_are_told_apart_by_every_column() {
     );
 }
 
-/// Clearing a generation in a transaction removes every entry of it, in
-/// both shapes, and no entry of another generation, the neighbouring
-/// numbers included, when the transaction commits and not before.
+/// Clearing a generation in a transaction removes every entry of it, a
+/// unique index's included (one shape for both), and no entry of another
+/// generation, the neighbouring numbers included, when the transaction
+/// commits and not before.
 #[test]
 fn clearing_a_generation_removes_its_entries_only() {
     let fx = open_engine();
@@ -383,9 +384,10 @@ fn clearing_a_generation_removes_its_entries_only() {
     let mut clear = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     store.clear_txn(&mut clear, plain.generation).unwrap();
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    // The two indexes share the generation, so their entries are one range.
     assert_eq!(
         store.scan_entry_ids(&mut t, &plain).unwrap(),
-        vec![id(1)],
+        vec![id(1), id(2)],
         "nothing is removed before the commit"
     );
     commit(&mut clear).unwrap();

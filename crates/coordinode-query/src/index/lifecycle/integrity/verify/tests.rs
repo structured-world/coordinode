@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::encoding::{encode_entry_key, encode_tuple, encode_unique_entry_key};
+use coordinode_core::index::encoding::{encode_entry_key, encode_tuple};
 use coordinode_modality::{
     IndexStore as _, LocalIndexStore, LocalNodeStore, Mismatch, NodeStore as _,
 };
@@ -163,9 +163,8 @@ fn sorted(mut mismatches: Vec<Mismatch>) -> Vec<Mismatch> {
 }
 
 /// Damage both indexes every way an entry can be wrong, and return what a
-/// check must find: entries missing, entries no record holds, a unique entry
-/// naming the wrong holder or none that decodes, and two records holding
-/// one unique value.
+/// check must find: entries missing, entries no record holds, a unique value
+/// held by the wrong owner's entry, and two records holding one unique value.
 fn damage(s: &Store) -> (Vec<Mismatch>, Vec<Mismatch>) {
     let engine = &s.env.engine;
     // Raw state planted under the stores, as a defect would leave it.
@@ -180,25 +179,22 @@ fn damage(s: &Store) -> (Vec<Mismatch>, Vec<Mismatch>) {
     engine
         .put(idx, &encode_entry_key(city, &ghost, 999), &[])
         .expect("plant");
-    // Unique: user 5's entry lost; user 6's value naming user 7; user 8's
-    // value naming no node that decodes.
+    // Unique: user 5's entry lost; user 6's value held by user 7's entry
+    // instead of its own.
     let u5 = string_tuple("u5@x");
     engine
-        .delete(idx, &encode_unique_entry_key(email, &u5))
+        .delete(idx, &encode_entry_key(email, &u5, 5))
         .expect("lose");
     let u6 = string_tuple("u6@x");
     engine
-        .put(
-            idx,
-            &encode_unique_entry_key(email, &u6),
-            &7u64.to_be_bytes(),
-        )
-        .expect("misattribute");
-    let u8 = string_tuple("u8@x");
+        .delete(idx, &encode_entry_key(email, &u6, 6))
+        .expect("lose");
     engine
-        .put(idx, &encode_unique_entry_key(email, &u8), &[1, 2, 3])
-        .expect("garble");
-    // Records: user 50 takes user 9's email behind the index's back.
+        .put(idx, &encode_entry_key(email, &u6, 7), &[])
+        .expect("misattribute");
+    // Records: user 50 takes user 9's email behind the index's back. The
+    // pair breaks the constraint, and user 50's entry is missing too: a
+    // repair names the pair instead of writing it.
     user(&s.env, 50, "u9@x");
     let u9 = string_tuple("u9@x");
     let c50 = string_tuple("c1");
@@ -219,14 +215,9 @@ fn damage(s: &Store) -> (Vec<Mismatch>, Vec<Mismatch>) {
             tuple: u6,
         },
         Mismatch::Missing {
-            node: 8,
+            node: 50,
             valid_from: None,
-            tuple: u8.clone(),
-        },
-        Mismatch::Extra {
-            node: u64::MAX,
-            valid_from: None,
-            tuple: u8,
+            tuple: u9.clone(),
         },
         Mismatch::SourceDuplicate {
             nodes: [9, 50],

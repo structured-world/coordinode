@@ -535,11 +535,11 @@ fn late_finalize_behind_a_flushed_newer_commit_survives_a_crash() {
 /// and nothing is stored under a generation's own number.
 #[test]
 fn an_index_entry_and_its_new_binding_lost_to_a_crash_are_replayed() {
-    use coordinode_core::index::encoding::encode_unique_entry_key;
+    use coordinode_core::index::encoding::encode_entry_key;
     use coordinode_core::index::identity::GenerationId;
     let rig = PowerRig::new();
-    let early = encode_unique_entry_key(GenerationId::from_raw(40), b"\x40a\x00");
-    let late = encode_unique_entry_key(GenerationId::from_raw(41), b"\x40b\x00");
+    let early = encode_entry_key(GenerationId::from_raw(40), b"\x40a\x00", 1);
+    let late = encode_entry_key(GenerationId::from_raw(41), b"\x40b\x00", 2);
     let put = |key: &[u8], value: &[u8]| Mutation::Put {
         partition: PartitionId::Idx,
         key: key.to_vec(),

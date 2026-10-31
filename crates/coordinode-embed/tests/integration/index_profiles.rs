@@ -7,9 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::encoding::{
-    GENERATION_PREFIX_LEN, entries_prefix, unique_entries_prefix,
-};
+use coordinode_core::index::encoding::{GENERATION_PREFIX_LEN, entries_prefix};
 use coordinode_core::index::identity::GenerationId;
 use coordinode_core::txn::proposal::DerivedIndexWork;
 use coordinode_embed::Database;
@@ -31,13 +29,9 @@ fn generation(db: &Database, name: &str) -> GenerationId {
         .generation
 }
 
-/// The key prefixes of the index `name`: its non-unique and unique entries.
-fn prefixes(db: &Database, name: &str) -> [[u8; GENERATION_PREFIX_LEN]; 2] {
-    let generation = generation(db, name);
-    [
-        entries_prefix(generation),
-        unique_entries_prefix(generation),
-    ]
+/// The key prefixes of the index `name`'s entries.
+fn prefixes(db: &Database, name: &str) -> [[u8; GENERATION_PREFIX_LEN]; 1] {
+    [entries_prefix(generation(db, name))]
 }
 
 /// Every entry of the index `name`, keys and values, in key order.

@@ -1160,8 +1160,9 @@ fn a_unique_value_taken_on_both_sides_of_a_change_is_held_once() {
 /// and both committed.
 #[test]
 fn a_unique_value_taken_on_both_sides_after_the_proof_is_held_once() {
+    use coordinode_core::graph::types::Value;
     use std::sync::mpsc;
-    let (mut db, _dir) = open();
+    let (mut db, dir) = open();
     for ddl in [
         "CREATE NODE TYPE Thing WITH (title: STRING)",
         "CREATE NODE TYPE Task WITH (title: STRING)",
@@ -1193,29 +1194,47 @@ fn a_unique_value_taken_on_both_sides_after_the_proof_is_held_once() {
 
     let thing = db.begin_transaction().expect("begin");
     let task_tx = db.begin_transaction().expect("begin");
-    let thing_ok = db
-        .execute_in_transaction(thing, "CREATE (:Thing {title: 'v'})", None)
-        .is_ok();
-    let task_ok = db
-        .execute_in_transaction(task_tx, "CREATE (:Task {title: 'v'})", None)
-        .is_ok();
-    let thing_committed = thing_ok && db.commit_transaction(thing).is_ok();
-    let task_committed = task_ok && db.commit_transaction(task_tx).is_ok();
+    // Both statements stage their entries, each from a view without the
+    // other; the first commit is admitted and the second refused as a write
+    // conflict on the value's ownership revision, which the attempt may
+    // retry.
+    db.execute_in_transaction(thing, "CREATE (:Thing {title: 'v'})", None)
+        .expect("the thing stages the title");
+    db.execute_in_transaction(task_tx, "CREATE (:Task {title: 'v'})", None)
+        .expect("the task stages the title");
+    db.commit_transaction(thing)
+        .expect("the first commit is admitted");
+    match db.commit_transaction(task_tx) {
+        Err(DatabaseError::TransactionConflict { .. }) => {}
+        other => panic!("the second commit must be refused as a conflict: {other:?}"),
+    }
     resume.send(()).expect("resume");
 
-    let _ = db.await_schema(&published, WAIT).expect("await");
-    let in_force = user_named(&db, "Task").implies() == ["Thing"];
-    let holders = db
-        .execute_cypher("MATCH (n:Thing {title: 'v'}) RETURN n")
-        .expect("lookup")
-        .len();
+    // The change itself goes through: what the transactions left holds the
+    // title once under both interpretations.
+    let outcome = db.await_schema(&published, WAIT).expect("await");
     assert!(
-        !(thing_committed && task_committed),
-        "both holders committed (in force: {in_force}, {holders} things hold 'v')"
+        user_named(&db, "Task").implies() == ["Thing"],
+        "the change is put in force: {outcome:?}"
     );
-    assert!(holders <= 1, "{holders} things hold 'v'");
+    let titled = |db: &mut Database| -> Vec<String> {
+        db.execute_cypher("MATCH (n:Thing {title: 'v'}) RETURN labels(n)[0] AS kind")
+            .expect("lookup")
+            .iter()
+            .map(|row| match row.get("kind") {
+                Some(Value::String(kind)) => kind.clone(),
+                other => panic!("kind {other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(
+        titled(&mut db),
+        ["Thing"],
+        "the thing holds the title alone"
+    );
 
-    // Once the index keeps no parts, the claims written meanwhile are gone.
+    // Once the index keeps no parts, the title is held through one entry, by
+    // the thing, and a task taking it is refused for the uniqueness.
     use coordinode_modality::IndexStore as _;
     let deadline = std::time::Instant::now() + WAIT;
     while coordinode_modality::LocalIndexStore::new(db.engine())
@@ -1227,22 +1246,20 @@ fn a_unique_value_taken_on_both_sides_after_the_proof_is_held_once() {
         assert!(std::time::Instant::now() < deadline, "parts left unfolded");
         std::thread::sleep(Duration::from_millis(10));
     }
-    let unique = coordinode_modality::LocalIndexStore::new(db.engine())
-        .list_definitions()
-        .expect("definitions")
-        .into_iter()
-        .find(|def| def.unique)
-        .expect("the unique index");
-    let prefix = coordinode_core::index::encoding::unique_claims_prefix(unique.id.as_raw());
-    let left = db
-        .engine()
-        .prefix_scan(
-            coordinode_storage::engine::partition::Partition::Idx,
-            &prefix,
-        )
-        .expect("scan")
-        .count();
-    assert_eq!(left, 0, "claims left after the fold");
+    match db.execute_cypher("CREATE (:Task {title: 'v'})") {
+        Err(DatabaseError::UniqueViolation { .. }) => {}
+        other => panic!("a task taking the title is a duplicate now: {other:?}"),
+    }
+    assert_eq!(titled(&mut db), ["Thing"], "and after the refusal");
+
+    // A reopened store holds the same: one owner, and the title still taken.
+    drop(db);
+    let mut db = Database::open(dir.path()).expect("reopen");
+    assert_eq!(titled(&mut db), ["Thing"], "after a reopen");
+    match db.execute_cypher("CREATE (:Thing {title: 'v'})") {
+        Err(DatabaseError::UniqueViolation { .. }) => {}
+        other => panic!("the title stays taken after a reopen: {other:?}"),
+    }
 }
 
 /// The schema of label `name` as the catalog holds it.

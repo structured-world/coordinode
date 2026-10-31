@@ -173,16 +173,17 @@ fn generations_are_disjoint() {
         }
     }
     let g = generation(5);
-    let unique = encode_unique_entry_key(g, &value);
-    assert!(!unique.starts_with(&entries_prefix(g)));
-    let [(start, end), (ustart, uend), (lstart, lend)] = generation_ranges(g);
+    let [(start, end), (lstart, lend)] = generation_ranges(g);
     let entry = encode_entry_key(g, &value, 1);
     assert!(start <= entry && entry < end);
-    assert!(ustart <= unique && unique < uend);
     let posting = encode_label_posting(g, 1, lid(2), 3);
     assert!(lstart.as_slice() <= posting.as_slice() && posting.as_slice() < lend.as_slice());
     assert!(!(start.as_slice() <= posting.as_slice() && posting.as_slice() < end.as_slice()));
-    assert!(!(ustart.as_slice() <= posting.as_slice() && posting.as_slice() < uend.as_slice()));
+    // The claim on a value is no key of any generation: clearing one keeps it.
+    let claim = encode_unique_claim_key(5, &value);
+    for (start, end) in generation_ranges(g) {
+        assert!(!(start <= claim && claim < end));
+    }
 }
 
 /// A label posting names its shard, label and node, decodes back to them in
@@ -241,7 +242,7 @@ fn label_postings_round_trip_and_sort_by_label_then_node() {
 /// The last generation's ranges still end: the range end steps the tag.
 #[test]
 fn the_last_generation_has_a_range_end() {
-    let [(start, end), _, (lstart, lend)] = generation_ranges(generation(u64::MAX));
+    let [(start, end), (lstart, lend)] = generation_ranges(generation(u64::MAX));
     assert!(lstart < lend, "the last generation's postings too");
     assert!(start < end);
     let key = encode_entry_key(generation(u64::MAX), &enc(Value::Int(1)), 1);
@@ -268,10 +269,6 @@ fn scan_prefixes_follow_the_structure() {
             entry_value_prefix(g, &tuple).as_slice()
         ]
     );
-
-    let unique = encode_unique_entry_key(g, &tuple);
-    let prefixes: Vec<&[u8]> = entry_scan_prefixes(&unique).expect("an entry").collect();
-    assert_eq!(prefixes, vec![&unique_entries_prefix(g)[..]]);
 
     let posting = encode_label_posting(g, 0x3A00, lid(0x003A_3A00), 0x3A);
     let prefixes: Vec<&[u8]> = entry_scan_prefixes(&posting).expect("a posting").collect();

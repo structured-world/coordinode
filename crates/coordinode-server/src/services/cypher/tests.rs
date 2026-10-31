@@ -3405,7 +3405,7 @@ fn a_write_to_a_follower_is_a_redirect_with_the_leader_named() {
 /// memory limit the request names, far below the label's size.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replicated_lookup_through_a_wrong_entry_answers_within_the_request_limit() {
-    use coordinode_core::index::encoding::{encode_tuple, encode_unique_entry_key};
+    use coordinode_core::index::encoding::{encode_entry_key, encode_tuple};
     use coordinode_modality::{IndexStore as _, LocalIndexStore};
     use coordinode_storage::engine::partition::Partition;
 
@@ -3450,13 +3450,20 @@ async fn a_replicated_lookup_through_a_wrong_entry_answers_within_the_request_li
             .and_then(|id| store.load_definition(id).expect("load"))
             .expect("index");
         let tuple = encode_tuple(&[Value::String("a@x".into())]).expect("tuple");
+        let id = |node: i64| u64::try_from(node).expect("id");
+        engine
+            .delete(
+                Partition::Idx,
+                &encode_entry_key(index.generation, &tuple, id(owner)),
+            )
+            .expect("the owner's entry lost");
         engine
             .put(
                 Partition::Idx,
-                &encode_unique_entry_key(index.generation, &tuple),
-                &u64::try_from(wrong).expect("id").to_be_bytes(),
+                &encode_entry_key(index.generation, &tuple, id(wrong)),
+                b"",
             )
-            .expect("an entry naming the wrong node");
+            .expect("the wrong node's entry in its place");
     }
 
     let lookup = "MATCH (u:U {email: 'a@x'}) RETURN id(u) AS id";

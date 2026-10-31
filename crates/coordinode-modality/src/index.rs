@@ -34,9 +34,8 @@ use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::{EntryOwner, entry, membership_effects, tuples};
 use coordinode_core::index::encoding::{
-    decode_entry, decode_entry_parts, decode_unique_entry_tuple, encode_element, encode_tuple,
-    encode_unique_entry_key, entries_prefix, entry_value_prefix, generation_ranges,
-    unique_entries_prefix,
+    decode_entry, decode_entry_parts, encode_element, encode_tuple, encode_unique_claim_key,
+    entries_prefix, entry_value_prefix, generation_ranges,
 };
 use coordinode_core::index::identity::IdentityAllocator;
 use coordinode_core::schema::label_id::LabelId;
@@ -237,9 +236,6 @@ pub struct StoredEntryPage {
 /// write: what a repair conditions its commit on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatestEntry {
-    /// The holder a unique entry names (`None` when it does not decode);
-    /// always `None` for a non-unique entry.
-    pub holder: Option<NodeId>,
     /// The version of the write that left it.
     pub version: u64,
 }
@@ -257,13 +253,15 @@ pub trait IndexStore {
     /// stages the entries as writes the unit logs; a DERIVED one stages them
     /// for this transaction's reads and conflicts, and the unit logs the
     /// change sealed under `index`'s binding, with property field ids from
-    /// `field_of`. A unique entry is removed only while the owner's node
-    /// holds it; for a unique value the caller has checked
+    /// `field_of`. Every entry is keyed by its owner, in a unique index too;
+    /// a unique index also advances the ownership revision of each value the
+    /// owner takes or leaves, so two transactions changing who holds one
+    /// value meet there. For a unique value the caller has checked
     /// [`Self::unique_conflict`] first. Returns how many entries were put.
     ///
     /// # Errors
     ///
-    /// A storage failure or an undecodable unique entry.
+    /// A storage failure.
     fn stage_membership(
         &self,
         txn: &mut Transaction,
@@ -274,12 +272,12 @@ pub trait IndexStore {
         new: Option<&[Value]>,
     ) -> StoreResult<usize>;
 
-    /// The node other than `node_id` that holds one of the entries `values`
-    /// would take in the unique `index`, as the transaction sees it.
+    /// A node other than `node_id` with an entry holding one of the values
+    /// `values` would take in the unique `index`, as the transaction sees it.
     ///
     /// # Errors
     ///
-    /// A storage failure or an undecodable entry.
+    /// A storage failure.
     fn unique_conflict(
         &self,
         txn: &mut Transaction,
@@ -287,33 +285,6 @@ pub trait IndexStore {
         values: &[Value],
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>>;
-
-    /// Write the logical claim on each value of `values` in the unique
-    /// index `index` in `txn`, whatever part of the index the value is kept
-    /// in: a second transaction taking one of them in another part, from a
-    /// view without this one, is refused at whichever commit comes second.
-    /// The claims stay until [`Self::clear_unique_claims_txn`] takes them out
-    /// once the index keeps no parts.
-    ///
-    /// # Errors
-    ///
-    /// A storage failure.
-    fn claim_unique_values_txn(
-        &self,
-        txn: &mut Transaction,
-        index: &IndexDefinition,
-        values: &[Value],
-    ) -> StoreResult<()>;
-
-    /// Take out every claim [`Self::claim_unique_values_txn`] wrote for the
-    /// index `index`: what the commit dropping its last part does, after
-    /// which no writer claims, and one still bound to the definition before
-    /// is refused at its commit.
-    ///
-    /// # Errors
-    ///
-    /// A storage failure.
-    fn clear_unique_claims_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()>;
 
     /// [`Self::unique_conflict`] against the latest committed state, outside
     /// any transaction. Tells a transaction that lost a race for a value
@@ -970,22 +941,21 @@ pub trait IndexStore {
         limit: usize,
     ) -> StoreResult<StoredEntryPage>;
 
-    /// The holder the unique entry of `tuple` in `index` names, as `txn`
-    /// sees it: `None` when there is no entry, `Some(None)` when its holder
-    /// does not decode. Untracked.
+    /// The nodes with an entry holding `tuple` in `index`, as `txn` sees
+    /// them, each once, in id order. Untracked.
     ///
     /// # Errors
     ///
     /// A storage failure.
-    fn unique_holder(
+    fn holders(
         &self,
         txn: &Transaction,
         index: &IndexDefinition,
         tuple: &[u8],
-    ) -> StoreResult<Option<Option<NodeId>>>;
+    ) -> StoreResult<Vec<NodeId>>;
 
-    /// Whether the non-unique `index` has the entry of `owner` under
-    /// `tuple`, as `txn` sees it. Untracked.
+    /// Whether `index` has the entry of `owner` under `tuple`, as `txn`
+    /// sees it. Untracked.
     ///
     /// # Errors
     ///
@@ -999,8 +969,7 @@ pub trait IndexStore {
     ) -> StoreResult<bool>;
 
     /// The latest committed state of the entry `owner` holds under `tuple`
-    /// in `index` (for a unique index, the entry of `tuple` whoever it
-    /// names), with the version of its write; `None` when there is none.
+    /// in `index`, with the version of its write; `None` when there is none.
     ///
     /// # Errors
     ///
@@ -1074,14 +1043,39 @@ impl<'a> LocalIndexStore<'a> {
     }
 }
 
-fn decode_holder(bytes: &[u8]) -> StoreResult<NodeId> {
-    match <[u8; 8]>::try_from(bytes) {
-        Ok(raw) => Ok(NodeId::from_raw(u64::from_be_bytes(raw))),
-        Err(_) => Err(StoreError::Decode {
-            kind: "unique index entry",
-            message: format!("{} bytes, expected 8", bytes.len()),
-        }),
+/// Advance the ownership revision of every value of the unique `index` an
+/// owner moving from `old` to `new` takes or leaves. The owners of one value
+/// write different entry keys; this key is the one two transactions changing
+/// who holds the value both write, so one of them is refused at its commit
+/// whatever parts, generations or owners each wrote through. A taken value's
+/// revision is written, a left one's removed: no record of a value nobody
+/// holds is kept, and a removal meets a concurrent taking all the same.
+fn advance_ownership(
+    txn: &mut Transaction,
+    index: &IndexDefinition,
+    old: Option<&[Value]>,
+    new: Option<&[Value]>,
+) -> StoreResult<()> {
+    let before = old.map(tuples).unwrap_or_default();
+    let after = new.map(tuples).unwrap_or_default();
+    for tuple in &after {
+        if before.binary_search(tuple).is_err() {
+            txn.put(
+                Partition::Idx,
+                &encode_unique_claim_key(index.id.as_raw(), tuple),
+                &[],
+            )?;
+        }
     }
+    for tuple in &before {
+        if after.binary_search(tuple).is_err() {
+            txn.delete(
+                Partition::Idx,
+                &encode_unique_claim_key(index.id.as_raw(), tuple),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn encode<T: serde::Serialize>(what: &'static str, value: &T) -> StoreResult<Vec<u8>> {
@@ -1203,23 +1197,9 @@ impl IndexStore for LocalIndexStore<'_> {
         old: Option<&[Value]>,
         new: Option<&[Value]>,
     ) -> StoreResult<usize> {
-        let node_id = NodeId::from_raw(owner.node_id);
-        let mut effects = membership_effects(index.generation, index.unique, owner, old, new);
+        let effects = membership_effects(index.generation, owner, old, new);
         if index.unique {
-            // A value another node holds now (taken in this transaction) is
-            // not this node's to release.
-            let mut kept = Vec::with_capacity(effects.len());
-            for effect in effects {
-                let keep = effect.value.is_some()
-                    || match txn.get(Partition::Idx, &effect.key)? {
-                        Some(bytes) => decode_holder(&bytes)? == node_id,
-                        None => false,
-                    };
-                if keep {
-                    kept.push(effect);
-                }
-            }
-            effects = kept;
+            advance_ownership(txn, index, old, new)?;
         }
         let puts = effects.iter().filter(|e| e.value.is_some()).count();
         match index.maintenance.profile {
@@ -1242,33 +1222,6 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(puts)
     }
 
-    fn claim_unique_values_txn(
-        &self,
-        txn: &mut Transaction,
-        index: &IndexDefinition,
-        values: &[Value],
-    ) -> StoreResult<()> {
-        use coordinode_core::index::encoding::encode_unique_claim_key;
-        for tuple in tuples(values) {
-            // A write, not a delete: a delete of a key never written leaves no
-            // version the commit's conflict check can meet. The fold of the
-            // index's last part clears them.
-            txn.put(
-                Partition::Idx,
-                &encode_unique_claim_key(index.id.as_raw(), &tuple),
-                &[],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn clear_unique_claims_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()> {
-        use coordinode_core::index::encoding::{prefix_end, unique_claims_prefix};
-        let prefix = unique_claims_prefix(index.as_raw());
-        txn.remove_range(Partition::Idx, &prefix, &prefix_end(&prefix))?;
-        Ok(())
-    }
-
     fn unique_conflict(
         &self,
         txn: &mut Transaction,
@@ -1277,12 +1230,12 @@ impl IndexStore for LocalIndexStore<'_> {
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>> {
         for tuple in tuples(values) {
-            let key = encode_unique_entry_key(index.generation, &tuple);
-            if let Some(bytes) = txn.get(Partition::Idx, &key)? {
-                let holder = decode_holder(&bytes)?;
-                if holder != node_id {
-                    return Ok(Some(holder));
-                }
+            if let Some(holder) = self
+                .holders(txn, index, &tuple)?
+                .into_iter()
+                .find(|holder| *holder != node_id)
+            {
+                return Ok(Some(holder));
             }
         }
         Ok(None)
@@ -1295,11 +1248,13 @@ impl IndexStore for LocalIndexStore<'_> {
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>> {
         for tuple in tuples(values) {
-            let key = encode_unique_entry_key(index.generation, &tuple);
-            if let Some(bytes) = self.engine.get(Partition::Idx, &key)? {
-                let holder = decode_holder(&bytes)?;
-                if holder != node_id {
-                    return Ok(Some(holder));
+            let prefix = entry_value_prefix(index.generation, &tuple);
+            for guard in self.engine.prefix_scan(Partition::Idx, &prefix)? {
+                let (key, _) = guard.into_inner()?;
+                if let Some((holder, _)) = decode_entry(index.generation, &key)
+                    && holder != node_id.as_raw()
+                {
+                    return Ok(Some(NodeId::from_raw(holder)));
                 }
             }
         }
@@ -1318,17 +1273,6 @@ impl IndexStore for LocalIndexStore<'_> {
         };
         let id_bytes = core::mem::size_of::<NodeId>() as u64;
         let mut kept = budget.empty_charge();
-        if index.unique {
-            budget.work(1)?;
-            kept.grow(id_bytes)?;
-            let key = encode_unique_entry_key(index.generation, &tuple);
-            let holder = match txn.get(Partition::Idx, &key)? {
-                Some(bytes) => vec![decode_holder(&bytes)?],
-                None => Vec::new(),
-            };
-            kept.keep_until_query_ends();
-            return Ok(Some(holder));
-        }
         let prefix = entry_value_prefix(index.generation, &tuple);
         let mut out: Vec<NodeId> = Vec::new();
         txn.prefix_for_each(Partition::Idx, &prefix, budget, |key, _| {
@@ -1363,43 +1307,10 @@ impl IndexStore for LocalIndexStore<'_> {
         keys: &[&Value],
         budget: &coordinode_core::budget::QueryBudget,
     ) -> StoreResult<Vec<Option<Vec<NodeId>>>> {
-        if !index.unique {
-            let mut out = Vec::with_capacity(keys.len());
-            for key in keys {
-                out.push(self.scan_exact(txn, index, core::slice::from_ref(*key), budget)?);
-            }
-            return Ok(out);
-        }
-        // One entry key per value that has one; the rest have no answer.
-        let mut entry_keys: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
-        let mut slots: Vec<Option<usize>> = Vec::with_capacity(keys.len());
-        for key in keys {
-            match encode_tuple(core::slice::from_ref(*key)) {
-                Ok(tuple) => {
-                    slots.push(Some(entry_keys.len()));
-                    entry_keys.push(encode_unique_entry_key(index.generation, &tuple));
-                }
-                Err(_) => slots.push(None),
-            }
-        }
-        budget.work(entry_keys.len() as u64)?;
-        let id_bytes = core::mem::size_of::<NodeId>() as u64;
-        let mut kept = budget.empty_charge();
-        // At most one holder per entry read: the product fits in u64.
-        kept.grow(entry_keys.len() as u64 * id_bytes)?;
-        let borrowed: Vec<&[u8]> = entry_keys.iter().map(Vec::as_slice).collect();
-        let found = txn.multi_read_untracked(Partition::Idx, &borrowed)?;
         let mut out = Vec::with_capacity(keys.len());
-        for slot in slots {
-            out.push(match slot {
-                Some(at) => Some(match &found[at] {
-                    Some(bytes) => vec![decode_holder(bytes)?],
-                    None => Vec::new(),
-                }),
-                None => None,
-            });
+        for key in keys {
+            out.push(self.scan_exact(txn, index, core::slice::from_ref(*key), budget)?);
         }
-        kept.keep_until_query_ends();
         Ok(out)
     }
 
@@ -1412,11 +1323,7 @@ impl IndexStore for LocalIndexStore<'_> {
         after: Option<&[u8]>,
         limit: usize,
     ) -> StoreResult<Option<EntryPage>> {
-        let prefix = if index.unique {
-            unique_entries_prefix(index.generation)
-        } else {
-            entries_prefix(index.generation)
-        };
+        let prefix = entries_prefix(index.generation);
         // An element is self-delimiting and sorts in value order, so every
         // entry holding a value in [from, to) lies between the generation
         // prefix followed by each bound.
@@ -1427,10 +1334,8 @@ impl IndexStore for LocalIndexStore<'_> {
         }
         let page = txn.range_scan_paged(Partition::Idx, &start, &end, after, limit)?;
         let mut entries = Vec::with_capacity(page.rows.len());
-        for (key, value) in &page.rows {
-            if index.unique {
-                entries.push((decode_holder(value)?, None));
-            } else if let Some((id, valid_from)) = decode_entry(index.generation, key) {
+        for (key, _) in &page.rows {
+            if let Some((id, valid_from)) = decode_entry(index.generation, key) {
                 entries.push((NodeId::from_raw(id), valid_from));
             }
         }
@@ -1446,17 +1351,10 @@ impl IndexStore for LocalIndexStore<'_> {
         txn: &mut Transaction,
         index: &IndexDefinition,
     ) -> StoreResult<Vec<NodeId>> {
-        let prefix = if index.unique {
-            unique_entries_prefix(index.generation)
-        } else {
-            entries_prefix(index.generation)
-        };
-        let entries = txn.prefix_scan(Partition::Idx, &prefix)?;
+        let entries = txn.prefix_scan(Partition::Idx, &entries_prefix(index.generation))?;
         let mut out = Vec::with_capacity(entries.len());
-        for (key, value) in entries {
-            if index.unique {
-                out.push(decode_holder(&value)?);
-            } else if let Some((id, _)) = decode_entry(index.generation, &key) {
+        for (key, _) in entries {
+            if let Some((id, _)) = decode_entry(index.generation, &key) {
                 out.push(NodeId::from_raw(id));
             }
         }
@@ -2334,23 +2232,11 @@ impl IndexStore for LocalIndexStore<'_> {
         after: Option<&[u8]>,
         limit: usize,
     ) -> StoreResult<StoredEntryPage> {
-        let [plain, unique, _] = generation_ranges(index.generation);
-        let (start, end) = if index.unique { unique } else { plain };
+        let [(start, end), _] = generation_ranges(index.generation);
         let page = txn.range_scan_paged(Partition::Idx, &start, &end, after, limit)?;
         let mut entries = Vec::with_capacity(page.rows.len());
-        for (key, value) in &page.rows {
-            if index.unique {
-                if let Some(tuple) = decode_unique_entry_tuple(index.generation, key) {
-                    entries.push(StoredEntry {
-                        tuple: tuple.to_vec(),
-                        owner: decode_holder(value)
-                            .ok()
-                            .map(|holder| EntryOwner::node(holder.as_raw())),
-                    });
-                }
-            } else if let Some((tuple, node_id, valid_from)) =
-                decode_entry_parts(index.generation, key)
-            {
+        for (key, _) in &page.rows {
+            if let Some((tuple, node_id, valid_from)) = decode_entry_parts(index.generation, key) {
                 entries.push(StoredEntry {
                     tuple: tuple.to_vec(),
                     owner: Some(EntryOwner {
@@ -2367,16 +2253,23 @@ impl IndexStore for LocalIndexStore<'_> {
         })
     }
 
-    fn unique_holder(
+    fn holders(
         &self,
         txn: &Transaction,
         index: &IndexDefinition,
         tuple: &[u8],
-    ) -> StoreResult<Option<Option<NodeId>>> {
-        let key = encode_unique_entry_key(index.generation, tuple);
-        Ok(txn
-            .read_untracked(Partition::Idx, &key)?
-            .map(|bytes| decode_holder(&bytes).ok()))
+    ) -> StoreResult<Vec<NodeId>> {
+        let prefix = entry_value_prefix(index.generation, tuple);
+        let mut out: Vec<NodeId> = Vec::new();
+        for (key, _) in txn.prefix_scan(Partition::Idx, &prefix)? {
+            // A node's versions sort together, so one node is one run.
+            if let Some((id, _)) = decode_entry(index.generation, &key)
+                && out.last().map(|n| n.as_raw()) != Some(id)
+            {
+                out.push(NodeId::from_raw(id));
+            }
+        }
+        Ok(out)
     }
 
     fn has_entry(
@@ -2386,7 +2279,7 @@ impl IndexStore for LocalIndexStore<'_> {
         tuple: &[u8],
         owner: EntryOwner,
     ) -> StoreResult<bool> {
-        let key = entry(index.generation, false, tuple, owner).0;
+        let key = entry(index.generation, tuple, owner).0;
         Ok(txn.read_untracked(Partition::Idx, &key)?.is_some())
     }
 
@@ -2396,18 +2289,11 @@ impl IndexStore for LocalIndexStore<'_> {
         tuple: &[u8],
         owner: EntryOwner,
     ) -> StoreResult<Option<LatestEntry>> {
-        let key = entry(index.generation, index.unique, tuple, owner).0;
+        let key = entry(index.generation, tuple, owner).0;
         Ok(self
             .engine
             .get_versioned(Partition::Idx, &key)?
-            .map(|(bytes, version)| LatestEntry {
-                holder: if index.unique {
-                    decode_holder(&bytes).ok()
-                } else {
-                    None
-                },
-                version,
-            }))
+            .map(|(_, version)| LatestEntry { version }))
     }
 
     fn repair_entry_txn(
@@ -2419,14 +2305,26 @@ impl IndexStore for LocalIndexStore<'_> {
         present: bool,
         version: Option<u64>,
     ) -> StoreResult<()> {
-        let (key, value) = entry(index.generation, index.unique, tuple, owner);
+        let (key, value) = entry(index.generation, tuple, owner);
         // The condition before the write it guards: a direct-mode engine
         // decides a condition when it is stated.
         txn.expect_version(Partition::Idx, &key, version)?;
+        // An entry a repair gives back or takes out changes who holds the
+        // value, as a writer's would: it meets a writer taking the value at
+        // the value's ownership revision.
+        let claim = index
+            .unique
+            .then(|| encode_unique_claim_key(index.id.as_raw(), tuple));
         if present {
             txn.put(Partition::Idx, &key, &value)?;
+            if let Some(claim) = &claim {
+                txn.put(Partition::Idx, claim, &[])?;
+            }
         } else {
             txn.delete(Partition::Idx, &key)?;
+            if let Some(claim) = &claim {
+                txn.delete(Partition::Idx, claim)?;
+            }
         }
         Ok(())
     }
@@ -2453,8 +2351,7 @@ impl LocalIndexStore<'_> {
             )>,
         > + use<>,
     > {
-        let [plain, unique, _] = generation_ranges(index.generation);
-        let (prefix, _) = if index.unique { unique } else { plain };
+        let [(prefix, _), _] = generation_ranges(index.generation);
         let entries = self
             .engine
             .snapshot_prefix_iter(&snapshot, Partition::Idx, &prefix)?;

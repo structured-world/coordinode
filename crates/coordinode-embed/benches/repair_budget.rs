@@ -19,7 +19,7 @@
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::encoding::{encode_tuple, encode_unique_entry_key};
+use coordinode_core::index::encoding::{encode_entry_key, encode_tuple};
 use coordinode_embed::Database;
 use coordinode_embed::db::StatementOptions;
 use coordinode_modality::{IndexStore as _, LocalIndexStore};
@@ -133,7 +133,7 @@ fn main() {
         &nothing,
     );
 
-    // Before every run the entry for 'u7@x' names another node: the lookup
+    // Before every run 'u7@x' gets an entry of another node: the lookup
     // finds the index wrong and answers from the records. A check started by
     // an earlier run repairs the entry in the background, and may rebuild
     // the index into a new generation, so the entry is written afresh into
@@ -154,8 +154,8 @@ fn main() {
         db.engine()
             .put(
                 Partition::Idx,
-                &encode_unique_entry_key(index.generation, &tuple),
-                &wrong.to_be_bytes(),
+                &encode_entry_key(index.generation, &tuple, wrong),
+                b"",
             )
             .expect("misattribute");
     };

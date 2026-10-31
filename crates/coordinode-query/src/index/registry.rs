@@ -1809,9 +1809,9 @@ fn stage_scoped(
         let store = LocalIndexStore::new(staging.engine);
         // The scopes read below are read at this attempt's view: a holder
         // another attempt commits in one of them meanwhile is not seen
-        // there, and its entry key is not this one's. Both claim the value
-        // itself, so one of them is refused at its commit.
-        store.claim_unique_values_txn(txn, index, values)?;
+        // there, and its entry key is not this one's. Both advance the
+        // value's ownership revision as they stage it, so one of them is
+        // refused at its commit.
         let mut views: smallvec::SmallVec<[(GenerationId, bool); 4]> = smallvec::SmallVec::new();
         if carried.in_force {
             views.extend(
@@ -1902,7 +1902,9 @@ fn stage(
         needs_source_proof = staging.registry.is_some_and(|(r, armed)| {
             !r.use_copy(staging.engine, serving, armed) || r.is_suspect(serving)
         });
-        if let Some(holder) = store.unique_conflict(txn, index, values, node_id)? {
+        // Every other owner, not only the first: one whose entry turned out
+        // stale must not hide a real holder behind it.
+        for holder in other_holders(&store, txn, index, values, node_id)? {
             if holds_values_as(
                 staging.engine,
                 txn,
@@ -1916,16 +1918,8 @@ fn stage(
                 return Err(UniqueViolation::new(index, values, holder).into());
             }
             if let Some((registry, _)) = staging.registry {
-                for tuple in held_tuples(&store, txn, index, values, holder)? {
-                    registry.report_mismatch(
-                        staging.engine,
-                        index,
-                        Mismatch::Extra {
-                            node: holder.as_raw(),
-                            valid_from: None,
-                            tuple,
-                        },
-                    );
+                for stale in stale_entries(txn, index, values, holder)? {
+                    registry.report_mismatch(staging.engine, index, stale);
                 }
             }
             needs_source_proof = true;
@@ -1953,20 +1947,54 @@ fn stage(
     Ok(written)
 }
 
-/// The tuples of `values` whose unique entry in `index` names `holder`, as
-/// `txn` sees them.
-fn held_tuples(
+/// The nodes other than `node_id` with an entry under a tuple of `values` in
+/// `index`, as `txn` sees them, each once.
+fn other_holders(
     store: &LocalIndexStore<'_>,
     txn: &Transaction,
     index: &IndexDefinition,
     values: &[Value],
-    holder: NodeId,
-) -> Result<Vec<Vec<u8>>, StoreError> {
+    node_id: NodeId,
+) -> Result<Vec<NodeId>, StoreError> {
     use coordinode_core::index::derive::tuples;
+    let mut out: Vec<NodeId> = Vec::new();
+    for tuple in tuples(values) {
+        for holder in store.holders(txn, index, &tuple)? {
+            if holder != node_id && !out.contains(&holder) {
+                out.push(holder);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The entries `holder` has under the tuples of `values` in `index`, as
+/// `txn` sees them, each as the extra entry it is once the holder's record
+/// was found not to hold the value.
+fn stale_entries(
+    txn: &Transaction,
+    index: &IndexDefinition,
+    values: &[Value],
+    holder: NodeId,
+) -> Result<Vec<Mismatch>, StoreError> {
+    use coordinode_core::index::derive::tuples;
+    use coordinode_core::index::encoding::{decode_entry, entry_value_prefix};
     let mut out = Vec::new();
     for tuple in tuples(values) {
-        if store.unique_holder(txn, index, &tuple)? == Some(Some(holder)) {
-            out.push(tuple);
+        let prefix = entry_value_prefix(index.generation, &tuple);
+        for (key, _) in txn.prefix_scan(
+            coordinode_storage::engine::partition::Partition::Idx,
+            &prefix,
+        )? {
+            if let Some((node, valid_from)) = decode_entry(index.generation, &key)
+                && node == holder.as_raw()
+            {
+                out.push(Mismatch::Extra {
+                    node,
+                    valid_from,
+                    tuple: tuple.clone(),
+                });
+            }
         }
     }
     Ok(out)

@@ -1027,8 +1027,7 @@ fn prefix_scan_uses_extractor() {
 fn index_entry_scans_match_an_unfiltered_oracle() {
     use coordinode_core::graph::types::Value;
     use coordinode_core::index::encoding::{
-        encode_entry_key, encode_tuple, encode_unique_entry_key, entries_prefix,
-        entry_value_prefix, unique_entries_prefix,
+        encode_entry_key, encode_tuple, encode_unique_claim_key, entries_prefix, entry_value_prefix,
     };
     use coordinode_core::index::identity::GenerationId;
 
@@ -1070,11 +1069,20 @@ fn index_entry_scans_match_an_unfiltered_oracle() {
             engine
                 .put(Partition::Idx, &encode_entry_key(*g, tuple, node), b"")
                 .expect("put");
+            // A second owner of the value, and the value's ownership revision
+            // beside the entries: neither may hide an entry from a scan.
             engine
                 .put(
                     Partition::Idx,
-                    &encode_unique_entry_key(*g, tuple),
-                    &node.to_be_bytes(),
+                    &encode_entry_key(*g, tuple, node ^ 0xFF),
+                    b"",
+                )
+                .expect("put");
+            engine
+                .put(
+                    Partition::Idx,
+                    &encode_unique_claim_key(g.as_raw(), tuple),
+                    b"",
                 )
                 .expect("put");
         }
@@ -1107,7 +1115,6 @@ fn index_entry_scans_match_an_unfiltered_oracle() {
     for raw in [0, 2, 0x39, 0x3A, 0x3B, 0x1_00, 0x1_01, u64::MAX] {
         let g = GenerationId::from_raw(raw);
         probes.push(entries_prefix(g).to_vec());
-        probes.push(unique_entries_prefix(g).to_vec());
         for tuple in &tuples {
             probes.push(entry_value_prefix(g, tuple));
         }
@@ -1123,6 +1130,6 @@ fn index_entry_scans_match_an_unfiltered_oracle() {
     }
     assert_eq!(
         scan(&entries_prefix(GenerationId::from_raw(u64::MAX))).len(),
-        values.len()
+        2 * values.len()
     );
 }
