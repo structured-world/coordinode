@@ -515,6 +515,16 @@ impl Bindings {
                 if lo >= hi {
                     continue;
                 }
+                // A bound too short to hold a slot stands above every key of
+                // the installation once past its start.
+                if lo.len() < GENERATION_PREFIX_LEN && short_key_is_past(lo, &start) {
+                    continue;
+                }
+                let hi = if hi.len() < GENERATION_PREFIX_LEN {
+                    end.as_slice()
+                } else {
+                    hi
+                };
                 let logical_lo = if lo == start.as_slice() {
                     prefix(tag, generation)
                 } else {
@@ -574,7 +584,7 @@ impl Bindings {
                     piece: Piece::Domain {
                         generation,
                         lo: physical_lower(dlo, &start, tag, installation),
-                        hi: physical_upper(dhi, &end, tag, installation),
+                        hi: physical_upper(dhi, &start, &end, tag, installation),
                     },
                     logical_lo: owned(dlo),
                     logical_hi: owned(dhi),
@@ -622,13 +632,23 @@ fn owned(bound: Bound<&[u8]>) -> Bound<Vec<u8>> {
     }
 }
 
+/// Whether `key`, too short to hold a slot, sorts above every key of the
+/// slot whose prefix is `start`. It cannot start with that prefix, so it
+/// sorts below every such key when it sorts at or below `start`, and above
+/// every one otherwise: the least key above a prefix ending in `0xFF` drops
+/// that byte and raises the one before it.
+fn short_key_is_past(key: &[u8], start: &[u8]) -> bool {
+    key > start
+}
+
 /// The physical form of a lower bound inside one generation's range: the
 /// installation's own start when the bound is the range's start, else the
 /// bound key with its slot replaced (a key past the start carries the
-/// generation's whole prefix).
+/// generation's whole prefix). A bound too short to hold a slot stands below
+/// or above all the generation's keys.
 fn physical_lower(bound: Bound<&[u8]>, start: &[u8], tag: u8, installation: u64) -> Bound<Vec<u8>> {
     let translate = |key: &[u8]| {
-        if key.len() < GENERATION_PREFIX_LEN || key <= start {
+        if key <= start {
             prefix(tag, installation)
         } else {
             let mut out = Vec::with_capacity(key.len());
@@ -637,6 +657,13 @@ fn physical_lower(bound: Bound<&[u8]>, start: &[u8], tag: u8, installation: u64)
         }
     };
     match bound {
+        Bound::Included(k) | Bound::Excluded(k) if k.len() < GENERATION_PREFIX_LEN => {
+            Bound::Included(if short_key_is_past(k, start) {
+                prefix_end(tag, installation)
+            } else {
+                prefix(tag, installation)
+            })
+        }
         Bound::Included(k) => Bound::Included(translate(k)),
         Bound::Excluded(k) if k < start => Bound::Included(prefix(tag, installation)),
         Bound::Excluded(k) => Bound::Excluded(translate(k)),
@@ -646,14 +673,28 @@ fn physical_lower(bound: Bound<&[u8]>, start: &[u8], tag: u8, installation: u64)
 
 /// The physical form of an upper bound inside one generation's range: the
 /// installation's own end when the bound is the range's end, else the bound
-/// key with its slot replaced.
-fn physical_upper(bound: Bound<&[u8]>, end: &[u8], tag: u8, installation: u64) -> Bound<Vec<u8>> {
+/// key with its slot replaced. A bound too short to hold a slot stands below
+/// or above all the generation's keys.
+fn physical_upper(
+    bound: Bound<&[u8]>,
+    start: &[u8],
+    end: &[u8],
+    tag: u8,
+    installation: u64,
+) -> Bound<Vec<u8>> {
     let translate = |key: &[u8]| {
         let mut out = Vec::with_capacity(key.len());
         with_slot(key, installation, &mut out);
         out
     };
     match bound {
+        Bound::Included(k) | Bound::Excluded(k) if k.len() < GENERATION_PREFIX_LEN => {
+            Bound::Excluded(if short_key_is_past(k, start) {
+                prefix_end(tag, installation)
+            } else {
+                prefix(tag, installation)
+            })
+        }
         Bound::Excluded(k) if k >= end => Bound::Excluded(prefix_end(tag, installation)),
         Bound::Excluded(k) => Bound::Excluded(translate(k)),
         Bound::Included(k) => Bound::Included(translate(k)),

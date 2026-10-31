@@ -408,6 +408,80 @@ fn a_generation_without_an_installation_holds_nothing() {
     );
 }
 
+/// A generation whose id ends in `0xFF` bounds its prefix from above with a
+/// key shorter than a generation prefix: the trailing `0xFF` is dropped and
+/// the byte before it raised. A scan of the prefix and a range delete up to
+/// that bound read and remove that generation's entries alone, never its
+/// neighbours', and never try to rewrite a slot the bound does not hold.
+#[test]
+fn a_generation_ending_in_ff_is_bounded_by_a_short_key() {
+    let (engine, _dir) = open();
+    for generation in [254, 255, 256] {
+        engine
+            .put(Partition::Idx, &entry(0x01, generation, b"a"), b"")
+            .expect("put");
+    }
+    let prefix = entry(0x01, 255, b"");
+    // The least key above every key the prefix starts: the trailing 0xFF
+    // dropped, the byte before it raised.
+    let mut upper = prefix.clone();
+    upper.pop();
+    *upper.last_mut().expect("tag and slot") += 1;
+    assert!(upper.len() < prefix.len());
+
+    let scanned: Vec<Vec<u8>> = engine
+        .range_seekable(Partition::Idx, &prefix, &upper, engine.snapshot())
+        .expect("scan")
+        .map(|guard| guard.into_owned().expect("row").0)
+        .collect();
+    assert_eq!(scanned, vec![entry(0x01, 255, b"a")]);
+
+    engine
+        .remove_range(Partition::Idx, &prefix, &upper)
+        .expect("range delete");
+    assert_eq!(
+        logical_keys(&engine),
+        vec![entry(0x01, 254, b"a"), entry(0x01, 256, b"a")]
+    );
+}
+
+/// A bound too short to hold a slot maps to the whole slot it stands past,
+/// both ways: a logical range ending at the short bound above generation
+/// 255 is its installation's whole range, a stored range ending at the
+/// short bound above installation 255 is its generation's whole range, and
+/// a range starting at such a bound holds none of that slot.
+#[test]
+fn a_bound_too_short_for_a_slot_stands_past_the_whole_slot() {
+    let short_past = |id: u64| {
+        let mut key = prefix(0x01, id);
+        while key.last() == Some(&0xFF) {
+            key.pop();
+        }
+        *key.last_mut().expect("tag") += 1;
+        key
+    };
+    let b = bindings(&[(255, 7), (5, 255)]);
+    assert_eq!(
+        b.pieces(
+            Bound::Included(&prefix(0x01, 255)),
+            Bound::Excluded(&short_past(255))
+        ),
+        vec![Piece::Domain {
+            generation: 255,
+            lo: Bound::Included(prefix(0x01, 7)),
+            hi: Bound::Excluded(prefix(0x01, 8)),
+        }]
+    );
+    assert_eq!(
+        b.logical_ranges_until(&prefix(0x01, 255), short_past(255)),
+        vec![(prefix(0x01, 5), prefix(0x01, 6))]
+    );
+    assert!(
+        b.logical_ranges_until(&short_past(255), prefix(0x01, 256))
+            .is_empty()
+    );
+}
+
 /// A range delete spanning several generations removes each one's entries
 /// from its installation and leaves keys outside the range alone.
 #[test]
