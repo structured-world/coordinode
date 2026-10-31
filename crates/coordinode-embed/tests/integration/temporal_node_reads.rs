@@ -573,6 +573,47 @@ fn concurrent_takers_of_one_value_are_held_to_their_times() {
     }
 }
 
+/// A label carried by an ordinary type and by a temporal type implying it:
+/// the ordinary node holds its value at every instant, so a temporal node
+/// cannot take it over any interval, and an ordinary node cannot take a
+/// value a temporal node holds over some interval. Values the other kind
+/// does not hold are admitted to both.
+#[test]
+fn an_ordinary_holder_of_a_shared_label_holds_its_value_at_every_instant() {
+    let mut db = Database::open_in_memory().expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (name: STRING)",
+        "CREATE NODE TYPE Ev TEMPORAL IMPLIES (Thing) \
+         WITH (name: STRING, valid_from: INT, valid_to: INT)",
+        "CREATE CONSTRAINT thing_name FOR (n:Thing) REQUIRE n.name IS UNIQUE",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    let now = now_us();
+    let (a, b) = (now - 2 * YEAR, now - YEAR);
+    db.execute_cypher("CREATE (:Thing {name: 'plain'})")
+        .expect("an ordinary holder");
+    db.execute_cypher(&format!(
+        "CREATE (:Ev {{name: 'timed', valid_from: {a}, valid_to: {b}}})"
+    ))
+    .expect("a temporal holder");
+    refused_as_unique(
+        db.execute_cypher(&format!(
+            "CREATE (:Ev {{name: 'plain', valid_from: {a}, valid_to: {b}}})"
+        )),
+        "a temporal node over an ordinary holder's value",
+    );
+    refused_as_unique(
+        db.execute_cypher("CREATE (:Thing {name: 'timed'})"),
+        "an ordinary node over a temporal holder's value",
+    );
+    db.execute_cypher(&format!("CREATE (:Ev {{name: 'timed', valid_from: {b}}})"))
+        .expect("another temporal node after the first one's time");
+    db.execute_cypher("CREATE (:Thing {name: 'free'})")
+        .expect("a free value");
+}
+
 /// A correction stretching a version over another node's interval is
 /// refused and leaves both as they were; one ending it earlier is admitted
 /// and frees the value from then on. A deleted node's past holding stays,
