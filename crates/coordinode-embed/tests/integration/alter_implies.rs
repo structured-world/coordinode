@@ -404,27 +404,38 @@ fn a_change_waits_for_the_text_index_to_follow_it() {
         db.execute_cypher(ddl)
             .unwrap_or_else(|e| panic!("{ddl}: {e}"));
     }
-    let (preparing, began) = mpsc::channel();
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        /// The worker began preparing the index and is held there.
+        Preparing,
+        /// The ALTER returned.
+        Altered,
+    }
+    let (steps, step) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
+    let preparing = steps.clone();
     *coordinode_embed::text_worker::BEFORE_PREPARE.lock() = Some(Box::new(move || {
-        let _ = preparing.send(());
+        let _ = preparing.send(Step::Preparing);
         let _ = released.recv();
     }));
-    let (done, finished) = mpsc::channel();
     let alter = std::thread::spawn(move || {
         let altered = db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)");
-        let _ = done.send(());
+        let _ = steps.send(Step::Altered);
         (db, altered)
     });
-    began
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the worker begins preparing the index for the change");
+    // The ALTER returning first means the change went in force before the
+    // index was even prepared for it.
+    assert_eq!(
+        step.recv_timeout(Duration::from_secs(30)),
+        Ok(Step::Preparing),
+        "the change was put in force before the text index followed it"
+    );
     assert!(
         matches!(
-            finished.recv_timeout(Duration::from_millis(500)),
+            step.recv_timeout(Duration::from_millis(500)),
             Err(mpsc::RecvTimeoutError::Timeout)
         ),
-        "the change was put in force before the text index followed it"
+        "the change was put in force while the text index was being prepared"
     );
     release.send(()).expect("release the preparation");
     let (mut db, altered) = alter.join().expect("the ALTER thread");
