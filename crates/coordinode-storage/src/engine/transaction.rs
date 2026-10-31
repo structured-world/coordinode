@@ -1005,7 +1005,8 @@ impl<'a> Transaction<'a> {
         if self.oracle.is_none() {
             return Err(StorageError::NoCommitTimestamp);
         }
-        self.admit_staged(STAGED_WRITE + prefix.len() + value.len())?;
+        // The key the commit stores carries its timestamp after the prefix.
+        self.admit_staged(STAGED_WRITE + prefix.len() + size_of::<u64>() + value.len())?;
         self.stamped.insert((part, prefix.to_vec()), value.to_vec());
         Ok(())
     }
