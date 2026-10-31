@@ -61,7 +61,7 @@ pub enum Partition {
     /// checkpoint over the keyspace is the shard's retention floor.
     Registry,
 
-    /// `nodehist:` — the canonical history of temporal nodes: one
+    /// `nodehist:`: the canonical history of temporal nodes, one
     /// independent full record per assertion, keyed by the version it states
     /// and the commit that stated it. Application data, kept past the
     /// time-travel window.
