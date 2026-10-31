@@ -1388,6 +1388,98 @@ fn a_lost_binding_is_not_refounded_over_history() {
     );
 }
 
+/// The first history is journalled after the unit founding its domain, and
+/// the two land in different trees: the history's can reach the disk while
+/// the catalog's has not. A power cut at any write or sync of that tree's
+/// persist, or after it, leaves on reopen the history with the domain it
+/// was recorded under, never history without its domain, and the store
+/// takes history again under that same domain.
+#[test]
+fn a_power_cut_in_the_first_history_never_leaves_it_without_its_domain() {
+    use crate::engine::metadata::bound_deployment;
+    use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs};
+    let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
+    let mut reached = 0u64;
+    for cut in [
+        FaultOp::Open,
+        FaultOp::Write,
+        FaultOp::SyncAll,
+        FaultOp::SyncData,
+        FaultOp::Rename,
+    ] {
+        for k in 0.. {
+            let dir = TempDir::new().expect("temp dir");
+            let crash = Arc::new(CrashFs::new(StdFs));
+            let faults = Arc::new(FaultInjector::new());
+            let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
+            config.fs = Some(Arc::new(FaultFs::with_injector(
+                CrashFs::clone(&crash),
+                Arc::clone(&faults),
+            )));
+            let oracle = Arc::new(TimestampOracle::new());
+            // Journalled as an embedded store is: an acknowledged commit is
+            // durable in its journal.
+            let engine = StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("open");
+            commit_stamped(&engine, &oracle, b"h:1:").expect("first history");
+            let founded = bound_deployment(&engine)
+                .expect("binding")
+                .expect("founded");
+            // The history's tree is persisted alone, the catalog's left in
+            // memory; the power goes at the k-th operation of the kind on
+            // the history's files, and nothing past the last sync survives.
+            faults.arm(
+                FaultRule::new(cut, refuse)
+                    .on_path(Partition::NodeHistory.name())
+                    .skip(k),
+            );
+            let persisted = engine.persist_partition(Partition::NodeHistory);
+            for op in [
+                FaultOp::Open,
+                FaultOp::Write,
+                FaultOp::SyncAll,
+                FaultOp::SyncData,
+                FaultOp::Rename,
+            ] {
+                faults.arm(FaultRule::new(op, refuse));
+            }
+            drop(engine);
+            faults.clear();
+            crash.crash();
+
+            let engine =
+                StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("reopen");
+            assert_eq!(
+                stored_under(&engine, Partition::NodeHistory, b"h:").len(),
+                1,
+                "{cut:?} {k}: the acknowledged history was lost"
+            );
+            assert_eq!(
+                bound_deployment(&engine).expect("binding"),
+                Some(founded),
+                "{cut:?} {k}: the history's domain"
+            );
+            commit_stamped(&engine, &oracle, b"h:2:").expect("history again");
+            assert_eq!(
+                bound_deployment(&engine).expect("binding"),
+                Some(founded),
+                "{cut:?} {k}: later history keeps the domain"
+            );
+            if persisted.is_ok() {
+                // The cut lies past the persist's last operation of the kind.
+                break;
+            }
+            reached += 1;
+        }
+    }
+    assert!(reached > 0, "no operation of the history's persist was cut");
+}
+
 /// Concurrent first histories, each proposing its own candidate, bind one
 /// domain: every commit succeeds and the record stays the first one landed.
 #[test]
