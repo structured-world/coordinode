@@ -23,6 +23,11 @@ use super::{
     begin, cannot_move_here, is_contention, move_attempts, next_token, terminal_outcome, text,
 };
 
+/// The longest a certification waiting for search indexes sleeps without a
+/// change of what they hold: every change and the service's stop wake it
+/// sooner, so this only bounds a wake-up lost to a worker that failed.
+const SEARCH_RECHECK: core::time::Duration = core::time::Duration::from_secs(30);
+
 /// The labels a certification refuses, each with why, and the typed refusal
 /// that refused them all, when there is one.
 #[derive(Default)]
@@ -245,7 +250,11 @@ impl Shared {
         }
         .run(&mut |txn| env.commit_page(txn));
         match placed {
-            Ok(_) => Ok(Some(Refusals::default())),
+            // The candidates are put in force only once this member's search
+            // indexes answer readers of them: activation is what makes those
+            // readers, and an index not ready for them would answer by
+            // reading every node instead.
+            Ok(_) => Ok(self.await_search_prepared()?.then(Refusals::default)),
             Err(crate::index::build::BackfillError::Stopped) => Ok(None),
             Err(e) => Ok(Some(Refusals {
                 cause: e.cause(),
@@ -259,6 +268,61 @@ impl Shared {
                     })
                     .collect(),
             })),
+        }
+    }
+
+    /// Wait until every text and vector index of this member answers
+    /// readers of both the facts in force and the published candidates
+    /// (see [`crate::index::selection::prepared`]): the workers maintaining
+    /// them prepare each from the catalog, and every change of what one
+    /// holds wakes this wait. `false` when the process is closing.
+    fn await_search_prepared(&self) -> Result<bool, String> {
+        use crate::index::membership::{CatalogMembership, label_carriers_in};
+        use crate::index::selection::{BothCarriers, HeldChanges};
+        let env = self.env.as_ref();
+        let engine = env.engine();
+        let waits: [Option<&HeldChanges>; 2] = [
+            env.text_registry().map(|r| r.held_changes()),
+            env.vector_registry().map(|r| r.held_changes()),
+        ];
+        loop {
+            if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
+                return Ok(false);
+            }
+            // Read before what the indexes hold is: a change after the read
+            // ends the wait below.
+            let seen = waits.map(|w| w.map(HeldChanges::seen));
+            let (snapshot, _pin) = engine.pin_latest_snapshot();
+            let mut carriers = |label: &str| -> Result<BothCarriers, StoreError> {
+                Ok((
+                    label_carriers_in(engine, label, &mut CatalogMembership::at(engine, snapshot))?,
+                    label_carriers_in(
+                        engine,
+                        label,
+                        &mut CatalogMembership::candidates_at(engine, snapshot),
+                    )?,
+                ))
+            };
+            let unprepared = [
+                match env.text_registry() {
+                    Some(r) => r.unprepared(&mut carriers).map_err(text)?,
+                    None => Vec::new(),
+                },
+                match env.vector_registry() {
+                    Some(r) => r.unprepared(&mut carriers).map_err(text)?,
+                    None => Vec::new(),
+                },
+            ];
+            let Some(at) = unprepared.iter().position(|u| !u.is_empty()) else {
+                return Ok(true);
+            };
+            tracing::debug!(
+                indexes = ?unprepared[at],
+                "the change waits for search indexes to follow it"
+            );
+            if let (Some(changes), Some(seen)) = (waits[at], seen[at]) {
+                changes.wait_past(seen, SEARCH_RECHECK);
+            }
         }
     }
 

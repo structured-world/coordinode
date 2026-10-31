@@ -362,11 +362,23 @@ impl Worker {
                 let base_holds = held.base.as_ref() == Some(&in_force);
                 if candidate != in_force {
                     // A change is certified: the index keeps both.
-                    if !base_holds {
+                    let revision = if base_holds {
+                        revision
+                    } else {
+                        // Rebuilt under the facts in force, it follows the
+                        // change in this same pass: nothing else wakes the
+                        // worker for it, and the change waits for it.
                         self.rebuild_plain(def, property, &interner)?;
-                        continue;
-                    }
-                    if held.candidate != Some((candidate.clone(), true)) {
+                        match self.registry.held_at(&def.label, property) {
+                            Some((rebuilt, revision))
+                                if rebuilt.base.as_ref() == Some(&in_force) =>
+                            {
+                                revision
+                            }
+                            _ => continue,
+                        }
+                    };
+                    if held.candidate != Some((candidate.clone(), true)) || !base_holds {
                         self.prepare(def, property, (&in_force, &candidate), revision, &interner)?;
                     }
                     continue;
@@ -431,6 +443,8 @@ impl Worker {
         interner: &coordinode_core::graph::intern::FieldInterner,
     ) -> Result<(), String> {
         use coordinode_query::index::text_registry::for_each_rows_batch;
+        #[cfg(any(test, feature = "test-hooks"))]
+        before_prepare();
         // Not prepared until the pass below wrote every node.
         let begun =
             self.registry
@@ -548,6 +562,23 @@ impl Worker {
             }
         }
         (!failed).then_some(covered)
+    }
+}
+
+/// A step a test runs in the worker before it prepares an index for a
+/// change: what a test holding the preparation back installs.
+#[cfg(any(test, feature = "test-hooks"))]
+pub type PrepareHook = Box<dyn FnOnce() + Send>;
+
+/// The step [`PrepareHook`] names, taken by the next preparation.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static BEFORE_PREPARE: parking_lot::Mutex<Option<PrepareHook>> = parking_lot::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn before_prepare() {
+    let hook = BEFORE_PREPARE.lock().take();
+    if let Some(hook) = hook {
+        hook();
     }
 }
 

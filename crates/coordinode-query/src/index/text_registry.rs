@@ -107,6 +107,9 @@ pub struct TextIndexRegistry {
     revisions: core::sync::atomic::AtomicU64,
     /// The owned footprints the index files are charged to.
     footprints: coordinode_storage::engine::footprint::Footprints,
+    /// Moves whenever what an index holds changes or an index comes or
+    /// goes.
+    held_changes: crate::index::selection::HeldChanges,
 }
 
 /// The stored rows of one node, as a text index reads them.
@@ -418,7 +421,39 @@ impl TextIndexRegistry {
             coverage: RwLock::new(None),
             revisions: core::sync::atomic::AtomicU64::new(0),
             footprints: Default::default(),
+            held_changes: Default::default(),
         }
+    }
+
+    /// The changes of what the indexes hold, for a caller waiting for one
+    /// to hold an interpretation.
+    pub fn held_changes(&self) -> &crate::index::selection::HeldChanges {
+        &self.held_changes
+    }
+
+    /// The text indexes not yet answering readers of both the carriers in
+    /// force and those with every published candidate put in force, each
+    /// as `(label, property)`: `carriers` gives both for a label, read from
+    /// one catalog state.
+    ///
+    /// # Errors
+    ///
+    /// What `carriers` fails with.
+    pub fn unprepared<E>(
+        &self,
+        carriers: &mut impl FnMut(&str) -> Result<crate::index::selection::BothCarriers, E>,
+    ) -> Result<Vec<(String, String)>, E> {
+        let mut unprepared = Vec::new();
+        for def in self.definitions() {
+            let (in_force, candidate) = carriers(&def.label)?;
+            for property in &def.properties {
+                let held = self.held(&def.label, property).unwrap_or_default();
+                if !crate::index::selection::prepared(&held, &in_force, &candidate) {
+                    unprepared.push((def.label.clone(), property.clone()));
+                }
+            }
+        }
+        Ok(unprepared)
     }
 
     /// A revision no installation was given before.
@@ -813,6 +848,7 @@ impl TextIndexRegistry {
         if after != *held || rewrites {
             *held = after;
             *revision = self.next_revision();
+            self.held_changes.changed();
         }
         Ok(Some((outcome, *revision)))
     }
@@ -964,6 +1000,7 @@ impl TextIndexRegistry {
 
         // Store definition under the first property (canonical key for metadata lookup).
         defs.insert(canonical_key, def);
+        self.held_changes.changed();
         Ok(true)
     }
 
@@ -989,6 +1026,7 @@ impl TextIndexRegistry {
         if let Ok(mut defs) = self.definitions.write() {
             defs.remove(&canonical_key);
         }
+        self.held_changes.changed();
     }
 
     /// Get a handle to the text index for a (label, property) pair.

@@ -79,6 +79,9 @@ pub trait BuildEnvironment: Send + Sync {
     /// The full-text indexes this member keeps, `None` where it keeps none.
     fn text_registry(&self) -> Option<&TextIndexRegistry>;
 
+    /// The vector indexes this member keeps, `None` where it keeps none.
+    fn vector_registry(&self) -> Option<&crate::index::VectorIndexRegistry>;
+
     /// Commit one backfill page through the deployment's write path.
     ///
     /// # Errors
@@ -648,6 +651,13 @@ impl IndexBuildService {
             .stopping
             .store(true, core::sync::atomic::Ordering::Release);
         self.shared.env.registry().wake_reporters();
+        // A certification waiting for the search indexes ends its wait.
+        if let Some(text) = self.shared.env.text_registry() {
+            text.held_changes().changed();
+        }
+        if let Some(vector) = self.shared.env.vector_registry() {
+            vector.held_changes().changed();
+        }
         {
             // Under the lock the seat waiters check the flag with, so none
             // misses this wake.

@@ -851,6 +851,7 @@ version = "0.9.0"
 dependencies = [
  "chrono",
  "coordinode-core",
+ "coordinode-embed",
  "coordinode-lsm-tree",
  "coordinode-modality",
  "coordinode-query",

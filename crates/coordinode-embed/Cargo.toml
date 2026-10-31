@@ -25,6 +25,9 @@ replication = [
     "dep:tonic",
     "dep:prost",
 ]
+# Test builds only: steps a test runs inside the index workers. Never
+# enabled in a release build.
+test-hooks = []
 
 [dependencies]
 coordinode-core = { workspace = true }
@@ -64,6 +67,8 @@ uuid = { version = "1", features = ["v4"] }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
+# The crate's own tests pause its index workers.
+coordinode-embed = { path = ".", features = ["test-hooks"] }
 chrono = { workspace = true }
 # Failure injection into the text indexes this crate's tests drive.
 coordinode-search = { workspace = true, features = ["test-hooks"] }

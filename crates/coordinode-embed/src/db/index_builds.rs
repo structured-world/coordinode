@@ -8,7 +8,9 @@ use std::sync::Arc;
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::TimestampOracle;
-use coordinode_query::index::{BuildEnvironment, IndexRegistry, TextIndexRegistry};
+use coordinode_query::index::{
+    BuildEnvironment, IndexRegistry, TextIndexRegistry, VectorIndexRegistry,
+};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
 
@@ -23,6 +25,7 @@ pub(super) struct DatabaseBuilds {
     pub(super) fields: Arc<FieldDictionary>,
     pub(super) registry: Arc<IndexRegistry>,
     pub(super) text_registry: Arc<TextIndexRegistry>,
+    pub(super) vector_registry: Arc<VectorIndexRegistry>,
     pub(super) shard_id: u16,
 }
 
@@ -65,6 +68,10 @@ impl BuildEnvironment for DatabaseBuilds {
 
     fn text_registry(&self) -> Option<&TextIndexRegistry> {
         Some(&self.text_registry)
+    }
+
+    fn vector_registry(&self) -> Option<&VectorIndexRegistry> {
+        Some(&self.vector_registry)
     }
 
     fn commit_page(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError> {

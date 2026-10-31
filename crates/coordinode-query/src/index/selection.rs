@@ -51,6 +51,62 @@ impl Held {
     }
 }
 
+/// A label's carriers in force and with every published candidate put in
+/// force, of one catalog state.
+pub type BothCarriers = (Option<LabelCarriers>, Option<LabelCarriers>);
+
+/// Whether an index holding `held` answers readers of both `in_force` and
+/// `candidate`, the label's carriers before and after a change of what a
+/// type implies: always when the change leaves them alone, otherwise once
+/// it holds the facts in force and every stored node was written in the
+/// candidate's scope.
+pub fn prepared(
+    held: &Held,
+    in_force: &Option<LabelCarriers>,
+    candidate: &Option<LabelCarriers>,
+) -> bool {
+    in_force == candidate
+        || (held.base.as_ref() == Some(in_force)
+            && held
+                .candidate
+                .as_ref()
+                .is_some_and(|(c, prepared)| *prepared && c == candidate))
+}
+
+/// Counts the changes of what a registry's indexes hold, so a caller
+/// waiting for one to hold an interpretation sleeps until something
+/// changed rather than asking again on a timer.
+#[derive(Debug, Default)]
+pub struct HeldChanges {
+    count: parking_lot::Mutex<u64>,
+    changed: parking_lot::Condvar,
+}
+
+impl HeldChanges {
+    /// Record a change and wake every waiter.
+    pub fn changed(&self) {
+        let mut count = self.count.lock();
+        // One per change of an index, far below u64::MAX.
+        *count += 1;
+        self.changed.notify_all();
+    }
+
+    /// How many changes were recorded: the mark a wait starts from.
+    pub fn seen(&self) -> u64 {
+        *self.count.lock()
+    }
+
+    /// Wait until a change after `seen` is recorded, or `limit` passed;
+    /// returns the count then.
+    pub fn wait_past(&self, seen: u64, limit: core::time::Duration) -> u64 {
+        let mut count = self.count.lock();
+        if *count == seen {
+            self.changed.wait_for(&mut count, limit);
+        }
+        *count
+    }
+}
+
 /// How an index holding `held` answers a reader for whom the label's
 /// carriers are `reader`.
 pub fn answer(reader: Option<&LabelCarriers>, held: &Held) -> Answer {

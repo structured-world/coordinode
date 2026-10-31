@@ -52,6 +52,39 @@ impl VectorIndexRegistry {
         self.revisions.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// The changes of what the indexes hold, for a caller waiting for one
+    /// to hold an interpretation.
+    pub fn held_changes(&self) -> &crate::index::selection::HeldChanges {
+        &self.held_changes
+    }
+
+    /// The vector indexes with a record not yet answering readers of both
+    /// the carriers in force and those with every published candidate put
+    /// in force, each as `(label, property)`: `carriers` gives both for a
+    /// label, read from one catalog state. An index without a record is
+    /// filled by its own build, which reads the catalog as it then stands.
+    ///
+    /// # Errors
+    ///
+    /// What `carriers` fails with.
+    pub fn unprepared<E>(
+        &self,
+        carriers: &mut impl FnMut(&str) -> Result<crate::index::selection::BothCarriers, E>,
+    ) -> Result<Vec<(String, String)>, E> {
+        let mut unprepared = Vec::new();
+        for def in self.all_definitions() {
+            let property = def.property();
+            let Some(held) = self.held(&def.label, property) else {
+                continue;
+            };
+            let (in_force, candidate) = carriers(&def.label)?;
+            if !crate::index::selection::prepared(&held, &in_force, &candidate) {
+                unprepared.push((def.label.clone(), property.to_string()));
+            }
+        }
+        Ok(unprepared)
+    }
+
     /// The interpretations the index of `(label, property)` holds; `None`
     /// when nothing filled it under a recorded one.
     pub fn held(&self, label: &str, property: &str) -> Option<Held> {
@@ -83,6 +116,7 @@ impl VectorIndexRegistry {
                     moved: FxHashMap::default(),
                 },
             );
+        self.held_changes.changed();
     }
 
     /// Forget what the index of `(label, property)` was filled with: a new
@@ -92,6 +126,7 @@ impl VectorIndexRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
+        self.held_changes.changed();
     }
 
     /// Begin keeping the members of `candidate` beside those of `base`, the
@@ -124,6 +159,8 @@ impl VectorIndexRegistry {
         };
         selection.revision = next;
         selection.moved.clear();
+        drop(selections);
+        self.held_changes.changed();
         Some(next)
     }
 
@@ -159,13 +196,18 @@ impl VectorIndexRegistry {
         let Some(selection) = selections.get_mut(&(label.to_string(), property.to_string())) else {
             return false;
         };
-        match &mut selection.held.candidate {
+        let finished = match &mut selection.held.candidate {
             Some((_, prepared)) if selection.revision == revision => {
                 *prepared = true;
                 true
             }
             _ => false,
+        };
+        drop(selections);
+        if finished {
+            self.held_changes.changed();
         }
+        finished
     }
 
     /// Bring the index of `(label, property)` back to one interpretation,
@@ -199,6 +241,8 @@ impl VectorIndexRegistry {
             revision: next,
             moved: FxHashMap::default(),
         };
+        drop(selections);
+        self.held_changes.changed();
         true
     }
 

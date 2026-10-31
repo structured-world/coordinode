@@ -232,6 +232,10 @@ impl BuildEnvironment for TestEnv {
         None
     }
 
+    fn vector_registry(&self) -> Option<&crate::index::VectorIndexRegistry> {
+        None
+    }
+
     // The injected fault is a panic: what the executor must survive.
     #[allow(clippy::panic)]
     fn commit_page(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError> {

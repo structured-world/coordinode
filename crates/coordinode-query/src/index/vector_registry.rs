@@ -214,6 +214,8 @@ pub struct VectorIndexRegistry {
     /// Numbers each change of a record in [`Self::selections`], so a pass
     /// begun under one record never finishes under another.
     revisions: std::sync::atomic::AtomicU64,
+    /// Moves whenever a record in [`Self::selections`] changes.
+    held_changes: crate::index::selection::HeldChanges,
 }
 
 /// A running backfill: the flag that stops it and the thread to join.
@@ -268,6 +270,7 @@ impl VectorIndexRegistry {
             coverage: RwLock::new(None),
             selections: RwLock::new(HashMap::new()),
             revisions: std::sync::atomic::AtomicU64::new(0),
+            held_changes: Default::default(),
         }
     }
 
@@ -293,6 +296,7 @@ impl VectorIndexRegistry {
             coverage: RwLock::new(None),
             selections: RwLock::new(HashMap::new()),
             revisions: std::sync::atomic::AtomicU64::new(0),
+            held_changes: Default::default(),
         }
     }
 

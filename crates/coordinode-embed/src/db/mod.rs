@@ -1066,6 +1066,7 @@ impl Database {
                 fields: Arc::clone(&fields),
                 registry: Arc::clone(&index_registry),
                 text_registry: Arc::clone(&text_index_registry),
+                vector_registry: Arc::clone(&vector_index_registry),
                 shard_id: 1,
             }),
             coordinode_query::index::IndexBuildConfig::default(),

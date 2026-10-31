@@ -378,6 +378,79 @@ fn text_reads_across_a_change(task: &str, alter: &str, (then, now): (&[&str], &[
     }
 }
 
+/// A change of what a type implies is put in force only once the text index
+/// on the label answers readers of the new carriers itself. With the index's
+/// preparation held back, the ALTER does not complete; released, it does,
+/// and a search right after it is the index's own answer, matching an index
+/// that holds the new carriers alone. Before, the change went in force at
+/// once and the index, holding only the old carriers, answered new readers
+/// by reading every node of the store.
+#[test]
+fn a_change_waits_for_the_text_index_to_follow_it() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dirs = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let mut db = Database::open(dirs.0.path()).expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE TEXT INDEX thing_text ON :Thing(title)",
+        "CREATE (:Thing {title: 'rust graph'}), (:Task {title: 'rust rust tools'})",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    let (preparing, began) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    *coordinode_embed::text_worker::BEFORE_PREPARE.lock() = Some(Box::new(move || {
+        let _ = preparing.send(());
+        let _ = released.recv();
+    }));
+    let (done, finished) = mpsc::channel();
+    let alter = std::thread::spawn(move || {
+        let altered = db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)");
+        let _ = done.send(());
+        (db, altered)
+    });
+    began
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the worker begins preparing the index for the change");
+    assert!(
+        matches!(
+            finished.recv_timeout(Duration::from_millis(500)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the change was put in force before the text index followed it"
+    );
+    release.send(()).expect("release the preparation");
+    let (mut db, altered) = alter.join().expect("the ALTER thread");
+    altered.expect("alter");
+
+    let carriers = coordinode_query::index::membership::label_carriers(db.engine(), "Thing")
+        .expect("carriers");
+    let held = db
+        .text_index_registry()
+        .held("Thing", "title")
+        .expect("the index");
+    assert_ne!(
+        coordinode_query::index::selection::answer(carriers.as_ref(), &held),
+        coordinode_query::index::selection::Answer::Unable,
+        "right after the change the index answers its readers itself: {held:?}"
+    );
+    let mut now = things_holding(dirs.1.path(), &["rust graph", "rust rust tools"]);
+    for words in ["rust", "graph", "tools"] {
+        assert_same_hits(
+            &text_hits(&mut db, words, None),
+            &text_hits(&mut now, words, None),
+            &format!("{words} right after the change"),
+        );
+    }
+}
+
 /// The implication goes A→B→A: Task comes to imply Thing, stops, and comes
 /// to imply it again, each change folded before the next. After each one
 /// the label scan, its counter, a B-tree lookup and a full-text search all
