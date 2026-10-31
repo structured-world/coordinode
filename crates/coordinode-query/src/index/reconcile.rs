@@ -86,6 +86,11 @@ impl Reconcile<'_> {
         let mut start_after: Option<Vec<u8>> = None;
         let mut placed = 0u64;
         let mut conflicts = 0u32;
+        // The labels a node carries under each interpretation, reused from
+        // node to node: they grow to the widest closure once and allocate
+        // nothing after.
+        let mut now: Vec<LabelId> = Vec::new();
+        let mut then: Vec<LabelId> = Vec::new();
         loop {
             if self
                 .stop
@@ -152,10 +157,10 @@ impl Reconcile<'_> {
                         kind: "node labels",
                         message: format!("node {}: {e}", node.as_raw()),
                     })?;
-                let now: smallvec::SmallVec<[LabelId; 8]> =
-                    in_force.of_stored(&stored)?.iter().collect();
-                let then: smallvec::SmallVec<[LabelId; 8]> =
-                    candidate.of_stored(&stored)?.iter().collect();
+                now.clear();
+                now.extend(in_force.of_stored(&stored)?.iter());
+                then.clear();
+                then.extend(candidate.of_stored(&stored)?.iter());
                 if now.len() == then.len() && now.iter().all(|l| then.contains(l)) {
                     continue;
                 }

@@ -1376,39 +1376,40 @@ impl IndexStore for LocalIndexStore<'_> {
         limit: usize,
     ) -> StoreResult<bool> {
         use coordinode_core::index::encoding::GENERATION_PREFIX_LEN;
-        let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
-        // One entry past the limit tells whether the scope holds more.
-        let mut page: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for (start, end) in generation_ranges(part) {
-            txn.range_for_each(Partition::Idx, &start, &end, &budget, |key, value| {
-                page.push((key.to_vec(), value.to_vec()));
-                Ok::<_, StoreError>(if page.len() > limit {
-                    core::ops::ControlFlow::Break(())
-                } else {
-                    core::ops::ControlFlow::Continue(())
-                })
-            })?;
-            if page.len() > limit {
-                break;
+        // Streamed from the step's view straight into its writes: the step
+        // keeps no page of its own, only the one key it rewrites. The view
+        // holds none of the step's own writes, which come after the read.
+        let at = txn.snapshot().unwrap_or_else(|| self.engine.snapshot());
+        let base = base.as_raw().to_be_bytes();
+        let mut target: Vec<u8> = Vec::new();
+        let mut moved = 0usize;
+        // The entries are read without tracking, as the commit conflicts on
+        // the keys it writes: every writer changing an entry of the label
+        // after the change clears it from every scope, writing the source key
+        // too, so a move read before that write is refused at whichever
+        // commit comes second. The caller binds the definition version, which
+        // every step of the change and every later one moves.
+        for (prefix, _) in generation_ranges(part) {
+            for guard in self
+                .engine
+                .snapshot_prefix_iter(&at, Partition::Idx, &prefix)?
+            {
+                // One entry past the limit tells the scope holds more.
+                if moved == limit {
+                    return Ok(false);
+                }
+                let (key, value) = guard.into_inner()?;
+                txn.delete(Partition::Idx, &key)?;
+                target.clear();
+                target.extend_from_slice(&key);
+                // The shape tag, then the generation: the rest names the same
+                // entry.
+                target[1..GENERATION_PREFIX_LEN].copy_from_slice(&base);
+                txn.put(Partition::Idx, &target, &value)?;
+                moved += 1;
             }
         }
-        let empty = page.len() <= limit;
-        page.truncate(limit);
-        let base = base.as_raw().to_be_bytes();
-        // The page is read without tracking, as the commit conflicts on the
-        // keys it writes: every writer changing an entry of the label after
-        // the change clears it from every scope, writing the source key too,
-        // so a move read before that write is refused at whichever commit
-        // comes second. The caller binds the definition version, which every
-        // step of the change and every later one moves.
-        for (key, value) in page {
-            txn.delete(Partition::Idx, &key)?;
-            let mut moved = key;
-            // The shape tag, then the generation: the rest names the same entry.
-            moved[1..GENERATION_PREFIX_LEN].copy_from_slice(&base);
-            txn.put(Partition::Idx, &moved, &value)?;
-        }
-        Ok(empty)
+        Ok(true)
     }
 
     fn apply_unreplicated(&self, mutations: &[Mutation]) -> StoreResult<()> {
