@@ -1264,6 +1264,25 @@ impl LocalIndexStore<'_> {
         wanted: impl Fn(&SelectionPart) -> bool,
         budget: &coordinode_core::budget::QueryBudget,
     ) -> StoreResult<Vec<IndexDefinition>> {
+        self.definitions_where(|head| head.parts.iter().any(&wanted), budget)
+    }
+
+    /// The definitions `pick` chooses by their kind, label and parts
+    /// ([`crate::index_def::DefinitionHead`]), in identity order, read for
+    /// placement ([`IndexDefinition::for_placement_from_msgpack`]): of every
+    /// other definition only its kind, label and parts are decoded, the
+    /// label borrowed. Charged as [`Self::definitions_with_part`] charges.
+    /// Only a label lookup or a B-tree index, which have no vector or text
+    /// configuration, is whole once read this way.
+    ///
+    /// # Errors
+    ///
+    /// A storage or decode failure, or the budget's refusal.
+    pub fn definitions_where(
+        &self,
+        pick: impl Fn(&crate::index_def::DefinitionHead<'_>) -> bool,
+        budget: &coordinode_core::budget::QueryBudget,
+    ) -> StoreResult<Vec<IndexDefinition>> {
         let unreadable = |key: &[u8], e: rmp_serde::decode::Error| {
             StoreError::Storage(StorageError::UnreadableCatalog {
                 kind: "index definition",
@@ -1281,10 +1300,8 @@ impl LocalIndexStore<'_> {
                 IndexDefinition::selection_bound(&value).map_err(|e| unreadable(&key, e))?;
             // Bytes of memory about to exist: fits in u64.
             let looked_at = budget.reserve(bound as u64)?;
-            let parts =
-                IndexDefinition::selection_from_msgpack(&value).map_err(|e| unreadable(&key, e))?;
-            let picked = parts.iter().any(&wanted);
-            drop(parts);
+            let picked =
+                IndexDefinition::with_head(&value, &pick).map_err(|e| unreadable(&key, e))?;
             drop(looked_at);
             if !picked {
                 continue;

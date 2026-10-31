@@ -334,6 +334,53 @@ fn a_derived_unit_past_its_budget_is_refused_before_expanding() {
 /// combinations, tuples alone, would take more than this beside the noise.
 const ENGINE_NOISE: usize = 16 << 20;
 
+/// Publishing an implication change reads whole only the definitions on the
+/// labels it moves, and the lookup: three hundred large definitions on
+/// another label are passed over by their kind and label, their properties
+/// never decoded. Decoding the catalog whole first would allocate every
+/// one of them.
+#[test]
+fn publishing_a_change_passes_over_unrelated_definitions() {
+    use coordinode_modality::index_def::{GenerationId, IndexDescriptor, IndexId};
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let (engine, oracle, _dir) = engine();
+    let store = LocalIndexStore::new(&engine);
+    let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+    for n in 0..300u64 {
+        let def = IndexDescriptor::compound(
+            format!("other_{n}"),
+            "Other",
+            (0..40)
+                .map(|p| format!("property_{p:03}_{}", "x".repeat(100)))
+                .collect(),
+        )
+        .bind(IndexId::from_raw(n + 1), GenerationId::from_raw(n + 1));
+        store.put_definition_txn(&mut txn, &def).unwrap();
+    }
+    txn.commit(&coordinode_storage::engine::transaction::CommitContext {
+        write_concern: &coordinode_core::txn::write_concern::WriteConcern::majority(),
+        pipeline: None,
+        id_gen: None,
+    })
+    .unwrap();
+
+    let label = LabelId::new(5).unwrap();
+    let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+    let (proposed, allocated) = allocated_by(|| {
+        coordinode_query::index::reconcile::propose_parts_txn(
+            &engine,
+            &mut txn,
+            GenerationId::from_raw(10_000),
+            &[(label, "Task".to_string())],
+        )
+    });
+    proposed.expect("proposed");
+    assert!(
+        allocated < BESIDE_THE_ROWS * 2,
+        "{allocated} bytes allocated passing over the catalog"
+    );
+}
+
 /// Reporting a disagreement to an integrity record copies it only when the
 /// record keeps it: one already held, or one past the evidence the record
 /// keeps, allocates nothing, though the latter still moves the revision.

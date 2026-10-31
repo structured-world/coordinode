@@ -690,6 +690,7 @@ impl Database {
                 .submit(generation)
                 .map_err(DatabaseError::Other)?;
         }
+        let page_bytes = self.index_builds.config().maintenance_page_bytes;
         for operation in certifications {
             // This member's writers keep the parts the publication proposed
             // from the next write on.
@@ -697,6 +698,7 @@ impl Database {
                 &self.engine,
                 &self.index_registry,
                 operation,
+                &coordinode_core::budget::QueryBudget::new(page_bytes),
             )
             .map_err(ExecutionError::from)?;
             self.index_builds

@@ -91,7 +91,7 @@ fn a_conclusion_never_brings_back_parts_a_fold_dropped() {
     }));
 
     let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
-    stage_selection_conclusion(&engine, &mut txn, concluded, PartState::InForce)
+    stage_selection_conclusion(&engine, &mut txn, concluded, PartState::InForce, 1 << 20)
         .expect("stage the conclusion");
     assert!(AFTER_LISTING.lock().is_none(), "the fold ran in the window");
     assert!(
@@ -100,7 +100,7 @@ fn a_conclusion_never_brings_back_parts_a_fold_dropped() {
     );
     // The retry, as the certification runs it.
     let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
-    stage_selection_conclusion(&engine, &mut txn, concluded, PartState::InForce)
+    stage_selection_conclusion(&engine, &mut txn, concluded, PartState::InForce, 1 << 20)
         .expect("stage the conclusion again");
     commit(&mut txn).expect("the retry commits");
 

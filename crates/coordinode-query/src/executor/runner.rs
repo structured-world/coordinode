@@ -20924,7 +20924,7 @@ fn execute_alter_node_type_implies(
     if !affected.is_empty()
         && let Some(registry) = ctx.btree_index_registry
     {
-        crate::index::reconcile::register_parts_of(engine, registry, operation)?;
+        crate::index::reconcile::register_parts_of(engine, registry, operation, &ctx.budget)?;
     }
     // The statement's own transaction is open while it waits; having staged
     // nothing, it leaves the proof's wait for older transactions.

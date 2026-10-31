@@ -193,6 +193,89 @@ struct SelectionView {
     selection: Vec<SelectionPart>,
 }
 
+/// What a catalog walk looks at to pick a definition, read without the
+/// rest of it: its kind, its label and its parts.
+#[derive(Debug)]
+pub struct DefinitionHead<'a> {
+    /// The index's kind.
+    pub index_type: IndexType,
+    /// The label it covers, borrowed from the encoded record.
+    pub label: &'a str,
+    /// The parts it keeps.
+    pub parts: &'a [SelectionPart],
+}
+
+/// [`IndexDefinition`] as encoded, all but its kind, label and parts
+/// skipped.
+#[derive(Deserialize)]
+struct HeadView<'a> {
+    #[serde(rename = "id")]
+    _id: serde::de::IgnoredAny,
+    #[serde(rename = "generation")]
+    _generation: serde::de::IgnoredAny,
+    #[serde(borrow)]
+    descriptor: DescriptorHeadView<'a>,
+    selection: Vec<SelectionPart>,
+}
+
+/// [`IndexDescriptor`] as encoded, all but its label and kind skipped.
+#[derive(Deserialize)]
+struct DescriptorHeadView<'a> {
+    #[serde(rename = "name")]
+    _name: serde::de::IgnoredAny,
+    #[serde(rename = "description")]
+    _description: serde::de::IgnoredAny,
+    label: &'a str,
+    #[serde(rename = "properties")]
+    _properties: serde::de::IgnoredAny,
+    index_type: IndexType,
+    #[serde(rename = "unique")]
+    _unique: serde::de::IgnoredAny,
+    #[serde(rename = "sparse")]
+    _sparse: serde::de::IgnoredAny,
+    #[serde(rename = "multikey")]
+    _multikey: serde::de::IgnoredAny,
+    #[serde(rename = "filter")]
+    _filter: serde::de::IgnoredAny,
+    #[serde(rename = "ttl_seconds")]
+    _ttl_seconds: serde::de::IgnoredAny,
+    #[serde(rename = "vector_config")]
+    _vector_config: serde::de::IgnoredAny,
+    #[serde(rename = "text_config")]
+    _text_config: serde::de::IgnoredAny,
+    #[serde(rename = "state")]
+    _state: serde::de::IgnoredAny,
+    #[serde(rename = "online_during_build")]
+    _online_during_build: serde::de::IgnoredAny,
+    #[serde(rename = "layout")]
+    _layout: serde::de::IgnoredAny,
+    #[serde(rename = "maintenance")]
+    _maintenance: serde::de::IgnoredAny,
+    #[serde(rename = "owner")]
+    _owner: serde::de::IgnoredAny,
+}
+
+impl IndexDefinition {
+    /// Read the kind, label and parts of the definition encoded in `bytes`
+    /// and hand them to `look`, the parts allocated (see
+    /// [`Self::selection_bound`]) and the label borrowed.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded definition.
+    pub fn with_head<T>(
+        bytes: &[u8],
+        look: impl FnOnce(&DefinitionHead<'_>) -> T,
+    ) -> Result<T, rmp_serde::decode::Error> {
+        let view: HeadView<'_> = rmp_serde::from_slice(bytes)?;
+        Ok(look(&DefinitionHead {
+            index_type: view.descriptor.index_type,
+            label: view.descriptor.label,
+            parts: &view.selection,
+        }))
+    }
+}
+
 /// [`IndexDefinition`] as encoded, its parts counted and nothing kept.
 #[derive(Deserialize)]
 struct SelectionLenView {

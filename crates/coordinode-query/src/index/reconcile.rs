@@ -589,7 +589,18 @@ pub fn propose_parts_txn(
         return Ok(());
     }
     let indexes = LocalIndexStore::new(engine);
-    for mut def in indexes.list_definitions()? {
+    // Only the definitions on an affected label, and the lookup, are read
+    // whole; the rest of the catalog is passed over by kind and label,
+    // charged to the statement's budget while each is looked at.
+    let budget = coordinode_modality::index::WriteBudget::of(txn);
+    let on_affected = indexes.definitions_where(
+        |head| {
+            head.index_type == IndexType::Labels
+                || affected.iter().any(|(_, name)| name == head.label)
+        },
+        budget.get(),
+    )?;
+    for mut def in on_affected {
         let labels: Vec<&(LabelId, String)> = match def.index_type {
             IndexType::Labels => affected.iter().collect(),
             _ => affected
@@ -641,22 +652,26 @@ pub fn propose_parts_txn(
 
 /// Register every index with parts of the certification `operation` with
 /// this member's writers as its record now stands: after a commit that
-/// proposed or concluded them.
+/// proposed or concluded them. Only those definitions are read whole, each
+/// charged to `budget`; the rest of the catalog is passed over by its parts.
 ///
 /// # Errors
 ///
-/// A catalog read failure.
+/// A catalog read failure, or the budget's refusal.
 pub fn register_parts_of(
     engine: &StorageEngine,
     registry: &super::IndexRegistry,
     operation: GenerationId,
+    budget: &coordinode_core::budget::QueryBudget,
 ) -> Result<(), StoreError> {
-    for def in LocalIndexStore::new(engine).list_definitions()? {
-        if def.selection.iter().any(|p| p.operation == operation) {
-            registry
-                .register_published(engine, def)
-                .map_err(StoreError::from)?;
-        }
+    // Only a lookup or a B-tree index keeps parts, and either is whole as
+    // read for placement.
+    for def in
+        LocalIndexStore::new(engine).definitions_with_part(|p| p.operation == operation, budget)?
+    {
+        registry
+            .register_published(engine, def)
+            .map_err(StoreError::from)?;
     }
     Ok(())
 }

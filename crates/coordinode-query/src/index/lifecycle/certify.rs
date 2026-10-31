@@ -57,6 +57,7 @@ impl IndexBuildService {
     pub fn cancel_certification(&self, generation: GenerationId) -> Result<bool, String> {
         let env = self.shared.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
+        let page_bytes = self.shared.config.read().maintenance_page_bytes;
         for () in move_attempts() {
             let Some((mut record, version)) = store.load_certification(generation).map_err(text)?
             else {
@@ -90,13 +91,14 @@ impl IndexBuildService {
                     &mut txn,
                     generation,
                     PartState::Withdrawn,
+                    page_bytes,
                 )
                 .map_err(text)?;
                 env.commit_catalog(&mut txn)
             };
             match committed {
                 Ok(()) => {
-                    refresh_lookup(env, generation).map_err(text)?;
+                    refresh_lookup(env, generation, page_bytes).map_err(text)?;
                     // The withdrawn parts are folded back now, as a
                     // concluded certification's are; the next open folds
                     // what this leaves if it stops first.
@@ -391,6 +393,7 @@ impl Shared {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
         let schemas = LocalSchemaStore::new(env.engine());
+        let page_bytes = self.config.read().maintenance_page_bytes;
         let mut coupled = false;
         for label in labels {
             coupled |= schemas.load_label(label).map_err(text)?.is_some_and(|s| {
@@ -461,6 +464,7 @@ impl Shared {
                     } else {
                         PartState::Withdrawn
                     },
+                    page_bytes,
                 )
                 .map_err(text)?;
                 let outcome = if withdrawn.is_empty() {
@@ -486,7 +490,7 @@ impl Shared {
             };
             match committed {
                 Ok(outcome) => {
-                    refresh_lookup(env, generation).map_err(text)?;
+                    refresh_lookup(env, generation, page_bytes).map_err(text)?;
                     return Ok(Executed::Outcome(outcome));
                 }
                 Err(e) if is_contention(&e) => continue,
@@ -507,8 +511,10 @@ impl Shared {
 fn refresh_lookup(
     env: &dyn super::BuildEnvironment,
     generation: GenerationId,
+    page_bytes: u64,
 ) -> Result<(), StoreError> {
-    crate::index::reconcile::register_parts_of(env.engine(), env.registry(), generation)
+    let budget = coordinode_core::budget::QueryBudget::new(page_bytes);
+    crate::index::reconcile::register_parts_of(env.engine(), env.registry(), generation, &budget)
 }
 
 /// Stage the parts of the certification `generation` moving to `state` in
@@ -521,9 +527,14 @@ fn stage_selection_conclusion(
     txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
     generation: GenerationId,
     state: PartState,
+    page_bytes: u64,
 ) -> Result<(), StoreError> {
     let store = LocalIndexStore::new(engine);
-    let listed_all = store.list_definitions()?;
+    // Only the definitions keeping parts of this certification are read,
+    // the rest of the catalog passed over by its parts within the page's
+    // bytes.
+    let budget = coordinode_core::budget::QueryBudget::new(page_bytes);
+    let listed_all = store.definitions_with_part(|p| p.operation == generation, &budget)?;
     #[cfg(test)]
     after_listing();
     for listed in listed_all {
