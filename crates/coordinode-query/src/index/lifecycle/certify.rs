@@ -188,6 +188,8 @@ impl Shared {
         // The outcome is recorded; what the change left apart is folded now,
         // and again where the storage is opened if this stops first.
         self.fold_parts();
+        #[cfg(any(test, feature = "test-hooks"))]
+        super::after_certification();
         Ok(concluded)
     }
 

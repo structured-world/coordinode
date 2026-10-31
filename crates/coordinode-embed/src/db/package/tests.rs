@@ -1308,6 +1308,123 @@ fn a_unique_value_taken_on_both_sides_after_the_proof_is_held_once() {
     }
 }
 
+/// An executor of a cancelled change, resumed while the next change of the
+/// same implication is being certified, writes nothing: the change `Task`
+/// implies `Thing` is published, its executor holds after its proof, and it
+/// is cancelled; the same change is published again and its own executor
+/// holds after its proof, its parts proposed. The first executor then runs
+/// on: it finds none of its parts and its record cancelled, and neither
+/// places a node into the second change's parts nor concludes anything. The
+/// second change goes in force with the label scan, its counter and the
+/// B-tree lookup exact, the parts folded, before and after a reopen.
+#[test]
+fn a_resumed_executor_of_a_cancelled_change_changes_nothing() {
+    use std::sync::mpsc;
+    let (mut db, dir) = open();
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE INDEX thing_title ON :Thing(title)",
+        "CREATE (:Thing {title: 'a'}), (:Task {title: 'b'})",
+    ] {
+        db.execute_cypher(ddl).expect(ddl);
+    }
+    let hold = || {
+        let (reached, at_hook) = mpsc::channel::<()>();
+        let (resume, go_on) = mpsc::channel::<()>();
+        *coordinode_query::index::lifecycle::AFTER_PROOF.lock() = Some(Box::new(move || {
+            let _ = reached.send(());
+            let _ = go_on.recv_timeout(WAIT);
+        }));
+        (at_hook, resume)
+    };
+    let imply = |db: &Database| {
+        let mut task = user_named(db, "Task");
+        let revision = task.schema_revision;
+        task.set_implies(vec!["Thing".into()]);
+        db.publish_schema(SchemaPackage {
+            labels: vec![LabelDeclaration {
+                schema: task,
+                intent: Intent::Change {
+                    expected_revision: revision,
+                },
+            }],
+            ..SchemaPackage::default()
+        })
+        .expect("publish")
+    };
+
+    let (first_held, resume_first) = hold();
+    let first = imply(&db);
+    first_held.recv_timeout(WAIT).expect("the first proof ran");
+    let operation = first.objects[0].operation.expect("certified");
+    assert!(
+        db.cancel_index_build(operation).expect("cancel"),
+        "the first change is cancelled"
+    );
+    assert!(user_named(&db, "Task").implies().is_empty());
+
+    let (second_held, resume_second) = hold();
+    let second = imply(&db);
+    second_held
+        .recv_timeout(WAIT)
+        .expect("the second proof ran");
+    // The stale executor runs to its end while the second change keeps its
+    // parts proposed, and only then does the second go on.
+    let (ended, first_ended) = mpsc::channel::<()>();
+    *coordinode_query::index::lifecycle::AFTER_CERTIFICATION.lock() = Some(Box::new(move || {
+        let _ = ended.send(());
+    }));
+    resume_first.send(()).expect("resume the first");
+    first_ended
+        .recv_timeout(WAIT)
+        .expect("the stale executor ended");
+    resume_second.send(()).expect("resume the second");
+    db.await_schema(&second, WAIT).expect("await");
+    assert_eq!(user_named(&db, "Task").implies(), ["Thing"]);
+
+    let exact = |db: &mut Database, what: &str| {
+        use coordinode_core::graph::types::Value;
+        assert_eq!(
+            db.execute_cypher("MATCH (n:Thing) RETURN n")
+                .expect("scan")
+                .len(),
+            2,
+            "{what}: label scan"
+        );
+        let counted = db
+            .execute_cypher("MATCH (n:Thing) RETURN count(n) AS c")
+            .expect("count");
+        assert_eq!(counted[0].get("c"), Some(&Value::Int(2)), "{what}: counter");
+        assert_eq!(
+            db.execute_cypher("MATCH (n:Thing {title: 'b'}) RETURN n")
+                .expect("lookup")
+                .len(),
+            1,
+            "{what}: B-tree lookup"
+        );
+    };
+    exact(&mut db, "in force");
+    use coordinode_modality::IndexStore as _;
+    let deadline = std::time::Instant::now() + WAIT;
+    while coordinode_modality::LocalIndexStore::new(db.engine())
+        .list_definitions()
+        .expect("definitions")
+        .iter()
+        .any(|def| !def.selection.is_empty())
+    {
+        assert!(std::time::Instant::now() < deadline, "parts left unfolded");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    exact(&mut db, "folded");
+
+    // Closing joins every executor, the stale one among them.
+    drop(db);
+    let mut db = Database::open(dir.path()).expect("reopen");
+    assert_eq!(user_named(&db, "Task").implies(), ["Thing"]);
+    exact(&mut db, "reopened");
+}
+
 /// The schema of label `name` as the catalog holds it.
 fn user_named(db: &Database, name: &str) -> LabelSchema {
     db.label_schemas()

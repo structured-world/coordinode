@@ -256,6 +256,21 @@ fn after_proof() {
     }
 }
 
+/// The step a test runs once a certification executor has ended its run,
+/// whatever it concluded, taken by the next one to end: what a test ordering
+/// a resumed executor before another change installs.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static AFTER_CERTIFICATION: parking_lot::Mutex<Option<ProofHook>> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn after_certification() {
+    let hook = AFTER_CERTIFICATION.lock().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// A step run after each committed step of a fold, told whether the step
 /// emptied a part; returning `true` stops the fold there, as closing the
 /// process does. What a test interrupting a fold at an exact step installs.
