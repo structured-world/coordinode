@@ -156,6 +156,8 @@ impl Shared {
         // Every node the proof must see is in the store already.
         self.set_phase(generation, BuildPhase::Indexing { indexed: None });
         let mut refused = self.prove(generation, &labels)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        super::after_proof();
         if refused.is_empty() {
             match self.reconcile(generation, &labels)? {
                 Some(not_reconciled) => refused = not_reconciled,

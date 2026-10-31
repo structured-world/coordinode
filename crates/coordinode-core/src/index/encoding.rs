@@ -33,6 +33,10 @@ const TAG_ENTRIES: u8 = 0x01;
 const TAG_UNIQUE_ENTRIES: u8 = 0x02;
 /// First byte of a label membership posting: one per node and label.
 const TAG_LABEL_POSTINGS: u8 = 0x03;
+/// First byte of the logical claim on a value of a unique index, shared by
+/// every part and generation of the index. Outside [`GENERATION_TAGS`], so
+/// clearing a generation never touches it.
+const TAG_UNIQUE_CLAIMS: u8 = 0x04;
 /// Ends the tuple of a non-unique entry. No element starts with it, so it
 /// marks where the tuple ends and the owner begins.
 const TUPLE_END: u8 = b':';
@@ -239,6 +243,27 @@ pub fn encode_unique_entry_key(generation: GenerationId, tuple: &[u8]) -> Vec<u8
 pub fn append_unique_entry_key(out: &mut Vec<u8>, generation: GenerationId, tuple: &[u8]) {
     out.extend_from_slice(&unique_entries_prefix(generation));
     out.extend_from_slice(tuple);
+}
+
+/// The logical claim on `tuple` in the unique index `index`: one key per
+/// value whatever part or generation of the index holds it. A write taking
+/// the value while the index keeps entries apart in several scopes writes
+/// this key too, so two writes taking it in different scopes, each from a
+/// view without the other, meet here and one of them is refused, as two
+/// writes of one scope meet on its entry key.
+pub fn encode_unique_claim_key(index: u64, tuple: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + tuple.len());
+    out.extend_from_slice(&unique_claims_prefix(index));
+    out.extend_from_slice(tuple);
+    out
+}
+
+/// Prefix of every claim [`encode_unique_claim_key`] makes for `index`.
+pub fn unique_claims_prefix(index: u64) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    out[0] = TAG_UNIQUE_CLAIMS;
+    out[1..].copy_from_slice(&index.to_be_bytes());
+    out
 }
 
 /// Prefix of every label posting of the lookup generation `generation`.

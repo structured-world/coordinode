@@ -288,6 +288,33 @@ pub trait IndexStore {
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>>;
 
+    /// Write the logical claim on each value of `values` in the unique
+    /// index `index` in `txn`, whatever part of the index the value is kept
+    /// in: a second transaction taking one of them in another part, from a
+    /// view without this one, is refused at whichever commit comes second.
+    /// The claims stay until [`Self::clear_unique_claims_txn`] takes them out
+    /// once the index keeps no parts.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn claim_unique_values_txn(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        values: &[Value],
+    ) -> StoreResult<()>;
+
+    /// Take out every claim [`Self::claim_unique_values_txn`] wrote for the
+    /// index `index`: what the commit dropping its last part does, after
+    /// which no writer claims, and one still bound to the definition before
+    /// is refused at its commit.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn clear_unique_claims_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()>;
+
     /// [`Self::unique_conflict`] against the latest committed state, outside
     /// any transaction. Tells a transaction that lost a race for a value
     /// which node won it.
@@ -1213,6 +1240,33 @@ impl IndexStore for LocalIndexStore<'_> {
             )?,
         }
         Ok(puts)
+    }
+
+    fn claim_unique_values_txn(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        values: &[Value],
+    ) -> StoreResult<()> {
+        use coordinode_core::index::encoding::encode_unique_claim_key;
+        for tuple in tuples(values) {
+            // A write, not a delete: a delete of a key never written leaves no
+            // version the commit's conflict check can meet. The fold of the
+            // index's last part clears them.
+            txn.put(
+                Partition::Idx,
+                &encode_unique_claim_key(index.id.as_raw(), &tuple),
+                &[],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn clear_unique_claims_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()> {
+        use coordinode_core::index::encoding::{prefix_end, unique_claims_prefix};
+        let prefix = unique_claims_prefix(index.as_raw());
+        txn.remove_range(Partition::Idx, &prefix, &prefix_end(&prefix))?;
+        Ok(())
     }
 
     fn unique_conflict(

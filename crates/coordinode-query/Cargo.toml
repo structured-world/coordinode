@@ -14,6 +14,9 @@ cjk-zh = ["coordinode-search/cjk-zh"]
 cjk-ja = ["coordinode-search/cjk-ja"]
 cjk-ko = ["coordinode-search/cjk-ko"]
 cjk = ["coordinode-search/cjk"]
+# Pause points for tests of other crates: a certification stops after its
+# proof until the test lets it go on.
+test-hooks = []
 
 [dependencies]
 coordinode-core = { workspace = true }

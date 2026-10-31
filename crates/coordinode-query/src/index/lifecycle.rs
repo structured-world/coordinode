@@ -205,6 +205,24 @@ mod certify;
 mod integrity;
 pub use integrity::{CheckOutcome, CheckRequestError, CheckStatus};
 
+/// A step a test runs once a certification has proved its candidates and
+/// before it places or concludes anything: the window writes admitted under
+/// the candidate after the proof land in.
+#[cfg(any(test, feature = "test-hooks"))]
+pub type ProofHook = Box<dyn FnOnce() + Send>;
+
+/// The step [`ProofHook`] names, taken by the next certification.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static AFTER_PROOF: parking_lot::Mutex<Option<ProofHook>> = parking_lot::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn after_proof() {
+    let hook = AFTER_PROOF.lock().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Fills the replacement of one of this member's index copies from a peer's
 /// copy of the same generation: registers it beside the published copy,
 /// imports the peer's history of the generation, and records it complete.

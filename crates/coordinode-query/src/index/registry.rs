@@ -1807,6 +1807,11 @@ fn stage_scoped(
     {
         let node_id = NodeId::from_raw(owner.node_id);
         let store = LocalIndexStore::new(staging.engine);
+        // The scopes read below are read at this attempt's view: a holder
+        // another attempt commits in one of them meanwhile is not seen
+        // there, and its entry key is not this one's. Both claim the value
+        // itself, so one of them is refused at its commit.
+        store.claim_unique_values_txn(txn, index, values)?;
         let mut views: smallvec::SmallVec<[(GenerationId, bool); 4]> = smallvec::SmallVec::new();
         if carried.in_force {
             views.extend(

@@ -1150,6 +1150,101 @@ fn a_unique_value_taken_on_both_sides_of_a_change_is_held_once() {
     assert!(holders <= 1, "{holders} things hold 'v'");
 }
 
+/// The same race once the change's proof has run: the certification pauses
+/// between its proof and its conclusion, and two transactions, each from a
+/// view without the other, take one title, one as a thing (written to the
+/// index's own entries) and one as a task (written to the part the change
+/// gains). The proof saw neither. Both being admitted would leave two
+/// things holding the title once the change is put in force, so one of the
+/// two commits is refused. Before, the two writes touched different keys
+/// and both committed.
+#[test]
+fn a_unique_value_taken_on_both_sides_after_the_proof_is_held_once() {
+    use std::sync::mpsc;
+    let (mut db, _dir) = open();
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE CONSTRAINT thing_title FOR (n:Thing) REQUIRE n.title IS UNIQUE",
+    ] {
+        db.execute_cypher(ddl).expect(ddl);
+    }
+    let (reached, at_hook) = mpsc::channel::<()>();
+    let (resume, go_on) = mpsc::channel::<()>();
+    *coordinode_query::index::lifecycle::AFTER_PROOF.lock() = Some(Box::new(move || {
+        let _ = reached.send(());
+        let _ = go_on.recv_timeout(WAIT);
+    }));
+    let mut task = user_named(&db, "Task");
+    let revision = task.schema_revision;
+    task.set_implies(vec!["Thing".into()]);
+    let published = db
+        .publish_schema(SchemaPackage {
+            labels: vec![LabelDeclaration {
+                schema: task,
+                intent: Intent::Change {
+                    expected_revision: revision,
+                },
+            }],
+            ..SchemaPackage::default()
+        })
+        .expect("publish");
+    at_hook.recv_timeout(WAIT).expect("the proof ran");
+
+    let thing = db.begin_transaction().expect("begin");
+    let task_tx = db.begin_transaction().expect("begin");
+    let thing_ok = db
+        .execute_in_transaction(thing, "CREATE (:Thing {title: 'v'})", None)
+        .is_ok();
+    let task_ok = db
+        .execute_in_transaction(task_tx, "CREATE (:Task {title: 'v'})", None)
+        .is_ok();
+    let thing_committed = thing_ok && db.commit_transaction(thing).is_ok();
+    let task_committed = task_ok && db.commit_transaction(task_tx).is_ok();
+    resume.send(()).expect("resume");
+
+    let _ = db.await_schema(&published, WAIT).expect("await");
+    let in_force = user_named(&db, "Task").implies() == ["Thing"];
+    let holders = db
+        .execute_cypher("MATCH (n:Thing {title: 'v'}) RETURN n")
+        .expect("lookup")
+        .len();
+    assert!(
+        !(thing_committed && task_committed),
+        "both holders committed (in force: {in_force}, {holders} things hold 'v')"
+    );
+    assert!(holders <= 1, "{holders} things hold 'v'");
+
+    // Once the index keeps no parts, the claims written meanwhile are gone.
+    use coordinode_modality::IndexStore as _;
+    let deadline = std::time::Instant::now() + WAIT;
+    while coordinode_modality::LocalIndexStore::new(db.engine())
+        .list_definitions()
+        .expect("definitions")
+        .iter()
+        .any(|def| !def.selection.is_empty())
+    {
+        assert!(std::time::Instant::now() < deadline, "parts left unfolded");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let unique = coordinode_modality::LocalIndexStore::new(db.engine())
+        .list_definitions()
+        .expect("definitions")
+        .into_iter()
+        .find(|def| def.unique)
+        .expect("the unique index");
+    let prefix = coordinode_core::index::encoding::unique_claims_prefix(unique.id.as_raw());
+    let left = db
+        .engine()
+        .prefix_scan(
+            coordinode_storage::engine::partition::Partition::Idx,
+            &prefix,
+        )
+        .expect("scan")
+        .count();
+    assert_eq!(left, 0, "claims left after the fold");
+}
+
 /// The schema of label `name` as the catalog holds it.
 fn user_named(db: &Database, name: &str) -> LabelSchema {
     db.label_schemas()
