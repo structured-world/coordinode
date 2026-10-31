@@ -223,6 +223,26 @@ fn after_proof() {
     }
 }
 
+/// A step run after each committed step of a fold, told whether the step
+/// emptied a part; returning `true` stops the fold there, as closing the
+/// process does. What a test interrupting a fold at an exact step installs.
+#[cfg(any(test, feature = "test-hooks"))]
+pub type FoldHook = Box<dyn FnMut(bool) -> bool + Send>;
+
+/// The step [`FoldHook`] names, run by every fold until taken out.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static AFTER_FOLD_STEP: parking_lot::Mutex<Option<FoldHook>> = parking_lot::Mutex::new(None);
+
+/// Whether the fold stops after a step that emptied a part (`emptied`) or
+/// not; never in a build without test hooks.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn fold_stops_after(emptied: bool) -> bool {
+    AFTER_FOLD_STEP
+        .lock()
+        .as_mut()
+        .is_some_and(|hook| hook(emptied))
+}
+
 /// Fills the replacement of one of this member's index copies from a peer's
 /// copy of the same generation: registers it beside the published copy,
 /// imports the peer's history of the generation, and records it complete.

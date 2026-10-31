@@ -335,6 +335,10 @@ impl Fold<'_> {
                             .register_published(self.engine, folded)
                             .map_err(StoreError::from)?;
                     }
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    if super::lifecycle::fold_stops_after(empty) {
+                        return Err(BackfillError::Stopped);
+                    }
                 }
                 Err(CommitError::Conflict(_) | CommitError::RevisionMismatch { .. }) => {
                     conflicts += 1;

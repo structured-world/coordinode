@@ -1016,11 +1016,12 @@ fn a_cancelled_implication_change_leaves_the_facts_in_force() {
     );
 }
 
-/// The store closes while the fold of a change put in force is still
-/// moving entries a page of one at a time. Reads stay exact over the
-/// unfolded parts before the close and after the reopen, which folds the
-/// rest: every carrier is counted once by scan and by counter, and an index
-/// lookup finds each one.
+/// The fold of a change put in force, moving entries a page of one at a
+/// time, is stopped after its third step, as a close there stops it: a part
+/// with entries in it is left. Reads stay exact over the unfolded parts
+/// before the close and after the reopen, which folds the rest: every
+/// carrier is counted once by scan and by counter, and an index lookup finds
+/// each one.
 #[test]
 fn a_fold_interrupted_by_a_close_finishes_after_a_reopen() {
     use coordinode_core::graph::types::Value;
@@ -1058,9 +1059,54 @@ fn a_fold_interrupted_by_a_close_finishes_after_a_reopen() {
             db.execute_cypher(&format!("CREATE (:Task {{title: 't{n}'}})"))
                 .expect("task");
         }
+        // The fold stops after its third step that leaves a part with
+        // entries still in it, as a close at that point would stop it.
+        let (stopped, at_stop) = std::sync::mpsc::channel::<()>();
+        let mut steps = 0;
+        *coordinode_query::index::lifecycle::AFTER_FOLD_STEP.lock() =
+            Some(Box::new(move |emptied| {
+                if emptied {
+                    return false;
+                }
+                steps += 1;
+                let stop = steps == 3;
+                if stop {
+                    let _ = stopped.send(());
+                }
+                stop
+            }));
         db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
             .expect("alter");
-        // Exact whether or not the fold has finished.
+        at_stop
+            .recv_timeout(WAIT)
+            .expect("the fold stopped mid-way");
+        *coordinode_query::index::lifecycle::AFTER_FOLD_STEP.lock() = None;
+        // Interrupted indeed: a part is left, with entries still in it.
+        {
+            use coordinode_modality::IndexStore as _;
+            let store = coordinode_modality::LocalIndexStore::new(db.engine());
+            let unfolded: Vec<_> = store
+                .list_definitions()
+                .expect("definitions")
+                .into_iter()
+                .flat_map(|def| def.selection)
+                .collect();
+            assert!(!unfolded.is_empty(), "parts are left at the stop");
+            let held = unfolded.iter().any(|part| {
+                let [(start, end), (lstart, lend)] =
+                    coordinode_core::index::encoding::generation_ranges(part.part);
+                let has = |s: &[u8], e: &[u8]| {
+                    db.engine()
+                        .range_scan(coordinode_storage::engine::partition::Partition::Idx, s, e)
+                        .expect("scan")
+                        .next()
+                        .is_some()
+                };
+                has(&start, &end) || has(&lstart, &lend)
+            });
+            assert!(held, "a part left at the stop still holds entries");
+        }
+        // Exact while the fold is interrupted.
         assert_eq!(
             state(&mut db),
             (tasks + 1, Some(Value::Int(tasks as i64 + 1)), 1),
