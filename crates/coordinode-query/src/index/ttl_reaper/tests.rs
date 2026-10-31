@@ -951,7 +951,12 @@ fn content_holder(
 ) -> Option<NodeId> {
     use coordinode_modality::{IndexStore as _, LocalIndexStore};
     LocalIndexStore::new(engine)
-        .committed_conflict(index, &[Value::String(value.into())], NodeId::from_raw(0))
+        .committed_conflict(
+            index,
+            &[Value::String(value.into())],
+            NodeId::from_raw(0),
+            &coordinode_core::budget::QueryBudget::new(1 << 20),
+        )
         .expect("holder")
 }
 

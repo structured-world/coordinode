@@ -3575,15 +3575,18 @@ impl<'a> ExecutionContext<'a> {
         node: NodeId,
         record: Option<&NodeRecord>,
     ) -> Result<bool, ExecutionError> {
-        use coordinode_core::index::derive::tuples;
         let Some(registry) = self.btree_index_registry else {
             return Ok(false);
         };
         let Some(index) = registry.get_by_id(id) else {
             return Ok(false);
         };
-        use coordinode_modality::StoreError;
-        let wanted = tuples(std::slice::from_ref(value)).map_err(StoreError::from)?;
+        use coordinode_modality::index::charged_tuples;
+        // The tuples wanted are charged while this check runs; those of each
+        // record read, only while that record is compared.
+        let budget = std::sync::Arc::clone(&self.budget);
+        let mut wanting = budget.empty_charge();
+        let wanted = charged_tuples(std::slice::from_ref(value), &mut wanting)?;
         if let Some(record) = record {
             self.bind_membership(&record.labels)?;
         }
@@ -3610,8 +3613,8 @@ impl<'a> ExecutionContext<'a> {
             let Some(held) = interpretation.record_membership(record) else {
                 return Ok(false);
             };
-            Ok(tuples(&held)
-                .map_err(StoreError::from)?
+            let mut compared = budget.empty_charge();
+            Ok(charged_tuples(&held, &mut compared)?
                 .iter()
                 .any(|t| wanted.contains(t)))
         };
@@ -3909,18 +3912,23 @@ impl<'a> ExecutionContext<'a> {
         let indexes = LocalIndexStore::new(self.engine);
         // The latest committed records, read directly: the holder an entry
         // names is a duplicate only while its own record holds the value.
-        let latest = coordinode_storage::engine::transaction::Transaction::new(
+        let mut latest = coordinode_storage::engine::transaction::Transaction::new(
             self.engine,
             None,
             Timestamp::ZERO,
             None,
         );
+        // What naming the winner reads and expands is the statement's to pay.
+        latest.charge_writes_to(Some(std::sync::Arc::clone(&self.budget)));
         let interner: &FieldInterner = self.interner;
         let field_of = |name: &str| interner.lookup(name);
         for claim in &self.key_claims.indexes {
-            let Ok(Some(holder)) =
-                indexes.committed_conflict(&claim.index, &claim.values, claim.node_id)
-            else {
+            let Ok(Some(holder)) = indexes.committed_conflict(
+                &claim.index,
+                &claim.values,
+                claim.node_id,
+                &self.budget,
+            ) else {
                 continue;
             };
             if crate::index::registry::holds_values(

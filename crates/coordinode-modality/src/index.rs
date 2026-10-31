@@ -33,7 +33,7 @@
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::{
-    EntryOwner, KeyTooLong, MAX_INDEX_KEY_LEN, effects_of, entry, tuples, tuples_within,
+    EntryOwner, KeyTooLong, MAX_INDEX_KEY_LEN, effects_of, entry, tuples_within,
 };
 use coordinode_core::index::encoding::{
     decode_entry, decode_entry_parts, encode_element, encode_tuple, encode_unique_claim_key,
@@ -290,16 +290,17 @@ pub trait IndexStore {
 
     /// [`Self::unique_conflict`] against the latest committed state, outside
     /// any transaction. Tells a transaction that lost a race for a value
-    /// which node won it.
+    /// which node won it. The tuples are charged to `budget` while they live.
     ///
     /// # Errors
     ///
-    /// As [`Self::unique_conflict`].
+    /// As [`Self::unique_conflict`], or the budget's refusal.
     fn committed_conflict(
         &self,
         index: &IndexDefinition,
         values: &[Value],
         node_id: NodeId,
+        budget: &coordinode_core::budget::QueryBudget,
     ) -> StoreResult<Option<NodeId>>;
 
     /// The nodes with an entry holding exactly `values`, as the transaction
@@ -1436,8 +1437,10 @@ impl IndexStore for LocalIndexStore<'_> {
         index: &IndexDefinition,
         values: &[Value],
         node_id: NodeId,
+        budget: &coordinode_core::budget::QueryBudget,
     ) -> StoreResult<Option<NodeId>> {
-        for tuple in tuples(values)? {
+        let mut held = budget.empty_charge();
+        for tuple in charged_tuples(values, &mut held)? {
             let prefix = entry_value_prefix(index.generation, &tuple);
             for guard in self.engine.prefix_scan(Partition::Idx, &prefix)? {
                 let (key, _) = guard.into_inner()?;

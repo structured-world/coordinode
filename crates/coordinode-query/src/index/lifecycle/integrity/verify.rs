@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use coordinode_core::graph::node::NodeRecord;
 use coordinode_core::index::derive::{
-    EntryOwner, IndexInterpretation, append_entry_key_of, tuples,
+    EntryOwner, IndexInterpretation, append_entry_key_of, tuples_held,
 };
 use coordinode_core::index::encoding::decode_entry_parts;
 use coordinode_core::schema::label_id::LabelId;
@@ -109,6 +109,10 @@ pub(super) enum VerifyError {
     /// have entered: lists making too many entries.
     #[error(transparent)]
     FanOut(#[from] coordinode_core::index::derive::FanOut),
+    /// One record's entries, made before they are kept or spilled, would
+    /// outgrow the pass's memory budget.
+    #[error("one record's index entries outgrow the check's memory budget: {0}")]
+    RecordTooWide(#[from] coordinode_core::budget::BudgetStop),
 }
 
 /// One expected entry: its key and the node holding it, with the version
@@ -535,6 +539,8 @@ pub(super) fn verify(
         }
     }
 
+    // What one record's entries may take while they are made.
+    let expansion = coordinode_core::budget::QueryBudget::new(budget.memory_bytes as u64);
     // The records, once.
     let scanning = Instant::now();
     let rows = LocalNodeStore::encoded_rows_at(engine, snapshot, shard_id)
@@ -575,7 +581,10 @@ pub(super) fn verify(
             let Some(values) = slot.target.interpretation.record_membership(&record) else {
                 continue;
             };
-            for tuple in tuples(&values)? {
+            // A record's entries exist at once while they are kept: charged
+            // to the pass's memory before they are made, released after.
+            let mut making = expansion.empty_charge();
+            for tuple in tuples_held::<VerifyError>(&values, &mut making)? {
                 slot.memory.push_entry(slot.target.def, &tuple, owner);
                 stats.expected_entries += 1;
             }

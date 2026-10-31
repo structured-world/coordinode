@@ -24,8 +24,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use coordinode_core::budget::QueryBudget;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
-use coordinode_core::index::derive::{EntryOwner, IndexInterpretation, tuples};
+use coordinode_core::index::derive::{EntryOwner, IndexInterpretation};
 use coordinode_modality::{
     CheckState, IndexCheck, IndexIntegrityRecord, IndexStore as _, Integrity, LocalIndexStore,
     LocalNodeStore, Mismatch, NodeStore as _, StoreError,
@@ -1018,12 +1019,13 @@ fn wall_clock_ms() -> u64 {
 
 /// Whether `record`, a stored state of node `node` (or one version of it),
 /// gives `def` an entry under `tuple`, by the index's own interpretation.
+/// The record's tuples are charged to `budget` while they are compared.
 fn record_holds(
     def: &IndexDefinition,
     interpretation: &IndexInterpretation,
     record: &NodeRecord,
     tuple: &[u8],
-    catalog: &mut CatalogMembership<'_>,
+    (catalog, budget): (&mut CatalogMembership<'_>, &QueryBudget),
 ) -> Result<bool, StoreError> {
     if !catalog.carries_named(record, &def.label)? {
         return Ok(false);
@@ -1031,7 +1033,12 @@ fn record_holds(
     let Some(held) = interpretation.record_membership(record) else {
         return Ok(false);
     };
-    Ok(tuples(&held)?.iter().any(|t| t.as_slice() == tuple))
+    let mut compared = budget.empty_charge();
+    Ok(
+        coordinode_modality::index::charged_tuples(&held, &mut compared)?
+            .iter()
+            .any(|t| t.as_slice() == tuple),
+    )
 }
 
 /// [`record_holds`] for a record that may be absent: an absent one holds
@@ -1041,10 +1048,10 @@ fn maybe_holds(
     interpretation: &IndexInterpretation,
     record: Option<&NodeRecord>,
     tuple: &[u8],
-    catalog: &mut CatalogMembership<'_>,
+    reading: (&mut CatalogMembership<'_>, &QueryBudget),
 ) -> Result<bool, StoreError> {
     match record {
-        Some(record) => record_holds(def, interpretation, record, tuple, catalog),
+        Some(record) => record_holds(def, interpretation, record, tuple, reading),
         None => Ok(false),
     }
 }
@@ -1058,14 +1065,14 @@ fn node_holds(
     interpretation: &IndexInterpretation,
     node: NodeId,
     tuple: &[u8],
-    catalog: &mut CatalogMembership<'_>,
+    (catalog, budget): (&mut CatalogMembership<'_>, &QueryBudget),
 ) -> Result<bool, StoreError> {
     let own = LocalNodeStore.get(txn, shard_id, node)?;
-    if maybe_holds(def, interpretation, own.as_ref(), tuple, catalog)? {
+    if maybe_holds(def, interpretation, own.as_ref(), tuple, (catalog, budget))? {
         return Ok(true);
     }
     for (_, record) in LocalNodeStore.versions(txn, shard_id, node)? {
-        if record_holds(def, interpretation, &record, tuple, catalog)? {
+        if record_holds(def, interpretation, &record, tuple, (catalog, budget))? {
             return Ok(true);
         }
     }
@@ -1082,14 +1089,21 @@ fn other_holder(
     def: &IndexDefinition,
     interpretation: &IndexInterpretation,
     (node, tuple): (u64, &[u8]),
-    (shard_id, catalog): (u16, &mut CatalogMembership<'_>),
+    (shard_id, catalog, budget): (u16, &mut CatalogMembership<'_>, &QueryBudget),
 ) -> Result<Option<u64>, StoreError> {
     // The holders are charged while they are looked at.
-    let budget = coordinode_modality::index::WriteBudget::of(txn);
-    let mut found = budget.get().empty_charge();
+    let mut found = budget.empty_charge();
     for holder in store.holders(txn, def, tuple, &mut found)? {
         if holder.as_raw() != node
-            && node_holds(txn, shard_id, def, interpretation, holder, tuple, catalog)?
+            && node_holds(
+                txn,
+                shard_id,
+                def,
+                interpretation,
+                holder,
+                tuple,
+                (catalog, budget),
+            )?
         {
             return Ok(Some(holder.as_raw()));
         }
@@ -1119,6 +1133,7 @@ impl Shared {
         let shard_id = self.env.shard_id();
         let store = LocalIndexStore::new(engine);
         let mut catalog = CatalogMembership::current(engine);
+        let budget = self.maintenance_budget();
         Ok(match mismatch {
             Mismatch::Missing {
                 node,
@@ -1134,7 +1149,7 @@ impl Shared {
                     interpretation,
                     row.as_ref().map(|(r, _)| r),
                     tuple,
-                    &mut catalog,
+                    (&mut catalog, &budget),
                 )
                 .map_err(text)?;
                 holds
@@ -1160,7 +1175,7 @@ impl Shared {
                             interpretation,
                             row.as_ref().map(|(r, _)| r),
                             tuple,
-                            &mut catalog,
+                            (&mut catalog, &budget),
                         )
                         .map_err(text)?
                     }
@@ -1326,6 +1341,12 @@ impl Shared {
         } else {
             LocalOutcome::Stopped
         })
+    }
+
+    /// What a check's follow-up reads and repairs may hold in memory at once:
+    /// the pass's own memory, charged before each allocation.
+    fn maintenance_budget(&self) -> Arc<QueryBudget> {
+        Arc::new(QueryBudget::new(self.config.read().check_memory as u64))
     }
 
     /// What a check pass may hold in memory, and where it spills the rest:
@@ -1816,18 +1837,22 @@ impl Shared {
         let shard_id = env.shard_id();
         let def = &taken.def;
         let store = LocalIndexStore::new(engine);
-        let latest = Transaction::new(
+        // The reads and the repair's writes are charged to one budget.
+        let budget = self.maintenance_budget();
+        let mut latest = Transaction::new(
             engine,
             None,
             coordinode_core::txn::timestamp::Timestamp::ZERO,
             None,
         );
+        latest.charge_writes_to(Some(std::sync::Arc::clone(&budget)));
         // The definition as it stands, still the one checked: an index
         // rebuilt, dropped or changed meanwhile takes no repair.
         let Some(def_version) = store.definition_version_as(def).map_err(text)? else {
             return Ok(0);
         };
         let mut txn = begin(env);
+        txn.charge_writes_to(Some(std::sync::Arc::clone(&budget)));
         // Conditions before the writes they guard: a direct-mode engine
         // decides a condition when it is stated.
         store
@@ -1854,7 +1879,7 @@ impl Shared {
                     else {
                         continue;
                     };
-                    if !record_holds(def, interpretation, &record, tuple, &mut catalog)
+                    if !record_holds(def, interpretation, &record, tuple, (&mut catalog, &budget))
                         .map_err(text)?
                     {
                         continue;
@@ -1873,7 +1898,7 @@ impl Shared {
                             def,
                             interpretation,
                             (*node, tuple),
-                            (shard_id, &mut catalog),
+                            (shard_id, &mut catalog, &budget),
                         )
                         .map_err(text)?
                     {
@@ -1915,7 +1940,7 @@ impl Shared {
                         interpretation,
                         row.as_ref().map(|(r, _)| r),
                         tuple,
-                        &mut catalog,
+                        (&mut catalog, &budget),
                     )
                     .map_err(text)?;
                     if holds {

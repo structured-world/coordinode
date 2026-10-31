@@ -354,6 +354,42 @@ fn a_pass_that_cannot_spill_fails() {
     ));
 }
 
+/// One record whose entries, made all at once, would not fit the pass's
+/// memory is refused before they are made, with that cause: spilling
+/// bounds what the pass keeps, not one record's expansion.
+#[test]
+fn a_record_too_wide_for_the_pass_is_refused_before_it_is_expanded() {
+    let s = store();
+    let cities: Vec<Value> = (0..2_000)
+        .map(|i| Value::String(format!("city-{i:05}")))
+        .collect();
+    put(
+        &s.env,
+        "User",
+        9_999,
+        &[
+            ("email", Value::String("wide@x".into())),
+            ("city", Value::Array(cities)),
+        ],
+    );
+    let scratch = tempfile::tempdir().expect("scratch");
+    let budget = Budget {
+        memory_bytes: 4 * 1024,
+        scratch: Some(scratch.path().join("runs")),
+    };
+    assert!(
+        matches!(
+            pass(&s, &[&s.city], &budget),
+            Err(VerifyError::RecordTooWide(_))
+        ),
+        "the wide record is refused"
+    );
+    // The narrow records alone fit the same budget, spilling as they go.
+    pass(&s, &[&s.email], &budget)
+        .expect("the narrow index is checked")
+        .expect("not stopped");
+}
+
 /// A run of three entries, one of them a version.
 fn three_entries() -> Run {
     let mut run = Run::default();

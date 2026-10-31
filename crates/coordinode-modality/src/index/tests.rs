@@ -209,7 +209,9 @@ fn a_unique_value_has_one_holder() {
         None
     );
     assert_eq!(
-        store.committed_conflict(&index, &s("a@x"), id(2)).unwrap(),
+        store
+            .committed_conflict(&index, &s("a@x"), id(2), &budget())
+            .unwrap(),
         Some(id(1))
     );
     assert_eq!(
@@ -370,7 +372,9 @@ fn two_concurrent_claims_of_one_value_conflict() {
             index.maintenance.profile
         );
         assert_eq!(
-            store.committed_conflict(&index, &s("a@x"), id(2)).unwrap(),
+            store
+                .committed_conflict(&index, &s("a@x"), id(2), &budget())
+                .unwrap(),
             Some(id(1)),
             "{:?}",
             index.maintenance.profile
@@ -398,7 +402,9 @@ fn a_unique_entry_is_removed_only_by_its_holder() {
     leave(&store, &mut t, &index, &s("a@x"), id(2));
     commit(&mut t).unwrap();
     assert_eq!(
-        store.committed_conflict(&index, &s("a@x"), id(2)).unwrap(),
+        store
+            .committed_conflict(&index, &s("a@x"), id(2), &budget())
+            .unwrap(),
         Some(id(1))
     );
 
@@ -406,7 +412,9 @@ fn a_unique_entry_is_removed_only_by_its_holder() {
     leave(&store, &mut t, &index, &s("a@x"), id(1));
     commit(&mut t).unwrap();
     assert_eq!(
-        store.committed_conflict(&index, &s("a@x"), id(2)).unwrap(),
+        store
+            .committed_conflict(&index, &s("a@x"), id(2), &budget())
+            .unwrap(),
         None
     );
 }
