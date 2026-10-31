@@ -166,6 +166,31 @@ fn a_label_with_carriers_without_history_is_refused() {
     );
 }
 
+/// The store's history and its operation descriptors share one domain,
+/// whichever founds it: a first temporal write founds the deployment a later
+/// descriptor names, and a descriptor issued first founds the one later
+/// history binds to, which the write does not replace.
+#[test]
+fn history_and_descriptors_share_one_domain() {
+    use coordinode_core::txn::operation::IssuerId;
+    let bound = |db: &Database| {
+        coordinode_storage::engine::metadata::bound_deployment(db.engine())
+            .expect("binding")
+            .expect("founded")
+    };
+    // History first.
+    let mut db = Database::open_in_memory().expect("open");
+    types(&mut db);
+    let founded = bound(&db);
+    let issuer = db.enroll_issuer(IssuerId([0x31; 16])).expect("enroll");
+    assert_eq!(issuer.deployment(), founded);
+    // A descriptor first.
+    let mut db = Database::open_in_memory().expect("open");
+    let issuer = db.enroll_issuer(IssuerId([0x32; 16])).expect("enroll");
+    types(&mut db);
+    assert_eq!(bound(&db), issuer.deployment());
+}
+
 /// A read that also reads what only the operational snapshot holds (here
 /// an edge) is refused as before, not answered from the history in part.
 #[test]

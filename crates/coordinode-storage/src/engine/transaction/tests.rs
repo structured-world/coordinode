@@ -1264,6 +1264,135 @@ fn a_stamped_write_needs_a_commit_timestamp() {
     assert!(stored_under(&engine, Partition::NodeHistory, b"h:").is_empty());
 }
 
+/// Commit `prefix` keyed by its commit in its own transaction.
+fn commit_stamped(
+    engine: &StorageEngine,
+    oracle: &TimestampOracle,
+    prefix: &[u8],
+) -> Result<CommitOutcome, CommitError> {
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    let mut txn = mvcc_txn(engine, oracle);
+    txn.put_stamped(Partition::NodeHistory, prefix, b"state")
+        .unwrap();
+    txn.commit(&ctx)
+}
+
+/// A store with no deployment founds one with its first history, before the
+/// history is visible, and keeps it: a later history commit binds nothing
+/// new, and the record is the one every reader of the binding finds.
+#[test]
+fn the_first_history_founds_the_domain_once() {
+    use crate::engine::metadata::{bound_deployment, recorded_deployment};
+    let (engine, oracle, _d) = test_engine();
+    assert_eq!(bound_deployment(&engine).unwrap(), None);
+    commit_stamped(&engine, &oracle, b"h:1:").expect("first history");
+    let founded = recorded_deployment(&engine)
+        .unwrap()
+        .expect("founded with the first history");
+    assert_eq!(bound_deployment(&engine).unwrap(), Some(founded));
+    commit_stamped(&engine, &oracle, b"h:2:").expect("second history");
+    assert_eq!(recorded_deployment(&engine).unwrap(), Some(founded));
+}
+
+/// A member enrolled in a deployment whose record has not reached it binds
+/// its history to that deployment: it founds nothing, minting no
+/// replacement, and the group's own record reaches it through the log.
+#[test]
+fn an_enrolled_store_binds_history_to_its_enrollment() {
+    use crate::engine::metadata::{bound_deployment, recorded_deployment};
+    use coordinode_core::group::{DeploymentId, ENROLLED_DEPLOYMENT_KEY};
+    let (engine, oracle, _d) = test_engine();
+    let enrolled = DeploymentId([7; 16]);
+    engine
+        .put(
+            Partition::Schema,
+            ENROLLED_DEPLOYMENT_KEY,
+            enrolled.as_bytes(),
+        )
+        .unwrap();
+    commit_stamped(&engine, &oracle, b"h:1:").expect("history");
+    assert_eq!(
+        recorded_deployment(&engine).unwrap(),
+        None,
+        "nothing minted"
+    );
+    assert_eq!(bound_deployment(&engine).unwrap(), Some(enrolled));
+    assert_eq!(
+        stored_under(&engine, Partition::NodeHistory, b"h:").len(),
+        1
+    );
+}
+
+/// A store whose record and enrollment name different deployments has no
+/// domain to bind history to: the commit is refused with both named, and
+/// nothing of it applies, the binding records unchanged.
+#[test]
+fn a_conflicting_binding_refuses_history() {
+    use coordinode_core::group::{DEPLOYMENT_KEY, DeploymentId, ENROLLED_DEPLOYMENT_KEY};
+    let (engine, oracle, _d) = test_engine();
+    let (recorded, enrolled) = (DeploymentId([1; 16]), DeploymentId([2; 16]));
+    engine
+        .put(Partition::Schema, DEPLOYMENT_KEY, recorded.as_bytes())
+        .unwrap();
+    engine
+        .put(
+            Partition::Schema,
+            ENROLLED_DEPLOYMENT_KEY,
+            enrolled.as_bytes(),
+        )
+        .unwrap();
+    let refused = commit_stamped(&engine, &oracle, b"h:1:");
+    assert!(
+        matches!(
+            refused,
+            Err(CommitError::Storage(StorageError::DeploymentConflict {
+                recorded: r,
+                enrolled: e,
+            })) if r == recorded && e == enrolled
+        ),
+        "{refused:?}"
+    );
+    assert!(stored_under(&engine, Partition::NodeHistory, b"h:").is_empty());
+    assert_eq!(
+        crate::engine::metadata::recorded_deployment(&engine).unwrap(),
+        Some(recorded)
+    );
+}
+
+/// Concurrent first histories, each proposing its own candidate, bind one
+/// domain: every commit succeeds and the record stays the first one landed.
+#[test]
+fn racing_first_histories_bind_one_domain() {
+    let (engine, oracle, _d) = test_engine();
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|s| {
+        for i in 0u8..8 {
+            let (engine, oracle, barrier) = (&engine, &oracle, &barrier);
+            s.spawn(move || {
+                barrier.wait();
+                commit_stamped(engine, oracle, &[b'h', b':', i, b':']).expect("history");
+            });
+        }
+    });
+    let founded = crate::engine::metadata::recorded_deployment(&engine)
+        .unwrap()
+        .expect("founded");
+    assert_eq!(
+        stored_under(&engine, Partition::NodeHistory, b"h:").len(),
+        8
+    );
+    commit_stamped(&engine, &oracle, b"h:9:").expect("later history");
+    assert_eq!(
+        crate::engine::metadata::recorded_deployment(&engine).unwrap(),
+        Some(founded)
+    );
+}
+
 /// Keys recorded for a post-state check survive parking and are handed out
 /// once.
 #[test]

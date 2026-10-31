@@ -221,10 +221,11 @@ impl Database {
         if let Some(id) = self.deployment()? {
             return Ok(id);
         }
-        // The first recorded identity stands: a concurrent founding loses,
-        // and both read back the one recorded.
+        // The first recorded identity stands: a concurrent founding (another
+        // descriptor, or a first temporal commit) loses, and all read back
+        // the one recorded.
         self.propose_mutation(Mutation::Command(MetadataCommand::RecordDeployment {
-            id: fresh_deployment_id(),
+            id: coordinode_storage::engine::metadata::founding_candidate(&self.engine)?,
         }))?;
         self.deployment()?
             .ok_or_else(|| DatabaseError::Other("the deployment identity was not recorded".into()))
@@ -271,21 +272,4 @@ impl Database {
                 other => DatabaseError::Other(format!("operation record: {other}")),
             })
     }
-}
-
-/// A deployment identity no other database draws: 128 bits from two hashers
-/// keyed by the process's random seed, mixed with the clock. It tells domains
-/// apart and grants nothing, so it needs uniqueness, not secrecy.
-fn fresh_deployment_id() -> DeploymentId {
-    use std::hash::{BuildHasher, Hasher};
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut id = [0u8; 16];
-    for half in id.as_chunks_mut::<8>().0 {
-        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-        hasher.write_u128(now);
-        *half = hasher.finish().to_be_bytes();
-    }
-    DeploymentId(id)
 }

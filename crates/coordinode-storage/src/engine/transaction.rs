@@ -2055,6 +2055,10 @@ impl<'a> Transaction<'a> {
                 applied_index: None,
             });
         }
+        // History becomes visible only in a store whose domain is bound.
+        if !self.stamped.is_empty() {
+            self.found_history_domain(oracle, ctx)?;
+        }
         // A bound operation is not checked here: the caller refuses a settled
         // retry before running its statements, the binding decides at the
         // apply, and the check after the commit reports a unit it refused.
@@ -2463,6 +2467,69 @@ impl<'a> Transaction<'a> {
             crate::engine::merge::apply_doc_deltas_to_record(&mut record, &deltas);
             *bytes = NodeRecord::to_msgpack(&record)
                 .map_err(|e| CommitError::Serialization(format!("node record: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Bind the store's history domain before this commit makes history
+    /// visible, unless it is bound: the domain is the store's deployment, and
+    /// a store that has none yet founds it here, in a unit of its own ordered
+    /// before this commit through the same path, the way every founder does.
+    ///
+    /// Founding is a metadata command decided where it applies: the first
+    /// recorded candidate stands, and this commit reads back the one that did,
+    /// so a losing candidate is named nowhere. An enrolled member proposes the
+    /// deployment it was enrolled in. The unit waits as this commit's write
+    /// concern asks, and comes first in the log, so the binding is never less
+    /// durable than the history it binds. Once bound, a commit pays one read.
+    ///
+    /// # Errors
+    ///
+    /// The binding is ambiguous ([`StorageError::DeploymentConflict`]), the
+    /// founding unit fails, or a waited-for founding left no binding.
+    fn found_history_domain(
+        &self,
+        oracle: &TimestampOracle,
+        ctx: &CommitContext<'_>,
+    ) -> Result<(), CommitError> {
+        use crate::engine::metadata::{bound_deployment, founding_candidate};
+        use coordinode_core::txn::proposal::MetadataCommand;
+        if bound_deployment(self.engine)?.is_some() {
+            return Ok(());
+        }
+        let mutations = vec![Mutation::Command(MetadataCommand::RecordDeployment {
+            id: founding_candidate(self.engine)?,
+        })];
+        // Held as not yet logged until the unit is handed over, so no closed
+        // bound passes over it.
+        let (ts, _held) = self
+            .engine
+            .pending_commits()
+            .obligate(|| oracle.next().as_raw());
+        if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
+            let proposal = RaftProposal {
+                id: id_gen.next(),
+                mutations,
+                commit_ts: Timestamp::from_raw(ts),
+                start_ts: Timestamp::ZERO,
+                bypass_rate_limiter: true,
+            };
+            pipeline
+                .propose_with_concern(&proposal, ctx.write_concern)
+                .map_err(proposal_err_to_commit)?;
+        } else if self.engine.has_journal() {
+            self.engine
+                .commit_logged(&mutations, ts, ctx.write_concern.journal)?;
+        } else {
+            let _admitted = self.engine.admit_write(&mutations)?;
+            self.engine.apply_proposal_at(&mutations, ts)?;
+        }
+        // A unit not waited for may land after this read; it still comes
+        // before this commit in the log.
+        if !ctx.write_concern.w.is_fire_and_forget() && bound_deployment(self.engine)?.is_none() {
+            return Err(CommitError::Serialization(
+                "the history domain was founded but no binding was recorded".into(),
+            ));
         }
         Ok(())
     }

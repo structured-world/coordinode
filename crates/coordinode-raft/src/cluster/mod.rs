@@ -237,15 +237,9 @@ async fn found_deployment(
     if let Some(id) = *recorded.borrow() {
         return Ok(id);
     }
-    let id = match given {
-        Some(id) => id,
-        None => {
-            let mut id = [0u8; 16];
-            getrandom::fill(&mut id)
-                .map_err(|e| RaftNodeError::Init(format!("a random deployment identity: {e:?}")))?;
-            DeploymentId(id)
-        }
-    };
+    // Every founder draws its candidate the same way; only the first
+    // recorded stands.
+    let id = given.unwrap_or_else(coordinode_storage::engine::metadata::deployment_candidate);
     commands
         .write(MetadataCommand::RecordDeployment { id })
         .await
@@ -1798,7 +1792,10 @@ impl RaftNode {
         }
         if leads_alone(&self.raft, self.node_id) {
             let mut recorded = self.deployment.clone();
-            return found_deployment(&self.commands, &mut recorded, None).await;
+            // An enrolled member founds with the deployment it was enrolled
+            // in, never a replacement.
+            let enrolled = enrolled_deployment(self.engine.arc())?;
+            return found_deployment(&self.commands, &mut recorded, enrolled).await;
         }
         Err(RaftNodeError::Membership(
             "this member does not know its deployment yet".to_owned(),

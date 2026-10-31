@@ -86,20 +86,57 @@ pub fn recorded_deployment(engine: &StorageEngine) -> StorageResult<Option<Deplo
 /// joined a group and has not received the record (a joiner installs the
 /// group's state from a snapshot, which leaves each member's own records
 /// out), the deployment it was enrolled in. `None` before either exists.
+/// It is the domain of the store's operations and of its history alike.
 ///
 /// # Errors
 ///
-/// A record does not decode.
+/// A record does not decode; [`StorageError::DeploymentConflict`] when the
+/// record and the enrollment both exist and disagree.
 pub fn bound_deployment(engine: &StorageEngine) -> StorageResult<Option<DeploymentId>> {
-    if let Some(recorded) = recorded_deployment(engine)? {
-        return Ok(Some(recorded));
-    }
-    match engine.get(Partition::Schema, ENROLLED_DEPLOYMENT_KEY)? {
-        None => Ok(None),
-        Some(bytes) => DeploymentId::from_slice(&bytes).map(Some).ok_or_else(|| {
+    let recorded = recorded_deployment(engine)?;
+    let enrolled = match engine.get(Partition::Schema, ENROLLED_DEPLOYMENT_KEY)? {
+        None => None,
+        Some(bytes) => Some(DeploymentId::from_slice(&bytes).ok_or_else(|| {
             StorageError::Serialization("the enrollment record does not decode".into())
-        }),
+        })?),
+    };
+    match (recorded, enrolled) {
+        (Some(recorded), Some(enrolled)) if recorded != enrolled => {
+            Err(StorageError::DeploymentConflict { recorded, enrolled })
+        }
+        (recorded, enrolled) => Ok(recorded.or(enrolled)),
     }
+}
+
+/// A deployment identity no other database draws, for a founder to propose:
+/// 128 bits from two hashers keyed by the process's random seed, mixed with
+/// the clock. It tells domains apart and grants nothing, so it needs
+/// uniqueness, not secrecy. Only the candidate the ordered decision records
+/// first is ever the domain; every founder reads that one back.
+pub fn deployment_candidate() -> DeploymentId {
+    use std::hash::{BuildHasher, Hasher};
+    // no-std: a caller-provided entropy source.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut id = [0u8; 16];
+    for half in id.as_chunks_mut::<8>().0 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(now);
+        *half = hasher.finish().to_be_bytes();
+    }
+    DeploymentId(id)
+}
+
+/// The deployment to found this store's domain with: the one it was
+/// enrolled in when it joined a group whose record has not reached it yet,
+/// else a fresh candidate. An enrolled member never mints a replacement.
+///
+/// # Errors
+///
+/// As [`bound_deployment`].
+pub fn founding_candidate(engine: &StorageEngine) -> StorageResult<DeploymentId> {
+    Ok(bound_deployment(engine)?.unwrap_or_else(deployment_candidate))
 }
 
 /// Whether the node identity `identity` (canonically encoded) was retired.

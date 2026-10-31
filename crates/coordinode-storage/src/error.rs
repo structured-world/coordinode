@@ -218,6 +218,20 @@ pub enum StorageError {
     /// name it. Nothing was written.
     #[error("a write keyed by its commit needs a transaction that commits at a timestamp")]
     NoCommitTimestamp,
+
+    /// The store's deployment record and the deployment it was enrolled in
+    /// disagree: which domain its history and operations belong to has no
+    /// single answer. Refused, never settled by preferring one record.
+    #[error(
+        "the store records deployment {recorded} but was enrolled in deployment {enrolled}: \
+         its domain is ambiguous"
+    )]
+    DeploymentConflict {
+        /// The deployment the store's own record names.
+        recorded: coordinode_core::group::DeploymentId,
+        /// The deployment the store was enrolled in.
+        enrolled: coordinode_core::group::DeploymentId,
+    },
 }
 
 /// `key` as text for a message: printable ASCII as it is, every other byte
