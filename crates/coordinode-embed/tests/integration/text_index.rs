@@ -1204,6 +1204,44 @@ fn duplicate_create_text_index_errors() {
     );
 }
 
+/// A text index created before its label's first node holds no document:
+/// that node giving the label its identity changes no implication, so the
+/// index follows nothing and a search right after the write is answered,
+/// never refused as not ready. Before, the worker followed it as a change
+/// of what a type implies and refused every search meanwhile.
+#[test]
+fn the_first_node_of_a_label_is_no_change_to_follow() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create index");
+    let (preparing, prepared) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    *coordinode_embed::text_worker::WHILE_PREPARING.lock() = Some(Box::new(move || {
+        let _ = preparing.send(());
+        let _ = released.recv_timeout(Duration::from_secs(30));
+    }));
+    db.execute_cypher("CREATE (a:Article {body: 'Rust graph database'})")
+        .expect("create node");
+    // Held there while it follows, if it does.
+    let followed = prepared.recv_timeout(Duration::from_secs(2));
+    let found =
+        db.execute_cypher("MATCH (a:Article) WHERE text_match(a.body, 'rust') RETURN a.body");
+    let _ = release.send(());
+    *coordinode_embed::text_worker::WHILE_PREPARING.lock() = None;
+    assert_eq!(
+        found.map(|rows| rows.len()).map_err(|e| e.to_string()),
+        Ok(1),
+        "the search right after the first node"
+    );
+    assert!(
+        followed.is_err(),
+        "the first node of a label was followed as a change of what a type implies"
+    );
+}
+
 // ── REMOVE property removes from index ─────────────────────────────
 
 /// REMOVE a.body removes the property from the text index.

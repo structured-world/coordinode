@@ -400,6 +400,12 @@ impl Worker {
                     // rather than answering them from the store, and
                     // settles it in the same pass.
                     _ => match held.base.clone() {
+                        // Built while the label had no identity, the index
+                        // holds no document: its label gaining one (its
+                        // first node) is no change to follow, and readers
+                        // are answered from the store while it is written
+                        // afresh.
+                        Some(None) => self.rebuild_plain(def, property, &interner)?,
                         Some(base) => {
                             self.prepare(def, property, (&base, &in_force), revision, &interner)?;
                             if let Some((followed, revision)) =

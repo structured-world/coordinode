@@ -551,6 +551,10 @@ impl Worker {
                 // a read of those answering to the index's build policy
                 // meanwhile, and settles it in the same pass.
                 _ => match held.base.clone() {
+                    // Built while the label had no identity, the index holds
+                    // no member: its label gaining one (its first node) is
+                    // no change to follow, and a rebuild writes it afresh.
+                    Some(None) => rebuild = true,
                     Some(base) => {
                         self.prepare(def, revision, (&base, &in_force))?;
                         if let Some((followed, revision)) =
