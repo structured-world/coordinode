@@ -77,6 +77,40 @@ fn composite_values_are_unindexable() {
     );
 }
 
+/// The room charged before an element is encoded covers its encoding, a
+/// string or binary of zero bytes, each escaped to two, included; for an
+/// element that has no key it is nothing, and nothing is appended.
+#[test]
+fn an_element_never_encodes_past_its_bound() {
+    let values = [
+        Value::Null,
+        Value::Bool(true),
+        Value::Int(-7),
+        Value::Float(1.5),
+        Value::Timestamp(9),
+        Value::String(String::new()),
+        Value::String("abc".into()),
+        Value::String("\0".repeat(100)),
+        Value::Binary(vec![0; 64]),
+        Value::Binary(vec![7; 64]),
+        Value::Array(vec![Value::Int(1)]),
+        Value::Float(f64::NAN),
+    ];
+    for value in values {
+        let mut out = Vec::new();
+        let encoded = encode_element(&value, &mut out);
+        assert!(
+            out.len() <= element_len_bound(&value),
+            "{value:?}: {} past {}",
+            out.len(),
+            element_len_bound(&value)
+        );
+        if encoded.is_err() {
+            assert!(out.is_empty(), "{value:?} appended though refused");
+        }
+    }
+}
+
 /// -0.0 equals 0.0, so it is the same key; NaN equals nothing, so it has none.
 #[test]
 fn float_keys_follow_float_equality() {

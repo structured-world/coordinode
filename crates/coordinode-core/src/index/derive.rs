@@ -353,11 +353,17 @@ pub fn tuples_within<E>(
         };
         let mut choices = Vec::with_capacity(items.len());
         for item in items {
+            // Room for the element's encoding, charged before the scratch
+            // grows to it, so the encoding never grows it.
             scratch.clear();
+            let room = super::encoding::element_len_bound(item);
+            if let Some(more) = room.checked_sub(scratch.capacity()).filter(|m| *m > 0) {
+                charge(more)?;
+                scratch.reserve_exact(room);
+            }
             choices.push(match super::encoding::encode_element(item, &mut scratch) {
                 Ok(()) => {
-                    // The scratch grows unseen to one element's encoding;
-                    // its kept copy is charged before it is made.
+                    // Its kept copy, at its exact length.
                     charge(scratch.len())?;
                     Some(scratch.clone())
                 }

@@ -124,6 +124,20 @@ pub fn encode_element(value: &Value, out: &mut Vec<u8>) -> Result<(), Unindexabl
     Ok(())
 }
 
+/// At most how many bytes [`encode_element`] appends for `value`: a tag,
+/// and for a string or a binary its bytes, each zero escaped to two, and a
+/// terminator.
+pub fn element_len_bound(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) => 1,
+        Value::Int(_) | Value::Float(_) | Value::Timestamp(_) => 9,
+        Value::String(s) => 2 + 2 * s.len(),
+        Value::Binary(b) => 2 + 2 * b.len(),
+        // Refused: nothing is appended.
+        _ => 0,
+    }
+}
+
 /// Encode a tuple of values: the concatenation of their elements.
 ///
 /// # Errors
