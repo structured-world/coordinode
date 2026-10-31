@@ -15,6 +15,7 @@ use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
 use coordinode_core::schema::definition::{ConstraintKind, MAX_ARRAY_NESTING, PropertyType};
 use coordinode_core::txn::command::TransactionId;
 use coordinode_core::txn::operation::IssuerId;
+use coordinode_core::txn::proposal::UnknownOutcome;
 use coordinode_core::version::{Mismatch, VersionPair};
 use coordinode_query::cypher::ParseError;
 use coordinode_query::cypher::errors::ErrorSpan;
@@ -103,6 +104,7 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::OperationDiffers(_) => "OperationDiffers",
         E::TransactionCommittedOnTimeout(_) => "TransactionCommittedOnTimeout",
         E::TransactionOutcomeUnknown(_) => "TransactionOutcomeUnknown",
+        E::WriteOutcomeUnknown { .. } => "WriteOutcomeUnknown",
         E::TransactionAborted { .. } => "TransactionAborted",
         E::TransactionConflict { .. } => "TransactionConflict",
         E::InvariantRefused { .. } => "InvariantRefused",
@@ -197,6 +199,28 @@ fn end_reason(end: TransactionEnd) -> i32 {
         TransactionEnd::StreamLost => R::StreamLost,
     }
     .into()
+}
+
+fn unknown_outcome_to_wire(cause: UnknownOutcome) -> wire::write_outcome_unknown::Cause {
+    use wire::write_outcome_unknown::Cause;
+    match cause {
+        UnknownOutcome::LeadershipLost { term } => Cause::LeadershipLostTerm(term),
+        UnknownOutcome::NotSeenCommitted { retries } => Cause::NotSeenCommittedRetries(retries),
+        UnknownOutcome::WriteConcernTimeout { timeout_ms } => {
+            Cause::WriteConcernTimeoutMs(timeout_ms)
+        }
+    }
+}
+
+fn unknown_outcome_from_wire(cause: wire::write_outcome_unknown::Cause) -> UnknownOutcome {
+    use wire::write_outcome_unknown::Cause;
+    match cause {
+        Cause::LeadershipLostTerm(term) => UnknownOutcome::LeadershipLost { term },
+        Cause::NotSeenCommittedRetries(retries) => UnknownOutcome::NotSeenCommitted { retries },
+        Cause::WriteConcernTimeoutMs(timeout_ms) => {
+            UnknownOutcome::WriteConcernTimeout { timeout_ms }
+        }
+    }
 }
 
 /// An operation's outcome as the routing answer to a resolution states it.
@@ -512,6 +536,13 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
         E::OperationDiffers(id) => Kind::OperationDiffers(transaction(id)),
         E::TransactionCommittedOnTimeout(id) => Kind::CommittedOnTimeout(transaction(id)),
         E::TransactionOutcomeUnknown(id) => Kind::OutcomeUnknown(transaction(id)),
+        E::WriteOutcomeUnknown {
+            cause,
+            transaction: of,
+        } => Kind::WriteOutcomeUnknown(wire::WriteOutcomeUnknown {
+            cause: Some(unknown_outcome_to_wire(cause)),
+            transaction: of.map(transaction),
+        }),
         E::TransactionAborted { id, end } => Kind::TransactionAborted(wire::TransactionAborted {
             transaction_id: id.to_bytes().to_vec(),
             end: end_reason(end),
@@ -909,6 +940,13 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
         Kind::OutcomeUnknown(t) => {
             E::TransactionOutcomeUnknown(transaction_from("outcome_unknown", &t.transaction_id)?)
         }
+        Kind::WriteOutcomeUnknown(w) => E::WriteOutcomeUnknown {
+            cause: unknown_outcome_from_wire(w.cause.ok_or("a write outcome of no cause")?),
+            transaction: w
+                .transaction
+                .map(|t| transaction_from("write_outcome_unknown", &t.transaction_id))
+                .transpose()?,
+        },
         Kind::TransactionAborted(t) => E::TransactionAborted {
             id: transaction_from("transaction_aborted", &t.transaction_id)?,
             end: transaction_end(t.end)?,

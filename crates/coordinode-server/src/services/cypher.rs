@@ -658,6 +658,24 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [("transaction", id.to_string())],
             );
         }
+        // UNAVAILABLE, as for a lost routed answer: the write may have
+        // committed, so it is neither a refusal nor an abort.
+        DatabaseError::WriteOutcomeUnknown { cause, transaction } => {
+            use coordinode_core::txn::proposal::UnknownOutcome;
+            let cause = match cause {
+                UnknownOutcome::LeadershipLost { .. } => "LEADERSHIP_LOST",
+                UnknownOutcome::NotSeenCommitted { .. } => "NOT_SEEN_COMMITTED",
+                UnknownOutcome::WriteConcernTimeout { .. } => "WRITE_CONCERN_TIMEOUT",
+            };
+            let mut metadata = vec![("cause", cause.to_owned())];
+            metadata.extend(transaction.map(|id| ("transaction", id.to_string())));
+            return status_with_reason(
+                Code::Unavailable,
+                rendered,
+                Reason::WriteOutcomeUnknown,
+                metadata,
+            );
+        }
         // Nothing was applied and the retry is the whole transaction, or the
         // statement outside one: ABORTED, naming the transaction when there
         // is one.

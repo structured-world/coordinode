@@ -234,6 +234,18 @@ fn every_variant() -> Vec<DatabaseError> {
         E::OperationDiffers(txid()),
         E::TransactionCommittedOnTimeout(txid()),
         E::TransactionOutcomeUnknown(txid()),
+        E::WriteOutcomeUnknown {
+            cause: UnknownOutcome::LeadershipLost { term: 7 },
+            transaction: None,
+        },
+        E::WriteOutcomeUnknown {
+            cause: UnknownOutcome::NotSeenCommitted { retries: 3 },
+            transaction: Some(txid()),
+        },
+        E::WriteOutcomeUnknown {
+            cause: UnknownOutcome::WriteConcernTimeout { timeout_ms: 250 },
+            transaction: None,
+        },
         E::TransactionAborted {
             id: txid(),
             end: TransactionEnd::StatementFailed,

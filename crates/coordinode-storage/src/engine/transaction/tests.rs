@@ -2087,6 +2087,65 @@ fn a_fire_and_forget_commit_never_writes_outside_the_pipeline() {
     );
 }
 
+/// A pipeline that hands every proposal to the log and then fails with `err`,
+/// so the outcome of the write is unknown.
+struct OutcomeUnknownPipeline(coordinode_core::txn::proposal::ProposalError);
+
+impl coordinode_core::txn::proposal::ProposalPipeline for OutcomeUnknownPipeline {
+    fn propose_and_wait(
+        &self,
+        _proposal: &coordinode_core::txn::proposal::RaftProposal,
+    ) -> Result<
+        coordinode_core::txn::proposal::ProposalOutcome,
+        coordinode_core::txn::proposal::ProposalError,
+    > {
+        Err(self.0.clone())
+    }
+}
+
+/// A leader that stepped down while the write waited, a write not seen
+/// committed and a write concern that timed out all leave a write that may
+/// still commit. The commit says so with its cause, never as a failure that
+/// applied nothing: the caller must not take it for a refusal and retry it
+/// blindly.
+#[test]
+fn a_write_whose_outcome_is_unknown_is_reported_as_such() {
+    use coordinode_core::txn::proposal::{ProposalError, UnknownOutcome};
+
+    let cases = [
+        (
+            ProposalError::LeadershipLost { term: 5 },
+            UnknownOutcome::LeadershipLost { term: 5 },
+        ),
+        (
+            ProposalError::Timeout { retries: 3 },
+            UnknownOutcome::NotSeenCommitted { retries: 3 },
+        ),
+        (
+            ProposalError::WriteConcernTimeout { timeout_ms: 200 },
+            UnknownOutcome::WriteConcernTimeout { timeout_ms: 200 },
+        ),
+    ];
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::majority();
+    let ids = coordinode_core::txn::proposal::ProposalIdGenerator::new();
+    for (failure, expected) in cases {
+        let pipeline = OutcomeUnknownPipeline(failure);
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: Some(&pipeline),
+            id_gen: Some(&ids),
+        };
+        let mut txn = mvcc_txn(&engine, &oracle);
+        txn.put(Partition::Node, b"unknown:node", b"v").unwrap();
+        let err = txn.commit(&ctx).expect_err("the pipeline failed");
+        assert!(
+            matches!(err, CommitError::OutcomeUnknown(cause) if cause == expected),
+            "expected an unknown outcome {expected:?}, got {err:?}"
+        );
+    }
+}
+
 /// A volatile commit takes the one commit path: it is committed state the
 /// moment `commit` returns, has exactly one effect, reports its commit
 /// timestamp and releases its keys like any commit, under both levels.

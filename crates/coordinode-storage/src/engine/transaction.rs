@@ -91,6 +91,12 @@ pub enum CommitError {
     /// Encoding / replication-pipeline failure.
     #[error("{0}")]
     Serialization(String),
+    /// The write was handed to the replication log and its outcome is
+    /// unknown: it may have committed, or may yet. Not a refusal, and not
+    /// safe to retry blindly; a write bound to an operation is resolved by
+    /// it.
+    #[error("{0}; the write may have been applied")]
+    OutcomeUnknown(coordinode_core::txn::proposal::UnknownOutcome),
     /// The engine is over its compaction-debt stop threshold: new client
     /// writes are rejected until compaction catches up. Nothing was applied;
     /// retry after a short delay.
@@ -249,11 +255,24 @@ fn partition_to_id(p: Partition) -> PartitionId {
     }
 }
 
-/// Translate a proposal-pipeline error into a [`CommitError`], preserving the
-/// capacity-exhaustion structured variant (operators retry on a different
-/// endpoint) and folding the rest into a serialization-class failure.
+/// Translate a proposal-pipeline error into a [`CommitError`], keeping every
+/// case a caller answers differently typed (a refusal, a write whose outcome
+/// is unknown, a full endpoint) and folding the rest into a
+/// serialization-class failure.
 fn proposal_err_to_commit(err: ProposalError) -> CommitError {
+    use coordinode_core::txn::proposal::UnknownOutcome;
     match err {
+        // Handed to the log and not seen through: the write may have
+        // committed. Never reported as a failure that applied nothing.
+        ProposalError::LeadershipLost { term } => {
+            CommitError::OutcomeUnknown(UnknownOutcome::LeadershipLost { term })
+        }
+        ProposalError::Timeout { retries } => {
+            CommitError::OutcomeUnknown(UnknownOutcome::NotSeenCommitted { retries })
+        }
+        ProposalError::WriteConcernTimeout { timeout_ms } => {
+            CommitError::OutcomeUnknown(UnknownOutcome::WriteConcernTimeout { timeout_ms })
+        }
         ProposalError::CapacityExhausted {
             endpoint_id,
             used_bytes,

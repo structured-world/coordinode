@@ -933,6 +933,11 @@ impl Database {
             CommitError::Serialization(detail) => {
                 DatabaseError::Other(format!("commit failed: {detail}"))
             }
+            // Not retryable from begin: the commit may have applied.
+            CommitError::OutcomeUnknown(cause) => DatabaseError::WriteOutcomeUnknown {
+                cause,
+                transaction: Some(id),
+            },
             // Retryable like a conflict, but with a delay: the engine sheds
             // writes until compaction drains its debt.
             CommitError::Backpressure => DatabaseError::WriteBackpressure,

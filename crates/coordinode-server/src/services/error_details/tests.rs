@@ -89,6 +89,7 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::TransactionOutcomeUnknown,
         Reason::MemberUnreachable,
         Reason::RoutedOutcomeUnknown,
+        Reason::WriteOutcomeUnknown,
         Reason::TransactionConflict,
         Reason::InvariantRefused,
         Reason::RevisionMismatch,

@@ -1489,6 +1489,17 @@ fn transaction_failures_carry_distinct_reasons() {
             "TRANSACTION_OUTCOME_UNKNOWN",
             false,
         ),
+        // A commit the leader lost while it waited may still apply: never
+        // INTERNAL, never retryable advice.
+        (
+            DatabaseError::WriteOutcomeUnknown {
+                cause: coordinode_core::txn::proposal::UnknownOutcome::LeadershipLost { term: 4 },
+                transaction: Some(id),
+            },
+            tonic::Code::Unavailable,
+            "WRITE_OUTCOME_UNKNOWN",
+            false,
+        ),
         (
             DatabaseError::TransactionAborted {
                 id,

@@ -341,6 +341,18 @@ pub enum DatabaseError {
     )]
     TransactionOutcomeUnknown(TransactionId),
 
+    /// A write was handed to the replication log and its outcome is unknown:
+    /// it may have committed, or may yet. Not a refusal: retrying it blindly
+    /// can apply it twice; a write bound to an operation is resolved by it.
+    /// `transaction` names the interactive transaction whose commit it was.
+    #[error("{cause}; the write may have been applied")]
+    WriteOutcomeUnknown {
+        /// Why the outcome is unknown.
+        cause: coordinode_core::txn::proposal::UnknownOutcome,
+        /// The transaction whose commit it was, if one.
+        transaction: Option<TransactionId>,
+    },
+
     /// The transaction ended before anything of it was submitted, so nothing
     /// of it was applied. Running it again is a new transaction.
     #[error("transaction {id} was aborted: {end}")]
@@ -775,6 +787,10 @@ impl From<ExecutionError> for DatabaseError {
             E::Storage(storage) => storage.into(),
             E::Modality(store) => store.into(),
             E::Budget(stop) => Self::Budget(stop),
+            E::OutcomeUnknown(cause) => Self::WriteOutcomeUnknown {
+                cause,
+                transaction: None,
+            },
             E::IndexUnresolved {
                 label,
                 property,

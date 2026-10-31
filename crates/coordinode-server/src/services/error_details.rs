@@ -283,6 +283,14 @@ pub enum Reason {
     /// DEADLINE or PROTOCOL). Terminal for a write: its outcome is resolved
     /// through its operation, never by sending it again.
     RoutedOutcomeUnknown,
+    /// A write was handed to the replication log and its outcome is unknown:
+    /// the leader stepped down while it waited, it was not seen committed, or
+    /// its write concern timed out. It may have committed, or may yet; it is
+    /// never rolled back. Metadata carries `cause` (LEADERSHIP_LOST,
+    /// NOT_SEEN_COMMITTED or WRITE_CONCERN_TIMEOUT) and `transaction` when it
+    /// was the commit of one. Terminal: its outcome is resolved through its
+    /// operation or by reading it back, never by sending it again blindly.
+    WriteOutcomeUnknown,
     /// A blob write on a member of a group with other members: blob payload
     /// is held durably on the member that wrote it and is not yet carried to
     /// the others, so the group could lose it on a leader change. Refused
@@ -348,6 +356,7 @@ impl Reason {
             Reason::ForeignOperation => "FOREIGN_OPERATION",
             Reason::MemberUnreachable => "MEMBER_UNREACHABLE",
             Reason::RoutedOutcomeUnknown => "ROUTED_OUTCOME_UNKNOWN",
+            Reason::WriteOutcomeUnknown => "WRITE_OUTCOME_UNKNOWN",
             Reason::BlobNotReplicated => "BLOB_NOT_REPLICATED",
         }
     }

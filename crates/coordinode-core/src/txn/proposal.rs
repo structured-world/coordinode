@@ -487,6 +487,33 @@ impl RaftProposal {
     }
 }
 
+/// Why a write handed to the replication log has an unknown outcome: it may
+/// have committed, or may yet, and nothing undoes it. Retrying it blindly can
+/// apply it twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum UnknownOutcome {
+    /// The member stopped leading in `term` while the write waited for its
+    /// quorum; another leader may still commit it.
+    #[error("leadership in term {term} was lost while the write waited")]
+    LeadershipLost {
+        /// The term the write was handed to the log in.
+        term: u64,
+    },
+    /// The write was not seen committed after `retries` retries.
+    #[error("the write was not seen committed after {retries} retries")]
+    NotSeenCommitted {
+        /// The retries made.
+        retries: u32,
+    },
+    /// The write concern's timeout ran out before the write was
+    /// acknowledged; the write is not rolled back.
+    #[error("the write concern's {timeout_ms} ms ran out before the write was acknowledged")]
+    WriteConcernTimeout {
+        /// The timeout, in milliseconds.
+        timeout_ms: u32,
+    },
+}
+
 /// Error from the proposal pipeline.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ProposalError {

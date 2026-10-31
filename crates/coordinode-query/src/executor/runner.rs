@@ -235,6 +235,10 @@ pub enum ExecutionError {
         /// election is in flight.
         leader_id: Option<u64>,
     },
+    /// The statement's write was handed to the replication log and its
+    /// outcome is unknown: it may have committed. Not safe to retry blindly.
+    #[error("{0}; the write may have been applied")]
+    OutcomeUnknown(coordinode_core::txn::proposal::UnknownOutcome),
 
     /// The write reached a member that does not run its group's version.
     /// Nothing was applied; the same write succeeds at the leader named in
@@ -23911,6 +23915,7 @@ pub fn commit_err_to_execution(
         CommitError::Conflict(msg) => ExecutionError::Conflict(msg),
         CommitError::Storage(e) => ExecutionError::Storage(e),
         CommitError::Serialization(msg) => ExecutionError::Serialization(msg),
+        CommitError::OutcomeUnknown(cause) => ExecutionError::OutcomeUnknown(cause),
         CommitError::Backpressure => ExecutionError::Backpressure,
         CommitError::NotLeader { leader_id } => ExecutionError::NotLeader { leader_id },
         CommitError::Mismatched(m) => ExecutionError::Mismatched(m),
