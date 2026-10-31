@@ -678,9 +678,8 @@ fn restore_binary<R: Read>(
             } => {
                 // An older dump is refused before any record of it is read:
                 // its records are laid out for a format this build does not
-                // read (node records naming their labels rather than storing
-                // catalog identities), and no conversion exists, so not even
-                // a forced restore may interpret them.
+                // read, and no conversion exists, so not even a forced
+                // restore may interpret them.
                 if format_version < super::export::BINARY_FORMAT_VERSION {
                     return Err(RestoreError::IncompatibleVersion(format!(
                         "dump format v{format_version} from {producer} is older than supported \

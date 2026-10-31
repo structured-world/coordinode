@@ -598,10 +598,9 @@ fn binary_restore_rejects_newer_format_version() {
         .expect("force should bypass the version gate");
 }
 
-/// A dump of an older format holds records this build would misread (node
-/// records naming their labels instead of storing catalog identities): it is
-/// refused before any of it is interpreted, and force does not override that,
-/// since no migration reads the old layout.
+/// A dump of an older format holds records laid out for a format this build
+/// does not read: it is refused before any of it is interpreted, and force
+/// does not override that, since nothing converts the older layout.
 #[test]
 fn binary_restore_refuses_an_older_format_even_forced() {
     let older = export::BINARY_FORMAT_VERSION - 1;

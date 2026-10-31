@@ -27,7 +27,7 @@ fn node_shard_prefix(shard_id: u16) -> Vec<u8> {
 /// incompatible change to [`BackupEntry`] layout or to the value
 /// encodings stored inside it. Restore refuses dumps of any other version
 /// (see `restore_binary`): an older one is never converted.
-pub const BINARY_FORMAT_VERSION: u32 = 2;
+pub const BINARY_FORMAT_VERSION: u32 = 1;
 
 /// Human-readable producer string embedded in the binary dump manifest:
 /// `coordinode-embed/<crate-version>`. Used only for diagnostics in

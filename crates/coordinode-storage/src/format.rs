@@ -30,8 +30,8 @@ pub struct MigrationStep {
 }
 
 /// Every migration this release ships, at most one per source format. None
-/// leads into this release's format: node records store catalog label
-/// identities where earlier directories stored names, and before the first
+/// leads into this release's format: membership records carry each member's
+/// node identity, which no earlier directory records, and before the first
 /// supported release an older directory is refused rather than converted.
 pub static MIGRATIONS: &[MigrationStep] = &[
     // A test build runs up to two formats past this release's, so a suite
