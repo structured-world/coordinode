@@ -137,6 +137,96 @@ fn each_interpretation_answers_after_collection_and_reopen() {
     );
 }
 
+/// A thing as a read knows it: its name and `valid_to`.
+type Known = (String, Option<i64>);
+
+/// The things at `as_of`, valid now, in name order.
+fn things_with_end(db: &mut Database, as_of: u64) -> Vec<Known> {
+    let rows = db
+        .execute_cypher(&format!(
+            "MATCH (n:Thing) RETURN n.name AS name, n.valid_to AS valid_to ORDER BY name \
+             AS OF TIMESTAMP {as_of}"
+        ))
+        .unwrap_or_else(|e| panic!("as of {as_of}: {e}"));
+    rows.iter()
+        .map(|row| {
+            let name = match row.get("name") {
+                Some(Value::String(name)) => name.clone(),
+                other => panic!("name {other:?}"),
+            };
+            let valid_to = match row.get("valid_to") {
+                Some(Value::Int(v)) => Some(*v),
+                Some(Value::Null) | None => None,
+                other => panic!("valid_to {other:?}"),
+            };
+            (name, valid_to)
+        })
+        .collect()
+}
+
+/// Later facts about a thing leave what was known before as it was, past
+/// the operational retention and after a reopen. `Y` comes to imply
+/// `Thing`; then its node is renamed (a new version), its current version's
+/// end is corrected twice at the same `valid_from` (set, then cleared), a
+/// thing valid only from a future time is written, and the node is deleted.
+/// A read at each system time answers what was known then, at the current
+/// valid time: the corrections each at its own time, the future thing at
+/// none, the deleted node up to its deletion.
+#[test]
+fn later_facts_leave_what_was_known_before() {
+    const FUTURE: i64 = 4_000_000_000_000_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let expected = {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.set_retention_window(Duration::from_secs(2));
+        types(&mut db);
+        let implied = settled(&mut db, "ALTER NODE TYPE Y SET IMPLIES (Thing)");
+        let at = |db: &mut Database, statement: &str| {
+            db.execute_cypher(statement)
+                .unwrap_or_else(|e| panic!("{statement}: {e}"));
+            mark(db)
+        };
+        let renamed = at(&mut db, "MATCH (n:Y) SET n.name = 'y2'");
+        let ended = at(&mut db, &format!("MATCH (n:Y) SET n.valid_to = {FUTURE}"));
+        let reopened = at(&mut db, "MATCH (n:Y) SET n.valid_to = null");
+        let future = at(
+            &mut db,
+            &format!("CREATE (:Y {{name: 'later', valid_from: {FUTURE}}})"),
+        );
+        let deleted = at(&mut db, "MATCH (n:Y) WHERE n.name = 'y2' DELETE n");
+        let expected: Vec<(u64, Vec<Known>)> = vec![
+            (implied, vec![("y".into(), None)]),
+            (renamed, vec![("y2".into(), None)]),
+            (ended, vec![("y2".into(), Some(FUTURE))]),
+            (reopened, vec![("y2".into(), None)]),
+            (future, vec![("y2".into(), None)]),
+            (deleted, vec![]),
+        ];
+        for (as_of, things) in &expected {
+            assert_eq!(
+                &things_with_end(&mut db, *as_of),
+                things,
+                "as of {as_of}, within the retention"
+            );
+        }
+        collect_history(&mut db);
+        assert!(
+            db.oldest_readable_timestamp().as_raw() > deleted,
+            "every read below is past the operational retention"
+        );
+        expected
+    };
+    let mut db = Database::open(dir.path()).expect("reopen");
+    db.set_retention_window(Duration::from_secs(2));
+    for (as_of, things) in &expected {
+        assert_eq!(
+            &things_with_end(&mut db, *as_of),
+            things,
+            "as of {as_of}, past the retention after a reopen"
+        );
+    }
+}
+
 /// A read past the operational retention of a label whose carriers are not
 /// all temporal is refused as past the retention: their past was in the
 /// collected row versions only, and part of the answer is no answer. So is
