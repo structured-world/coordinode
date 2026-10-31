@@ -37,6 +37,25 @@ use super::registry::{Carried, place_entry, record_lookup};
 /// Conflicts one page may meet in a row before the pass gives up.
 const MAX_PAGE_CONFLICTS: u32 = 64;
 
+/// A page's budget of `bytes`, holding first the `held` bytes the pass
+/// carries into it from the pages before. Nothing of the page exists before
+/// this returns, so a page that cannot hold what the pass carries is refused
+/// before it reads anything.
+///
+/// # Errors
+///
+/// The budget's refusal of `held`.
+pub(crate) fn page_budget(
+    bytes: u64,
+    held: usize,
+) -> Result<std::sync::Arc<coordinode_core::budget::QueryBudget>, coordinode_core::budget::BudgetStop>
+{
+    let budget = std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(bytes));
+    // Bytes of memory that already exist: fits in u64.
+    budget.reserve(held as u64)?.keep_until_query_ends();
+    Ok(budget)
+}
+
 /// Where a reconciliation reads and how it opens its transactions.
 pub(crate) struct Reconcile<'a> {
     /// The storage engine.
@@ -138,22 +157,21 @@ impl Reconcile<'_> {
                 Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
                 None => Transaction::begin(self.engine, None, Timestamp::ZERO),
             };
-            // One budget per page, of the configured bytes: the definitions
-            // the page places under, the label scratch and the cursor the pass
-            // still holds, then what the page reads, keeps, decodes and
-            // stages, and the catalog facts it learns, each before the memory
-            // is taken.
-            let page_budget =
-                std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(self.page_bytes));
+            // One budget per page, of the configured bytes: the label scratch
+            // and the cursor the pass still holds, then the definitions the
+            // page places under, what it reads, keeps, decodes and stages,
+            // and the catalog facts it learns, each before the memory is
+            // taken.
+            let page_budget = page_budget(
+                self.page_bytes,
+                scratch_held + start_after.as_ref().map_or(0, Vec::capacity),
+            )?;
             txn.charge_writes_to(Some(std::sync::Arc::clone(&page_budget)));
             let charge = |bytes: usize| -> Result<(), coordinode_core::budget::BudgetStop> {
                 // Bytes of memory about to exist: fits in u64.
                 page_budget.reserve(bytes as u64)?.keep_until_query_ends();
                 Ok(())
             };
-            // What the pass still holds, first: the label scratch and the
-            // cursor carried from the page before.
-            charge(scratch_held + start_after.as_ref().map_or(0, Vec::capacity))?;
             // Read for each page, each bound to the record as read: one the
             // conclusion moved refuses the page.
             let defs = store.definitions_with_part(

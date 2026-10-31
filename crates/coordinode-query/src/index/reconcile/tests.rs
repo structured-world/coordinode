@@ -18,6 +18,28 @@ fn direct(engine: &StorageEngine) -> Transaction<'_> {
     Transaction::new(engine, None, Timestamp::ZERO, None)
 }
 
+/// A page's budget holds what the pass carries into it before the page
+/// takes anything: carried state that alone does not fit refuses the page
+/// at once, and state that fits leaves the rest of the bytes for the page.
+#[test]
+fn a_page_holds_what_the_pass_carries_first() {
+    assert!(matches!(
+        page_budget(1024, 2048),
+        Err(coordinode_core::budget::BudgetStop::Memory {
+            requested: 2048,
+            used: 0,
+            limit: 1024
+        })
+    ));
+    let budget = page_budget(1024, 1000).expect("fits");
+    assert_eq!(budget.memory_used(), 1000);
+    assert!(
+        budget.reserve(25).is_err(),
+        "the page took past what was left"
+    );
+    assert!(budget.reserve(24).is_ok());
+}
+
 /// A change put in force keeps its parts until its fold brings them back to
 /// the index's own entries. A change of the same label published meanwhile
 /// is refused, as it would be while the first is certified: two changes'
