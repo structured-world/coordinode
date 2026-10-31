@@ -672,17 +672,22 @@ fn an_implication_change_keeps_within_its_page_bytes() {
 
 /// What a placement learns of the catalog and the label lists it reuses
 /// from node to node count against the same bytes as the rows it reads and
-/// the postings it stages. A type implying six hundred labels takes far more
-/// than 48 KiB in label names and closures under both interpretations,
-/// though its one node and that node's postings would fit: the change is
-/// refused, leaving nothing, and goes through once the pages hold 4 MiB.
+/// the postings it stages. A type implying three hundred labels with long
+/// names: its one node, that node's postings and the label lists fit 128
+/// KiB (they need under 96), but not with the names and closures both
+/// interpretations learn (they need over 160). The change is refused,
+/// leaving nothing, and goes through once the pages hold 4 MiB.
 #[test]
 fn an_implication_change_counts_its_catalog_in_the_page_bytes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
     db.execute_cypher("CREATE NODE TYPE Task WITH (title: STRING)")
         .expect("task type");
-    let labels: Vec<String> = (0..600).map(|n| format!("Wide{n:03}")).collect();
+    // Long names: the catalog the placement learns outweighs the postings
+    // it stages for the same labels.
+    let labels: Vec<String> = (0..300)
+        .map(|n| format!("Wide{n:03}{}", "x".repeat(196)))
+        .collect();
     for label in &labels {
         db.execute_cypher(&format!("CREATE NODE TYPE {label} WITH (title: STRING)"))
             .unwrap_or_else(|e| panic!("{label}: {e}"));
@@ -692,13 +697,16 @@ fn an_implication_change_counts_its_catalog_in_the_page_bytes() {
     let change = format!("ALTER NODE TYPE Task SET IMPLIES ({})", labels.join(", "));
 
     db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
-        maintenance_page_bytes: 48 * 1024,
+        maintenance_page_bytes: 128 * 1024,
         ..db.index_build_config()
     });
     let err = refused(&mut db, &change);
     assert!(err.contains("memory") || err.contains("page"), "{err}");
     await_folded(&db);
-    assert_eq!(count(&mut db, "MATCH (n:Wide000) RETURN n"), 0);
+    assert_eq!(
+        count(&mut db, &format!("MATCH (n:{}) RETURN n", labels[0])),
+        0
+    );
 
     db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
         maintenance_page_bytes: 4 << 20,
@@ -707,7 +715,10 @@ fn an_implication_change_counts_its_catalog_in_the_page_bytes() {
     db.execute_cypher(&change)
         .expect("with room for the catalog, the same change goes through");
     await_folded(&db);
-    assert_eq!(count(&mut db, "MATCH (n:Wide599) RETURN n"), 1);
+    assert_eq!(
+        count(&mut db, &format!("MATCH (n:{}) RETURN n", labels[299])),
+        1
+    );
 }
 
 /// One schema package moving a value's holder out of a label and another
