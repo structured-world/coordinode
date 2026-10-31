@@ -5878,6 +5878,60 @@ fn create_index_registers_and_backfills() {
     );
 }
 
+/// What the statement's budget holds after writing a User whose name is a
+/// list of `n` strings, under an index on it that is unique or not.
+fn charged_by_list_write(unique: bool, n: usize) -> u64 {
+    let (_dir, engine, mut interner) = setup_test_graph();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+    let (env, builds) = btree_member(engine, &interner);
+    let mut def = crate::index::IndexDescriptor::btree("u_name", "User", "name");
+    if unique {
+        def = def.unique();
+    }
+    env.registry.register_in_memory(def.bind(
+        crate::index::IndexId::from_raw(1),
+        crate::index::GenerationId::from_raw(1),
+    ));
+    let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
+    // As a statement's execution does: what it stages is charged to it.
+    ctx.txn
+        .charge_writes_to(Some(std::sync::Arc::clone(&ctx.budget)));
+    let names = (0..n)
+        .map(|i| Value::String(format!("name{i:05}")))
+        .collect();
+    execute_op(
+        &LogicalOp::CreateNode {
+            input: None,
+            variable: None,
+            labels: vec!["User".to_string()],
+            properties: vec![(
+                "name".to_string(),
+                nx(crate::cypher::ast::Expr::Literal(Value::Array(names))),
+            )],
+        },
+        &mut ctx,
+    )
+    .expect("write");
+    ctx.budget.memory_used()
+}
+
+/// The claims a unique write keeps until it commits are charged to its
+/// statement, before they are made: one per value of a list of two
+/// thousand, so a write holding more than its budget is refused before
+/// they grow. Writing the same list under an index that is not unique
+/// keeps no claim, which is what the difference measures.
+#[test]
+fn a_unique_write_charges_the_claims_it_keeps() {
+    let plain = charged_by_list_write(false, 2000);
+    let unique = charged_by_list_write(true, 2000);
+    let claims = (2000 * core::mem::size_of::<coordinode_core::txn::invariant::Claim>()) as u64;
+    assert!(
+        unique >= plain + claims,
+        "{unique} charged for the unique write, {plain} for the plain one: \
+         {claims} of claims not counted"
+    );
+}
+
 #[test]
 fn create_unique_index_enforces_constraint_on_insert() {
     // After CREATE UNIQUE INDEX, inserting a node with a duplicate property value

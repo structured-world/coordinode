@@ -1027,6 +1027,22 @@ impl IndexDefinition {
         self.selection.iter().any(|p| p.label == label)
     }
 
+    /// The heap bytes [`Self::interpretation`] allocates, counted before it
+    /// is built: a reference per property and its name, and the filter's
+    /// name and string.
+    pub fn interpretation_bytes(&self) -> usize {
+        use coordinode_core::index::derive::PropertyRef;
+        let filter = self.filter.as_ref().map_or(0, |f| match f {
+            PartialFilter::PropertyEquals { property, value } => property.len() + value.len(),
+            PartialFilter::PropertyEqualsInt { property, .. }
+            | PartialFilter::PropertyEqualsBool { property, .. }
+            | PartialFilter::PropertyExists { property } => property.len(),
+        });
+        self.properties.len() * core::mem::size_of::<PropertyRef>()
+            + self.properties.iter().map(String::len).sum::<usize>()
+            + filter
+    }
+
     /// The interpretation that decides this B-tree index's entries, with
     /// each property resolved to the field id `field_of` binds it to now:
     /// what a DERIVED effect is sealed with, so no member consults the

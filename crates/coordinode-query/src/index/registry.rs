@@ -1904,7 +1904,9 @@ fn stage(
         });
         // Every other owner, not only the first: one whose entry turned out
         // stale must not hide a real holder behind it.
-        for holder in other_holders(&store, txn, index, values, node_id)? {
+        let budget = coordinode_modality::index::WriteBudget::of(txn);
+        let mut others = budget.get().empty_charge();
+        for holder in other_holders(&store, txn, index, values, node_id, &mut others)? {
             if holds_values_as(
                 staging.engine,
                 txn,
@@ -1918,7 +1920,8 @@ fn stage(
                 return Err(UniqueViolation::new(index, values, holder).into());
             }
             if let Some((registry, _)) = staging.registry {
-                for stale in stale_entries(txn, index, values, holder)? {
+                let mut found = others.empty_like();
+                for stale in stale_entries(txn, index, values, holder, &mut found)? {
                     registry.report_mismatch(staging.engine, index, stale);
                 }
             }
@@ -1948,31 +1951,28 @@ fn stage(
 }
 
 /// The nodes other than `node_id` with an entry under a tuple of `values` in
-/// `index`, as `txn` sees them, each once.
+/// `index`, as `txn` sees them, each once. Each growth of the list returned
+/// is charged to `kept`, which the caller keeps as long as the list; the
+/// tuples and the holders of each are charged only while they are looked at.
 fn other_holders(
     store: &LocalIndexStore<'_>,
     txn: &Transaction,
     index: &IndexDefinition,
     values: &[Value],
     node_id: NodeId,
+    kept: &mut coordinode_core::budget::MemoryCharge<'_>,
 ) -> Result<Vec<NodeId>, StoreError> {
-    // The tuples and the holders found are charged to the transaction's
-    // budget before they are kept.
-    let budget = txn.write_budget();
+    let mut held = kept.empty_like();
     let mut out: Vec<NodeId> = Vec::new();
-    for tuple in coordinode_modality::index::charged_tuples(txn, values)? {
-        for holder in store.holders(txn, index, &tuple)? {
+    for tuple in coordinode_modality::index::charged_tuples(values, &mut held)? {
+        let mut found = held.empty_like();
+        for holder in store.holders(txn, index, &tuple, &mut found)? {
             if holder != node_id && !out.contains(&holder) {
-                if out.len() == out.capacity()
-                    && let Some(budget) = budget.as_deref()
-                {
-                    // Bytes of memory about to exist: fits in u64.
-                    budget
-                        .reserve((out.len().max(4) * core::mem::size_of::<NodeId>()) as u64)?
-                        .keep_until_query_ends();
-                }
                 if out.len() == out.capacity() {
-                    out.reserve_exact(out.len().max(4));
+                    let more = out.len().max(4);
+                    // Bytes of memory about to exist: fits in u64.
+                    kept.grow((more * core::mem::size_of::<NodeId>()) as u64)?;
+                    out.reserve_exact(more);
                 }
                 out.push(holder);
             }
@@ -1983,40 +1983,33 @@ fn other_holders(
 
 /// The entries `holder` has under the tuples of `values` in `index`, as
 /// `txn` sees them, each as the extra entry it is once the holder's record
-/// was found not to hold the value.
+/// was found not to hold the value. The entries are streamed, not copied;
+/// each one returned is charged to `kept`, which the caller keeps as long as
+/// the list, before it is taken.
 fn stale_entries(
     txn: &Transaction,
     index: &IndexDefinition,
     values: &[Value],
     holder: NodeId,
+    kept: &mut coordinode_core::budget::MemoryCharge<'_>,
 ) -> Result<Vec<Mismatch>, StoreError> {
     use coordinode_core::index::encoding::{decode_entry, entry_value_prefix};
-    // The entries are streamed, not copied; each kept one is charged to the
-    // transaction's budget before it is kept.
-    let write_budget = txn.write_budget();
-    let unbounded;
-    let budget = match write_budget.as_deref() {
-        Some(budget) => budget,
-        None => {
-            unbounded = coordinode_core::budget::QueryBudget::new(u64::MAX);
-            &unbounded
-        }
-    };
+    let budget = coordinode_modality::index::WriteBudget::of(txn);
+    let mut held = kept.empty_like();
     let mut out = Vec::new();
-    for tuple in coordinode_modality::index::charged_tuples(txn, values)? {
+    for tuple in coordinode_modality::index::charged_tuples(values, &mut held)? {
         let prefix = entry_value_prefix(index.generation, &tuple);
         txn.prefix_for_each(
             coordinode_storage::engine::partition::Partition::Idx,
             &prefix,
-            budget,
+            budget.get(),
             |key, _| -> Result<(), StoreError> {
                 if let Some((node, valid_from)) = decode_entry(index.generation, key)
                     && node == holder.as_raw()
                 {
-                    // Bytes of memory about to exist: fits in u64.
-                    budget
-                        .reserve((core::mem::size_of::<Mismatch>() + tuple.len()) as u64 * 2)?
-                        .keep_until_query_ends();
+                    // The entry and its slot, the list growing to twice its
+                    // length at most: bytes of memory about to exist.
+                    kept.grow((core::mem::size_of::<Mismatch>() + tuple.len()) as u64 * 2)?;
                     out.push(Mismatch::Extra {
                         node,
                         valid_from,
@@ -2073,7 +2066,12 @@ pub fn holds_values_as(
     candidate: bool,
 ) -> Result<bool, StoreError> {
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let wanted = coordinode_modality::index::charged_tuples(txn, values)?;
+    // The tuples wanted are charged while this check runs; those of each
+    // record read, only while that record is compared.
+    let budget = coordinode_modality::index::WriteBudget::of(txn);
+    let mut wanting = budget.get().empty_charge();
+    // Sorted and distinct, as every expansion gives them.
+    let wanted = coordinode_modality::index::charged_tuples(values, &mut wanting)?;
     let interpretation = index.interpretation(field_of);
     let mut membership = if candidate {
         crate::index::membership::CatalogMembership::candidates(engine)
@@ -2087,9 +2085,12 @@ pub fn holds_values_as(
         let Some(held) = interpretation.record_membership(record) else {
             return Ok(false);
         };
-        Ok(coordinode_modality::index::charged_tuples(txn, &held)?
-            .iter()
-            .any(|t| wanted.contains(t)))
+        let mut compared = budget.get().empty_charge();
+        Ok(
+            coordinode_modality::index::charged_tuples(&held, &mut compared)?
+                .iter()
+                .any(|t| wanted.binary_search(t).is_ok()),
+        )
     };
     if let Some(record) = LocalNodeStore.get(txn, shard_id, holder)?
         && holds(&record)?

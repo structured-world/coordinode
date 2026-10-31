@@ -944,16 +944,19 @@ pub trait IndexStore {
     ) -> StoreResult<StoredEntryPage>;
 
     /// The nodes with an entry holding `tuple` in `index`, as `txn` sees
-    /// them, each once, in id order. Untracked.
+    /// them, each once, in id order. Untracked. The entries are streamed, not
+    /// copied; each growth of the list is charged to `held` before it is
+    /// taken, and stays charged as long as the caller keeps `held`.
     ///
     /// # Errors
     ///
-    /// A storage failure.
+    /// A storage failure, or the budget's refusal.
     fn holders(
         &self,
         txn: &Transaction,
         index: &IndexDefinition,
         tuple: &[u8],
+        held: &mut coordinode_core::budget::MemoryCharge<'_>,
     ) -> StoreResult<Vec<NodeId>>;
 
     /// Whether `index` has the entry of `owner` under `tuple`, as `txn`
@@ -1101,22 +1104,46 @@ fn advance_ownership(
     Ok(())
 }
 
-/// The tuples of `values`, every byte charged to `txn`'s budget before it
-/// is allocated and kept charged for the rest of the transaction, as what
-/// the caller keeps may outlive this call; refused past the fan-out.
+/// The budget a transaction's index work charges: its write budget, or one
+/// without a limit when it has none.
+pub enum WriteBudget {
+    /// The transaction's write budget.
+    Charged(std::sync::Arc<coordinode_core::budget::QueryBudget>),
+    /// No budget: charges are counted against no limit.
+    Unbounded(coordinode_core::budget::QueryBudget),
+}
+
+impl WriteBudget {
+    /// `txn`'s write budget, or an unbounded one.
+    pub fn of(txn: &Transaction) -> Self {
+        match txn.write_budget() {
+            Some(budget) => Self::Charged(budget),
+            None => Self::Unbounded(coordinode_core::budget::QueryBudget::new(u64::MAX)),
+        }
+    }
+
+    /// The budget to charge.
+    pub fn get(&self) -> &coordinode_core::budget::QueryBudget {
+        match self {
+            Self::Charged(budget) => budget,
+            Self::Unbounded(budget) => budget,
+        }
+    }
+}
+
+/// The tuples of `values`, every byte charged to `held` before it is
+/// allocated; once they are made, `held` keeps exactly the bytes of the
+/// tuples returned, for as long as the caller keeps it. Refused past the
+/// fan-out.
 ///
 /// # Errors
 ///
 /// [`StoreError::IndexEntry`] past the fan-out, or the budget's refusal.
-pub fn charged_tuples(txn: &Transaction, values: &[Value]) -> StoreResult<Vec<Vec<u8>>> {
-    let budget = txn.write_budget();
-    tuples_within(values, |bytes| -> StoreResult<()> {
-        if let Some(budget) = budget.as_deref() {
-            // Bytes of memory about to exist: fits in u64.
-            budget.reserve(bytes as u64)?.keep_until_query_ends();
-        }
-        Ok(())
-    })
+pub fn charged_tuples(
+    values: &[Value],
+    held: &mut coordinode_core::budget::MemoryCharge<'_>,
+) -> StoreResult<Vec<Vec<u8>>> {
+    coordinode_core::index::derive::tuples_held(values, held)
 }
 
 /// Write the ownership revision of `tuple` in the unique `index`.
@@ -1362,9 +1389,14 @@ impl IndexStore for LocalIndexStore<'_> {
         values: &[Value],
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>> {
-        for tuple in charged_tuples(txn, values)? {
+        // The tuples and each list of holders are charged for as long as
+        // they live: released when this check returns.
+        let budget = WriteBudget::of(txn);
+        let mut held = budget.get().empty_charge();
+        for tuple in charged_tuples(values, &mut held)? {
+            let mut found = held.empty_like();
             if let Some(holder) = self
-                .holders(txn, index, &tuple)?
+                .holders(txn, index, &tuple, &mut found)?
                 .into_iter()
                 .find(|holder| *holder != node_id)
             {
@@ -2401,24 +2433,17 @@ impl IndexStore for LocalIndexStore<'_> {
         txn: &Transaction,
         index: &IndexDefinition,
         tuple: &[u8],
+        held: &mut coordinode_core::budget::MemoryCharge<'_>,
     ) -> StoreResult<Vec<NodeId>> {
         let prefix = entry_value_prefix(index.generation, tuple);
-        // Streamed, never copied: the holders alone are kept, each growth of
-        // the list charged to the transaction's budget before it is taken.
-        let write_budget = txn.write_budget();
-        let unbounded;
-        let budget = match write_budget.as_deref() {
-            Some(budget) => budget,
-            None => {
-                unbounded = coordinode_core::budget::QueryBudget::new(u64::MAX);
-                &unbounded
-            }
-        };
+        // The scan's own buffers are charged to this budget for the scan
+        // alone; the list it returns, to `held`.
+        let budget = WriteBudget::of(txn);
         let mut out: Vec<NodeId> = Vec::new();
         txn.prefix_for_each(
             Partition::Idx,
             &prefix,
-            budget,
+            budget.get(),
             |key, _| -> StoreResult<()> {
                 // A node's versions sort together, so one node is one run.
                 if let Some((id, _)) = decode_entry(index.generation, key)
@@ -2427,9 +2452,7 @@ impl IndexStore for LocalIndexStore<'_> {
                     if out.len() == out.capacity() {
                         let more = out.len().max(4);
                         // Bytes of memory about to exist: fits in u64.
-                        budget
-                            .reserve((more * core::mem::size_of::<NodeId>()) as u64)?
-                            .keep_until_query_ends();
+                        held.grow((more * core::mem::size_of::<NodeId>()) as u64)?;
                         out.reserve_exact(more);
                     }
                     out.push(NodeId::from_raw(id));

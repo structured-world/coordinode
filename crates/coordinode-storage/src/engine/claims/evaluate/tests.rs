@@ -1375,7 +1375,7 @@ mod unique_while_building {
             },
             ClaimPredicate::UniqueHolder {
                 node: node(claimant),
-                uncovered: Some(Box::new(UncoveredSource {
+                uncovered: Some(std::sync::Arc::new(UncoveredSource {
                     shard_id: SHARD,
                     label: "User".into(),
                     interpretation,

@@ -380,8 +380,44 @@ pub fn tuples(values: &[Value]) -> Result<Vec<Vec<u8>>, FanOut> {
 /// [`FanOut`], or what `charge` returns.
 pub fn tuples_within<E: From<FanOut>>(
     values: &[Value],
-    mut charge: impl FnMut(usize) -> Result<(), E>,
+    charge: impl FnMut(usize) -> Result<(), E>,
 ) -> Result<Vec<Vec<u8>>, E> {
+    expand(values, charge).map(|(tuples, _)| tuples)
+}
+
+/// [`tuples_within`] charging `held`, which keeps exactly the bytes of the
+/// tuples returned: the encodings and the odometer the expansion works
+/// with, and any duplicate tuple, are returned to the budget once dropped,
+/// before this returns. Dropping `held` with the tuples returns the rest;
+/// on an error, what it took so far.
+///
+/// # Errors
+///
+/// [`FanOut`], or the budget's refusal.
+pub fn tuples_held<E: From<FanOut> + From<crate::budget::BudgetStop>>(
+    values: &[Value],
+    held: &mut crate::budget::MemoryCharge<'_>,
+) -> Result<Vec<Vec<u8>>, E> {
+    // Bytes of memory about to exist: fits in u64.
+    let (tuples, transient) = expand(values, |bytes| Ok::<(), E>(held.grow(bytes as u64)?))?;
+    held.shrink(transient as u64);
+    Ok(tuples)
+}
+
+/// [`tuples_within`], and how many of the bytes it charged were of memory
+/// it dropped before returning.
+fn expand<E: From<FanOut>>(
+    values: &[Value],
+    mut charge: impl FnMut(usize) -> Result<(), E>,
+) -> Result<(Vec<Vec<u8>>, usize), E> {
+    let mut charged = 0usize;
+    // Each charge is of memory that exists at once with the rest, so the
+    // sum stays within the address space.
+    let mut charge = |bytes: usize| -> Result<(), E> {
+        charge(bytes)?;
+        charged += bytes;
+        Ok(())
+    };
     // Within the cap, so every product below fits a usize.
     let count = combinations(values).ok_or(FanOut)?;
     // Each value, or each element of a list, encoded once: a segment, or
@@ -454,7 +490,10 @@ pub fn tuples_within<E: From<FanOut>>(
     // One list may repeat an element; its entry is one entry.
     out.sort_unstable();
     out.dedup();
-    Ok(out)
+    // What is returned: the list's `count` slots, and each tuple at the
+    // length it was charged; the rest was charged for memory dropped here.
+    let kept = count * core::mem::size_of::<Vec<u8>>() + out.iter().map(Vec::len).sum::<usize>();
+    Ok((out, charged - kept))
 }
 
 /// Combine the entry effects of one application unit into one effect per

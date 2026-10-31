@@ -2718,27 +2718,48 @@ impl<'a> ExecutionContext<'a> {
         let revision = self.txn.schema_generation();
         let interner: &FieldInterner = self.interner;
         let field_of = |name: &str| interner.lookup(name);
-        let mut stated = Vec::new();
+        // Every byte a claim keeps is charged before it exists and stays
+        // charged while the transaction holds the claim: its tuple, the one
+        // source an index's claims share, and the set's growth.
+        let budget = coordinode_modality::index::WriteBudget::of(&self.txn);
         for claim in &self.key_claims.indexes[from..] {
             let building = matches!(claim.index.state, IndexState::Building { .. });
             let generation = claim.index.generation;
-            let uncovered = (building || claim.needs_source_proof).then(|| {
+            let mut held = budget.get().empty_charge();
+            let tuples = coordinode_modality::index::charged_tuples(&claim.values, &mut held)?;
+            let uncovered = if building || claim.needs_source_proof {
                 let covered_through = if claim.needs_source_proof {
                     None
                 } else {
                     self.index_builds
                         .and_then(|builds| builds.covered_through(generation))
                 };
-                Box::new(UncoveredSource {
+                // The shared allocation (two counts beside the source), and
+                // the heap the source owns: bytes about to exist.
+                held.grow(
+                    (2 * core::mem::size_of::<usize>()
+                        + core::mem::size_of::<UncoveredSource>()
+                        + claim.index.label.len()
+                        + claim.index.interpretation_bytes()
+                        + covered_through.as_ref().map_or(0, Vec::len)) as u64,
+                )
+                .map_err(ExecutionError::Budget)?;
+                Some(std::sync::Arc::new(UncoveredSource {
                     shard_id: self.shard_id,
                     label: claim.index.label.clone(),
                     interpretation: claim.index.interpretation(&field_of),
                     covered_through,
                     read_limit: limit,
-                })
-            });
-            for tuple in coordinode_modality::index::charged_tuples(&self.txn, &claim.values)? {
-                stated.push(Claim::new(
+                }))
+            } else {
+                None
+            };
+            self.txn
+                .reserve_claims(tuples.len())
+                .map_err(ExecutionError::Budget)?;
+            held.keep_until_query_ends();
+            for tuple in tuples {
+                self.txn.claim(Claim::new(
                     ClaimScope::UniqueValue { generation, tuple },
                     ClaimPredicate::UniqueHolder {
                         node: claim.node_id,
@@ -2747,9 +2768,6 @@ impl<'a> ExecutionContext<'a> {
                     revision,
                 ));
             }
-        }
-        for claim in stated {
-            self.txn.claim(claim);
         }
         Ok(())
     }

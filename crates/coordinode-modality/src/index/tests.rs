@@ -220,6 +220,42 @@ fn a_unique_value_has_one_holder() {
     );
 }
 
+/// What a uniqueness check holds while it looks (the tuples of the values,
+/// the holders of each) is charged while it lives and returned when the
+/// check returns: a thousand checks of a list of twenty values in a budget
+/// of 64 KiB all pass, and leave nothing charged. Kept for the rest of the
+/// statement instead, they would exhaust it within a few dozen.
+#[test]
+fn a_uniqueness_check_returns_what_it_held() {
+    let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = bound(
+        IndexDescriptor::btree("user_email", "User", "email").unique(),
+        1,
+    );
+    let list: Vec<Value> = vec![Value::Array(
+        (0..20)
+            .map(|n| Value::String(format!("{n:02}@x")))
+            .collect(),
+    )];
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    enter(&store, &mut t, &index, &list, id(1));
+    commit(&mut t).unwrap();
+
+    let budget = std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(64 * 1024));
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    t.charge_writes_to(Some(std::sync::Arc::clone(&budget)));
+    for _ in 0..1000 {
+        assert_eq!(
+            store.unique_conflict(&mut t, &index, &list, id(2)).unwrap(),
+            Some(id(1))
+        );
+    }
+    assert_eq!(budget.memory_used(), 0, "a check kept what it held");
+}
+
 /// A unique value too long to have an entry, which its owner leaves for a
 /// short one, was never held: leaving it writes no ownership revision (whose
 /// key would be too long to store as well), and the short value is taken.

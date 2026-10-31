@@ -462,7 +462,7 @@ fn take_free_email(
             },
             ClaimPredicate::UniqueHolder {
                 node: NodeId::from_raw(id),
-                uncovered: Some(Box::new(UncoveredSource {
+                uncovered: Some(std::sync::Arc::new(UncoveredSource {
                     shard_id: shard,
                     label: "User".into(),
                     interpretation: interpretation.clone(),
@@ -550,7 +550,7 @@ fn unique_values_in_one_commit(stored: u64, uncovered: u64, values: u64, commits
                         },
                         ClaimPredicate::UniqueHolder {
                             node: NodeId::from_raw(id),
-                            uncovered: Some(Box::new(UncoveredSource {
+                            uncovered: Some(std::sync::Arc::new(UncoveredSource {
                                 shard_id: shard,
                                 label: "User".into(),
                                 interpretation: interpretation.clone(),

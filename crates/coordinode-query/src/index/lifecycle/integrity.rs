@@ -1080,7 +1080,10 @@ fn other_holder(
     (node, tuple): (u64, &[u8]),
     (shard_id, catalog): (u16, &mut CatalogMembership<'_>),
 ) -> Result<Option<u64>, StoreError> {
-    for holder in store.holders(txn, def, tuple)? {
+    // The holders are charged while they are looked at.
+    let budget = coordinode_modality::index::WriteBudget::of(txn);
+    let mut found = budget.get().empty_charge();
+    for holder in store.holders(txn, def, tuple, &mut found)? {
         if holder.as_raw() != node
             && node_holds(txn, shard_id, def, interpretation, holder, tuple, catalog)?
         {

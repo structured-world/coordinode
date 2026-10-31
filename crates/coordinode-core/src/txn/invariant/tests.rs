@@ -782,3 +782,38 @@ fn a_pair_change_meets_a_bound_by_its_direction() {
             .compatible_with(&bound(CardinalityBound::AtLeastOne))
     );
 }
+
+/// A claim stated twice is held once, one stated over the same scope with
+/// another predicate or revision is held beside it, and claims made room for
+/// grow nothing as they are stated: what the room was charged for is all
+/// they take.
+#[test]
+fn a_claim_set_keeps_one_of_each_and_grows_only_into_its_room() {
+    let unique = |value: &[u8], holder: u64, revision: u64| {
+        Claim::new(
+            ClaimScope::UniqueValue {
+                generation: GenerationId::from_raw(3),
+                tuple: value.to_vec(),
+            },
+            ClaimPredicate::UniqueHolder {
+                node: node(holder),
+                uncovered: None,
+            },
+            revision,
+        )
+    };
+    let mut claims = ClaimSet::new();
+    assert!(claims.room_for(1000) >= 1000 * core::mem::size_of::<Claim>());
+    claims.reserve(1000);
+    let (slots, table) = (claims.claims.capacity(), claims.by_scope.capacity());
+    for n in 0..998u32 {
+        claims.insert(unique(&n.to_be_bytes(), 1, GEN));
+        claims.insert(unique(&n.to_be_bytes(), 1, GEN));
+    }
+    claims.insert(unique(b"x", 2, GEN));
+    claims.insert(unique(b"x", 2, GEN + 1));
+    assert_eq!(claims.len(), 1000);
+    assert_eq!(claims.claims.capacity(), slots, "the claims grew");
+    assert_eq!(claims.by_scope.capacity(), table, "the index grew");
+    assert_eq!(claims.room_for(0), 0);
+}

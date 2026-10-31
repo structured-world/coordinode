@@ -1440,6 +1440,22 @@ impl<'a> Transaction<'a> {
         self.claims.insert(claim);
     }
 
+    /// Make room for `more` claims, the bytes the set grows by charged as a
+    /// staged write is, before it grows: claims stated after this up to
+    /// `more` grow nothing. What each claim owns is the caller's to charge.
+    ///
+    /// # Errors
+    ///
+    /// The budget's refusal, after which every later write is refused too.
+    pub fn reserve_claims(
+        &mut self,
+        more: usize,
+    ) -> Result<(), coordinode_core::budget::BudgetStop> {
+        self.admit_staged(self.claims.room_for(more))?;
+        self.claims.reserve(more);
+        Ok(())
+    }
+
     /// Record that this attempt read `label`'s schema at `revision` (`0` when
     /// the label has none). If the attempt writes, its commit depends on that
     /// schema still being the one in force; if it only reads, on nothing.

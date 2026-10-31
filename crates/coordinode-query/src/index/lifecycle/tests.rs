@@ -1589,7 +1589,7 @@ fn take_while_building(
                 },
                 ClaimPredicate::UniqueHolder {
                     node: NodeId::from_raw(id),
-                    uncovered: Some(Box::new(UncoveredSource {
+                    uncovered: Some(std::sync::Arc::new(UncoveredSource {
                         shard_id: 1,
                         label: "User".into(),
                         interpretation: def.interpretation(&field_of),

@@ -294,8 +294,9 @@ pub enum ClaimPredicate {
         /// The node taking the value.
         node: NodeId,
         /// The stored nodes still to be read, while the index is being built
-        /// or its entries cannot prove the value free.
-        uncovered: Option<alloc::boxed::Box<UncoveredSource>>,
+        /// or its entries cannot prove the value free. One source for every
+        /// value an index's claims take, shared rather than copied per value.
+        uncovered: Option<alloc::sync::Arc<UncoveredSource>>,
     },
 }
 
@@ -636,23 +637,76 @@ impl ClaimScope {
 /// because reducing them is how a footprint gets lost: folding the mutations
 /// that produced them, which the storage layer is free to do, must not fold
 /// what they protect.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct ClaimSet {
     claims: Vec<Claim>,
+    /// The positions in `claims` by the hash of their scope: a duplicate
+    /// shares its scope, so it is looked for among those alone.
+    by_scope: rustc_hash::FxHashMap<u64, smallvec::SmallVec<[u32; 1]>>,
 }
+
+impl PartialEq for ClaimSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.claims == other.claims
+    }
+}
+
+impl Eq for ClaimSet {}
+
+/// One entry of [`ClaimSet`]'s index, as its table holds it.
+type ScopeSlot = (u64, smallvec::SmallVec<[u32; 1]>);
 
 impl ClaimSet {
     /// An empty set.
     pub fn new() -> Self {
-        Self { claims: Vec::new() }
+        Self::default()
     }
 
     /// Add a claim, keeping duplicates out. The same condition stated twice
     /// by two statements of one attempt is one condition.
     pub fn insert(&mut self, claim: Claim) {
-        if !self.claims.contains(&claim) {
-            self.claims.push(claim);
+        use core::hash::BuildHasher;
+        let slots = self
+            .by_scope
+            .entry(rustc_hash::FxBuildHasher.hash_one(&claim.scope))
+            .or_default();
+        if slots.iter().any(|&at| self.claims[at as usize] == claim) {
+            return;
         }
+        // A set of more than u32::MAX claims exhausts any guard budget long
+        // before; the position fits.
+        slots.push(self.claims.len() as u32);
+        self.claims.push(claim);
+    }
+
+    /// The bytes holding `more` claims beside those held can take, at most:
+    /// their slots, and the index's table grown to fit them. What the claims
+    /// own themselves (a tuple, a name) is the caller's to count.
+    pub fn room_for(&self, more: usize) -> usize {
+        let len = self.claims.len() + more;
+        let slots = if len > self.claims.capacity() {
+            (len - self.claims.capacity()) * core::mem::size_of::<Claim>()
+        } else {
+            0
+        };
+        let table = if len > self.by_scope.capacity() {
+            // A table at most half empty after growing, a control byte per
+            // bucket beside each slot.
+            len.next_power_of_two() * 2 * (core::mem::size_of::<ScopeSlot>() + 1)
+        } else {
+            0
+        };
+        // A scope stated with several predicates spills its positions to
+        // the heap, which at most doubles them.
+        let spilled = more * 2 * core::mem::size_of::<u32>();
+        slots + table + spilled
+    }
+
+    /// Make room for `more` claims, so inserting them grows nothing whose
+    /// bytes [`Self::room_for`] did not count.
+    pub fn reserve(&mut self, more: usize) {
+        self.claims.reserve_exact(more);
+        self.by_scope.reserve(more);
     }
 
     /// The claims held, in the order they were stated.

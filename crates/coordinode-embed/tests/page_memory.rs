@@ -247,18 +247,17 @@ fn compound_combinations_are_refused_before_they_are_built() {
 }
 
 /// Under a compound uniqueness, a change placing a node whose two lists make
-/// ninety thousand combinations is refused by a small page budget before
-/// the combinations are built: the uniqueness checks that run ahead of the
-/// staging count them against the same budget. Building them first would
-/// allocate megabytes before the refusal.
+/// three hundred sixty thousand combinations is refused by a small page
+/// budget before the combinations are built: the uniqueness checks that run
+/// ahead of the staging count them against the same budget. Building them
+/// first would allocate tens of megabytes before the refusal.
 ///
 /// A change allocates far more than the combinations in its own machinery
 /// (catalog, certification, engine threads, each halved page tried again),
 /// all of it the same whatever the lists hold. So the measure is a
-/// difference: lists of three hundred elements (ninety thousand
-/// combinations) against lists of a hundred and fifty (a quarter as many),
-/// both refused at the count. Built, the extra combinations alone would
-/// take over ten megabytes.
+/// difference: lists of six hundred elements against lists of three
+/// hundred (a quarter as many combinations), both refused at the count.
+/// Built, the extra combinations alone would take over twenty megabytes.
 #[test]
 fn a_unique_change_refuses_compound_combinations_before_building_them() {
     let refused_as_budget = |outcome: &Result<_, coordinode_embed::DatabaseError>| {
@@ -268,13 +267,13 @@ fn a_unique_change_refuses_compound_combinations_before_building_them() {
             outcome.as_ref().err()
         );
     };
-    let (quarter, quarter_allocated) = compound_change(150, 256 * 1024);
+    let (quarter, quarter_allocated) = compound_change(300, 256 * 1024);
     refused_as_budget(&quarter);
-    let (refused, allocated) = compound_change(300, 256 * 1024);
+    let (refused, allocated) = compound_change(600, 256 * 1024);
     refused_as_budget(&refused);
     let grown = allocated.saturating_sub(quarter_allocated);
     assert!(
-        grown < 2 << 20,
+        grown < ENGINE_NOISE,
         "{grown} more bytes for four times the combinations \
          ({allocated} against {quarter_allocated})"
     );
@@ -329,11 +328,18 @@ fn a_derived_unit_past_its_budget_is_refused_before_expanding() {
     );
 }
 
-/// A write under a compound uniqueness whose two lists make ninety thousand
-/// combinations is refused by the statement's memory before they are
-/// built, its uniqueness checks counting them against the same budget as
-/// its writes. Measured, as the change above, against lists a quarter as
-/// many combinations.
+/// What the engine's own threads allocate during one statement varies by
+/// some megabytes from run to run under load, and the allocator counts every
+/// thread. The two sizes compared are chosen so that building the extra
+/// combinations, tuples alone, would take more than this beside the noise.
+const ENGINE_NOISE: usize = 16 << 20;
+
+/// A write under a compound uniqueness whose two lists make three hundred
+/// sixty thousand combinations is refused by the statement's memory before
+/// they are built, its uniqueness checks counting them against the same
+/// budget as its writes. Measured, as the change above, against lists a
+/// quarter as many combinations: the extra ones built would be over twenty
+/// megabytes of tuples.
 #[test]
 fn a_unique_write_refuses_compound_combinations_before_building_them() {
     let refused_as_budget = |outcome: &Result<_, coordinode_embed::DatabaseError>| {
@@ -343,13 +349,13 @@ fn a_unique_write_refuses_compound_combinations_before_building_them() {
             outcome.as_ref().err()
         );
     };
-    let (quarter, quarter_allocated) = compound_write(150);
+    let (quarter, quarter_allocated) = compound_write(300);
     refused_as_budget(&quarter);
-    let (refused, allocated) = compound_write(300);
+    let (refused, allocated) = compound_write(600);
     refused_as_budget(&refused);
     let grown = allocated.saturating_sub(quarter_allocated);
     assert!(
-        grown < 2 << 20,
+        grown < ENGINE_NOISE,
         "{grown} more bytes for four times the combinations \
          ({allocated} against {quarter_allocated})"
     );
