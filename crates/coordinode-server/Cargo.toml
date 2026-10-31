@@ -30,6 +30,9 @@ io-uring = ["coordinode-storage/io-uring"]
 # format version this binary runs, so a test suite can run two versions of
 # the server side by side. Never enabled in a release build.
 test-format-bump = ["coordinode-storage/test-format-bump"]
+# Test builds only: SIGUSR1 makes the node's Raft log refuse writes, as a full
+# disk does. Never enabled in a release build.
+test-faults = ["coordinode-raft/test-faults"]
 
 [dependencies]
 coordinode-cluster = { workspace = true }
@@ -103,6 +106,8 @@ name = "idle_wakeups"
 harness = false
 
 [dev-dependencies]
+# The binary the process tests start carries the test fault hook.
+coordinode-server = { path = ".", features = ["test-faults"] }
 tempfile = { workspace = true }
 # Failure injection into the text indexes the text service tests drive.
 coordinode-search = { workspace = true, features = ["test-hooks"] }

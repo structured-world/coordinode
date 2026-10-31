@@ -1118,13 +1118,30 @@ pub(crate) async fn serve(
         let consensus_readiness = readiness.clone();
         tokio::spawn(async move {
             if let Some(fatal) = node.consensus_stopped().await {
+                // Down before anything else, so no probe that follows the
+                // report finds the node ready.
+                consensus_readiness.consensus_failed();
                 tracing::error!(
                     %fatal,
                     "consensus stopped on a fatal error; the process exits so it restarts \
                      from its durable state"
                 );
-                consensus_readiness.consensus_failed();
                 fatal_tx.send_replace(Some(fatal));
+            }
+        });
+    }
+    // Test builds only: SIGUSR1 makes every later write of the Raft log fail,
+    // as a full disk does, so a test drives the failure through the process.
+    #[cfg(all(unix, feature = "test-faults"))]
+    {
+        let mut fault =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .map_err(|e| format!("failed to install SIGUSR1 handler: {e}"))?;
+        let node = Arc::clone(&raft_node);
+        tokio::spawn(async move {
+            while fault.recv().await.is_some() {
+                node.fail_log_writes();
+                tracing::warn!("test fault: Raft log writes now fail");
             }
         });
     }

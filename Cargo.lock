@@ -1134,6 +1134,7 @@ dependencies = [
  "coordinode-raft",
  "coordinode-replicate",
  "coordinode-search",
+ "coordinode-server",
  "coordinode-session",
  "coordinode-storage",
  "coordinode-test-fixtures",
