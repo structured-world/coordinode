@@ -29,8 +29,8 @@
 //! [`NodeStore::get_at`] so callers don't reimplement the seek-and-pick.
 
 use coordinode_core::graph::node::{
-    NodeId, NodeRecord, decode_node_key, decode_temporal_node_key, encode_node_key,
-    encode_temporal_node_key, temporal_node_id_prefix,
+    NodeAssertion, NodeId, NodeRecord, decode_node_key, decode_temporal_node_key,
+    encode_node_history_prefix, encode_node_key, encode_temporal_node_key, temporal_node_id_prefix,
 };
 use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
@@ -718,6 +718,12 @@ impl NodeStore for LocalNodeStore {
     ) -> StoreResult<()> {
         let key = encode_temporal_node_key(shard_id, node_id, valid_from_ms);
         txn.delete(Partition::Node, &key)?;
+        // The canonical history keeps that this commit removed the version.
+        txn.put_stamped(
+            Partition::NodeHistory,
+            &encode_node_history_prefix(shard_id, node_id, valid_from_ms),
+            &NodeAssertion::Removed.encode(),
+        )?;
         Ok(())
     }
 
@@ -873,6 +879,14 @@ impl NodeStore for LocalNodeStore {
         let key = encode_temporal_node_key(shard_id, node_id, valid_from_ms);
         let body = Self::encode_record(record)?;
         txn.put(Partition::Node, &key, &body)?;
+        // The canonical history keeps the version's whole state as this
+        // commit leaves it, under the commit: a later commit stating the same
+        // version adds its own assertion beside this one.
+        txn.put_stamped(
+            Partition::NodeHistory,
+            &encode_node_history_prefix(shard_id, node_id, valid_from_ms),
+            &NodeAssertion::encode_state(&body),
+        )?;
         Ok(())
     }
 

@@ -503,6 +503,143 @@ pub fn decode_temporal_node_key(key: &[u8]) -> Option<(u16, NodeId, i64)> {
     Some((shard_id, NodeId(node_id), valid_from))
 }
 
+/// Prefix of every assertion of the canonical history of temporal nodes.
+pub const NODE_HISTORY_PREFIX: &[u8] = b"nhist:";
+
+/// Bytes of an assertion's key: the prefix, shard (2), `:` (1), node (8),
+/// `:` (1), valid_from (8), `:` (1) and the asserting commit (8).
+const NODE_HISTORY_KEY_LEN: usize = NODE_HISTORY_PREFIX.len() + 2 + 1 + 8 + 1 + 8 + 1 + 8;
+
+/// The key of the assertions of one version of a temporal node, all but the
+/// asserting commit, which the commit appends:
+/// `nhist:<shard_id u16 BE>:<node_id u64 BE>:<valid_from sortable>:`.
+/// One assertion per commit stating the version: a correction with the same
+/// valid start is a distinct assertion under the commit that made it.
+pub fn encode_node_history_prefix(shard_id: u16, node_id: NodeId, valid_from_ms: i64) -> Vec<u8> {
+    let mut key = node_history_id_prefix(shard_id, node_id);
+    key.reserve_exact(8 + 1 + 8);
+    key.extend_from_slice(&crate::graph::edge::encode_valid_from_sortable(
+        valid_from_ms,
+    ));
+    key.push(b':');
+    key
+}
+
+/// Prefix of every assertion of one temporal node in one shard:
+/// `nhist:<shard_id>:<node_id>:`, in valid_from then commit order.
+pub fn node_history_id_prefix(shard_id: u16, node_id: NodeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_HISTORY_KEY_LEN);
+    key.extend_from_slice(NODE_HISTORY_PREFIX);
+    key.extend_from_slice(&shard_id.to_be_bytes());
+    key.push(b':');
+    key.extend_from_slice(&node_id.as_raw().to_be_bytes());
+    key.push(b':');
+    key
+}
+
+/// Prefix of every assertion of temporal nodes in one shard.
+pub fn node_history_shard_prefix(shard_id: u16) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_HISTORY_PREFIX.len() + 3);
+    key.extend_from_slice(NODE_HISTORY_PREFIX);
+    key.extend_from_slice(&shard_id.to_be_bytes());
+    key.push(b':');
+    key
+}
+
+/// The identity of one assertion: the shard, node and valid start of the
+/// version it states, and the commit that stated it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AssertionId {
+    /// The shard holding the node.
+    pub shard_id: u16,
+    /// The node.
+    pub node_id: NodeId,
+    /// The valid start of the version stated.
+    pub valid_from: i64,
+    /// The commit that stated it.
+    pub commit: u64,
+}
+
+/// Decode an assertion's key; `None` for any other key.
+pub fn decode_node_history_key(key: &[u8]) -> Option<AssertionId> {
+    let p = NODE_HISTORY_PREFIX.len();
+    if key.len() != NODE_HISTORY_KEY_LEN
+        || &key[..p] != NODE_HISTORY_PREFIX
+        || key[p + 2] != b':'
+        || key[p + 11] != b':'
+        || key[p + 20] != b':'
+    {
+        return None;
+    }
+    Some(AssertionId {
+        shard_id: u16::from_be_bytes(key[p..p + 2].try_into().ok()?),
+        node_id: NodeId(u64::from_be_bytes(key[p + 3..p + 11].try_into().ok()?)),
+        valid_from: crate::graph::edge::decode_valid_from_sortable(
+            key[p + 12..p + 20].try_into().ok()?,
+        ),
+        commit: u64::from_be_bytes(key[p + 21..p + 29].try_into().ok()?),
+    })
+}
+
+/// What one assertion states of its version: the version's whole state as
+/// the commit left it (its valid end among its properties), or that the
+/// commit removed the version.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeAssertion {
+    /// The version's whole state, MessagePack-encoded as a node record.
+    State(Vec<u8>),
+    /// The version was removed.
+    Removed,
+}
+
+/// Tag of [`NodeAssertion::Removed`] in its encoding.
+const ASSERTION_REMOVED: u8 = 0;
+/// Tag of [`NodeAssertion::State`] in its encoding, followed by the record.
+const ASSERTION_STATE: u8 = 1;
+
+impl NodeAssertion {
+    /// The assertion as stored: a tag byte, then the record for a state.
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Removed => vec![ASSERTION_REMOVED],
+            Self::State(record) => {
+                let mut out = Vec::with_capacity(1 + record.len());
+                out.push(ASSERTION_STATE);
+                out.extend_from_slice(record);
+                out
+            }
+        }
+    }
+
+    /// [`Self::encode`] for a state, from its record's encoding, without
+    /// building the assertion first.
+    pub fn encode_state(record: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + record.len());
+        out.push(ASSERTION_STATE);
+        out.extend_from_slice(record);
+        out
+    }
+
+    /// The record an encoded assertion states, borrowed; `Ok(None)` for a
+    /// removal.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded assertion.
+    pub fn state_of(bytes: &[u8]) -> Result<Option<&[u8]>, UnknownAssertion> {
+        match bytes.split_first() {
+            Some((&ASSERTION_STATE, record)) => Ok(Some(record)),
+            Some((&ASSERTION_REMOVED, [])) => Ok(None),
+            _ => Err(UnknownAssertion),
+        }
+    }
+}
+
+/// Bytes that are no encoded [`NodeAssertion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("an assertion of the node history does not decode")]
+pub struct UnknownAssertion;
+
 /// The `(shard_id, node_id)` a node row's key belongs to, in either form: the
 /// node's own key or one version of a temporal node.
 pub fn decode_written_node(key: &[u8]) -> Option<(u16, NodeId)> {

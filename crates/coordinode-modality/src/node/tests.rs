@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::Arc;
 
+use coordinode_core::graph::node::{AssertionId, decode_node_history_key};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_storage::engine::core::StorageEngine;
@@ -466,6 +467,89 @@ fn put_temporal_same_valid_from_overwrites_body() {
         versions[0].1.get_extra("v"),
         Some(&coordinode_core::graph::types::Value::Int(2)),
     );
+}
+
+/// Every assertion the canonical history holds of `id`, in valid start then
+/// commit order: its identity and the state it states (`None`: removed).
+fn assertions_of(db: &TestDb, id: NodeId) -> Vec<(AssertionId, Option<NodeRecord>)> {
+    db.engine
+        .prefix_scan(
+            Partition::NodeHistory,
+            &coordinode_core::graph::node::node_history_id_prefix(0, id),
+        )
+        .expect("scan")
+        .map(|guard| {
+            let (key, value) = guard.into_inner().expect("row");
+            let assertion = decode_node_history_key(&key).expect("an assertion key");
+            let state = NodeAssertion::state_of(&value)
+                .expect("an assertion")
+                .map(|record| NodeRecord::from_msgpack(record).expect("a record"));
+            (assertion, state)
+        })
+        .collect()
+}
+
+/// Each commit writing a version of a temporal node leaves its own
+/// assertion of the version's whole state in the canonical history, under
+/// the commit, beside those of the commits before it: a correction with the
+/// same valid start does not overwrite the assertion it corrects. A version
+/// written twice in one commit is asserted once, as the commit leaves it.
+#[test]
+fn each_commit_writing_a_version_asserts_it() {
+    let db = open();
+    let id = NodeId::from_raw(41);
+    db.write(|s, t| {
+        s.put_temporal(t, 0, id, 1000, &rec("first")).expect("v1");
+        s.put_temporal(t, 0, id, 1000, &rec("second"))
+            .expect("v1 again");
+        s.put_temporal(t, 0, id, 2000, &rec("later")).expect("v2");
+    });
+    db.write(|s, t| {
+        s.put_temporal(t, 0, id, 1000, &rec("corrected"))
+            .expect("correction");
+    });
+
+    let asserted = assertions_of(&db, id);
+    let at = |valid_from: i64| -> Vec<(u64, Option<_>)> {
+        asserted
+            .iter()
+            .filter(|(a, _)| a.valid_from == valid_from && a.node_id == id && a.shard_id == 0)
+            .map(|(a, state)| (a.commit, state.as_ref().and_then(NodeRecord::primary_label)))
+            .collect()
+    };
+    let first = at(1000);
+    assert_eq!(first.len(), 2, "{asserted:?}");
+    assert!(first[0].0 < first[1].0, "in commit order");
+    assert_eq!(
+        first[0].1,
+        Some(mark("second")),
+        "as the first commit left it"
+    );
+    assert_eq!(first[1].1, Some(mark("corrected")));
+    assert_eq!(at(2000).len(), 1);
+    assert_eq!(at(2000)[0].0, first[0].0, "one commit, one timestamp");
+}
+
+/// Removing a version is an assertion too: the history keeps that the
+/// commit removed it, after what it stated before.
+#[test]
+fn removing_a_version_asserts_its_removal() {
+    let db = open();
+    let id = NodeId::from_raw(42);
+    db.write(|s, t| {
+        s.put_temporal(t, 0, id, 1000, &rec("kept")).expect("put");
+    });
+    db.write(|s, t| {
+        s.delete_temporal(t, 0, id, 1000).expect("delete");
+    });
+    let asserted = assertions_of(&db, id);
+    assert_eq!(asserted.len(), 2, "{asserted:?}");
+    assert_eq!(
+        asserted[0].1.as_ref().and_then(NodeRecord::primary_label),
+        Some(mark("kept"))
+    );
+    assert!(asserted[1].1.is_none(), "the removal");
+    assert!(asserted[0].0.commit < asserted[1].0.commit);
 }
 
 #[test]
