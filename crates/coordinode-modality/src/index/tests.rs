@@ -220,6 +220,44 @@ fn a_unique_value_has_one_holder() {
     );
 }
 
+/// A unique value too long to have an entry, which its owner leaves for a
+/// short one, was never held: leaving it writes no ownership revision (whose
+/// key would be too long to store as well), and the short value is taken.
+/// Such an unheld long membership is what a writer meets on a label a
+/// pending implication change brings under the index.
+#[test]
+fn leaving_a_unique_value_too_long_to_hold_writes_nothing_for_it() {
+    let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = bound(
+        IndexDescriptor::btree("user_email", "User", "email").unique(),
+        1,
+    );
+    let long = s(&"x".repeat(70 * 1024));
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    store
+        .stage_membership(
+            &mut t,
+            &index,
+            &no_fields,
+            owner(id(1)),
+            Some(&long),
+            Some(&s("a@x")),
+        )
+        .expect("staged");
+    commit(&mut t).expect("committed");
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    assert_eq!(
+        store
+            .unique_conflict(&mut t, &index, &s("a@x"), id(2))
+            .unwrap(),
+        Some(id(1))
+    );
+}
+
 /// Two transactions that both found a value free and both claim it write
 /// one key, so only the first to commit succeeds, in either profile.
 #[test]
