@@ -1513,21 +1513,111 @@ pub struct IntegrityState {
     pub trusted_from: Option<u64>,
 }
 
-/// [`IndexIntegrityRecord`] as encoded, its evidence and check skipped
-/// unread.
+/// [`IndexIntegrityRecord`] as encoded, every field checked as the record's
+/// own decode checks it, but its evidence and check built from nothing:
+/// what the record refuses is refused here too, and nothing is allocated.
 #[derive(Deserialize)]
 struct IntegrityStateView {
     generation: GenerationId,
     #[serde(rename = "index")]
-    _index: serde::de::IgnoredAny,
+    _index: IndexId,
     integrity: Integrity,
     #[serde(rename = "evidence")]
-    _evidence: serde::de::IgnoredAny,
+    _evidence: Checked<MismatchShape>,
     #[serde(rename = "evidence_revision")]
-    _evidence_revision: serde::de::IgnoredAny,
+    _evidence_revision: u64,
     #[serde(rename = "check")]
-    _check: serde::de::IgnoredAny,
+    _check: Option<IndexCheckShape>,
     trusted_from: Option<u64>,
+}
+
+/// [`Mismatch`] as its decode checks it, its tuple read and dropped.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum MismatchShape {
+    Missing {
+        node: u64,
+        valid_from: Option<i64>,
+        tuple: Checked<u8>,
+    },
+    Extra {
+        node: u64,
+        valid_from: Option<i64>,
+        tuple: Checked<u8>,
+    },
+    SourceDuplicate {
+        nodes: [u64; 2],
+        tuple: Checked<u8>,
+    },
+}
+
+/// [`IndexCheck`] as its decode checks it, nothing of it kept.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct IndexCheckShape {
+    state: CheckStateShape,
+    started_revision: u64,
+    passes: u32,
+    checked: u64,
+    mismatches: u64,
+    repaired: u64,
+    rebuilt_into: Option<GenerationId>,
+    finished_at_ms: Option<u64>,
+}
+
+/// [`CheckState`] as its decode checks it, a failure's reason read and
+/// dropped.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum CheckStateShape {
+    Accepted,
+    Running { executor: u64 },
+    Done,
+    Failed { reason: CheckedStr },
+    Cancelled,
+}
+
+/// A list whose every element decodes as `T`, as a `Vec<T>` would, with
+/// nothing kept.
+struct Checked<T>(core::marker::PhantomData<T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Checked<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Each<T>(core::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Each<T> {
+            type Value = Checked<T>;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a sequence")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Checked<T>, A::Error> {
+                while seq.next_element::<T>()?.is_some() {}
+                Ok(Checked(core::marker::PhantomData))
+            }
+        }
+        deserializer.deserialize_seq(Each(core::marker::PhantomData))
+    }
+}
+
+/// A string, as a `String` decodes it, with nothing kept.
+struct CheckedStr;
+
+impl<'de> Deserialize<'de> for CheckedStr {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Text;
+        impl serde::de::Visitor<'_> for Text {
+            type Value = CheckedStr;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<CheckedStr, E> {
+                Ok(CheckedStr)
+            }
+        }
+        deserializer.deserialize_string(Text)
+    }
 }
 
 impl IndexIntegrityRecord {

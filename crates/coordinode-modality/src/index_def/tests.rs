@@ -167,6 +167,97 @@ fn reports_past_the_cap_still_move_the_revision() {
     );
 }
 
+/// The state read without the evidence refuses whatever the whole record's
+/// decode refuses: a field of the wrong type among those it does not keep
+/// (the index, the evidence or one disagreement in it, the revision, the
+/// check), or a record cut short. Each malformed record is refused by the
+/// whole decode too, and a well-formed one gives the same state both ways;
+/// a malformed record never makes a generation trusted.
+#[test]
+fn an_integrity_state_refuses_what_the_record_refuses() {
+    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
+    record.report(&extra(7));
+    record.check = Some(IndexCheck {
+        state: CheckState::Failed {
+            reason: "stopped".into(),
+        },
+        ..IndexCheck::accepted(1)
+    });
+    record.integrity = Integrity::Verified;
+    record.trusted_from = Some(77);
+    let bytes = rmp_serde::to_vec(&record).expect("encode");
+    assert_eq!(
+        IndexIntegrityRecord::state_from_msgpack(&bytes).expect("state"),
+        record.state()
+    );
+
+    let verified = Integrity::Verified;
+    let none: Option<u8> = None;
+    let malformed = [
+        (
+            "an index that is no number",
+            rmp_serde::to_vec(&(
+                2u64,
+                true,
+                verified,
+                Vec::<u8>::new(),
+                0u64,
+                none,
+                Some(77u64),
+            )),
+        ),
+        (
+            "evidence that is no list",
+            rmp_serde::to_vec(&(2u64, 1u64, verified, "x", 0u64, none, Some(77u64))),
+        ),
+        (
+            "a disagreement that is none",
+            rmp_serde::to_vec(&(2u64, 1u64, verified, vec!["x"], 0u64, none, Some(77u64))),
+        ),
+        (
+            "a revision that is no number",
+            rmp_serde::to_vec(&(
+                2u64,
+                1u64,
+                verified,
+                Vec::<u8>::new(),
+                "x",
+                none,
+                Some(77u64),
+            )),
+        ),
+        (
+            "a check that is none",
+            rmp_serde::to_vec(&(
+                2u64,
+                1u64,
+                verified,
+                Vec::<u8>::new(),
+                0u64,
+                Some("x"),
+                Some(77u64),
+            )),
+        ),
+    ];
+    for (what, bytes) in malformed {
+        let bytes = bytes.expect("encode");
+        assert!(
+            rmp_serde::from_slice::<IndexIntegrityRecord>(&bytes).is_err(),
+            "{what}: the record decodes"
+        );
+        assert!(
+            IndexIntegrityRecord::state_from_msgpack(&bytes).is_err(),
+            "{what}: the state was read"
+        );
+    }
+    let cut = &bytes[..bytes.len() - 1];
+    assert!(rmp_serde::from_slice::<IndexIntegrityRecord>(cut).is_err());
+    assert!(
+        IndexIntegrityRecord::state_from_msgpack(cut).is_err(),
+        "a cut record was read"
+    );
+}
+
 /// A check is pending until it reaches an outcome.
 #[test]
 fn a_check_is_pending_until_its_outcome() {

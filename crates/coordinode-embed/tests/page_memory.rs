@@ -380,6 +380,12 @@ fn an_integrity_state_is_read_without_its_evidence() {
     }
     record.integrity = Integrity::Verified;
     record.trusted_from = Some(77);
+    record.check = Some(coordinode_modality::index_def::IndexCheck {
+        state: coordinode_modality::index_def::CheckState::Failed {
+            reason: "x".repeat(4096),
+        },
+        ..coordinode_modality::index_def::IndexCheck::accepted(1)
+    });
     let bytes = rmp_serde::to_vec(&record).unwrap();
     let (state, allocated) =
         allocated_by(|| IndexIntegrityRecord::state_from_msgpack(&bytes).unwrap());
