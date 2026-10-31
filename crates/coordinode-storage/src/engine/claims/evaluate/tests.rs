@@ -1440,6 +1440,94 @@ mod unique_while_building {
         }
     }
 
+    /// While the index is being built, a stored version of a temporal node
+    /// holds its value over its own valid time only: a version taking it
+    /// from where that one ends is admitted, one overlapping it is refused,
+    /// and a version that is a deletion holds nothing.
+    #[test]
+    fn a_stored_version_holds_its_value_over_its_valid_time_only() {
+        use coordinode_core::graph::node::encode_temporal_node_key;
+        use coordinode_core::txn::invariant::OwnerTimeline;
+        const VALID_TO: u32 = 90;
+        const DELETED: u32 = 91;
+        let (engine, _d) = engine();
+        let version = |value: Value, valid_to: Option<i64>, deleted: bool| {
+            let mut record = NodeRecord::new(bind(&engine, "User"));
+            record.set(EMAIL, value);
+            if let Some(end) = valid_to {
+                record.set(VALID_TO, Value::Int(end));
+            }
+            if deleted {
+                record.set(DELETED, Value::Bool(true));
+            }
+            record.to_msgpack().expect("encode")
+        };
+        engine
+            .put(
+                Partition::Node,
+                &encode_temporal_node_key(SHARD, node(1), 10),
+                &version(email("a@x"), Some(20), false),
+            )
+            .expect("held over [10, 20)");
+        engine
+            .put(
+                Partition::Node,
+                &encode_temporal_node_key(SHARD, node(3), 10),
+                &version(email("gone@x"), None, true),
+            )
+            .expect("a deletion");
+        let timed = |claimant: u64, value: Value| {
+            let mut claim = claim(claimant, value, None, 1_000);
+            if let ClaimPredicate::UniqueHolder { timeline, .. } = &mut claim.predicate {
+                *timeline = Some(OwnerTimeline {
+                    shard_id: SHARD,
+                    valid_to: Some(VALID_TO),
+                    deleted: Some(DELETED),
+                });
+            }
+            claim
+        };
+        let taking = |valid_from: i64, value: Value| {
+            let mut points = HashMap::new();
+            points.insert(
+                (
+                    Partition::Node,
+                    encode_temporal_node_key(SHARD, node(2), valid_from),
+                ),
+                Some(version(value, None, false)),
+            );
+            points
+        };
+
+        assert_eq!(
+            decide_with(
+                &engine,
+                &timed(2, email("a@x")),
+                &taking(20, email("a@x")),
+                &[]
+            ),
+            Verdict::Holds,
+            "from where the stored version ends"
+        );
+        assert!(
+            matches!(
+                decide_with(&engine, &timed(2, email("a@x")), &taking(19, email("a@x")), &[]),
+                Verdict::HeldBy { holder, .. } if holder == node(1)
+            ),
+            "one instant of overlap"
+        );
+        assert_eq!(
+            decide_with(
+                &engine,
+                &timed(2, email("gone@x")),
+                &taking(0, email("gone@x")),
+                &[]
+            ),
+            Verdict::Holds,
+            "a deletion holds nothing"
+        );
+    }
+
     /// A list is indexed by each element, so a stored list holding the value
     /// holds it.
     #[test]

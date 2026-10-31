@@ -392,7 +392,7 @@ impl<'a> Evaluation<'a> {
                 Some(source) => uncovered_holders(
                     engine,
                     &core::iter::once((tuple.as_slice(), *node)).collect(),
-                    source,
+                    (source, timeline.as_ref()),
                     staged_points,
                     node_deltas,
                 ),
@@ -570,22 +570,86 @@ pub type WantedValues<'a> = rustc_hash::FxHashMap<&'a [u8], NodeId>;
 pub fn uncovered_holders(
     engine: &StorageEngine,
     wanted: &WantedValues<'_>,
-    source: &UncoveredSource,
+    (source, fields): (
+        &UncoveredSource,
+        Option<&coordinode_core::txn::invariant::OwnerTimeline>,
+    ),
     staged_points: StagedPoints<'_>,
-    node_deltas: &[(Vec<u8>, Vec<u8>)],
+    node_deltas: NodeDeltas<'_>,
 ) -> StorageResult<Verdict> {
     use coordinode_core::graph::node::{
         NodeRecord, decode_node_key, decode_temporal_node_key, encode_node_key,
     };
     use coordinode_core::index::derive::tuples;
 
+    use coordinode_core::graph::node::{ValidSpan, VersionBounds};
+
     let mut closures = Closures::new(engine, staged_points);
+    // The field ids bounding a version's valid time: the claim's, and one
+    // it could not know read from the dictionary once a temporal record is
+    // met.
+    let mut timeline: Option<(Option<u32>, Option<u32>)> = None;
+    let mut bounds_of = |record: &NodeRecord| -> StorageResult<VersionBounds> {
+        if timeline.is_none() {
+            let known = fields.map_or((None, None), |f| (f.valid_to, f.deleted));
+            timeline = Some(if known.0.is_some() && known.1.is_some() {
+                known
+            } else {
+                let dictionary = crate::engine::metadata::load_field_dictionary(engine)?;
+                (
+                    known.0.or_else(|| dictionary.lookup("valid_to")),
+                    known.1.or_else(|| dictionary.lookup("__deleted__")),
+                )
+            });
+        }
+        let (valid_to, deleted) = timeline.unwrap_or_default();
+        Ok(VersionBounds::of(record, valid_to, deleted))
+    };
+    // What each node the attempt writes holds a tuple over, in its staged
+    // records: a node at every instant, a version over its valid time.
+    // A taker whose staged records show none (written through a document
+    // delta) is held to every instant.
+    let mut taken: rustc_hash::FxHashMap<(NodeId, Vec<u8>), Vec<ValidSpan>> =
+        rustc_hash::FxHashMap::default();
+    for ((part, key), value) in staged_points.iter() {
+        let (Partition::Node, Some(bytes)) = (*part, value) else {
+            continue;
+        };
+        let (taker, valid_from) = match decode_node_key(key) {
+            Some((shard, id)) if shard == source.shard_id => (id, None),
+            Some(_) => continue,
+            None => match decode_temporal_node_key(key) {
+                Some((shard, id, vf)) if shard == source.shard_id => (id, Some(vf)),
+                _ => continue,
+            },
+        };
+        let record = NodeRecord::from_msgpack(bytes)
+            .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
+        let Some(values) = source.interpretation.record_membership(&record) else {
+            continue;
+        };
+        let span = match valid_from {
+            None => Some(ValidSpan::ALWAYS),
+            Some(vf) => ValidSpan::of_version(vf, bounds_of(&record)?),
+        };
+        let Some(span) = span else {
+            continue;
+        };
+        for tuple in tuples(&values).map_err(coordinode_core::index::derive::EntryError::from)? {
+            if wanted.get(tuple.as_slice()) == Some(&taker) {
+                taken.entry((taker, tuple)).or_default().push(span);
+            }
+        }
+    }
     let mut holder = |key: &[u8], bytes: &[u8]| -> StorageResult<Option<Verdict>> {
-        // A temporal node holds the values of each of its versions.
-        let Some((shard, holder)) = decode_node_key(key)
-            .or_else(|| decode_temporal_node_key(key).map(|(shard, id, _)| (shard, id)))
-        else {
-            return Ok(None);
+        // A temporal node holds the values of each of its versions, over
+        // that version's valid time.
+        let (shard, holder, valid_from) = match decode_node_key(key) {
+            Some((shard, id)) => (shard, id, None),
+            None => match decode_temporal_node_key(key) {
+                Some((shard, id, vf)) => (shard, id, Some(vf)),
+                None => return Ok(None),
+            },
         };
         if shard != source.shard_id {
             return Ok(None);
@@ -600,13 +664,25 @@ pub fn uncovered_holders(
         let Some(values) = source.interpretation.record_membership(&record) else {
             return Ok(None);
         };
-        // A node taking a value it already holds holds it still.
+        let held_over = match valid_from {
+            None => Some(ValidSpan::ALWAYS),
+            Some(vf) => ValidSpan::of_version(vf, bounds_of(&record)?),
+        };
+        let Some(held_over) = held_over else {
+            return Ok(None);
+        };
+        // A node taking a value it already holds holds it still; another
+        // holds it against the taker only where their times meet.
         let held = tuples(&values).map_err(coordinode_core::index::derive::EntryError::from)?;
-        if !held.iter().any(|t| {
-            wanted
-                .get(t.as_slice())
-                .is_some_and(|taker| *taker != holder)
-        }) {
+        let conflicts = held.iter().any(|t| {
+            wanted.get(t.as_slice()).is_some_and(|taker| {
+                *taker != holder
+                    && taken
+                        .get(&(*taker, t.clone()))
+                        .is_none_or(|spans| spans.iter().any(|s| s.overlaps(&held_over)))
+            })
+        });
+        if !conflicts {
             return Ok(None);
         }
         Ok(Some(Verdict::HeldBy { holder, values }))

@@ -1414,7 +1414,11 @@ impl<'a> Transaction<'a> {
         // generation -> (the source with the least coverage, values wanted)
         let mut groups: rustc_hash::FxHashMap<
             coordinode_core::index::identity::GenerationId,
-            (UncoveredSource, WantedValues<'_>),
+            (
+                UncoveredSource,
+                Option<coordinode_core::txn::invariant::OwnerTimeline>,
+                WantedValues<'_>,
+            ),
         > = rustc_hash::FxHashMap::default();
         for claim in self.claims.claims() {
             let (
@@ -1422,15 +1426,15 @@ impl<'a> Transaction<'a> {
                 ClaimPredicate::UniqueHolder {
                     node,
                     uncovered: Some(source),
-                    ..
+                    timeline,
                 },
             ) = (&claim.scope, &claim.predicate)
             else {
                 continue;
             };
-            let (group, wanted) = groups
+            let (group, _, wanted) = groups
                 .entry(*generation)
-                .or_insert_with(|| ((**source).clone(), WantedValues::default()));
+                .or_insert_with(|| ((**source).clone(), *timeline, WantedValues::default()));
             // Coverage only grows, so the oldest cursor stated is a bound
             // that holds for every claim of the group (no cursor sorts first).
             if source.covered_through < group.covered_through {
@@ -1438,11 +1442,11 @@ impl<'a> Transaction<'a> {
             }
             wanted.insert(tuple.as_slice(), *node);
         }
-        for (generation, (source, wanted)) in &groups {
+        for (generation, (source, timeline, wanted)) in &groups {
             match uncovered_holders(
                 self.engine,
                 wanted,
-                source,
+                (source, timeline.as_ref()),
                 &self.write_buffer,
                 &self.merge_node_deltas,
             )? {
