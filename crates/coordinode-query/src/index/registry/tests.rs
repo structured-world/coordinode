@@ -726,7 +726,15 @@ fn a_full_report_queue_drops_reports_but_keeps_marks() {
 fn queue_held(reg: &IndexRegistry) -> usize {
     let view = reg.integrity.lock();
     view.reports.capacity() * core::mem::size_of::<IntegrityReport>()
-        + view.reports.iter().map(report_bytes).sum::<usize>()
+        + view
+            .reports
+            .iter()
+            .map(|report| match &report.found {
+                Mismatch::Missing { tuple, .. }
+                | Mismatch::Extra { tuple, .. }
+                | Mismatch::SourceDuplicate { tuple, .. } => tuple.capacity(),
+            })
+            .sum::<usize>()
 }
 
 /// The report queue is bounded by the memory it holds as well as its count:
