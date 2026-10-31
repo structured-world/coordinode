@@ -780,6 +780,105 @@ fn every_key_shape_is_held_per_instant() {
     seat(&mut db, "room: 'r9', desk: 9, badge: null", b, None).expect("NULL from b");
 }
 
+/// Set by the parent test; the child test does nothing without it.
+const OWNERSHIP_CRASH_DIR: &str = "COORDINODE_TEMPORAL_UNIQUE_CRASH_DIR";
+/// The maintenance the child's index is kept under.
+const OWNERSHIP_CRASH_MAINTENANCE: &str = "COORDINODE_TEMPORAL_UNIQUE_CRASH_MAINTENANCE";
+/// The instants the child and the parent agree on, passed through the
+/// environment: a, b.
+const OWNERSHIP_CRASH_TIMES: &str = "COORDINODE_TEMPORAL_UNIQUE_CRASH_TIMES";
+
+/// Child half of `temporal_ownership_is_restored_after_a_kill`: an
+/// acknowledged holding over [a, b) and a handover in one transaction, then
+/// the process dies without a destructor, as under SIGKILL. Run on its own it
+/// has no directory and returns.
+#[test]
+fn temporal_ownership_crash_child_writes_then_aborts() {
+    let Some(dir) = std::env::var_os(OWNERSHIP_CRASH_DIR) else {
+        return;
+    };
+    let maintenance = std::env::var(OWNERSHIP_CRASH_MAINTENANCE).expect("maintenance");
+    let times = std::env::var(OWNERSHIP_CRASH_TIMES).expect("times");
+    let (a, b) = times.split_once(',').expect("a,b");
+    let (a, b): (i64, i64) = (a.parse().expect("a"), b.parse().expect("b"));
+    let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal label");
+    unique_name_index(&mut db, &maintenance);
+    create(&mut db, "ada", a, None);
+    // One transaction ends the first holding at b and gives the value to
+    // another node from b.
+    let txn = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(
+        txn,
+        &format!("MATCH (n:Emp) WHERE temporal_active_at(n, {a}) SET n.valid_to = {b}"),
+        None,
+    )
+    .expect("end staged");
+    db.execute_in_transaction(
+        txn,
+        &format!("CREATE (n:Emp {{name: 'ada', valid_from: {b}}})"),
+        None,
+    )
+    .expect("take staged");
+    db.commit_transaction(txn).expect("handover acknowledged");
+    std::process::abort();
+}
+
+/// Ownership acknowledged before a kill is enforced after the reopen, under
+/// either maintenance: the handed-over value is refused over both holders'
+/// times and stays free before the first.
+#[test]
+fn temporal_ownership_is_restored_after_a_kill() {
+    for maintenance in ["resolved", "derived"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = now_us();
+        let (a, b) = (now - 2 * YEAR, now - YEAR);
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "integration::temporal_node_reads::temporal_ownership_crash_child_writes_then_aborts",
+                "--nocapture",
+            ])
+            .env(OWNERSHIP_CRASH_DIR, dir.path())
+            .env(OWNERSHIP_CRASH_MAINTENANCE, maintenance)
+            .env(OWNERSHIP_CRASH_TIMES, format!("{a},{b}"))
+            .status()
+            .expect("run the child");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(6),
+                "{maintenance}: the child must die by abort after its writes, got {status:?}"
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(!status.success(), "the child must die, got {status:?}");
+
+        let mut db = Database::open(dir.path()).expect("reopen after the kill");
+        for t in [a, b] {
+            assert_eq!(held_at(&mut db, t), ["ada"], "{maintenance} at {t}");
+        }
+        for (from, what) in [(a, "over the first holder"), (b, "over the second")] {
+            refused_as_unique(
+                db.execute_cypher(&format!(
+                    "CREATE (n:Emp {{name: 'ada', valid_from: {from}}})"
+                )),
+                &format!("{maintenance}: {what}"),
+            );
+        }
+        db.execute_cypher(&format!(
+            "CREATE (n:Emp {{name: 'ada', valid_from: {}, valid_to: {a}}})",
+            a - YEAR
+        ))
+        .expect("free before the first holder");
+    }
+}
+
 /// Ownership over valid time survives a reopen: after it, an overlap with a
 /// holder admitted before is still refused and a value meeting it at a
 /// bound is still admitted, under either maintenance.
