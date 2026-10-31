@@ -3,7 +3,7 @@ use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Ti
 use crate::engine::merge::{encode_add, encode_remove};
 use crate::engine::transaction::AdjOp;
 use coordinode_core::txn::invariant::ClaimScope;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use tempfile::TempDir;
 
 const GEN: u64 = 1;
@@ -23,7 +23,7 @@ fn engine() -> (StorageEngine, TempDir) {
 /// Decide a claim for an attempt that has staged no point writes, which is
 /// every case below except the ones about staged writes themselves.
 fn decide(engine: &StorageEngine, claim: &Claim, staged: &[(Vec<u8>, AdjOp)]) -> Verdict {
-    let no_points = HashMap::new();
+    let no_points = BTreeMap::new();
     // An attempt whose view is the current state: nothing has been written
     // since it, which is the case every test here but the destruction ones.
     evaluate(engine, claim, staged, &no_points, engine.snapshot()).expect("evaluate")
@@ -125,7 +125,7 @@ fn a_posting_that_does_not_decode_decides_nothing() {
     engine
         .put(Partition::Adj, &key, &[0xFF, 0xFE, 0xFD])
         .expect("store bytes that are not a posting");
-    let no_points = HashMap::new();
+    let no_points = BTreeMap::new();
     let view = engine.snapshot();
 
     let absent = Claim::new(
@@ -361,7 +361,7 @@ fn a_pair_claim_is_broken_by_a_change_under_the_attempt() {
         },
         GEN,
     );
-    let no_points = HashMap::new();
+    let no_points = BTreeMap::new();
     assert_eq!(
         evaluate(&engine, &saw_absent, &[], &no_points, view).expect("evaluate"),
         Verdict::Broken
@@ -435,7 +435,7 @@ fn an_endpoint_claim_refuses_a_node_deleted_since_the_attempts_view() {
         ClaimPredicate::EndpointAlive,
         GEN,
     );
-    let no_points = HashMap::new();
+    let no_points = BTreeMap::new();
     assert_eq!(
         evaluate(&engine, &claim, &[], &no_points, view).expect("evaluate"),
         Verdict::Broken,
@@ -468,7 +468,7 @@ fn an_endpoint_claim_reads_the_shard_the_engine_holds() {
         ClaimPredicate::EndpointAlive,
         GEN,
     );
-    let no_points = HashMap::new();
+    let no_points = BTreeMap::new();
     assert_eq!(
         evaluate(&engine, &claim, &[], &no_points, view).expect("evaluate"),
         Verdict::Broken,
@@ -512,7 +512,7 @@ fn an_endpoint_claim_reads_the_attempts_own_point_writes() {
     );
     let key = coordinode_core::graph::node::encode_node_key(engine.node_shard(), node(4));
 
-    let mut staged_points = HashMap::new();
+    let mut staged_points = BTreeMap::new();
     staged_points.insert((Partition::Node, key.clone()), Some(b"record".to_vec()));
     assert_eq!(
         evaluate(&engine, &claim, &[], &staged_points, engine.snapshot()).expect("evaluate"),
@@ -521,7 +521,7 @@ fn an_endpoint_claim_reads_the_attempts_own_point_writes() {
     );
 
     engine.put(Partition::Node, &key, b"record").expect("put");
-    let mut deleted = HashMap::new();
+    let mut deleted = BTreeMap::new();
     deleted.insert((Partition::Node, key), None);
     assert_eq!(
         evaluate(&engine, &claim, &[], &deleted, engine.snapshot()).expect("evaluate"),
@@ -579,7 +579,7 @@ fn a_completed_scan_is_broken_by_a_member_that_joined_after_it() {
     engine
         .merge(Partition::Adj, &key, &encode_add(3))
         .expect("merge");
-    let no_points = HashMap::new();
+    let no_points = BTreeMap::new();
     assert_eq!(
         evaluate(&engine, &scan, &[], &no_points, view).expect("evaluate"),
         Verdict::Broken,
@@ -678,7 +678,7 @@ fn a_schema_read_is_broken_by_any_change_of_the_schema() {
             revision: schema.schema_revision,
         },
     );
-    let no_points = HashMap::new();
+    let no_points = BTreeMap::new();
     let view = engine.snapshot();
     let at_view =
         |engine: &StorageEngine| evaluate(engine, &read, &[], &no_points, view).expect("evaluate");
@@ -707,7 +707,7 @@ fn a_schema_read_of_an_undeclared_label_is_broken_by_its_declaration() {
 
     let (engine, _d) = engine();
     let read = schema_claim("Doc", ClaimPredicate::SchemaRead { revision: 0 });
-    let no_points = HashMap::new();
+    let no_points = BTreeMap::new();
     let view = engine.snapshot();
     assert_eq!(
         evaluate(&engine, &read, &[], &no_points, view).expect("evaluate"),
@@ -739,7 +739,7 @@ fn a_schema_read_is_asked_from_the_first_unseen_number() {
             revision: schema.schema_revision,
         },
     );
-    let no_points = HashMap::new();
+    let no_points = BTreeMap::new();
     let unseen_from = engine.snapshot();
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     engine
@@ -793,7 +793,7 @@ fn an_activation_changing_what_a_typed_label_implies_is_refused() {
         .expect("node");
     let view = engine.snapshot();
     let staged = |schema: &LabelSchema| {
-        let mut points = HashMap::new();
+        let mut points = BTreeMap::new();
         points.insert(
             (
                 Partition::Schema,
@@ -846,7 +846,7 @@ fn an_activation_is_refused_only_by_a_node_its_kind_cannot_type() {
     let mut top = LabelSchema::new_node_id("Top");
     top.set_implies(vec!["Middle".to_string()]);
     top.schema_revision = 1;
-    let mut points = HashMap::new();
+    let mut points = BTreeMap::new();
     points.insert(
         (Partition::Schema, body_key(&engine, "Top", 1)),
         Some(top.to_msgpack().expect("encode")),
@@ -905,7 +905,7 @@ fn an_activation_is_decided_by_the_stored_nodes_of_its_label() {
     let mut staged_schema = LabelSchema::new_node_id("Doc");
     staged_schema.set_mode(SchemaMode::Strict);
     staged_schema.schema_revision = 2;
-    let mut points = HashMap::new();
+    let mut points = BTreeMap::new();
     points.insert(
         (
             Partition::Schema,
@@ -914,7 +914,7 @@ fn an_activation_is_decided_by_the_stored_nodes_of_its_label() {
         Some(staged_schema.to_msgpack().expect("encode")),
     );
     let activation = schema_claim("Doc", ClaimPredicate::SchemaActivated { revision: 2 });
-    let decide_with = |engine: &StorageEngine, points: &HashMap<_, _>| {
+    let decide_with = |engine: &StorageEngine, points: &BTreeMap<_, _>| {
         evaluate(engine, &activation, &[], points, engine.snapshot()).expect("evaluate")
     };
 
@@ -995,12 +995,12 @@ fn a_candidate_holds_only_the_nodes_the_attempt_writes() {
     assert_eq!(decide(&engine, &claim, &[]), Verdict::Holds);
 
     // Written by the attempt under another primary label: not held.
-    let mut points = HashMap::new();
+    let mut points = BTreeMap::new();
     points.insert(
         (Partition::Node, encode_node_key(0, node(2))),
         Some(loose(vec!["User", "Doc"])),
     );
-    let decide_with = |points: &HashMap<_, _>| {
+    let decide_with = |points: &BTreeMap<_, _>| {
         evaluate(&engine, &claim, &[], points, engine.snapshot()).expect("evaluate")
     };
     assert_eq!(decide_with(&points), Verdict::Holds);
@@ -1269,7 +1269,7 @@ fn an_instance_bound_counts_the_attempts_own_entries() {
 
     // The attempt stages a second identity: the bound it claims is broken by
     // its own post-state, not by anything committed.
-    let mut adding = HashMap::new();
+    let mut adding = BTreeMap::new();
     adding.insert(
         (Partition::EdgeProp, entry(b"college")),
         Some(b"props".to_vec()),
@@ -1288,7 +1288,7 @@ fn an_instance_bound_counts_the_attempts_own_entries() {
         .expect("put");
     assert_eq!(decide(&engine, &at_most_one, &[]), Verdict::Broken);
 
-    let mut removing = HashMap::new();
+    let mut removing = BTreeMap::new();
     removing.insert((Partition::EdgeProp, second), None);
     assert_eq!(
         evaluate(&engine, &at_most_one, &[], &removing, engine.snapshot()).expect("evaluate"),
@@ -1391,7 +1391,7 @@ mod unique_while_building {
     fn decide_with(
         engine: &StorageEngine,
         claim: &Claim,
-        points: &HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>,
+        points: &BTreeMap<(Partition, Vec<u8>), Option<Vec<u8>>>,
         deltas: &[(Vec<u8>, Vec<u8>)],
     ) -> Verdict {
         Evaluation::new(engine, &[], points, engine.snapshot())
@@ -1488,7 +1488,7 @@ mod unique_while_building {
             claim
         };
         let taking = |valid_from: i64, value: Value| {
-            let mut points = HashMap::new();
+            let mut points = BTreeMap::new();
             points.insert(
                 (
                     Partition::Node,
@@ -1555,7 +1555,7 @@ mod unique_while_building {
         store(&engine, 1, "User", email("a@x"));
         store(&engine, 3, "User", email("c@x"));
         store(&engine, 5, "User", email("e@x"));
-        let mut points = HashMap::new();
+        let mut points = BTreeMap::new();
         points.insert((Partition::Node, encode_node_key(SHARD, node(1))), None);
         points.insert(
             (Partition::Node, encode_node_key(SHARD, node(3))),
@@ -1632,7 +1632,7 @@ mod unique_while_building {
                 &engine,
                 &claim(2, email("a@x"), None, 1_000),
                 &[],
-                &HashMap::new(),
+                &BTreeMap::new(),
                 engine.snapshot()
             )
             .is_err()

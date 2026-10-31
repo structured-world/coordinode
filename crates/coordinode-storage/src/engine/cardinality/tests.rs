@@ -818,12 +818,12 @@ fn a_rebuild_of_an_undeclared_constraint_is_refused() {
 /// it, on either side of the pair, and from nothing else.
 #[test]
 fn a_scope_trend_follows_the_writes_that_reach_it() {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
-    let trend = |staged: &[(Vec<u8>, AdjOp)], points: &HashMap<_, _>| {
+    let trend = |staged: &[(Vec<u8>, AdjOp)], points: &BTreeMap<_, _>| {
         scope_trend(node(1), OWNS, Direction::Outgoing, staged, points)
     };
-    let none = HashMap::new();
+    let none = BTreeMap::new();
     let fwd = |n| encode_adj_key_forward(OWNS, node(n));
     let rev = |n| encode_adj_key_reverse(OWNS, node(n));
 
@@ -854,7 +854,7 @@ fn a_scope_trend_follows_the_writes_that_reach_it() {
         CountTrend::Unchanged
     );
     let instance = |value: Option<Vec<u8>>| {
-        HashMap::from([((Partition::EdgeProp, instance_key(1, 2, b"a")), value)])
+        BTreeMap::from([((Partition::EdgeProp, instance_key(1, 2, b"a")), value)])
     };
     assert_eq!(
         trend(&[], &instance(Some(b"x".to_vec()))),
@@ -862,7 +862,7 @@ fn a_scope_trend_follows_the_writes_that_reach_it() {
     );
     assert_eq!(trend(&[], &instance(None)), CountTrend::Shrinks);
     // A whole posting dropped can only take; written whole, either way.
-    let posting = |value: Option<Vec<u8>>| HashMap::from([((Partition::Adj, fwd(1)), value)]);
+    let posting = |value: Option<Vec<u8>>| BTreeMap::from([((Partition::Adj, fwd(1)), value)]);
     assert_eq!(trend(&[], &posting(None)), CountTrend::Shrinks);
     assert_eq!(trend(&[], &posting(Some(Vec::new()))), CountTrend::Changes);
 }
@@ -1056,7 +1056,7 @@ fn concurrent_first_edges_under_one_upper_bound_land_once() {
     );
     assert_eq!(landed, 1);
     assert_eq!(kept(&f, &d), BTreeMap::from([(node(1), 1)]));
-    let none = std::collections::HashMap::new();
+    let none = BTreeMap::new();
     let stored = enumerated_count(&f.engine, node(1), OWNS, d.direction, &[], &none)
         .unwrap()
         .unwrap();
@@ -1223,7 +1223,7 @@ fn differential(discriminated: bool) {
                     proptest::prop_assert_eq!(&ours, &model.counts(d), "{:?} after {:?}", d, batch);
                 }
             }
-            let none = std::collections::HashMap::new();
+            let none = BTreeMap::new();
             for d in &ds {
                 for (n, count) in model.counts(d) {
                     let counted: IncidentCount =

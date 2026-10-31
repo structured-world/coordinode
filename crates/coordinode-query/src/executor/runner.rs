@@ -21140,7 +21140,7 @@ fn execute_alter_label(
     // The new mode governs the nodes already stored. The commit decides this
     // authoritatively with no write under the old mode beside it; checking
     // here as well names the node that refuses it.
-    let staged = std::collections::HashMap::new();
+    let staged = coordinode_storage::engine::transaction::WriteBuffer::new();
     if let Some(violation) =
         coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
             ctx.engine, &schema, &staged,
@@ -23455,7 +23455,7 @@ fn execute_create_constraint(
     // well names the node that refuses it. A presence or type constraint is
     // proved in the background instead.
     if constraint.checks_each_node() && constraint.owns_index() {
-        let staged = std::collections::HashMap::new();
+        let staged = coordinode_storage::engine::transaction::WriteBuffer::new();
         if let Some(violation) =
             coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
                 ctx.engine, &next, &staged,

@@ -3720,7 +3720,7 @@ impl Database {
             {
                 continue;
             }
-            let staged = std::collections::HashMap::new();
+            let staged = coordinode_storage::engine::transaction::WriteBuffer::new();
             if let Some(violation) =
                 coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
                     &self.engine,

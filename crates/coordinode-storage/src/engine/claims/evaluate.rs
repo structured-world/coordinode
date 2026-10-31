@@ -103,9 +103,6 @@ pub struct Evaluation<'a> {
     /// in flight under the view as it was taken.
     unseen_from: u64,
     edge_types: core::cell::OnceCell<Vec<String>>,
-    /// The index entries the attempt puts, in key order, built on first use:
-    /// each unique value finds its own by a range, not by reading them all.
-    staged_entries: core::cell::OnceCell<Vec<&'a [u8]>>,
     /// The attempt's document deltas in key order, a key's own in the order
     /// they were made, built on first use.
     deltas_by_key: core::cell::OnceCell<Vec<(&'a [u8], &'a [u8])>>,
@@ -128,23 +125,8 @@ impl<'a> Evaluation<'a> {
             read_ts,
             unseen_from: read_ts,
             edge_types: core::cell::OnceCell::new(),
-            staged_entries: core::cell::OnceCell::new(),
             deltas_by_key: core::cell::OnceCell::new(),
         }
-    }
-
-    /// The index entries the attempt puts, in key order.
-    fn staged_entries(&self) -> &[&'a [u8]] {
-        self.staged_entries.get_or_init(|| {
-            let mut keys: Vec<&'a [u8]> = self
-                .staged_points
-                .iter()
-                .filter(|((part, _), value)| *part == Partition::Idx && value.is_some())
-                .map(|((_, key), _)| key.as_slice())
-                .collect();
-            keys.sort_unstable();
-            keys
-        })
     }
 
     /// The attempt's document deltas in key order, a key's own in the order
@@ -426,7 +408,6 @@ impl<'a> Evaluation<'a> {
                     (*node, timeline.as_ref()),
                     Staged {
                         points: staged_points,
-                        entries: self.staged_entries(),
                         deltas: self.deltas_by_key(),
                     },
                 ),
@@ -486,13 +467,13 @@ fn entry_holders(
         }
     }
     // The attempt's own entries of this value: their range of the ordered
-    // keys, not every key the attempt staged.
-    let from = staged.entries.partition_point(|k| *k < prefix.as_slice());
-    for key in staged.entries[from..]
-        .iter()
-        .take_while(|k| k.starts_with(&prefix))
+    // buffer, not every key the attempt staged.
+    for ((_, key), value) in staged_points
+        .range((Partition::Idx, prefix.clone())..)
+        .take_while(|((part, key), _)| *part == Partition::Idx && key.starts_with(&prefix))
     {
-        if let Some(owner) = decode_entry(generation, key)
+        if value.is_some()
+            && let Some(owner) = decode_entry(generation, key)
             && !owners.contains(&owner)
         {
             owners.push(owner);
@@ -598,11 +579,9 @@ fn entry_holders(
 type NodeDeltas<'a> = &'a [(Vec<u8>, Vec<u8>)];
 
 /// What an attempt staged, as a unique value's owners are read from it:
-/// its point writes, the index entries it puts in key order and its
-/// document deltas in key order.
+/// its point writes and its document deltas in key order.
 struct Staged<'s, 'a> {
     points: StagedPoints<'a>,
-    entries: &'s [&'a [u8]],
     deltas: &'s [(&'a [u8], &'a [u8])],
 }
 
@@ -986,7 +965,7 @@ fn changes_implication(
     engine: &StorageEngine,
     schema: &coordinode_core::schema::definition::LabelSchema,
 ) -> StorageResult<bool> {
-    let nothing_staged = std::collections::HashMap::new();
+    let nothing_staged = crate::engine::transaction::WriteBuffer::new();
     let in_force = match current_binding(engine, &schema.name, &nothing_staged)? {
         Some(binding) if binding.declared_revision() != 0 => label_body(
             engine,
@@ -1475,7 +1454,7 @@ pub fn label_schema_violations(
     use coordinode_core::graph::node::NodeRecord;
 
     // Only definitions that can refuse a node are read for.
-    let nothing_staged = std::collections::HashMap::new();
+    let nothing_staged = crate::engine::transaction::WriteBuffer::new();
     let mut closures = Closures::new(engine, &nothing_staged);
     // A label without an identity is carried by no node.
     let mut pending: rustc_hash::FxHashMap<
@@ -1556,7 +1535,7 @@ pub fn implication_violations(
 ) -> StorageResult<Vec<(String, LabelSchemaViolation)>> {
     use coordinode_core::graph::node::NodeRecord;
 
-    let nothing_staged = std::collections::HashMap::new();
+    let nothing_staged = crate::engine::transaction::WriteBuffer::new();
     let mut closures = Closures::new(engine, &nothing_staged);
     let mut pending: Vec<(
         coordinode_core::schema::label_id::LabelId,

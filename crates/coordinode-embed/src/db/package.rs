@@ -840,7 +840,7 @@ impl Database {
         ) {
             return refused;
         }
-        let none = std::collections::HashMap::new();
+        let none = coordinode_storage::engine::transaction::WriteBuffer::new();
         for schema in labels {
             match coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
                 &self.engine,

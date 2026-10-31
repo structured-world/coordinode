@@ -71,7 +71,7 @@ pub fn admit_label_kind(
         && (schema.is_auxiliary() || !schema.implies().is_empty())
         && let Some(id) = store.label_id_txn(txn, &schema.name)?
     {
-        let staged_writes = std::collections::HashMap::new();
+        let staged_writes = coordinode_storage::engine::transaction::WriteBuffer::new();
         if let Some(node) = coordinode_storage::engine::claims::evaluate::first_node_typed_by(
             engine,
             id,

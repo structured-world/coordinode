@@ -238,7 +238,7 @@ pub fn rebuild_node_counters(txn: &mut Transaction<'_>) -> StorageResult<()> {
     let mut total: i64 = 0;
     let mut label_counts: rustc_hash::FxHashMap<coordinode_core::schema::label_id::LabelId, i64> =
         rustc_hash::FxHashMap::default();
-    let nothing_staged = HashMap::new();
+    let nothing_staged = crate::engine::transaction::WriteBuffer::new();
     let engine = txn.engine();
     let mut closures = crate::engine::claims::evaluate::Closures::new(engine, &nothing_staged);
 

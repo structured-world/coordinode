@@ -23,7 +23,7 @@
 //! write-concern-aware flush) still lives in the query engine, which drains
 //! these buffers via the `take_*` accessors.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use coordinode_core::graph::edge::PostingList;
 use coordinode_core::txn::invariant::{Claim, ClaimSet};
@@ -43,6 +43,12 @@ use crate::error::{StorageError, StorageResult};
 
 /// A key/value pair returned by [`Transaction::prefix_scan`].
 pub type KvPair = (Vec<u8>, Vec<u8>);
+
+/// A transaction's buffered point writes, `Some(value)` for a put and
+/// `None` for a tombstone, in key order within each partition: a read of a
+/// prefix or a range finds its own writes by a range, not by reading them
+/// all.
+pub type WriteBuffer = BTreeMap<(Partition, Vec<u8>), Option<Vec<u8>>>;
 
 /// Per-statement commit policy passed to [`Transaction::commit`]. These are
 /// execution-context concerns (durability level, replication wiring), not part
@@ -301,7 +307,7 @@ pub struct Transaction<'a> {
     /// (tombstone). Reads consult this first (read-your-own-writes); the
     /// buffer is drained atomically at commit. Empty in legacy mode (writes
     /// go straight to the engine).
-    write_buffer: HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>,
+    write_buffer: WriteBuffer,
     /// Lazily-created OCC read-set, pinned at `read_ts`. Every non-own-write
     /// read records its key here; `commit` validates the set against
     /// concurrent writers. `None` until the first tracked read (and always in
@@ -423,7 +429,7 @@ pub struct TransactionState {
     read_ts: Timestamp,
     snapshot: Option<StorageSnapshot>,
     adj_snapshot: Option<StorageSnapshot>,
-    write_buffer: HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>,
+    write_buffer: WriteBuffer,
     occ_scope: Option<OccScope>,
     merge_adj_ops: Vec<(Vec<u8>, AdjOp)>,
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
@@ -617,7 +623,7 @@ impl<'a> Transaction<'a> {
             read_ts,
             snapshot,
             adj_snapshot: None,
-            write_buffer: HashMap::new(),
+            write_buffer: WriteBuffer::new(),
             occ_scope: None,
             merge_adj_ops: Vec::new(),
             merge_node_deltas: Vec::new(),
@@ -1190,21 +1196,48 @@ impl<'a> Transaction<'a> {
 
     /// Borrow the buffered writes (for the commit path's read-only scan +
     /// CDC pre-image collection). See [`Self::write_buffer_mut`] to drain.
-    pub fn write_buffer(&self) -> &HashMap<(Partition, Vec<u8>), Option<Vec<u8>>> {
+    pub fn write_buffer(&self) -> &WriteBuffer {
         &self.write_buffer
     }
 
     /// Mutable access to the buffered writes for the commit path
     /// (drain / clear). Transitional: the commit path itself moves into this
     /// type in a follow-on increment.
-    pub fn write_buffer_mut(&mut self) -> &mut HashMap<(Partition, Vec<u8>), Option<Vec<u8>>> {
+    pub fn write_buffer_mut(&mut self) -> &mut WriteBuffer {
         &mut self.write_buffer
     }
 
     /// Take the buffered writes, leaving the buffer empty. The commit path
     /// drains this and applies each `(partition, key) -> value | tombstone`.
-    pub fn take_write_buffer(&mut self) -> HashMap<(Partition, Vec<u8>), Option<Vec<u8>>> {
+    pub fn take_write_buffer(&mut self) -> WriteBuffer {
         std::mem::take(&mut self.write_buffer)
+    }
+
+    /// The buffered writes of `part` whose keys start with `prefix`, in key
+    /// order: a range of the buffer, however many other writes it holds.
+    fn buffered_with_prefix<'s>(
+        &'s self,
+        part: Partition,
+        prefix: &'s [u8],
+    ) -> impl Iterator<Item = (&'s [u8], Option<&'s [u8]>)> + 's {
+        self.write_buffer
+            .range((part, prefix.to_vec())..)
+            .take_while(move |((p, k), _)| *p == part && k.starts_with(prefix))
+            .map(|((_, k), v)| (k.as_slice(), v.as_deref()))
+    }
+
+    /// The buffered writes of `part` whose keys lie in `[start, end)`, in key
+    /// order: a range of the buffer.
+    fn buffered_in_range<'s>(
+        &'s self,
+        part: Partition,
+        start: &'s [u8],
+        end: &'s [u8],
+    ) -> impl Iterator<Item = (&'s [u8], Option<&'s [u8]>)> + 's {
+        self.write_buffer
+            .range((part, start.to_vec())..)
+            .take_while(move |((p, k), _)| *p == part && k.as_slice() < end)
+            .map(|((_, k), v)| (k.as_slice(), v.as_deref()))
     }
 
     /// Whether the write buffer holds no buffered mutations (commit read-only
@@ -2539,7 +2572,7 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
-    fn seal_unit(&mut self, wb: HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>) -> Vec<Mutation> {
+    fn seal_unit(&mut self, wb: WriteBuffer) -> Vec<Mutation> {
         let derived = std::mem::take(&mut self.derived);
         debug_assert!(
             self.range_removals.iter().all(|(rp, start, end)| {
@@ -2632,15 +2665,11 @@ impl<'a> Transaction<'a> {
     /// overlays the (empty-in-legacy) buffer.
     pub fn prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<Vec<KvPair>> {
         // Own writes under the prefix, values and tombstones, in key order:
-        // the buffer is a hash map, so its iteration order is arbitrary, and
         // readers group consecutive keys (a node's versions).
-        let mut buffer_matches: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
-            .write_buffer
-            .iter()
-            .filter(|((p, k), _)| *p == part && k.starts_with(prefix))
-            .map(|((_, k), v)| (k.clone(), v.clone()))
+        let buffer_matches: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
+            .buffered_with_prefix(part, prefix)
+            .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
             .collect();
-        buffer_matches.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         let stored: Vec<KvPair> = match self.snapshot {
             // Scanned keys are not conflict-tracked: see `get` — the default
@@ -2672,9 +2701,9 @@ impl<'a> Transaction<'a> {
     ///
     /// Each row counts one unit of `budget`'s work (which checks its deadline
     /// and cancellation) and holds its bytes against the budget while `visit`
-    /// sees it; the index of this transaction's own writes under the prefix is
-    /// reserved before it is built. A refusal stops the scan before the row
-    /// it was for is read further.
+    /// sees it; this transaction's own writes under the prefix are read in
+    /// place, in order, with nothing copied. A refusal stops the scan before
+    /// the row it was for is read further.
     ///
     /// # Errors
     ///
@@ -2689,28 +2718,10 @@ impl<'a> Transaction<'a> {
     where
         E: From<StorageError> + From<coordinode_core::budget::BudgetStop>,
     {
-        // Own writes under the prefix, by reference and in key order, so the
-        // stored rows they shadow are skipped as they stream past.
-        let own = self
-            .write_buffer
-            .keys()
-            .filter(|(p, k)| *p == part && k.starts_with(prefix))
-            .count();
-        // A size past u64 asks for more than any limit, and is refused as such.
-        let _own_index = budget.reserve(
-            own.checked_mul(core::mem::size_of::<(&[u8], Option<&[u8]>)>())
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .unwrap_or(u64::MAX),
-        )?;
-        let mut overlay: Vec<(&[u8], Option<&[u8]>)> = Vec::with_capacity(own);
-        overlay.extend(
-            self.write_buffer
-                .iter()
-                .filter(|((p, k), _)| *p == part && k.starts_with(prefix))
-                .map(|((_, k), v)| (k.as_slice(), v.as_deref())),
-        );
-        overlay.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        let mut overlay = overlay.into_iter().peekable();
+        // Own writes under the prefix, by reference and in key order as the
+        // buffer keeps them, so the stored rows they shadow are skipped as
+        // they stream past; nothing is copied.
+        let mut overlay = self.buffered_with_prefix(part, prefix).peekable();
 
         let mut emit = |key: &[u8], value: &[u8]| -> Result<(), E> {
             budget.work(1)?;
@@ -2781,27 +2792,9 @@ impl<'a> Transaction<'a> {
         if start >= end {
             return Ok(());
         }
-        let in_range = |k: &[u8]| k >= start && k < end;
-        let own = self
-            .write_buffer
-            .keys()
-            .filter(|(p, k)| *p == part && in_range(k))
-            .count();
-        // A size past u64 asks for more than any limit, and is refused as such.
-        let _own_index = budget.reserve(
-            own.checked_mul(core::mem::size_of::<(&[u8], Option<&[u8]>)>())
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .unwrap_or(u64::MAX),
-        )?;
-        let mut overlay: Vec<(&[u8], Option<&[u8]>)> = Vec::with_capacity(own);
-        overlay.extend(
-            self.write_buffer
-                .iter()
-                .filter(|((p, k), _)| *p == part && in_range(k))
-                .map(|((_, k), v)| (k.as_slice(), v.as_deref())),
-        );
-        overlay.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        let mut overlay = overlay.into_iter().peekable();
+        // Own writes in the range, by reference and in key order as the
+        // buffer keeps them; nothing is copied.
+        let mut overlay = self.buffered_in_range(part, start, end).peekable();
 
         let mut emit = |key: &[u8], value: &[u8]| -> Result<ControlFlow<()>, E> {
             budget.work(1)?;

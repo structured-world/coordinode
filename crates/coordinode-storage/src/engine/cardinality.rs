@@ -39,8 +39,9 @@ use crate::error::{StorageError, StorageResult};
 /// The attempt's staged adjacency operands, in the order they were staged.
 pub type StagedAdj<'a> = &'a [(Vec<u8>, AdjOp)];
 
-/// The attempt's staged point writes: `Some` written, `None` deleted.
-pub type StagedPoints<'a> = &'a std::collections::HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>;
+/// The attempt's staged point writes: `Some` written, `None` deleted, in key
+/// order within each partition.
+pub type StagedPoints<'a> = &'a crate::engine::transaction::WriteBuffer;
 
 /// One ordered pair of a counted type.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -5,7 +5,7 @@
 /// Each partition maps to a storage partition (similar to a column family in
 /// RocksDB). Data is separated by category for independent compaction,
 /// compression tuning, and scan isolation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Partition {
     /// `node:` — Node properties (MessagePack-encoded).
     /// Key format: `node:<shard_id>:<node_id>`
