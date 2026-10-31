@@ -2749,6 +2749,82 @@ impl<'a> Transaction<'a> {
         })
     }
 
+    /// [`Self::prefix_scan_paged`] holding the page within `budget`: every
+    /// growth of the page's row list, every row copied into it and the
+    /// cursor copied out of it are charged to `budget` before the memory is
+    /// taken, and the charges stay with `budget` for as long as it lives. A
+    /// row that does not fit stops the read with the budget's refusal before
+    /// it is copied.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or the budget's refusal ([`StorageError::Budget`]).
+    pub fn prefix_scan_paged_charged(
+        &mut self,
+        part: Partition,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        budget: &coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<PagedScan> {
+        // Bytes of `n` bytes' worth of memory about to exist: fits in u64.
+        let charge = |n: usize| -> Result<(), coordinode_core::budget::BudgetStop> {
+            budget.reserve(n as u64)?.keep_until_query_ends();
+            Ok(())
+        };
+        let start = match start_after {
+            Some(after) => {
+                charge(after.len() + 1)?;
+                // The smallest key strictly greater than `after`.
+                let mut s = Vec::with_capacity(after.len() + 1);
+                s.extend_from_slice(after);
+                s.push(0);
+                s
+            }
+            None => {
+                charge(prefix.len())?;
+                prefix.to_vec()
+            }
+        };
+        let end = prefix_upper_bound(prefix);
+        let iter = self.base_range_seekable(part, &start, &end)?;
+
+        let mut rows: Vec<KvPair> = Vec::new();
+        let mut exhausted = true;
+        for guard in iter {
+            let (key, value) = guard.into_inner()?;
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            if rows.len() == limit {
+                // At least one more matching row exists beyond this page.
+                exhausted = false;
+                break;
+            }
+            if rows.len() == rows.capacity() {
+                // The list grows by as many slots as it holds, at least four,
+                // never past the page.
+                let more = rows.len().max(4).min(limit - rows.len());
+                charge(more * core::mem::size_of::<KvPair>())?;
+                rows.reserve_exact(more);
+            }
+            charge(key.len() + value.len())?;
+            rows.push((key.to_vec(), value.to_vec()));
+        }
+        let last_key = match rows.last() {
+            Some((k, _)) => {
+                charge(k.len())?;
+                Some(k.clone())
+            }
+            None => None,
+        };
+        Ok(PagedScan {
+            rows,
+            last_key,
+            exhausted,
+        })
+    }
+
     /// At most `limit` rows of `part` with keys in `[start, end)`, in key
     /// order, strictly after `start_after` when given, with the same paging,
     /// snapshot and tracking contract as [`Self::prefix_scan_paged`]: an

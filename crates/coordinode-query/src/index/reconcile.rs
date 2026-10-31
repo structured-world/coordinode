@@ -64,24 +64,21 @@ fn halved(page: usize) -> Option<usize> {
     (page > 1).then_some(page / 2)
 }
 
-/// Bytes a page of `rows` holds once read.
-fn rows_bytes(rows: &[(Vec<u8>, Vec<u8>)]) -> u64 {
-    rows.iter()
-        .map(|(k, v)| (k.len() + v.len() + 2 * core::mem::size_of::<Vec<u8>>()) as u64)
-        .sum()
-}
-
-/// Make room in `labels` for `wanted` labels, charging any growth of its
-/// capacity to `scratch` before it happens.
+/// Make room in `labels` for `wanted` labels, passing `charge` the bytes its
+/// capacity is about to grow by, before it grows, and adding them to `held`.
+/// Emptied first, so the room asked for is `wanted` itself.
 fn reserve_labels(
     labels: &mut Vec<LabelId>,
     wanted: usize,
-    scratch: &mut coordinode_core::budget::MemoryCharge<'_>,
+    charge: &dyn Fn(usize) -> Result<(), coordinode_core::budget::BudgetStop>,
+    held: &mut usize,
 ) -> Result<(), coordinode_core::budget::BudgetStop> {
+    labels.clear();
     if let Some(more) = wanted.checked_sub(labels.capacity()).filter(|m| *m > 0) {
-        // `more` labels of memory about to exist: the product fits in u64.
-        scratch.grow((more * core::mem::size_of::<LabelId>()) as u64)?;
-        labels.reserve_exact(wanted - labels.len());
+        let bytes = more * core::mem::size_of::<LabelId>();
+        charge(bytes)?;
+        labels.reserve_exact(wanted);
+        *held += bytes;
     }
     Ok(())
 }
@@ -122,10 +119,10 @@ impl Reconcile<'_> {
         let mut size = self.page.max(1);
         // The labels a node carries under each interpretation, reused from
         // node to node: they grow to the widest closure once and allocate
-        // nothing after, every growth charged before it happens and held
-        // for the whole pass.
-        let scratch_budget = coordinode_core::budget::QueryBudget::new(self.page_bytes);
-        let mut scratch = scratch_budget.empty_charge();
+        // nothing after. Their bytes count against every page they outlive,
+        // charged into each page's budget before the page takes anything,
+        // and every growth is charged before it happens.
+        let mut scratch_held = 0usize;
         let mut now: Vec<LabelId> = Vec::new();
         let mut then: Vec<LabelId> = Vec::new();
         loop {
@@ -174,23 +171,51 @@ impl Reconcile<'_> {
             let view = txn.snapshot().ok_or_else(|| {
                 StoreError::Invariant("a reconciliation page reads at no snapshot".into())
             })?;
-            let mut in_force = CatalogMembership::at(self.engine, view);
-            let mut candidate = CatalogMembership::candidates_at(self.engine, view);
-            // What the page reads and stages is charged to its own bytes,
-            // each write before it is buffered.
+            // One budget per page, of the configured bytes: the label scratch
+            // the pass still holds first, then what the page reads, keeps,
+            // decodes and stages, and the catalog facts it learns, each
+            // before the memory is taken.
             let page_budget =
                 std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(self.page_bytes));
             txn.charge_writes_to(Some(std::sync::Arc::clone(&page_budget)));
+            let charge = |bytes: usize| -> Result<(), coordinode_core::budget::BudgetStop> {
+                // Bytes of memory about to exist: fits in u64.
+                page_budget.reserve(bytes as u64)?.keep_until_query_ends();
+                Ok(())
+            };
             let mut staged = || -> Result<_, BackfillError> {
-                let page = nodes.prefix_scan_paged_tracked(
+                charge(scratch_held)?;
+                let mut in_force =
+                    CatalogMembership::at(self.engine, view).charged_to(&page_budget);
+                let mut candidate =
+                    CatalogMembership::candidates_at(self.engine, view).charged_to(&page_budget);
+                // The properties a B-tree index the page places reads: only
+                // they are decoded from a record.
+                let wanted = placing
+                    .iter()
+                    .filter(|p| p.def.index_type == IndexType::BTree)
+                    .map(|p| p.def.properties.len() + usize::from(p.def.filter.is_some()))
+                    .sum::<usize>();
+                charge(wanted * (core::mem::size_of::<&str>() + core::mem::size_of::<u32>()))?;
+                let mut names: Vec<&str> = Vec::with_capacity(wanted);
+                for Placing { def, .. } in &placing {
+                    if def.index_type != IndexType::BTree {
+                        continue;
+                    }
+                    names.extend(def.properties.iter().map(String::as_str));
+                    names.extend(def.filter.as_ref().map(|f| f.property()));
+                }
+                let mut fields: Vec<u32> = Vec::with_capacity(wanted);
+                fields.extend(names.iter().filter_map(|n| self.interner.lookup(n)));
+
+                let page = nodes.prefix_scan_paged_charged(
                     &mut txn,
                     &prefix,
                     start_after.as_deref(),
                     size,
+                    &page_budget,
                 )?;
-                page_budget
-                    .reserve(rows_bytes(&page.rows))?
-                    .keep_until_query_ends();
+                charge(page.rows.len() * core::mem::size_of::<Vec<u8>>())?;
                 let mut read = Vec::with_capacity(page.rows.len());
                 let mut page_placed = 0u64;
                 for (key, bytes) in &page.rows {
@@ -198,22 +223,28 @@ impl Reconcile<'_> {
                         continue;
                     };
                     let node = NodeId::from_raw(owner.node_id);
-                    let stored =
-                        NodeRecord::labels_from_msgpack(bytes).map_err(|e| StoreError::Decode {
-                            kind: "node labels",
-                            message: format!("node {}: {e}", node.as_raw()),
-                        })?;
+                    let decode = |e: rmp_serde::decode::Error| StoreError::Decode {
+                        kind: "node record",
+                        message: format!("node {}: {e}", node.as_raw()),
+                    };
+                    // The decoded labels live for this row only.
+                    let labels_len = NodeRecord::labels_len_from_msgpack(bytes).map_err(decode)?;
+                    let _labels_held = page_budget
+                        .reserve((labels_len * core::mem::size_of::<LabelId>()) as u64)?;
+                    let stored = NodeRecord::labels_from_msgpack(bytes).map_err(decode)?;
                     let carried_now = in_force.of_stored(&stored)?;
-                    reserve_labels(&mut now, carried_now.len(), &mut scratch)?;
-                    now.clear();
+                    reserve_labels(&mut now, carried_now.len(), &charge, &mut scratch_held)?;
                     now.extend(carried_now.iter());
                     let carried_then = candidate.of_stored(&stored)?;
-                    reserve_labels(&mut then, carried_then.len(), &mut scratch)?;
-                    then.clear();
+                    reserve_labels(&mut then, carried_then.len(), &charge, &mut scratch_held)?;
                     then.extend(carried_then.iter());
                     if now.len() == then.len() && now.iter().all(|l| then.contains(l)) {
                         continue;
                     }
+                    // The projected record, the values an entry clones from it
+                    // and the key it encodes them into live for this row
+                    // only: each is at most the projection's bound.
+                    let mut record_held = None;
                     let mut record = None;
                     for Placing { def, label } in &placing {
                         let carried = Carried {
@@ -242,13 +273,14 @@ impl Reconcile<'_> {
                             )?,
                             IndexType::BTree => {
                                 if record.is_none() {
-                                    record =
-                                        Some(NodeRecord::from_msgpack(bytes).map_err(|e| {
-                                            StoreError::Decode {
-                                                kind: "node record",
-                                                message: format!("node {}: {e}", node.as_raw()),
-                                            }
-                                        })?);
+                                    let bound =
+                                        NodeRecord::projection_bound(bytes, &fields, &names)
+                                            .map_err(decode)?;
+                                    record_held = Some(page_budget.reserve(3 * bound as u64)?);
+                                    record = Some(
+                                        NodeRecord::project_from_msgpack(bytes, &fields, &names)
+                                            .map_err(decode)?,
+                                    );
                                 }
                                 let Some(record) = record.as_ref() else {
                                     continue;
@@ -270,7 +302,10 @@ impl Reconcile<'_> {
                             _ => {}
                         }
                     }
+                    drop(record);
+                    drop(record_held);
                     page_placed += 1;
+                    charge(key.len())?;
                     read.push(key.clone());
                 }
                 Ok((read, page_placed, page.exhausted, page.last_key))

@@ -777,8 +777,6 @@ impl NodeRecord {
         fields: &[u32],
         names: &[&str],
     ) -> Result<Self, rmp_serde::decode::Error> {
-        use serde::Deserialize as _;
-
         let syntax = |what: &str, e: &dyn core::fmt::Display| {
             rmp_serde::decode::Error::Syntax(format!("record {what}: {e}"))
         };
@@ -805,8 +803,10 @@ impl NodeRecord {
             let field: u32 =
                 rmp::decode::read_int(&mut rest).map_err(|e| syntax("property id", &e))?;
             if fields.contains(&field) {
-                let mut value = rmp_serde::Deserializer::new(&mut rest);
-                props.insert(field, PropertyValue::deserialize(&mut value)?);
+                props.insert(
+                    field,
+                    take_value(&mut rest).map_err(|e| syntax("property", &e))??,
+                );
             } else {
                 skip_msgpack_value(&mut rest).map_err(|e| syntax("property", &e))?;
             }
@@ -821,8 +821,8 @@ impl NodeRecord {
                     .map_err(|e| syntax("extra property name", &e))?;
                 rest = tail;
                 if names.contains(&name) {
-                    let mut value = rmp_serde::Deserializer::new(&mut rest);
-                    let value = PropertyValue::deserialize(&mut value)?;
+                    let value =
+                        take_value(&mut rest).map_err(|e| syntax("extra property", &e))??;
                     extra
                         .get_or_insert_with(HashMap::new)
                         .insert(name.to_owned(), value);
@@ -839,10 +839,125 @@ impl NodeRecord {
     }
 }
 
+/// Heap bytes one entry of a decoded property map may take: its key and
+/// value four times over, a hash map holding at least four slots and
+/// growing to a little over twice what it holds, and its control bytes.
+const DECODED_ENTRY: usize =
+    4 * (core::mem::size_of::<PropertyValue>() + core::mem::size_of::<String>()) + 24;
+
+/// Heap bytes one node of a decoded nested map takes: a `BTreeMap` node
+/// holds room for eleven entries and twelve child edges, whatever it holds.
+const DECODED_MAP_NODE: usize = 11
+    * (core::mem::size_of::<PropertyValue>() + core::mem::size_of::<String>())
+    + 12 * core::mem::size_of::<usize>()
+    + 16;
+
+impl NodeRecord {
+    /// How many labels a stored record holds, read from its header without
+    /// decoding them: what decoding them with
+    /// [`Self::labels_from_msgpack`] allocates room for.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::labels_from_msgpack`].
+    pub fn labels_len_from_msgpack(data: &[u8]) -> Result<usize, rmp_serde::decode::Error> {
+        let syntax = |what: &str, e: &dyn core::fmt::Display| {
+            rmp_serde::decode::Error::Syntax(format!("record {what}: {e}"))
+        };
+        let mut rest = match data.first() {
+            Some(&crate::graph::doc_delta::PREFIX_NODE_RECORD) => &data[1..],
+            Some(&crate::graph::doc_delta::PREFIX_DOC_DELTA) => {
+                return Err(rmp_serde::decode::Error::Syntax(
+                    "cannot read labels from a DocDelta merge operand".to_string(),
+                ));
+            }
+            _ => data,
+        };
+        rmp::decode::read_array_len(&mut rest).map_err(|e| syntax("header", &e))?;
+        let len = rmp::decode::read_array_len(&mut rest).map_err(|e| syntax("labels", &e))?;
+        // At most u32::MAX: fits a usize on every target the engine runs on.
+        Ok(len as usize)
+    }
+
+    /// An upper bound of the heap bytes [`Self::project_from_msgpack`] takes
+    /// for the same arguments, read from markers and lengths alone: what a
+    /// reader holding to a memory budget reserves before decoding.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::project_from_msgpack`].
+    pub fn projection_bound(
+        data: &[u8],
+        fields: &[u32],
+        names: &[&str],
+    ) -> Result<usize, rmp_serde::decode::Error> {
+        let syntax = |what: &str, e: &dyn core::fmt::Display| {
+            rmp_serde::decode::Error::Syntax(format!("record {what}: {e}"))
+        };
+        let body = match data.first() {
+            Some(&crate::graph::doc_delta::PREFIX_NODE_RECORD) => &data[1..],
+            Some(&crate::graph::doc_delta::PREFIX_DOC_DELTA) => {
+                return Err(rmp_serde::decode::Error::Syntax(
+                    "cannot decode DocDelta merge operand as NodeRecord".to_string(),
+                ));
+            }
+            _ => data,
+        };
+        // Bounded by the record's length times a constant: no sum here can
+        // approach usize::MAX for bytes that fit in memory.
+        let mut bound = fields.len() * DECODED_ENTRY;
+        let mut rest = body;
+        let len = rmp::decode::read_array_len(&mut rest).map_err(|e| syntax("header", &e))?;
+        if len < 2 {
+            return Err(syntax("header", &format_args!("{len} elements")));
+        }
+        skip_msgpack_value(&mut rest).map_err(|e| syntax("labels", &e))?;
+        let count = rmp::decode::read_map_len(&mut rest).map_err(|e| syntax("properties", &e))?;
+        for _ in 0..count {
+            let field: u32 =
+                rmp::decode::read_int(&mut rest).map_err(|e| syntax("property id", &e))?;
+            let value = skip_msgpack_value(&mut rest).map_err(|e| syntax("property", &e))?;
+            if fields.contains(&field) {
+                bound += value;
+            }
+        }
+        if len > 2 && !names.is_empty() && rest.first() != Some(&0xc0) {
+            let count =
+                rmp::decode::read_map_len(&mut rest).map_err(|e| syntax("extra properties", &e))?;
+            for _ in 0..count {
+                let (name, tail) = rmp::decode::read_str_from_slice(rest)
+                    .map_err(|e| syntax("extra property name", &e))?;
+                rest = tail;
+                let value =
+                    skip_msgpack_value(&mut rest).map_err(|e| syntax("extra property", &e))?;
+                if names.contains(&name) {
+                    bound += name.len() + DECODED_ENTRY + value;
+                }
+            }
+        }
+        Ok(bound)
+    }
+}
+
+/// Decode the property value `rest` starts with and advance past it. The
+/// value's extent is found from its markers first and it is decoded from
+/// that slice in place, so a string or binary is copied once, into the
+/// value, never staged in a reader's buffer.
+fn take_value(rest: &mut &[u8]) -> Result<Result<PropertyValue, rmp_serde::decode::Error>, String> {
+    let start = *rest;
+    skip_msgpack_value(rest)?;
+    let value = &start[..start.len() - rest.len()];
+    Ok(rmp_serde::from_slice(value))
+}
+
 /// Advance `rest` past one MessagePack value, nested ones included, reading
 /// only markers and lengths: nothing is copied or allocated. Iterative, so a
-/// deeply nested value cannot exhaust the stack.
-fn skip_msgpack_value(rest: &mut &[u8]) -> Result<(), String> {
+/// deeply nested value cannot exhaust the stack. Returns an upper bound of
+/// the heap bytes the value takes decoded as a [`PropertyValue`]: twice a
+/// value's size for each element of a list (a list longer than its decoder
+/// preallocates for grows by doubling), the nodes of each map, and its
+/// string, binary and extension bytes.
+fn skip_msgpack_value(rest: &mut &[u8]) -> Result<usize, String> {
     use rmp::Marker;
 
     fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
@@ -861,6 +976,9 @@ fn skip_msgpack_value(rest: &mut &[u8]) -> Result<(), String> {
 
     // Values still to skip: one, plus the elements each container adds.
     let mut pending: u64 = 1;
+    // Each value adds at most a constant times the bytes it spans, so the
+    // sum stays below a constant times the input's length.
+    let mut bound = 0usize;
     while pending > 0 {
         pending -= 1;
         let marker = rmp::decode::read_marker(rest).map_err(|e| format!("{e:?}"))?;
@@ -895,11 +1013,30 @@ fn skip_msgpack_value(rest: &mut &[u8]) -> Result<(), String> {
             Marker::Reserved => return Err("reserved marker 0xc1".into()),
         };
         take(rest, bytes)?;
-        // A container declares at most 2 * u32::MAX values: the sum stays
-        // far below u64::MAX for any input that fits in memory.
+        bound += bytes;
+        if values > 0 {
+            // Every value takes at least one byte: a container declaring
+            // more than the bytes left is malformed, refused before its
+            // declared size counts for anything.
+            if values > rest.len() as u64 {
+                return Err(format!(
+                    "{values} values declared, {} bytes left",
+                    rest.len()
+                ));
+            }
+            // At most the bytes left, so each product below fits a usize.
+            let elements = values as usize;
+            bound += match marker {
+                Marker::FixMap(_) | Marker::Map16 | Marker::Map32 => {
+                    // A node at least half full past the first two.
+                    ((elements / 2).div_ceil(5) + 2) * DECODED_MAP_NODE
+                }
+                _ => 2 * elements * core::mem::size_of::<PropertyValue>(),
+            };
+        }
         pending += values;
     }
-    Ok(())
+    Ok(bound)
 }
 
 #[cfg(test)]

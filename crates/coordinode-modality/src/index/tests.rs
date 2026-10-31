@@ -395,6 +395,31 @@ fn one_of_several_owners_leaving_keeps_the_values_revision() {
     }
 }
 
+/// The key buffer a fold step rewrites into is charged exactly the growth
+/// of its capacity, before it grows, for keys longer, shorter and longer
+/// again than what it held: the bytes charged always equal the capacity.
+/// Room counted past the bytes the buffer still held would leave the
+/// capacity above what was charged.
+#[test]
+fn a_rewritten_key_buffer_is_charged_its_whole_growth() {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut charged = 0usize;
+    for len in [10, 20, 15, 30, 30, 5, 64] {
+        super::fit_buffer(&mut buffer, len, |more| {
+            charged += more;
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        buffer.extend(core::iter::repeat_n(b'k', len));
+        assert_eq!(buffer.len(), len);
+        assert_eq!(charged, buffer.capacity(), "after a key of {len} bytes");
+    }
+    // A refusal leaves the buffer as small as it was.
+    let before = buffer.capacity();
+    assert!(super::fit_buffer(&mut buffer, before + 1, |_| Err(())).is_err());
+    assert_eq!(buffer.capacity(), before);
+}
+
 /// A list indexes each element; a value with no key indexes nothing and a
 /// lookup of it reports that the index cannot answer.
 #[test]

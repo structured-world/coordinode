@@ -99,6 +99,9 @@ pub struct CatalogMembership<'a> {
     /// Whether a label's published candidate answers for it instead of the
     /// facts in force.
     candidates: bool,
+    /// Where what the pass learns of the catalog is charged before it is
+    /// kept, when it holds to a memory budget.
+    budget: Option<&'a coordinode_core::budget::QueryBudget>,
 }
 
 impl<'a> CatalogMembership<'a> {
@@ -136,7 +139,28 @@ impl<'a> CatalogMembership<'a> {
             implied: ImpliedCache::default(),
             ids: rustc_hash::FxHashMap::default(),
             candidates: false,
+            budget: None,
         }
+    }
+
+    /// The same membership, charging `budget` for every catalog fact it
+    /// keeps before keeping it, for as long as the budget lives: the names
+    /// it binds, the implications it reads and the closures it compiles.
+    /// A fact that does not fit fails the read with the budget's refusal.
+    pub fn charged_to(self, budget: &'a coordinode_core::budget::QueryBudget) -> Self {
+        Self {
+            budget: Some(budget),
+            ..self
+        }
+    }
+
+    /// Charge `bytes` about to be kept to the budget, when there is one.
+    fn charge(&self, bytes: usize) -> Result<(), StoreError> {
+        if let Some(budget) = self.budget {
+            // Bytes of memory about to exist: fits in u64.
+            budget.reserve(bytes as u64)?.keep_until_query_ends();
+        }
+        Ok(())
     }
 
     /// [`Self::candidates`] as `snapshot` reads the catalog: with
@@ -165,6 +189,8 @@ impl<'a> CatalogMembership<'a> {
             return Ok(*id);
         }
         let id = LocalSchemaStore::new(self.engine).label_id_at(self.view(), name)?;
+        // The name, and its entry with room for the map to double.
+        self.charge(name.len() + 2 * core::mem::size_of::<(String, Option<LabelId>)>())?;
         self.ids.insert(name.to_string(), id);
         Ok(id)
     }
@@ -194,6 +220,9 @@ impl<'a> CatalogMembership<'a> {
         {
             schema = candidate;
         }
+        // The implications kept for the walk, and the label's slot in the
+        // closure it builds, with room for that to double.
+        self.charge((schema.implies().len() + 2) * core::mem::size_of::<LabelId>())?;
         let mut implies = Vec::with_capacity(schema.implies().len());
         for implied in schema.implies() {
             let Some(implied_id) = self.label_id(implied)? else {
@@ -229,6 +258,16 @@ impl<'a> CatalogMembership<'a> {
         stored: &'r [LabelId],
     ) -> Result<Membership<'r>, StoreError> {
         if let Some(&primary) = stored.first() {
+            if self.implied.implied(primary).is_none() {
+                // The compiled type's entry, with room for the map to double;
+                // its labels are charged as the walk reads them.
+                self.charge(
+                    2 * core::mem::size_of::<(
+                        LabelId,
+                        coordinode_core::schema::labels::ImpliedLabels,
+                    )>(),
+                )?;
+            }
             let mut implied = core::mem::take(&mut self.implied);
             let compiled = implied.compile(primary, |id| self.facts(id));
             self.implied = implied;

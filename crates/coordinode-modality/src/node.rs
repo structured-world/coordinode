@@ -210,6 +210,22 @@ pub trait NodeStore {
     /// A storage failure.
     fn condition_unchanged(&self, txn: &mut Transaction, keys: &[Vec<u8>]) -> StoreResult<bool>;
 
+    /// [`Self::prefix_scan_paged_tracked`] holding the page within
+    /// `budget`, every row and every growth of the page charged before it
+    /// is copied.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or the budget's refusal.
+    fn prefix_scan_paged_charged(
+        &self,
+        txn: &mut Transaction,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        budget: &coordinode_core::budget::QueryBudget,
+    ) -> StoreResult<PagedScan>;
+
     /// Read the temporal version of a node valid at `at_ms`: returns
     /// the version whose `valid_from <= at_ms` is largest. Returns
     /// `None` if the node has no version at-or-before that instant.
@@ -788,6 +804,17 @@ impl NodeStore for LocalNodeStore {
         limit: usize,
     ) -> StoreResult<PagedScan> {
         Ok(txn.prefix_scan_paged(Partition::Node, prefix, start_after, limit)?)
+    }
+
+    fn prefix_scan_paged_charged(
+        &self,
+        txn: &mut Transaction,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        budget: &coordinode_core::budget::QueryBudget,
+    ) -> StoreResult<PagedScan> {
+        Ok(txn.prefix_scan_paged_charged(Partition::Node, prefix, start_after, limit, budget)?)
     }
 
     fn condition_unchanged(&self, txn: &mut Transaction, keys: &[Vec<u8>]) -> StoreResult<bool> {

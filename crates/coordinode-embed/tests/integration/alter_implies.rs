@@ -609,7 +609,7 @@ fn a_vector_index_drops_what_a_refused_change_kept() {
 fn an_implication_change_keeps_within_its_page_bytes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
-    let bytes = 16 * 1024;
+    let bytes = 64 * 1024;
     db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
         reconcile_page: 512,
         fold_page: 512,
@@ -646,7 +646,9 @@ fn an_implication_change_keeps_within_its_page_bytes() {
         .expect("dropped again");
     await_folded(&db);
 
-    let huge = "y".repeat(2 * bytes as usize);
+    // Within the length a key may take, past what one page may hold once
+    // read, decoded and staged.
+    let huge = "y".repeat(40_000);
     db.execute_cypher(&format!("CREATE (:Task {{title: '{huge}'}})"))
         .expect("a task whose title alone does not fit a page");
     let err = refused(&mut db, "ALTER NODE TYPE Task SET IMPLIES (Thing)");
@@ -659,13 +661,53 @@ fn an_implication_change_keeps_within_its_page_bytes() {
     );
 
     db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
-        maintenance_page_bytes: 16 * bytes,
+        maintenance_page_bytes: 64 * bytes,
         ..db.index_build_config()
     });
     db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
         .expect("with room for the title, the same change goes through");
     await_folded(&db);
     assert_eq!(count(&mut db, "MATCH (n:Thing) RETURN n"), 61);
+}
+
+/// What a placement learns of the catalog and the label lists it reuses
+/// from node to node count against the same bytes as the rows it reads and
+/// the postings it stages. A type implying six hundred labels takes far more
+/// than 48 KiB in label names and closures under both interpretations,
+/// though its one node and that node's postings would fit: the change is
+/// refused, leaving nothing, and goes through once the pages hold 4 MiB.
+#[test]
+fn an_implication_change_counts_its_catalog_in_the_page_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("CREATE NODE TYPE Task WITH (title: STRING)")
+        .expect("task type");
+    let labels: Vec<String> = (0..600).map(|n| format!("Wide{n:03}")).collect();
+    for label in &labels {
+        db.execute_cypher(&format!("CREATE NODE TYPE {label} WITH (title: STRING)"))
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+    }
+    db.execute_cypher("CREATE (:Task {title: 't'})")
+        .expect("task");
+    let change = format!("ALTER NODE TYPE Task SET IMPLIES ({})", labels.join(", "));
+
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        maintenance_page_bytes: 48 * 1024,
+        ..db.index_build_config()
+    });
+    let err = refused(&mut db, &change);
+    assert!(err.contains("memory") || err.contains("page"), "{err}");
+    await_folded(&db);
+    assert_eq!(count(&mut db, "MATCH (n:Wide000) RETURN n"), 0);
+
+    db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        maintenance_page_bytes: 4 << 20,
+        ..db.index_build_config()
+    });
+    db.execute_cypher(&change)
+        .expect("with room for the catalog, the same change goes through");
+    await_folded(&db);
+    assert_eq!(count(&mut db, "MATCH (n:Wide599) RETURN n"), 1);
 }
 
 /// One schema package moving a value's holder out of a label and another

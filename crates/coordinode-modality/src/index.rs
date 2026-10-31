@@ -1043,6 +1043,23 @@ impl<'a> LocalIndexStore<'a> {
     }
 }
 
+/// Empty `buffer` and make room in it for `len` bytes, passing `charge`
+/// exactly the bytes its capacity is about to grow by, before it grows: the
+/// buffer is emptied first, so the room asked for is `len` itself and not
+/// `len` past what it held.
+fn fit_buffer<E>(
+    buffer: &mut Vec<u8>,
+    len: usize,
+    charge: impl FnOnce(usize) -> Result<(), E>,
+) -> Result<(), E> {
+    buffer.clear();
+    if let Some(more) = len.checked_sub(buffer.capacity()).filter(|m| *m > 0) {
+        charge(more)?;
+        buffer.reserve_exact(len);
+    }
+    Ok(())
+}
+
 /// Advance the ownership revision of every value of the unique `index` an
 /// owner moving from `old` to `new` takes or leaves. The owners of one value
 /// write different entry keys; this key is the one two transactions changing
@@ -1414,11 +1431,7 @@ impl IndexStore for LocalIndexStore<'_> {
                 txn.delete(Partition::Idx, &key)?;
                 // The rewritten key's buffer grows only to the longest key,
                 // each growth charged before it happens.
-                if let Some(more) = key.len().checked_sub(target.capacity()).filter(|m| *m > 0) {
-                    txn.charge_scratch(more)?;
-                    target.reserve_exact(key.len());
-                }
-                target.clear();
+                fit_buffer(&mut target, key.len(), |more| txn.charge_scratch(more))?;
                 target.extend_from_slice(&key);
                 // The shape tag, then the generation: the rest names the same
                 // entry.
