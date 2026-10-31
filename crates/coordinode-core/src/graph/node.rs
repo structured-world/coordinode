@@ -581,55 +581,112 @@ pub fn decode_node_history_key(key: &[u8]) -> Option<AssertionId> {
     })
 }
 
-/// What one assertion states of its version: the version's whole state as
-/// the commit left it (its valid end among its properties), or that the
-/// commit removed the version.
-#[derive(Debug, Clone, PartialEq)]
-pub enum NodeAssertion {
-    /// The version's whole state, MessagePack-encoded as a node record.
-    State(Vec<u8>),
+/// What a temporal version states of its valid time besides its start: where
+/// it ends, exclusive (`None`: it holds for good), and whether it is a
+/// deletion rather than a positive state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VersionBounds {
+    /// The exclusive valid end; `None` for an unbounded one.
+    pub valid_to: Option<i64>,
+    /// The version states that the node was deleted.
+    pub deleted: bool,
+}
+
+impl VersionBounds {
+    /// The bounds `record` carries in its properties `valid_to` and
+    /// `deleted`, given by field id (`None`: no record carries that name).
+    /// A valid end is an integer or timestamp; any other value is no end.
+    pub fn of(record: &NodeRecord, valid_to: Option<u32>, deleted: Option<u32>) -> Self {
+        Self {
+            valid_to: valid_to
+                .and_then(|id| record.props.get(&id))
+                .and_then(|value| match value {
+                    PropertyValue::Int(t) | PropertyValue::Timestamp(t) => Some(*t),
+                    _ => None,
+                }),
+            deleted: deleted
+                .and_then(|id| record.props.get(&id))
+                .is_some_and(|value| matches!(value, PropertyValue::Bool(true))),
+        }
+    }
+}
+
+/// What one assertion states of its version: its whole state as the commit
+/// left it, with the valid time it holds over, or that the commit removed the
+/// version.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NodeAssertion<'a> {
+    /// The version's whole state.
+    State {
+        /// Its valid end and whether it is a deletion, stated by the
+        /// assertion itself rather than read through a field dictionary.
+        bounds: VersionBounds,
+        /// The state, MessagePack-encoded as a node record.
+        record: &'a [u8],
+    },
     /// The version was removed.
     Removed,
 }
 
 /// Tag of [`NodeAssertion::Removed`] in its encoding.
 const ASSERTION_REMOVED: u8 = 0;
-/// Tag of [`NodeAssertion::State`] in its encoding, followed by the record.
+/// Tag of [`NodeAssertion::State`] in its encoding, followed by its flags,
+/// the valid end when one is flagged, and the record.
 const ASSERTION_STATE: u8 = 1;
+/// Flag: the version is a deletion.
+const STATE_DELETED: u8 = 1;
+/// Flag: a valid end follows, as a big-endian `i64`.
+const STATE_ENDS: u8 = 1 << 1;
 
-impl NodeAssertion {
-    /// The assertion as stored: a tag byte, then the record for a state.
+impl<'a> NodeAssertion<'a> {
+    /// The assertion as stored.
     pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Self::Removed => vec![ASSERTION_REMOVED],
-            Self::State(record) => {
-                let mut out = Vec::with_capacity(1 + record.len());
-                out.push(ASSERTION_STATE);
-                out.extend_from_slice(record);
-                out
-            }
+        let Self::State { bounds, record } = self else {
+            return vec![ASSERTION_REMOVED];
+        };
+        let mut flags = 0;
+        if bounds.deleted {
+            flags |= STATE_DELETED;
         }
-    }
-
-    /// [`Self::encode`] for a state, from its record's encoding, without
-    /// building the assertion first.
-    pub fn encode_state(record: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + record.len());
+        if bounds.valid_to.is_some() {
+            flags |= STATE_ENDS;
+        }
+        let mut out = Vec::with_capacity(2 + size_of::<i64>() + record.len());
         out.push(ASSERTION_STATE);
+        out.push(flags);
+        if let Some(end) = bounds.valid_to {
+            out.extend_from_slice(&end.to_be_bytes());
+        }
         out.extend_from_slice(record);
         out
     }
 
-    /// The record an encoded assertion states, borrowed; `Ok(None)` for a
-    /// removal.
+    /// An encoded assertion, its record borrowed from `bytes`.
     ///
     /// # Errors
     ///
-    /// The bytes are not an encoded assertion.
-    pub fn state_of(bytes: &[u8]) -> Result<Option<&[u8]>, UnknownAssertion> {
-        match bytes.split_first() {
-            Some((&ASSERTION_STATE, record)) => Ok(Some(record)),
-            Some((&ASSERTION_REMOVED, [])) => Ok(None),
+    /// The bytes are not an encoded assertion: an unknown tag or flag, a
+    /// removal with trailing bytes, or a state cut short.
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, UnknownAssertion> {
+        match bytes {
+            [ASSERTION_REMOVED] => Ok(Self::Removed),
+            [ASSERTION_STATE, flags, rest @ ..] if flags & !(STATE_DELETED | STATE_ENDS) == 0 => {
+                let (valid_to, record) = if flags & STATE_ENDS == 0 {
+                    (None, rest)
+                } else {
+                    let (end, record) = rest
+                        .split_first_chunk::<{ size_of::<i64>() }>()
+                        .ok_or(UnknownAssertion)?;
+                    (Some(i64::from_be_bytes(*end)), record)
+                };
+                Ok(Self::State {
+                    bounds: VersionBounds {
+                        valid_to,
+                        deleted: flags & STATE_DELETED != 0,
+                    },
+                    record,
+                })
+            }
             _ => Err(UnknownAssertion),
         }
     }

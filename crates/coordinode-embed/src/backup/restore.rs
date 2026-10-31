@@ -1283,14 +1283,25 @@ fn write_node(
     let mut record = NodeRecord::with_labels(ids);
     let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
     let ids = field_ids(target.fields, &names)?;
-    for ((_, value), field_id) in props.into_iter().zip(ids) {
+    // The field ids of the version's valid end and deletion mark, by the
+    // names a version stores them under, among those just registered.
+    let id_of = |name: &str| {
+        names
+            .iter()
+            .zip(&ids)
+            .find_map(|(n, id)| (*n == name).then_some(*id))
+    };
+    let (valid_to, deleted) = (id_of("valid_to"), id_of("__deleted__"));
+    for ((_, value), field_id) in props.into_iter().zip(ids.iter().copied()) {
         record.set(field_id, value);
     }
     let node_id = NodeId::from_raw(id);
     match valid_from {
         None => LocalNodeStore.put(txn, shard_id, node_id, &record),
         Some(valid_from) => {
-            LocalNodeStore.put_temporal(txn, shard_id, node_id, valid_from, &record)
+            let bounds =
+                coordinode_core::graph::node::VersionBounds::of(&record, valid_to, deleted);
+            LocalNodeStore.put_temporal(txn, shard_id, node_id, valid_from, &record, bounds)
         }
     }
     .map_err(|e| RestoreError::Storage(e.to_string()))

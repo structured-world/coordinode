@@ -10,8 +10,7 @@
 
 use std::borrow::Borrow;
 
-use coordinode_core::graph::node::NodeRecord;
-use coordinode_core::graph::types::Value;
+use coordinode_core::graph::node::{NodeRecord, VersionBounds};
 
 /// What a node's timeline holds at one instant; `R` is the record, owned or
 /// borrowed from the versions read.
@@ -92,14 +91,8 @@ pub(crate) fn state_span<R: Borrow<NodeRecord>>(
             until: next,
         };
     };
-    let props = &record.borrow().props;
-    let valid_to = fields
-        .valid_to
-        .and_then(|id| props.get(&id))
-        .and_then(|value| match value {
-            Value::Int(t) | Value::Timestamp(t) => Some(*t),
-            _ => None,
-        });
+    let VersionBounds { valid_to, deleted } =
+        VersionBounds::of(record.borrow(), fields.valid_to, fields.deleted);
     if let Some(ended) = valid_to.filter(|valid_to| *valid_to <= at) {
         return StateSpan {
             state: StateAt::Absent,
@@ -111,10 +104,6 @@ pub(crate) fn state_span<R: Borrow<NodeRecord>>(
         (Some(end), Some(next)) => Some(end.min(next)),
         (end, next) => end.or(next),
     };
-    let deleted = fields
-        .deleted
-        .and_then(|id| props.get(&id))
-        .is_some_and(|value| matches!(value, Value::Bool(true)));
     let state = if deleted {
         StateAt::Deleted
     } else {

@@ -95,6 +95,7 @@ proptest! {
                         id,
                         vf,
                         &NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID),
+                        Default::default(),
                     )
                     .unwrap();
             }

@@ -29,7 +29,7 @@
 //! [`NodeStore::get_at`] so callers don't reimplement the seek-and-pick.
 
 use coordinode_core::graph::node::{
-    NodeAssertion, NodeId, NodeRecord, decode_node_key, decode_temporal_node_key,
+    NodeAssertion, NodeId, NodeRecord, VersionBounds, decode_node_key, decode_temporal_node_key,
     encode_node_history_prefix, encode_node_key, encode_temporal_node_key, temporal_node_id_prefix,
 };
 use coordinode_core::index::derive::EntryOwner;
@@ -240,6 +240,8 @@ pub trait NodeStore {
     /// Write a per-version temporal node record. Each `valid_from`
     /// gets its own key — versions accumulate, prior versions remain
     /// readable through [`Self::get_at`] and [`Self::scan_versions`].
+    /// `bounds` is the valid time `record` states besides its start, which
+    /// the node's history keeps with the state.
     fn put_temporal(
         &self,
         txn: &mut Transaction,
@@ -247,6 +249,7 @@ pub trait NodeStore {
         node_id: NodeId,
         valid_from_ms: i64,
         record: &NodeRecord,
+        bounds: VersionBounds,
     ) -> StoreResult<()>;
 
     /// All temporal versions of one node, in valid_from order.
@@ -495,6 +498,90 @@ impl LocalNodeStore {
             kind: "node record",
             message: format!("encode: {e}"),
         })
+    }
+
+    /// The versions of temporal node `node_id` as the database knew them at
+    /// system time `known_at`: for every valid start, the state the last
+    /// assertion committed at or before `known_at` states, unless that
+    /// assertion removed the version, handed to `visit` in valid start order
+    /// with the version's bounds and encoded record.
+    ///
+    /// Read from the node's history at the newest view, never from an older
+    /// one, so the answer holds however long ago `known_at` is: a version
+    /// written or corrected later is passed over, not mistaken for what was
+    /// known. Each assertion read counts one unit of `budget`'s work; the
+    /// latest one of the version being read is held, and charged, until the
+    /// next version starts. `visit` keeps, and pays for, what it retains.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, the budget's refusal, an assertion that does not
+    /// decode, or the first error of `visit`.
+    pub fn versions_known_at<E>(
+        engine: &StorageEngine,
+        shard_id: u16,
+        node_id: NodeId,
+        known_at: coordinode_core::txn::timestamp::Timestamp,
+        budget: &coordinode_core::budget::QueryBudget,
+        mut visit: impl FnMut(i64, VersionBounds, &[u8]) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<coordinode_storage::error::StorageError>
+            + From<coordinode_core::budget::BudgetStop>
+            + From<StoreError>,
+    {
+        let undecodable = |message: &str| StoreError::Decode {
+            kind: "node history",
+            message: message.to_owned(),
+        };
+        // The last assertion known at `known_at` of the version being read:
+        // its valid start and encoded assertion.
+        let mut latest: Option<i64> = None;
+        let mut held_assertion: Vec<u8> = Vec::new();
+        let mut held = budget.empty_charge();
+        let mut flush = |valid_from: i64, assertion: &[u8]| -> Result<(), E> {
+            match NodeAssertion::decode(assertion).map_err(|e| undecodable(&e.to_string()))? {
+                NodeAssertion::State { bounds, record } => visit(valid_from, bounds, record),
+                NodeAssertion::Removed => Ok(()),
+            }
+        };
+        let view = engine.snapshot();
+        let prefix = coordinode_core::graph::node::node_history_id_prefix(shard_id, node_id);
+        for guard in engine.snapshot_prefix_iter(&view, Partition::NodeHistory, &prefix)? {
+            budget.work(1)?;
+            let (key, value) = guard
+                .into_inner()
+                .map_err(coordinode_storage::error::StorageError::from)?;
+            let assertion = coordinode_core::graph::node::decode_node_history_key(&key)
+                .filter(|a| a.shard_id == shard_id && a.node_id == node_id)
+                .ok_or_else(|| {
+                    undecodable("a key under a node's history names no assertion of it")
+                })?;
+            // The previous version ends where another starts: what was known
+            // of it is settled.
+            if let Some(valid_from) = latest.take_if(|vf| *vf != assertion.valid_from) {
+                flush(valid_from, &held_assertion)?;
+            }
+            // Assertions of one version come in commit order: those committed
+            // after `known_at` were not known then, and neither is any later.
+            if assertion.commit > known_at.as_raw() {
+                continue;
+            }
+            // The buffer only grows: a smaller assertion reuses what it holds.
+            if let Some(grown) = value.len().checked_sub(held_assertion.capacity())
+                && grown > 0
+            {
+                held.grow(grown as u64)?;
+                held_assertion.reserve_exact(value.len() - held_assertion.len());
+            }
+            held_assertion.clear();
+            held_assertion.extend_from_slice(&value);
+            latest = Some(assertion.valid_from);
+        }
+        match latest {
+            Some(valid_from) => flush(valid_from, &held_assertion),
+            None => Ok(()),
+        }
     }
 
     /// Every stored row of shard `shard_id` at `snapshot`, in key order: its
@@ -875,18 +962,23 @@ impl NodeStore for LocalNodeStore {
         node_id: NodeId,
         valid_from_ms: i64,
         record: &NodeRecord,
+        bounds: VersionBounds,
     ) -> StoreResult<()> {
         let key = encode_temporal_node_key(shard_id, node_id, valid_from_ms);
         let body = Self::encode_record(record)?;
-        txn.put(Partition::Node, &key, &body)?;
         // The canonical history keeps the version's whole state as this
         // commit leaves it, under the commit: a later commit stating the same
         // version adds its own assertion beside this one.
         txn.put_stamped(
             Partition::NodeHistory,
             &encode_node_history_prefix(shard_id, node_id, valid_from_ms),
-            &NodeAssertion::encode_state(&body),
+            &NodeAssertion::State {
+                bounds,
+                record: &body,
+            }
+            .encode(),
         )?;
+        txn.put(Partition::Node, &key, &body)?;
         Ok(())
     }
 

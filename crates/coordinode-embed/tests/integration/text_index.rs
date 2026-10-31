@@ -48,7 +48,17 @@ fn seed_version(
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let mut txn = Transaction::begin(db.engine(), Some(&oracle), oracle.next());
     LocalNodeStore
-        .put_temporal(&mut txn, 1, NodeId::from_raw(id), valid_from, &record)
+        .put_temporal(
+            &mut txn,
+            1,
+            NodeId::from_raw(id),
+            valid_from,
+            &record,
+            coordinode_core::graph::node::VersionBounds {
+                valid_to,
+                deleted: false,
+            },
+        )
         .expect("put version");
     let wc = WriteConcern::majority();
     txn.commit(&CommitContext {

@@ -344,9 +344,12 @@ fn temporal_versions_round_trip() {
     let db = open();
     let id = NodeId::from_raw(11);
     db.write(|s, t| {
-        s.put_temporal(t, 0, id, 100, &rec("V1")).expect("put v1");
-        s.put_temporal(t, 0, id, 200, &rec("V2")).expect("put v2");
-        s.put_temporal(t, 0, id, 300, &rec("V3")).expect("put v3");
+        s.put_temporal(t, 0, id, 100, &rec("V1"), open_ended())
+            .expect("put v1");
+        s.put_temporal(t, 0, id, 200, &rec("V2"), open_ended())
+            .expect("put v2");
+        s.put_temporal(t, 0, id, 300, &rec("V3"), open_ended())
+            .expect("put v3");
     });
     let versions = LocalNodeStore
         .scan_versions(&db.read(), 0, id)
@@ -371,9 +374,12 @@ fn get_at_returns_largest_valid_from_le_query() {
     let db = open();
     let id = NodeId::from_raw(11);
     db.write(|s, t| {
-        s.put_temporal(t, 0, id, 100, &rec("V1")).expect("v1");
-        s.put_temporal(t, 0, id, 200, &rec("V2")).expect("v2");
-        s.put_temporal(t, 0, id, 300, &rec("V3")).expect("v3");
+        s.put_temporal(t, 0, id, 100, &rec("V1"), open_ended())
+            .expect("v1");
+        s.put_temporal(t, 0, id, 200, &rec("V2"), open_ended())
+            .expect("v2");
+        s.put_temporal(t, 0, id, 300, &rec("V3"), open_ended())
+            .expect("v3");
     });
     let store = LocalNodeStore;
     let r = db.read();
@@ -421,8 +427,10 @@ fn get_at_isolated_per_node_id() {
     let a = NodeId::from_raw(1);
     let b = NodeId::from_raw(2);
     db.write(|s, t| {
-        s.put_temporal(t, 0, a, 50, &rec("A50")).expect("a");
-        s.put_temporal(t, 0, b, 70, &rec("B70")).expect("b");
+        s.put_temporal(t, 0, a, 50, &rec("A50"), open_ended())
+            .expect("a");
+        s.put_temporal(t, 0, b, 70, &rec("B70"), open_ended())
+            .expect("b");
     });
     let store = LocalNodeStore;
     let r = db.read();
@@ -455,8 +463,10 @@ fn put_temporal_same_valid_from_overwrites_body() {
     let mut rec_v2 = rec("A");
     rec_v2.set_extra("v", coordinode_core::graph::types::Value::Int(2));
     db.write(|s, t| {
-        s.put_temporal(t, 0, id, 1000, &rec_v1).expect("v1");
-        s.put_temporal(t, 0, id, 1000, &rec_v2).expect("v2");
+        s.put_temporal(t, 0, id, 1000, &rec_v1, open_ended())
+            .expect("v1");
+        s.put_temporal(t, 0, id, 1000, &rec_v2, open_ended())
+            .expect("v2");
     });
     let versions = LocalNodeStore
         .scan_versions(&db.read(), 0, id)
@@ -467,6 +477,11 @@ fn put_temporal_same_valid_from_overwrites_body() {
         versions[0].1.get_extra("v"),
         Some(&coordinode_core::graph::types::Value::Int(2)),
     );
+}
+
+/// The bounds of a version that holds for good.
+fn open_ended() -> VersionBounds {
+    VersionBounds::default()
 }
 
 /// Every assertion the canonical history holds of `id`, in valid start then
@@ -481,12 +496,183 @@ fn assertions_of(db: &TestDb, id: NodeId) -> Vec<(AssertionId, Option<NodeRecord
         .map(|guard| {
             let (key, value) = guard.into_inner().expect("row");
             let assertion = decode_node_history_key(&key).expect("an assertion key");
-            let state = NodeAssertion::state_of(&value)
-                .expect("an assertion")
-                .map(|record| NodeRecord::from_msgpack(record).expect("a record"));
+            let state = match NodeAssertion::decode(&value).expect("an assertion") {
+                NodeAssertion::State { record, .. } => {
+                    Some(NodeRecord::from_msgpack(record).expect("a record"))
+                }
+                NodeAssertion::Removed => None,
+            };
             (assertion, state)
         })
         .collect()
+}
+
+/// The versions of node `id` known at `known_at`, read from its history:
+/// valid start, bounds and the label marking the state.
+fn known_at(
+    db: &TestDb,
+    id: NodeId,
+    known_at: u64,
+) -> Vec<(
+    i64,
+    VersionBounds,
+    Option<coordinode_core::schema::label_id::LabelId>,
+)> {
+    let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
+    let mut out = Vec::new();
+    LocalNodeStore::versions_known_at::<StoreError>(
+        &db.engine,
+        0,
+        id,
+        Timestamp::from_raw(known_at),
+        &budget,
+        |valid_from, bounds, record| {
+            let record = NodeRecord::from_msgpack(record).expect("a record");
+            out.push((valid_from, bounds, record.primary_label()));
+            Ok(())
+        },
+    )
+    .expect("history read");
+    out
+}
+
+/// The timestamp the last commit through `db` committed at: the oracle's
+/// latest grant, which the commit took.
+fn last_commit(db: &TestDb) -> u64 {
+    db.oracle.current().as_raw()
+}
+
+/// The history answers what was known at each system time, from the
+/// assertions alone: a version appears from the commit that stated it, a
+/// correction with the same valid start replaces what was known only from its
+/// own commit on, a removal hides the version from then on, and the bounds an
+/// assertion states come back with it. Nothing at a later commit changes what
+/// an earlier system time knew.
+#[test]
+fn versions_known_at_answer_each_system_time() {
+    let db = open();
+    let id = NodeId::from_raw(43);
+    let ended = VersionBounds {
+        valid_to: Some(5000),
+        deleted: false,
+    };
+    db.write(|s, t| {
+        s.put_temporal(t, 0, id, 1000, &rec("a"), ended)
+            .expect("v1");
+        s.put_temporal(t, 0, id, 5000, &rec("b"), open_ended())
+            .expect("v2");
+    });
+    let first = last_commit(&db);
+    db.write(|s, t| {
+        s.put_temporal(t, 0, id, 1000, &rec("a2"), ended)
+            .expect("correction");
+    });
+    let corrected = last_commit(&db);
+    db.write(|s, t| s.delete_temporal(t, 0, id, 5000).expect("removal"));
+    let removed = last_commit(&db);
+    assert!(first < corrected && corrected < removed);
+
+    assert!(known_at(&db, id, first - 1).is_empty(), "before any commit");
+    assert_eq!(
+        known_at(&db, id, first),
+        [
+            (1000, ended, Some(mark("a"))),
+            (5000, open_ended(), Some(mark("b")))
+        ]
+    );
+    assert_eq!(
+        known_at(&db, id, corrected - 1),
+        known_at(&db, id, first),
+        "a correction is not known before its commit"
+    );
+    assert_eq!(
+        known_at(&db, id, corrected),
+        [
+            (1000, ended, Some(mark("a2"))),
+            (5000, open_ended(), Some(mark("b")))
+        ]
+    );
+    assert_eq!(
+        known_at(&db, id, removed),
+        [(1000, ended, Some(mark("a2")))],
+        "the removal hides the version from its commit on"
+    );
+    assert_eq!(known_at(&db, id, u64::MAX), known_at(&db, id, removed));
+}
+
+/// The history keeps what a version stated after the current row is
+/// rewritten and every older row version is collected: a system time before
+/// the rewrite still reads the state then known.
+#[test]
+fn versions_known_at_survive_collection_of_older_row_versions() {
+    let db = open();
+    let id = NodeId::from_raw(44);
+    db.write(|s, t| {
+        s.put_temporal(t, 0, id, 1000, &rec("old"), open_ended())
+            .expect("v1");
+    });
+    let before = last_commit(&db);
+    // The storage view that still holds the row as `before` knew it.
+    let row_view = db.engine.snapshot();
+    db.write(|s, t| {
+        s.put_temporal(t, 0, id, 1000, &rec("new"), open_ended())
+            .expect("rewrite");
+    });
+    // Every row version below now is collectable, and is collected.
+    db.engine.set_gc_watermark(db.engine.snapshot());
+    db.engine.persist().expect("persist");
+    db.engine
+        .force_compaction(Partition::Node)
+        .expect("compact node rows");
+    db.engine
+        .force_compaction(Partition::NodeHistory)
+        .expect("compact history");
+    assert!(
+        matches!(
+            db.engine.snapshot_get(
+                &row_view,
+                Partition::Node,
+                &encode_temporal_node_key(0, id, 1000)
+            ),
+            Err(coordinode_storage::error::StorageError::SnapshotOutsideRetention { .. })
+        ),
+        "the row version known at `before` is out of the node rows' reach"
+    );
+    assert_eq!(
+        known_at(&db, id, before),
+        [(1000, open_ended(), Some(mark("old")))]
+    );
+}
+
+/// An assertion that does not decode is refused, not read as no state.
+#[test]
+fn versions_known_at_refuse_an_undecodable_assertion() {
+    let db = open();
+    let id = NodeId::from_raw(45);
+    let mut key = coordinode_core::graph::node::encode_node_history_prefix(0, id, 1000);
+    key.extend_from_slice(&7u64.to_be_bytes());
+    db.engine
+        .put(Partition::NodeHistory, &key, &[9])
+        .expect("put");
+    let budget = coordinode_core::budget::QueryBudget::new(u64::MAX);
+    let read = LocalNodeStore::versions_known_at::<StoreError>(
+        &db.engine,
+        0,
+        id,
+        Timestamp::from_raw(u64::MAX),
+        &budget,
+        |_, _, _| Ok(()),
+    );
+    assert!(
+        matches!(
+            read,
+            Err(StoreError::Decode {
+                kind: "node history",
+                ..
+            })
+        ),
+        "{read:?}"
+    );
 }
 
 /// Each commit writing a version of a temporal node leaves its own
@@ -499,13 +685,15 @@ fn each_commit_writing_a_version_asserts_it() {
     let db = open();
     let id = NodeId::from_raw(41);
     db.write(|s, t| {
-        s.put_temporal(t, 0, id, 1000, &rec("first")).expect("v1");
-        s.put_temporal(t, 0, id, 1000, &rec("second"))
+        s.put_temporal(t, 0, id, 1000, &rec("first"), open_ended())
+            .expect("v1");
+        s.put_temporal(t, 0, id, 1000, &rec("second"), open_ended())
             .expect("v1 again");
-        s.put_temporal(t, 0, id, 2000, &rec("later")).expect("v2");
+        s.put_temporal(t, 0, id, 2000, &rec("later"), open_ended())
+            .expect("v2");
     });
     db.write(|s, t| {
-        s.put_temporal(t, 0, id, 1000, &rec("corrected"))
+        s.put_temporal(t, 0, id, 1000, &rec("corrected"), open_ended())
             .expect("correction");
     });
 
@@ -537,7 +725,8 @@ fn removing_a_version_asserts_its_removal() {
     let db = open();
     let id = NodeId::from_raw(42);
     db.write(|s, t| {
-        s.put_temporal(t, 0, id, 1000, &rec("kept")).expect("put");
+        s.put_temporal(t, 0, id, 1000, &rec("kept"), open_ended())
+            .expect("put");
     });
     db.write(|s, t| {
         s.delete_temporal(t, 0, id, 1000).expect("delete");
@@ -568,9 +757,9 @@ fn get_at_boundary_i64_min_max() {
     let db = open();
     let id = NodeId::from_raw(41);
     db.write(|s, t| {
-        s.put_temporal(t, 0, id, i64::MIN, &rec("min"))
+        s.put_temporal(t, 0, id, i64::MIN, &rec("min"), open_ended())
             .expect("min");
-        s.put_temporal(t, 0, id, i64::MAX, &rec("max"))
+        s.put_temporal(t, 0, id, i64::MAX, &rec("max"), open_ended())
             .expect("max");
     });
     let store = LocalNodeStore;
@@ -654,7 +843,7 @@ fn scan_shard_skips_temporal_versions() {
     let db = open();
     db.write(|s, t| {
         s.put(t, 0, NodeId::from_raw(1), &rec("nt")).unwrap();
-        s.put_temporal(t, 0, NodeId::from_raw(2), 1000, &rec("t"))
+        s.put_temporal(t, 0, NodeId::from_raw(2), 1000, &rec("t"), open_ended())
             .unwrap();
     });
     let all = LocalNodeStore.scan_shard(&db.read(), 0).unwrap();

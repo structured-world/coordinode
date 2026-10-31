@@ -723,6 +723,115 @@ fn either_key_form_names_its_node() {
     assert_eq!(decode_written_node(&encode_node_key(5, nid)[..15]), None);
 }
 
+/// An assertion's key decodes to the identity it was written with, sorts
+/// assertions of one node by valid start (negative ones first) then commit,
+/// and no other key, a node row's included, decodes as one.
+#[test]
+fn assertion_keys_identify_and_order_assertions() {
+    let nid = NodeId(7);
+    let key = |valid_from: i64, commit: u64| {
+        let mut key = encode_node_history_prefix(3, nid, valid_from);
+        key.extend_from_slice(&commit.to_be_bytes());
+        key
+    };
+    assert_eq!(
+        decode_node_history_key(&key(-5, 9)),
+        Some(AssertionId {
+            shard_id: 3,
+            node_id: nid,
+            valid_from: -5,
+            commit: 9,
+        })
+    );
+    let mut keys = [key(10, 2), key(-5, 9), key(10, 1), key(-5, 3)];
+    keys.sort();
+    let order: Vec<_> = keys
+        .iter()
+        .map(|k| decode_node_history_key(k).map(|a| (a.valid_from, a.commit)))
+        .collect();
+    assert_eq!(
+        order,
+        [Some((-5, 3)), Some((-5, 9)), Some((10, 1)), Some((10, 2))]
+    );
+    assert!(key(0, 1).starts_with(&node_history_id_prefix(3, nid)));
+    assert!(key(0, 1).starts_with(&node_history_shard_prefix(3)));
+    assert_eq!(decode_node_history_key(&key(0, 1)[..28]), None);
+    assert_eq!(
+        decode_node_history_key(&encode_temporal_node_key(3, nid, 0)),
+        None
+    );
+}
+
+/// An assertion decodes to what was encoded, its bounds included, and bytes
+/// of no assertion are refused rather than read as one.
+#[test]
+fn assertions_decode_to_what_was_encoded() {
+    let record = [0x90u8, 1, 2];
+    for bounds in [
+        VersionBounds::default(),
+        VersionBounds {
+            valid_to: Some(-3),
+            deleted: false,
+        },
+        VersionBounds {
+            valid_to: Some(i64::MAX),
+            deleted: true,
+        },
+        VersionBounds {
+            valid_to: None,
+            deleted: true,
+        },
+    ] {
+        let state = NodeAssertion::State {
+            bounds,
+            record: &record,
+        };
+        assert_eq!(NodeAssertion::decode(&state.encode()), Ok(state));
+    }
+    assert_eq!(
+        NodeAssertion::decode(&NodeAssertion::Removed.encode()),
+        Ok(NodeAssertion::Removed)
+    );
+    for bytes in [&[][..], &[0, 0], &[2], &[1], &[1, 4], &[1, 2, 0, 0, 0]] {
+        assert_eq!(
+            NodeAssertion::decode(bytes),
+            Err(UnknownAssertion),
+            "{bytes:?}"
+        );
+    }
+}
+
+/// The bounds a record carries come from the fields named for them: an
+/// integer or timestamp end, and a deletion mark only when it is `true`.
+#[test]
+fn version_bounds_read_the_named_fields() {
+    let mut record = NodeRecord::new(crate::schema::label_id::FIRST_LABEL_ID);
+    assert_eq!(
+        VersionBounds::of(&record, Some(1), Some(2)),
+        VersionBounds::default()
+    );
+    record.set(1, PropertyValue::Timestamp(40));
+    record.set(2, PropertyValue::Bool(true));
+    assert_eq!(
+        VersionBounds::of(&record, Some(1), Some(2)),
+        VersionBounds {
+            valid_to: Some(40),
+            deleted: true,
+        }
+    );
+    assert_eq!(
+        VersionBounds::of(&record, None, None),
+        VersionBounds::default(),
+        "fields no record carries"
+    );
+    record.set(1, PropertyValue::String("soon".into()));
+    record.set(2, PropertyValue::Bool(false));
+    assert_eq!(
+        VersionBounds::of(&record, Some(1), Some(2)),
+        VersionBounds::default()
+    );
+}
+
 #[test]
 fn node_write_key_picks_correct_form() {
     let nid = NodeId(42);

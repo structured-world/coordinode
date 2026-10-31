@@ -4392,7 +4392,20 @@ impl<'a> ExecutionContext<'a> {
                 },
             )?;
         }
-        Ok(LocalNodeStore.put_temporal(&mut self.txn, shard_id, node_id, valid_from_ms, record)?)
+        let fields = self.timeline_fields();
+        let bounds = coordinode_core::graph::node::VersionBounds::of(
+            record,
+            fields.valid_to,
+            fields.deleted,
+        );
+        Ok(LocalNodeStore.put_temporal(
+            &mut self.txn,
+            shard_id,
+            node_id,
+            valid_from_ms,
+            record,
+            bounds,
+        )?)
     }
 
     /// Close the version of temporal node `node_id` that starts at

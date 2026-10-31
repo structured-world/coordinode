@@ -285,8 +285,16 @@ fn seed_node_temporal(
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
     let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
+    // The seeded versions carry no valid end or deletion mark: open ended.
     LocalNodeStore
-        .put_temporal(&mut txn, shard_id, node_id, valid_from_ms, record)
+        .put_temporal(
+            &mut txn,
+            shard_id,
+            node_id,
+            valid_from_ms,
+            record,
+            Default::default(),
+        )
         .expect("put temporal node");
     let wc = WriteConcern::majority();
     let ctx = CommitContext {

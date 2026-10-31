@@ -1,4 +1,5 @@
 use super::*;
+use coordinode_core::graph::types::Value;
 use coordinode_core::schema::label_id::FIRST_LABEL_ID;
 
 const NAME: u32 = 1;
