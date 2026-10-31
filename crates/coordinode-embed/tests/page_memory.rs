@@ -98,6 +98,56 @@ fn a_page_refuses_a_row_before_copying_it() {
     assert!(budget.memory_peak() <= budget.memory_limit());
 }
 
+/// A nearest-neighbour read through a vector index whose candidate records
+/// do not fit the statement's memory is refused before it reads them all:
+/// two thousand 16 KiB records against 2 MiB of budget allocate a batch of
+/// them, well under the whole 32 MiB, before the refusal. Reading every
+/// candidate first and charging them afterwards would allocate all of them.
+#[test]
+fn a_vector_index_read_refuses_candidates_before_reading_them_all() {
+    let mut db = coordinode_embed::Database::open_in_memory().unwrap();
+    for ddl in [
+        "CREATE NODE TYPE Doc WITH (title: STRING)",
+        "ALTER LABEL Doc SET SCHEMA FLEXIBLE",
+        r#"CREATE VECTOR INDEX doc_emb ON :Doc(emb) OPTIONS {metric: "l2"}"#,
+    ] {
+        db.execute_cypher(ddl).unwrap();
+    }
+    let body = "b".repeat(16 << 10);
+    for i in 0..2000 {
+        db.execute_cypher(&format!(
+            "CREATE (:Doc {{title: '{body}', emb: [{}, 0.0]}})",
+            f64::from(i)
+        ))
+        .unwrap();
+    }
+    let query = "MATCH (n:Doc) WITH n, vector_distance(n.emb, [0.0, 0.0]) AS d \
+                 ORDER BY d LIMIT 2000 RETURN n.title AS title";
+    // The index has taken every node once a read through it finds them all.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while db.execute_cypher(query).unwrap().len() < 2000 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the index never caught up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(db.explain_cypher(query).unwrap().contains("HnswScan("));
+    db.set_query_memory_limit(2 << 20).unwrap();
+
+    let (refused, allocated) = allocated_by(|| db.execute_cypher(query));
+
+    assert!(
+        matches!(refused, Err(coordinode_embed::DatabaseError::Budget(_))),
+        "{:?}",
+        refused.map(|rows| rows.len())
+    );
+    assert!(
+        allocated < 20 << 20,
+        "the candidates were read past the budget: {allocated} bytes allocated"
+    );
+}
+
 /// Every byte a fitting page keeps is charged before it is taken: the read
 /// allocates no more than it charged and the reading itself, the rows,
 /// their list and the cursor included.

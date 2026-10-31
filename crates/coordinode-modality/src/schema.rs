@@ -827,11 +827,16 @@ fn bind_name_txn(txn: &mut Transaction, name: &str, binding: LabelBinding) -> St
         &encode_label_current_revision_key(name),
         &encoded,
     )?;
-    txn.put_stamped(
-        Partition::Schema,
-        &encode_label_binding_history_prefix(name),
-        &encoded,
-    )?;
+    // A transaction writing straight to the engine commits at no system
+    // time to keep the binding under: like a batch's, its binding stays out
+    // of the history, which then reports it as uncovered rather than read.
+    if txn.is_mvcc() {
+        txn.put_stamped(
+            Partition::Schema,
+            &encode_label_binding_history_prefix(name),
+            &encoded,
+        )?;
+    }
     Ok(())
 }
 

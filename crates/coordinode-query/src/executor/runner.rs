@@ -9255,6 +9255,15 @@ impl IndexCandidates<'_> {
 /// Index candidates whose records are read, and held, at once.
 const CANDIDATE_BATCH: usize = 256;
 
+/// Bytes a list of `len` values of `T` takes, for a reservation made before
+/// the list exists. A size past u64 asks for more than any limit, and is
+/// refused as such.
+fn list_bytes<T>(len: usize) -> u64 {
+    len.checked_mul(core::mem::size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(u64::MAX)
+}
+
 /// The nodes a read through an index of the current state answers itself,
 /// beyond `pending` (what the index's worker has not folded): on a read at a
 /// named timestamp T, every node written after T, whose state then the index
@@ -9351,6 +9360,10 @@ fn execute_hnsw_scan(
     materialize_own_node_writes(ctx)?;
     let delta = read_delta(registry.delta(ctx.shard_id), ctx)?;
     let mut candidates: Vec<(u64, NodeRecord)> = Vec::new();
+    // The search runs against the statement's budget, and the records of its
+    // hits are held, by `held`, until the rows built from them are.
+    let budget = Arc::clone(&ctx.budget);
+    let mut held = budget.empty_charge();
     if delta != IndexDelta::Unknown {
         let superseded = match &delta {
             IndexDelta::Nodes(nodes) => nodes.len(),
@@ -9369,10 +9382,6 @@ fn execute_hnsw_scan(
             .ok_or_else(|| {
                 ExecutionError::Unsupported(format!("HnswScan({index_name}): k={k} is too large"))
             })?;
-        // The search runs against the statement's budget, and the records
-        // of its hits are held while the rows are built.
-        let budget = Arc::clone(&ctx.budget);
-        let mut held = budget.empty_charge();
         // A label without an identity is carried by no node.
         let label_id = ctx.label_id(label)?;
         // The index answers with this statement's interpretation of the label.
@@ -9388,24 +9397,44 @@ fn execute_hnsw_scan(
                 return Ok(None);
             };
             search.finish()?;
+            // The lists this pass builds over the hits, reserved before any
+            // of them exists: the kept hits, their ids and what is found.
+            // A sum past u64 asks for more than any limit, and is refused.
+            let _lists = budget.reserve(
+                list_bytes::<&coordinode_vector::hnsw::SearchResult>(hits.len())
+                    .checked_add(list_bytes::<NodeId>(hits.len()))
+                    .and_then(|b| b.checked_add(list_bytes::<(u64, f32, NodeRecord)>(hits.len())))
+                    .unwrap_or(u64::MAX),
+            )?;
             let kept: Vec<_> = hits
                 .iter()
                 .filter(|h| !delta.contains(NodeId::from_raw(h.id)))
                 .collect();
-            // Hydrate the kept hits in one batched multi_get; the input order
-            // is preserved, so the rows stay in similarity order.
             let ids: Vec<NodeId> = kept.iter().map(|h| NodeId::from_raw(h.id)).collect();
-            let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
-            budget.work(records.len() as u64)?;
+            // The kept records, each charged as it is found and held from
+            // then on; the order is the hits', so similarity order stays.
+            let mut found_charge = budget.empty_charge();
             let mut found = Vec::with_capacity(kept.len());
-            for (hit, record) in kept.iter().zip(records) {
-                let Some(record) = record else {
-                    continue;
-                };
-                if let Some(label_id) = label_id
-                    && ctx.carries(&record.labels, label_id)?
-                {
-                    found.push((hit.id, hit.score, record));
+            // Hydrated a batch at a time: one batch's records are read, and
+            // charged, before the next is.
+            for (batch_ids, batch_hits) in ids
+                .chunks(CANDIDATE_BATCH)
+                .zip(kept.chunks(CANDIDATE_BATCH))
+            {
+                let records = nodes.get_many(&ctx.txn, ctx.shard_id, batch_ids)?;
+                budget.work(records.len() as u64)?;
+                let _batch =
+                    budget.reserve(records.iter().flatten().map(NodeRecord::held_bytes).sum())?;
+                for (hit, record) in batch_hits.iter().zip(records) {
+                    let Some(record) = record else {
+                        continue;
+                    };
+                    if let Some(label_id) = label_id
+                        && ctx.carries(&record.labels, label_id)?
+                    {
+                        found_charge.grow(record.held_bytes())?;
+                        found.push((hit.id, hit.score, record));
+                    }
                 }
             }
             // The function orders as the index distance does, but rounding
@@ -9415,7 +9444,10 @@ fn execute_hnsw_scan(
             let settled =
                 found.len() >= k && hits.last().is_some_and(|last| last.score > found[k - 1].1);
             if settled || hits.len() < want {
-                held.grow(found.iter().map(|(_, _, record)| record.held_bytes()).sum())?;
+                // The found records are the candidates now, held by `held`
+                // until the rows built from them are.
+                held = found_charge;
+                held.grow(list_bytes::<(u64, NodeRecord)>(found.len()))?;
                 candidates = found
                     .into_iter()
                     .map(|(id, _, record)| (id, record))
@@ -9433,6 +9465,7 @@ fn execute_hnsw_scan(
     }
     // One scale for the index's hits and the written nodes: the function the
     // query orders by, computed exactly on each vector, equal scores by id.
+    held.grow(list_bytes::<(u64, NodeRecord, f64)>(candidates.len()))?;
     let mut scored = Vec::with_capacity(candidates.len());
     for (id, record) in candidates {
         let Some(vector) = field.and_then(|field| record_vector(&record, field)) else {
@@ -9456,6 +9489,10 @@ fn execute_hnsw_scan(
         order.then(a.0.cmp(&b.0))
     });
     scored.truncate(k);
+    // The rows go on to the query's later stages, which see no single owner
+    // of them: charged as they are built and kept for the rest of the query.
+    let mut rows_charge = budget.empty_charge();
+    rows_charge.grow(list_bytes::<Row>(scored.len()))?;
     let mut results = Vec::with_capacity(scored.len());
 
     for (id, record, score) in scored {
@@ -9477,8 +9514,12 @@ fn execute_hnsw_scan(
         if let Some(alias) = distance_alias {
             row.insert(alias.to_string(), Value::Float(score));
         }
+        rows_charge.grow(crate::executor::row::row_held_bytes(&row))?;
         results.push(row);
     }
+    rows_charge.keep_until_query_ends();
+    // The records the rows were built from go now, with their charge.
+    drop(held);
     Ok(Some(results))
 }
 
@@ -9642,13 +9683,23 @@ fn written_vector_nodes(
     // rest of the statement, which ranks and builds rows from them.
     match delta {
         IndexDelta::Nodes(ids) => {
+            let budget = &ctx.budget;
+            // The ids, reserved before the list exists.
+            let _ids = budget.reserve(list_bytes::<NodeId>(ids.len()))?;
             let mut ids: Vec<NodeId> = ids.iter().copied().collect();
             ids.sort_unstable();
-            ctx.budget.work(ids.len() as u64)?;
-            let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
-            for (id, record) in ids.into_iter().zip(records) {
-                if let Some(record) = record.filter(|r| record_vector(r, field).is_some()) {
-                    with_vector.push((id.as_raw(), record));
+            budget.work(ids.len() as u64)?;
+            // Read a batch at a time: one batch's records are held, and
+            // charged, before the next is read; those kept stay charged.
+            for batch in ids.chunks(CANDIDATE_BATCH) {
+                let records = nodes.get_many(&ctx.txn, ctx.shard_id, batch)?;
+                let _batch =
+                    budget.reserve(records.iter().flatten().map(NodeRecord::held_bytes).sum())?;
+                for (id, record) in batch.iter().zip(records) {
+                    if let Some(record) = record.filter(|r| record_vector(r, field).is_some()) {
+                        budget.reserve(record.held_bytes())?.keep_until_query_ends();
+                        with_vector.push((id.as_raw(), record));
+                    }
                 }
             }
         }
@@ -9666,19 +9717,19 @@ fn written_vector_nodes(
             })?;
         }
     }
-    let held = matches!(delta, IndexDelta::Unknown);
     // A label without an identity is carried by no node.
     let Some(label_id) = ctx.label_id(label)? else {
         return Ok(Vec::new());
     };
     // The label is judged once the scan is done: what a node's type
-    // implies is compiled from the statement's catalog view.
+    // implies is compiled from the statement's catalog view. The records
+    // were charged as they were kept; the list is reserved before it exists.
+    ctx.budget
+        .reserve(list_bytes::<(u64, NodeRecord)>(with_vector.len()))?
+        .keep_until_query_ends();
     let mut written = Vec::with_capacity(with_vector.len());
     for (id, record) in with_vector {
         if ctx.carries(&record.labels, label_id)? {
-            if !held {
-                ctx.hold(record.held_bytes())?;
-            }
             written.push((id, record));
         }
     }
