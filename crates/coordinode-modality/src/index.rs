@@ -779,6 +779,14 @@ pub trait IndexStore {
     /// A storage failure or an undecodable record.
     fn list_integrity(&self) -> StoreResult<Vec<IndexIntegrityRecord>>;
 
+    /// What a member's registry takes from every integrity record, read
+    /// without the evidence they keep.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn integrity_states(&self) -> StoreResult<Vec<crate::index_def::IntegrityState>>;
+
     /// Stage `record` through a statement [`Transaction`], only while the
     /// stored record of its generation is at `version` when it commits
     /// (`None`: while there is none).
@@ -2100,6 +2108,26 @@ impl IndexStore for LocalIndexStore<'_> {
         {
             let (key, value) = guard.into_inner()?;
             out.push(decode_catalog("index integrity record", &key, &value)?);
+        }
+        Ok(out)
+    }
+
+    fn integrity_states(&self) -> StoreResult<Vec<crate::index_def::IntegrityState>> {
+        let mut out = Vec::new();
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, IndexIntegrityRecord::PREFIX)?
+        {
+            let (key, value) = guard.into_inner()?;
+            out.push(
+                IndexIntegrityRecord::state_from_msgpack(&value).map_err(|e| {
+                    StoreError::Storage(StorageError::UnreadableCatalog {
+                        kind: "index integrity record",
+                        key: coordinode_storage::error::printable_key(&key),
+                        detail: e.to_string(),
+                    })
+                })?,
+            );
         }
         Ok(out)
     }

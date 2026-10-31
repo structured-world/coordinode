@@ -508,8 +508,8 @@ impl IndexBuildService {
     /// Bring this process's registry in line with the integrity records.
     fn refresh_integrity(&self) -> Result<(), String> {
         let store = LocalIndexStore::new(self.shared.env.engine());
-        let records = store.list_integrity().map_err(text)?;
-        self.shared.env.registry().apply_integrity(&records);
+        let states = store.integrity_states().map_err(text)?;
+        self.shared.env.registry().apply_integrity(&states);
         Ok(())
     }
 
@@ -1766,7 +1766,7 @@ impl Shared {
             let env = self.env.as_ref();
             env.registry().apply_integrity(
                 &LocalIndexStore::new(env.engine())
-                    .list_integrity()
+                    .integrity_states()
                     .map_err(text)?,
             );
             // The pass read this member's copy whole, after the revision it
@@ -2043,7 +2043,7 @@ impl Shared {
         let env = self.env.as_ref();
         let store = LocalIndexStore::new(env.engine());
         env.registry()
-            .apply_integrity(&store.list_integrity().map_err(text)?);
+            .apply_integrity(&store.integrity_states().map_err(text)?);
         if !landed {
             return self.lost_check(generation, taken);
         }

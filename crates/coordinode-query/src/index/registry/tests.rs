@@ -150,10 +150,15 @@ fn btree(name: &str, property: &str, raw: u64) -> IndexDefinition {
     )
 }
 
-fn integrity(index: &IndexDefinition, state: Integrity) -> IndexIntegrityRecord {
-    let mut record = IndexIntegrityRecord::new(index.id, index.generation);
+/// The registry's view of an integrity record of `index` in `state`.
+fn integrity(
+    index: &IndexDefinition,
+    state: Integrity,
+) -> coordinode_modality::index_def::IntegrityState {
+    let mut record =
+        coordinode_modality::index_def::IndexIntegrityRecord::new(index.id, index.generation);
     record.integrity = state;
-    record
+    record.state()
 }
 
 fn stray(node: u64) -> Mismatch {

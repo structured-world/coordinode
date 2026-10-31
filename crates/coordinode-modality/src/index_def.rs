@@ -1500,7 +1500,61 @@ pub struct IndexIntegrityRecord {
     pub trusted_from: Option<u64>,
 }
 
+/// What a member's registry takes from an integrity record: whether its
+/// generation is suspect or verified, and from which snapshot a verified
+/// one answers. Read without the evidence the record keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrityState {
+    /// The generation.
+    pub generation: GenerationId,
+    /// What is known about it.
+    pub integrity: Integrity,
+    /// See [`IndexIntegrityRecord::trusted_from`].
+    pub trusted_from: Option<u64>,
+}
+
+/// [`IndexIntegrityRecord`] as encoded, its evidence and check skipped
+/// unread.
+#[derive(Deserialize)]
+struct IntegrityStateView {
+    generation: GenerationId,
+    #[serde(rename = "index")]
+    _index: serde::de::IgnoredAny,
+    integrity: Integrity,
+    #[serde(rename = "evidence")]
+    _evidence: serde::de::IgnoredAny,
+    #[serde(rename = "evidence_revision")]
+    _evidence_revision: serde::de::IgnoredAny,
+    #[serde(rename = "check")]
+    _check: serde::de::IgnoredAny,
+    trusted_from: Option<u64>,
+}
+
 impl IndexIntegrityRecord {
+    /// What a member's registry takes from this record.
+    pub fn state(&self) -> IntegrityState {
+        IntegrityState {
+            generation: self.generation,
+            integrity: self.integrity,
+            trusted_from: self.trusted_from,
+        }
+    }
+
+    /// [`Self::state`] of the record encoded in `bytes`, its evidence and
+    /// check skipped unread: nothing is allocated.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded record.
+    pub fn state_from_msgpack(bytes: &[u8]) -> Result<IntegrityState, rmp_serde::decode::Error> {
+        let view: IntegrityStateView = rmp_serde::from_slice(bytes)?;
+        Ok(IntegrityState {
+            generation: view.generation,
+            integrity: view.integrity,
+            trusted_from: view.trusted_from,
+        })
+    }
+
     /// Prefix of every integrity record in the schema catalog. Outside the
     /// definition and name prefixes.
     pub const PREFIX: &'static [u8] = b"schema:idxcheck:";

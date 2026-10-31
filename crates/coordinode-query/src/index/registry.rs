@@ -18,9 +18,7 @@ use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::error::StorageError;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::definition::{
-    GenerationId, IndexDefinition, IndexId, IndexIntegrityRecord, IndexType, Integrity, Mismatch,
-};
+use super::definition::{GenerationId, IndexDefinition, IndexId, IndexType, Integrity, Mismatch};
 
 /// Registry of active indexes.
 ///
@@ -629,14 +627,14 @@ impl IndexRegistry {
     /// verifies it. A suspicion found here is about this member's copy and
     /// is left alone: a verified record proves the copy of the member that
     /// checked.
-    pub fn apply_integrity(&self, records: &[IndexIntegrityRecord]) {
+    pub fn apply_integrity(&self, states: &[coordinode_modality::index_def::IntegrityState]) {
         let mut view = self.integrity.lock();
-        view.recorded = records
+        view.recorded = states
             .iter()
             .filter(|r| r.integrity == Integrity::Suspect)
             .map(|r| r.generation)
             .collect();
-        view.trusted_from = records
+        view.trusted_from = states
             .iter()
             .filter(|r| r.integrity == Integrity::Verified)
             .filter_map(|r| r.trusted_from.map(|ts| (r.generation, ts)))
@@ -1189,8 +1187,8 @@ impl IndexRegistry {
             StoreError::Storage(e) => e,
             other => StorageError::Serialization(other.to_string()),
         };
-        let records = store.list_integrity().map_err(storage)?;
-        self.apply_integrity(&records);
+        let states = store.integrity_states().map_err(storage)?;
+        self.apply_integrity(&states);
         let defs = super::ops::list_index_definitions(engine)?;
         // This member's own marks survive a restart. A generation that left
         // the catalog keeps its mark: a reader pinned to an older snapshot,

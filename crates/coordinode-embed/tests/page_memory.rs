@@ -361,6 +361,32 @@ fn a_report_the_record_does_not_keep_allocates_nothing() {
     assert_eq!(record.evidence_revision, revision + 1);
 }
 
+/// What the registry takes from an integrity record is read without the
+/// evidence it keeps: a record holding its full evidence of 4 KiB tuples
+/// gives the same state as decoding it whole, and reading the state
+/// allocates nothing.
+#[test]
+fn an_integrity_state_is_read_without_its_evidence() {
+    use coordinode_modality::index_def::{
+        GenerationId, IndexId, IndexIntegrityRecord, Integrity, Mismatch,
+    };
+    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
+    for node in 0..IndexIntegrityRecord::MAX_EVIDENCE as u64 {
+        record.report(&Mismatch::Extra {
+            node,
+            valid_from: None,
+            tuple: vec![b'x'; 4096],
+        });
+    }
+    record.integrity = Integrity::Verified;
+    record.trusted_from = Some(77);
+    let bytes = rmp_serde::to_vec(&record).unwrap();
+    let (state, allocated) =
+        allocated_by(|| IndexIntegrityRecord::state_from_msgpack(&bytes).unwrap());
+    assert_eq!(state, record.state());
+    assert_eq!(allocated, 0, "the evidence was decoded");
+}
+
 /// Restating an attempt's claims at commit allocates nothing, whatever it
 /// drops: six scopes each holding two bounds whose trends become one (more
 /// dropped than any inline list of positions would hold), and a scope held
