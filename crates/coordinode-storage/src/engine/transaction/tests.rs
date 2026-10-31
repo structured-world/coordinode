@@ -1364,6 +1364,30 @@ fn a_conflicting_binding_refuses_history() {
     );
 }
 
+/// A store whose binding was lost while its history was kept founds no new
+/// domain over that history: the next history commit is refused, nothing
+/// of it applies, and no binding is minted.
+#[test]
+fn a_lost_binding_is_not_refounded_over_history() {
+    use coordinode_core::group::DEPLOYMENT_KEY;
+    let (engine, oracle, _d) = test_engine();
+    commit_stamped(&engine, &oracle, b"h:1:").expect("first history");
+    engine.delete(Partition::Schema, DEPLOYMENT_KEY).unwrap();
+    let refused = commit_stamped(&engine, &oracle, b"h:2:");
+    assert!(
+        matches!(
+            refused,
+            Err(CommitError::Storage(StorageError::HistoryDomainMissing))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(stored_under(&engine, Partition::NodeHistory, b"h:2:"), []);
+    assert_eq!(
+        crate::engine::metadata::bound_deployment(&engine).unwrap(),
+        None
+    );
+}
+
 /// Concurrent first histories, each proposing its own candidate, bind one
 /// domain: every commit succeeds and the record stays the first one landed.
 #[test]

@@ -130,13 +130,36 @@ pub fn deployment_candidate() -> DeploymentId {
 
 /// The deployment to found this store's domain with: the one it was
 /// enrolled in when it joined a group whose record has not reached it yet,
-/// else a fresh candidate. An enrolled member never mints a replacement.
+/// else a fresh candidate. An enrolled member never mints a replacement, and
+/// neither does a store that already holds history without a binding: that
+/// history belongs to a domain whose binding was lost, not to a new one.
 ///
 /// # Errors
 ///
-/// As [`bound_deployment`].
+/// As [`bound_deployment`]; [`StorageError::HistoryDomainMissing`] for an
+/// unbound store holding history.
 pub fn founding_candidate(engine: &StorageEngine) -> StorageResult<DeploymentId> {
-    Ok(bound_deployment(engine)?.unwrap_or_else(deployment_candidate))
+    if let Some(bound) = bound_deployment(engine)? {
+        return Ok(bound);
+    }
+    if holds_history(engine)? {
+        return Err(StorageError::HistoryDomainMissing);
+    }
+    Ok(deployment_candidate())
+}
+
+/// Whether the store holds any retained assertion of a node. The kept label
+/// bindings do not count: the ordered first-use binding keeps them before a
+/// store has founded anything, and they answer no read without node history.
+///
+/// # Errors
+///
+/// A read failure.
+pub fn holds_history(engine: &StorageEngine) -> StorageResult<bool> {
+    Ok(engine
+        .prefix_scan(Partition::NodeHistory, &[])?
+        .next()
+        .is_some())
 }
 
 /// Whether the node identity `identity` (canonically encoded) was retired.

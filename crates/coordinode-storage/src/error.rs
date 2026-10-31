@@ -219,6 +219,16 @@ pub enum StorageError {
     #[error("a write keyed by its commit needs a transaction that commits at a timestamp")]
     NoCommitTimestamp,
 
+    /// The store holds history but no binding of the domain it belongs to:
+    /// the binding was lost or removed, and founding a new domain now would
+    /// claim that history for another. Refused; the binding is recovered
+    /// from qualified recovery material, never minted.
+    #[error(
+        "the store holds history but its deployment binding is missing; \
+         restore the binding from a backup of this store rather than founding a new one"
+    )]
+    HistoryDomainMissing,
+
     /// The store's deployment record and the deployment it was enrolled in
     /// disagree: which domain its history and operations belong to has no
     /// single answer. Refused, never settled by preferring one record.

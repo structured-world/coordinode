@@ -238,8 +238,13 @@ async fn found_deployment(
         return Ok(id);
     }
     // Every founder draws its candidate the same way; only the first
-    // recorded stands.
-    let id = given.unwrap_or_else(coordinode_storage::engine::metadata::deployment_candidate);
+    // recorded stands. A store holding history it has lost the binding of
+    // founds nothing.
+    let id = match given {
+        Some(id) => id,
+        None => coordinode_storage::engine::metadata::founding_candidate(commands.engine.arc())
+            .map_err(|e| RaftNodeError::Init(format!("found the deployment identity: {e}")))?,
+    };
     commands
         .write(MetadataCommand::RecordDeployment { id })
         .await
