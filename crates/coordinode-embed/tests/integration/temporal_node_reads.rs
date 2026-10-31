@@ -641,6 +641,81 @@ fn an_ordinary_holder_of_a_shared_label_holds_its_value_at_every_instant() {
         .expect("a free value");
 }
 
+/// The per-instant rule holds for every shape of key: a long interval
+/// enclosing another's is refused; a compound key is held only by the whole
+/// tuple, a list by each element, a partial index only by versions its
+/// predicate admits. A version without the value holds nothing under a
+/// sparse index and NULL under one that is not, one node at each instant.
+#[test]
+fn every_key_shape_is_held_per_instant() {
+    let mut db = Database::open_in_memory().expect("open");
+    db.execute_cypher(
+        "CREATE NODE TYPE Seat TEMPORAL WITH \
+         (room: STRING, desk: INT, open: BOOL, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal label");
+    // Lists are not declarable: the label takes them undeclared.
+    db.execute_cypher("ALTER LABEL Seat SET SCHEMA FLEXIBLE")
+        .expect("flexible");
+    db.execute_cypher("CREATE CONSTRAINT seat_key FOR (n:Seat) REQUIRE (n.room, n.desk) IS UNIQUE")
+        .expect("compound key");
+    db.execute_cypher("CREATE UNIQUE SPARSE INDEX seat_tag ON :Seat(tags)")
+        .expect("multikey index");
+    db.execute_cypher("CREATE UNIQUE INDEX seat_badge ON :Seat(badge)")
+        .expect("non-sparse index");
+    db.execute_cypher("CREATE UNIQUE INDEX seat_open ON :Seat(desk) WHERE n.open = true")
+        .expect("partial index");
+    let now = now_us();
+    let (a, b, c) = (now - 3 * YEAR, now - 2 * YEAR, now - YEAR);
+    // Each seat gets a badge of its own unless the test leaves it out.
+    let mut badges = 0;
+    let mut seat = |db: &mut Database, props: &str, from: i64, to: Option<i64>| {
+        let to = to.map_or(String::new(), |t| format!(", valid_to: {t}"));
+        badges += 1;
+        let badge = if props.contains("badge") {
+            String::new()
+        } else {
+            format!(", badge: {badges}")
+        };
+        db.execute_cypher(&format!(
+            "CREATE (n:Seat {{{props}{badge}, valid_from: {from}{to}}})"
+        ))
+    };
+
+    seat(&mut db, "room: 'r1', desk: 1, tags: ['x', 'y']", b, Some(c)).expect("first holder");
+    refused_as_unique(
+        seat(&mut db, "room: 'r1', desk: 1", a, None),
+        "an interval enclosing the holder's",
+    );
+    seat(&mut db, "room: 'r1', desk: 2", a, None).expect("another tuple of the compound key");
+    refused_as_unique(
+        seat(&mut db, "room: 'r2', desk: 3, tags: ['z', 'y']", a, None),
+        "one element of a list held over an overlapping time",
+    );
+    seat(&mut db, "room: 'r2', desk: 3, tags: ['y']", c, None).expect("the element from the end");
+
+    // Only open seats hold their desk under the partial index.
+    seat(&mut db, "room: 'r3', desk: 7, open: true", a, Some(c)).expect("an open seat");
+    seat(&mut db, "room: 'r4', desk: 7, open: false", a, None)
+        .expect("a closed seat holds nothing");
+    refused_as_unique(
+        seat(&mut db, "room: 'r5', desk: 7, open: true", b, None),
+        "an open seat overlapping the first",
+    );
+    seat(&mut db, "room: 'r5', desk: 7, open: true", c, None).expect("open from the end");
+
+    // Versions without tags hold nothing under the sparse index, whatever
+    // their times; versions without a badge hold NULL, one at an instant.
+    seat(&mut db, "room: 'r6', desk: 9", a, None).expect("no tags");
+    seat(&mut db, "room: 'r7', desk: 9", a, None).expect("no tags again");
+    seat(&mut db, "room: 'r8', desk: 9, badge: null", a, Some(b)).expect("NULL over [a, b)");
+    refused_as_unique(
+        seat(&mut db, "room: 'r9', desk: 9, badge: null", b - 1, None),
+        "NULL overlapping its holder",
+    );
+    seat(&mut db, "room: 'r9', desk: 9, badge: null", b, None).expect("NULL from b");
+}
+
 /// Ownership over valid time survives a reopen: after it, an overlap with a
 /// holder admitted before is still refused and a value meeting it at a
 /// bound is still admitted, under either maintenance.
