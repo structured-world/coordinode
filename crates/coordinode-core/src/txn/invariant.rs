@@ -714,6 +714,11 @@ impl ClaimSet {
         &self.claims
     }
 
+    /// The claims held, in the order they were stated, moved out.
+    pub fn into_claims(self) -> Vec<Claim> {
+        self.claims
+    }
+
     /// Whether the set holds nothing.
     pub fn is_empty(&self) -> bool {
         self.claims.is_empty()

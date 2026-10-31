@@ -1494,9 +1494,10 @@ impl<'a> Transaction<'a> {
         {
             return;
         }
-        let stated = std::mem::take(&mut self.claims);
-        for claim in stated.claims() {
-            let mut claim = claim.clone();
+        // Moved, not copied: a claim's tuple is not duplicated to restate it.
+        let stated = std::mem::take(&mut self.claims).into_claims();
+        self.claims.reserve(stated.len());
+        for mut claim in stated {
             let Claim {
                 scope, predicate, ..
             } = &mut claim;
