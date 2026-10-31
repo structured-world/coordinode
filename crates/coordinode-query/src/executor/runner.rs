@@ -8967,6 +8967,21 @@ fn read_delta(
 /// tiny) instead of trusting the index's internal score, whose units
 /// differ per metric (e.g. squared L2 inside the engine vs sqrt L2
 /// from the Cypher scalar).
+/// The carriers of `label` as this statement's view of the catalog has
+/// them, in the form an index records the interpretation it holds, so the
+/// two compare equal when they are one.
+fn view_carriers(
+    ctx: &ExecutionContext<'_>,
+    label: &str,
+) -> Result<Option<crate::index::membership::LabelCarriers>, ExecutionError> {
+    use crate::index::membership::{CatalogMembership, label_carriers_in};
+    let mut catalog = match ctx.txn.snapshot() {
+        Some(snapshot) => CatalogMembership::at(ctx.engine, snapshot),
+        None => CatalogMembership::current(ctx.engine),
+    };
+    Ok(label_carriers_in(ctx.engine, label, &mut catalog)?)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_hnsw_scan(
     label: &str,
@@ -9032,11 +9047,16 @@ fn execute_hnsw_scan(
         let mut held = budget.empty_charge();
         // A label without an identity is carried by no node.
         let label_id = ctx.label_id(label)?;
+        // The index answers with this statement's interpretation of the label.
+        let carriers = view_carriers(ctx, label)?;
+        let reader = crate::index::vector_registry::Reader::Of(carriers.as_ref());
         loop {
             let mut search = coordinode_core::budget::BatchedWork::new(&budget);
-            let Some(hits) = registry.search(label, property, &qv, want, &mut search)? else {
+            let Some(hits) = registry.search((label, property), reader, &qv, want, &mut search)?
+            else {
                 // Index disappeared between planning and execution (concurrent
-                // DROP): the scan answers.
+                // DROP), or it does not hold this statement's interpretation:
+                // the scan answers.
                 return Ok(None);
             };
             search.finish()?;
@@ -10852,6 +10872,9 @@ fn try_hnsw_vector_top_k(
     // Either runs against the statement's budget.
     let budget = Arc::clone(&ctx.budget);
     let mut search = coordinode_core::budget::BatchedWork::new(&budget);
+    // The index answers with this statement's interpretation of the label.
+    let carriers = view_carriers(ctx, &label_str)?;
+    let reader = crate::index::vector_registry::Reader::Of(carriers.as_ref());
     let search_results = if let Some(pred) = predicate {
         // Resolve property names referenced by the predicate once, outside
         // the closure, so the search hot path never re-enters the interner
@@ -10876,17 +10899,14 @@ fn try_hnsw_vector_top_k(
                 &implying,
             )
         };
-        // Overfetch factor 2.0 + 3 expansion rounds matches the existing
-        // visibility-aware MVCC search defaults; ACORN literature suggests
-        // higher overfetch for very selective filters but those tunables
-        // remain a follow-up.
+        // A node the predicate refuses leads the traversal on but is never
+        // a hit, so the search ends with as many visible hits as it asked
+        // for whenever the index holds them.
         match registry.search_with_visibility(
-            &label_str,
-            &property_str,
+            (&label_str, &property_str),
+            reader,
             &query_vec,
             overfetch,
-            2.0,
-            3,
             is_visible,
             &mut search,
         )? {
@@ -10895,8 +10915,8 @@ fn try_hnsw_vector_top_k(
         }
     } else {
         match registry.search_with_loader(
-            &label_str,
-            &property_str,
+            (&label_str, &property_str),
+            reader,
             &query_vec,
             overfetch,
             ctx.vector_loader,
@@ -12221,18 +12241,10 @@ fn text_index_matches(
     use coordinode_search::tantivy::multi_lang::TextRequest;
     use coordinode_search::tantivy::pending::Matches;
 
-    use crate::index::membership::{CatalogMembership, label_carriers_in};
-
     let also = read_delta(IndexDelta::Nodes(Default::default()), ctx)
         .map_err(|e| FindError::Failed(e.to_string()))?;
-    // The label's carriers as this statement's view of the catalog has them:
-    // the index answers with that interpretation.
-    let mut catalog = match ctx.txn.snapshot() {
-        Some(snapshot) => CatalogMembership::at(ctx.engine, snapshot),
-        None => CatalogMembership::current(ctx.engine),
-    };
-    let carriers = label_carriers_in(ctx.engine, label, &mut catalog)
-        .map_err(|e| FindError::Failed(e.to_string()))?;
+    // The index answers with this statement's interpretation of the label.
+    let carriers = view_carriers(ctx, label).map_err(|e| FindError::Failed(e.to_string()))?;
     let mut search = coordinode_core::budget::BatchedWork::new(&ctx.budget);
     let Some(hits) = registry.find(
         label,
@@ -22205,7 +22217,10 @@ fn execute_create_vector_index(
             ))
         })?;
         let unbuilt = Arc::clone(&health);
-        let carriers = ctx.label_carriers(label)?;
+        let carriers = view_carriers(ctx, label)?;
+        // The graph is filled with these carriers' members, the
+        // interpretation it answers with.
+        registry.record_built(label, property, carriers.clone());
 
         let thread = std::thread::Builder::new()
             .name(format!("vec-backfill-{name}"))

@@ -423,10 +423,10 @@ pub fn propose_parts_txn(
         };
         match def.index_type {
             IndexType::Labels | IndexType::BTree => {}
-            // A text index keeps the documents of both interpretations in
-            // scopes and learns where the change stands from the label
-            // lookup's parts: it keeps no parts of its own.
-            IndexType::Text => continue,
+            // A text or vector index keeps the members of both
+            // interpretations apart itself and learns where the change
+            // stands from the catalog: it keeps no parts of its own.
+            IndexType::Text | IndexType::Hnsw => continue,
             other => {
                 return Err(StoreError::Invariant(format!(
                     "the change moves the carriers of :{name}, which the {other:?} index {} \

@@ -91,8 +91,8 @@ fn search(
     k: usize,
 ) -> Option<Vec<SearchResult>> {
     reg.search(
-        label,
-        property,
+        (label, property),
+        Reader::Any,
         query,
         k,
         &mut coordinode_core::budget::Unmetered,
@@ -100,8 +100,7 @@ fn search(
     .expect("an evaluable query")
 }
 
-/// `reg`'s filtered search with overfetch 2.0 and 4 rounds, under no query
-/// budget.
+/// `reg`'s filtered search under no query budget.
 fn search_visible(
     reg: &VectorIndexRegistry,
     query: &[f32],
@@ -109,12 +108,10 @@ fn search_visible(
     is_visible: impl Fn(u64) -> bool,
 ) -> Option<Vec<SearchResult>> {
     reg.search_with_visibility(
-        "Doc",
-        "embedding",
+        ("Doc", "embedding"),
+        Reader::Any,
         query,
         k,
-        2.0,
-        4,
         is_visible,
         &mut coordinode_core::budget::Unmetered,
     )
@@ -414,7 +411,13 @@ fn a_scattered_search_charges_the_merge_of_its_partitions() {
     .unwrap();
     let mut recorded = Recorded::default();
     let found = reg
-        .search("Doc", "embedding", &[0.0, 1.0, 0.0], 10, &mut recorded)
+        .search(
+            ("Doc", "embedding"),
+            Reader::Any,
+            &[0.0, 1.0, 0.0],
+            10,
+            &mut recorded,
+        )
         .unwrap();
     assert_eq!(found.map(|r| r.len()), Some(2));
     // The boundary query reaches the first partition (one answer) and then
@@ -551,4 +554,114 @@ fn search_scores_are_exact() {
     assert_eq!(hits[0].id, 1);
     assert_eq!(hits[0].score, 0.0);
     assert!(hits[1].score.is_finite());
+}
+
+/// The ids the index answers `reader` with for the query nearest the moved
+/// members, `None` when the store answers instead.
+fn answered(reg: &VectorIndexRegistry, reader: Reader<'_>, k: usize) -> Option<Vec<u64>> {
+    reg.search(
+        ("Doc", "embedding"),
+        reader,
+        &[1.0, 0.0, 0.0],
+        k,
+        &mut coordinode_core::budget::Unmetered,
+    )
+    .expect("an evaluable query")
+    .map(|hits| hits.into_iter().map(|h| h.id).collect())
+}
+
+/// While an index keeps the members of two interpretations of its label, a
+/// reader is answered with its own alone, nearest first, the other's members
+/// only leading the search on: the members only the candidate carries lie
+/// nearest the query and are passed over for a reader under the facts in
+/// force, and those only the facts in force carry for a reader under the
+/// candidate. A reader holding neither is answered from the store. Once the
+/// change is settled, the dropped members are gone from the graph and a
+/// reader under the interpretation now in force is answered whole.
+#[test]
+fn a_reader_is_answered_with_its_own_interpretation_while_a_change_is_kept() {
+    use coordinode_core::schema::label_id::LabelId;
+    use coordinode_search::tantivy::Scope;
+    let id = |raw| LabelId::new(raw).expect("label id");
+    let base = Some(crate::index::membership::LabelCarriers::stored_only(id(1)));
+    let candidate = Some(crate::index::membership::LabelCarriers {
+        label: id(1),
+        implying: vec![id(2)],
+    });
+    let other = Some(crate::index::membership::LabelCarriers {
+        label: id(1),
+        implying: vec![id(3)],
+    });
+
+    let reg = VectorIndexRegistry::new();
+    reg.register(hnsw(1, "emb", "Doc", "embedding"));
+    // Shared members far from the query, then the candidate's own nearest,
+    // then those of the facts in force next.
+    let mut items: Vec<(u64, Vec<f32>)> = (0..60u64)
+        .map(|i| (i, vec![0.0, 1.0, i as f32 * 0.01]))
+        .collect();
+    items.extend((100..110u64).map(|i| (i, vec![1.0, (i - 100) as f32 * 0.001, 0.0])));
+    items.extend((200..205u64).map(|i| (i, vec![1.0, 0.05 + (i - 200) as f32 * 0.001, 0.0])));
+    reg.bulk_insert("Doc", "embedding", items.into_iter())
+        .unwrap();
+    reg.record_built("Doc", "embedding", base.clone());
+    let (_, revision) = reg.held_at("Doc", "embedding").expect("recorded");
+    let guard = reg
+        .begin_change(
+            ("Doc", "embedding"),
+            revision,
+            base.clone(),
+            candidate.clone(),
+        )
+        .expect("begun at its revision");
+    for gained in 100..110u64 {
+        assert!(reg.mark(("Doc", "embedding"), guard, gained, Some(Scope::Gained)));
+    }
+    for retired in 200..205u64 {
+        assert!(reg.mark(("Doc", "embedding"), guard, retired, Some(Scope::Retired)));
+    }
+
+    let as_base = answered(&reg, Reader::Of(base.as_ref()), 3).expect("the index answers");
+    assert_eq!(
+        as_base,
+        [200, 201, 202],
+        "the facts in force skip the gained"
+    );
+    assert_eq!(
+        answered(&reg, Reader::Of(candidate.as_ref()), 3),
+        None,
+        "not answered under the candidate before every member is written"
+    );
+    assert!(reg.finish_change(("Doc", "embedding"), guard));
+    let as_candidate = answered(&reg, Reader::Of(candidate.as_ref()), 12).expect("answered");
+    assert_eq!(&as_candidate[..10], &(100..110).collect::<Vec<_>>()[..]);
+    assert!(
+        as_candidate.iter().all(|id| !(200..205).contains(id)),
+        "the candidate skips the retired: {as_candidate:?}"
+    );
+    assert_eq!(answered(&reg, Reader::Of(other.as_ref()), 3), None);
+
+    assert!(reg.settle_change(
+        ("Doc", "embedding"),
+        guard,
+        Scope::Retired,
+        candidate.clone()
+    ));
+    assert_eq!(
+        reg.held("Doc", "embedding"),
+        Some(crate::index::selection::Held::built(candidate.clone()))
+    );
+    let settled = answered(&reg, Reader::Of(candidate.as_ref()), 12).expect("answered");
+    assert_eq!(&settled[..10], &(100..110).collect::<Vec<_>>()[..]);
+    for retired in 200..205u64 {
+        assert!(
+            !reg.holds("Doc", "embedding", NodeId::from_raw(retired)),
+            "retired member {retired} left the graph"
+        );
+    }
+    assert_eq!(answered(&reg, Reader::Of(base.as_ref()), 3), None);
+    assert!(
+        !reg.mark(("Doc", "embedding"), guard, 1, None),
+        "a pass of the settled change marks nothing"
+    );
 }

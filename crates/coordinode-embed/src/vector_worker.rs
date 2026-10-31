@@ -20,11 +20,15 @@ use std::sync::Arc;
 
 use coordinode_core::graph::intern::FieldRegistrar;
 use coordinode_core::graph::node::NodeId;
+use coordinode_core::schema::label_id::LabelId;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
+use coordinode_query::index::membership::LabelCarriers;
+use coordinode_query::index::selection::Held;
 use coordinode_query::index::{
     BuildTarget, BuildToken, IndexCoverage, VectorBuild, VectorIndexRegistry,
 };
+use coordinode_search::tantivy::Scope;
 use coordinode_storage::engine::applied::{
     AppliedEvent, AppliedPosition, AppliedStop, AppliedSubscription,
 };
@@ -130,9 +134,32 @@ impl Worker {
         // releasing a later batch would release them too, so every round
         // rebuilds until one rebuild covers them.
         let mut behind = false;
+        let mut stale = self.sync_selections_logged();
         while !self.stop.is_cancelled() {
-            // Asleep until an entry applies or the worker is stopped.
+            // An index holding neither interpretation of its label is
+            // rebuilt under the one in force, then follows a change still
+            // certified like any other.
+            if stale {
+                match self.rebuild() {
+                    Some(seq) => {
+                        behind = false;
+                        self.coverage.release(seq);
+                        stale = self.sync_selections_logged();
+                    }
+                    None => {
+                        behind = true;
+                        stale = false;
+                    }
+                }
+                continue;
+            }
+            // Asleep until an entry applies, the catalog changes, or the
+            // worker is stopped.
             let Some(first) = self.applied.next(None) else {
+                // Woken for a change of what a type implies.
+                if !self.stop.is_cancelled() {
+                    stale = self.sync_selections_logged();
+                }
                 continue;
             };
             // A complete cut: every commit at or below it has landed here,
@@ -237,28 +264,64 @@ impl Worker {
         // a bulk load fills with every node of a statement.
         for def in &definitions {
             let property = def.property();
-            // The index covers the nodes of every type implying its label.
-            let carriers =
-                coordinode_query::index::membership::label_carriers(&self.engine, &def.label)
-                    .map_err(|e| format!("read the carriers of :{}: {e}", def.label))?;
+            // Judged by the interpretations the index holds as it is written,
+            // never by a catalog read before: a change the worker has not
+            // followed yet leaves the members in the interpretation readers
+            // are answered with. An index without a record covers the
+            // carriers in force.
+            let (interpretations, revision) = match self.registry.held_at(&def.label, property) {
+                Some((held, revision)) => (Interpretations::of(&held), Some(revision)),
+                None => (
+                    Interpretations::In(
+                        coordinode_query::index::membership::label_carriers(
+                            &self.engine,
+                            &def.label,
+                        )
+                        .map_err(|e| format!("read the carriers of :{}: {e}", def.label))?,
+                    ),
+                    None,
+                ),
+            };
             let mut upserts: Vec<(NodeId, Vec<f32>)> = Vec::new();
             for (node_id, record) in ids.iter().copied().zip(&records) {
+                let scope = record
+                    .as_ref()
+                    .and_then(|r| interpretations.scope(&r.labels));
                 let vector = record
                     .as_ref()
-                    .filter(|r| {
-                        carriers
-                            .as_ref()
-                            .is_some_and(|carriers| carriers.carried_by(&r.labels))
-                    })
+                    .filter(|_| scope.is_some())
                     .and_then(|r| r.props.get(&interner.lookup(property)?))
                     .and_then(crate::db::try_extract_vector);
-                match vector {
-                    Some(vector) => upserts.push((node_id, vector)),
-                    None if self.registry.holds(&def.label, property, node_id) => {
+                match (vector, scope, revision) {
+                    (Some(vector), Some(scope), revision) => {
+                        // Recorded before it is inserted, so no search takes
+                        // it for a member of both meanwhile.
+                        if let Some(revision) = revision
+                            && !self.registry.mark(
+                                (&def.label, property),
+                                revision,
+                                node_id.as_raw(),
+                                scope,
+                            )
+                        {
+                            // The record moved on: its own pass writes the node.
+                            continue;
+                        }
+                        upserts.push((node_id, vector));
+                    }
+                    _ if self.registry.holds(&def.label, property, node_id) => {
                         self.registry
                             .on_vector_removed(&def.label, property, node_id);
+                        if let Some(revision) = revision {
+                            self.registry.mark(
+                                (&def.label, property),
+                                revision,
+                                node_id.as_raw(),
+                                None,
+                            );
+                        }
                     }
-                    None => {}
+                    _ => {}
                 }
             }
             // A write is refused before it commits a vector its index cannot
@@ -310,9 +373,16 @@ impl Worker {
         if members.is_empty() {
             return Some(covered);
         }
-        for (_, _, health, _, _) in &members {
+        for (def, _, health, _, carriers) in &members {
             // Incomplete until the build hands it over again.
             health.report_rebuild_progress(0.0, 0);
+            // Filled with these carriers' members alone from here.
+            for (id, _) in self.registry.moved(&def.label, def.property()) {
+                self.registry
+                    .on_vector_removed(&def.label, def.property(), NodeId::from_raw(id));
+            }
+            self.registry
+                .record_built(&def.label, def.property(), carriers.clone());
         }
         let targets: Vec<BuildTarget<'_>> = members
             .iter()
@@ -347,6 +417,230 @@ impl Worker {
                 None
             }
         }
+    }
+}
+
+/// The interpretations of its label a fold judges a node's membership in an
+/// index by.
+enum Interpretations {
+    /// The carriers in force alone: an index without a record of its own.
+    In(Option<LabelCarriers>),
+    /// What the index holds: its base and, while it follows a change of
+    /// what a type implies, the candidate.
+    Held {
+        base: Option<LabelCarriers>,
+        candidate: Option<Option<LabelCarriers>>,
+    },
+}
+
+impl Interpretations {
+    fn of(held: &Held) -> Self {
+        Self::Held {
+            base: held.base.clone().flatten(),
+            candidate: held.candidate.as_ref().map(|(c, _)| c.clone()),
+        }
+    }
+
+    /// Whether a node storing `stored` is a member, and if so, the one
+    /// interpretation alone carrying it: `None` for not a member,
+    /// `Some(None)` for one of both.
+    fn scope(&self, stored: &[LabelId]) -> Option<Option<Scope>> {
+        let carried = |c: &Option<LabelCarriers>| c.as_ref().is_some_and(|c| c.carried_by(stored));
+        match self {
+            Self::In(carriers)
+            | Self::Held {
+                base: carriers,
+                candidate: None,
+            } => carried(carriers).then_some(None),
+            Self::Held {
+                base,
+                candidate: Some(candidate),
+            } => match (carried(base), carried(candidate)) {
+                (true, true) => Some(None),
+                (true, false) => Some(Some(Scope::Retired)),
+                (false, true) => Some(Some(Scope::Gained)),
+                (false, false) => None,
+            },
+        }
+    }
+}
+
+impl Worker {
+    /// [`Self::sync_selections`], a failure logged: searches stay exact
+    /// meanwhile, reading from the store what the indexes do not hold, and
+    /// the next wake-up tries again.
+    fn sync_selections_logged(&self) -> bool {
+        self.sync_selections().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "vector index worker could not follow a change of what a type implies");
+            false
+        })
+    }
+
+    /// Bring every index in line with the interpretations the catalog holds
+    /// of its label: while a change of what a type implies is certified,
+    /// keep the members of the candidate beside those in force; once it
+    /// ended, bring them back to the one now in force. Whether an index
+    /// holds neither, which only a rebuild brings back.
+    fn sync_selections(&self) -> Result<bool, String> {
+        use coordinode_query::index::membership::{CatalogMembership, label_carriers_in};
+        let definitions = self.registry.all_definitions();
+        if definitions.is_empty() {
+            return Ok(false);
+        }
+        let mut rebuild = false;
+        // One catalog state for every index: the facts in force and the
+        // candidates are never of two different commits.
+        let (snapshot, _pin) = self.engine.pin_latest_snapshot();
+        for def in &definitions {
+            let property = def.property();
+            let failed = |e: coordinode_modality::StoreError| {
+                format!("read the carriers of :{}: {e}", def.label)
+            };
+            let in_force = label_carriers_in(
+                &self.engine,
+                &def.label,
+                &mut CatalogMembership::at(&self.engine, snapshot),
+            )
+            .map_err(failed)?;
+            let candidate = label_carriers_in(
+                &self.engine,
+                &def.label,
+                &mut CatalogMembership::candidates_at(&self.engine, snapshot),
+            )
+            .map_err(failed)?;
+            // An index without a record is filled by its own build.
+            let Some((held, revision)) = self.registry.held_at(&def.label, property) else {
+                continue;
+            };
+            let base_holds = held.base.as_ref() == Some(&in_force);
+            if candidate != in_force {
+                // A change is certified: the index keeps both.
+                if !base_holds {
+                    // It holds neither: a rebuild writes it afresh.
+                    rebuild = true;
+                    continue;
+                }
+                if held.candidate != Some((candidate.clone(), true)) {
+                    self.prepare(def, revision, (&in_force, &candidate))?;
+                }
+                continue;
+            }
+            match held.candidate {
+                None if base_holds => {}
+                // The change the index followed was put in force.
+                Some((followed, true)) if followed == in_force => {
+                    self.registry.settle_change(
+                        (&def.label, property),
+                        revision,
+                        Scope::Retired,
+                        in_force,
+                    );
+                }
+                // It was withdrawn: the facts the index's base holds stay.
+                Some(_) if base_holds => {
+                    self.registry.settle_change(
+                        (&def.label, property),
+                        revision,
+                        Scope::Gained,
+                        in_force,
+                    );
+                }
+                // The index holds neither: a rebuild writes it afresh.
+                _ => rebuild = true,
+            }
+        }
+        Ok(rebuild)
+    }
+
+    /// Insert every stored member of `def`'s label only the candidate
+    /// carries and record the ones only the facts in force carry, so
+    /// searches under either leave the other's out; then record the index
+    /// holding the candidate. Begun only while the index's record is at
+    /// `revision`, and each later step only while it is at the revision the
+    /// beginning set: a rebuild or another change meanwhile ends the pass.
+    fn prepare(
+        &self,
+        def: &coordinode_query::index::IndexDefinition,
+        revision: u64,
+        (in_force, candidate): (&Option<LabelCarriers>, &Option<LabelCarriers>),
+    ) -> Result<(), String> {
+        let property = def.property();
+        let Some(guard) = self.registry.begin_change(
+            (&def.label, property),
+            revision,
+            in_force.clone(),
+            candidate.clone(),
+        ) else {
+            return Ok(());
+        };
+        let interpretations = Interpretations::Held {
+            base: in_force.clone(),
+            candidate: Some(candidate.clone()),
+        };
+        let interner = self
+            .fields
+            .view()
+            .map_err(|e| format!("read the field dictionary: {e}"))?;
+        let Some(field) = interner.lookup(property) else {
+            // No node holds the property: nothing to keep apart.
+            self.registry.finish_change((&def.label, property), guard);
+            return Ok(());
+        };
+        let read = Transaction::new(&self.engine, None, Timestamp::ZERO, None);
+        let mut gained: Vec<(NodeId, Vec<f32>)> = Vec::new();
+        let insert = |gained: &mut Vec<(NodeId, Vec<f32>)>| {
+            self.registry
+                .on_vectors_written(&def.label, property, std::mem::take(gained))
+                .map_err(|e| coordinode_modality::StoreError::Invariant(e.to_string()))
+        };
+        // Set when the pass stops early, the worker stopping or the record
+        // moving on: what it marked and inserted stays under a revision no
+        // search answers the candidate with until a later pass finishes.
+        let mut interrupted = false;
+        let scanned =
+            LocalNodeStore.for_each_in_shard(&read, self.shard_id, &mut |node_id, record| {
+                let Some(Some(scope)) = interpretations.scope(&record.labels) else {
+                    return Ok(());
+                };
+                let Some(vector) = record
+                    .props
+                    .get(&field)
+                    .and_then(crate::db::try_extract_vector)
+                else {
+                    return Ok(());
+                };
+                if self.stop.is_cancelled()
+                    || !self.registry.mark(
+                        (&def.label, property),
+                        guard,
+                        node_id.as_raw(),
+                        Some(scope),
+                    )
+                {
+                    interrupted = true;
+                    return Err(coordinode_modality::StoreError::Invariant(
+                        "the pass was interrupted".to_string(),
+                    ));
+                }
+                if scope == Scope::Gained {
+                    gained.push((node_id, vector));
+                    if gained.len() >= BATCH {
+                        insert(&mut gained)?;
+                    }
+                }
+                Ok(())
+            });
+        drop(read);
+        if interrupted {
+            return Ok(());
+        }
+        scanned.map_err(|e| format!("scan the nodes of :{}: {e}", def.label))?;
+        insert(&mut gained).map_err(|e| format!("index :{}({property}): {e}", def.label))?;
+        // Writes applied while the pass ran are folded under both
+        // interpretations by this worker after it, and searches read them
+        // from the store until then.
+        self.registry.finish_change((&def.label, property), guard);
+        Ok(())
     }
 }
 

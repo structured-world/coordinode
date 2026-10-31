@@ -1718,6 +1718,56 @@ fn search_with_visibility_expansion_rounds() {
     assert!(stats.candidates_fetched > 5);
 }
 
+/// The k nearest admitted nodes are found even when every node near the
+/// query is not admitted and the beam is far smaller than the run of them:
+/// those nodes only lead the search on. A fixed beam searched first and
+/// filtered after would find none of them here.
+#[test]
+fn an_admitting_search_finds_the_nearest_admitted_nodes_past_a_beam_of_others() {
+    let mut index = HnswIndex::new(HnswConfig {
+        metric: coordinode_core::graph::types::VectorMetric::L2,
+        ef_search: 10,
+        ..HnswConfig::default()
+    });
+    for i in 0..3000u64 {
+        index.insert(i, vec![i as f32, 0.0]);
+    }
+    let admitted = |id: u64| id.is_multiple_of(100);
+    let query = [1550.0, 0.0];
+    let found = unmetered(index.search_admitting_metered(&query, 5, admitted, &mut Unmetered))
+        .expect("searchable");
+    let mut expected: Vec<u64> = (0..3000u64).filter(|&id| admitted(id)).collect();
+    expected.sort_by(|a, b| {
+        let da = (*a as f32 - 1550.0).abs();
+        let db = (*b as f32 - 1550.0).abs();
+        da.total_cmp(&db).then(a.cmp(b))
+    });
+    expected.truncate(5);
+    let ids: Vec<u64> = found.iter().map(|r| r.id).collect();
+    assert_eq!(ids, expected, "the nearest admitted nodes, nearest first");
+}
+
+/// Admitting every node answers as the plain search does, and admitting
+/// none answers with nothing.
+#[test]
+fn an_admitting_search_of_all_or_none_answers_as_expected() {
+    let mut index = HnswIndex::new(HnswConfig {
+        metric: coordinode_core::graph::types::VectorMetric::L2,
+        ..HnswConfig::default()
+    });
+    for i in 0..500u64 {
+        index.insert(i, vec![(i % 37) as f32, (i / 37) as f32]);
+    }
+    let query = [11.3, 4.7];
+    let plain = index.search(&query, 10);
+    let all = unmetered(index.search_admitting_metered(&query, 10, |_| true, &mut Unmetered))
+        .expect("searchable");
+    assert_eq!(all, plain);
+    let none = unmetered(index.search_admitting_metered(&query, 10, |_| false, &mut Unmetered))
+        .expect("searchable");
+    assert!(none.is_empty());
+}
+
 #[test]
 fn search_with_visibility_empty_index() {
     let index = HnswIndex::new(HnswConfig::default());

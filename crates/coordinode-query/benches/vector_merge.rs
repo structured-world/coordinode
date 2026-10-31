@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use coordinode_cluster::{PartitionSet, VectorShardRouter};
 use coordinode_core::budget::Unmetered;
 use coordinode_core::graph::types::VectorMetric;
+use coordinode_query::index::vector_registry::Reader;
 use coordinode_query::index::{
     GenerationId, IndexDescriptor, IndexId, VectorIndexConfig, VectorIndexRegistry,
 };
@@ -114,7 +115,13 @@ fn measure(label: &str, registry: &VectorIndexRegistry, queries: &[Vec<f32>]) {
         .map(|i| {
             let start = Instant::now();
             let hits = registry
-                .search("V", "e", &queries[i % queries.len()], K, &mut Unmetered)
+                .search(
+                    ("V", "e"),
+                    Reader::Any,
+                    &queries[i % queries.len()],
+                    K,
+                    &mut Unmetered,
+                )
                 .expect("an evaluable query")
                 .expect("the index");
             let took = start.elapsed();

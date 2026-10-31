@@ -462,6 +462,142 @@ fn an_implication_changed_there_and_back_answers_each_state() {
     }
 }
 
+/// Titles of the `k` things nearest `[1, 0]` through the vector index on
+/// `:Thing(emb)`, nearest first; read at `as_of` when given.
+fn nearest_things(db: &mut Database, k: usize, as_of: Option<u64>) -> Vec<String> {
+    let as_of = as_of.map_or(String::new(), |ts| format!(" AS OF TIMESTAMP {ts}"));
+    let query = format!(
+        "MATCH (n:Thing) WITH n, vector_distance(n.emb, [1.0, 0.0]) AS d \
+         ORDER BY d LIMIT {k} RETURN n.title AS title{as_of}"
+    );
+    let plan = db.explain_cypher(&query).expect("explain");
+    assert!(plan.contains("HnswScan("), "not the index path:\n{plan}");
+    db.execute_cypher(&query)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .iter()
+        .map(|row| match row.get("title") {
+            Some(Value::String(title)) => title.clone(),
+            other => panic!("title {other:?}"),
+        })
+        .collect()
+}
+
+/// Wait until the vector index on `:Thing(emb)` holds the carriers of
+/// `:Thing` now in force, and nothing of another interpretation.
+fn await_vector_settled(db: &Database, what: &str) {
+    let in_force = coordinode_query::index::membership::label_carriers(db.engine(), "Thing")
+        .expect("carriers");
+    let want = Some(coordinode_query::index::selection::Held::built(in_force));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while db.vector_index_registry().held("Thing", "emb") != want {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: the vector index never settled: {:?}",
+            db.vector_index_registry().held("Thing", "emb")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A vector index on a label whose carriers a change of what a type implies
+/// moves follows the change instead of refusing it. The nodes nearest the
+/// query, the type's nodes far nearer than the label's own, are searched
+/// through the index at each state: before the change and at a timestamp
+/// before it, the label's own things alone; after it, the tasks too; and
+/// after the implication is dropped again, the things alone. The index
+/// itself comes to hold each interpretation in force, so the reads are its
+/// own and not the store's.
+#[test]
+fn a_vector_index_follows_a_change_of_what_a_type_implies() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "ALTER LABEL Thing SET SCHEMA FLEXIBLE",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "ALTER LABEL Task SET SCHEMA FLEXIBLE",
+        r#"CREATE VECTOR INDEX thing_emb ON :Thing(emb) OPTIONS {metric: "l2"}"#,
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    // Tasks lie nearer the query than every thing, so a search that kept
+    // them out by discarding a beam of nearest nodes would find nothing.
+    for i in 0..40 {
+        db.execute_cypher(&format!(
+            "CREATE (:Task {{title: 'task{i:02}', emb: [1.0, {}]}})",
+            f64::from(i) * 0.001
+        ))
+        .expect("task");
+    }
+    for i in 0..5 {
+        db.execute_cypher(&format!(
+            "CREATE (:Thing {{title: 'thing{i}', emb: [{}, 1.0]}})",
+            -f64::from(i)
+        ))
+        .expect("thing");
+    }
+    let things: Vec<String> = (0..3).map(|i| format!("thing{i}")).collect();
+    let tasks: Vec<String> = (0..3).map(|i| format!("task{i:02}")).collect();
+    await_vector_settled(&db, "built");
+    assert_eq!(nearest_things(&mut db, 3, None), things, "before");
+
+    let before = commit(
+        &mut db,
+        "CREATE (:Thing {title: 'far', emb: [-100.0, 0.0]})",
+    );
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("a vector index follows the change");
+    await_folded(&db);
+    await_vector_settled(&db, "gained");
+    assert_eq!(nearest_things(&mut db, 3, None), tasks, "after");
+    assert_eq!(
+        nearest_things(&mut db, 3, Some(before)),
+        things,
+        "read at a timestamp before the change"
+    );
+
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES ()")
+        .expect("dropped");
+    await_folded(&db);
+    await_vector_settled(&db, "lost");
+    assert_eq!(nearest_things(&mut db, 3, None), things, "dropped again");
+}
+
+/// A change refused by its proof leaves a vector index answering as before:
+/// the members it kept for the withdrawn candidate leave the graph, and a
+/// search through the index finds the label's own things alone.
+#[test]
+fn a_vector_index_drops_what_a_refused_change_kept() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "ALTER LABEL Thing SET SCHEMA FLEXIBLE",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "ALTER LABEL Task SET SCHEMA FLEXIBLE",
+        r#"CREATE VECTOR INDEX thing_emb ON :Thing(emb) OPTIONS {metric: "l2"}"#,
+        "CREATE CONSTRAINT thing_title FOR (n:Thing) REQUIRE n.title IS UNIQUE",
+        "CREATE (:Thing {title: 'same', emb: [0.0, 1.0]})",
+        "CREATE (:Thing {title: 'thing', emb: [-1.0, 1.0]})",
+        "CREATE (:Task {title: 'same', emb: [1.0, 0.0]})",
+        "CREATE (:Task {title: 'task', emb: [1.0, 0.001]})",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    await_vector_settled(&db, "built");
+    let err = refused(&mut db, "ALTER NODE TYPE Task SET IMPLIES (Thing)");
+    assert!(err.contains("same") || err.contains("unique"), "{err}");
+    await_folded(&db);
+    await_vector_settled(&db, "withdrawn");
+    assert!(
+        db.vector_index_registry().moved("Thing", "emb").is_empty(),
+        "nothing kept apart"
+    );
+    assert_eq!(nearest_things(&mut db, 5, None), ["same", "thing"]);
+}
+
 /// One schema package moving a value's holder out of a label and another
 /// into it: Chore stops implying Thing while Task starts, a Chore and a Task
 /// holding the same title under a uniqueness on Thing. Each interpretation

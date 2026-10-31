@@ -25,8 +25,19 @@ use coordinode_vector::storage::{VectorTierHandle, VectorTierStorage};
 use super::coverage::{IndexCoverage, IndexDelta};
 use super::definition::{GenerationId, IndexDefinition};
 
+mod selection;
+
+pub use selection::Reader;
+
 /// Key for vector index lookup: (label, property).
 type VectorIndexKey = (String, String);
+
+/// What a search goes by beside its query: the loader reranking from disk,
+/// and which members it may return (all of them without one).
+type SearchWith<'a> = (
+    Option<&'a dyn VectorLoader>,
+    Option<&'a dyn Fn(u64) -> bool>,
+);
 
 /// Thread-safe handle to an HNSW index. Searches and inserts share the lock;
 /// the exclusive side is for the transitions that rewrite every node at once
@@ -197,6 +208,12 @@ pub struct VectorIndexRegistry {
     /// The writes the indexes have not folded, when a worker maintains them
     /// from the applied entries; a registry without one serves what it holds.
     coverage: RwLock<Option<Arc<IndexCoverage>>>,
+    /// The interpretations of its label each index holds, recorded by what
+    /// filled it; an index without a record answers every reader whole.
+    selections: RwLock<HashMap<VectorIndexKey, selection::Selection>>,
+    /// Numbers each change of a record in [`Self::selections`], so a pass
+    /// begun under one record never finishes under another.
+    revisions: std::sync::atomic::AtomicU64,
 }
 
 /// A running backfill: the flag that stops it and the thread to join.
@@ -249,6 +266,8 @@ impl VectorIndexRegistry {
             builds: Mutex::new(HashMap::new()),
             retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
             coverage: RwLock::new(None),
+            selections: RwLock::new(HashMap::new()),
+            revisions: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -272,6 +291,8 @@ impl VectorIndexRegistry {
             builds: Mutex::new(HashMap::new()),
             retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
             coverage: RwLock::new(None),
+            selections: RwLock::new(HashMap::new()),
+            revisions: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -442,6 +463,7 @@ impl VectorIndexRegistry {
         };
         let health = HealthSignal::new_ready();
         health.report_rebuild_progress(0.0, 0);
+        self.forget_selection(&key);
         self.indexes
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -464,6 +486,7 @@ impl VectorIndexRegistry {
             return;
         };
         let key = (def.label.clone(), def.property().to_string());
+        self.forget_selection(&key);
         self.indexes
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -554,6 +577,7 @@ impl VectorIndexRegistry {
             .collect();
 
         let key = (def.label.clone(), def.property().to_string());
+        self.forget_selection(&key);
         self.sharded
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -622,7 +646,7 @@ impl VectorIndexRegistry {
         layout: &ShardedLayout,
         query: &[f32],
         k: usize,
-        loader: Option<&dyn VectorLoader>,
+        (loader, admits): SearchWith<'_>,
         meter: &mut M,
     ) -> Result<Vec<SearchResult>, SearchError<M::Stop>> {
         let parts = layout.router.route(query, layout.shards.len());
@@ -634,54 +658,11 @@ impl VectorIndexRegistry {
             let Ok(hnsw) = handle.read() else {
                 continue;
             };
-            let results = match loader {
-                Some(l) => hnsw.search_with_loader_metered(query, k, l, meter)?,
-                None => hnsw.search_metered(query, k, meter)?,
+            let results = match (admits, loader) {
+                (Some(admits), _) => hnsw.search_admitting_metered(query, k, admits, meter)?,
+                (None, Some(l)) => hnsw.search_with_loader_metered(query, k, l, meter)?,
+                (None, None) => hnsw.search_metered(query, k, meter)?,
             };
-            meter
-                .scratch(merged_bytes(&results))
-                .map_err(SearchError::Stopped)?;
-            Self::accumulate_best(&mut best, results);
-        }
-        Ok(Self::finalize_merge(best, k))
-    }
-
-    /// Scatter-gather filtered (ACORN-style) search over a sharded layout: the
-    /// same `is_visible` predicate runs on every routed partition, results
-    /// merge by ascending score with dedup-by-id. The predicate is keyed by
-    /// node id, so it is partition-independent and shared by reference across
-    /// the routed partitions.
-    #[allow(clippy::too_many_arguments)]
-    fn search_visibility_sharded<F, M: Meter>(
-        &self,
-        layout: &ShardedLayout,
-        query: &[f32],
-        k: usize,
-        overfetch_factor: f64,
-        max_expansion_rounds: usize,
-        is_visible: F,
-        meter: &mut M,
-    ) -> Result<Vec<SearchResult>, SearchError<M::Stop>>
-    where
-        F: Fn(u64) -> bool,
-    {
-        let parts = layout.router.route(query, layout.shards.len());
-        let mut best: HashMap<u64, f64> = HashMap::new();
-        for &p in &parts {
-            let Some(handle) = layout.shards.get(p as usize) else {
-                continue;
-            };
-            let Ok(hnsw) = handle.read() else {
-                continue;
-            };
-            let (results, _stats) = hnsw.search_with_visibility_metered(
-                query,
-                k,
-                overfetch_factor,
-                max_expansion_rounds,
-                &is_visible,
-                meter,
-            )?;
             meter
                 .scratch(merged_bytes(&results))
                 .map_err(SearchError::Stopped)?;
@@ -739,6 +720,7 @@ impl VectorIndexRegistry {
     pub fn register_with_index(&self, def: IndexDefinition, hnsw: HnswIndex) {
         hnsw.set_retired_bytes_budget(self.retired_bytes_budget());
         let key = (def.label.clone(), def.property().to_string());
+        self.forget_selection(&key);
         self.indexes
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -758,6 +740,7 @@ impl VectorIndexRegistry {
     /// Uses interior mutability — safe to call via `&self`.
     pub fn unregister(&self, label: &str, property: &str) {
         let key = (label.to_string(), property.to_string());
+        self.forget_selection(&key);
         self.indexes
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -1299,12 +1282,17 @@ impl VectorIndexRegistry {
         if self.build_owns_writes(label, property) {
             return;
         }
+        self.remove_member(label, property, node_id.as_raw());
+    }
+
+    /// Take `id` out of every graph of the index of `(label, property)`.
+    fn remove_member(&self, label: &str, property: &str, id: u64) {
         {
             let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
             if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
                 for shard in &layout.shards {
                     if let Ok(graph) = shard.read() {
-                        graph.remove(node_id.as_raw());
+                        graph.remove(id);
                     }
                 }
                 return;
@@ -1313,7 +1301,7 @@ impl VectorIndexRegistry {
         if let Some(handle) = self.get(label, property)
             && let Ok(graph) = handle.read()
         {
-            graph.remove(node_id.as_raw());
+            graph.remove(id);
         }
     }
 
@@ -1344,39 +1332,58 @@ impl VectorIndexRegistry {
     /// cannot evaluate.
     pub fn search<M: Meter>(
         &self,
-        label: &str,
-        property: &str,
+        (label, property): (&str, &str),
+        reader: Reader<'_>,
         query: &[f32],
         k: usize,
         meter: &mut M,
     ) -> Result<Option<Vec<SearchResult>>, SearchError<M::Stop>> {
-        self.search_with_loader(label, property, query, k, None, meter)
+        self.search_with_loader((label, property), reader, query, k, None, meter)
     }
 
     /// Search with optional VectorLoader for disk-backed f32 reranking,
-    /// reporting the search's progress to `meter`.
+    /// reporting the search's progress to `meter`, answering `reader` with
+    /// its own interpretation of the label.
     ///
     /// When the HNSW index has offloaded f32 vectors, the loader provides
     /// them on-demand for exact reranking. Falls back to in-memory search
-    /// when no loader is provided or vectors are not offloaded.
+    /// when no loader is provided or vectors are not offloaded. `Ok(None)`
+    /// when there is no such index or it does not hold the reader's
+    /// interpretation, which the store answers then.
     ///
     /// # Errors
     ///
-    /// As [`Self::search`].
+    /// The stop `meter` returned, or a query or candidate the index's metric
+    /// cannot evaluate.
     pub fn search_with_loader<M: Meter>(
         &self,
-        label: &str,
-        property: &str,
+        (label, property): (&str, &str),
+        reader: Reader<'_>,
         query: &[f32],
         k: usize,
         loader: Option<&dyn VectorLoader>,
+        meter: &mut M,
+    ) -> Result<Option<Vec<SearchResult>>, SearchError<M::Stop>> {
+        self.with_admission((label, property), reader, |admits| {
+            self.search_admitted((label, property), query, k, (loader, admits), meter)
+        })
+    }
+
+    /// The `k` nearest members of `(label, property)`'s index that `admits`
+    /// takes, all of them without it.
+    fn search_admitted<M: Meter>(
+        &self,
+        (label, property): (&str, &str),
+        query: &[f32],
+        k: usize,
+        (loader, admits): SearchWith<'_>,
         meter: &mut M,
     ) -> Result<Option<Vec<SearchResult>>, SearchError<M::Stop>> {
         {
             let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
             if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
                 return self
-                    .search_sharded(layout, query, k, loader, meter)
+                    .search_sharded(layout, query, k, (loader, admits), meter)
                     .map(Some);
             }
         }
@@ -1386,74 +1393,40 @@ impl VectorIndexRegistry {
         let Ok(hnsw) = handle.read() else {
             return Ok(None);
         };
-        match loader {
-            Some(loader) => hnsw.search_with_loader_metered(query, k, loader, meter),
-            None => hnsw.search_metered(query, k, meter),
+        match (admits, loader) {
+            (Some(admits), _) => hnsw.search_admitting_metered(query, k, admits, meter),
+            (None, Some(loader)) => hnsw.search_with_loader_metered(query, k, loader, meter),
+            (None, None) => hnsw.search_metered(query, k, meter),
         }
         .map(Some)
     }
 
-    /// HNSW top-K with a per-node visibility predicate (ACORN-style filtered
-    /// search). The closure is called for every candidate the traversal
-    /// considers; returning `false` prunes that branch. `overfetch_factor`
-    /// scales the in-search candidate window, `max_expansion_rounds` caps
-    /// how many times the inner loop expands when too many candidates fail
-    /// the predicate. Returns `None` when no index exists for `(label,
-    /// property)`.
-    ///
-    /// The HNSW engine never panics inside the closure: if the predicate
-    /// throws (caller-side bug) the search returns whatever it had so far.
-    /// The search's progress is reported to `meter`, which can stop it.
+    /// HNSW top-K of the members `is_visible` takes (filtered search): a
+    /// member it refuses still leads the traversal on but is never a result,
+    /// so the search ends with `k` visible members whenever the graph holds
+    /// them. Answers `reader` with its own interpretation of the label, as
+    /// [`Self::search_with_loader`] does. The search's progress is reported
+    /// to `meter`, which can stop it.
     ///
     /// # Errors
     ///
-    /// As [`Self::search`].
-    #[allow(clippy::too_many_arguments)]
+    /// As [`Self::search_with_loader`].
     pub fn search_with_visibility<F, M: Meter>(
         &self,
-        label: &str,
-        property: &str,
+        (label, property): (&str, &str),
+        reader: Reader<'_>,
         query: &[f32],
         k: usize,
-        overfetch_factor: f64,
-        max_expansion_rounds: usize,
         is_visible: F,
         meter: &mut M,
     ) -> Result<Option<Vec<SearchResult>>, SearchError<M::Stop>>
     where
         F: Fn(u64) -> bool,
     {
-        {
-            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
-                return self
-                    .search_visibility_sharded(
-                        layout,
-                        query,
-                        k,
-                        overfetch_factor,
-                        max_expansion_rounds,
-                        is_visible,
-                        meter,
-                    )
-                    .map(Some);
-            }
-        }
-        let Some(handle) = self.get(label, property) else {
-            return Ok(None);
-        };
-        let Ok(hnsw) = handle.read() else {
-            return Ok(None);
-        };
-        let (results, _stats) = hnsw.search_with_visibility_metered(
-            query,
-            k,
-            overfetch_factor,
-            max_expansion_rounds,
-            is_visible,
-            meter,
-        )?;
-        Ok(Some(results))
+        self.with_admission((label, property), reader, |admits| {
+            let both = |id: u64| admits.is_none_or(|admits| admits(id)) && is_visible(id);
+            self.search_admitted((label, property), query, k, (None, Some(&both)), meter)
+        })
     }
 
     /// Bulk-insert multiple vectors into a specific HNSW index.

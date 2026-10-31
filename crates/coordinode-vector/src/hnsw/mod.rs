@@ -2665,6 +2665,66 @@ impl HnswIndex {
         Ok(ranked)
     }
 
+    /// [`Self::search_metered`] answering only with the nodes whose external
+    /// id `admits` takes. The others are still traversed, as bridges to the
+    /// admitted nodes beyond them, but never fill the beam: the search ends
+    /// with as many admitted nodes as an unfiltered one ends with nodes,
+    /// whenever the graph holds them, instead of discarding a fixed beam's
+    /// worth after it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::search_metered`].
+    pub fn search_admitting_metered<F, M: Meter>(
+        &self,
+        query: &[f32],
+        k: usize,
+        admits: F,
+        meter: &mut M,
+    ) -> Result<Vec<SearchResult>, SearchError<M::Stop>>
+    where
+        F: Fn(u64) -> bool,
+    {
+        let exact = self.exact_query(query)?;
+        let _op = self.begin_operation();
+        let qctx = QueryCtx::new(
+            query,
+            self.config.metric,
+            self.rabitq_params.as_ref(),
+            &self.config.quantization,
+            self.wide_for(query),
+        );
+        let Some((start_idx, top_level)) = self.entry_point.for_search() else {
+            return Ok(Vec::new());
+        };
+        let mut current_ep = start_idx;
+        for level in (1..=top_level).rev() {
+            current_ep = self
+                .search_layer_greedy_ctx(&qctx, current_ep, level, meter)
+                .map_err(SearchError::Stopped)?;
+        }
+        let mut ef = self.config.ef_search.max(k);
+        if self.is_quantized() {
+            ef = ef.max(self.config.rerank_candidates);
+        }
+        // A retired or free node is no result either: it is left out of the
+        // beam here rather than after it.
+        let store = self.data_level0.get();
+        let result = |idx: usize| {
+            store.is_none_or(|store| store.state(idx).is_linkable()) && admits(self.node_id(idx))
+        };
+        let mut candidates = self
+            .search_layer_ctx_admitting(&qctx, current_ep, ef, 0, &result, meter)
+            .map_err(SearchError::Stopped)?;
+        self.exact_band(&qctx, &mut candidates, k);
+        meter
+            .work(candidates.len() as u64)
+            .map_err(SearchError::Stopped)?;
+        let mut ranked = self.rank_exactly(&exact, candidates)?;
+        ranked.truncate(k);
+        Ok(ranked)
+    }
+
     /// Search with explicit mode selection. `SearchMode::Hnsw` matches
     /// `search()`; `SearchMode::Exact` performs a brute-force linear scan
     /// over every indexed vector and returns recall=1.0 top-k. Both modes
@@ -3113,22 +3173,39 @@ impl HnswIndex {
         level: usize,
         meter: &mut M,
     ) -> Result<Vec<Candidate>, M::Stop> {
+        self.search_layer_ctx_admitting(ctx, ep, ef, level, &|_| true, meter)
+    }
+
+    /// A layer pass returning only the nodes `admits` takes (by internal
+    /// index): every node it reaches still guides it, as a bridge to the
+    /// admitted ones beyond. The beam is filled with admitted nodes alone,
+    /// so it ends with `ef` of them when the reachable graph holds that many.
+    fn search_layer_ctx_admitting<M: Meter, A: Fn(usize) -> bool>(
+        &self,
+        ctx: &QueryCtx<'_>,
+        ep: usize,
+        ef: usize,
+        level: usize,
+        admits: &A,
+        meter: &mut M,
+    ) -> Result<Vec<Candidate>, M::Stop> {
         // One epoch pin for the whole layer pass, handed down to every
         // layer-0 list read and prefetch, so a visit pays no pin of its own.
         let guard = crossbeam_epoch::pin();
-        // Dispatch on the configured rerank policy. Inline (the legacy
-        // default) keeps the two-heap two-distance design that preserves
+        // Dispatch on the configured rerank policy. Inline (the default)
+        // keeps the two-heap two-distance design that preserves
         // glove-class recall. EndOfSearch / None drop the per-visit f32
         // call and reach much higher QPS at the cost of using a noisy
         // cheap threshold during traversal; see [`RerankMode`].
         match self.config.rerank_mode {
             RerankMode::Inline => {
-                self.search_layer_ctx_inline_rerank(ctx, ep, ef, level, &guard, meter)
+                self.search_layer_ctx_inline_rerank(ctx, ep, ef, level, admits, &guard, meter)
             }
-            RerankMode::EndOfSearch => {
-                self.search_layer_ctx_end_of_search_rerank(ctx, ep, ef, level, &guard, meter)
+            RerankMode::EndOfSearch => self
+                .search_layer_ctx_end_of_search_rerank(ctx, ep, ef, level, admits, &guard, meter),
+            RerankMode::None => {
+                self.search_layer_ctx_no_rerank(ctx, ep, ef, level, admits, &guard, meter)
             }
-            RerankMode::None => self.search_layer_ctx_no_rerank(ctx, ep, ef, level, &guard, meter),
         }
     }
 
@@ -3143,12 +3220,14 @@ impl HnswIndex {
     /// configured `compute_distance` (RaBitQ popcount when active) ranks
     /// as top-ef. Lowest cost per visit (one distance call, one Vec
     /// lookup); recall is bounded by the cheap estimator's accuracy.
-    fn search_layer_ctx_no_rerank<M: Meter>(
+    #[allow(clippy::too_many_arguments)]
+    fn search_layer_ctx_no_rerank<M: Meter, A: Fn(usize) -> bool>(
         &self,
         ctx: &QueryCtx<'_>,
         ep: usize,
         ef: usize,
         level: usize,
+        admits: &A,
         guard: &crossbeam_epoch::Guard,
         meter: &mut M,
     ) -> Result<Vec<Candidate>, M::Stop> {
@@ -3171,13 +3250,16 @@ impl HnswIndex {
             distance: ep_dist,
             idx: ep as u32,
         });
-        results.push(FarCandidate {
-            distance: ep_dist,
-            idx: ep as u32,
-        });
+        // A NaN bound (no result yet) gives way to any distance.
+        let mut farthest_dist = f32::NAN;
+        if admits(ep) {
+            results.push(FarCandidate {
+                distance: ep_dist,
+                idx: ep as u32,
+            });
+            farthest_dist = ep_dist;
+        }
         visited.check_and_mark(ep);
-
-        let mut farthest_dist = ep_dist;
 
         while let Some(closest) = candidates.pop() {
             // Standard HNSW termination (Malkov 2018, hnswlib `hnswalg.h`):
@@ -3239,6 +3321,10 @@ impl HnswIndex {
                         distance: dist,
                         idx: neighbor_idx as u32,
                     });
+                    // A node not admitted guides the pass but is no result.
+                    if !admits(neighbor_idx) {
+                        continue;
+                    }
                     if results.len() < ef {
                         results.push(FarCandidate {
                             distance: dist,
@@ -3279,12 +3365,14 @@ impl HnswIndex {
     /// §4). Per-visit cost during traversal drops to popcount + one Vec
     /// lookup; the exact-distance work is amortised to ef calls at the
     /// very end, instead of being paid per visit.
-    fn search_layer_ctx_end_of_search_rerank<M: Meter>(
+    #[allow(clippy::too_many_arguments)]
+    fn search_layer_ctx_end_of_search_rerank<M: Meter, A: Fn(usize) -> bool>(
         &self,
         ctx: &QueryCtx<'_>,
         ep: usize,
         ef: usize,
         level: usize,
+        admits: &A,
         guard: &crossbeam_epoch::Guard,
         meter: &mut M,
     ) -> Result<Vec<Candidate>, M::Stop> {
@@ -3296,7 +3384,7 @@ impl HnswIndex {
         let frontier_ef = ((ef as f32) * factor).ceil() as usize;
 
         let mut result_vec =
-            self.search_layer_ctx_no_rerank(ctx, ep, frontier_ef, level, guard, meter)?;
+            self.search_layer_ctx_no_rerank(ctx, ep, frontier_ef, level, admits, guard, meter)?;
 
         // End-of-search rerank: replace every candidate's distance with
         // the exact f32 value, then sort by it. This is the only place
@@ -3316,12 +3404,14 @@ impl HnswIndex {
         Ok(result_vec)
     }
 
-    fn search_layer_ctx_inline_rerank<M: Meter>(
+    #[allow(clippy::too_many_arguments)]
+    fn search_layer_ctx_inline_rerank<M: Meter, A: Fn(usize) -> bool>(
         &self,
         ctx: &QueryCtx<'_>,
         ep: usize,
         ef: usize,
         level: usize,
+        admits: &A,
         guard: &crossbeam_epoch::Guard,
         meter: &mut M,
     ) -> Result<Vec<Candidate>, M::Stop> {
@@ -3380,13 +3470,16 @@ impl HnswIndex {
             distance: cheap_ep,
             idx: ep as u32,
         });
-        results.push(FarCandidate {
-            distance: exact_ep,
-            idx: ep as u32,
-        });
+        // A NaN bound (no result yet) gives way to any distance.
+        let mut farthest_dist = f32::NAN;
+        if admits(ep) {
+            results.push(FarCandidate {
+                distance: exact_ep,
+                idx: ep as u32,
+            });
+            farthest_dist = exact_ep;
+        }
         visited.check_and_mark(ep);
-
-        let mut farthest_dist = exact_ep;
 
         while let Some(closest) = candidates.pop() {
             // Standard HNSW termination (Malkov 2018, hnswlib `hnswalg.h`):
@@ -3477,6 +3570,11 @@ impl HnswIndex {
                             distance: cheap_dist,
                             idx: neighbor_idx as u32,
                         });
+                        // A node not admitted guides the pass but is no
+                        // result.
+                        if !admits(neighbor_idx) {
+                            continue;
+                        }
 
                         // Fixed-length results: peek_mut + in-place swap when
                         // full, single push during fill. The push+pop pattern

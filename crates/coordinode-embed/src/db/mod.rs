@@ -1016,6 +1016,7 @@ impl Database {
         // The rebuild above covered what the store held; the worker keeps the
         // indexes current with every entry applied from here on.
         vector_index_registry.set_coverage(Arc::clone(&vector_coverage));
+        let vector_nudge = applied.nudger();
         let vector_worker = crate::vector_worker::VectorIndexWorker::spawn(
             Arc::clone(&engine),
             applied,
@@ -1043,9 +1044,11 @@ impl Database {
         )?);
         text_index_registry.set_coverage(Arc::clone(&text_coverage));
         // A change of what a type implies writes no node: the catalog watch
-        // wakes the worker for it.
-        let catalog_watch =
-            crate::catalog_watch::CatalogWatch::spawn(&engine, vec![text_applied.nudger()]);
+        // wakes the workers for it.
+        let catalog_watch = crate::catalog_watch::CatalogWatch::spawn(
+            &engine,
+            vec![text_applied.nudger(), vector_nudge],
+        );
         let text_worker = crate::text_worker::TextIndexWorker::spawn(
             Arc::clone(&engine),
             text_applied,
@@ -1356,6 +1359,11 @@ impl Database {
             members.push((def, field_id, hnsw, health, carriers));
         }
 
+        // Each graph is filled with the members of its label's carriers now,
+        // the interpretation it answers with.
+        for (def, _, _, _, carriers) in &members {
+            registry.record_built(&def.label, def.property(), carriers.clone());
+        }
         match mode {
             PopulateMode::Blocking => {
                 let targets: Vec<coordinode_query::index::BuildTarget<'_>> = members

@@ -72,8 +72,8 @@ fn search(
 ) -> Option<Vec<SearchResult>> {
     registry
         .search(
-            label,
-            property,
+            (label, property),
+            coordinode_query::index::vector_registry::Reader::Any,
             query,
             k,
             &mut coordinode_core::budget::Unmetered,
@@ -2149,8 +2149,8 @@ fn forced_offload_search_through_registry() {
     let reg = db.vector_index_registry();
     let results = reg
         .search_with_loader(
-            "Widget",
-            "vec",
+            ("Widget", "vec"),
+            coordinode_query::index::vector_registry::Reader::Any,
             &[0.0, 1.0, 0.5],
             5,
             Some(&loader),
