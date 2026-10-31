@@ -449,10 +449,28 @@ fn a_renamed_value_is_free_after_the_rename_only() {
 /// interval ends there.
 #[test]
 fn unique_values_meet_at_interval_bounds_past_and_future() {
+    meet_at_interval_bounds("resolved");
+}
+
+/// The same with the index's entries derived at apply instead of carried by
+/// the write.
+#[test]
+fn unique_values_meet_at_interval_bounds_under_derived_maintenance() {
+    meet_at_interval_bounds("derived");
+}
+
+/// A unique index on `:Emp(name)` kept under `maintenance`.
+fn unique_name_index(db: &mut Database, maintenance: &str) {
+    db.execute_cypher(&format!(
+        "CREATE UNIQUE INDEX emp_name_u ON :Emp(name) OPTIONS {{maintenance: '{maintenance}'}}"
+    ))
+    .expect("unique index");
+}
+
+fn meet_at_interval_bounds(maintenance: &str) {
     let mut db = open_db();
     let now = now_us();
-    db.execute_cypher("CREATE UNIQUE INDEX emp_name_u ON :Emp(name)")
-        .expect("unique index");
+    unique_name_index(&mut db, maintenance);
     let (a, b) = (now - 2 * YEAR, now - YEAR);
     create(&mut db, "ada", a, Some(b));
     refused_as_unique(
@@ -493,10 +511,19 @@ fn unique_values_meet_at_interval_bounds_past_and_future() {
 /// handover that would leave the two overlapping is refused whole.
 #[test]
 fn a_value_is_handed_over_in_one_transaction_in_either_order() {
+    hand_over_in_one_transaction("resolved");
+}
+
+/// The same under derived maintenance.
+#[test]
+fn a_value_is_handed_over_under_derived_maintenance() {
+    hand_over_in_one_transaction("derived");
+}
+
+fn hand_over_in_one_transaction(maintenance: &str) {
     let mut db = open_db();
     let now = now_us();
-    db.execute_cypher("CREATE UNIQUE INDEX emp_name_u ON :Emp(name)")
-        .expect("unique index");
+    unique_name_index(&mut db, maintenance);
     let (a, b) = (now - 2 * YEAR, now - YEAR);
     create(&mut db, "ada", a, None);
     let end = format!("MATCH (n:Emp) WHERE temporal_active_at(n, {a}) SET n.valid_to = {b}");
@@ -612,6 +639,38 @@ fn an_ordinary_holder_of_a_shared_label_holds_its_value_at_every_instant() {
         .expect("another temporal node after the first one's time");
     db.execute_cypher("CREATE (:Thing {name: 'free'})")
         .expect("a free value");
+}
+
+/// Ownership over valid time survives a reopen: after it, an overlap with a
+/// holder admitted before is still refused and a value meeting it at a
+/// bound is still admitted, under either maintenance.
+#[test]
+fn temporal_ownership_is_kept_across_a_reopen() {
+    for maintenance in ["resolved", "derived"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = now_us();
+        let (a, b) = (now - 2 * YEAR, now - YEAR);
+        {
+            let mut db = Database::open(dir.path()).expect("open");
+            db.execute_cypher(
+                "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+            )
+            .expect("temporal label");
+            unique_name_index(&mut db, maintenance);
+            create(&mut db, "ada", a, Some(b));
+        }
+        let mut db = Database::open(dir.path()).expect("reopen");
+        refused_as_unique(
+            db.execute_cypher(&format!(
+                "CREATE (n:Emp {{name: 'ada', valid_from: {}}})",
+                b - 1
+            )),
+            &format!("{maintenance}: an overlap after the reopen"),
+        );
+        create(&mut db, "ada", b, None);
+        assert_eq!(held_at(&mut db, a), ["ada"], "{maintenance}");
+        assert_eq!(held_at(&mut db, b), ["ada"], "{maintenance}");
+    }
 }
 
 /// A correction stretching a version over another node's interval is
