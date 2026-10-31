@@ -817,3 +817,45 @@ fn a_claim_set_keeps_one_of_each_and_grows_only_into_its_room() {
     assert_eq!(claims.by_scope.capacity(), table, "the index grew");
     assert_eq!(claims.room_for(0), 0);
 }
+
+/// Restating predicates in place keeps one of each: two bounds over one
+/// scope stated with different trends become one claim once both are given
+/// the trend the writes show, the first stated stays, and the set still
+/// finds a claim stated after that by its position, with no copy made.
+#[test]
+fn restating_in_place_keeps_one_of_each() {
+    let scope = incident(1, "OWNS", Direction::Outgoing);
+    let mut claims = set(vec![
+        Claim::new(
+            scope.clone(),
+            bounded(CardinalityBound::AtMostOne, CountTrend::Grows),
+            GEN,
+        ),
+        Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairInstanceWritten, GEN),
+        Claim::new(
+            scope.clone(),
+            bounded(CardinalityBound::AtMostOne, CountTrend::Shrinks),
+            GEN,
+        ),
+    ]);
+    let slots = claims.claims.capacity();
+    claims.restate(|_, predicate| {
+        if let ClaimPredicate::CardinalityBound { trend, .. } = predicate {
+            *trend = CountTrend::Changes;
+        }
+    });
+    assert_eq!(
+        claims.claims(),
+        [
+            Claim::new(scope.clone(), at_most_one(), GEN),
+            Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairInstanceWritten, GEN),
+        ]
+    );
+    assert_eq!(claims.claims.capacity(), slots, "restated in place");
+    assert!(!claims.insert(Claim::new(scope, at_most_one(), GEN)));
+    assert!(!claims.insert(Claim::new(
+        pair(1, 2, "OWNS"),
+        ClaimPredicate::PairInstanceWritten,
+        GEN
+    )));
+}

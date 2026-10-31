@@ -721,6 +721,35 @@ fn a_full_report_queue_drops_reports_but_keeps_marks() {
     assert_eq!(marked(&engine), vec![index.generation, other.generation]);
 }
 
+/// The report queue is bounded by its bytes as well as its count: a report's
+/// tuple can be as long as an index key, so a hundred reports of 60 KiB
+/// tuples reach the byte bound long before the count. Past it a report is
+/// dropped and flagged like one past the count; taking the queue frees its
+/// room for new ones.
+#[test]
+fn a_report_queue_holding_its_bytes_drops_reports_but_keeps_marks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    let long = |node: u64| Mismatch::Extra {
+        node,
+        valid_from: None,
+        tuple: vec![b'x'; 60 * 1024],
+    };
+    let fits = MAX_PENDING_REPORT_BYTES / (60 * 1024 + core::mem::size_of::<IntegrityReport>());
+    for node in 0..fits as u64 {
+        reg.report_mismatch(&engine, &index, long(node));
+    }
+    assert!(!reg.take_overflow());
+    reg.report_mismatch(&engine, &index, long(fits as u64));
+    assert!(reg.take_overflow(), "the drop is flagged");
+    assert_eq!(reg.take_reports(core::time::Duration::ZERO).len(), fits);
+    reg.report_mismatch(&engine, &index, long(fits as u64));
+    assert!(!reg.take_overflow(), "taking the queue freed its room");
+    assert_eq!(marked(&engine), vec![index.generation]);
+}
+
 /// A generation that left the catalog keeps a mark found here: a reader
 /// pinned to an older snapshot, plan or cursor may still reach its
 /// entries, and nothing says when the last one is gone.

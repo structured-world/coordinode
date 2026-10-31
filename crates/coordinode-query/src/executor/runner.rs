@@ -2720,30 +2720,32 @@ impl<'a> ExecutionContext<'a> {
         let field_of = |name: &str| interner.lookup(name);
         // Every byte a claim keeps is charged before it exists and stays
         // charged while the transaction holds the claim: its tuple, the one
-        // source an index's claims share, and the set's growth.
+        // source an index's claims share, and the set's growth. What a claim
+        // already held makes redundant is returned as it is dropped.
         let budget = coordinode_modality::index::WriteBudget::of(&self.txn);
         for claim in &self.key_claims.indexes[from..] {
             let building = matches!(claim.index.state, IndexState::Building { .. });
             let generation = claim.index.generation;
             let mut held = budget.get().empty_charge();
             let tuples = coordinode_modality::index::charged_tuples(&claim.values, &mut held)?;
+            let mut shared = held.empty_like();
             let uncovered = if building || claim.needs_source_proof {
-                let covered_through = if claim.needs_source_proof {
-                    None
-                } else {
-                    self.index_builds
-                        .and_then(|builds| builds.covered_through(generation))
+                let covered_through = match self.index_builds {
+                    Some(builds) if !claim.needs_source_proof => builds
+                        .covered_through(generation, &mut shared)
+                        .map_err(ExecutionError::Budget)?,
+                    _ => None,
                 };
                 // The shared allocation (two counts beside the source), and
                 // the heap the source owns: bytes about to exist.
-                held.grow(
-                    (2 * core::mem::size_of::<usize>()
-                        + core::mem::size_of::<UncoveredSource>()
-                        + claim.index.label.len()
-                        + claim.index.interpretation_bytes()
-                        + covered_through.as_ref().map_or(0, Vec::len)) as u64,
-                )
-                .map_err(ExecutionError::Budget)?;
+                shared
+                    .grow(
+                        (2 * core::mem::size_of::<usize>()
+                            + core::mem::size_of::<UncoveredSource>()
+                            + claim.index.label.len()
+                            + claim.index.interpretation_bytes()) as u64,
+                    )
+                    .map_err(ExecutionError::Budget)?;
                 Some(std::sync::Arc::new(UncoveredSource {
                     shard_id: self.shard_id,
                     label: claim.index.label.clone(),
@@ -2757,16 +2759,27 @@ impl<'a> ExecutionContext<'a> {
             self.txn
                 .reserve_claims(tuples.len())
                 .map_err(ExecutionError::Budget)?;
-            held.keep_until_query_ends();
+            // The tuples a claim takes stay charged; the list carrying them
+            // and the tuple of a claim already held go with this loop.
+            let mut retained = 0usize;
             for tuple in tuples {
-                self.txn.claim(Claim::new(
+                let len = tuple.len();
+                if self.txn.claim(Claim::new(
                     ClaimScope::UniqueValue { generation, tuple },
                     ClaimPredicate::UniqueHolder {
                         node: claim.node_id,
                         uncovered: uncovered.clone(),
                     },
                     revision,
-                ));
+                )) {
+                    retained += len;
+                }
+            }
+            held.shrink(held.bytes() - retained as u64);
+            held.keep_until_query_ends();
+            // The source stays charged while a claim holds it.
+            if uncovered.is_some_and(|source| std::sync::Arc::strong_count(&source) > 1) {
+                shared.keep_until_query_ends();
             }
         }
         Ok(())

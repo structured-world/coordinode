@@ -76,6 +76,8 @@ struct IntegrityView {
     trusted_from: FxHashMap<GenerationId, u64>,
     /// Disagreements found here, waiting to be recorded.
     reports: Vec<IntegrityReport>,
+    /// The bytes `reports` holds, each report with its tuple.
+    report_bytes: usize,
     /// A report was dropped at the bound: the maintenance finds the
     /// generations it would have named from the marks instead.
     overflowed: bool,
@@ -160,6 +162,21 @@ pub struct LocalCopyStatus {
 /// the generation stays suspect here, and the maintenance admits the checks
 /// they would have started from this member's marks.
 const MAX_PENDING_REPORTS: usize = 1024;
+
+/// The most bytes the reports waiting to be recorded hold, their tuples
+/// included: a report's tuple can be as long as an index key, so the count
+/// alone does not bound them. Past it new ones are dropped as past the count.
+const MAX_PENDING_REPORT_BYTES: usize = 4 << 20;
+
+/// The bytes a queued report holds.
+fn report_bytes(report: &IntegrityReport) -> usize {
+    let tuple = match &report.found {
+        Mismatch::Missing { tuple, .. }
+        | Mismatch::Extra { tuple, .. }
+        | Mismatch::SourceDuplicate { tuple, .. } => tuple.len(),
+    };
+    core::mem::size_of::<IntegrityReport>() + tuple
+}
 
 /// The indexes in force, by identity, and the names that bind them.
 #[derive(Default)]
@@ -480,9 +497,13 @@ impl IndexRegistry {
                 generation: index.generation,
                 found,
             };
+            let bytes = report_bytes(&report);
             if view.reports.contains(&report) {
-                // Already queued.
-            } else if view.reports.len() < MAX_PENDING_REPORTS {
+                // Already queued; this copy is dropped.
+            } else if view.reports.len() < MAX_PENDING_REPORTS
+                && view.report_bytes + bytes <= MAX_PENDING_REPORT_BYTES
+            {
+                view.report_bytes += bytes;
                 view.reports.push(report);
             } else {
                 view.overflowed = true;
@@ -584,6 +605,7 @@ impl IndexRegistry {
         if view.reports.is_empty() {
             self.reported.wait_for(&mut view, timeout);
         }
+        view.report_bytes = 0;
         core::mem::take(&mut view.reports)
     }
 

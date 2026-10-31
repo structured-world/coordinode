@@ -669,9 +669,24 @@ impl IndexBuildService {
 
     /// The last node key the backfill of `generation` running on this
     /// process has committed entries through; `None` when no executor here
-    /// runs it or it has committed no page yet.
-    pub fn covered_through(&self, generation: GenerationId) -> Option<Vec<u8>> {
-        self.shared.covered.lock().get(&generation).cloned()
+    /// runs it or it has committed no page yet. The copy returned is charged
+    /// to `held` before it is made.
+    ///
+    /// # Errors
+    ///
+    /// The budget's refusal.
+    pub fn covered_through(
+        &self,
+        generation: GenerationId,
+        held: &mut coordinode_core::budget::MemoryCharge<'_>,
+    ) -> Result<Option<Vec<u8>>, coordinode_core::budget::BudgetStop> {
+        let covered = self.shared.covered.lock();
+        let Some(key) = covered.get(&generation) else {
+            return Ok(None);
+        };
+        // Bytes of memory about to exist: fits in u64.
+        held.grow(key.len() as u64)?;
+        Ok(Some(key.clone()))
     }
 
     /// How the service runs builds now.

@@ -1625,9 +1625,13 @@ fn a_build_stopped_part_way_covers_some_owners_and_reads_the_rest() {
     builds.submit(def.generation).expect("submit");
     env.await_held_page();
 
+    let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
+    let mut held = budget.empty_charge();
     let covered = builds
-        .covered_through(def.generation)
+        .covered_through(def.generation, &mut held)
+        .expect("charged")
         .expect("the first page is covered");
+    assert_eq!(held.bytes(), covered.len() as u64, "the copy is charged");
     let key =
         |id: u64| coordinode_core::graph::node::encode_node_key(1, NodeId::from_raw(id)).to_vec();
     assert!(key(1) <= covered && covered < key(total), "{covered:?}");
@@ -1652,7 +1656,7 @@ fn a_build_stopped_part_way_covers_some_owners_and_reads_the_rest() {
         matches!(outcome, Some(IndexBuildOutcome::Published { .. })),
         "{outcome:?}"
     );
-    assert_eq!(builds.covered_through(def.generation), None);
+    assert_eq!(builds.covered_through(def.generation, &mut held), Ok(None));
     assert_eq!(env.holders(&def, "free@x"), vec![10_003]);
     assert_eq!(env.holders(&def, &format!("u{total}@x")), vec![total]);
 }

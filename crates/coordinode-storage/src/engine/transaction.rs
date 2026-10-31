@@ -1436,8 +1436,9 @@ impl<'a> Transaction<'a> {
     /// Called by the writer that knows the condition, as it writes: the
     /// storage layer sees keys and operands and cannot recover from them
     /// which graph predicate a mutation was constructed against.
-    pub fn claim(&mut self, claim: Claim) {
-        self.claims.insert(claim);
+    /// Whether it was added: a condition already stated is held once.
+    pub fn claim(&mut self, claim: Claim) -> bool {
+        self.claims.insert(claim)
     }
 
     /// Make room for `more` claims, the bytes the set grows by charged as a
@@ -1494,13 +1495,9 @@ impl<'a> Transaction<'a> {
         {
             return;
         }
-        // Moved, not copied: a claim's tuple is not duplicated to restate it.
-        let stated = std::mem::take(&mut self.claims).into_claims();
-        self.claims.reserve(stated.len());
-        for mut claim in stated {
-            let Claim {
-                scope, predicate, ..
-            } = &mut claim;
+        // In place: nothing is copied or allocated to restate the claims.
+        let (merge_adj_ops, write_buffer) = (&self.merge_adj_ops, &self.write_buffer);
+        self.claims.restate(|scope, predicate| {
             if let (
                 ClaimScope::Incident {
                     node,
@@ -1508,18 +1505,17 @@ impl<'a> Transaction<'a> {
                     direction,
                 },
                 ClaimPredicate::CardinalityBound { trend, .. },
-            ) = (&*scope, predicate)
+            ) = (scope, predicate)
             {
                 *trend = crate::engine::cardinality::scope_trend(
                     *node,
                     edge_type,
                     *direction,
-                    &self.merge_adj_ops,
-                    &self.write_buffer,
+                    merge_adj_ops,
+                    write_buffer,
                 );
             }
-            self.claims.insert(claim);
-        }
+        });
     }
 
     /// Whether this attempt stages anything the commit would write.

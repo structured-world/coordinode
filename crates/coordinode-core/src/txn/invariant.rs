@@ -662,21 +662,23 @@ impl ClaimSet {
         Self::default()
     }
 
-    /// Add a claim, keeping duplicates out. The same condition stated twice
-    /// by two statements of one attempt is one condition.
-    pub fn insert(&mut self, claim: Claim) {
+    /// Add a claim, keeping duplicates out: whether it was added. The same
+    /// condition stated twice by two statements of one attempt is one
+    /// condition; the copy stated again is dropped.
+    pub fn insert(&mut self, claim: Claim) -> bool {
         use core::hash::BuildHasher;
         let slots = self
             .by_scope
             .entry(rustc_hash::FxBuildHasher.hash_one(&claim.scope))
             .or_default();
         if slots.iter().any(|&at| self.claims[at as usize] == claim) {
-            return;
+            return false;
         }
         // A set of more than u32::MAX claims exhausts any guard budget long
         // before; the position fits.
         slots.push(self.claims.len() as u32);
         self.claims.push(claim);
+        true
     }
 
     /// The bytes holding `more` claims beside those held can take, at most:
@@ -714,9 +716,47 @@ impl ClaimSet {
         &self.claims
     }
 
-    /// The claims held, in the order they were stated, moved out.
-    pub fn into_claims(self) -> Vec<Claim> {
-        self.claims
+    /// Change each claim's predicate in place by `restate`, which sees the
+    /// scope it covers and cannot move it, then drop a claim that became
+    /// equal to one stated before it: one of each stays held, in the order
+    /// first stated. Nothing is allocated unless two claims became one.
+    pub fn restate(&mut self, mut restate: impl FnMut(&ClaimScope, &mut ClaimPredicate)) {
+        for claim in &mut self.claims {
+            restate(&claim.scope, &mut claim.predicate);
+        }
+        // Equal claims share their scope, so only positions of one scope
+        // are compared; most scopes hold one claim.
+        let mut dropped: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
+        for slots in self.by_scope.values() {
+            for (i, &at) in slots.iter().enumerate() {
+                if slots[..i]
+                    .iter()
+                    .any(|&before| self.claims[before as usize] == self.claims[at as usize])
+                {
+                    dropped.push(at);
+                }
+            }
+        }
+        if dropped.is_empty() {
+            return;
+        }
+        dropped.sort_unstable();
+        let mut at = 0u32;
+        self.claims.retain(|_| {
+            let keep = dropped.binary_search(&at).is_err();
+            at += 1;
+            keep
+        });
+        // Positions moved: the index is rebuilt over the capacity it has.
+        self.by_scope.clear();
+        for (at, claim) in self.claims.iter().enumerate() {
+            use core::hash::BuildHasher;
+            self.by_scope
+                .entry(rustc_hash::FxBuildHasher.hash_one(&claim.scope))
+                .or_default()
+                // Fewer claims than before: the position fits.
+                .push(at as u32);
+        }
     }
 
     /// Whether the set holds nothing.
