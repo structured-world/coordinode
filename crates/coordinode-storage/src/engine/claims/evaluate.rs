@@ -376,9 +376,19 @@ impl<'a> Evaluation<'a> {
             // without an entry, and only reading those nodes tells.
             (
                 ClaimScope::UniqueValue { generation, tuple },
-                ClaimPredicate::UniqueHolder { node, uncovered },
+                ClaimPredicate::UniqueHolder {
+                    node,
+                    uncovered,
+                    timeline,
+                },
             ) => match uncovered {
-                None => entry_holders(engine, *generation, tuple, *node, staged_points),
+                None => entry_holders(
+                    engine,
+                    *generation,
+                    tuple,
+                    (*node, timeline.as_ref()),
+                    (staged_points, node_deltas),
+                ),
                 Some(source) => uncovered_holders(
                     engine,
                     &core::iter::once((tuple.as_slice(), *node)).collect(),
@@ -396,52 +406,147 @@ impl<'a> Evaluation<'a> {
 }
 
 /// The verdict on `node` taking `tuple` in the published unique index
-/// generation `generation`: `HeldBy` an owner other than `node` with an entry
-/// holding it, committed and not removed by the attempt, or staged by the
-/// attempt itself; `Holds` when none has one. The entry names its owner, so
-/// no record is read; the values reported are left to the caller, who knows
-/// which it took.
+/// generation `generation`: `HeldBy` an owner other than `node` holding it
+/// at an instant `node` does, by the value's entries as the attempt leaves
+/// them (committed and not removed, or staged); `Holds` when none does. The
+/// values reported are left to the caller, who knows which it took.
+///
+/// An entry names its owner: a node, holding the value at every instant,
+/// or one version of a temporal node, holding it over the version's valid
+/// time as its record in the attempt's post-state states it, and not at all
+/// when that version is a deletion. Without a `timeline` every owner holds
+/// it at every instant. Only the owners of this value are read, never a
+/// node's whole history.
 fn entry_holders(
     engine: &StorageEngine,
     generation: coordinode_core::index::identity::GenerationId,
     tuple: &[u8],
-    node: NodeId,
-    staged_points: StagedPoints<'_>,
+    (node, timeline): (
+        NodeId,
+        Option<&coordinode_core::txn::invariant::OwnerTimeline>,
+    ),
+    (staged_points, node_deltas): (StagedPoints<'_>, NodeDeltas<'_>),
 ) -> StorageResult<Verdict> {
+    use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_DOC_DELTA};
+    use coordinode_core::graph::node::ValidSpan;
     use coordinode_core::index::encoding::{decode_entry, entry_value_prefix};
     let prefix = entry_value_prefix(generation, tuple);
-    let other = |key: &[u8]| {
-        decode_entry(generation, key)
-            .map(|(owner, _)| owner)
-            .filter(|owner| *owner != node.as_raw())
-    };
+    // Every owner of the value as the attempt leaves it, each once.
+    let mut owners: Vec<(u64, Option<i64>)> = Vec::new();
     for guard in engine.prefix_scan(Partition::Idx, &prefix)? {
         let (key, _) = guard.into_inner()?;
         let removed = matches!(
             staged_points.get(&(Partition::Idx, key.to_vec())),
             Some(None)
         );
-        if !removed && let Some(holder) = other(&key) {
-            return Ok(Verdict::HeldBy {
-                holder: NodeId::from_raw(holder),
-                values: Vec::new(),
-            });
+        if !removed && let Some(owner) = decode_entry(generation, &key) {
+            owners.push(owner);
         }
     }
     for ((part, key), value) in staged_points.iter() {
         if *part == Partition::Idx
             && value.is_some()
             && key.starts_with(&prefix)
-            && let Some(holder) = other(key)
+            && let Some(owner) = decode_entry(generation, key)
+            && !owners.contains(&owner)
         {
-            return Ok(Verdict::HeldBy {
-                holder: NodeId::from_raw(holder),
-                values: Vec::new(),
-            });
+            owners.push(owner);
+        }
+    }
+    let held_by = |holder: u64| {
+        Ok(Verdict::HeldBy {
+            holder: NodeId::from_raw(holder),
+            values: Vec::new(),
+        })
+    };
+    let Some(timeline) = timeline else {
+        return match owners.iter().find(|(owner, _)| *owner != node.as_raw()) {
+            Some(&(holder, _)) => held_by(holder),
+            None => Ok(Verdict::Holds),
+        };
+    };
+    // The field ids bounding a version's valid time. One the claim did not
+    // know, a property no record had carried when it was made, is looked
+    // up in the dictionary as it stands, once: the attempt may have written
+    // it since.
+    let dictionary = core::cell::OnceCell::new();
+    let fields = || -> StorageResult<(Option<u32>, Option<u32>)> {
+        if timeline.valid_to.is_some() && timeline.deleted.is_some() {
+            return Ok((timeline.valid_to, timeline.deleted));
+        }
+        if dictionary.get().is_none() {
+            let loaded = crate::engine::metadata::load_field_dictionary(engine)?;
+            let _ = dictionary.set(loaded);
+        }
+        let named = |name: &str| dictionary.get().and_then(|d| d.lookup(name));
+        Ok((
+            timeline.valid_to.or_else(|| named("valid_to")),
+            timeline.deleted.or_else(|| named("__deleted__")),
+        ))
+    };
+    let span = |(owner, valid_from): (u64, Option<i64>)| -> StorageResult<Option<ValidSpan>> {
+        let Some(valid_from) = valid_from else {
+            return Ok(Some(ValidSpan::ALWAYS));
+        };
+        let key = coordinode_core::graph::node::encode_temporal_node_key(
+            timeline.shard_id,
+            NodeId::from_raw(owner),
+            valid_from,
+        );
+        let serialization = |e: &dyn core::fmt::Display| {
+            crate::error::StorageError::Serialization(format!("node record: {e}"))
+        };
+        // The version as the attempt leaves it: staged whole, or the stored
+        // record under the document deltas the attempt adds to it, in order.
+        let record = match staged_points.get(&(Partition::Node, key.clone())) {
+            Some(Some(staged)) => Some(
+                coordinode_core::graph::node::NodeRecord::from_msgpack(staged)
+                    .map_err(|e| serialization(&e))?,
+            ),
+            Some(None) => None,
+            None => match engine.get(Partition::Node, &key)? {
+                Some(stored) => {
+                    let mut record = crate::engine::merge::decode_node_record(&stored)
+                        .map_err(|e| serialization(&e))?;
+                    let mut deltas = Vec::new();
+                    for (_, operand) in node_deltas.iter().filter(|(k, _)| *k == key) {
+                        let Some((&PREFIX_DOC_DELTA, body)) = operand.split_first() else {
+                            return Err(serialization(&"an operand that is not a document delta"));
+                        };
+                        deltas.push(DocDelta::decode(body).map_err(|e| serialization(&e))?);
+                    }
+                    crate::engine::merge::apply_doc_deltas_to_record(&mut record, &deltas);
+                    Some(record)
+                }
+                None => None,
+            },
+        };
+        // An entry whose version is gone is no evidence of a free value:
+        // it counts at every instant until repaired.
+        let Some(record) = record else {
+            return Ok(Some(ValidSpan::ALWAYS));
+        };
+        let (valid_to, deleted) = fields()?;
+        let bounds = coordinode_core::graph::node::VersionBounds::of(&record, valid_to, deleted);
+        Ok(ValidSpan::of_version(valid_from, bounds))
+    };
+    let mut taken: Vec<ValidSpan> = Vec::new();
+    for &owner in owners.iter().filter(|(o, _)| *o == node.as_raw()) {
+        taken.extend(span(owner)?);
+    }
+    for &owner in owners.iter().filter(|(o, _)| *o != node.as_raw()) {
+        if let Some(held) = span(owner)?
+            && taken.iter().any(|t| t.overlaps(&held))
+        {
+            return held_by(owner.0);
         }
     }
     Ok(Verdict::Holds)
 }
+
+/// The document deltas an attempt adds to stored node records, each with
+/// the key of the record it applies to, in the order they were made.
+type NodeDeltas<'a> = &'a [(Vec<u8>, Vec<u8>)];
 
 /// The unique values an attempt takes in one index generation while it is
 /// being built, each keyed by its encoded tuple and naming the node taking it.

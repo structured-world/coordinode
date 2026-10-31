@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use coordinode_core::graph::node::NodeId;
+use coordinode_core::graph::node::{NodeId, ValidSpan};
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::EntryOwner;
 use coordinode_modality::{IndexStore as _, LocalCopy, LocalIndexStore, StoreError};
@@ -1385,7 +1385,7 @@ impl IndexRegistry {
                 &index,
                 scope,
                 node.carried,
-                node.owner(),
+                Owned::reading(node.owner(), node.value_of),
                 None,
                 Some(values),
                 claims,
@@ -1447,9 +1447,64 @@ impl IndexRegistry {
                 &index,
                 scope,
                 change.carried,
-                owner,
+                Owned::reading(owner, change.after),
                 old,
                 new,
+                claims,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Claim again the unique values of a version of a temporal node whose
+    /// valid time moved (its end corrected in place, or the version now a
+    /// deletion) while its values stayed: they are decided anew over the
+    /// valid time it now states, against every other owner as the attempt
+    /// leaves them.
+    pub fn on_version_span_changed(
+        &self,
+        engine: &StorageEngine,
+        txn: &mut Transaction,
+        shard_id: u16,
+        node: &NodeState<'_>,
+        field_of: FieldOf<'_>,
+        claims: &mut Vec<UniqueClaim>,
+    ) -> Result<(), IndexWriteError> {
+        for Registered {
+            def: index,
+            version,
+            armed,
+        } in self.btree_for_label(node.label)
+        {
+            if !index.unique {
+                continue;
+            }
+            let Some(values) = entry_values(&index, node.value_of) else {
+                continue;
+            };
+            let Some(scope) = entry_scope(&index, node.carried) else {
+                continue;
+            };
+            self.bind(engine, txn, &index, version)?;
+            let staging = Staging {
+                engine,
+                shard_id,
+                field_of,
+                registry: Some((self, &*armed)),
+            };
+            let owned = Owned {
+                reclaim: true,
+                ..Owned::reading(node.owner(), node.value_of)
+            };
+            stage_scoped(
+                &staging,
+                txn,
+                &index,
+                scope,
+                node.carried,
+                owned,
+                Some(values.clone()),
+                Some(values),
                 claims,
             )?;
         }
@@ -1661,7 +1716,7 @@ pub fn stage_node_entry(
             txn,
             index,
             (index.generation, false),
-            owner,
+            Owned::reading(owner, value_of),
             None,
             Some(values),
             claims,
@@ -1806,7 +1861,7 @@ pub(crate) fn place_entry(
         index,
         scope,
         carried,
-        owner,
+        Owned::reading(owner, value_of),
         None,
         Some(values),
         &mut Vec::new(),
@@ -1825,14 +1880,15 @@ fn stage_scoped(
     index: &IndexDefinition,
     scope: GenerationId,
     carried: Carried,
-    owner: EntryOwner,
+    owned: Owned,
     old: Option<Vec<Value>>,
     new: Option<Vec<Value>>,
     claims: &mut Vec<UniqueClaim>,
 ) -> Result<bool, IndexWriteError> {
     use coordinode_modality::Interpretation;
+    let Owned { owner, during, .. } = owned;
     if index.unique
-        && let (Some(part), Some(values)) = (index.selection.first(), &new)
+        && let (Some(part), Some(values), Some(during)) = (index.selection.first(), &new, during)
     {
         let node_id = NodeId::from_raw(owner.node_id);
         let store = LocalIndexStore::new(staging.engine);
@@ -1871,7 +1927,7 @@ fn stage_scoped(
                     staging.field_of,
                     holder,
                     values,
-                    candidate,
+                    (candidate, during),
                 )?
             {
                 return Err(UniqueViolation::new(index, values, holder).into());
@@ -1890,11 +1946,34 @@ fn stage_scoped(
         txn,
         &target,
         (index.generation, candidate),
-        owner,
+        owned,
         old,
         new,
         claims,
     )
+}
+
+/// Who an entry is staged for: its owner, the valid time the owner holds
+/// the entry's values over (`None` for a version that is a deletion, which
+/// holds nothing), and whether its unique values are claimed again even
+/// when its entry stays as it is, as when that valid time moved.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Owned {
+    pub(crate) owner: EntryOwner,
+    pub(crate) during: Option<ValidSpan>,
+    pub(crate) reclaim: bool,
+}
+
+impl Owned {
+    /// `owner` holding the values `value_of` reads, over the valid time its
+    /// record states.
+    pub(crate) fn reading(owner: EntryOwner, value_of: &dyn Fn(&str) -> Option<Value>) -> Self {
+        Self {
+            owner,
+            during: owner_span(owner, value_of),
+            reclaim: false,
+        }
+    }
 }
 
 /// Stage `owner`'s membership in `index` moving from `old` to `new`,
@@ -1913,7 +1992,11 @@ fn stage(
     txn: &mut Transaction,
     index: &IndexDefinition,
     (serving, candidate): (GenerationId, bool),
-    owner: EntryOwner,
+    Owned {
+        owner,
+        during,
+        reclaim,
+    }: Owned,
     old: Option<Vec<Value>>,
     new: Option<Vec<Value>>,
     claims: &mut Vec<UniqueClaim>,
@@ -1923,6 +2006,7 @@ fn stage(
     let mut needs_source_proof = false;
     if index.unique
         && let Some(values) = &new
+        && let Some(during) = during
     {
         // The entries prove a value free only from a copy armed for use
         // and not suspect: the copy of the generation the index serves, its
@@ -1936,17 +2020,29 @@ fn stage(
         let budget = coordinode_modality::index::WriteBudget::of(txn);
         let mut others = budget.get().empty_charge();
         for holder in other_holders(&store, txn, index, values, node_id, &mut others)? {
-            if holds_values_as(
-                staging.engine,
-                txn,
-                staging.shard_id,
-                index,
-                staging.field_of,
-                holder,
-                values,
-                candidate,
-            )? {
+            let holds = |at: ValidSpan| {
+                holds_values_as(
+                    staging.engine,
+                    txn,
+                    staging.shard_id,
+                    index,
+                    staging.field_of,
+                    holder,
+                    values,
+                    (candidate, at),
+                )
+            };
+            // A version of a temporal node is decided at the commit, over
+            // the valid time every owner states as the attempt leaves it:
+            // an owner the attempt ends later, in the same transaction, is
+            // not one here.
+            if during == ValidSpan::ALWAYS && holds(during)? {
                 return Err(UniqueViolation::new(index, values, holder).into());
+            }
+            // A version holding the value outside this owner's valid time
+            // is a holder, not a wrong entry.
+            if holds(ValidSpan::ALWAYS)? {
+                continue;
             }
             if let Some((registry, _)) = staging.registry {
                 let mut found = others.empty_like();
@@ -1966,7 +2062,7 @@ fn stage(
         new.as_deref(),
     )? > 0;
     if index.unique
-        && written
+        && (written || reclaim)
         && let Some(values) = new
     {
         claims.push(UniqueClaim {
@@ -2072,13 +2168,45 @@ pub fn holds_values(
     values: &[Value],
 ) -> Result<bool, StoreError> {
     holds_values_as(
-        engine, txn, shard_id, index, field_of, holder, values, false,
+        engine,
+        txn,
+        shard_id,
+        index,
+        field_of,
+        holder,
+        values,
+        (false, ValidSpan::ALWAYS),
     )
 }
 
+/// The valid time over which `owner` holds the values `value_of` reads: an
+/// ordinary node at every instant, a version of a temporal node from its
+/// start up to its `valid_to`; `None` for a version that is a deletion,
+/// which holds nothing.
+pub(crate) fn owner_span(
+    owner: EntryOwner,
+    value_of: &dyn Fn(&str) -> Option<Value>,
+) -> Option<ValidSpan> {
+    let Some(valid_from) = owner.valid_from else {
+        return Some(ValidSpan::ALWAYS);
+    };
+    if matches!(value_of("__deleted__"), Some(Value::Bool(true))) {
+        return None;
+    }
+    Some(ValidSpan {
+        from: Some(valid_from),
+        to: match value_of("valid_to") {
+            Some(Value::Int(t) | Value::Timestamp(t)) => Some(t),
+            _ => None,
+        },
+    })
+}
+
 /// [`holds_values`] with the label judged under the candidates published
-/// (`candidate`) instead of the facts in force: what an entry found in a
-/// part only the candidate reads is checked against.
+/// (`candidate`) instead of the facts in force, what an entry found in a
+/// part only the candidate reads is checked against, and only at an instant
+/// of `during`: a version of a temporal node holds its values over its own
+/// valid time, so one holding them only outside `during` does not.
 ///
 /// # Errors
 ///
@@ -2092,7 +2220,7 @@ pub fn holds_values_as(
     field_of: FieldOf<'_>,
     holder: NodeId,
     values: &[Value],
-    candidate: bool,
+    (candidate, during): (bool, ValidSpan),
 ) -> Result<bool, StoreError> {
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
     // The tuples wanted are charged while this check runs; those of each
@@ -2126,8 +2254,12 @@ pub fn holds_values_as(
     {
         return Ok(true);
     }
-    for (_, record) in LocalNodeStore.versions(txn, shard_id, holder)? {
-        if holds(&record)? {
+    let (valid_to, deleted) = (field_of("valid_to"), field_of("__deleted__"));
+    for (valid_from, record) in LocalNodeStore.versions(txn, shard_id, holder)? {
+        let bounds = coordinode_core::graph::node::VersionBounds::of(&record, valid_to, deleted);
+        if ValidSpan::of_version(valid_from, bounds).is_some_and(|held| held.overlaps(&during))
+            && holds(&record)?
+        {
             return Ok(true);
         }
     }

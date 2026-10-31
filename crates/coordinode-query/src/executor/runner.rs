@@ -2788,6 +2788,13 @@ impl<'a> ExecutionContext<'a> {
             let predicate = ClaimPredicate::UniqueHolder {
                 node: claim.node_id,
                 uncovered: uncovered.clone(),
+                // A temporal owner holds the value over its version's valid
+                // time only: owners conflict where those overlap.
+                timeline: Some(coordinode_core::txn::invariant::OwnerTimeline {
+                    shard_id: self.shard_id,
+                    valid_to: interner.lookup("valid_to"),
+                    deleted: interner.lookup("__deleted__"),
+                }),
             };
             // Room for the claims not held yet only: one stated again adds
             // nothing, so it neither grows the set nor charges it.
@@ -3111,6 +3118,11 @@ impl<'a> ExecutionContext<'a> {
             let before_of = crate::index::registry::record_lookup(before, interner);
             let after_of = crate::index::registry::record_lookup(after, interner);
             let field_of = |name: &str| interner.lookup(name);
+            // The valid time the version holds its values over moved: its
+            // unique values are decided again over the new one.
+            let span_moved = changed
+                .iter()
+                .any(|p| *p == "valid_to" || *p == "__deleted__");
             let view = &self.labels;
             for (label, carried) in labels
                 .iter()
@@ -3135,6 +3147,24 @@ impl<'a> ExecutionContext<'a> {
                         &mut self.key_claims.indexes,
                     )
                     .map_err(index_write_error)?;
+                if span_moved {
+                    registry
+                        .on_version_span_changed(
+                            self.engine,
+                            &mut self.txn,
+                            self.shard_id,
+                            &crate::index::registry::NodeState {
+                                node_id,
+                                valid_from: Some(valid_from),
+                                label,
+                                value_of: &after_of,
+                                carried,
+                            },
+                            &field_of,
+                            &mut self.key_claims.indexes,
+                        )
+                        .map_err(index_write_error)?;
+                }
             }
         }
         self.claim_uniques(from)

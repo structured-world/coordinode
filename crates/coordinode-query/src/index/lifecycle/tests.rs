@@ -1596,6 +1596,7 @@ fn take_while_building(
                         covered_through: covered.clone(),
                         read_limit: 100_000,
                     })),
+                    timeline: None,
                 },
                 revision,
             ));

@@ -832,6 +832,48 @@ fn version_bounds_read_the_named_fields() {
     );
 }
 
+/// Valid spans are half open: `[a, b)` and `[b, c)` share no instant, one
+/// instant more does, an ordinary owner's span meets every nonempty one,
+/// an empty span meets none, and a deletion holds no span at all.
+#[test]
+fn valid_spans_meet_only_where_an_instant_is_shared() {
+    let span = |from, to| ValidSpan { from, to };
+    let (a, b, c) = (10, 20, 30);
+    assert!(!span(Some(a), Some(b)).overlaps(&span(Some(b), Some(c))));
+    assert!(!span(Some(b), None).overlaps(&span(Some(a), Some(b))));
+    assert!(span(Some(a), Some(b + 1)).overlaps(&span(Some(b), Some(c))));
+    assert!(
+        span(Some(c), None).overlaps(&span(Some(a), None)),
+        "two open ends"
+    );
+    assert!(ValidSpan::ALWAYS.overlaps(&span(Some(c), Some(c + 1))));
+    assert!(
+        !ValidSpan::ALWAYS.overlaps(&span(Some(b), Some(b))),
+        "an empty span holds no instant"
+    );
+    assert_eq!(
+        ValidSpan::of_version(
+            a,
+            VersionBounds {
+                valid_to: Some(b),
+                deleted: false
+            }
+        ),
+        Some(span(Some(a), Some(b)))
+    );
+    assert_eq!(
+        ValidSpan::of_version(
+            a,
+            VersionBounds {
+                valid_to: None,
+                deleted: true
+            }
+        ),
+        None,
+        "a deletion holds nothing"
+    );
+}
+
 #[test]
 fn node_write_key_picks_correct_form() {
     let nid = NodeId(42);

@@ -352,7 +352,7 @@ CREATE EDGE TYPE ASSERTS TEMPORAL DISCRIMINATED BY (assertion_key) WITH (
 - `DETACH DOCUMENT n.<path> AS (t:Target)-[:E]->(n)` — close+open on the source, property promoted to a new node (temporal-aware CREATE). `TRANSFER EDGES` on a temporal source: rejected.
 - `ATTACH (s:Source)-[:E]->(t:Temp) INTO t.<path>` — close+open on the target. Temporal source on ATTACH: rejected.
 - Reads (`MATCH (n:Temp)`, index lookups, traversal `MATCH (a)-[:E]->(b:Temp)`, pattern predicate `WHERE (a)-[:E]->(:Temp)`) see each node's state valid at the statement's `NOW`: at most one row per node, none for a deleted, ended or not-yet-valid node. `WHERE temporal_active_at(n, t)` reads the state at `t` instead. See [Temporal Edges → Reading temporal nodes](./temporal-edges.md#reading-temporal-nodes).
-- B-tree indexes on temporal labels hold an entry per version; a `UNIQUE` index there reserves a value for a node once any of its versions held it, so it is not uniqueness at each instant of valid time.
+- B-tree indexes on temporal labels hold an entry per version; a `UNIQUE` constraint there holds a value to at most one node at each instant of valid time (half-open intervals, past and future included), checked on the state a transaction leaves. See [Temporal Edges](./temporal-edges.md).
 - Not yet supported on temporal labels: `MERGE`, `UPSERT ON CREATE`, enumerating every version in one `MATCH`, the `AS OF VALID_TIME` clause.
 
 #### Label kinds: type, implied and auxiliary labels ✅ 🔷

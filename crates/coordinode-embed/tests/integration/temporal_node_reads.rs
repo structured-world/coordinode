@@ -383,11 +383,32 @@ fn a_correction_keeping_valid_from_reads_alike_through_index_and_scan() {
     assert!(read(&mut db, corrected, None, &before).is_empty());
 }
 
-/// A UNIQUE index on a temporal label reserves a value for the node once
-/// any of its versions held it: after a rename, another node still cannot
-/// take the old value, and the node keeps its new one.
+/// Refused for the unique constraint, not for any other reason.
+fn refused_as_unique<T: std::fmt::Debug>(
+    result: Result<T, coordinode_embed::DatabaseError>,
+    what: &str,
+) {
+    match result {
+        Err(coordinode_embed::DatabaseError::UniqueViolation { .. }) => {}
+        other => panic!("{what}: expected a unique violation, got {other:?}"),
+    }
+}
+
+/// The names the nodes hold at valid-time instant `t`, in order.
+fn held_at(db: &mut Database, t: i64) -> Vec<String> {
+    names(
+        db,
+        &format!("MATCH (n:Emp) WHERE temporal_active_at(n, {t}) RETURN n.name AS name"),
+    )
+}
+
+/// A UNIQUE index on a temporal label holds a value to one node at each
+/// instant of valid time: a node whose name was another's until a rename
+/// may take it from then on, but not over the time the other held it;
+/// the current value stays held. Before, any version having held a value
+/// reserved it for good.
 #[test]
-fn a_unique_value_stays_reserved_after_a_rename() {
+fn a_renamed_value_is_free_after_the_rename_only() {
     let mut db = open_db();
     let now = now_us();
     db.execute_cypher("CREATE UNIQUE INDEX emp_name_u ON :Emp(name)")
@@ -395,35 +416,204 @@ fn a_unique_value_stays_reserved_after_a_rename() {
     create(&mut db, "ada", now - YEAR, None);
     db.execute_cypher("MATCH (n:Emp {name: 'ada'}) SET n.name = 'lovelace'")
         .expect("rename");
+    let after_rename = now_us() + YEAR;
 
-    // Refused for the unique constraint, not for any other reason.
-    let refused_as_unique =
-        |result: Result<_, coordinode_embed::DatabaseError>, what: &str| match result {
-            Err(coordinode_embed::DatabaseError::UniqueViolation { .. }) => {}
-            other => panic!("{what}: expected a unique violation, got {other:?}"),
-        };
     refused_as_unique(
         db.execute_cypher(&format!(
-            "CREATE (n:Emp {{name: 'ada', valid_from: {now}}})"
+            "CREATE (n:Emp {{name: 'ada', valid_from: {}}})",
+            now - 2 * YEAR
         )),
-        "the old value stays reserved",
+        "the old value over the time it was held",
     );
     refused_as_unique(
         db.execute_cypher(&format!(
-            "CREATE (n:Emp {{name: 'lovelace', valid_from: {now}}})"
+            "CREATE (n:Emp {{name: 'lovelace', valid_from: {after_rename}}})"
         )),
-        "the current value is held",
+        "the current value is held for good",
     );
-    // A free value is admitted, so the refusals above came from the index.
     db.execute_cypher(&format!(
-        "CREATE (n:Emp {{name: 'babbage', valid_from: {now}}})"
+        "CREATE (n:Emp {{name: 'ada', valid_from: {after_rename}}})"
     ))
-    .expect("a free value is admitted");
+    .expect("the old value after the rename");
     assert_eq!(
         names(&mut db, "MATCH (n:Emp) RETURN n.name AS name"),
-        ["babbage", "lovelace"],
-        "the refused creates left nothing behind"
+        ["lovelace"],
+        "only the renamed node is valid now"
     );
+}
+
+/// Half-open intervals: a value held over [a, b) may be held by another
+/// node from b, and is refused to it from any earlier start. Past and
+/// future intervals count alike: a value one node holds from a future time
+/// is refused to another holding it from now on, and admitted to one whose
+/// interval ends there.
+#[test]
+fn unique_values_meet_at_interval_bounds_past_and_future() {
+    let mut db = open_db();
+    let now = now_us();
+    db.execute_cypher("CREATE UNIQUE INDEX emp_name_u ON :Emp(name)")
+        .expect("unique index");
+    let (a, b) = (now - 2 * YEAR, now - YEAR);
+    create(&mut db, "ada", a, Some(b));
+    refused_as_unique(
+        db.execute_cypher(&format!(
+            "CREATE (n:Emp {{name: 'ada', valid_from: {}}})",
+            b - 1
+        )),
+        "one instant of overlap",
+    );
+    create(&mut db, "ada", b, None);
+
+    let future = now + YEAR;
+    create(&mut db, "grace", future, None);
+    refused_as_unique(
+        db.execute_cypher(&format!(
+            "CREATE (n:Emp {{name: 'grace', valid_from: {now}}})"
+        )),
+        "a value held from a future time",
+    );
+    create(&mut db, "grace", now, Some(future));
+    for (t, held) in [
+        (a, &["ada"][..]),
+        (b, &["ada"][..]),
+        (now, &["ada", "grace"][..]),
+        (future, &["ada", "grace"][..]),
+    ] {
+        assert_eq!(
+            held_at(&mut db, t),
+            held,
+            "at {t}: the refused creates left nothing behind"
+        );
+    }
+}
+
+/// One transaction handing a value over, ending one node's holding at b and
+/// giving it to another from b, is admitted in either order of its
+/// statements: what is decided is the state it leaves, not each step. A
+/// handover that would leave the two overlapping is refused whole.
+#[test]
+fn a_value_is_handed_over_in_one_transaction_in_either_order() {
+    let mut db = open_db();
+    let now = now_us();
+    db.execute_cypher("CREATE UNIQUE INDEX emp_name_u ON :Emp(name)")
+        .expect("unique index");
+    let (a, b) = (now - 2 * YEAR, now - YEAR);
+    create(&mut db, "ada", a, None);
+    let end = format!("MATCH (n:Emp) WHERE temporal_active_at(n, {a}) SET n.valid_to = {b}");
+    let take = |from: i64| format!("CREATE (n:Emp {{name: 'ada', valid_from: {from}}})");
+
+    // Taken first, ended after.
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(tx, &take(b), None)
+        .expect("taken from b");
+    let ended = db
+        .execute_in_transaction(tx, &format!("{end} RETURN n.name AS name"), None)
+        .expect("ended at b");
+    assert_eq!(ended.len(), 1, "the first holder is ended: {ended:?}");
+    db.commit_transaction(tx)
+        .expect("the handover leaves one owner at each instant");
+    assert_eq!(held_at(&mut db, a), ["ada"]);
+    assert_eq!(held_at(&mut db, b), ["ada"]);
+
+    // Ended first, taken after: a third node from a later time.
+    let c = now + YEAR;
+    let end_second = format!("MATCH (n:Emp) WHERE temporal_active_at(n, {b}) SET n.valid_to = {c}");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(tx, &end_second, None)
+        .expect("ended at c");
+    db.execute_in_transaction(tx, &take(c), None)
+        .expect("taken from c");
+    db.commit_transaction(tx).expect("handed over again");
+
+    // Taken from before the end: the two would overlap, and nothing lands.
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(tx, &take(c - 1), None)
+        .expect("staged");
+    refused_as_unique(db.commit_transaction(tx), "an overlapping handover");
+    for (t, held) in [(a, 1), (b, 1), (c - 1, 1), (c, 1)] {
+        assert_eq!(held_at(&mut db, t).len(), held, "at {t}: one owner");
+    }
+}
+
+/// Two transactions taking one value over overlapping times, each from a
+/// view without the other, are not both admitted; over disjoint times they
+/// are.
+#[test]
+fn concurrent_takers_of_one_value_are_held_to_their_times() {
+    let mut db = open_db();
+    let now = now_us();
+    db.execute_cypher("CREATE UNIQUE INDEX emp_name_u ON :Emp(name)")
+        .expect("unique index");
+    let (a, b, c) = (now - 2 * YEAR, now - YEAR, now);
+    let take = |from: i64, to: i64| {
+        format!("CREATE (n:Emp {{name: 'ada', valid_from: {from}, valid_to: {to}}})")
+    };
+    let first = db.begin_transaction().expect("begin");
+    let second = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(first, &take(a, c), None)
+        .expect("first staged");
+    db.execute_in_transaction(second, &take(b, c), None)
+        .expect("second staged");
+    db.commit_transaction(first).expect("the first is admitted");
+    match db.commit_transaction(second) {
+        Err(
+            coordinode_embed::DatabaseError::UniqueViolation { .. }
+            | coordinode_embed::DatabaseError::TransactionConflict { .. },
+        ) => {}
+        other => panic!("the second overlaps the first: {other:?}"),
+    }
+    assert_eq!(held_at(&mut db, b), ["ada"]);
+
+    // Disjoint times: both land, one owner each.
+    let d = now + YEAR;
+    db.execute_cypher(&take(c, d)).expect("from c to d");
+    db.execute_cypher(&take(d, d + YEAR)).expect("from d on");
+    for t in [a, c, d] {
+        assert_eq!(held_at(&mut db, t), ["ada"], "at {t}");
+    }
+}
+
+/// A correction stretching a version over another node's interval is
+/// refused and leaves both as they were; one ending it earlier is admitted
+/// and frees the value from then on. A deleted node's past holding stays,
+/// its holding from the deletion on does not.
+#[test]
+fn a_correction_or_deletion_moves_where_a_value_is_held() {
+    let mut db = open_db();
+    let now = now_us();
+    db.execute_cypher("CREATE UNIQUE INDEX emp_name_u ON :Emp(name)")
+        .expect("unique index");
+    let (a, b, c) = (now - 3 * YEAR, now - 2 * YEAR, now - YEAR);
+    create(&mut db, "ada", a, Some(b));
+    create(&mut db, "ada", b, Some(c));
+    refused_as_unique(
+        db.execute_cypher(&format!(
+            "MATCH (n:Emp) WHERE temporal_active_at(n, {a}) SET n.valid_to = {c}"
+        )),
+        "stretched over the other's interval",
+    );
+    for t in [a, b] {
+        assert_eq!(
+            held_at(&mut db, t),
+            ["ada"],
+            "at {t}: the refusal changed nothing"
+        );
+    }
+
+    create(&mut db, "babbage", c, None);
+    db.execute_cypher("MATCH (n:Emp {name: 'babbage'}) DELETE n")
+        .expect("delete");
+    refused_as_unique(
+        db.execute_cypher(&format!(
+            "CREATE (n:Emp {{name: 'babbage', valid_from: {c}}})"
+        )),
+        "the deleted node held it before its deletion",
+    );
+    db.execute_cypher(&format!(
+        "CREATE (n:Emp {{name: 'babbage', valid_from: {}}})",
+        now_us() + YEAR
+    ))
+    .expect("free after the deletion");
 }
 
 /// An index built over existing versions holds every version's values, as

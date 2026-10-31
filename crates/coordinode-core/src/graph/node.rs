@@ -611,6 +611,47 @@ impl VersionBounds {
     }
 }
 
+/// The valid time over which an owner holds what it holds, half open: from
+/// `from` (`None`: an ordinary node, holding it at every instant) up to
+/// `to`, exclusive (`None`: for good).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidSpan {
+    /// The first instant; `None` for no start.
+    pub from: Option<i64>,
+    /// The first instant after; `None` for no end.
+    pub to: Option<i64>,
+}
+
+impl ValidSpan {
+    /// Every instant: what an ordinary node holds a value over.
+    pub const ALWAYS: Self = Self {
+        from: None,
+        to: None,
+    };
+
+    /// What the version starting at `valid_from` with `bounds` holds its
+    /// state over; `None` for a deletion, which holds nothing.
+    pub fn of_version(valid_from: i64, bounds: VersionBounds) -> Option<Self> {
+        (!bounds.deleted).then_some(Self {
+            from: Some(valid_from),
+            to: bounds.valid_to,
+        })
+    }
+
+    /// Whether some instant is in both: `[a, b)` and `[b, c)` share none.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        let before = |from: Option<i64>, to: Option<i64>| match (from, to) {
+            (Some(from), Some(to)) => from < to,
+            _ => true,
+        };
+        // An empty span holds no instant.
+        before(self.from, self.to)
+            && before(other.from, other.to)
+            && before(self.from, other.to)
+            && before(other.from, self.to)
+    }
+}
+
 /// What one assertion states of its version: its whole state as the commit
 /// left it, with the valid time it holds over, or that the commit removed the
 /// version.

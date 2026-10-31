@@ -470,6 +470,7 @@ fn take_free_email(
                         .then(|| encode_node_key(shard, NodeId::from_raw(stored - uncovered))),
                     read_limit: u64::MAX,
                 })),
+                timeline: None,
             },
             generation,
         ));
@@ -560,6 +561,7 @@ fn unique_values_in_one_commit(stored: u64, uncovered: u64, values: u64, commits
                                 )),
                                 read_limit: u64::MAX,
                             })),
+                            timeline: None,
                         },
                         generation,
                     ));

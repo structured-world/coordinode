@@ -297,7 +297,24 @@ pub enum ClaimPredicate {
         /// or its entries cannot prove the value free. One source for every
         /// value an index's claims take, shared rather than copied per value.
         uncovered: Option<alloc::sync::Arc<UncoveredSource>>,
+        /// Where an owner that is a version of a temporal node keeps the
+        /// valid time it holds the value over: two owners conflict only
+        /// where those overlap. `None` holds every owner to every instant.
+        timeline: Option<OwnerTimeline>,
     },
+}
+
+/// Where the versions of the temporal nodes owning a unique value are kept,
+/// and which of their properties bound the valid time each holds it over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerTimeline {
+    /// The shard the owners' records live in.
+    pub shard_id: u16,
+    /// The field id of `valid_to`, the exclusive valid end; `None` when no
+    /// record carries it.
+    pub valid_to: Option<u32>,
+    /// The field id of the deletion mark; `None` when no record carries it.
+    pub deleted: Option<u32>,
 }
 
 /// Whether a pair was seen as adjacent.

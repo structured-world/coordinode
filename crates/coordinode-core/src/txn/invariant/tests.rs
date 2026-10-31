@@ -584,6 +584,7 @@ fn two_holders_of_one_unique_value_are_left_to_its_entry_key() {
             ClaimPredicate::UniqueHolder {
                 node: node(id),
                 uncovered: None,
+                timeline: None,
             },
             GEN,
         )
@@ -798,6 +799,7 @@ fn a_claim_set_keeps_one_of_each_and_grows_only_into_its_room() {
             ClaimPredicate::UniqueHolder {
                 node: node(holder),
                 uncovered: None,
+                timeline: None,
             },
             revision,
         )

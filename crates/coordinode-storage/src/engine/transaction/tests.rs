@@ -2223,6 +2223,7 @@ mod unique_while_building {
                     covered_through: covered.map(|c| key(engine, c)),
                     read_limit: 1_000,
                 })),
+                timeline: None,
             },
             0,
         )

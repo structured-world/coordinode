@@ -1382,6 +1382,7 @@ mod unique_while_building {
                     covered_through: covered.map(|id| encode_node_key(SHARD, node(id))),
                     read_limit: limit,
                 })),
+                timeline: None,
             },
             GEN,
         )

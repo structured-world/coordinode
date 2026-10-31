@@ -1422,6 +1422,7 @@ impl<'a> Transaction<'a> {
                 ClaimPredicate::UniqueHolder {
                     node,
                     uncovered: Some(source),
+                    ..
                 },
             ) = (&claim.scope, &claim.predicate)
             else {
