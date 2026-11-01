@@ -85,6 +85,7 @@ the key is unset.
 | `max_connections` | (unbounded) | restart | Maximum in-flight requests per client connection (gRPC concurrency limit). |
 | `max_request_size_mb` | `16` | restart | Maximum decoded request message size, in MiB. Guards against unbounded-allocation requests. |
 | `request_timeout_secs` | (none) | restart | Per-request server-side timeout, in seconds. |
+| `shutdown_grace_secs` | `15` | restart | On a stop (SIGTERM, Ctrl+C, a Windows console stop event), how long the server waits for open connections to finish before it closes them and stops, in seconds. Members of a group hold streams to each other; when they are stopped together, these are closed at the end of this window. Set it below the service manager's stop timeout (systemd `TimeoutStopSec`, Kubernetes `terminationGracePeriodSeconds`), so the store is closed before the process is killed. |
 | `http2_keepalive_secs` | (none) | restart | HTTP/2 keepalive ping interval, in seconds. Detects half-open connections behind a load balancer. |
 | `cache_size_mb` | `64` | restart | Block cache size, in MiB. The read path serves hot blocks from this cache before touching disk. Size it to the blocks reads touch often: a working set larger than the cache is read and decompressed again on every access. |
 | `write_buffer_mb` | `64` | restart | Write buffer (memtable) size, in MiB. Larger buffers flush less often at the cost of memory. |

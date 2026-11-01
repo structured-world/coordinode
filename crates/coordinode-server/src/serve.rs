@@ -172,6 +172,7 @@ pub(crate) async fn serve(
         nofile,
         max_connections,
         request_timeout_secs,
+        shutdown_grace_secs,
         http2_keepalive_secs,
         // Converted to bytes above (`sizes`).
         max_request_size_mb: _,
@@ -1363,6 +1364,8 @@ pub(crate) async fn serve(
         }
     };
     let mut fatal_watch = fatal_rx.clone();
+    // Set once the stop starts: the drain window counts from it.
+    let (stopping_tx, stopping_rx) = tokio::sync::watch::channel(false);
     let shutdown = async move {
         tokio::select! {
             () = signals => {}
@@ -1372,7 +1375,9 @@ pub(crate) async fn serve(
         }
         // First, so /ready turns a balancer away while in-flight RPCs drain.
         shutdown_readiness.set(false);
+        stopping_tx.send_replace(true);
     };
+    let grace = std::time::Duration::from_secs(shutdown_grace_secs.map_or(15, |s| s.get()));
 
     // Network limits: per-request timeout, per-connection in-flight cap,
     // and HTTP/2 keepalive pings. Each applies only when configured.
@@ -1611,16 +1616,22 @@ pub(crate) async fn serve(
         Some((context, accept)) => {
             let incoming = coordinode_wire::peer::incoming(grpc_listener, &context, accept)
                 .map_err(|e| format!("gRPC port TLS configuration: {e}"))?;
-            router
-                .serve_with_incoming_shutdown(incoming, shutdown)
-                .await?;
+            drain_within(
+                router.serve_with_incoming_shutdown(incoming, shutdown),
+                stopping_rx,
+                grace,
+            )
+            .await?;
         }
         None => {
             let incoming =
                 tonic::transport::server::TcpIncoming::from(grpc_listener).with_nodelay(Some(true));
-            router
-                .serve_with_incoming_shutdown(incoming, shutdown)
-                .await?;
+            drain_within(
+                router.serve_with_incoming_shutdown(incoming, shutdown),
+                stopping_rx,
+                grace,
+            )
+            .await?;
         }
     }
     // The member's background work finishes the pass it is in, then the
@@ -1634,6 +1645,36 @@ pub(crate) async fn serve(
         return Err(format!("consensus stopped on a fatal error: {fatal}").into());
     }
     Ok(())
+}
+
+/// Run `serving` until it returns, or until `grace` has passed since
+/// `stopping` was set, whichever comes first; dropping it then closes the
+/// connections still open. A graceful stop waits for every connection to
+/// end, and the long-lived ones members hold to each other end only when
+/// those members stop: members stopped together would otherwise wait on
+/// each other forever.
+async fn drain_within<E>(
+    serving: impl std::future::Future<Output = Result<(), E>>,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+    grace: std::time::Duration,
+) -> Result<(), E> {
+    let window = async move {
+        if stopping.wait_for(|s| *s).await.is_err() {
+            // The stop signal can no longer come: serving decides alone.
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(grace).await;
+    };
+    tokio::select! {
+        served = serving => served,
+        () = window => {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "connections still open after the drain window; closing them"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Resolves once the consensus watcher reports a fatal error; never when the

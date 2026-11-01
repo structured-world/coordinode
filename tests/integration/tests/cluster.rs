@@ -1286,6 +1286,36 @@ async fn a_write_through_a_follower_runs_at_the_leader() {
     assert_eq!(on_leader.into_inner().rows.len(), 1);
 }
 
+/// Every member of a group stopped at once exits on its own. Each waited for
+/// the connections other members held to it to close, while those members
+/// kept them open until they stopped themselves: all three waited forever,
+/// with the leader still appending entries, until something killed them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_stopped_at_once_exits() {
+    let (mut n1, mut n2, mut n3) = three_member_group().await;
+    // Peers' streams in use: a write a follower passes on to the leader.
+    n2.cypher_client()
+        .await
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE (:Stopping {k: 1})".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("a write through a follower");
+
+    for member in [&n1, &n2, &n3] {
+        member.request_stop();
+    }
+    // The drain window, then the close and the store's flush.
+    let within = Duration::from_secs(40);
+    let (a, b, c) = tokio::join!(
+        n1.exits_within(within),
+        n2.exits_within(within),
+        n3.exits_within(within)
+    );
+    assert!(a && b && c, "exited: n1 {a}, n2 {b}, n3 {c}");
+}
+
 /// A client works through whichever member it reached: a session on a
 /// follower opens and fills a transaction held by the leader, a second
 /// session on another member continues the transaction the first one began

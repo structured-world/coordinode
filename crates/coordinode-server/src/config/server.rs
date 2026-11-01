@@ -466,6 +466,9 @@ pub struct ServerConfig {
     pub max_request_size_mb: usize,
     /// Per-request timeout in seconds (`None` = none).
     pub request_timeout_secs: Option<u64>,
+    /// How long a stopping server waits for open connections to finish
+    /// before it closes them, in seconds (`None` = 15).
+    pub shutdown_grace_secs: Option<std::num::NonZeroU64>,
     /// HTTP/2 keepalive ping interval in seconds (`None` = disabled).
     pub http2_keepalive_secs: Option<u64>,
     /// Block-cache size in MiB (`None` = engine default).
@@ -732,6 +735,7 @@ impl Default for ServerConfig {
             max_connections: None,
             max_request_size_mb: 16,
             request_timeout_secs: None,
+            shutdown_grace_secs: None,
             http2_keepalive_secs: None,
             cache_size_mb: None,
             write_buffer_mb: None,

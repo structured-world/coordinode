@@ -13,6 +13,34 @@ fn the_rest_proxy_dials_the_grpc_listener_where_it_is_bound() {
     assert_eq!(at("[::]:7080"), "http://[::1]:7080");
 }
 
+/// A stopping server waits for its connections only as long as the drain
+/// window: serving that never finishes (a peer holding a stream open) is cut
+/// once the window has passed since the stop, never before the stop, and
+/// serving that finishes on its own returns at once.
+#[tokio::test]
+async fn the_drain_window_bounds_a_stop() {
+    use std::time::Duration;
+
+    let grace = Duration::from_millis(300);
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let held_open = std::future::pending::<Result<(), ()>>();
+    let draining = tokio::spawn(drain_within(held_open, stopping, grace));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!draining.is_finished(), "no stop, no cut");
+    stop.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!draining.is_finished(), "cut before the window passed");
+    let cut = tokio::time::timeout(Duration::from_secs(5), draining)
+        .await
+        .expect("cut once the window passed")
+        .expect("join");
+    assert_eq!(cut, Ok(()));
+
+    let (_stop, stopping) = tokio::sync::watch::channel(true);
+    let drained = std::future::ready(Ok::<(), ()>(()));
+    assert_eq!(drain_within(drained, stopping, grace).await, Ok(()));
+}
+
 /// A fatal consensus error starts the shutdown that ends the process, and
 /// nothing else does: a watcher that ends without one (a normal stop) never
 /// triggers it.

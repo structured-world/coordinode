@@ -986,12 +986,15 @@ fn peer_timeouts_parse_from_the_config_file() {
             interval: std::time::Duration::from_secs(5),
         }
     );
+    let c = parse("shutdown_grace_secs: 30\n").expect("parse");
+    assert_eq!(c.shutdown_grace_secs.map(|s| s.get()), Some(30));
     for key in [
         "peer_connect_timeout_ms",
         "peer_call_timeout_ms",
         "peer_handshake_timeout_ms",
         "tcp_keepalive_idle_secs",
         "tcp_keepalive_interval_secs",
+        "shutdown_grace_secs",
     ] {
         assert!(parse(&format!("{key}: 0\n")).is_err(), "{key} = 0");
     }

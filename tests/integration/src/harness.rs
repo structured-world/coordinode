@@ -549,6 +549,23 @@ impl CoordinodeProcess {
             .unwrap_or_else(|| panic!("no status line in {response:?}"))
     }
 
+    /// Ask the process to stop, as a service manager does, without waiting.
+    pub fn request_stop(&self) {
+        send_sigterm(&self.child);
+    }
+
+    /// Wait up to `within` for the process to exit on its own; whether it did.
+    pub async fn exits_within(&mut self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if has_exited(&mut self.child) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        has_exited(&mut self.child)
+    }
+
     /// Send the process `SIGHUP`, which makes it reload as `POST /reload`
     /// does; the outcome is only logged.
     #[cfg(unix)]
