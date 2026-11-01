@@ -69,21 +69,34 @@ pub type FlushDebt = Box<dyn Fn() -> u64 + Send + Sync>;
 /// up to whole allocation units.
 pub const FLUSH_ALLOWANCE: u64 = 128 * 1024;
 
-/// The room a flush of `unflushed` memtable bytes takes while it runs,
-/// bounded from above: the data, an eighth more for block and filter
-/// overhead, the fixed [`FLUSH_ALLOWANCE`], and what the file system may
-/// allocate ahead of the table being written ([`allocation_ahead`]). Nothing
-/// for empty memtables. Held for every admitted write until its memtable is
-/// flushed, so a flush always finds the room it needs and reclamation, which
-/// flushes before it removes covered journal segments, never stalls.
+/// The room `flushes` flushes of `unflushed` memtable bytes in all take while
+/// they run, bounded from above: the data, an eighth more for block and
+/// filter overhead, and for each flush the fixed [`FLUSH_ALLOWANCE`] and what
+/// the file system may allocate ahead of its table ([`allocation_ahead`]).
+/// Each memtable is its own flush with its own table, so each needs its own
+/// allowance. Nothing when nothing is unflushed. Held for every admitted
+/// write until its memtable is flushed, so a flush always finds the room it
+/// needs and reclamation, which flushes before it removes covered journal
+/// segments, never stalls.
 #[must_use]
-pub fn flush_debt(unflushed: u64) -> u64 {
-    if unflushed == 0 {
+pub fn flush_debt(unflushed: u64, flushes: u64) -> u64 {
+    if unflushed == 0 && flushes == 0 {
         return 0;
     }
-    // Memtable bytes are bounded by memory: no overflow.
-    let table = unflushed + unflushed / 8 + FLUSH_ALLOWANCE;
-    table + allocation_ahead(table)
+    // Bytes in memtables count at least one flush, whatever the count read.
+    let flushes = flushes.max(1);
+    // Memtable bytes are bounded by memory and the flush count by the trees:
+    // no overflow.
+    let tables = unflushed + unflushed / 8 + flushes * FLUSH_ALLOWANCE;
+    // One table's allocation ahead is known from its size. Of several, each
+    // is at most MAX_AHEAD and at most its own size plus MIN_AHEAD, so the
+    // sum is bounded by both totals.
+    let ahead = if flushes == 1 {
+        allocation_ahead(tables)
+    } else {
+        (flushes * MAX_AHEAD).min(tables + flushes * MIN_AHEAD)
+    };
+    tables + ahead
 }
 
 /// The smallest journal segment a hard limit brings the configured size down

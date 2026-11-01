@@ -109,6 +109,37 @@ fn flush_debt_counts_against_admission_and_room() {
     assert_eq!(footprint.room(), 0);
 }
 
+/// The debt of several memtables covers each one's flush, however their
+/// bytes are split: each flush writes a table of its own, with its own fixed
+/// cost and its own allocation ahead. With one allowance for all of them, a
+/// backup that flushes each tree in turn on a store at its limit found no
+/// room for the last flush.
+#[test]
+fn flush_debt_covers_each_flush_of_a_split() {
+    // What one flush of `bytes` takes, as the single-flush bound gives it.
+    let one = |bytes: u64| {
+        let table = bytes + bytes / 8 + FLUSH_ALLOWANCE;
+        table + allocation_ahead(table)
+    };
+    for split in [
+        vec![1u64, 1, 1],
+        vec![100, 200_000, 3],
+        vec![5 << 20, 1, 7 << 20],
+        vec![64 << 10; 12],
+    ] {
+        let total: u64 = split.iter().sum();
+        let each: u64 = split.iter().map(|&bytes| one(bytes)).sum();
+        assert!(
+            flush_debt(total, split.len() as u64) >= each,
+            "{split:?}: {} < {each}",
+            flush_debt(total, split.len() as u64)
+        );
+    }
+    assert_eq!(flush_debt(0, 0), 0);
+    // Bytes read with no flush counted still owe one.
+    assert_eq!(flush_debt(10, 0), one(10));
+}
+
 /// Racing admissions never admit more than fits.
 #[test]
 fn concurrent_admissions_never_overcommit() {

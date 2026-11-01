@@ -787,7 +787,7 @@ impl StorageEngine {
         if !footprints.is_empty() {
             let unflushed = Arc::clone(&write_buffer);
             footprints.set_debt(move || {
-                crate::engine::footprint::flush_debt(unflushed.unflushed_bytes())
+                crate::engine::footprint::flush_debt(unflushed.unflushed_bytes(), 0)
             });
         }
         // One maintenance budget for every tree's compaction and the scrub:
