@@ -1301,6 +1301,7 @@ impl Shared {
         // below would live as long as the whole build, and a retune waiting
         // for it would hold up every reader of the configuration.
         let older_transactions_wait = self.config.read().older_transactions_wait;
+        let page_bytes = self.config.read().maintenance_page_bytes;
         let maintained_after = self.maintained_after.lock().get(&generation).copied();
         Ok(Backfill {
             engine: env.engine(),
@@ -1314,6 +1315,7 @@ impl Shared {
             repair,
             stop: Some(&self.stopping),
             maintained_after,
+            page_bytes,
         }
         .run(&taken.def, &mut |txn| env.commit_page(txn)))
     }

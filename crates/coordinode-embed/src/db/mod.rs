@@ -3187,13 +3187,17 @@ impl Database {
         self.commit_catalog_txn(txn)
     }
 
-    /// A transaction for one catalog change.
+    /// A transaction for one catalog change, held to the memory limit a
+    /// statement making the change would be: what it stages and the index
+    /// work it does are charged to that budget.
     fn begin_catalog_txn(&self) -> coordinode_storage::engine::transaction::Transaction<'_> {
-        coordinode_storage::engine::transaction::Transaction::begin(
+        let mut txn = coordinode_storage::engine::transaction::Transaction::begin(
             &self.engine,
             Some(&self.oracle),
             self.oracle.next(),
-        )
+        );
+        txn.charge_writes_to(Some(statement_budget(self.query_memory_limit, None, None)));
+        txn
     }
 
     /// Commit catalog change `txn` through the write pipeline.

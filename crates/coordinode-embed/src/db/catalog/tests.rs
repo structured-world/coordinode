@@ -194,6 +194,19 @@ fn an_identical_edge_type_definition_publishes_nothing() {
     assert_eq!(stored.schema_revision, first);
 }
 
+/// A catalog change made through the API holds its staging and index work to
+/// the same memory limit a statement making it would: the session's query
+/// memory limit. Without one, the parts a change of what a type implies
+/// proposes and the definitions it walks were held to no bound at all.
+#[test]
+fn a_catalog_change_is_held_to_the_query_memory_limit() {
+    let (mut db, _dir) = open();
+    db.set_query_memory_limit(48 << 20).expect("limit");
+    let txn = db.begin_catalog_txn();
+    let budget = txn.write_budget().expect("a catalog change has a budget");
+    assert_eq!(budget.memory_limit(), 48 << 20);
+}
+
 /// A definition replaced while a constraint is created concurrently does not
 /// publish over it: the replacement read the definition the constraint's
 /// commit changed, so its own commit is refused and the constraint stays.

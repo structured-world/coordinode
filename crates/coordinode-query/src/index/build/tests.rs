@@ -75,6 +75,7 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
         repair: None,
         stop: None,
         maintained_after: None,
+        page_bytes: crate::index::lifecycle::DEFAULT_MAINTENANCE_PAGE_BYTES,
     }
 }
 
@@ -178,6 +179,58 @@ fn a_page_whose_repairs_never_end_its_duplicate_is_refused() {
         lookup(&fx, &index, "same@x").is_empty(),
         "the page committed nothing"
     );
+}
+
+/// A backfill page holds no more than its bytes: a node whose index entries
+/// alone take more than a page may (a list value expanded into many tuples)
+/// refuses the build with the budget's refusal, committing nothing, instead
+/// of growing without a bound. A page of smaller nodes under the same bytes
+/// still indexes.
+#[test]
+fn a_backfill_page_holds_no_more_than_its_bytes() {
+    let mut fx = fixture();
+    put_node(&mut fx, 1, "User", &email("small@x"));
+    let index = bound(crate::index::IndexDescriptor::btree(
+        "user_email",
+        "User",
+        "email",
+    ));
+    let page_bytes = 64 * 1024;
+    let indexed = Backfill {
+        page_bytes,
+        ..backfill(&fx)
+    }
+    .run(&index, &mut commit)
+    .expect("a small node fits");
+    assert_eq!(indexed, 1);
+
+    // One string per entry, together well past the page.
+    let wide: Vec<Value> = (0..4096)
+        .map(|i| Value::String(format!("{i:0>64}")))
+        .collect();
+    put_node(&mut fx, 2, "User", &[("email", Value::Array(wide))]);
+    let index = bound(crate::index::IndexDescriptor::btree(
+        "user_email_2",
+        "User",
+        "email",
+    ));
+    let err = Backfill {
+        page_bytes,
+        ..backfill(&fx)
+    }
+    .run(&index, &mut commit)
+    .expect_err("the wide node does not fit a page");
+    assert!(
+        err.budget_stop().is_some(),
+        "refused by the budget: {err:?}"
+    );
+    // Halved down to the wide node alone, which commits nothing; the page
+    // before it, of the small node, committed on its own.
+    assert!(
+        lookup(&fx, &index, &format!("{:0>64}", 7)).is_empty(),
+        "nothing of the wide node is committed"
+    );
+    assert_eq!(lookup(&fx, &index, "small@x"), vec![1]);
 }
 
 /// A sparse index skips a node missing the property.

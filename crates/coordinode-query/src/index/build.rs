@@ -201,6 +201,9 @@ pub struct Backfill<'a> {
     /// transaction open: the rows past it are passed over. `None`: learned
     /// by waiting for the transactions opened before the index.
     pub maintained_after: Option<u64>,
+    /// Bytes one page may hold: the rows it reads and the writes it stages,
+    /// the index entries' expansions among them.
+    pub page_bytes: u64,
 }
 
 /// What a backfill does about a stored node whose value of a unique index
@@ -361,133 +364,216 @@ impl<'a> Backfill<'a> {
         // The identity the index's label is bound to; a label without one
         // is carried by no node yet.
         let label = membership.label_id(&index.label)?;
+        // Rows one page reads: halved while a page does not fit its bytes,
+        // grown back towards the full page once one does.
+        let mut size = PAGE;
         loop {
             self.check_stop()?;
             let mut txn = match self.oracle {
                 Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
                 None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
             };
-            if self.bind_definition {
-                // Read for each page: a version held across the build could
-                // stop matching a record storage renumbered without a write.
-                let Some(version) = coordinode_modality::LocalIndexStore::new(self.engine)
-                    .definition_version_as(index)?
-                else {
-                    return Err(BackfillError::Superseded);
-                };
-                txn.bind_index_definition(&index.schema_key(), Some(version))
-                    .map_err(StoreError::from)?;
-            }
-            let page =
-                nodes.prefix_scan_paged_tracked(&mut txn, &prefix, start_after.as_deref(), PAGE)?;
-            let mut claims = Vec::new();
-            let mut read = Vec::with_capacity(page.rows.len());
-            let mut staged = 0u64;
-            let mut duplicate = None;
-            if index.index_type == super::definition::IndexType::Labels {
-                staged = self.stage_page_labels(
-                    &mut txn,
-                    index,
-                    &page.rows,
-                    maintained_after,
-                    &mut read,
-                    (&mut membership, &mut candidate_membership),
-                )?;
-            }
-            for (key, bytes) in &page.rows {
-                if index.index_type == super::definition::IndexType::Labels {
-                    break;
-                }
-                let Some(owner) = stored_owner(key) else {
-                    continue;
-                };
-                let record = decode_record(bytes)?;
-                // An index covers every node carrying its label, its type's
-                // implied ones included.
-                let Some(label) = label else {
-                    continue;
-                };
-                if !membership.carries(&record, label)? {
-                    continue;
-                }
-                let lookup = record_lookup(&record, self.interner);
-                let field_of = |name: &str| self.interner.lookup(name);
-                match stage_node_entry(
-                    self.engine,
-                    &mut txn,
-                    self.shard_id,
-                    index,
-                    owner,
-                    &lookup,
-                    &field_of,
-                    &mut claims,
-                ) {
-                    Ok(true) => staged += 1,
-                    Ok(false) => {}
-                    Err(IndexWriteError::Unique(_)) if self.repair.is_some() => {
-                        let property = self.repair.map_or("", |r| r.property);
-                        duplicate = Some((NodeId::from_raw(owner.node_id), lookup(property)));
-                        break;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-                read.push(key.clone());
-            }
-            // A duplicate the build may repair: the page commits nothing, the
-            // node is repaired in a transaction of its own, and the page is
-            // read again over the repaired data.
-            if let (Some((node, value)), Some(repair)) = (duplicate, self.repair) {
-                drop(txn);
-                page_repairs += 1;
-                if page_repairs > MAX_PAGE_REPAIRS {
-                    return Err(BackfillError::Contended);
-                }
-                (repair.run)(node, value.as_ref())?;
-                continue;
-            }
-            page_repairs = 0;
-            // The page's entries hold only if the rows they came from are
-            // still the rows it read when the page commits.
-            let unchanged = nodes.condition_unchanged(&mut txn, &read)?;
-            let committed = if unchanged {
-                match commit(&mut txn) {
-                    Ok(()) => true,
-                    Err(CommitError::Conflict(_) | CommitError::RevisionMismatch { .. }) => {
-                        // A conflict over the page's nodes is read again; a
-                        // definition that moved is not this build's any more.
-                        if self.bind_definition
-                            && coordinode_modality::LocalIndexStore::new(self.engine)
-                                .definition_version_as(index)?
-                                .is_none()
-                        {
-                            return Err(BackfillError::Superseded);
+            // One budget per page: the cursor the pass carries, then what
+            // the page reads and stages, each before the memory is taken.
+            let page_budget = crate::index::reconcile::page_budget(
+                self.page_bytes,
+                start_after.as_ref().map_or(0, Vec::capacity),
+            )?;
+            txn.charge_writes_to(Some(page_budget));
+            match self.page(
+                &mut txn,
+                index,
+                (&prefix, start_after.as_deref(), size),
+                maintained_after,
+                label,
+                (&mut membership, &mut candidate_membership),
+            ) {
+                Err(e) if e.budget_stop().is_some() => {
+                    // Nothing of the page is committed; fewer rows may fit.
+                    match size.checked_div(2).filter(|half| *half > 0) {
+                        Some(half) => {
+                            size = half;
+                            continue;
                         }
-                        false
+                        None => return Err(e),
                     }
-                    Err(e) => return Err(BackfillError::Commit(e)),
                 }
-            } else {
-                false
-            };
-            if !committed {
-                conflicts += 1;
-                if conflicts > MAX_PAGE_CONFLICTS {
-                    return Err(BackfillError::Contended);
+                Err(e) => return Err(e),
+                Ok(Page::Repair(node, value)) => {
+                    drop(txn);
+                    page_repairs += 1;
+                    if page_repairs > MAX_PAGE_REPAIRS {
+                        return Err(BackfillError::Contended);
+                    }
+                    if let Some(repair) = self.repair {
+                        (repair.run)(node, value.as_ref())?;
+                    }
+                    continue;
                 }
-                continue;
+                Ok(Page::Staged {
+                    staged,
+                    read,
+                    last_key,
+                    exhausted,
+                }) => {
+                    page_repairs = 0;
+                    // The page's entries hold only if the rows they came from
+                    // are still the rows it read when the page commits.
+                    let unchanged = nodes.condition_unchanged(&mut txn, &read)?;
+                    let committed = if unchanged {
+                        match commit(&mut txn) {
+                            Ok(()) => true,
+                            Err(
+                                CommitError::Conflict(_) | CommitError::RevisionMismatch { .. },
+                            ) => {
+                                // A conflict over the page's nodes is read
+                                // again; a definition that moved is not this
+                                // build's any more.
+                                if self.bind_definition
+                                    && coordinode_modality::LocalIndexStore::new(self.engine)
+                                        .definition_version_as(index)?
+                                        .is_none()
+                                {
+                                    return Err(BackfillError::Superseded);
+                                }
+                                false
+                            }
+                            Err(e) => return Err(BackfillError::Commit(e)),
+                        }
+                    } else {
+                        false
+                    };
+                    if !committed {
+                        conflicts += 1;
+                        if conflicts > MAX_PAGE_CONFLICTS {
+                            return Err(BackfillError::Contended);
+                        }
+                        continue;
+                    }
+                    indexed += staged;
+                    report(BackfillProgress::Indexed(indexed));
+                    if let (Some(covered), Some(last)) = (self.covered, last_key.as_deref()) {
+                        covered(last);
+                    }
+                    conflicts = 0;
+                    if exhausted {
+                        return Ok(indexed);
+                    }
+                    start_after = last_key;
+                    size = (size * 2).min(PAGE);
+                }
             }
-            indexed += staged;
-            report(BackfillProgress::Indexed(indexed));
-            if let (Some(covered), Some(last)) = (self.covered, page.last_key.as_deref()) {
-                covered(last);
-            }
-            conflicts = 0;
-            if page.exhausted {
-                return Ok(indexed);
-            }
-            start_after = page.last_key;
         }
     }
+
+    /// Read one page of at most `size` rows of the shard after `start_after`
+    /// under `prefix` and stage its entries in `txn`, or name the duplicate
+    /// the build may repair before the page commits.
+    #[allow(clippy::too_many_arguments)]
+    fn page(
+        &self,
+        txn: &mut Transaction<'a>,
+        index: &IndexDefinition,
+        (prefix, start_after, size): (&[u8], Option<&[u8]>, usize),
+        maintained_after: u64,
+        label: Option<LabelId>,
+        (membership, candidate_membership): (
+            &mut crate::index::membership::CatalogMembership<'_>,
+            &mut crate::index::membership::CatalogMembership<'_>,
+        ),
+    ) -> Result<Page, BackfillError> {
+        let nodes = LocalNodeStore;
+        if self.bind_definition {
+            // Read for each page: a version held across the build could stop
+            // matching a record storage renumbered without a write.
+            let Some(version) = coordinode_modality::LocalIndexStore::new(self.engine)
+                .definition_version_as(index)?
+            else {
+                return Err(BackfillError::Superseded);
+            };
+            txn.bind_index_definition(&index.schema_key(), Some(version))
+                .map_err(StoreError::from)?;
+        }
+        let page = nodes.prefix_scan_paged_tracked(txn, prefix, start_after, size)?;
+        let mut claims = Vec::new();
+        let mut read = Vec::with_capacity(page.rows.len());
+        let mut staged = 0u64;
+        if index.index_type == super::definition::IndexType::Labels {
+            staged = self.stage_page_labels(
+                txn,
+                index,
+                &page.rows,
+                maintained_after,
+                &mut read,
+                (membership, candidate_membership),
+            )?;
+        }
+        for (key, bytes) in &page.rows {
+            if index.index_type == super::definition::IndexType::Labels {
+                break;
+            }
+            let Some(owner) = stored_owner(key) else {
+                continue;
+            };
+            let record = decode_record(bytes)?;
+            // An index covers every node carrying its label, its type's
+            // implied ones included.
+            let Some(label) = label else {
+                continue;
+            };
+            if !membership.carries(&record, label)? {
+                continue;
+            }
+            let lookup = record_lookup(&record, self.interner);
+            let field_of = |name: &str| self.interner.lookup(name);
+            match stage_node_entry(
+                self.engine,
+                txn,
+                self.shard_id,
+                index,
+                owner,
+                &lookup,
+                &field_of,
+                &mut claims,
+            ) {
+                Ok(true) => staged += 1,
+                Ok(false) => {}
+                // A duplicate the build may repair: the page commits nothing,
+                // the node is repaired in a transaction of its own, and the
+                // page is read again over the repaired data.
+                Err(IndexWriteError::Unique(_)) if self.repair.is_some() => {
+                    let property = self.repair.map_or("", |r| r.property);
+                    return Ok(Page::Repair(
+                        NodeId::from_raw(owner.node_id),
+                        lookup(property),
+                    ));
+                }
+                Err(e) => return Err(e.into()),
+            }
+            read.push(key.clone());
+        }
+        Ok(Page::Staged {
+            staged,
+            read,
+            last_key: page.last_key,
+            exhausted: page.exhausted,
+        })
+    }
+}
+
+/// What one page of a backfill came to before it commits.
+enum Page {
+    /// Its entries are staged: how many, the node keys read, where it ended
+    /// and whether the shard is read through.
+    Staged {
+        staged: u64,
+        read: Vec<Vec<u8>>,
+        last_key: Option<Vec<u8>>,
+        exhausted: bool,
+    },
+    /// A stored node holds a unique value another holds, to repair first:
+    /// the node and its value of the repaired property.
+    Repair(NodeId, Option<Value>),
 }
 
 /// The owner of the index entries of the stored node row under `key`: the
