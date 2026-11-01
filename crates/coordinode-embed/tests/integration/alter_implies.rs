@@ -727,6 +727,91 @@ fn a_vector_index_follows_a_change_of_what_a_type_implies() {
     assert_eq!(nearest_things(&mut db, 3, None), things, "dropped again");
 }
 
+/// A change stopped after its proof, before it places or concludes anything,
+/// as a close there stops it, leaves the text and vector indexes answering
+/// the implication in force until the close; the reopen takes the change
+/// again and both indexes come to answer it: the tasks are found by their
+/// words and are the nearest things.
+#[test]
+fn search_indexes_follow_a_change_concluded_after_a_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let things: Vec<String> = (0..3).map(|i| format!("thing{i}")).collect();
+    let tasks: Vec<String> = (0..3).map(|i| format!("task{i:02}")).collect();
+    let titled = |hits: Vec<(String, f64)>| hits.into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+            statement_wait: std::time::Duration::from_millis(200),
+            ..db.index_build_config()
+        });
+        for ddl in [
+            "CREATE NODE TYPE Thing WITH (title: STRING)",
+            "ALTER LABEL Thing SET SCHEMA FLEXIBLE",
+            "CREATE NODE TYPE Task WITH (title: STRING)",
+            "ALTER LABEL Task SET SCHEMA FLEXIBLE",
+            "CREATE TEXT INDEX thing_text ON :Thing(title)",
+            r#"CREATE VECTOR INDEX thing_emb ON :Thing(emb) OPTIONS {metric: "l2"}"#,
+        ] {
+            db.execute_cypher(ddl)
+                .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+        }
+        for i in 0..20 {
+            db.execute_cypher(&format!(
+                "CREATE (:Task {{title: 'task{i:02}', emb: [1.0, {}]}})",
+                f64::from(i) * 0.001
+            ))
+            .expect("task");
+        }
+        for i in 0..5 {
+            db.execute_cypher(&format!(
+                "CREATE (:Thing {{title: 'thing{i}', emb: [{}, 1.0]}})",
+                -f64::from(i)
+            ))
+            .expect("thing");
+        }
+        await_vector_settled(&db, "built");
+        coordinode_query::index::lifecycle::STOP_AFTER_PROOF
+            .store(true, std::sync::atomic::Ordering::Release);
+        let rows = db
+            .execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+            .expect("alter");
+        assert!(
+            matches!(rows[0].get("operation"), Some(Value::Int(_))),
+            "an unfinished change names its operation: {rows:?}"
+        );
+        assert!(
+            !coordinode_query::index::lifecycle::STOP_AFTER_PROOF
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the certification reached its proof and stopped there"
+        );
+        assert_eq!(nearest_things(&mut db, 3, None), things, "before the close");
+        assert!(
+            titled(text_hits(&mut db, "task07", None)).is_empty(),
+            "no task is a thing before the close"
+        );
+    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !db
+        .execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .is_ok_and(|rows| rows[0].get("changed") == Some(&Value::Bool(false)))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reopen did not conclude the change"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    await_folded(&db);
+    await_vector_settled(&db, "after the reopen");
+    assert_eq!(nearest_things(&mut db, 3, None), tasks, "after the reopen");
+    assert_eq!(
+        titled(text_hits(&mut db, "task07", None)),
+        ["task07"],
+        "a task is found by its words after the reopen"
+    );
+}
+
 /// A change refused by its proof leaves a vector index answering as before:
 /// the members it kept for the withdrawn candidate leave the graph, and a
 /// search through the index finds the label's own things alone.

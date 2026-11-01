@@ -1139,6 +1139,107 @@ fn a_fold_interrupted_by_a_close_finishes_after_a_reopen() {
     );
 }
 
+/// A change making Task imply Thing is proved and then stopped, before it
+/// places or concludes anything, as a close there stops it. Until the close
+/// every read answers the implication in force, Task alone; the reopen takes
+/// the certification again and puts the change in force: every task is a
+/// thing by scan, by counter and through Thing's index, the type implies
+/// Thing, and no part is left behind.
+#[test]
+fn a_change_stopped_after_its_proof_concludes_after_a_reopen() {
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = |db: &mut Database| {
+        let scanned = db
+            .execute_cypher("MATCH (n:Thing) WHERE n.title + '' <> '' RETURN n")
+            .expect("scan")
+            .len();
+        let rows = db
+            .execute_cypher("MATCH (n:Thing) RETURN count(n) AS c")
+            .expect("count");
+        let looked_up = db
+            .execute_cypher("MATCH (n:Thing {title: 't7'}) RETURN n")
+            .expect("lookup")
+            .len();
+        (scanned, rows[0].get("c").cloned(), looked_up)
+    };
+    let tasks = 20;
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+            statement_wait: Duration::from_millis(200),
+            ..db.index_build_config()
+        });
+        for ddl in [
+            "CREATE NODE TYPE Thing WITH (title: STRING)",
+            "CREATE NODE TYPE Task WITH (title: STRING)",
+            "CREATE INDEX thing_title ON :Thing(title)",
+            "CREATE (:Thing {title: 'c'})",
+        ] {
+            db.execute_cypher(ddl).expect(ddl);
+        }
+        for n in 0..tasks {
+            db.execute_cypher(&format!("CREATE (:Task {{title: 't{n}'}})"))
+                .expect("task");
+        }
+        coordinode_query::index::lifecycle::STOP_AFTER_PROOF
+            .store(true, std::sync::atomic::Ordering::Release);
+        let rows = db
+            .execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+            .expect("alter");
+        // Answered while still being proved: the implication in force is
+        // the one before, with the operation to wait on.
+        assert!(
+            matches!(rows[0].get("operation"), Some(Value::Int(_))),
+            "an unfinished change names its operation: {rows:?}"
+        );
+        assert!(
+            !coordinode_query::index::lifecycle::STOP_AFTER_PROOF
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the certification reached its proof and stopped there"
+        );
+        assert_eq!(
+            state(&mut db),
+            (1, Some(Value::Int(1)), 0),
+            "the implication in force is Task alone until the change concludes"
+        );
+    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        // Refused while the change is still being certified; once it is in
+        // force, setting it again changes nothing.
+        let implies = db
+            .execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+            .ok()
+            .and_then(|rows| rows.into_iter().next());
+        let concluded = implies
+            .as_ref()
+            .is_some_and(|row| row.get("changed") == Some(&Value::Bool(false)));
+        let unfolded = {
+            use coordinode_modality::IndexStore as _;
+            coordinode_modality::LocalIndexStore::new(db.engine())
+                .list_definitions()
+                .expect("definitions")
+                .iter()
+                .any(|def| !def.selection.is_empty())
+        };
+        if concluded && !unfolded {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reopen did not conclude the change: implies {implies:?}, parts left {unfolded}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        state(&mut db),
+        (tasks + 1, Some(Value::Int(tasks as i64 + 1)), 1),
+        "in force after the reopen"
+    );
+}
+
 /// While a change making Task imply Thing waits to be proved, under a
 /// uniqueness on Thing's title, two transactions take one title at once: one
 /// as a thing, the other as a task, each from a view without the other.

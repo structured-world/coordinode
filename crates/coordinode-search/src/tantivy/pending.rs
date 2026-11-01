@@ -194,22 +194,29 @@ impl TextIndex {
                 _ => excluded,
             },
         };
+        // What is left out only filters: it is never scored. A scored clause
+        // would weigh its own term against the corpus above, which no longer
+        // counts the documents that term matches (the scope is excluded from
+        // it), and BM25 refuses a term held by more documents than the corpus.
+        let unscored = |query: Box<dyn Query>| -> Box<dyn Query> {
+            Box::new(tantivy::query::ConstScoreQuery::new(query, 0.0))
+        };
         let mut left_out: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         if let Some(scope) = exclude.filter(|s| *s != Scope::Shared) {
             let term = self.scope_term(scope);
             left_out.push((
                 Occur::MustNot,
-                Box::new(tantivy::query::TermQuery::new(
+                unscored(Box::new(tantivy::query::TermQuery::new(
                     term,
                     tantivy::schema::IndexRecordOption::Basic,
-                )),
+                ))),
             ));
         }
         if let Superseded::Nodes(nodes) = &pending.superseded {
             let terms = nodes
                 .iter()
                 .map(|id| Term::from_field_u64(self.node_id_field, *id));
-            left_out.push((Occur::MustNot, Box::new(TermSetQuery::new(terms))));
+            left_out.push((Occur::MustNot, unscored(Box::new(TermSetQuery::new(terms)))));
         }
         let mut hits = match &pending.superseded {
             Superseded::All => Vec::new(),

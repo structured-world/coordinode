@@ -256,6 +256,20 @@ fn after_proof() {
     }
 }
 
+/// Set by a test to stop the next certification once it has proved its
+/// candidates, before it places or concludes anything, as a close there
+/// stops it: its record stays without an outcome for the next open to take.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static STOP_AFTER_PROOF: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the certification that has just proved its candidates stops
+/// there; never in a build without test hooks.
+#[cfg(any(test, feature = "test-hooks"))]
+fn stops_after_proof() -> bool {
+    STOP_AFTER_PROOF.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
 /// The step a test runs once a certification executor has ended its run,
 /// whatever it concluded, taken by the next one to end: what a test ordering
 /// a resumed executor before another change installs.

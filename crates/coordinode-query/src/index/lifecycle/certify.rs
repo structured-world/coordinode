@@ -176,6 +176,10 @@ impl Shared {
         };
         #[cfg(any(test, feature = "test-hooks"))]
         super::after_proof();
+        #[cfg(any(test, feature = "test-hooks"))]
+        if super::stops_after_proof() {
+            return Ok(Executed::Lost);
+        }
         if refused.labels.is_empty() {
             match self.reconcile(generation, &labels)? {
                 Some(not_reconciled) => refused = not_reconciled,
