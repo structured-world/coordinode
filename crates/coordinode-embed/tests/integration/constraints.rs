@@ -1222,7 +1222,7 @@ fn interrupted_child_publishes_a_constraint_then_aborts() {
             assert!(std::time::Instant::now() < deadline, "never published");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        std::process::abort();
+        super::helpers::die_killed();
     });
 }
 
@@ -1250,8 +1250,8 @@ fn a_kill_between_publication_and_activation_is_finished_on_open() {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             status.signal(),
-            Some(6),
-            "the child must die by abort after the publication, got {status:?}"
+            Some(super::helpers::CHILD_KILL_SIGNAL),
+            "the child must be killed after the publication, got {status:?}"
         );
     }
     #[cfg(not(unix))]
@@ -1293,7 +1293,7 @@ fn replay_child_creates_constraints_then_aborts() {
     db.execute_cypher("CREATE (:User {email: 'a@x', name: 'a', age: 1})")
         .expect("write");
     db.execute_cypher("DROP CONSTRAINT user_age").expect("drop");
-    std::process::abort();
+    super::helpers::die_killed();
 }
 
 /// Constraint DDL acknowledged before a kill is what the replayed database
@@ -1317,8 +1317,8 @@ fn constraint_ddl_survives_a_kill_and_replay() {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             status.signal(),
-            Some(6),
-            "the child must die by abort after its DDL, got {status:?}"
+            Some(super::helpers::CHILD_KILL_SIGNAL),
+            "the child must be killed after its DDL, got {status:?}"
         );
     }
     #[cfg(not(unix))]

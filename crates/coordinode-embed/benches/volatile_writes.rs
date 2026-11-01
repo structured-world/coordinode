@@ -230,7 +230,7 @@ fn killed_writer(dir: &std::path::Path) -> ! {
     for k in 0..KILLED_WRITES {
         write(&db, WriteConcern::majority(), "Killed", k);
     }
-    std::process::abort()
+    coordinode_test_fixtures::die_killed()
 }
 
 /// How long an open takes: of a new store, and of one a killed process left

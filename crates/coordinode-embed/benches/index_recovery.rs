@@ -155,7 +155,7 @@ fn child(dir: &std::path::Path) {
             db.execute_cypher(&query).expect("use the index");
         }
     }
-    std::process::abort();
+    coordinode_test_fixtures::die_killed();
 }
 
 fn main() {
@@ -169,7 +169,7 @@ fn main() {
         .env(CHILD_DIR, dir.path())
         .status()
         .expect("run the child");
-    assert!(!status.success(), "the child must die by abort: {status:?}");
+    assert!(!status.success(), "the child must be killed: {status:?}");
     println!(
         "store built by the child in {:?} (nodes per label {}, large records {})",
         built.elapsed(),

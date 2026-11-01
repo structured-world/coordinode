@@ -1997,7 +1997,7 @@ fn guard_child_uses_an_index_then_aborts() {
     // the next open, and its guard names an installation that is gone.
     db.engine().persist().expect("the copy on disk");
     assert_eq!(found(&mut db, "c@x").len(), 1, "the lookup used the index");
-    std::process::abort();
+    super::helpers::die_killed();
 }
 
 /// A process that dies while an index copy is in use may have found damage
@@ -2021,8 +2021,8 @@ fn a_copy_in_use_when_the_process_died_is_checked_before_it_serves() {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             status.signal(),
-            Some(6),
-            "the child must die by abort after its lookup, got {status:?}"
+            Some(super::helpers::CHILD_KILL_SIGNAL),
+            "the child must be killed after its lookup, got {status:?}"
         );
     }
     #[cfg(not(unix))]

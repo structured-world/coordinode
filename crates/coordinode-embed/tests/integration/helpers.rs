@@ -18,6 +18,8 @@ use coordinode_query::executor::runner::{AdaptiveConfig, ExecutionContext, Write
 use coordinode_storage::engine::StorageSnapshot;
 use coordinode_storage::engine::core::StorageEngine;
 
+pub use coordinode_test_fixtures::{CHILD_KILL_SIGNAL, die_killed};
+
 /// The catalog identity of `label`, bound on first use as a write binds it.
 #[allow(clippy::expect_used)]
 pub fn bind_label(

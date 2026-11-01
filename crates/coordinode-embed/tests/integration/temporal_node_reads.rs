@@ -824,7 +824,7 @@ fn temporal_ownership_crash_child_writes_then_aborts() {
     )
     .expect("take staged");
     db.commit_transaction(txn).expect("handover acknowledged");
-    std::process::abort();
+    super::helpers::die_killed();
 }
 
 /// Ownership acknowledged before a kill is enforced after the reopen, under
@@ -852,8 +852,8 @@ fn temporal_ownership_is_restored_after_a_kill() {
             use std::os::unix::process::ExitStatusExt;
             assert_eq!(
                 status.signal(),
-                Some(6),
-                "{maintenance}: the child must die by abort after its writes, got {status:?}"
+                Some(super::helpers::CHILD_KILL_SIGNAL),
+                "{maintenance}: the child must be killed after its writes, got {status:?}"
             );
         }
         #[cfg(not(unix))]

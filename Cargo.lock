@@ -1243,6 +1243,7 @@ dependencies = [
  "coordinode-wire",
  "hyper-util",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",

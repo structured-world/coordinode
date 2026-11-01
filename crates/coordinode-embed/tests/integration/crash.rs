@@ -26,7 +26,7 @@ fn crash_child_writes_then_aborts() {
     let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
     db.execute_cypher("CREATE (:Survivor {k: 1})")
         .expect("write in child");
-    std::process::abort();
+    super::helpers::die_killed();
 }
 
 /// A write acknowledged before the process was killed survives it, and the
@@ -46,14 +46,14 @@ fn acknowledged_write_survives_process_kill() {
         .env(CRASH_CHILD_DIR, dir.path())
         .status()
         .expect("run the child");
-    // The child must have reached its abort, not failed before the write.
+    // The child must have reached its kill, not failed before the write.
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             status.signal(),
-            Some(6),
-            "the child must die by abort after its write, got {status:?}"
+            Some(super::helpers::CHILD_KILL_SIGNAL),
+            "the child must be killed after its write, got {status:?}"
         );
     }
     #[cfg(not(unix))]
@@ -113,7 +113,7 @@ fn crash_child_moves_an_indexed_node_then_aborts() {
         1,
         "the child moves the node"
     );
-    std::process::abort();
+    super::helpers::die_killed();
 }
 
 /// After a kill and the journal replay that follows it, a transaction that
@@ -136,8 +136,8 @@ fn an_indexed_node_is_found_after_replay_behind_a_create() {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             status.signal(),
-            Some(6),
-            "the child must die by abort after its writes, got {status:?}"
+            Some(super::helpers::CHILD_KILL_SIGNAL),
+            "the child must be killed after its writes, got {status:?}"
         );
     }
     #[cfg(not(unix))]

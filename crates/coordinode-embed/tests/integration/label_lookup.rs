@@ -692,7 +692,7 @@ fn crash_child_changes_labels_then_aborts() {
         .expect("label removed");
     db.execute_cypher("MATCH (n:K {name: 'k6'}) DELETE n")
         .expect("delete");
-    std::process::abort();
+    super::helpers::die_killed();
 }
 
 /// After a kill and the journal replay that follows it, every label's
@@ -715,8 +715,8 @@ fn label_scans_after_a_crash_match_the_records() {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             status.signal(),
-            Some(6),
-            "the child must die by abort after its writes, got {status:?}"
+            Some(super::helpers::CHILD_KILL_SIGNAL),
+            "the child must be killed after its writes, got {status:?}"
         );
     }
     #[cfg(not(unix))]
@@ -751,7 +751,7 @@ fn crash_child_scans_labels_then_aborts() {
         .expect("create");
     assert_eq!(names(&mut db, "MATCH (n:Q) RETURN n.name AS name").len(), 2);
     db.engine().persist().expect("persist");
-    std::process::abort();
+    super::helpers::die_killed();
 }
 
 /// A process killed while its label scans read the lookup leaves a copy
@@ -769,6 +769,16 @@ fn a_lookup_in_use_at_a_kill_serves_after_the_restart() {
         .env(SCANNED_CHILD_DIR, dir.path())
         .status()
         .expect("run the child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(super::helpers::CHILD_KILL_SIGNAL),
+            "the child must be killed after its scans, got {status:?}"
+        );
+    }
+    #[cfg(not(unix))]
     assert!(!status.success(), "the child must die, got {status:?}");
 
     let mut db = Database::open(dir.path()).expect("reopen after the kill");

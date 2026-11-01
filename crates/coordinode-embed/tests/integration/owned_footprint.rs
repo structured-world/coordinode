@@ -327,7 +327,7 @@ fn footprint_child_fills_then_aborts() {
     let mut db = Database::open_with_config(capped(&root)).expect("open in child");
     let accepted = fill(&mut db, &root, 0);
     std::fs::write(dir.join("accepted"), accepted.to_string()).expect("record");
-    std::process::abort();
+    super::helpers::die_killed();
 }
 
 /// A full capped database killed mid-flight (journal tail unsealed, memtables
@@ -350,8 +350,8 @@ fn a_full_store_killed_reopens_inside_the_cap_with_its_writes() {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             status.signal(),
-            Some(6),
-            "the child must die by abort once full, got {status:?}"
+            Some(super::helpers::CHILD_KILL_SIGNAL),
+            "the child must be killed once full, got {status:?}"
         );
     }
     #[cfg(not(unix))]

@@ -30,6 +30,10 @@ tokio-rustls = { version = "0.26", default-features = false }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower-service = "0.3"
 
+# Crash-test children send themselves SIGKILL.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [lints.clippy]
 # The storage-partition guard (clippy.toml `disallowed-types`) is global and
 # warn-by-default; only coordinode-query opts into it. Keep it inert here.
