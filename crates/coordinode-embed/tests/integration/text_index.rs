@@ -539,7 +539,10 @@ fn a_documented_fuzzy_term_matches_within_its_distance() {
 
 /// A worker that cannot fold a write, nor rebuild after it (its index
 /// directory is gone), releases nothing: the write stays in the delta, a
-/// search finds the node from the store, and nothing panics.
+/// search finds the node from the store, and nothing panics. Unix only:
+/// Windows refuses to delete the files a running index holds open, so its
+/// directory cannot vanish under the process there.
+#[cfg(unix)]
 #[test]
 fn a_write_the_worker_cannot_fold_is_answered_from_the_store() {
     let (mut db, _dir) = open_db();
