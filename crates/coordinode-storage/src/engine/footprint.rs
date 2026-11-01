@@ -99,6 +99,13 @@ pub fn flush_debt(unflushed: u64, flushes: u64) -> u64 {
     tables + ahead
 }
 
+/// The most the flush debt grows when an empty memtable takes its first
+/// write and becomes one more flush: [`FLUSH_ALLOWANCE`] in its table and as
+/// much again, with [`MIN_AHEAD`] twice, in the allocation ahead the sum of
+/// the tables bounds. A write into a tree whose active memtable is empty is
+/// admitted for this as well as its own bytes.
+pub const MEMTABLE_START_DEBT: u64 = 2 * (FLUSH_ALLOWANCE + MIN_AHEAD);
+
 /// The smallest journal segment a hard limit brings the configured size down
 /// to: below it the per-segment header, footer and file cost outweigh the
 /// finer reclamation.

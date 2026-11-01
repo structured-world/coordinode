@@ -388,6 +388,19 @@ fn mutation_partition(mutation: &Mutation) -> Option<Partition> {
     }
 }
 
+/// The trees a mutation writes once it is applied: its own partition, or
+/// for one decided at apply, where its decision lands (a metadata command and
+/// an operation record in Schema, derived index work in the indexes and
+/// their counters).
+fn written_partitions(mutation: &Mutation) -> impl Iterator<Item = Partition> {
+    let parts = match mutation {
+        Mutation::Command(_) | Mutation::Operation(_) => [Some(Partition::Schema), None],
+        Mutation::Derive(_) => [Some(Partition::Idx), Some(Partition::Counter)],
+        resolved => [mutation_partition(resolved), None],
+    };
+    parts.into_iter().flatten()
+}
+
 /// One write to a node-local record ([`StorageEngine::commit_local`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalWrite {
@@ -1765,8 +1778,37 @@ impl StorageEngine {
         if self.footprints.is_empty() {
             return Ok(crate::engine::footprint::Admitted::default());
         }
-        let bytes = crate::engine::footprint::write_footprint(mutations);
+        let bytes = crate::engine::footprint::write_footprint(mutations)
+            + self.memtable_starts(mutations.iter().flat_map(written_partitions));
         self.admit_footprint(bytes, class)
+    }
+
+    /// The growth of the flush debt a write into `parts` may cause: one
+    /// [`MEMTABLE_START_DEBT`](crate::engine::footprint::MEMTABLE_START_DEBT)
+    /// for each distinct tree among them whose active memtable is empty,
+    /// which the write makes one more flush owed. Read without a tree's lock.
+    fn memtable_starts(&self, parts: impl IntoIterator<Item = Partition>) -> u64 {
+        use lsm_tree::AbstractTree;
+        let all = Partition::all();
+        // One bit per partition: a handful of them.
+        let mut seen = 0u64;
+        let mut starts = 0u64;
+        for part in parts {
+            let Some(bit) = all.iter().position(|p| *p == part) else {
+                continue;
+            };
+            if seen & (1 << bit) != 0 {
+                continue;
+            }
+            seen |= 1 << bit;
+            if self
+                .tree(part)
+                .is_ok_and(|tree| tree.active_memtable_is_empty())
+            {
+                starts += crate::engine::footprint::MEMTABLE_START_DEBT;
+            }
+        }
+        starts
     }
 
     /// Admit, on the owned footprint, a write of the partitions `parts` that
@@ -1779,21 +1821,23 @@ impl StorageEngine {
     /// [`StorageError::CapacityExhausted`] when the write does not fit.
     pub(crate) fn admit_partition_write(
         &self,
-        parts: impl IntoIterator<Item = Partition>,
+        parts: impl IntoIterator<Item = Partition, IntoIter: Clone>,
         bytes: u64,
     ) -> StorageResult<crate::engine::footprint::Admitted> {
         use crate::engine::footprint::Admit;
         if self.footprints.is_empty() {
             return Ok(crate::engine::footprint::Admitted::default());
         }
+        let parts = parts.into_iter();
         let class = if parts
-            .into_iter()
+            .clone()
             .all(|part| matches!(part, Partition::Schema | Partition::Raft))
         {
             Admit::Recovery
         } else {
             Admit::Client.on_this_thread()
         };
+        let bytes = bytes + self.memtable_starts(parts);
         self.admit_footprint(bytes, class)
     }
 
