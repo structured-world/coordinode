@@ -11,7 +11,8 @@ documentation = "https://docs.rs/coordinode-embed"
 
 [features]
 # Use the io_uring storage backend on Linux (forwards to
-# coordinode-storage/io-uring). Default-off; no-op on non-Linux targets.
+# coordinode-storage/io-uring). On through coordinode-storage's defaults;
+# no-op on non-Linux targets.
 io-uring = ["coordinode-storage/io-uring"]
 # A database that is a member of a replicated group: consensus, the
 # inter-node channel and its listener. Without it none of them is compiled

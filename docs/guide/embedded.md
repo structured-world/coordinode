@@ -32,7 +32,7 @@ coordinode-storage = "0.9"
   a newer compiler; older compilers are not tested.
 - **Features.** The default build is a standalone database (see
   [Build features](#build-features)). `replication` adds membership in a
-  replicated group; `io-uring` adds the io_uring storage backend on Linux.
+  replicated group; the io_uring storage backend is on by default on Linux.
 - **What the registry checks run.** A registry release passes when the
   [quickstart example](#quickstart) and a broader consumer build from the
   published packages and run standalone, and the same consumer compiles with
@@ -426,11 +426,11 @@ backup.
   snapshot and segment transfer, under mutual TLS node identity), never a
   client protocol. A build with the feature still runs standalone until it is
   given peers.
-- **`io-uring`.** The storage engine opens on one shared io_uring ring instead
-  of synchronous `pread`/`pwrite`, on Linux 5.6 and later. Elsewhere it is a
-  no-op; a kernel without io_uring makes the engine log a warning and use the
-  default backend. The registry checks do not run it; it is built and tested
-  inside the workspace on Linux.
+- **`io-uring`, on by default.** The storage engine opens on one shared
+  io_uring ring instead of synchronous `pread`/`pwrite`, on Linux 5.6 and
+  later. Elsewhere it is a no-op; a kernel without io_uring makes the engine
+  log a warning and use synchronous I/O. It comes with the storage crate's
+  default features.
 
 Enabling a feature changes the build, not the store format: a store written by
 a standalone build becomes the member a group is formed around in place (see

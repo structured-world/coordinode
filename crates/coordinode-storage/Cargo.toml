@@ -10,7 +10,7 @@ readme.workspace = true
 documentation = "https://docs.rs/coordinode-storage"
 
 [features]
-default = ["lz4", "zstd", "columnar"]
+default = ["lz4", "zstd", "columnar", "io-uring"]
 lz4 = ["lsm-tree/lz4", "dep:lz4_flex"]
 # Pure-Rust zstd (no C library). On by default: the cold LSM levels compress
 # with it unless the configuration says otherwise.
@@ -36,7 +36,7 @@ page_ecc = ["lsm-tree/page_ecc"]
 # itself target-gated to Linux, so enabling this is a no-op on other
 # platforms). When enabled, the engine opens its partition trees on a single
 # shared io_uring ring; if the kernel lacks io_uring at runtime it falls back
-# to StdFs. Off by default.
+# to StdFs. On by default.
 io-uring = ["lsm-tree/io-uring"]
 # The engine's own read and compaction counters (bytes read, decoded and
 # copied, cache hits, compaction work), published per partition as metrics.

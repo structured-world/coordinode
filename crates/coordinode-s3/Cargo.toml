@@ -8,7 +8,8 @@ publish.workspace = true
 
 [features]
 # Use the io_uring storage backend on Linux (forwards to
-# coordinode-storage/io-uring). Default-off; no-op on non-Linux targets.
+# coordinode-storage/io-uring). On through coordinode-storage's defaults;
+# no-op on non-Linux targets.
 io-uring = ["coordinode-storage/io-uring"]
 
 [[bin]]
