@@ -154,11 +154,52 @@ async fn the_raft_log_rotates_by_the_engine_configuration() {
         .append(entries, IOFlushed::noop())
         .await
         .expect("append");
+    // The writer thread puts the entries in the segments.
+    store.sync.wait_idle();
 
     let sealed = store.oplog.lock().expect("lock").sealed_segment_count();
     assert_eq!(sealed, 3, "10 entries at 3 per segment seal three segments");
     let read = store.try_get_log_entries(1..=10).await.expect("read");
     assert_eq!(read.len(), 10);
+}
+
+/// An append does no file I/O: with the segments held by another thread (a
+/// write of the segment waits out a full sync of the same file, as macOS
+/// holds it), it returns at once and the entry reads back. The Raft core
+/// appends; when it wrote the segment itself it waited out every sync of
+/// the log and handed over one batch per sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_append_returns_while_the_segments_are_held() {
+    let (_dir, engine) = test_engine();
+    let mut store = LogStore::open(engine).unwrap();
+    let oplog = Arc::clone(&store.oplog);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _held = oplog.lock().expect("lock");
+        held_tx.send(()).expect("held");
+        release_rx.recv().ok();
+    });
+    held_rx.recv().expect("the segments are held");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.append(vec![make_entry(1, 1, "a")], IOFlushed::noop()),
+    )
+    .await
+    .expect("the append waited on the segments")
+    .expect("append");
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.try_get_log_entries(1..=1),
+    )
+    .await
+    .expect("the read waited on the segments")
+    .expect("read");
+    assert_eq!(read.len(), 1, "the entry reads back before it is written");
+
+    release_tx.send(()).expect("release");
+    holder.join().expect("holder");
 }
 
 #[tokio::test]
@@ -245,6 +286,8 @@ async fn a_truncation_never_removes_the_kept_prefix() {
         .append(entries, IOFlushed::noop())
         .await
         .expect("append");
+    // The writer thread puts the entries in the segments.
+    store.sync.wait_idle();
 
     let first_segment = {
         let oplog = store.oplog.lock().expect("lock");
@@ -296,6 +339,7 @@ async fn oplog_record_carries_commit_ts_and_term() {
         .append(vec![make_entry(5, 3, "a")], IOFlushed::noop())
         .await
         .unwrap();
+    store.sync.wait_idle();
 
     let records = store.oplog.lock().unwrap().read_range(5, 6).unwrap();
     assert_eq!(records.len(), 1);
@@ -320,6 +364,7 @@ async fn a_log_record_holds_each_proposal_once_as_its_frame() {
         .append(vec![entry.clone()], IOFlushed::noop())
         .await
         .unwrap();
+    store.sync.wait_idle();
 
     let record = store
         .oplog
@@ -1043,7 +1088,7 @@ async fn a_rebuild_the_log_cannot_complete_changes_nothing() {
     let key = b"counter:degree:1";
     let before = engine.get(Partition::Counter, key).unwrap();
 
-    let log = Arc::clone(&store.oplog);
+    let log = store.oplog_handle();
     let rebuilder = Arc::clone(&engine);
     let err = tokio::task::spawn_blocking(move || {
         rebuild_partition_from_checkpoint(&rebuilder, &log, &ckpt, Partition::Counter)
@@ -2504,33 +2549,29 @@ async fn a_failed_log_write_stops_the_raft_log() {
     {
         let engine = Arc::new(StorageEngine::open(&config()).expect("open"));
         let mut store = LogStore::open(Arc::clone(&engine)).expect("open log");
-        store
-            .append(
-                vec![make_entry(1, 1, "a"), make_entry(2, 1, "b")],
-                IOFlushed::noop(),
-            )
+        // The answer openraft gets for an append: durable, or the failure.
+        async fn appended(store: &mut LogStore, entry: Entry) -> Result<(), io::Error> {
+            let (tx, rx) = <TypeConfig as openraft::type_config::TypeConfigExt>::oneshot();
+            store
+                .append(vec![entry], IOFlushed::signal(tx))
+                .await
+                .expect("an append is taken; the writer answers it");
+            rx.await.expect("answered")
+        }
+        appended(&mut store, make_entry(1, 1, "a"))
             .await
-            .expect("append 1..2");
-        store
-            .oplog
-            .lock()
-            .expect("oplog")
-            .flush()
-            .expect("sync 1..2");
+            .expect("1 durable");
+        appended(&mut store, make_entry(2, 1, "b"))
+            .await
+            .expect("2 durable");
         store.oplog.lock().expect("oplog").fail_writes();
         assert!(
-            store
-                .append(vec![make_entry(3, 1, "c")], IOFlushed::noop())
-                .await
-                .is_err(),
+            appended(&mut store, make_entry(3, 1, "c")).await.is_err(),
             "the write fails"
         );
         assert!(
-            store
-                .append(vec![make_entry(4, 1, "d")], IOFlushed::noop())
-                .await
-                .is_err(),
-            "nothing is appended past the failure"
+            appended(&mut store, make_entry(4, 1, "d")).await.is_err(),
+            "nothing is acknowledged past the failure"
         );
     }
     let engine = Arc::new(StorageEngine::open(&config()).expect("reopen"));

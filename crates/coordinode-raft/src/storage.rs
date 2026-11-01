@@ -563,7 +563,7 @@ pub fn clear_catch_up(engine: &StorageEngine) -> Result<(), io::Error> {
 /// is changed unless the log holds every entry needed.
 pub fn rebuild_partition_from_checkpoint(
     engine: &StorageEngine,
-    log: &Mutex<OplogManager>,
+    log: &RaftLogHandle,
     checkpoint_dir: &std::path::Path,
     partition: Partition,
 ) -> Result<(), io::Error> {
@@ -575,9 +575,7 @@ pub fn rebuild_partition_from_checkpoint(
             let (rows, held) = StorageEngine::checkpoint_raft_partition(checkpoint_dir, partition)?;
             let (from, to) = (held.base_next(), applies.next());
             let entries = if from < to {
-                log.lock()
-                    .map_err(|_| StorageError::Io("raft log mutex poisoned".into()))?
-                    .read_range(from, to)?
+                log.read_range(from, to)?
             } else {
                 Vec::new()
             };
@@ -750,8 +748,12 @@ pub struct LogStore {
     oplog: Arc<Mutex<OplogManager>>,
     /// Waiters for "my proposal is durable in this log", see [`AppendNotifier`].
     append_notifier: Arc<AppendNotifier>,
-    /// Makes appends durable off the Raft core and answers them.
+    /// Writes appends and makes them durable off the Raft core, and answers
+    /// them.
     sync: Arc<crate::log_sync::LogSync>,
+    /// The latest entries, every one not yet written among them: reads of
+    /// the log's end are served from here.
+    tail: Arc<parking_lot::Mutex<crate::log_sync::Tail>>,
     /// In-memory cache of the last appended log id. Updated on every
     /// `append()` and persisted to `Partition::Raft` so it survives restarts.
     last_log_id: Arc<Mutex<Option<LogId>>>,
@@ -767,6 +769,44 @@ pub struct LogStore {
     saved_vote: Arc<Mutex<Option<Vote>>>,
     /// The member the store's records belong to, once bound.
     member: Arc<Mutex<Option<MemberBinding>>>,
+}
+
+/// The Raft log's segments as a reader outside openraft sees them. The log's
+/// writer thread puts appended entries in the segments a little after the
+/// Raft core took them, so a read here first waits until the entries it asks
+/// for are written.
+#[derive(Clone)]
+pub struct RaftLogHandle {
+    oplog: Arc<Mutex<OplogManager>>,
+    sync: Arc<crate::log_sync::LogSync>,
+}
+
+impl RaftLogHandle {
+    /// The log's entries in `[from, to)` that it holds, once written.
+    ///
+    /// # Errors
+    ///
+    /// The segments cannot be read.
+    pub fn read_range(&self, from: u64, to: u64) -> Result<Vec<OplogEntry>, StorageError> {
+        if to > from {
+            self.sync.wait_written(to - 1);
+        }
+        self.oplog
+            .lock()
+            .map_err(|_| StorageError::Io("raft log mutex poisoned".into()))?
+            .read_range(from, to)
+    }
+
+    /// The segment manager itself, for what reads its state rather than its
+    /// entries.
+    pub fn manager(&self) -> &Arc<Mutex<OplogManager>> {
+        &self.oplog
+    }
+
+    /// The last index written to the segments, as it advances.
+    pub(crate) fn written(&self) -> tokio::sync::watch::Receiver<Option<u64>> {
+        self.sync.written()
+    }
 }
 
 /// Where a shard's Raft log lives on disk.
@@ -915,12 +955,15 @@ impl LogStore {
         Ok(())
     }
 
-    /// A shared handle to the Raft oplog manager. Cloned out before the
+    /// A shared handle to the Raft log's segments. Cloned out before the
     /// `LogStore` is moved into `openraft::Raft` so a subsystem (e.g. WAL-replay
     /// repair) can read committed entries since a checkpoint without going
-    /// through openraft. Reads serialize against appends via the inner `Mutex`.
-    pub fn oplog_handle(&self) -> Arc<Mutex<OplogManager>> {
-        Arc::clone(&self.oplog)
+    /// through openraft.
+    pub fn oplog_handle(&self) -> RaftLogHandle {
+        RaftLogHandle {
+            oplog: Arc::clone(&self.oplog),
+            sync: Arc::clone(&self.sync),
+        }
     }
 
     /// The local-append notifier the proposal pipeline waits on for `w:1` and
@@ -1089,14 +1132,22 @@ impl LogStore {
         }
 
         let append_notifier = Arc::new(AppendNotifier::default());
-        let sync = Arc::new(crate::log_sync::LogSync::start(Arc::clone(
-            &append_notifier,
-        ))?);
+        let oplog = Arc::new(Mutex::new(oplog));
+        let tail = Arc::new(parking_lot::Mutex::new(crate::log_sync::Tail::default()));
+        // What the segments hold at open is written: a replay of it applies
+        // without waiting for the writer.
+        let sync = Arc::new(crate::log_sync::LogSync::start(
+            Arc::clone(&append_notifier),
+            Arc::clone(&oplog),
+            Arc::clone(&tail),
+            last_log_id.map(|id| id.index),
+        )?);
         let store = Self {
             engine: crate::engine_hold::EngineHold::new(engine, "raft log store"),
-            oplog: Arc::new(Mutex::new(oplog)),
+            oplog,
             append_notifier,
             sync,
+            tail,
             last_log_id: Arc::new(Mutex::new(last_log_id)),
             last_purged: Arc::new(Mutex::new(last_purged)),
             hold: EngineWork::default().start(),
@@ -1151,7 +1202,7 @@ impl LogStore {
     /// it, one unit frame each, so every proposal's bytes are written once, in
     /// the encoding the embedded journal records a unit in. A change stream
     /// reads the operations out of those frames.
-    fn entry_to_oplog(entry: &Entry) -> Result<OplogEntry, io::Error> {
+    pub(crate) fn entry_to_oplog(entry: &Entry) -> Result<OplogEntry, io::Error> {
         let (envelope, units) = match &entry.payload {
             openraft::entry::EntryPayload::Normal(request) => {
                 let units = request
@@ -1241,6 +1292,8 @@ impl LogStore {
     ///
     /// The log cannot be read or an entry does not decode.
     pub fn writes_user_data_from(&self, from: u64) -> Result<bool, io::Error> {
+        // Every entry taken is in the segments before they are read.
+        self.sync.wait_idle();
         let entries = self
             .oplog
             .lock()
@@ -1345,14 +1398,24 @@ impl RaftLogReader<TypeConfig> for LogStore {
             .map(|id| id.index + 1)
             .unwrap_or(0);
 
-        let oplog_entries = self
-            .oplog
-            .lock()
-            .map_err(|_| io::Error::other("oplog mutex poisoned"))?
-            .read_range(start, end_exclusive)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        // The end of the log comes from the tail, which holds every entry
+        // not yet written; below the tail every entry is in the segments.
+        let (cached, tail_first) = {
+            let tail = self.tail.lock();
+            (tail.range(start, end_exclusive), tail.first())
+        };
+        let file_end = tail_first.map_or(end_exclusive, |first| first.min(end_exclusive));
+        let oplog_entries = if start < file_end {
+            self.oplog
+                .lock()
+                .map_err(|_| io::Error::other("oplog mutex poisoned"))?
+                .read_range(start, file_end)
+                .map_err(|e| io::Error::other(e.to_string()))?
+        } else {
+            Vec::new()
+        };
 
-        let mut entries = Vec::with_capacity(oplog_entries.len());
+        let mut entries = Vec::with_capacity(oplog_entries.len() + cached.len());
         for oe in oplog_entries {
             // Skip entries that fall within the purged range (segment granularity
             // means a segment may still contain some pre-purge-boundary entries).
@@ -1361,6 +1424,12 @@ impl RaftLogReader<TypeConfig> for LogStore {
             }
             entries.push(Self::oplog_to_entry(oe)?);
         }
+        entries.extend(
+            cached
+                .iter()
+                .filter(|e| e.log_id.index >= min_valid_index)
+                .map(|e| Entry::clone(e)),
+        );
 
         Ok(entries)
     }
@@ -1412,6 +1481,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             last_purged: Arc::clone(&self.last_purged),
             append_notifier: Arc::clone(&self.append_notifier),
             sync: Arc::clone(&self.sync),
+            tail: Arc::clone(&self.tail),
             hold: self.hold.another(),
             incarnation: self.incarnation,
             saved_vote: Arc::clone(&self.saved_vote),
@@ -1493,51 +1563,36 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut last: Option<LogId> = None;
         // (proposal id, log index) of every proposal in this batch, told to
-        // the waiting writers only once the batch is durable.
+        // the waiting writers once the batch is written and durable.
         let mut appended: Vec<(coordinode_core::txn::proposal::ProposalId, u64)> = Vec::new();
-        let handle = {
-            let mut oplog = self
-                .oplog
-                .lock()
-                .map_err(|_| io::Error::other("oplog mutex poisoned"))?;
-            for entry in entries {
-                let oplog_entry = Self::entry_to_oplog(&entry)?;
+        let entries: Vec<Arc<Entry>> = entries
+            .into_iter()
+            .map(|entry| {
                 if let openraft::entry::EntryPayload::Normal(request) = &entry.payload {
                     appended.extend(request.proposals.iter().map(|p| (p.id, entry.log_id.index)));
                 }
-                last = Some(entry.log_id);
-                oplog
-                    .append(&oplog_entry)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-            }
-            // Written to the kernel, so a read sees the entries at once; the
-            // sync thread makes them durable, and only then is openraft told
-            // (the crash-safety boundary) and the writers answered. The Raft
-            // core meanwhile replicates the batch instead of waiting on the
-            // disk, and one sync covers every batch appended while it runs.
-            oplog
-                .flush_to_os()
-                .map_err(|e| io::Error::other(e.to_string()))?
+                Arc::new(entry)
+            })
+            .collect();
+        let Some(last) = entries.last().map(|e| e.log_id) else {
+            callback.io_completed(Ok(()));
+            return Ok(());
         };
-
-        if let Some(log_id) = last {
-            *self
-                .last_log_id
-                .lock()
-                .map_err(|_| io::Error::other("last_log_id mutex poisoned"))? = Some(log_id);
-        }
-        // A writer under a volatile `j` is answered now, at the write; the
-        // commit still waits for the sync below, as every commit does.
-        self.append_notifier.notify_written(&appended);
-        self.sync.submit(
-            handle,
-            crate::log_sync::Append {
-                callback,
-                proposals: appended,
-            },
-        );
+        // In the tail first, so a read sees the entries at once; the writer
+        // thread writes and syncs them, and only then is openraft told (the
+        // crash-safety boundary) and the writers answered. The Raft core does
+        // no file I/O here and keeps replicating while the disk flushes.
+        self.tail.lock().push(&entries);
+        *self
+            .last_log_id
+            .lock()
+            .map_err(|_| io::Error::other("last_log_id mutex poisoned"))? = Some(last);
+        self.sync.submit(crate::log_sync::Append {
+            callback,
+            proposals: appended,
+            entries,
+        });
         Ok(())
     }
 
@@ -1558,6 +1613,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             .map_err(|_| io::Error::other("oplog mutex poisoned"))?
             .truncate_from(keep_exclusive)
             .map_err(|e| io::Error::other(e.to_string()))?;
+        self.tail.lock().truncate_from(keep_exclusive);
+        self.sync.truncated(keep_exclusive);
 
         *self
             .last_log_id
@@ -1745,6 +1802,11 @@ pub struct CoordinodeStateMachine {
     /// Snapshot work holding the engine off the async runtime, which a
     /// shutdown waits out.
     engine_work: EngineWork,
+    /// The last index the log has written to its segments. An entry is
+    /// applied only once it is there, so whatever reads the segments (change
+    /// streams, a partition rebuild) holds every applied entry: a commit can
+    /// reach this member before its own log writer has written the entry.
+    log_written: Option<tokio::sync::watch::Receiver<Option<u64>>>,
     /// This state machine's own share of `engine_work`: it holds the engine
     /// for as long as openraft keeps it. Declared last, so it is dropped after
     /// every field holding the engine: a shutdown waiting on it would
@@ -2019,7 +2081,14 @@ impl CoordinodeStateMachine {
             gate,
             _hold: engine_work.start(),
             engine_work,
+            log_written: None,
         })
+    }
+
+    /// Apply an entry only once `log` holds it in its segments.
+    pub fn with_log(mut self, log: &RaftLogHandle) -> Self {
+        self.log_written = Some(log.written());
+        self
     }
 
     /// Count this state machine and its snapshot work in `work`, the log
@@ -2436,6 +2505,11 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         let mut gate = gate.state.lock().await;
         while let Some(item) = stream.next().await {
             let (entry, responder) = item?;
+            if let Some(written) = &mut self.log_written {
+                let index = entry.log_id.index;
+                // A closed sender means the log is gone; nothing waits then.
+                let _ = written.wait_for(|w| w.is_some_and(|w| w >= index)).await;
+            }
             // Apply time of one entry: the last stage between a commit and
             // its writer's answer.
             let applying = std::time::Instant::now();

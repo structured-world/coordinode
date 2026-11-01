@@ -628,7 +628,7 @@ pub struct RaftNode {
     engine: crate::engine_hold::EngineHold,
     /// Shared handle to the Raft oplog, for reading committed entries since a
     /// checkpoint (WAL-replay repair). Shares the `LogStore`'s manager.
-    oplog: Arc<std::sync::Mutex<coordinode_storage::oplog::OplogManager>>,
+    oplog: crate::storage::RaftLogHandle,
     /// Local-append notifier of the `LogStore`, for `w:1` / `w:N` in the
     /// proposal pipeline.
     append_notifier: Arc<AppendNotifier>,
@@ -854,7 +854,8 @@ impl RaftNode {
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), oracle.clone())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
-                .with_engine_work(log_store.engine_work());
+                .with_engine_work(log_store.engine_work())
+                .with_log(&oplog);
         let version = version_gate(node_id, group, &state_machine, host_epoch);
         let mut deployment = state_machine.subscribe_deployment();
 
@@ -1136,7 +1137,8 @@ impl RaftNode {
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
-                .with_engine_work(log_store.engine_work());
+                .with_engine_work(log_store.engine_work())
+                .with_log(&oplog);
         if let Founding::Join = founding {
             refuse_join_with_local_data(node_id, &engine, &log_store, &state_machine)?;
         }
@@ -2109,6 +2111,7 @@ impl RaftNode {
         // A poisoned lock still guards a manager whose floor handle is sound:
         // the handle is only cloned here.
         self.oplog
+            .manager()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retained_floor()
@@ -2492,7 +2495,7 @@ impl RaftNode {
     /// does.
     #[cfg(feature = "test-faults")]
     pub fn fail_log_writes(&self) {
-        if let Ok(mut oplog) = self.oplog.lock() {
+        if let Ok(mut oplog) = self.oplog.manager().lock() {
             oplog.fail_writes();
         }
     }
