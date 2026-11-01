@@ -300,6 +300,26 @@ fn register_replication_metrics() {
         "coordinode_raft_rate_limiter_pending",
         "Available rate limiter permits (lower = more backpressure)"
     );
+    metrics::describe_histogram!(
+        "coordinode_raft_log_sync_seconds",
+        "Time one sync of the Raft log took to reach the medium"
+    );
+    metrics::describe_histogram!(
+        "coordinode_raft_log_sync_appends",
+        "Log appends one Raft log sync made durable"
+    );
+    metrics::describe_histogram!(
+        "coordinode_raft_log_sync_proposals",
+        "Proposals one Raft log sync made durable"
+    );
+    metrics::describe_histogram!(
+        "coordinode_raft_apply_entry_seconds",
+        "Time one committed Raft log entry took to apply to the store"
+    );
+    metrics::describe_gauge!(
+        "coordinode_log_dropped_lines",
+        "Log lines dropped because the log writer fell behind"
+    );
 
     // Versions in the group
     metrics::describe_gauge!(

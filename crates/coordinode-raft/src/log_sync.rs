@@ -135,11 +135,20 @@ impl Shared {
                     queue.failed.clone(),
                 )
             };
+            // What one sync covers and how long it took: the group commit's
+            // batching and the medium's flush cost, the two halves of an
+            // acknowledged write's latency here.
+            metrics::histogram!("coordinode_raft_log_sync_appends").record(appends.len() as f64);
+            metrics::histogram!("coordinode_raft_log_sync_proposals")
+                .record(appends.iter().map(|a| a.proposals.len()).sum::<usize>() as f64);
+            let started = std::time::Instant::now();
             let synced = match (failed, &handle) {
                 (Some(failed), _) => Err(failed),
                 (None, Some(handle)) => handle.sync().map_err(|e| e.to_string()),
                 (None, None) => Ok(()),
             };
+            metrics::histogram!("coordinode_raft_log_sync_seconds")
+                .record(started.elapsed().as_secs_f64());
             self.answer(appends, &synced);
             let mut queue = self.queue.lock();
             if let Err(e) = &synced

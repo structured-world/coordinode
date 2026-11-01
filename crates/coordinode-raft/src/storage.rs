@@ -2436,6 +2436,9 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         let mut gate = gate.state.lock().await;
         while let Some(item) = stream.next().await {
             let (entry, responder) = item?;
+            // Apply time of one entry: the last stage between a commit and
+            // its writer's answer.
+            let applying = std::time::Instant::now();
 
             // Membership changes are applied before normal entries (pure metadata,
             // no tree mutations, no crash-consistency concern with ordering).
@@ -2546,6 +2549,9 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
 
             // Broadcast applied watermark (ignore send error — receivers may be dropped)
             let _ = self.applied_tx.send(entry.log_id.index);
+
+            metrics::histogram!("coordinode_raft_apply_entry_seconds")
+                .record(applying.elapsed().as_secs_f64());
 
             // Send response back to the caller
             if let Some(tx) = responder {
