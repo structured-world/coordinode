@@ -60,6 +60,19 @@ async fn a_session_socket_sends_at_once_and_probes_an_idle_peer() {
             before
         );
     }
+    // The bounds cannot be read back here; the accepting side is set the same
+    // way and must come out with keepalive on and no Nagle delay.
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        session_options(&accepted, tight).expect("options");
+        assert!(accepted.nodelay().expect("nodelay"), "no Nagle delay");
+        assert!(
+            socket2::SockRef::from(&accepted)
+                .keepalive()
+                .expect("keepalive"),
+            "keepalive on"
+        );
+    }
 }
 
 /// Dial `addr` as `from`, expecting `expected`, and exchange one byte with
