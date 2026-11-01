@@ -37,6 +37,20 @@ fn allocated_by<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (value, stats.bytes_allocated + grown)
 }
 
+/// What `f` returns, and the fewest bytes allocated over a few calls of it:
+/// the count is the whole process's, so a thread of the harness or a one-off
+/// initialization can land in one call; what `f` itself allocates lands in
+/// every one.
+fn least_allocated_by<T>(mut f: impl FnMut() -> T) -> (T, usize) {
+    let (mut value, mut least) = allocated_by(&mut f);
+    for _ in 0..4 {
+        let (again, allocated) = allocated_by(&mut f);
+        value = again;
+        least = least.min(allocated);
+    }
+    (value, least)
+}
+
 fn engine() -> (
     StorageEngine,
     std::sync::Arc<TimestampOracle>,
@@ -685,7 +699,7 @@ fn the_definition_bounds_cover_their_decodes() {
     );
 
     let (kept_bound, measuring) =
-        allocated_by(|| IndexDefinition::for_placement_bound(&bytes).unwrap());
+        least_allocated_by(|| IndexDefinition::for_placement_bound(&bytes).unwrap());
     assert_eq!(measuring, 0, "measuring allocated");
     let (kept, allocated) =
         allocated_by(|| IndexDefinition::for_placement_from_msgpack(&bytes).unwrap());
@@ -718,7 +732,7 @@ fn the_implication_facts_skip_the_rest_of_the_definition() {
     schema.set_implies(vec!["Thing".into(), "Work".into()]);
     let bytes = schema.to_msgpack().expect("encode");
     let (bound, measuring) =
-        allocated_by(|| LabelSchema::implication_facts_bound(&bytes).expect("bound"));
+        least_allocated_by(|| LabelSchema::implication_facts_bound(&bytes).expect("bound"));
     assert_eq!(measuring, 0, "measuring allocated");
     assert!(bound < 1024, "the bound counts the properties: {bound}");
     let (facts, allocated) =
