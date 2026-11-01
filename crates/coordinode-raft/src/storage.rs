@@ -778,7 +778,10 @@ pub struct LogStore {
 #[derive(Clone)]
 pub struct RaftLogHandle {
     oplog: Arc<Mutex<OplogManager>>,
-    sync: Arc<crate::log_sync::LogSync>,
+    /// Weak: the writer lives as long as the log store openraft owns, and
+    /// writes what is queued when it goes; a handle kept past a shutdown
+    /// does not keep the writer, or the engine it records through, alive.
+    sync: std::sync::Weak<crate::log_sync::LogSync>,
 }
 
 impl RaftLogHandle {
@@ -788,8 +791,10 @@ impl RaftLogHandle {
     ///
     /// The segments cannot be read.
     pub fn read_range(&self, from: u64, to: u64) -> Result<Vec<OplogEntry>, StorageError> {
-        if to > from {
-            self.sync.wait_written(to - 1);
+        if to > from
+            && let Some(sync) = self.sync.upgrade()
+        {
+            sync.wait_written(to - 1);
         }
         self.oplog
             .lock()
@@ -803,9 +808,10 @@ impl RaftLogHandle {
         &self.oplog
     }
 
-    /// The last index written to the segments, as it advances.
-    pub(crate) fn written(&self) -> tokio::sync::watch::Receiver<Option<u64>> {
-        self.sync.written()
+    /// The last index written to the segments, as it advances; `None` once
+    /// the writer is gone.
+    pub(crate) fn written(&self) -> Option<tokio::sync::watch::Receiver<Option<u64>>> {
+        self.sync.upgrade().map(|sync| sync.written())
     }
 }
 
@@ -962,7 +968,7 @@ impl LogStore {
     pub fn oplog_handle(&self) -> RaftLogHandle {
         RaftLogHandle {
             oplog: Arc::clone(&self.oplog),
-            sync: Arc::clone(&self.sync),
+            sync: Arc::downgrade(&self.sync),
         }
     }
 
@@ -1136,11 +1142,20 @@ impl LogStore {
         let tail = Arc::new(parking_lot::Mutex::new(crate::log_sync::Tail::default()));
         // What the segments hold at open is written: a replay of it applies
         // without waiting for the writer.
+        let record_engine =
+            crate::engine_hold::EngineHold::new(Arc::clone(&engine), "raft log writer");
         let sync = Arc::new(crate::log_sync::LogSync::start(
             Arc::clone(&append_notifier),
             Arc::clone(&oplog),
             Arc::clone(&tail),
             last_log_id.map(|id| id.index),
+            Box::new(move |write| {
+                // The next sync of the member-local journal covers it, as
+                // the vote and the purge point are recorded.
+                record_engine
+                    .commit_local(vec![write], LocalSync::Deferred)
+                    .map_err(|e| e.to_string())
+            }),
         )?);
         let store = Self {
             engine: crate::engine_hold::EngineHold::new(engine, "raft log store"),
@@ -1184,15 +1199,6 @@ impl LogStore {
         self.engine
             .get(Partition::Raft, key)
             .map(|opt| opt.map(|v| v.to_vec()))
-            .map_err(|e| io::Error::other(e.to_string()))
-    }
-
-    /// Record consensus state the next sync covers, as the vote and the
-    /// purge point are recorded: a refusal here would stop the group, and
-    /// each record is a few bytes tied to entries already admitted.
-    fn put_consensus(&self, write: LocalWrite) -> Result<(), io::Error> {
-        self.engine
-            .commit_local(vec![write], LocalSync::Deferred)
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
@@ -1524,26 +1530,30 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         committed: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
     ) -> Result<(), io::Error> {
-        match committed {
-            Some(log_id) => {
-                let bytes =
-                    rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?;
-                self.put_consensus(LocalWrite::Put {
-                    partition: Partition::Raft,
-                    key: KEY_COMMITTED.to_vec(),
-                    value: bytes,
-                })
-            }
-            None => self.put_consensus(LocalWrite::Delete {
+        // Recorded by the log's writer thread, as the next sync covers it
+        // either way: the Raft core calls this on every commit and must not
+        // wait on the journal it lands in.
+        let record = match committed {
+            Some(log_id) => LocalWrite::Put {
                 partition: Partition::Raft,
                 key: KEY_COMMITTED.to_vec(),
-            }),
-        }
+                value: rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?,
+            },
+            None => LocalWrite::Delete {
+                partition: Partition::Raft,
+                key: KEY_COMMITTED.to_vec(),
+            },
+        };
+        self.sync.save_record(record);
+        Ok(())
     }
 
     async fn read_committed(
         &mut self,
     ) -> Result<Option<openraft::type_config::alias::LogIdOf<TypeConfig>>, io::Error> {
+        // A record still queued for the writer thread lands first, so the
+        // committed index read is the one last saved.
+        self.sync.wait_idle();
         match self.get(KEY_COMMITTED)? {
             Some(bytes) => {
                 let log_id =
@@ -2087,7 +2097,7 @@ impl CoordinodeStateMachine {
 
     /// Apply an entry only once `log` holds it in its segments.
     pub fn with_log(mut self, log: &RaftLogHandle) -> Self {
-        self.log_written = Some(log.written());
+        self.log_written = log.written();
         self
     }
 

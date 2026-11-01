@@ -107,9 +107,16 @@ impl Tail {
     }
 }
 
+/// Records a consensus write (the committed index) where the store keeps it.
+pub(crate) type RecordWrite =
+    Box<dyn Fn(coordinode_storage::engine::core::LocalWrite) -> Result<(), String> + Send + Sync>;
+
 #[derive(Default)]
 struct Queue {
     appends: Vec<Append>,
+    /// The latest consensus record waiting to be written: each replaces the
+    /// one before it, so a burst of commits writes one record.
+    record: Option<coordinode_storage::engine::core::LocalWrite>,
     /// The thread is writing or syncing a taken group.
     syncing: bool,
     closed: bool,
@@ -135,6 +142,8 @@ struct Shared {
     /// The last index in the segments, for async waiters; `u64::MAX` once
     /// the log failed or closed, so no waiter is left behind.
     written_tx: tokio::sync::watch::Sender<Option<u64>>,
+    /// Writes a queued consensus record.
+    record_write: RecordWrite,
 }
 
 /// Owns the writer thread of one Raft log; dropping it writes, syncs and
@@ -146,8 +155,9 @@ pub(crate) struct LogSync {
 
 impl LogSync {
     /// Start the writer thread of the log in `oplog`, whose segments end at
-    /// `written`, keeping `tail` and telling `notifier` of every proposal
-    /// written and made durable.
+    /// `written`, keeping `tail`, telling `notifier` of every proposal
+    /// written and made durable, and writing consensus records through
+    /// `record_write`.
     ///
     /// # Errors
     ///
@@ -157,6 +167,7 @@ impl LogSync {
         oplog: Arc<std::sync::Mutex<OplogManager>>,
         tail: Arc<Mutex<Tail>>,
         written: Option<u64>,
+        record_write: RecordWrite,
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
@@ -169,6 +180,7 @@ impl LogSync {
             oplog,
             tail,
             written_tx: tokio::sync::watch::Sender::new(written),
+            record_write,
         });
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -187,12 +199,21 @@ impl LogSync {
         self.shared.queued.notify_one();
     }
 
-    /// Block until every queued append is written, durable and answered. A
-    /// change that rewrites the log waits here first, so no append is
-    /// answered after entries it covered were replaced.
+    /// Queue a consensus record whose write the next sync covers, in place
+    /// of one still waiting. The caller never waits on the file it lands in.
+    pub(crate) fn save_record(&self, record: coordinode_storage::engine::core::LocalWrite) {
+        let mut queue = self.shared.queue.lock();
+        queue.record = Some(record);
+        self.shared.queued.notify_one();
+    }
+
+    /// Block until every queued append is written, durable and answered, and
+    /// a queued consensus record written. A change that rewrites the log
+    /// waits here first, so no append is answered after entries it covered
+    /// were replaced.
     pub(crate) fn wait_idle(&self) {
         let mut queue = self.shared.queue.lock();
-        while !queue.appends.is_empty() || queue.syncing {
+        while !queue.appends.is_empty() || queue.record.is_some() || queue.syncing {
             self.shared.progress.wait(&mut queue);
         }
     }
@@ -255,19 +276,41 @@ impl Drop for LogSync {
 impl Shared {
     fn run(&self) {
         loop {
-            let (appends, failed) = {
+            let (appends, record, failed) = {
                 let mut queue = self.queue.lock();
-                while queue.appends.is_empty() && !queue.closed {
+                while queue.appends.is_empty() && queue.record.is_none() && !queue.closed {
                     self.queued.wait(&mut queue);
                 }
-                if queue.appends.is_empty() {
+                if queue.appends.is_empty() && queue.record.is_none() {
                     // Closed, and nothing is left to answer.
                     self.written_tx.send_replace(Some(u64::MAX));
                     return;
                 }
                 queue.syncing = true;
-                (std::mem::take(&mut queue.appends), queue.failed.clone())
+                (
+                    std::mem::take(&mut queue.appends),
+                    queue.record.take(),
+                    queue.failed.clone(),
+                )
             };
+            // The consensus record goes to its own journal, off the Raft
+            // core: a write there waits out that journal's syncs too.
+            if let Some(record) = record
+                && failed.is_none()
+                && let Err(e) = (self.record_write)(record)
+            {
+                tracing::error!(error = %e, "raft consensus record write failed");
+                let mut queue = self.queue.lock();
+                queue.failed.get_or_insert(e);
+                self.written_tx.send_replace(Some(u64::MAX));
+            }
+            if appends.is_empty() {
+                let mut queue = self.queue.lock();
+                queue.syncing = false;
+                self.progress.notify_all();
+                continue;
+            }
+            let failed = self.queue.lock().failed.clone();
             // What one sync covers and how long it took: the group commit's
             // batching and the medium's flush cost, the two halves of an
             // acknowledged write's latency here.

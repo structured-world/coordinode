@@ -6,12 +6,17 @@ use openraft::type_config::TypeConfigExt;
 use super::*;
 use crate::storage::{CommittedLeaderId, LogReach};
 
+use coordinode_storage::engine::core::LocalWrite;
+use coordinode_storage::engine::partition::Partition;
+
 /// A writer thread over a log in a fresh directory.
 struct Fixture {
     _dir: tempfile::TempDir,
     oplog: Arc<std::sync::Mutex<OplogManager>>,
     tail: Arc<Mutex<Tail>>,
     notifier: Arc<AppendNotifier>,
+    /// Every consensus record the writer wrote, in order.
+    records: Arc<Mutex<Vec<LocalWrite>>>,
     sync: Arc<LogSync>,
 }
 
@@ -22,12 +27,18 @@ fn fixture() -> Fixture {
     ));
     let tail = Arc::new(Mutex::new(Tail::default()));
     let notifier = Arc::new(AppendNotifier::default());
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let written = Arc::clone(&records);
     let sync = Arc::new(
         LogSync::start(
             Arc::clone(&notifier),
             Arc::clone(&oplog),
             Arc::clone(&tail),
             None,
+            Box::new(move |write| {
+                written.lock().push(write);
+                Ok(())
+            }),
         )
         .expect("start"),
     );
@@ -36,8 +47,38 @@ fn fixture() -> Fixture {
         oplog,
         tail,
         notifier,
+        records,
         sync,
     }
+}
+
+fn committed(index: u8) -> LocalWrite {
+    LocalWrite::Put {
+        partition: Partition::Raft,
+        key: b"committed".to_vec(),
+        value: vec![index],
+    }
+}
+
+/// A consensus record reaches the store through the writer thread, and a
+/// burst of them is written as the last one: the Raft core records each
+/// commit and never waits on the journal the record lands in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_of_records_writes_the_last_one() {
+    let f = fixture();
+    for i in 1..=5 {
+        f.sync.save_record(committed(i));
+    }
+    let waiter = Arc::clone(&f.sync);
+    tokio::task::spawn_blocking(move || waiter.wait_idle())
+        .await
+        .expect("wait_idle");
+    let records = f.records.lock();
+    assert!(!records.is_empty() && records.len() <= 5);
+    assert!(
+        matches!(records.last(), Some(LocalWrite::Put { value, .. }) if value == &vec![5]),
+        "the last record is the one kept"
+    );
 }
 
 fn entry(index: u64) -> Arc<Entry> {
