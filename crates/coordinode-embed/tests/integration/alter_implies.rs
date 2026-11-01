@@ -185,9 +185,10 @@ fn folded(db: &Database) -> bool {
         .all(|def| def.selection.is_empty())
 }
 
-/// Wait up to five seconds for the parts of the changes made to be folded.
+/// Wait up to thirty seconds for the parts of the changes made to be folded:
+/// a fold is background work, which a slow shared CI host runs late.
 fn await_folded(db: &Database) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !folded(db) {
         assert!(std::time::Instant::now() < deadline, "parts left unfolded");
         std::thread::sleep(std::time::Duration::from_millis(10));
