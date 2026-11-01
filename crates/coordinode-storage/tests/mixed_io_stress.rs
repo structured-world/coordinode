@@ -64,7 +64,7 @@ fn reads_and_maintenance_survive_files_rewritten_under_them() {
                         round += 1;
                         for n in (round % 7..KEYS_PER_WRITER).step_by(7) {
                             let k = key(writer, n);
-                            let outcome = if (n + round) % 11 == 0 {
+                            let outcome = if (n + round).is_multiple_of(11) {
                                 engine.delete(Partition::Node, &k).map(|()| None)
                             } else {
                                 let v = value(writer, n, round);
@@ -92,7 +92,7 @@ fn reads_and_maintenance_survive_files_rewritten_under_them() {
                     if let Err(e) = engine.get(Partition::Node, &key(n % WRITERS, n / WRITERS)) {
                         failures.lock().push(format!("get: {e}"));
                     }
-                    if n % 64 == 0 {
+                    if n.is_multiple_of(64) {
                         let prefix = format!("node:{}:", n % WRITERS);
                         match engine.prefix_scan(Partition::Node, prefix.as_bytes()) {
                             Ok(rows) => {
@@ -115,7 +115,7 @@ fn reads_and_maintenance_survive_files_rewritten_under_them() {
                 let mut pass = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     pass += 1;
-                    let done = if pass % 3 == 0 {
+                    let done = if pass.is_multiple_of(3) {
                         engine.major_compact(Partition::Node)
                     } else {
                         engine
