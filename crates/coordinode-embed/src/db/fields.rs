@@ -69,6 +69,12 @@ pub struct FieldDictionary {
     proposal_ids: Arc<ProposalIdGenerator>,
     oracle: Arc<TimestampOracle>,
     published: RwLock<Published>,
+    /// Held while a registration of field names is proposed: a concurrent
+    /// first use of the same names waits for it and finds them bound,
+    /// instead of proposing them again.
+    registering: parking_lot::Mutex<()>,
+    /// The same for label identities.
+    binding: parking_lot::Mutex<()>,
 }
 
 impl FieldDictionary {
@@ -118,6 +124,8 @@ impl FieldDictionary {
                 generation,
                 epoch,
             }),
+            registering: parking_lot::Mutex::new(()),
+            binding: parking_lot::Mutex::new(()),
         })
     }
 
@@ -197,14 +205,21 @@ impl FieldDictionary {
 impl FieldRegistrar for FieldDictionary {
     fn register(&self, names: &[&str]) -> Result<Vec<u32>, DictionaryError> {
         let mut view = self.view_or_err()?;
-        let mut missing: Vec<&str> = Vec::new();
-        for &name in names {
-            if view.lookup(name).is_none() && !missing.contains(&name) {
-                missing.push(name);
+        let missing_from = |view: &FieldInterner| {
+            let mut missing: Vec<&str> = Vec::new();
+            for &name in names {
+                if view.lookup(name).is_none() && !missing.contains(&name) {
+                    missing.push(name);
+                }
             }
-        }
-        if !missing.is_empty() {
-            for batch in missing.chunks(MAX_REGISTRATION_BATCH) {
+            missing
+        };
+        if !missing_from(&view).is_empty() {
+            // One registration at a time: the names one waited for are
+            // bound by the time it runs, and are not proposed again.
+            let _registering = self.registering.lock();
+            view = self.view_or_err()?;
+            for batch in missing_from(&view).chunks(MAX_REGISTRATION_BATCH) {
                 validate_registration(batch)?;
                 self.propose(MetadataCommand::RegisterFields {
                     names: batch.iter().map(|n| (*n).to_owned()).collect(),
@@ -274,12 +289,29 @@ impl coordinode_core::schema::label_id::LabelRegistrar for FieldDictionary {
                 .label_id(name)
                 .map_err(|e| DictionaryError::Registration(e.to_string()))
         };
-        let mut missing: Vec<&str> = Vec::new();
-        for &name in names {
-            if bound(&store, name)?.is_none() && !missing.contains(&name) {
-                missing.push(name);
+        let missing_from = |store: &LocalSchemaStore<'_>| {
+            let mut missing: Vec<&str> = Vec::new();
+            for &name in names {
+                if bound(store, name)?.is_none() && !missing.contains(&name) {
+                    missing.push(name);
+                }
             }
+            Ok::<_, DictionaryError>(missing)
+        };
+        if missing_from(&store)?.is_empty() {
+            return names
+                .iter()
+                .map(|name| {
+                    bound(&store, name)?.ok_or_else(|| {
+                        DictionaryError::Registration(format!("label {name:?} is not bound"))
+                    })
+                })
+                .collect();
         }
+        // One binding at a time: the labels one waited for are bound by the
+        // time it runs, and are not proposed again.
+        let _binding = self.binding.lock();
+        let missing = missing_from(&store)?;
         for batch in missing.chunks(MAX_REGISTRATION_BATCH) {
             validate_registration(batch)?;
             // A binding refused because a retirement of the name carries a
