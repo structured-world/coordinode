@@ -348,7 +348,9 @@ pub(crate) async fn serve(
         }
     };
 
-    logging::init_logging();
+    // Held until `serve` returns: dropping it flushes the queued lines.
+    let log = logging::init_logging();
+    let dropped_log_lines = log.dropped();
 
     // Raise the open-file-descriptor limit before opening storage: the
     // engine keeps many files open at once. Honour an explicit target or
@@ -914,6 +916,8 @@ pub(crate) async fn serve(
         let version_node = Arc::clone(&raft_node);
         let registry_metrics = consumer_registry.clone();
         Arc::new(move || {
+            // Log lines dropped because the log writer fell behind.
+            metrics::gauge!("coordinode_log_dropped_lines").set(dropped_log_lines.get() as f64);
             // How far each change-stream consumer is behind, sampled per
             // scrape.
             registry::sample_consumer_gauges(&registry_metrics);

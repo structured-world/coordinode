@@ -86,7 +86,7 @@ pub(crate) fn run_backup(
     output: String,
     format: coordinode_embed::backup::BackupFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    logging::init_logging();
+    let _log = logging::init_logging();
     info!(
         data_dir = %data_dir,
         output = %output,
@@ -223,7 +223,7 @@ pub(crate) fn run_restore(
     only_labels: Vec<String>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    logging::init_logging();
+    let _log = logging::init_logging();
     info!(
         data_dir = %data_dir,
         input = %input,

@@ -78,6 +78,7 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 thiserror = { workspace = true }
 rmpv = { workspace = true }
 sha2 = { workspace = true }

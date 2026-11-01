@@ -129,7 +129,7 @@ pub(crate) async fn run_with(
             config_path,
             deep,
         } => {
-            logging::init_logging();
+            let _log = logging::init_logging();
             info!(data_dir = %data_dir, deep = deep, "verifying storage integrity");
 
             let config = admin_storage_config(config_path.as_deref(), &data_dir)?;
@@ -176,7 +176,7 @@ pub(crate) async fn run_with(
             config_path,
             output,
         } => {
-            logging::init_logging();
+            let _log = logging::init_logging();
             info!(data_dir = %data_dir, output = %output, "creating checkpoint");
 
             let config = admin_storage_config(config_path.as_deref(), &data_dir)?;
@@ -205,7 +205,7 @@ pub(crate) async fn run_with(
             data_dir,
             config_path,
         } => {
-            logging::init_logging();
+            let _log = logging::init_logging();
             info!(data_dir = %data_dir, "compacting database");
 
             let config = admin_storage_config(config_path.as_deref(), &data_dir)?;

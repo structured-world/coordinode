@@ -103,6 +103,7 @@ rmpv = { version = "1", features = ["with-serde"] }
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
 metrics = "0.24"
 # default-features off: we use install_recorder() + text render via our own ops
 # server, not the crate's built-in http-listener / push-gateway — whose default
