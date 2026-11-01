@@ -49,7 +49,7 @@ publish = false
 # it first). The floor is the oldest release the code actually needs: 7.4,
 # whose flushes can leave their durability to a barrier (`persist_flushes`)
 # for trees a journal already covers.
-lsm-tree = { package = "coordinode-lsm-tree", version = "7.4.1", default-features = false }
+lsm-tree = { package = "coordinode-lsm-tree", version = "7.5.0", default-features = false }
 
 # Consensus
 openraft = { version = "0.10.0-alpha.37", features = ["serde"] }

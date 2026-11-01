@@ -911,9 +911,9 @@ dependencies = [
 
 [[package]]
 name = "coordinode-lsm-tree"
-version = "7.4.2"
+version = "7.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fbe645b1532a486f49b8d2d500991dac26f435ed6fdc424f802d750ab86d87d"
+checksum = "0b76c5c8d11f2bfba7333f9c25dddb95c9b70a68da194a3ff83bd16a2d98840f"
 dependencies = [
  "aes-gcm",
  "arc-swap",
