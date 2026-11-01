@@ -7967,6 +7967,22 @@ async fn an_idle_group_closes_past_its_last_commit() {
             e2.closure_frontier()
         );
         assert!(e2.complete_cut().is_some_and(|cut| cut >= ts));
+
+        // Closed, the group goes quiet: recording the committed index makes
+        // no further closing entry due. When it did, closing entries bred
+        // one another, about 55 a second on an idle group.
+        let last_index = || {
+            use openraft::async_runtime::watch::WatchReceiver as _;
+            n1.raft().metrics().borrow_watched().last_log_index
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let settled = last_index();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            last_index(),
+            settled,
+            "an idle group kept appending entries"
+        );
     })
     .await;
     assert!(

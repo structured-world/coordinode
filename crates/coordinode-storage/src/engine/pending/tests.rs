@@ -507,6 +507,31 @@ fn a_closing_entry_is_due_once_per_uncovered_withdrawal() {
     );
 }
 
+/// A timestamp taken for a write that never goes to the log (a member's own
+/// consensus record) holds the bound while the write runs, but its release
+/// makes no closing entry due: nothing reached the log for one to cover.
+/// When it did, every committed index this member recorded made a closing
+/// entry due, whose commit recorded the index again: an idle group appended
+/// about 55 entries a second.
+#[test]
+fn a_local_timestamp_holds_the_bound_but_makes_no_closing_entry_due() {
+    let pending = Arc::new(table());
+    pending.stamp_closed_below(|| 10);
+    let (ts, held) = pending.obligate_local(|| 20);
+    assert_eq!(ts, 20);
+    assert_eq!(
+        pending.stamp_closed_below(|| 30),
+        20,
+        "held while it is written"
+    );
+    drop(held);
+    assert_eq!(
+        pending.closure_due(|| 40),
+        None,
+        "nothing in the log to cover"
+    );
+}
+
 /// A closing entry is not due while a timestamp below the would-be bound is
 /// still held: the bound could not pass it, so the entry would cover
 /// nothing new.

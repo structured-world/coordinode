@@ -4645,7 +4645,9 @@ impl StorageEngine {
             return Ok(());
         };
         let compact_due = {
-            let (seqno, _held) = self.pending_commits.obligate(|| self.next_seqno());
+            // The record stays on this member: nothing reaches the log for a
+            // closing entry to cover once it is written.
+            let (seqno, _held) = self.pending_commits.obligate_local(|| self.next_seqno());
             local.commit(
                 self.coordinator.trees(),
                 &self.installations,

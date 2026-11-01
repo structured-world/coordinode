@@ -494,8 +494,19 @@ impl PendingCommits {
             Unlogged {
                 pending: Arc::clone(self),
                 id,
+                local: false,
             },
         )
+    }
+
+    /// [`Self::obligate`] for a write that never goes to the log (a member's
+    /// own records): its timestamp holds the bound while it is written, and
+    /// its release makes no closing entry due, since no entry reached the log
+    /// for one to cover.
+    pub fn obligate_local(self: &Arc<Self>, allocate: impl FnOnce() -> u64) -> (u64, Unlogged) {
+        let (commit_ts, mut held) = self.obligate(allocate);
+        held.local = true;
+        (commit_ts, held)
     }
 
     /// Hold `commit_ts` as not yet logged past the hold the caller has on it
@@ -512,6 +523,7 @@ impl PendingCommits {
         Unlogged {
             pending: Arc::clone(self),
             id,
+            local: false,
         }
     }
 
@@ -581,9 +593,14 @@ impl PendingCommits {
         self.finished.notify_all();
     }
 
-    fn withdraw_unlogged(&self, id: u64) {
+    /// Release an unlogged timestamp. One whose entry went to the log counts
+    /// toward a closing entry; a `local` one never reaches the log, so only
+    /// stops holding the bound.
+    fn withdraw_unlogged(&self, id: u64, local: bool) {
         let mut table = self.inner.lock();
-        if let Some(commit_ts) = table.unlogged.remove(&id) {
+        if let Some(commit_ts) = table.unlogged.remove(&id)
+            && !local
+        {
             table.max_released = table.max_released.max(commit_ts);
             table.withdrawals += 1;
         }
@@ -598,11 +615,13 @@ impl PendingCommits {
 pub struct Unlogged {
     pending: Arc<PendingCommits>,
     id: u64,
+    /// Taken for a write that never goes to the log.
+    local: bool,
 }
 
 impl Drop for Unlogged {
     fn drop(&mut self) {
-        self.pending.withdraw_unlogged(self.id);
+        self.pending.withdraw_unlogged(self.id, self.local);
     }
 }
 
