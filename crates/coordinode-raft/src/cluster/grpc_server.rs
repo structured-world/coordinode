@@ -623,6 +623,23 @@ impl RaftService for RaftGrpcHandler {
             Err(fatal) => Err(Status::internal(format!("fatal: {fatal}"))),
         });
 
+        // openraft ends the reply stream only on the next request once its
+        // consensus has stopped: on a stream an idle leader sends nothing
+        // over, it never would, and the open stream keeps its connection,
+        // and the services that connection routes to, alive past the stop.
+        // So the stream also ends when the stop is published.
+        let watched = Arc::clone(&replica.raft);
+        let consensus_stopped = async move {
+            use openraft::async_runtime::watch::WatchReceiver;
+            let mut metrics = watched.metrics();
+            while metrics.borrow_watched().running_state.is_ok() {
+                if metrics.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        let output_stream = output_stream.take_until(consensus_stopped);
+
         // openraft ends the reply stream without a word once its consensus
         // has stopped: the request it could not deliver goes unanswered. A
         // leader reading a cleanly ended stream keeps waiting on that request
