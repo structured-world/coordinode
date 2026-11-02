@@ -226,3 +226,14 @@ codegen-units = 1
 strip = true
 panic = "abort"
 opt-level = 3
+
+# openraft 0.10.0-alpha.37 answers a heartbeat only after every log entry
+# accepted before it is flushed, so a slow disk on the followers costs the
+# leader its lease. The structured-world fork carries the fix (heartbeats wait
+# only for their own prev_log_id) on top of alpha.37 until an openraft release
+# includes it; the whole workspace comes from the same revision.
+[patch.crates-io]
+openraft = { git = "https://github.com/structured-world/openraft", rev = "462f2e7f08871dff6e5900f586b822b59953955d" }
+openraft-macros = { git = "https://github.com/structured-world/openraft", rev = "462f2e7f08871dff6e5900f586b822b59953955d" }
+openraft-rt = { git = "https://github.com/structured-world/openraft", rev = "462f2e7f08871dff6e5900f586b822b59953955d" }
+openraft-rt-tokio = { git = "https://github.com/structured-world/openraft", rev = "462f2e7f08871dff6e5900f586b822b59953955d" }

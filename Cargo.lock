@@ -3655,8 +3655,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "openraft"
 version = "0.10.0-alpha.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "225e445aeba04deb36474dfc77d7b8f54364cfbee968851e31d50f4db4b7c53a"
+source = "git+https://github.com/structured-world/openraft?rev=462f2e7f08871dff6e5900f586b822b59953955d#462f2e7f08871dff6e5900f586b822b59953955d"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -3685,8 +3684,7 @@ dependencies = [
 [[package]]
 name = "openraft-macros"
 version = "0.10.0-alpha.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa8e23a59e3b485cae920364ee1290f4deb5e5468cbce25be12397856273dab"
+source = "git+https://github.com/structured-world/openraft?rev=462f2e7f08871dff6e5900f586b822b59953955d#462f2e7f08871dff6e5900f586b822b59953955d"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -3698,8 +3696,7 @@ dependencies = [
 [[package]]
 name = "openraft-rt"
 version = "0.10.0-alpha.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abdbb3b5cbb27c4f6520b60b385a1dd4f170dd9a971cc057da3641c4baa7e649"
+source = "git+https://github.com/structured-world/openraft?rev=462f2e7f08871dff6e5900f586b822b59953955d#462f2e7f08871dff6e5900f586b822b59953955d"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -3711,8 +3708,7 @@ dependencies = [
 [[package]]
 name = "openraft-rt-tokio"
 version = "0.10.0-alpha.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc4f79eaaf4c90b816235b72376b48b96f72167d15f0aaadaee50f965e8ba909"
+source = "git+https://github.com/structured-world/openraft?rev=462f2e7f08871dff6e5900f586b822b59953955d#462f2e7f08871dff6e5900f586b822b59953955d"
 dependencies = [
  "futures-util",
  "openraft-rt",
