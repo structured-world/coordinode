@@ -54,6 +54,62 @@ fn execute(request_id: u64, query: &str) -> ClientFrame {
     }
 }
 
+/// An Execute frame that depends on `committed`: its receipt is the causal
+/// bound, waited for up to ten seconds. A session reading after a commit
+/// it did not run itself carries the commit's receipt so; without it a read
+/// may be answered from a view complete below a commit still being closed.
+fn execute_after(
+    request_id: u64,
+    query: &str,
+    committed: &coordinode_integration::proto::session::Committed,
+) -> ClientFrame {
+    let mut frame = execute_after_ts(request_id, query, committed.commit_ts);
+    if let Some(client_frame::Op::Execute(Execute {
+        read_concern: Some(concern),
+        ..
+    })) = &mut frame.op
+    {
+        concern.after_position = committed.position.clone();
+    }
+    frame
+}
+
+/// [`execute_after`] for a bound known only by its commit time.
+fn execute_after_ts(request_id: u64, query: &str, after_ts: u64) -> ClientFrame {
+    use coordinode_integration::proto::replication::ReadConcern;
+    ClientFrame {
+        request_id,
+        op: Some(client_frame::Op::Execute(Execute {
+            query: query.to_string(),
+            read_concern: Some(ReadConcern {
+                level: 2, // MAJORITY
+                after_ts,
+                wait_ms: 10_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+    }
+}
+
+/// The latest receipt across the requests of a session: the causal bound a
+/// session that depends on all of them carries.
+fn latest_receipt(by_id: &HashMap<u64, Vec<Event>>) -> u64 {
+    by_id
+        .values()
+        .flatten()
+        .filter_map(|e| match e {
+            Event::CursorEnd(end) => end
+                .stats
+                .as_ref()
+                .and_then(|s| s.receipt.as_ref())
+                .map(|r| r.operation_time),
+            _ => None,
+        })
+        .max()
+        .unwrap_or_default()
+}
+
 /// An Execute frame bound to the open transaction `txid`.
 fn execute_tx(request_id: u64, query: &str, txid: &[u8]) -> ClientFrame {
     ClientFrame {
@@ -209,9 +265,9 @@ async fn session_pages_a_label_scan_through_the_keyset_cursor() {
     let proc = CoordinodeProcess::start().await;
 
     // Seed all nodes in a single statement (one write), drained to completion
-    // before the scan: the scan must observe a committed dataset, and a second
-    // session guarantees the write happened-before the read.
-    run_session(
+    // before the scan: the scan must observe a committed dataset, so it
+    // carries the write's receipt as its causal bound.
+    let seeded = run_session(
         &proc,
         vec![execute(
             1,
@@ -221,7 +277,15 @@ async fn session_pages_a_label_scan_through_the_keyset_cursor() {
     .await;
 
     // Scan in a fresh session: keyset-eligible, paged across the gRPC stream.
-    let by_id = run_session(&proc, vec![execute(1, "MATCH (n:Scan) RETURN n.k AS k")]).await;
+    let by_id = run_session(
+        &proc,
+        vec![execute_after_ts(
+            1,
+            "MATCH (n:Scan) RETURN n.k AS k",
+            latest_receipt(&seeded),
+        )],
+    )
+    .await;
     let events = by_id.get(&1).map(Vec::as_slice).unwrap_or_default();
     match events {
         [Event::CursorOpen(open), rest @ ..] => {
@@ -237,9 +301,15 @@ async fn session_pages_a_label_scan_through_the_keyset_cursor() {
 }
 
 /// Drive a controlled session: Begin, run `write` inside the transaction, then
-/// commit (or roll back). Returns once the transaction resolves. Sequences each
-/// step on the response so Begin strictly precedes the in-transaction write.
-async fn drive_transaction(proc: &CoordinodeProcess, write: &str, do_commit: bool) {
+/// commit (or roll back). Returns once the transaction resolves, with the
+/// commit's receipt when it committed. Sequences each step on the response so
+/// Begin strictly precedes the in-transaction write.
+async fn drive_transaction(
+    proc: &CoordinodeProcess,
+    write: &str,
+    do_commit: bool,
+) -> Option<coordinode_integration::proto::session::Committed> {
+    let mut receipt = None;
     let (tx, mut inbound) = open_stream(proc).await;
 
     // Begin under the client's ID; the write after it waits for it.
@@ -268,7 +338,10 @@ async fn drive_transaction(proc: &CoordinodeProcess, write: &str, do_commit: boo
             let f = inbound.message().await.expect("frame").expect("not end");
             if f.request_id == 3 {
                 match f.event {
-                    Some(Event::Committed(_)) => break,
+                    Some(Event::Committed(committed)) => {
+                        receipt = Some(committed);
+                        break;
+                    }
                     Some(Event::Error(e)) => panic!("commit errored: {}", e.message),
                     _ => {}
                 }
@@ -284,17 +357,25 @@ async fn drive_transaction(proc: &CoordinodeProcess, write: &str, do_commit: boo
     drop(tx);
     // Drain to end so the server finishes the transaction task.
     while inbound.message().await.expect("frame").is_some() {}
+    receipt
 }
 
 #[tokio::test]
 async fn in_session_transaction_commit_persists_writes() {
     // A write inside a committed interactive transaction must be durable: a
-    // fresh session sees it. Proves the real interactive transaction lifecycle
-    // runs through the session core (begin, buffered write, commit).
+    // fresh session reading after its receipt sees it. Proves the real
+    // interactive transaction lifecycle runs through the session core
+    // (begin, buffered write, commit).
     let proc = CoordinodeProcess::start().await;
-    drive_transaction(&proc, "CREATE (n:Tx {k: 1})", true).await;
+    let committed = drive_transaction(&proc, "CREATE (n:Tx {k: 1})", true)
+        .await
+        .expect("committed");
 
-    let by_id = run_session(&proc, vec![execute(1, "MATCH (n:Tx) RETURN n.k AS k")]).await;
+    let by_id = run_session(
+        &proc,
+        vec![execute_after(1, "MATCH (n:Tx) RETURN n.k AS k", &committed)],
+    )
+    .await;
     let events = by_id.get(&1).map(Vec::as_slice).unwrap_or_default();
     match events {
         [Event::CursorOpen(_), rest @ ..] => {
@@ -395,15 +476,23 @@ async fn a_pipelined_transaction_runs_in_the_order_it_was_sent() {
         .expect("second");
     tx.send(commit_tx(4, &txid)).await.expect("commit");
 
-    match await_terminal(&mut inbound, 4).await {
-        Event::Committed(_) => {}
+    let committed = match await_terminal(&mut inbound, 4).await {
+        Event::Committed(committed) => committed,
         other => panic!("the pipelined commit lands, got {other:?}"),
-    }
+    };
     drop(tx);
     while inbound.message().await.expect("frame").is_some() {}
 
     use coordinode_integration::proto::common::property_value::Value as Pv;
-    let by_id = run_session(&proc, vec![execute(1, "MATCH (n:Ord) RETURN n.k AS k")]).await;
+    let by_id = run_session(
+        &proc,
+        vec![execute_after(
+            1,
+            "MATCH (n:Ord) RETURN n.k AS k",
+            &committed,
+        )],
+    )
+    .await;
     let events = by_id.get(&1).map(Vec::as_slice).unwrap_or_default();
     let values: Vec<_> = events
         .iter()
@@ -513,8 +602,17 @@ async fn session_runs_concurrent_writes_without_deadlocking_the_runtime() {
         }
     }
 
-    // The data is durably committed: a follow-up scan sees all 40 nodes.
-    let scan = run_session(&proc, vec![execute(1, "MATCH (n:Conc) RETURN n.k AS k")]).await;
+    // The data is durably committed: a follow-up scan after the writes'
+    // receipts sees all 40 nodes.
+    let scan = run_session(
+        &proc,
+        vec![execute_after_ts(
+            1,
+            "MATCH (n:Conc) RETURN n.k AS k",
+            latest_receipt(&by_id),
+        )],
+    )
+    .await;
     let events = scan.get(&1).map(Vec::as_slice).unwrap_or_default();
     match events {
         [Event::CursorOpen(_), rest @ ..] => {
@@ -571,13 +669,17 @@ async fn session_interleaves_a_transaction_with_independent_queries() {
         "{:?}",
         by_id.get(&3)
     );
-    match by_id.get(&5).map(Vec::as_slice) {
-        Some([Event::Committed(_)]) => {}
+    let committed = match by_id.get(&5).map(Vec::as_slice) {
+        Some([Event::Committed(committed)]) => committed.clone(),
         other => panic!("request 5 (commit) got {other:?}"),
-    }
+    };
     let scan = run_session(
         &proc,
-        vec![execute(1, "MATCH (n:Interleaved) RETURN n.k AS k")],
+        vec![execute_after(
+            1,
+            "MATCH (n:Interleaved) RETURN n.k AS k",
+            &committed,
+        )],
     )
     .await;
     assert_eq!(
@@ -622,16 +724,20 @@ async fn a_transaction_continues_on_another_stream() {
         Event::CursorEnd(_)
     ));
     second.send(commit_tx(2, &txid)).await.expect("commit");
-    match await_terminal(&mut second_in, 2).await {
-        Event::Committed(_) => {}
+    let committed = match await_terminal(&mut second_in, 2).await {
+        Event::Committed(committed) => committed,
         other => panic!("the second stream commits it, got {other:?}"),
-    }
+    };
     drop(second);
     while second_in.message().await.expect("frame").is_some() {}
 
     let scan = run_session(
         &proc,
-        vec![execute(1, "MATCH (n:Reattached) RETURN n.k AS k")],
+        vec![execute_after(
+            1,
+            "MATCH (n:Reattached) RETURN n.k AS k",
+            &committed,
+        )],
     )
     .await;
     assert_eq!(

@@ -435,6 +435,68 @@ async fn a_retry_below_the_closed_bound_is_not_a_refusal() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A commit sealed into its proposal is closed by the entry carrying it, as
+/// soon as that entry is applied: no later write and no closing entry is
+/// needed. Its timestamp is still registered when the bound is checked, so
+/// no closing entry can have passed it. A lower timestamp held for anything
+/// else keeps that entry's bound below it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sealed_commit_is_closed_by_its_own_entry() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine =
+        Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open"));
+    let node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+        .await
+        .expect("open raft node");
+    let pipeline = node.pipeline();
+    let ids = ProposalIdGenerator::new();
+    let put = |ts: u64, key: &[u8]| RaftProposal {
+        id: ids.next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: key.to_vec(),
+            value: b"v".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts),
+        bypass_rate_limiter: false,
+    };
+
+    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let alone = put(ts, b"node:1:alone");
+    held.seal(alone.id);
+    pipeline.propose_async(&alone).await.expect("commit");
+    assert!(
+        engine.closure_frontier() > ts,
+        "the entry closed its own commit: frontier {} at {ts}",
+        engine.closure_frontier()
+    );
+    drop(held);
+
+    // A lower timestamp held for another write, in flight beside this one.
+    let (low, low_held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let (high, high_held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let later = put(high, b"node:1:later");
+    high_held.seal(later.id);
+    pipeline.propose_async(&later).await.expect("commit");
+    assert!(
+        engine.closure_frontier() <= low,
+        "the bound passed {low}, held for another write: frontier {}",
+        engine.closure_frontier()
+    );
+    drop(high_held);
+    drop(low_held);
+    node.shutdown().await.expect("shutdown");
+}
+
 /// An early answer proves where the entry is, not that it committed: the
 /// leader's copy written but not synced counts toward `w`, never toward the
 /// majority that commits it, so such an answer carries no committed index a

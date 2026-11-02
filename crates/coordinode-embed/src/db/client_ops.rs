@@ -252,7 +252,7 @@ impl Database {
     fn propose_mutation(&self, mutation: Mutation) -> Result<(), DatabaseError> {
         // Held as not yet logged until the entry is handed over, so no
         // closed bound passes over it meanwhile.
-        let (commit_ts, _held) = self
+        let (commit_ts, held) = self
             .engine
             .pending_commits()
             .obligate(|| self.oracle.next().as_raw());
@@ -263,6 +263,8 @@ impl Database {
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: true,
         };
+        // The proposal carries the whole command.
+        held.seal(proposal.id);
         self.pipeline
             .propose_and_wait(&proposal)
             .map(drop)

@@ -213,6 +213,10 @@ impl Commands {
             self.ids.next(),
             coordinode_core::txn::timestamp::Timestamp::from_raw(at),
         );
+        // The entry's one proposal carries the whole command.
+        for proposal in &request.proposals {
+            held.seal(proposal.id);
+        }
         let written = match crate::closure::stamp(&self.raft, &self.engine, &mut request).await {
             Ok(()) => self
                 .raft

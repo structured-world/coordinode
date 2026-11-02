@@ -3790,7 +3790,7 @@ impl<'a> ExecutionContext<'a> {
         };
         // Held as not yet logged until the entry is handed over, so no
         // closed bound passes over it meanwhile.
-        let (commit_ts, _held) = match self.mvcc_oracle {
+        let (commit_ts, held) = match self.mvcc_oracle {
             Some(oracle) => {
                 let (ts, held) = self
                     .engine
@@ -3807,6 +3807,10 @@ impl<'a> ExecutionContext<'a> {
             start_ts: self.mvcc_read_ts,
             bypass_rate_limiter: false,
         };
+        // The proposal carries every effect of the statement's entry.
+        if let Some(held) = &held {
+            held.seal(proposal.id);
+        }
         let outcome = pipeline
             .propose_and_wait(&proposal)
             .map_err(|e| ExecutionError::Unsupported(format!("commit DDL: {e}")))?;

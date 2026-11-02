@@ -492,7 +492,7 @@ impl Database {
         // A timestamp of its own, held as not yet logged until the entry is
         // handed over: the queue's changes are ordered with every other
         // commit, and no closed bound passes over them meanwhile.
-        let (commit_ts, _held) = self
+        let (commit_ts, held) = self
             .engine
             .pending_commits()
             .obligate(|| self.oracle.next().as_raw());
@@ -503,6 +503,8 @@ impl Database {
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: true,
         };
+        // The proposal carries every change of the queue write.
+        held.seal(proposal.id);
         self.pipeline
             .propose_and_wait(&proposal)
             .map(|_| ())

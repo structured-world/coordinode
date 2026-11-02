@@ -480,6 +480,74 @@ fn the_closed_bound_stops_below_every_timestamp_not_yet_logged() {
     assert_eq!(pending.stamp_closed_below(|| 70), 71);
 }
 
+/// The entry carrying a sealed commit closes the bound past it, since a
+/// member applies the entry's proposals before its bound; an entry carrying
+/// anything else stays below it. A lower timestamp held elsewhere still holds
+/// the bound, in whichever order the two are handed over, and a seal names
+/// one proposal: another entry's seal does not release this one.
+#[test]
+fn an_entry_closes_the_commit_sealed_into_it_and_nothing_else() {
+    use coordinode_core::txn::proposal::ProposalId;
+    let pending = Arc::new(table());
+    let (own, other) = (ProposalId::from_raw(7), ProposalId::from_raw(8));
+
+    let admitted = admit_at(&pending, 60, key(Partition::Node, b"a")).expect("admit");
+    admitted.seal(own);
+    assert_eq!(
+        pending.stamp_closed_below_sealing(&[own], || 70),
+        71,
+        "its own entry closes past it"
+    );
+    assert_eq!(
+        pending.stamp_closed_below_sealing(&[other], || 70),
+        60,
+        "another entry does not"
+    );
+    assert_eq!(pending.stamp_closed_below(|| 70), 60, "nor an unsealed one");
+
+    // A lower timestamp held for another entry still holds the bound.
+    let (_, low) = pending.obligate(|| 55);
+    assert_eq!(pending.stamp_closed_below_sealing(&[own], || 70), 55);
+    low.seal(other);
+    assert_eq!(
+        pending.stamp_closed_below_sealing(&[own], || 70),
+        55,
+        "sealed into another proposal, it holds this entry's bound"
+    );
+    assert_eq!(
+        pending.stamp_closed_below_sealing(&[other], || 70),
+        60,
+        "and the other entry's bound stays below the first commit"
+    );
+    assert_eq!(
+        pending.stamp_closed_below_sealing(&[own, other], || 70),
+        71,
+        "one entry carrying both closes both"
+    );
+    drop(low);
+    drop(admitted);
+    assert_eq!(pending.stamp_closed_below(|| 70), 71);
+}
+
+/// A seal does not outlive its registration: a timestamp withdrawn and a new
+/// one registered are not sealed by the old seal.
+#[test]
+fn a_seal_ends_with_its_registration() {
+    use coordinode_core::txn::proposal::ProposalId;
+    let pending = Arc::new(table());
+    let own = ProposalId::from_raw(7);
+    let (_, held) = pending.obligate(|| 40);
+    held.seal(own);
+    drop(held);
+    let (_, next) = pending.obligate(|| 50);
+    assert_eq!(
+        pending.stamp_closed_below_sealing(&[own], || 60),
+        50,
+        "the new registration was never sealed"
+    );
+    drop(next);
+}
+
 /// A closing entry is due only when it would cover a timestamp withdrawn
 /// since the last bound; stamping it makes none due again, so closing
 /// entries do not breed more of themselves.

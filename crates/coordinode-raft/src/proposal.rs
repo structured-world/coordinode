@@ -221,6 +221,9 @@ impl RaftProposalPipeline {
             Err(e) => return Err(e),
         }
         let hold = engine.pending_commits().hold(proposal.commit_ts.as_raw());
+        // A retry hands over the same proposal: its entry may close this
+        // hold as it closes the caller's.
+        hold.seal(proposal.id);
         Ok((request, Some(hold)))
     }
 

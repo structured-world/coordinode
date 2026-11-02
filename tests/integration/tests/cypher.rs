@@ -53,6 +53,58 @@ async fn cypher_q(proc: &CoordinodeProcess, query: &str) -> Vec<HashMap<String, 
         .collect()
 }
 
+/// Execute a write and return its receipt's commit time.
+async fn cypher_write(proc: &CoordinodeProcess, query: &str) -> u64 {
+    let mut client = proc.cypher_client().await;
+    client
+        .execute_cypher(ExecuteCypherRequest {
+            query: query.to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("the write succeeds")
+        .into_inner()
+        .stats
+        .and_then(|s| s.receipt)
+        .expect("a write reports its receipt")
+        .operation_time
+}
+
+/// [`cypher_q`] for a read that depends on the commit at `after_ts`, waited
+/// for up to ten seconds.
+async fn cypher_q_after(
+    proc: &CoordinodeProcess,
+    query: &str,
+    after_ts: u64,
+) -> Vec<HashMap<String, PropertyValue>> {
+    let mut client = proc.cypher_client().await;
+    let resp = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: query.to_string(),
+            read_concern: Some(ReadConcern {
+                level: 2, // MAJORITY
+                after_ts,
+                wait_ms: 10_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("the causal read succeeds")
+        .into_inner();
+    let columns = resp.columns;
+    resp.rows
+        .into_iter()
+        .map(|Row { values }| {
+            columns
+                .iter()
+                .zip(values)
+                .map(|(col, v)| (col.clone(), v))
+                .collect::<HashMap<_, _>>()
+        })
+        .collect()
+}
+
 /// Extract a string value from a row by column name.
 fn str_val(row: &HashMap<String, PropertyValue>, col: &str) -> Option<String> {
     match row.get(col)?.value.as_ref()? {
@@ -1725,27 +1777,25 @@ async fn as_of_timestamp_composes_with_temporal_active_at() {
     )
     .await;
     cypher_q(&server, "CREATE (:P {n: 'p'}), (:Q {n: 'q'})").await;
-    cypher_q(
+    let now_us = cypher_write(
         &server,
         "MATCH (p:P), (q:Q) CREATE (p)-[:BITEMP {valid_from: 100, valid_to: 200}]->(q)",
     )
     .await;
 
-    // Read transaction-time AS OF "now" (effectively current snapshot) +
+    // Read transaction-time AS OF the last write (the current state) +
     // valid-time filter. The version is closed by valid_to=200, so a query
-    // at valid time 300 must return nothing.
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-
-    let inactive_at_300 = cypher_q(
+    // at valid time 300 must return nothing. The named time is answered once
+    // every commit at or below it is applied; the read waits for that by
+    // carrying the write as its causal bound.
+    let inactive_at_300 = cypher_q_after(
         &server,
         &format!(
             "AS OF TIMESTAMP {now_us} \
              MATCH (p:P)-[r:BITEMP]->(q:Q) \
              WHERE temporal_active_at(r, 300) RETURN q.n"
         ),
+        now_us,
     )
     .await;
     assert!(
@@ -1753,13 +1803,14 @@ async fn as_of_timestamp_composes_with_temporal_active_at() {
         "AS OF (current snapshot) + temporal_active_at(300) on closed version must be empty"
     );
 
-    let active_at_150 = cypher_q(
+    let active_at_150 = cypher_q_after(
         &server,
         &format!(
             "AS OF TIMESTAMP {now_us} \
              MATCH (p:P)-[r:BITEMP]->(q:Q) \
              WHERE temporal_active_at(r, 150) RETURN q.n"
         ),
+        now_us,
     )
     .await;
     assert_eq!(

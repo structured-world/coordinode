@@ -100,10 +100,12 @@ impl LogLeaseReserver {
         let id = self.proposal_ids.next();
         // Held as not yet logged until the entry is handed over, so no
         // closed bound passes over it meanwhile.
-        let (commit_ts, _held) = self
+        let (commit_ts, held) = self
             .engine
             .pending_commits()
             .obligate(|| self.oracle.next().as_raw());
+        // The proposal below carries the whole grant.
+        held.seal(id);
         let commit_ts = Timestamp::from_raw(commit_ts);
         let token = token.unwrap_or_else(|| {
             let mut token = [0u8; NODE_LEASE_TOKEN_LEN];

@@ -172,24 +172,24 @@ impl FieldDictionary {
     fn propose(&self, command: MetadataCommand) -> Result<(), DictionaryError> {
         // Held as not yet logged until the entry is handed over, so no
         // closed bound passes over it meanwhile.
-        let (commit_ts, _held) = self
+        let (commit_ts, held) = self
             .engine
             .pending_commits()
             .obligate(|| self.oracle.next().as_raw());
+        let proposal = RaftProposal {
+            id: self.proposal_ids.next(),
+            mutations: vec![Mutation::Command(command)],
+            commit_ts: Timestamp::from_raw(commit_ts),
+            start_ts: Timestamp::from_raw(0),
+            bypass_rate_limiter: false,
+        };
+        // The proposal carries the whole registration.
+        held.seal(proposal.id);
         // A registration promises nothing on its own: it is logged ahead of
         // every entry that uses its ids, so the sync those entries wait for
         // covers it, and a crash before that loses it together with them.
         self.pipeline
-            .propose_with_concern(
-                &RaftProposal {
-                    id: self.proposal_ids.next(),
-                    mutations: vec![Mutation::Command(command)],
-                    commit_ts: Timestamp::from_raw(commit_ts),
-                    start_ts: Timestamp::from_raw(0),
-                    bypass_rate_limiter: false,
-                },
-                &self.engine.bookkeeping_concern(),
-            )
+            .propose_with_concern(&proposal, &self.engine.bookkeeping_concern())
             .map(|_| ())
             .map_err(registration_refusal)
     }

@@ -2404,6 +2404,9 @@ impl<'a> Transaction<'a> {
                 start_ts: self.read_ts,
                 bypass_rate_limiter: false,
             };
+            // The proposal carries every write of the commit, so the entry
+            // carrying it may close the bound past it.
+            admission.seal(proposal.id);
 
             // The wait is bounded by wtimeout when one is set. Per MongoDB:
             // on timeout the data is NOT rolled back, the proposal may still
@@ -2566,7 +2569,7 @@ impl<'a> Transaction<'a> {
         })];
         // Held as not yet logged until the unit is handed over, so no closed
         // bound passes over it.
-        let (ts, _held) = self
+        let (ts, held) = self
             .engine
             .pending_commits()
             .obligate(|| oracle.next().as_raw());
@@ -2578,6 +2581,7 @@ impl<'a> Transaction<'a> {
                 start_ts: Timestamp::ZERO,
                 bypass_rate_limiter: true,
             };
+            held.seal(proposal.id);
             pipeline
                 .propose_with_concern(&proposal, ctx.write_concern)
                 .map_err(proposal_err_to_commit)?;

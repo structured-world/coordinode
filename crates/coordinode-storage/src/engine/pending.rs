@@ -32,6 +32,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
+use coordinode_core::txn::proposal::ProposalId;
+
 use crate::engine::partition::Partition;
 
 /// One admitted commit's write scope, keyed by the timestamp it will land at.
@@ -116,6 +118,11 @@ struct Table {
     /// the same identity: metadata proposed outside a commit. They do not
     /// hold back this node's own snapshots, only the closed bound.
     unlogged: HashMap<u64, u64>,
+    /// The proposal each registration's write travels in, by registration
+    /// identity, once the caller has sealed it into one: the entry carrying
+    /// that proposal applies its write before its own bound, so the bound
+    /// that entry carries need not stay below it.
+    sealed: HashMap<u64, ProposalId>,
     /// The highest bound handed out for a log entry.
     last_closed: u64,
     /// The highest timestamp withdrawn from the table: a timestamp at or
@@ -537,8 +544,23 @@ impl PendingCommits {
     /// clock cannot pass a timestamp between its allocation and its
     /// registration.
     pub fn stamp_closed_below(&self, read_clock: impl FnOnce() -> u64) -> u64 {
+        self.stamp_closed_below_sealing(&[], read_clock)
+    }
+
+    /// [`Self::stamp_closed_below`] for the entry carrying the proposals
+    /// `sealed`: a registration sealed into one of them (see
+    /// [`Admission::seal`], [`Unlogged::seal`]) does not hold the bound,
+    /// since a member applies every proposal of the entry before its bound.
+    /// The registration itself stays: every other entry's bound, and every
+    /// overlap check, still sees it until it is withdrawn.
+    pub fn stamp_closed_below_sealing(
+        &self,
+        sealed: &[ProposalId],
+        read_clock: impl FnOnce() -> u64,
+    ) -> u64 {
         let mut table = self.inner.lock();
-        let bound = Self::closed_below_of(&table, read_clock());
+        let latest = read_clock();
+        let bound = Self::closed_below_except(&table, latest, sealed);
         table.last_closed = table.last_closed.max(bound);
         bound
     }
@@ -568,11 +590,30 @@ impl PendingCommits {
     }
 
     fn closed_below_of(table: &Table, latest: u64) -> u64 {
+        Self::closed_below_except(table, latest, &[])
+    }
+
+    /// The bound below every registration except those sealed into one of
+    /// the proposals `sealed`.
+    fn closed_below_except(table: &Table, latest: u64, sealed: &[ProposalId]) -> u64 {
+        let held_elsewhere = |id: &u64| {
+            table
+                .sealed
+                .get(id)
+                .is_none_or(|proposal| !sealed.contains(proposal))
+        };
         let held = table
             .admitted
-            .values()
-            .map(|a| a.commit_ts)
-            .chain(table.unlogged.values().copied())
+            .iter()
+            .filter(|(id, _)| held_elsewhere(id))
+            .map(|(_, a)| a.commit_ts)
+            .chain(
+                table
+                    .unlogged
+                    .iter()
+                    .filter(|(id, _)| held_elsewhere(id))
+                    .map(|(_, ts)| *ts),
+            )
             .min();
         // A clock in microseconds since the epoch is far below u64::MAX, so
         // the bound one past it cannot overflow.
@@ -581,6 +622,7 @@ impl PendingCommits {
 
     fn withdraw(&self, id: u64) {
         let mut table = self.inner.lock();
+        table.sealed.remove(&id);
         if let Some(admitted) = table.admitted.remove(&id) {
             table.unindex(id, &admitted);
             table.max_released = table.max_released.max(admitted.commit_ts);
@@ -593,11 +635,20 @@ impl PendingCommits {
         self.finished.notify_all();
     }
 
+    /// Seal registration `id` into `proposal`, if it is still registered.
+    fn seal(&self, id: u64, proposal: ProposalId) {
+        let mut table = self.inner.lock();
+        if table.admitted.contains_key(&id) || table.unlogged.contains_key(&id) {
+            table.sealed.insert(id, proposal);
+        }
+    }
+
     /// Release an unlogged timestamp. One whose entry went to the log counts
     /// toward a closing entry; a `local` one never reaches the log, so only
     /// stops holding the bound.
     fn withdraw_unlogged(&self, id: u64, local: bool) {
         let mut table = self.inner.lock();
+        table.sealed.remove(&id);
         if let Some(commit_ts) = table.unlogged.remove(&id)
             && !local
         {
@@ -619,6 +670,16 @@ pub struct Unlogged {
     local: bool,
 }
 
+impl Unlogged {
+    /// Record that this timestamp's write travels in `proposal`, sealed:
+    /// the entry carrying it may close the bound past it (see
+    /// [`PendingCommits::stamp_closed_below_sealing`]). Seal only the
+    /// proposal that carries the whole write.
+    pub fn seal(&self, proposal: ProposalId) {
+        self.pending.seal(self.id, proposal);
+    }
+}
+
 impl Drop for Unlogged {
     fn drop(&mut self) {
         self.pending.withdraw_unlogged(self.id, self.local);
@@ -632,6 +693,16 @@ impl Drop for Unlogged {
 pub struct Admission<'p> {
     pending: &'p PendingCommits,
     id: u64,
+}
+
+impl Admission<'_> {
+    /// Record that this commit's writes travel in `proposal`, sealed: the
+    /// entry carrying it may close the bound past it (see
+    /// [`PendingCommits::stamp_closed_below_sealing`]). Seal only the
+    /// proposal that carries every write of the commit.
+    pub fn seal(&self, proposal: ProposalId) {
+        self.pending.seal(self.id, proposal);
+    }
 }
 
 impl Drop for Admission<'_> {

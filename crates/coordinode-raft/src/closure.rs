@@ -3,10 +3,13 @@
 //! A commit takes its timestamp before its entry reaches the log, and two
 //! commits can reach it in the other order, so a member applying the log
 //! applies timestamps out of order. The bound an entry carries tells it what
-//! it may rely on: every commit timestamp below it is in an earlier entry, or
-//! never will be. A member that applied the entry knows every commit below
-//! the bound is applied, which is what a cut through the log needs (a
-//! derived index claiming freshness, a read waiting for a timestamp).
+//! it may rely on: every commit timestamp below it is in an earlier entry, in
+//! this one, or never will be. A member applies an entry's proposals before
+//! its bound, so once it applied the entry every commit below the bound is
+//! applied, which is what a cut through the log needs (a derived index
+//! claiming freshness, a read waiting for a timestamp). A commit is closed by
+//! its own entry only when it was sealed into one of that entry's proposals:
+//! anything else in flight holds the bound below it.
 //!
 //! The leader takes the bound from the commits it still has in flight. A
 //! timestamp is registered from its allocation until its entry is handed to
@@ -87,9 +90,13 @@ pub(crate) async fn stamp(
             closed_below: closed,
         });
     }
+    // A member applies every proposal of the entry before its bound, so a
+    // commit sealed into one of them (and only such a commit) may be closed
+    // by this very entry.
+    let sealed: Vec<_> = request.proposals.iter().map(|p| p.id).collect();
     request.closed_below = engine
         .pending_commits()
-        .stamp_closed_below(|| oracle.current().as_raw());
+        .stamp_closed_below_sealing(&sealed, || oracle.current().as_raw());
     Ok(())
 }
 
