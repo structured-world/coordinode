@@ -152,6 +152,12 @@ pub struct StorageEngine {
     /// store opened; `0` before any. Every such commit is in the log, so a
     /// closed bound reaches it once the leader covers it.
     raft_applied_ts: AtomicU64,
+    /// For the latest Raft entries applied here, in log order: an entry's
+    /// index and the highest commit timestamp in it and every entry before
+    /// it. Turns a log position into the commits a read at that position
+    /// must hold; see [`Self::commit_ceiling_through`].
+    // no-std: spin::Mutex; held for one push or one search.
+    raft_applied_prefix: parking_lot::Mutex<std::collections::VecDeque<(u64, u64)>>,
     /// How long a snapshot waits for those commits before stepping behind
     /// them. Runtime-settable: it trades read latency against freshness, and
     /// which side a deployment wants is not known at compile time.
@@ -1508,6 +1514,7 @@ impl StorageEngine {
             pending_commits,
             closure_frontier: AtomicU64::new(0),
             raft_applied_ts: AtomicU64::new(0),
+            raft_applied_prefix: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             snapshot_wait: std::sync::atomic::AtomicU64::new(config.snapshot_wait_ms),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
@@ -5738,15 +5745,55 @@ impl StorageEngine {
             >= self.closure_frontier()
     }
 
-    /// Record that a Raft entry carrying `commit_ts` applied here.
-    pub(crate) fn note_raft_applied(&self, commit_ts: u64) {
-        self.raft_applied_ts
-            .fetch_max(commit_ts, std::sync::atomic::Ordering::AcqRel);
+    /// Record that the Raft entry at `index` carrying `commit_ts` applied
+    /// here. Entries apply in log order, so the prefix's ceiling only grows.
+    pub(crate) fn note_raft_applied(&self, index: u64, commit_ts: u64) {
+        let ceiling = self
+            .raft_applied_ts
+            .fetch_max(commit_ts, std::sync::atomic::Ordering::AcqRel)
+            .max(commit_ts);
+        let mut prefix = self.raft_applied_prefix.lock();
+        match prefix.back_mut() {
+            Some((last, at)) if *last == index => *at = (*at).max(ceiling),
+            _ => {
+                prefix.push_back((index, ceiling));
+                if prefix.len() > APPLIED_PREFIX_ENTRIES {
+                    prefix.pop_front();
+                }
+            }
+        }
+    }
+
+    /// The highest commit timestamp in the Raft log through `index`, an
+    /// index this member has applied: a read that must hold the effects of
+    /// that prefix holds every commit at or below it. Exact for the latest
+    /// entries; for an older index, or one applied before the store
+    /// reopened, the highest commit applied here, which is above it and so
+    /// asks for no less than the prefix needs.
+    pub fn commit_ceiling_through(&self, index: u64) -> u64 {
+        let prefix = self.raft_applied_prefix.lock();
+        let exact = match prefix.front() {
+            Some((first, _)) if *first <= index => prefix
+                .iter()
+                .rev()
+                .find(|(at, _)| *at <= index)
+                .map(|(_, ceiling)| *ceiling),
+            _ => None,
+        };
+        drop(prefix);
+        exact.unwrap_or_else(|| {
+            self.raft_applied_ts
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// Read the closed bound from its stored record: when the store opens
     /// and when a snapshot replaced it. A store whose applied entries carried
     /// none knows of no bound.
+    ///
+    /// The commits applied before are not known one by one: they are taken
+    /// to reach the clock, which is past each of them, so a bound or a
+    /// closing entry covering them asks for no less than they need.
     ///
     /// # Errors
     ///
@@ -5758,6 +5805,13 @@ impl StorageEngine {
         };
         self.closure_frontier
             .store(below, std::sync::atomic::Ordering::Release);
+        self.raft_applied_prefix.lock().clear();
+        if let Some(oracle) = self.oracle() {
+            self.raft_applied_ts.fetch_max(
+                oracle.current().as_raw(),
+                std::sync::atomic::Ordering::AcqRel,
+            );
+        }
         Ok(())
     }
 
@@ -6843,6 +6897,11 @@ const REBUILD_INTENT_DIR: &str = "rebuild";
 /// the apply of the entry carrying it. It is replicated data, so a snapshot
 /// carries it and a restart finds it with the entries its tree holds.
 pub const CLOSURE_KEY: &[u8] = b"closure:below";
+
+/// How many of the latest applied Raft entries keep their prefix's exact
+/// commit ceiling (16 bytes each): positions further back than this ask for
+/// the highest commit applied, which is still enough.
+const APPLIED_PREFIX_ENTRIES: usize = 16_384;
 
 /// The stored form of a closed bound.
 #[must_use]

@@ -1785,15 +1785,6 @@ pub struct CoordinodeStateMachine {
     /// The highest commit timestamp applied here: what a member that stops
     /// receiving entries serves its reads as of.
     applied_commit_ts: Arc<core::sync::atomic::AtomicU64>,
-    /// Per-shard `maxAssigned` watermark over HLC commit_ts.
-    /// Distinct from `applied_tx` (Raft log index). Advanced after every
-    /// successful proposal apply so snapshot readers can `WaitForTs(T)`
-    /// until every write with `commit_ts ≤ T` has been applied to every
-    /// modality on this shard.
-    ///
-    /// Optional so legacy paths that don't need cross-modality snapshot
-    /// semantics can leave it `None` (e.g. embedded-mode fast tests).
-    max_assigned: Option<Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
     /// Count of snapshot builds performed by this state machine.
     /// Observability for the snapshot trigger: every build flushes every
     /// tree's memtables, so redundant rebuilds are worth monitoring.
@@ -1962,8 +1953,8 @@ const RAFT_FOLD_EVERY: u64 = 4096;
 const RAFT_FOLD_EVERY: u64 = 5;
 
 impl CoordinodeStateMachine {
-    /// Open the state machine over `engine`; see
-    /// [`Self::with_oracle_and_watermark`] for the errors.
+    /// Open the state machine over `engine`; see [`Self::with_oracle`] for
+    /// the errors.
     pub fn new(engine: Arc<StorageEngine>) -> Result<Self, io::Error> {
         Self::with_oracle(engine, None)
     }
@@ -1972,20 +1963,6 @@ impl CoordinodeStateMachine {
     ///
     /// When oracle is set, `apply_proposal()` calls `oracle.advance_to(commit_ts)`
     /// after applying the entry at `commit_ts`, so later allocations are newer.
-    pub fn with_oracle(
-        engine: Arc<StorageEngine>,
-        oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
-    ) -> Result<Self, io::Error> {
-        Self::with_oracle_and_watermark(engine, oracle, None)
-    }
-
-    /// Create with a timestamp oracle AND a `MaxAssignedWatermark`.
-    ///
-    /// When the watermark is set, `apply_proposal()` advances it to the
-    /// proposal's `commit_ts` AFTER every mutation in that proposal has
-    /// been persisted to the storage engine. Readers at snapshot_ts T can
-    /// then `watermark.wait_for(T, timeout)` to block until every write
-    /// with `commit_ts ≤ T` is visible on this shard.
     ///
     /// The applied position is read from the partition trees' Raft coverage
     /// records, not from a key of its own: each tree flushes on its own
@@ -1998,10 +1975,9 @@ impl CoordinodeStateMachine {
     /// records is refused: nothing in it proves which entries each tree
     /// holds. A failed coverage read, an unreadable applied membership or the
     /// first record's flush also fails the open.
-    pub fn with_oracle_and_watermark(
+    pub fn with_oracle(
         engine: Arc<StorageEngine>,
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
-        max_assigned: Option<Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
     ) -> Result<Self, io::Error> {
         let coverage = engine
             .raft_coverage()
@@ -2083,7 +2059,6 @@ impl CoordinodeStateMachine {
             group_pair_tx,
             deployment_tx,
             applied_commit_ts: Arc::new(core::sync::atomic::AtomicU64::new(reopened_at)),
-            max_assigned,
             snapshot_builds: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             replay_skip,
             skip_until,
@@ -2123,15 +2098,6 @@ impl CoordinodeStateMachine {
         self.engine_work.clone()
     }
 
-    /// Handle to the per-shard `maxAssigned` watermark, if one was wired
-    /// in at construction. Query executors hold this to drive
-    /// `read_consistency='snapshot'` waits.
-    pub fn max_assigned(
-        &self,
-    ) -> Option<Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>> {
-        self.max_assigned.clone()
-    }
-
     /// Subscribe to the applied watermark.
     ///
     /// Returns a `watch::Receiver<u64>` that yields the latest applied
@@ -2139,7 +2105,8 @@ impl CoordinodeStateMachine {
     /// to wait for updates, or `borrow()` to read the current value.
     ///
     /// Used by:
-    /// - Follower reads: wait until `Applied >= query.readTs`
+    /// - Causal reads: wake when the log is applied through a position of
+    ///   this history (a log index, never compared with a commit timestamp)
     /// - Snapshot decisions: check entries since last snapshot
     /// - Health monitoring: detect how far behind this node is
     pub fn subscribe_applied(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -2345,18 +2312,6 @@ impl CoordinodeStateMachine {
 
         // Periodic dedup GC (every DEDUP_GC_INTERVAL_SECS)
         self.maybe_gc_dedup();
-
-        // Advance the per-shard `maxAssigned` watermark AFTER every
-        // mutation in this proposal has been persisted. Snapshot readers at
-        // T ≤ commit_ts now see a fully-applied state on this shard.
-        // Monotonic — a proposal whose commit_ts is below the current
-        // watermark is a no-op (shouldn't happen in a healthy cluster; HLC
-        // guarantees per-shard monotonicity — but defensive).
-        if let Some(ref wm) = self.max_assigned
-            && proposal.commit_ts.as_raw() > 0
-        {
-            wm.advance(proposal.commit_ts);
-        }
 
         Ok(Response {
             mutations_applied: count,

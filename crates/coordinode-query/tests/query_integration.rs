@@ -94,7 +94,6 @@ fn make_test_ctx<'a>(
         labels: Default::default(),
         index_deferred: Default::default(),
         node_columns: None,
-        applied_watermark: None,
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         read_timeout: std::time::Duration::from_millis(2000),
         params: std::collections::HashMap::new(),
@@ -11654,7 +11653,6 @@ fn doc_score_query_as_parameter() {
 // ═══════════════════════════════════════════════════════════════════════
 
 use coordinode_core::txn::read_consistency::ReadConsistencyMode;
-use coordinode_core::txn::watermark::MaxAssignedWatermark;
 
 /// Regression: cross-modality query with NO hint is auto-promoted
 /// to `snapshot` by the planner. Here the query touches graph + vector +
@@ -11773,147 +11771,38 @@ fn read_consistency_explicit_current_hint_defeats_auto_promotion() {
     );
 }
 
-/// `read_consistency = 'current'` skips the watermark wait entirely —
-/// even when `applied_watermark` is wired, `Current` mode does not invoke
-/// `wait_for`. Verify by wiring a watermark that is permanently behind the
-/// `mvcc_read_ts`; in `Current` mode the query succeeds immediately.
+/// The executor never waits in any `read_consistency` mode: the caller that
+/// chose the statement's timestamp chose one eligible for the mode (the
+/// closed bound on a replicated member), and `snapshot` and `exact` read at
+/// it at once, as `current` does.
 #[test]
-fn read_consistency_current_does_not_block_on_watermark() {
+fn read_consistency_never_waits_in_the_executor() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     insert_node(engine, 1, 1, "Person", &[], &mut interner);
 
-    // Watermark stuck at 0; mvcc_read_ts = 1000. In `Snapshot` mode this
-    // would time out; in `Current` it doesn't consult the watermark at all.
-    let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
+    for hint in ["current", "snapshot", "exact"] {
+        let ast = parse(&format!(
+            "MATCH (p:Person) RETURN p /*+ read_consistency('{hint}') */"
+        ))
+        .unwrap();
+        let plan = build_logical_plan(&ast).unwrap();
+        assert_eq!(plan.read_consistency.as_str(), hint);
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+        let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
+        ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
+        ctx.read_timeout = std::time::Duration::from_secs(30);
 
-    let ast = parse("MATCH (p:Person) RETURN p").unwrap();
-    let plan = build_logical_plan(&ast).unwrap();
-    assert_eq!(plan.read_consistency, ReadConsistencyMode::Current);
-
-    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
-    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
-    ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
-    ctx.read_timeout = std::time::Duration::from_millis(50);
-
-    let before = std::time::Instant::now();
-    let rows = execute(&plan, &mut ctx).expect("current mode must not block");
-    let elapsed = before.elapsed();
-    assert_eq!(rows.len(), 1);
-    assert!(
-        elapsed < std::time::Duration::from_millis(40),
-        "Current mode must not hit wait_for (stale watermark ignored), elapsed={elapsed:?}"
-    );
-}
-
-/// `read_consistency = 'snapshot'` with an explicit hint on a
-/// single-modality query blocks on the watermark and returns an error
-/// when the applier never catches up. Direct test of the timeout path.
-#[test]
-fn read_consistency_snapshot_times_out_on_stale_watermark() {
-    let fx = test_engine();
-    let engine = &fx.engine;
-    let mut interner = FieldInterner::new();
-    insert_node(engine, 1, 1, "Person", &[], &mut interner);
-
-    // Watermark stuck at 0; mvcc_read_ts = 1000; timeout = 50ms → must error.
-    let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
-
-    let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
-    let plan = build_logical_plan(&ast).unwrap();
-    assert_eq!(plan.read_consistency, ReadConsistencyMode::Snapshot);
-
-    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
-    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
-    ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
-    ctx.read_timeout = std::time::Duration::from_millis(50);
-
-    let err = execute(&plan, &mut ctx)
-        .expect_err("snapshot mode must error when watermark never catches up");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("read_consistency='snapshot'")
-            && msg.contains("timed out")
-            && msg.contains("commit_ts=1000"),
-        "error must name read_consistency, timeout, and target commit_ts; got: {msg}"
-    );
-}
-
-/// `read_consistency = 'snapshot'` unblocks when the applier
-/// catches up before the timeout. Full integration: reader blocks, we
-/// advance the watermark from a spawned thread, reader unblocks and
-/// returns rows.
-#[test]
-fn read_consistency_snapshot_unblocks_on_watermark_advance() {
-    let fx = test_engine();
-    let engine = &fx.engine;
-    let mut interner = FieldInterner::new();
-    insert_node(engine, 1, 1, "Person", &[], &mut interner);
-
-    let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
-    let wm_advancer = std::sync::Arc::clone(&wm);
-    // The advancer's 30ms start once the clock below runs: counted from the
-    // spawn, a slow parse on a loaded host would use them up and the read
-    // would find the watermark already advanced.
-    let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
-    let advancer = std::thread::spawn(move || {
-        start_rx.recv().expect("the reader starts");
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        wm_advancer.advance(coordinode_core::txn::timestamp::Timestamp::from_raw(500));
-    });
-
-    let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
-    let plan = build_logical_plan(&ast).unwrap();
-    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
-    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(500);
-    ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
-    // Far longer than the advance takes: a read woken by the advance returns
-    // long before it, one that only gives up at the timeout does not. The
-    // margin is wide so a slow or loaded host cannot read as either.
-    let timeout = std::time::Duration::from_secs(10);
-    ctx.read_timeout = timeout;
-
-    let before = std::time::Instant::now();
-    start_tx.send(()).expect("the advancer waits");
-    let rows = execute(&plan, &mut ctx).expect("must unblock on advance");
-    let elapsed = before.elapsed();
-    advancer.join().unwrap();
-
-    assert_eq!(rows.len(), 1);
-    assert!(
-        elapsed >= std::time::Duration::from_millis(25),
-        "must actually wait for advance (~30ms), elapsed={elapsed:?}"
-    );
-    assert!(
-        elapsed < timeout / 2,
-        "must be woken by the advance, not by the timeout, elapsed={elapsed:?}"
-    );
-}
-
-/// `read_consistency = 'snapshot'` with NO watermark wired (legacy
-/// context) executes without blocking — mode applies only when a watermark
-/// is available.
-#[test]
-fn read_consistency_snapshot_without_watermark_is_noop() {
-    let fx = test_engine();
-    let engine = &fx.engine;
-    let mut interner = FieldInterner::new();
-    insert_node(engine, 1, 1, "Person", &[], &mut interner);
-
-    let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
-    let plan = build_logical_plan(&ast).unwrap();
-    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
-    // No applied_watermark. Would be an error if watermark were required.
-    assert!(ctx.applied_watermark.is_none());
-    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
-
-    let rows = execute(&plan, &mut ctx).expect("legacy context must succeed");
-    assert_eq!(rows.len(), 1);
+        let before = std::time::Instant::now();
+        let rows = execute(&plan, &mut ctx).expect("read");
+        assert_eq!(rows.len(), 1, "{hint}");
+        assert!(
+            before.elapsed() < std::time::Duration::from_secs(5),
+            "{hint} waited {:?}",
+            before.elapsed()
+        );
+    }
 }
 
 /// EXPLAIN output shows the effective `vector_consistency` when
@@ -11938,81 +11827,17 @@ fn read_consistency_drives_explain_vector_consistency_label() {
     );
 }
 
-/// `read_consistency='exact'` hint triggers the watermark wait
-/// just like `snapshot` (both return true from `requires_snapshot_wait`).
-/// The difference between them is the downstream vector scoring path
-/// (HNSW post-filter vs brute-force); at the wait-for boundary they
-/// behave identically.
+/// `read_consistency='exact'` follows through to the vector modality when
+/// no narrower hint names another.
 #[test]
-fn read_consistency_exact_also_blocks_on_watermark() {
-    let fx = test_engine();
-    let engine = &fx.engine;
-    let mut interner = FieldInterner::new();
-    insert_node(engine, 1, 1, "Person", &[], &mut interner);
-
-    let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
-
+fn read_consistency_exact_carries_to_vector_consistency() {
     let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('exact') */").unwrap();
     let plan = build_logical_plan(&ast).unwrap();
     assert_eq!(plan.read_consistency, ReadConsistencyMode::Exact);
-    // Narrower rule: vector_consistency follows read_consistency when no
-    // explicit hint → Exact on both sides.
     assert_eq!(
         plan.vector_consistency,
         coordinode_core::graph::types::VectorConsistencyMode::Exact,
         "vector_consistency follows read_consistency='exact' when no hint"
-    );
-
-    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
-    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
-    ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
-    ctx.read_timeout = std::time::Duration::from_millis(50);
-
-    let err = execute(&plan, &mut ctx).expect_err("exact mode must also block on watermark");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("read_consistency='exact'") && msg.contains("timed out"),
-        "error must name exact mode, got: {msg}"
-    );
-}
-
-/// When `AS OF TIMESTAMP` is set, the watermark wait targets
-/// `ctx.snapshot_ts` (the explicit historical point), NOT `mvcc_read_ts`.
-/// This covers the target-resolution branch in `execute()`.
-#[test]
-fn read_consistency_snapshot_targets_as_of_timestamp_when_set() {
-    let fx = test_engine();
-    let engine = &fx.engine;
-    let mut interner = FieldInterner::new();
-    insert_node(engine, 1, 1, "Person", &[], &mut interner);
-
-    // Watermark at 750. snapshot_ts (AS OF) = 700 → wait_for should
-    // return immediately (current >= target). mvcc_read_ts = 5000
-    // would time out IF it were the target — this test proves snapshot_ts
-    // wins.
-    let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::from_raw(750));
-
-    let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
-    let plan = build_logical_plan(&ast).unwrap();
-    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
-    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(5000);
-    ctx.snapshot_ts = Some(700);
-    ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
-    // Short timeout: if AS OF were ignored and mvcc_read_ts=5000 used, we'd
-    // time out after 50ms.
-    ctx.read_timeout = std::time::Duration::from_millis(50);
-
-    let before = std::time::Instant::now();
-    let rows = execute(&plan, &mut ctx)
-        .expect("AS OF TIMESTAMP target (700) <= watermark (750) — must not block");
-    let elapsed = before.elapsed();
-    assert_eq!(rows.len(), 1);
-    assert!(
-        elapsed < std::time::Duration::from_millis(40),
-        "target_ts must resolve from snapshot_ts (AS OF), not mvcc_read_ts; \
-         elapsed={elapsed:?}"
     );
 }
 

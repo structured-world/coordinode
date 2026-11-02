@@ -1954,6 +1954,195 @@ async fn raft_write_returns_own_receipt() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A read whose modalities must resolve at one timestamp
+/// (`read_consistency('snapshot')`) on a replicated member is taken at the
+/// closed bound, a timestamp every commit below is applied at, never at a
+/// fresh clock reading that can be past a lower-stamped commit still in the
+/// log; it is chosen without waiting. Bounded by a write it does not yet
+/// cover, it is refused at once and served after an explicit wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aligned_read_is_taken_at_the_closed_bound() {
+    let (svc, node, _dir) = test_service_raft().await;
+    let written = svc
+        .execute_cypher(cypher_request("CREATE (n:Aligned {v: 1})"))
+        .await
+        .expect("write")
+        .into_inner()
+        .stats
+        .and_then(|s| s.receipt)
+        .expect("receipt")
+        .operation_time;
+
+    let aligned = "MATCH (n:Aligned) RETURN n.v /*+ read_consistency('snapshot') */";
+    let read = svc
+        .execute_cypher(cypher_request(aligned))
+        .await
+        .expect("an aligned read is answered without waiting")
+        .into_inner();
+    let read_at = read
+        .stats
+        .and_then(|s| s.receipt)
+        .expect("receipt")
+        .operation_time;
+    let closed = svc.database().read().engine().closure_frontier();
+    assert!(
+        read_at < closed,
+        "the aligned read is at or below the closed bound: read at {read_at}, closed below {closed}"
+    );
+
+    let seen = svc
+        .execute_cypher(causal_request(aligned, 2, written, None, 10_000))
+        .await
+        .expect("bounded by the write, after the wait")
+        .into_inner();
+    assert_eq!(
+        seen.rows.len(),
+        1,
+        "the aligned read sees the write it is bounded by"
+    );
+
+    node.shutdown().await.expect("shutdown");
+}
+
+/// A commit timestamp L is allocated and held, not yet in the log, while a
+/// later write H commits and applies: the log's closed bound stays at L, and
+/// a view past it would hold H without L. No public read path answers from
+/// such a view. An aligned read is taken below L and sees neither; a time
+/// named at or past H (`at_timestamp`, `AS OF TIMESTAMP`) is refused as not
+/// ready, never answered from the hole; a cursor and a transaction start
+/// below L; a read bounded only by H's log position, and a linearizable
+/// read, refuse rather than answer from a view without H. Once L is released
+/// the same bounds are met and H is seen.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_read_is_answered_from_a_hole_below_an_applied_commit() {
+    let (svc, node, _dir) = test_service_raft().await;
+    let (low, held) = {
+        let db = svc.database().read();
+        let engine = db.engine();
+        let oracle = engine.oracle().expect("an oracle");
+        engine.pending_commits().obligate(|| oracle.next().as_raw())
+    };
+    let written = svc
+        .execute_cypher(cypher_request("CREATE (n:Hole {v: 1})"))
+        .await
+        .expect("H commits and applies")
+        .into_inner()
+        .stats
+        .and_then(|s| s.receipt)
+        .expect("receipt");
+    let high = written.operation_time;
+    assert!(high > low, "H is stamped after L: {high} <= {low}");
+    let position = written.position.clone().expect("H's entry");
+
+    // An aligned read: below L, neither L nor H.
+    let aligned = "MATCH (n:Hole) RETURN n.v /*+ read_consistency('snapshot') */";
+    let read = svc
+        .execute_cypher(cypher_request(aligned))
+        .await
+        .expect("an aligned read is answered from a complete view")
+        .into_inner();
+    assert_eq!(read.rows.len(), 0, "the view holds H without L");
+    let read_at = read
+        .stats
+        .and_then(|s| s.receipt)
+        .expect("receipt")
+        .operation_time;
+    assert!(read_at < low, "read at {read_at}, at or past L {low}");
+
+    // A named time at H is not ready, by the read concern and in the query.
+    let named = svc
+        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+            query: "MATCH (n:Hole) RETURN n.v".to_string(),
+            read_concern: Some(crate::proto::replication::ReadConcern {
+                level: 4, // SNAPSHOT
+                at_timestamp: high,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("at_timestamp H while L is open");
+    assert_eq!(named.code(), tonic::Code::Unavailable, "{named:?}");
+    let as_of = svc
+        .execute_cypher(cypher_request(&format!(
+            "MATCH (n:Hole) RETURN n.v AS OF TIMESTAMP {high}"
+        )))
+        .await
+        .expect_err("AS OF TIMESTAMP H while L is open");
+    assert_eq!(as_of.code(), tonic::Code::Unavailable, "{as_of:?}");
+
+    // A cursor's first page and a transaction take a view below L.
+    let page = svc
+        .database()
+        .read()
+        .execute_cypher_paged("MATCH (n:Hole) RETURN n.v", None, None, None, 100)
+        .expect("a cursor opens on a complete view");
+    assert!(
+        page.read_ts < low,
+        "cursor at {}, at or past L {low}",
+        page.read_ts
+    );
+    assert_eq!(page.rows.len(), 0, "the cursor holds H without L");
+    let tx = begin(&svc);
+    let (in_tx, _) = in_txn(&svc, "MATCH (n:Hole) RETURN n.v", tx).expect("a statement");
+    assert_eq!(in_tx.len(), 0, "the transaction holds H without L");
+
+    // Bounded by H's position only, or linearizable: H must be in the view,
+    // so the read is refused rather than answered from below L.
+    let by_position = svc
+        .execute_cypher(causal_request(aligned, 2, 0, Some(position.clone()), 0))
+        .await
+        .expect_err("H's position is applied, its commit is not closed");
+    assert_eq!(
+        by_position.code(),
+        tonic::Code::Unavailable,
+        "{by_position:?}"
+    );
+    let mut linearizable = cypher_request(aligned);
+    linearizable.get_mut().read_concern = Some(crate::proto::replication::ReadConcern {
+        level: 3, // LINEARIZABLE
+        ..Default::default()
+    });
+    match svc.execute_cypher(linearizable).await {
+        Ok(answer) => assert_eq!(
+            answer.into_inner().rows.len(),
+            1,
+            "a linearizable read answered without the acknowledged H"
+        ),
+        Err(status) => assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}"),
+    }
+
+    // L released: the closed bound passes H, and the bounds are met.
+    drop(held);
+    let seen = svc
+        .execute_cypher(causal_request(aligned, 2, 0, Some(position), 10_000))
+        .await
+        .expect("H's position is met once L is released")
+        .into_inner();
+    assert_eq!(
+        seen.rows.len(),
+        1,
+        "the read bounded by H's position sees H"
+    );
+    // The named time is inclusive: once complete, at_timestamp = H holds H.
+    let at_high = svc
+        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+            query: "MATCH (n:Hole) RETURN n.v".to_string(),
+            read_concern: Some(crate::proto::replication::ReadConcern {
+                level: 4, // SNAPSHOT
+                at_timestamp: high,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("at_timestamp H once every commit at or below it is applied")
+        .into_inner();
+    assert_eq!(at_high.rows.len(), 1, "at_timestamp H holds H");
+
+    node.shutdown().await.expect("shutdown");
+}
+
 /// A request that names no read preference is fenced with the server's
 /// default: `secondary` refuses it on the leader, while a request on the same
 /// leader that names `primary` is served. Guards against the unnamed field

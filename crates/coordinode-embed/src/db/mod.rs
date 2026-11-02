@@ -1876,6 +1876,68 @@ impl Database {
         Ok(Some(bound))
     }
 
+    /// The view of a read whose modalities must all resolve at one timestamp
+    /// (`read_consistency` `snapshot` or `exact`): the latest one every
+    /// commit below is applied at. On a replicated member that is its closed
+    /// bound: a fresh clock reading can be past a lower-stamped commit still
+    /// on its way through the log, and a view there would hold one
+    /// modality's effects without another's. Standalone it is below every
+    /// commit still in flight. Chosen from what is published, never by
+    /// waiting.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::ReadNotReady`] on a replicated member with no closed
+    /// bound yet, which proves no state complete, not an empty one;
+    /// [`DatabaseError::OutsideRetention`] when the view's history may be
+    /// collected already.
+    fn aligned_pinned_read_ts(
+        &self,
+        hold: &mut Option<coordinode_storage::engine::coordinator::SnapshotPin>,
+        durable: bool,
+    ) -> Result<Timestamp, DatabaseError> {
+        let fresh = self.fresh_pinned_read_ts(hold, durable).as_raw();
+        let complete = self.complete_below(fresh)?;
+        if complete == fresh {
+            return Ok(Timestamp::from_raw(fresh));
+        }
+        let Some(pin) = self.engine.pin_snapshot_at(complete) else {
+            return Err(DatabaseError::OutsideRetention {
+                // Both clamped at the bottom of the timestamp domain: an
+                // empty view and horizon zero name no timestamp below it.
+                requested: complete.saturating_sub(1),
+                oldest_readable: self.engine.oldest_readable_seqno().saturating_sub(1),
+            });
+        };
+        *hold = Some(pin);
+        Ok(Timestamp::from_raw(complete))
+    }
+
+    /// The latest snapshot at or below `view` (exclusive, as storage
+    /// snapshots are) that every commit below is applied at: on a replicated
+    /// member its closed bound, standalone below every commit in flight.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::ReadNotReady`] on a replicated member whose log has
+    /// carried no closed bound yet.
+    fn complete_below(&self, view: u64) -> Result<u64, DatabaseError> {
+        let floor = self.engine.pending_commits().durable_floor(view);
+        if self.engine.raft_fence().is_none() {
+            return Ok(floor);
+        }
+        let closed = self.engine.closure_frontier();
+        if closed == 0 {
+            return Err(DatabaseError::ReadNotReady {
+                // The view's inclusive timestamp; an empty view names the
+                // bottom of the timestamp domain, there being none below.
+                requested: view.saturating_sub(1),
+                ready_through: None,
+            });
+        }
+        Ok(floor.min(closed))
+    }
+
     fn fresh_pinned_read_ts(
         &self,
         hold: &mut Option<coordinode_storage::engine::coordinator::SnapshotPin>,
@@ -2372,14 +2434,17 @@ impl Database {
         // rather than naming a fresh timestamp, which a commit in flight or
         // an unsynced write below it would refuse. A view at S holds what is
         // stamped below S, and a timestamp names what it covers, so the
-        // cursor's timestamp is S - 1. Saturating by design: a store with
-        // nothing in it has S = 0, and timestamp 0, never assigned to a
-        // commit, reads nothing too.
-        let pinned = read_ts.unwrap_or_else(|| {
-            self.engine
-                .durable_view(self.engine.snapshot())
-                .saturating_sub(1)
-        });
+        // cursor's timestamp is S - 1. On a replicated member the view is
+        // also under the closed bound, past which a lower-stamped commit can
+        // still be on its way. Saturating by design: a store with nothing in
+        // it has S = 0, and timestamp 0, never assigned to a commit, reads
+        // nothing too.
+        let pinned = match read_ts {
+            Some(pinned) => pinned,
+            None => self
+                .complete_below(self.engine.durable_view(self.engine.snapshot()))?
+                .saturating_sub(1),
+        };
         let session = QuerySession {
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Snapshot,
             snapshot_read_ts: Some(pinned),
@@ -2685,7 +2750,12 @@ impl Database {
                         // state missing a write the timestamp covers, or one a
                         // crash can still take back; answering at another
                         // timestamp would give a different read than asked for.
-                        let ready_below = self.engine.pending_commits().durable_floor(seqno);
+                        let mut ready_below = self.engine.pending_commits().durable_floor(seqno);
+                        // A replicated member holds every commit at or below
+                        // the time only under its closed bound.
+                        if self.engine.raft_fence().is_some() {
+                            ready_below = ready_below.min(self.engine.closure_frontier());
+                        }
                         if ready_below < seqno {
                             return Err(DatabaseError::ReadNotReady {
                                 requested: ts,
@@ -2714,18 +2784,31 @@ impl Database {
                         // committed, so the executor gets the largest value it holds.
                         named_read_ts = Some(i64::try_from(ts).unwrap_or(i64::MAX));
                         Timestamp::from_raw(seqno)
+                    } else if plan.read_consistency.requires_aligned_view() {
+                        self.aligned_pinned_read_ts(&mut retention_pin, true)?
                     } else {
                         self.fresh_pinned_read_ts(&mut retention_pin, true)
                     }
                 }
                 TxnMode::AutoCommit => {
-                    self.fresh_pinned_read_ts(&mut retention_pin, session.read_concern.is_durable())
+                    let durable = session.read_concern.is_durable();
+                    if plan.read_consistency.requires_aligned_view() {
+                        self.aligned_pinned_read_ts(&mut retention_pin, durable)?
+                    } else {
+                        self.fresh_pinned_read_ts(&mut retention_pin, durable)
+                    }
                 }
+            };
+            // The snapshot the statement reads: a transaction's, chosen when it
+            // began, which its attempt timestamp can be past.
+            let view = match &txn_mode {
+                TxnMode::Interactive(state) => state.snapshot().unwrap_or(read_ts.as_raw()),
+                TxnMode::AutoCommit => read_ts.as_raw(),
             };
             // The view's inclusive timestamp. A causal bound above it is not
             // met here: the read is refused rather than answered from before
             // the bound.
-            let view_through = read_ts.as_raw().checked_sub(1);
+            let view_through = view.checked_sub(1);
             if let Some(bound) = causal_after_ts {
                 // Below every commit still in flight, whatever the store
                 // keeps in a journal: the bound needs each commit at or below
@@ -2733,7 +2816,7 @@ impl Database {
                 let ready_through = self
                     .engine
                     .pending_commits()
-                    .durable_floor(read_ts.as_raw())
+                    .durable_floor(view)
                     .checked_sub(1);
                 if ready_through.is_none_or(|through| through < bound) {
                     return Err(DatabaseError::ReadNotReady {
@@ -2866,7 +2949,6 @@ impl Database {
                 labels: Default::default(),
                 index_deferred: Default::default(),
                 node_columns: None,
-                applied_watermark: None,
                 read_consistency:
                     coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
                 read_timeout: READ_TIMEOUT,

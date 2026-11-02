@@ -859,6 +859,13 @@ impl From<ExecutionError> for DatabaseError {
                 requested,
                 oldest_readable,
             },
+            E::ReadNotReady {
+                requested,
+                ready_through,
+            } => Self::ReadNotReady {
+                requested,
+                ready_through,
+            },
             E::SchemaViolation(detail) => Self::SchemaViolation(detail),
             E::DuplicateKey {
                 table,

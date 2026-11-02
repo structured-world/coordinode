@@ -360,21 +360,31 @@ impl Admitter {
         {
             return fence_refusal(e, node.current_leader(), already_forwarded);
         }
-        if checked.read_concern.is_causal() {
-            fence
+        let mut read_concern = checked.read_concern;
+        if read_concern.is_causal() {
+            // A position becomes the commit timestamp bound its prefix needs,
+            // which the database's view must reach; the position itself is
+            // established here.
+            read_concern.after_ts = fence
                 .await_causal(
-                    checked.read_concern.after_ts,
-                    checked.read_concern.after_position,
-                    checked.read_concern.wait,
+                    read_concern.after_ts,
+                    read_concern.after_position,
+                    read_concern.wait,
                 )
                 .await
                 .map_err(fence_error)?;
+        } else if read_concern.level == ReadConcernLevel::Linearizable {
+            // The barrier proved authority and applied the log through it;
+            // what is left is a view holding that prefix, the same bound a
+            // causal majority read meets, never an older cut.
+            read_concern.level = ReadConcernLevel::Majority;
+            read_concern.after_ts = fence.barrier_bound();
         }
         let applied_index = fence.applied_index();
         let history = fence.history();
         let served_by_leader = fence.locally_leads();
         Ok(Admission::Run(Box::new(Admitted {
-            read_concern: checked.read_concern,
+            read_concern,
             write_concern: checked.write_concern,
             vector_consistency: checked.vector_consistency,
             vector_build_wait: checked.vector_build_wait,
@@ -408,6 +418,7 @@ impl Admitter {
         node.read_fence()
             .await_causal(Some(after_ts), None, wait)
             .await
+            .map(|_| ())
             .map_err(fence_error)
     }
 

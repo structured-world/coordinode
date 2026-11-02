@@ -626,8 +626,32 @@ impl Database {
         // neither that write nor any sign of it. `read_ts` stays the
         // allocated value because it identifies this attempt. A read concern
         // that must not see a write a crash can still take back reads the
-        // durable view.
-        let mut txn = if read_concern.is_durable() {
+        // durable view. On a replicated member it is also under the closed
+        // bound, past which a lower-stamped commit can still be on its way:
+        // one view for every statement, so it is chosen complete once here.
+        let mut txn = if self.engine.raft_fence().is_some() {
+            let latest = if read_concern.is_durable() {
+                self.engine.durable_view(self.engine.snapshot())
+            } else {
+                self.engine.snapshot()
+            };
+            let view = self.complete_below(latest)?;
+            // Held until the transaction pins the view itself.
+            let Some(_held) = self.engine.pin_snapshot_at(view) else {
+                return Err(DatabaseError::OutsideRetention {
+                    // Both clamped at the bottom of the timestamp domain: an
+                    // empty view and horizon zero name no timestamp below it.
+                    requested: view.saturating_sub(1),
+                    oldest_readable: self.engine.oldest_readable_seqno().saturating_sub(1),
+                });
+            };
+            coordinode_storage::engine::transaction::Transaction::new(
+                &self.engine,
+                Some(&self.oracle),
+                read_ts,
+                Some(view),
+            )
+        } else if read_concern.is_durable() {
             coordinode_storage::engine::transaction::Transaction::begin_durable(
                 &self.engine,
                 Some(&self.oracle),
@@ -642,8 +666,9 @@ impl Database {
         };
         let state = txn.take_state();
         // Every statement reads this snapshot, so a causal bound past it is
-        // refused here rather than answered from before it.
-        let view_through = state.read_ts().as_raw().checked_sub(1);
+        // refused here rather than answered from before it. The snapshot,
+        // not the attempt's timestamp, which the clock can have moved past.
+        let view_through = state.snapshot().and_then(|view| view.checked_sub(1));
         if let Some(bound) = causal_after_ts
             && view_through.is_none_or(|through| through < bound)
         {

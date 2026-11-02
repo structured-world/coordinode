@@ -22,18 +22,19 @@
 /// `/*+ read_consistency('mode') */` per-query hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadConsistencyMode {
-    /// Each modality reads its latest state independently. No `WaitForTs`,
+    /// Each modality reads its latest state independently. No alignment,
     /// no HNSW post-filter, no FTS segment filter. Lowest latency.
     /// Default for single-modality reads (e.g. pure vector KNN, pure graph
     /// traversal).
     #[default]
     Current,
 
-    /// All modalities resolve against the same HLC timestamp `T`. The shard
-    /// blocks on `MaxAssignedWatermark::wait_for(T, timeout)` before
-    /// dispatching; HNSW search is post-filtered, tantivy reader is
-    /// segment-filtered by `commit_ts ≤ T`. Auto-selected by the planner
-    /// when a query touches >1 modality; user-selectable for any query.
+    /// All modalities resolve against the same HLC timestamp `T`, one every
+    /// commit below is applied at (on a replicated member, its closed bound),
+    /// chosen from what is published rather than waited for; HNSW search is
+    /// post-filtered, tantivy reader is segment-filtered by `commit_ts ≤ T`.
+    /// Auto-selected by the planner when a query touches >1 modality;
+    /// user-selectable for any query.
     Snapshot,
 
     /// `Snapshot` semantics plus HNSW bypassed — vector search runs a
@@ -64,10 +65,9 @@ impl ReadConsistencyMode {
         }
     }
 
-    /// Whether this mode requires the executor to allocate a snapshot
-    /// timestamp and call `applied_watermark.wait_for(T, timeout)` before
-    /// dispatching the read.
-    pub fn requires_snapshot_wait(&self) -> bool {
+    /// Whether this mode needs the read's timestamp to be one every commit
+    /// below is applied at, so every modality reads the same complete state.
+    pub fn requires_aligned_view(&self) -> bool {
         matches!(self, Self::Snapshot | Self::Exact)
     }
 }

@@ -263,6 +263,21 @@ pub enum ExecutionError {
         oldest_readable: u64,
     },
 
+    /// `AS OF TIMESTAMP` named a time not every commit at or below which is
+    /// applied here yet. Nothing was answered: the same read succeeds once
+    /// they are, and it is never answered at an earlier time.
+    #[error(
+        "AS OF TIMESTAMP {requested} is not ready here: not every commit at or below it is \
+         applied{}; retry shortly",
+        ready_through.map_or_else(String::new, |t| format!(" (complete through {t})"))
+    )]
+    ReadNotReady {
+        /// The timestamp the query asked for.
+        requested: u64,
+        /// The last timestamp complete here, if any is.
+        ready_through: Option<u64>,
+    },
+
     /// Schema mode violation: STRICT label rejected an undeclared property, or
     /// a write attempted to SET a COMPUTED (read-only) property.
     #[error("schema violation: {0}")]
@@ -1348,24 +1363,14 @@ pub struct ExecutionContext<'a> {
     pub vector_loader: Option<&'a dyn coordinode_vector::VectorLoader>,
     /// MVCC timestamp oracle. When set, enables MVCC-versioned reads/writes.
     pub mvcc_oracle: Option<&'a TimestampOracle>,
-    /// Per-shard `maxAssigned` watermark handle.
-    ///
-    /// Readers under `read_consistency = 'snapshot'` call
-    /// `applied_watermark.wait_for(snapshot_ts, read_timeout)` before
-    /// dispatching the read, so every modality on this shard observes the
-    /// fully-applied state at `snapshot_ts`. `None` in legacy /
-    /// single-writer test contexts — the executor then skips the wait and
-    /// reads "current" state.
-    pub applied_watermark:
-        Option<std::sync::Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
     /// Cross-modality read consistency mode for this statement.
     /// Set by the planner from `LogicalPlan::read_consistency` (hint or
     /// auto-promotion). Default `Current` preserves the single-modality
-    /// fast path.
+    /// fast path. The caller that chose `mvcc_read_ts` chose it eligible for
+    /// this mode; the executor does not wait for it.
     pub read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode,
-    /// Timeout for `applied_watermark.wait_for(snapshot_ts, …)` under
-    /// `Snapshot` / `Exact` consistency. Default 2s, the documented
-    /// `read_timeout`.
+    /// How long a read of a key's outcome waits for the commits already
+    /// numbered to land. Default 2s.
     pub read_timeout: std::time::Duration,
     /// MVCC read timestamp (start_ts). Allocated from oracle at statement start.
     /// All reads see a consistent snapshot at this timestamp.
@@ -5597,6 +5602,22 @@ pub fn execute_no_commit(
             let seqno = (ts as u64).checked_add(1).ok_or_else(|| {
                 ExecutionError::Unsupported("AS OF TIMESTAMP value out of range".into())
             })?;
+            // The named time is kept, never lowered, and answered only once
+            // every commit at or below it is applied here: below every
+            // commit in flight and, on a replicated member, under its closed
+            // bound, past which a lower-stamped commit can still be on its way.
+            // A read of canonical history keeps this logical time too, though
+            // it may read a newer physical view.
+            let mut ready_below = ctx.engine.pending_commits().durable_floor(seqno);
+            if ctx.engine.raft_fence().is_some() {
+                ready_below = ready_below.min(ctx.engine.closure_frontier());
+            }
+            if ready_below < seqno {
+                return Err(ExecutionError::ReadNotReady {
+                    requested: seqno - 1,
+                    ready_through: ready_below.checked_sub(1),
+                });
+            }
             // Pin the snapshot for the statement. The pin is refused when the
             // seqno is already below the GC watermark: that history may be
             // collected, and a read there would answer from whatever survived
@@ -5673,40 +5694,6 @@ pub fn execute_no_commit(
     ctx.vector_consistency = plan.vector_consistency;
     // Scans build only the node properties the statement reads.
     ctx.node_columns = crate::executor::columns::NodeColumns::for_plan(&plan.root);
-
-    // Cross-modality snapshot wait. When `read_consistency` is
-    // `Snapshot` or `Exact`, every modality on this shard must observe the
-    // fully-applied state at a single HLC timestamp T. Block on the
-    // `MaxAssignedWatermark` until the applier has persisted every write
-    // with `commit_ts ≤ T`; timeout returns `ErrReadTimeout` so the client
-    // can retry or fall back to `Current`.
-    //
-    // Target ts: prefer the explicit `AS OF TIMESTAMP` value when present,
-    // otherwise `mvcc_read_ts` (statement start_ts). If the watermark is not
-    // wired into this context (legacy / single-writer test), skip the wait —
-    // the test is responsible for sequencing reads after writes itself.
-    if plan.read_consistency.requires_snapshot_wait()
-        && let Some(ref wm) = ctx.applied_watermark.clone()
-    {
-        let target_raw = ctx
-            .snapshot_ts
-            .map(|t| t.max(0) as u64)
-            .unwrap_or_else(|| ctx.mvcc_read_ts.as_raw());
-        if target_raw > 0 {
-            let target = coordinode_core::txn::timestamp::Timestamp::from_raw(target_raw);
-            let timeout = ctx.read_timeout;
-            // The executor is sync, and so is the wait: it parks this
-            // thread until the applier reaches the target.
-            if let Err(err) = wm.wait_for(target, timeout) {
-                return Err(ExecutionError::Unsupported(format!(
-                    "read_consistency='{}' timed out waiting for applier \
-                     to reach commit_ts={target_raw}: {err}. Retry or fall \
-                     back to read_consistency='current'.",
-                    plan.read_consistency
-                )));
-            }
-        }
-    }
 
     // Enable per-node dedup of variable-length traversal emission when the plan
     // provably cannot observe target multiplicity (count(DISTINCT v) over a lone
@@ -9314,12 +9301,24 @@ fn list_bytes<T>(len: usize) -> u64 {
 /// The nodes a read through an index of the current state answers itself,
 /// beyond `pending` (what the index's worker has not folded): on a read at a
 /// named timestamp T, every node written after T, whose state then the index
-/// no longer holds; on a current read, the transaction's own uncommitted
-/// writes. Each is evaluated exactly from the store as the statement reads it.
+/// no longer holds; otherwise the transaction's own uncommitted writes and,
+/// when its snapshot is older than the store's latest (a transaction begun
+/// earlier, or a view chosen below a commit in flight), every node written
+/// since, which the index may hold as it is now rather than as the snapshot
+/// does. Each is evaluated exactly from the store as the statement reads it.
 fn read_delta(
     pending: IndexDelta,
     ctx: &ExecutionContext<'_>,
 ) -> Result<IndexDelta, ExecutionError> {
+    if ctx.snapshot_ts.is_none()
+        && let Some(view) = ctx.txn.snapshot()
+        && view < ctx.engine.snapshot()
+    {
+        // A view at S holds what is stamped below S: written since is from S on.
+        return Ok(pending
+            .union(IndexDelta::written_since(ctx.engine, ctx.shard_id, view)?)
+            .with_nodes(own_written_nodes(ctx)));
+    }
     match ctx.snapshot_ts {
         Some(at) => {
             // A read at T sees the commits at or below T: the nodes changed

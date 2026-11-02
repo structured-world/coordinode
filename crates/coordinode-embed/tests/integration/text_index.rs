@@ -1677,3 +1677,64 @@ fn a_temporal_label_ranks_as_its_states_valid_now() {
         );
     }
 }
+
+/// A transaction reads the snapshot it began on, and a search through the
+/// index answers at that snapshot too, though the worker has folded later
+/// commits into the index since: each node written after the snapshot is
+/// read from it in place of what the index now holds. A node rewritten
+/// later is found by its text at the snapshot, and a node created later is
+/// not found at all, while a current read sees both changes.
+#[test]
+fn a_transaction_searches_the_index_at_its_own_snapshot() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'rust words'})")
+        .expect("create a");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_cypher("MATCH (n:Article {title: 'a'}) SET n.body = 'golang words'")
+        .expect("rewrite a after the snapshot");
+    db.execute_cypher("CREATE (:Article {title: 'late', body: 'rust late'})")
+        .expect("create after the snapshot");
+    // The worker folds both commits: the index is now past the snapshot.
+    let worker = db
+        .text_index_registry()
+        .coverage()
+        .expect("the worker's coverage");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !worker.delta(1).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never folded"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(titles(&mut db, "rust"), ["late"], "the current read");
+    assert_eq!(titles(&mut db, "golang"), ["a"], "the current read");
+
+    let in_tx = |db: &mut Database, words: &str| -> Vec<String> {
+        let mut found: Vec<String> = db
+            .execute_in_transaction(
+                tx,
+                &format!(
+                    "MATCH (n:Article) WHERE text_match(n.body, '{words}') RETURN n.title AS t"
+                ),
+                None,
+            )
+            .expect("search in transaction")
+            .into_iter()
+            .filter_map(|row| match row.get("t") {
+                Some(Value::String(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(in_tx(&mut db, "rust"), ["a"], "a as the snapshot holds it");
+    assert!(
+        in_tx(&mut db, "golang").is_empty(),
+        "a's later text is not in the snapshot"
+    );
+    db.rollback_transaction(tx).expect("rollback");
+}

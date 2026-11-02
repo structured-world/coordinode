@@ -473,6 +473,11 @@ impl ReadFence {
     /// clock alone never gives), and the log applied through
     /// `after_position`, which must count entries of this member's history.
     ///
+    /// A position is met once the log is applied through it and the closed
+    /// bound covers every commit of that prefix: a view taken at the closed
+    /// bound then holds the prefix's effects. It is answered as the commit
+    /// timestamp bound it amounts to, which the read's view must reach.
+    ///
     /// A bound not met is refused at once as not ready, unless `wait` asks
     /// the read to wait for it: then it waits up to `wait` as entries apply,
     /// and is refused the same way if it is still not met. It is never
@@ -488,7 +493,7 @@ impl ReadFence {
         after_ts: Option<u64>,
         after_position: Option<coordinode_core::txn::read_concern::HistoryPosition>,
         wait: Option<Duration>,
-    ) -> Result<(), ReadFenceError> {
+    ) -> Result<Option<u64>, ReadFenceError> {
         if let Some(position) = after_position
             && self.history != Some(position.history)
         {
@@ -502,8 +507,9 @@ impl ReadFence {
         }
         let deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
         loop {
-            let Some(missing) = self.causal_gap(after_ts, after_position) else {
-                return Ok(());
+            let missing = match self.causal_gap(after_ts, after_position) {
+                Ok(bound) => return Ok(bound),
+                Err(missing) => missing,
             };
             // A read-only member receives nothing, so a later point never
             // arrives: refuse by name instead of waiting out the bound.
@@ -531,16 +537,35 @@ impl ReadFence {
         }
     }
 
-    /// What of the causal bounds is not met here, `None` when both are.
+    /// The commit timestamp bound the causal bounds amount to when they are
+    /// met here, or what of them is not.
     fn causal_gap(
         &self,
         after_ts: Option<u64>,
         after_position: Option<coordinode_core::txn::read_concern::HistoryPosition>,
-    ) -> Option<String> {
-        if let Some(ts) = after_ts {
+    ) -> Result<Option<u64>, String> {
+        let mut bound = after_ts;
+        if let Some(position) = after_position {
+            let applied = *self.applied_rx.borrow();
+            if applied < position.index {
+                return Err(format!(
+                    "the log is applied through {applied}, the read needs {}",
+                    position.index
+                ));
+            }
+            // Applied through the position is not yet visible at a view
+            // taken at the closed bound: the prefix's commits must be under
+            // it too.
+            let prefix = self
+                .engine
+                .as_ref()
+                .map(|engine| engine.commit_ceiling_through(position.index));
+            bound = bound.max(prefix);
+        }
+        if let Some(ts) = bound {
             let complete = self.complete_through();
             if complete.is_none_or(|through| through < ts) {
-                return Some(match complete {
+                return Err(match complete {
                     Some(through) => format!(
                         "commits at or below {ts} are not all applied (complete through {through})"
                     ),
@@ -548,16 +573,18 @@ impl ReadFence {
                 });
             }
         }
-        if let Some(position) = after_position {
-            let applied = *self.applied_rx.borrow();
-            if applied < position.index {
-                return Some(format!(
-                    "the log is applied through {applied}, the read needs {}",
-                    position.index
-                ));
-            }
-        }
-        None
+        Ok(bound)
+    }
+
+    /// The commit timestamp bound a linearizable read amounts to once its
+    /// authority barrier passed: the commits of the log applied here
+    /// through the barrier, which the read's view must hold. `None` without
+    /// a store to tell.
+    pub fn barrier_bound(&self) -> Option<u64> {
+        let applied = *self.applied_rx.borrow();
+        self.engine
+            .as_ref()
+            .map(|engine| engine.commit_ceiling_through(applied))
     }
 
     /// Return the current applied log index on this node, a position in

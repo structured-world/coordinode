@@ -548,6 +548,13 @@ impl TransactionState {
         self.read_ts
     }
 
+    /// The storage snapshot the parked transaction's statements read: it
+    /// holds what is stamped below it. `read_ts` identifies the attempt and
+    /// can be later; this is what was actually seen.
+    pub fn snapshot(&self) -> Option<StorageSnapshot> {
+        self.snapshot
+    }
+
     /// State a version condition on a transaction that is parked between
     /// statements.
     ///

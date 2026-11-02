@@ -146,14 +146,14 @@ fn contract_default_is_current() {
     assert_eq!(ReadConsistencyMode::default(), ReadConsistencyMode::Current);
 }
 
-/// CONTRACT: `requires_snapshot_wait` is true for `Snapshot` and `Exact`
-/// only. Changing this changes whether the executor blocks on the
-/// watermark — a behavioural breaking change.
+/// CONTRACT: `requires_aligned_view` is true for `Snapshot` and `Exact`
+/// only. Changing this changes which reads are taken at a timestamp every
+/// commit below is applied at.
 #[test]
-fn contract_requires_snapshot_wait_matrix() {
-    assert!(!ReadConsistencyMode::Current.requires_snapshot_wait());
-    assert!(ReadConsistencyMode::Snapshot.requires_snapshot_wait());
-    assert!(ReadConsistencyMode::Exact.requires_snapshot_wait());
+fn contract_requires_aligned_view_matrix() {
+    assert!(!ReadConsistencyMode::Current.requires_aligned_view());
+    assert!(ReadConsistencyMode::Snapshot.requires_aligned_view());
+    assert!(ReadConsistencyMode::Exact.requires_aligned_view());
 }
 
 // ─────────────────────────────────────────────────────────────────────────

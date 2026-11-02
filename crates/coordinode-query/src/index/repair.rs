@@ -237,7 +237,6 @@ fn attempt(
         labels: Default::default(),
         index_deferred: Default::default(),
         node_columns: None,
-        applied_watermark: None,
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         read_timeout: std::time::Duration::from_secs(2),
         params,

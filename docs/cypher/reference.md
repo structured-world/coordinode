@@ -1288,12 +1288,12 @@ cancellation are checked as its work proceeds, inside index searches too.
 
 ### `read_consistency`
 
-Governs whether graph, vector, full-text, document, and time-series reads inside a single query resolve against the **same HLC timestamp** `T`. Every modality on the serving shard waits until every write with `commit_ts ≤ T` has been applied to every index before the read dispatches. Orthogonal to `read_concern` (which governs replication durability).
+Governs whether graph, vector, full-text, document, and time-series reads inside a single query resolve against the **same HLC timestamp** `T`. Orthogonal to `read_concern` (which governs replication durability).
 
 | Mode | Behaviour |
 |------|-----------|
-| `current` | Each modality reads its latest state independently. No watermark wait. Lowest latency. Default for single-modality reads. |
-| `snapshot` | All modalities align at a single HLC `T` via `MaxAssignedWatermark::wait_for(T, read_timeout)`. HNSW post-filtered, tantivy segment-filtered by `commit_ts ≤ T`. **Auto-selected** when a query touches >1 modality. |
+| `current` | Each modality reads its latest state. Lowest latency. Default for single-modality reads. |
+| `snapshot` | All modalities answer at one `T`: the latest timestamp every commit at or below which is applied on the serving member, chosen from what is already published, never by waiting. A node written after `T` is read from the snapshot in place of what a vector or full-text index holds of it. **Auto-selected** when a query touches >1 modality. |
 | `exact` | As `snapshot`, plus HNSW is bypassed (brute-force scan with MVCC filter). 100% recall, 10–100× slower vector path; use for audit / correctness-critical reads, and for vector search at an `AS OF TIMESTAMP`, which the current-state index cannot answer. |
 
 **What counts as a "modality" for the auto-promotion rule:**
@@ -1343,6 +1343,6 @@ RETURN c /*+ vector_consistency('exact') */
 -- text + graph align at the same HLC T.
 ```
 
-### Timeout behaviour
+### What `snapshot` does not wait for
 
-Under `snapshot` or `exact` the executor blocks on the shard's applied-watermark. If the applier is stuck (replication lag, network partition), the wait times out after `read_timeout` (default 2s) and the query returns an error naming the mode, the target `commit_ts`, and a retry/fallback hint. Callers that prefer latency over cross-modality alignment can retry with `/*+ read_consistency('current') */`.
+Under `snapshot` or `exact` the query never waits: `T` is below any commit still in flight, so a write acknowledged a moment ago can be outside it. A query that must see a particular write carries it as a causal bound (`ReadConcern.after_ts` / `after_position`, see [Causal reads](../guide/transactions#causal-reads)), or reads `linearizable`. A replicated member that has not yet learned which commits are complete (just joined or restarted) refuses these queries with `UNAVAILABLE`, reason `READ_NOT_READY`, rather than answering from an empty state; retry or read elsewhere.

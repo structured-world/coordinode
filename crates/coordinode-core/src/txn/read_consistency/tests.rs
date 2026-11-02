@@ -37,10 +37,10 @@ fn roundtrip_as_str_parse() {
 }
 
 #[test]
-fn requires_snapshot_wait_semantics() {
-    assert!(!ReadConsistencyMode::Current.requires_snapshot_wait());
-    assert!(ReadConsistencyMode::Snapshot.requires_snapshot_wait());
-    assert!(ReadConsistencyMode::Exact.requires_snapshot_wait());
+fn requires_aligned_view_semantics() {
+    assert!(!ReadConsistencyMode::Current.requires_aligned_view());
+    assert!(ReadConsistencyMode::Snapshot.requires_aligned_view());
+    assert!(ReadConsistencyMode::Exact.requires_aligned_view());
 }
 
 #[test]

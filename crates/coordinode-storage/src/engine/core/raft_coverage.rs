@@ -318,7 +318,7 @@ impl StorageEngine {
             let staged = self.applied_feed.stage(index, commit_ts, &kept);
             self.apply_proposal_covered(&kept, commit_ts, Some(mark))?;
             staged.publish();
-            self.note_raft_applied(commit_ts);
+            self.note_raft_applied(index, commit_ts);
             Ok(kept.len())
         } else {
             // Staged before the write lands: a reader that sees it is told
@@ -328,7 +328,7 @@ impl StorageEngine {
             #[cfg(test)]
             self.applied_feed.pause_after_write();
             staged.publish();
-            self.note_raft_applied(commit_ts);
+            self.note_raft_applied(index, commit_ts);
             Ok(mutations.len())
         }
     }

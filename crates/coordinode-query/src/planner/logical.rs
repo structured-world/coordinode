@@ -24,8 +24,8 @@ pub struct LogicalPlan {
     ///
     /// Set from an explicit `/*+ read_consistency('mode') */` hint or
     /// auto-promoted by the planner when the query touches >1 modality.
-    /// Drives `applied_watermark.wait_for(snapshot_ts, timeout)` at the
-    /// executor boundary when it is `Snapshot` or `Exact`.
+    /// When it is `Snapshot` or `Exact`, the caller reads at a timestamp
+    /// every commit below is applied at.
     pub read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode,
 }
 
