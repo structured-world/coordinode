@@ -1113,6 +1113,11 @@ pub struct WriteStats {
     /// a caller that wrote a record already holds the version to condition
     /// its next write on rather than having to read it back.
     pub commit_ts: Option<u64>,
+    /// The timestamp this statement's view was read at, inclusive: no commit
+    /// it saw is later. With `commit_ts` it is the statement's causal
+    /// receipt; a read's next causal statement is bounded below by it.
+    /// `None` when the caller that ran the statement did not record it.
+    pub read_ts: Option<u64>,
 }
 
 impl WriteStats {

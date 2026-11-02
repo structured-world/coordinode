@@ -621,6 +621,7 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
                 ReadFenceFailure::Role => wire::ReadFenceKind::Role,
                 ReadFenceFailure::Stale => wire::ReadFenceKind::Stale,
                 ReadFenceFailure::Timeout => wire::ReadFenceKind::Timeout,
+                ReadFenceFailure::NotReady => wire::ReadFenceKind::NotReady,
             }
             .into(),
             message: cut(message),
@@ -1002,6 +1003,7 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
                 Ok(wire::ReadFenceKind::Role) => ReadFenceFailure::Role,
                 Ok(wire::ReadFenceKind::Stale) => ReadFenceFailure::Stale,
                 Ok(wire::ReadFenceKind::Timeout) => ReadFenceFailure::Timeout,
+                Ok(wire::ReadFenceKind::NotReady) => ReadFenceFailure::NotReady,
                 _ => {
                     return Err(format!(
                         "a read fence failure {} this member does not know",

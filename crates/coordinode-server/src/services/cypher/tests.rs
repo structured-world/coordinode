@@ -722,8 +722,8 @@ async fn interactive_transaction_commit() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 4, // SNAPSHOT
-                after_index: 0,
                 at_timestamp,
+                ..Default::default()
             }),
             write_concern: None,
             ..Default::default()
@@ -1674,152 +1674,140 @@ fn timestamp_roundtrip_keeps_type_and_sign() {
 
 // --- Causal consistency tests ---
 
-/// after_index > 0 with readConcern=LOCAL is rejected with FailedPrecondition.
-///
-/// A LOCAL read offers no majority-commit guarantee; combining it with an
-/// afterClusterTime fence is logically unsound and hard-rejected by the server.
-#[tokio::test]
-async fn causal_after_index_with_local_concern_rejected() {
-    let (svc, _dir) = test_service();
-
-    let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
-            query: "MATCH (n) RETURN n".to_string(),
-            parameters: std::collections::HashMap::new(),
-            read_preference: 0,
-            read_concern: Some(crate::proto::replication::ReadConcern {
-                level: 1, // READ_CONCERN_LEVEL_LOCAL
-                after_index: 42,
-                at_timestamp: 0,
-            }),
-            write_concern: None,
+/// A request bounded below by `after_ts` / `after_position` at `level`.
+fn causal_request(
+    query: &str,
+    level: i32,
+    after_ts: u64,
+    after_position: Option<crate::proto::replication::HistoryPosition>,
+    wait_ms: u32,
+) -> Request<query::ExecuteCypherRequest> {
+    Request::new(query::ExecuteCypherRequest {
+        query: query.to_string(),
+        read_concern: Some(crate::proto::replication::ReadConcern {
+            level,
+            after_ts,
+            after_position,
+            wait_ms,
             ..Default::default()
-        }))
-        .await;
-
-    assert!(result.is_err(), "after_index + LOCAL should return error");
-    assert_eq!(
-        result.unwrap_err().code(),
-        tonic::Code::FailedPrecondition,
-        "should be FailedPrecondition"
-    );
+        }),
+        ..Default::default()
+    })
 }
 
-/// after_index > 0 with readConcern=LINEARIZABLE is rejected with FailedPrecondition.
-///
-/// LINEARIZABLE is incompatible with afterClusterTime per the consistency spec.
+/// A causal bound with readConcern=LOCAL or LINEARIZABLE is rejected with
+/// FailedPrecondition: LOCAL offers no majority guarantee to bound, and
+/// LINEARIZABLE already reads the latest committed state.
 #[tokio::test]
-async fn causal_after_index_with_linearizable_rejected() {
+async fn a_causal_bound_with_local_or_linearizable_is_rejected() {
     let (svc, _dir) = test_service();
-
-    let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
-            query: "MATCH (n) RETURN n".to_string(),
-            parameters: std::collections::HashMap::new(),
-            read_preference: 0,
-            read_concern: Some(crate::proto::replication::ReadConcern {
-                level: 3, // READ_CONCERN_LEVEL_LINEARIZABLE
-                after_index: 1,
-                at_timestamp: 0,
-            }),
-            write_concern: None,
-            ..Default::default()
-        }))
-        .await;
-
-    assert!(
-        result.is_err(),
-        "after_index + LINEARIZABLE should return error"
-    );
-    assert_eq!(
-        result.unwrap_err().code(),
-        tonic::Code::FailedPrecondition,
-        "should be FailedPrecondition"
-    );
+    for level in [1, 3] {
+        let status = svc
+            .execute_cypher(causal_request("MATCH (n) RETURN n", level, 42, None, 0))
+            .await
+            .expect_err("a causal bound needs MAJORITY or SNAPSHOT");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    }
 }
 
-/// after_index > 0 with readConcern=MAJORITY succeeds in standalone mode.
-///
-/// In standalone (no Raft), after_index is trivially satisfied because all
-/// writes are immediately visible. The fence is skipped; the query executes.
+/// Standalone: a bound the store's commits cover is met at once; a bound past
+/// anything its clock issued is refused as not ready (never answered from
+/// before it, and the clock is not moved to it); a log position is refused,
+/// a standalone store has no log history to count it in.
 #[tokio::test]
-async fn causal_after_index_with_majority_standalone_succeeds() {
+async fn a_standalone_causal_bound_is_met_refused_or_rejected() {
     let (svc, _dir) = test_service();
+    let written = svc
+        .execute_cypher(cypher_request("CREATE (n:Bound {v: 1})"))
+        .await
+        .expect("write")
+        .into_inner()
+        .stats
+        .and_then(|s| s.receipt)
+        .expect("receipt")
+        .operation_time;
 
-    // Even a large after_index is fine in standalone — no Raft means the
-    // fence block is never entered, so the read proceeds immediately.
-    let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
-            query: "MATCH (n) RETURN n".to_string(),
-            parameters: std::collections::HashMap::new(),
-            read_preference: 0,
-            read_concern: Some(crate::proto::replication::ReadConcern {
-                level: 2, // READ_CONCERN_LEVEL_MAJORITY
-                after_index: 999,
-                at_timestamp: 0,
-            }),
-            write_concern: None,
-            ..Default::default()
-        }))
-        .await;
+    svc.execute_cypher(causal_request(
+        "MATCH (n:Bound) RETURN n",
+        2,
+        written,
+        None,
+        0,
+    ))
+    .await
+    .expect("a bound the store's commits cover is met without waiting");
 
-    assert!(
-        result.is_ok(),
-        "after_index + MAJORITY in standalone should succeed, got: {:?}",
-        result.err()
-    );
+    let status = svc
+        .execute_cypher(causal_request(
+            "MATCH (n:Bound) RETURN n",
+            2,
+            u64::MAX - 1,
+            None,
+            50,
+        ))
+        .await
+        .expect_err("a bound past the store's clock");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert!(status.message().contains("not ready"), "{status:?}");
+
+    let position = crate::proto::replication::HistoryPosition {
+        history: Some(crate::proto::replication::HistoryId {
+            deployment: vec![1; 16],
+            group: 0,
+        }),
+        index: 1,
+    };
+    let status = svc
+        .execute_cypher(causal_request(
+            "MATCH (n:Bound) RETURN n",
+            2,
+            0,
+            Some(position),
+            0,
+        ))
+        .await
+        .expect_err("a standalone store has no log");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
 }
 
-/// Write followed by causal read: applied_index in stats is 0 (standalone).
-///
-/// Verifies the round-trip: write returns applied_index=0 in standalone mode,
-/// and a read with after_index=0 (= value from write response) succeeds.
-/// This is the simplest causal session: no fence needed in standalone.
+/// Write followed by causal read, standalone: the write's receipt is its
+/// commit time, never zero; a read bounded by it returns the write and a
+/// receipt no earlier, with no log position.
 #[tokio::test]
 async fn causal_write_read_roundtrip_standalone() {
     let (svc, _dir) = test_service();
 
-    // Write
-    let write_resp = svc
+    let receipt = svc
         .execute_cypher(cypher_request("CREATE (n:CausalTest {val: 1}) RETURN n"))
         .await
-        .expect("write should succeed");
-
-    let stats = write_resp
+        .expect("write should succeed")
         .into_inner()
         .stats
-        .expect("stats must be present");
-    let operation_time = stats.applied_index;
-    // In standalone mode, applied_index is always 0.
-    assert_eq!(operation_time, 0, "standalone applied_index must be 0");
+        .and_then(|s| s.receipt)
+        .expect("a write reports its receipt");
+    assert!(receipt.operation_time > 0, "{receipt:?}");
+    assert!(receipt.position.is_none(), "a standalone store has no log");
 
-    // Subsequent causal read with after_index = operation_time (= 0).
-    // after_index = 0 means no fence — trivially satisfied everywhere.
-    let read_result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
-            query: "MATCH (n:CausalTest) RETURN n.val".to_string(),
-            parameters: std::collections::HashMap::new(),
-            read_preference: 0,
-            read_concern: Some(crate::proto::replication::ReadConcern {
-                level: 2, // MAJORITY
-                after_index: operation_time,
-                at_timestamp: 0,
-            }),
-            write_concern: None,
-            ..Default::default()
-        }))
-        .await;
-
-    assert!(
-        read_result.is_ok(),
-        "causal read after write must succeed: {:?}",
-        read_result.err()
-    );
-    let body = read_result.unwrap().into_inner();
+    let body = svc
+        .execute_cypher(causal_request(
+            "MATCH (n:CausalTest) RETURN n.val",
+            2,
+            receipt.operation_time,
+            None,
+            0,
+        ))
+        .await
+        .expect("causal read after write")
+        .into_inner();
     assert_eq!(
         body.rows.len(),
         1,
         "causal read must return the written node"
+    );
+    let read = body.stats.and_then(|s| s.receipt).expect("read receipt");
+    assert!(
+        read.operation_time >= receipt.operation_time,
+        "a read bounded by a write reports a time no earlier: {read:?} < {receipt:?}"
     );
 }
 
@@ -1869,57 +1857,98 @@ async fn test_service_raft() -> (CypherServiceImpl, Arc<RaftNode>, tempfile::Tem
     (svc, node, dir)
 }
 
-/// operationTime regression (end-to-end): a write through a Raft-backed service
-/// returns ITS OWN committed Raft index as `operationTime`, not the
-/// node's current applied index sampled by the read fence. Successive
-/// writes report strictly increasing indices, and a causal read fencing
-/// on a write's reported index observes that write.
+/// Receipt regression (end-to-end): a write through a Raft-backed service
+/// reports ITS OWN commit time and log position, qualified by its history,
+/// not the index the read fence sampled. Successive writes report advancing
+/// times and positions, and a causal read bounded by either observes them.
 #[tokio::test(flavor = "multi_thread")]
-async fn raft_write_returns_own_committed_index() {
+async fn raft_write_returns_own_receipt() {
     let (svc, node, _dir) = test_service_raft().await;
 
-    let w1 = svc
-        .execute_cypher(cypher_request("CREATE (n:RaftCausal {v: 1}) RETURN n"))
-        .await
-        .expect("first write")
-        .into_inner();
-    let idx1 = w1.stats.expect("stats present").applied_index;
-    assert!(
-        idx1 > 0,
-        "Raft-backed write must return its committed index, got {idx1}"
+    let receipt = |body: query::ExecuteCypherResponse| {
+        body.stats
+            .and_then(|s| s.receipt)
+            .expect("a write reports its receipt")
+    };
+    let w1 = receipt(
+        svc.execute_cypher(cypher_request("CREATE (n:RaftCausal {v: 1}) RETURN n"))
+            .await
+            .expect("first write")
+            .into_inner(),
     );
-
-    let w2 = svc
-        .execute_cypher(cypher_request("CREATE (n:RaftCausal {v: 2}) RETURN n"))
-        .await
-        .expect("second write")
-        .into_inner();
-    let idx2 = w2.stats.expect("stats present").applied_index;
-    assert!(
-        idx2 > idx1,
-        "second write's operationTime must advance: {idx1} -> {idx2}"
+    let w2 = receipt(
+        svc.execute_cypher(cypher_request("CREATE (n:RaftCausal {v: 2}) RETURN n"))
+            .await
+            .expect("second write")
+            .into_inner(),
     );
+    let (p1, p2) = (
+        w1.position.clone().expect("its own entry"),
+        w2.position.clone().expect("its own entry"),
+    );
+    assert!(p1.index > 0, "{p1:?}");
+    assert!(p2.index > p1.index, "positions advance: {p1:?} -> {p2:?}");
+    assert!(
+        w2.operation_time > w1.operation_time,
+        "commit times advance: {w1:?} -> {w2:?}"
+    );
+    let history = p2.history.clone().expect("qualified by its history");
+    assert_eq!(history.deployment.len(), 16);
 
-    // A causal read fencing on the second write's own index sees both nodes.
-    let read = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
-            query: "MATCH (n:RaftCausal) RETURN n.v".to_string(),
-            parameters: std::collections::HashMap::new(),
-            read_preference: 0,
-            read_concern: Some(crate::proto::replication::ReadConcern {
-                level: 2, // MAJORITY
-                after_index: idx2,
-                at_timestamp: 0,
-            }),
-            write_concern: None,
-            ..Default::default()
-        }))
+    // Bounded by the second write's time, or by its position: both see both.
+    for (after_ts, after_position) in [(w2.operation_time, None), (0, Some(p2))] {
+        let read = svc
+            .execute_cypher(causal_request(
+                "MATCH (n:RaftCausal) RETURN n.v",
+                2,
+                after_ts,
+                after_position,
+                10_000,
+            ))
+            .await
+            .expect("causal read after write")
+            .into_inner();
+        assert_eq!(read.rows.len(), 2, "the causal read observes both writes");
+    }
+
+    // A position of another history is refused, never compared.
+    let foreign = crate::proto::replication::HistoryPosition {
+        history: Some(crate::proto::replication::HistoryId {
+            deployment: vec![0xEE; 16],
+            ..history
+        }),
+        index: 1,
+    };
+    let status = svc
+        .execute_cypher(causal_request(
+            "MATCH (n:RaftCausal) RETURN n.v",
+            2,
+            0,
+            Some(foreign),
+            0,
+        ))
         .await
-        .expect("causal read after write");
-    assert_eq!(
-        read.into_inner().rows.len(),
-        2,
-        "causal read fencing on the write index must observe both writes"
+        .expect_err("another history");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+
+    // A bound past every closed commit is refused as not ready, at once
+    // without a wait: the ordinary path never waits implicitly.
+    let started = std::time::Instant::now();
+    let status = svc
+        .execute_cypher(causal_request(
+            "MATCH (n:RaftCausal) RETURN n.v",
+            2,
+            u64::MAX - 1,
+            None,
+            0,
+        ))
+        .await
+        .expect_err("a bound never met");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "refused without waiting, took {:?}",
+        started.elapsed()
     );
 
     node.shutdown().await.expect("shutdown");
@@ -1961,24 +1990,11 @@ async fn an_unnamed_read_preference_takes_the_server_default() {
 }
 
 /// A request that names no read concern level takes the server's default:
-/// with `majority` configured, a causal read (after_index set, level left
+/// with `majority` configured, a causal read (after_ts set, level left
 /// unspecified) is accepted, where the built-in `local` refuses it.
 #[tokio::test]
 async fn an_unnamed_read_concern_takes_the_server_default() {
-    let causal = || {
-        Request::new(query::ExecuteCypherRequest {
-            query: "RETURN 1 AS one".to_string(),
-            parameters: std::collections::HashMap::new(),
-            read_preference: 0,
-            read_concern: Some(crate::proto::replication::ReadConcern {
-                level: 0, // unspecified
-                after_index: 1,
-                at_timestamp: 0,
-            }),
-            write_concern: None,
-            ..Default::default()
-        })
-    };
+    let causal = || causal_request("RETURN 1 AS one", 0, 1, None, 0);
 
     let (builtin, _dir) = test_service();
     let refused = builtin
@@ -2008,18 +2024,13 @@ async fn an_unnamed_write_concern_is_checked_as_the_database_default() {
     let (svc, _dir) = test_service();
     svc.database().write().set_write_concern(WriteConcern::w1());
     let refused = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
-            query: "CREATE (n:DefaultWc) RETURN n".to_string(),
-            parameters: std::collections::HashMap::new(),
-            read_preference: 0,
-            read_concern: Some(crate::proto::replication::ReadConcern {
-                level: 2, // MAJORITY
-                after_index: 1,
-                at_timestamp: 0,
-            }),
-            write_concern: None,
-            ..Default::default()
-        }))
+        .execute_cypher(causal_request(
+            "CREATE (n:DefaultWc) RETURN n",
+            2,
+            1,
+            None,
+            0,
+        ))
         .await
         .expect_err("a w:1 default is not causal-safe");
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
@@ -2038,8 +2049,7 @@ async fn an_unknown_level_or_preference_is_refused_not_downgraded() {
     let mut unknown_level = cypher_request("RETURN 1 AS one");
     unknown_level.get_mut().read_concern = Some(crate::proto::replication::ReadConcern {
         level: 99,
-        after_index: 0,
-        at_timestamp: 0,
+        ..Default::default()
     });
     let mut unknown_preference = cypher_request("RETURN 1 AS one");
     unknown_preference.get_mut().read_preference = 42;
@@ -2104,9 +2114,9 @@ async fn a_statement_names_its_vector_settings() {
     assert_eq!(violations[0].field, "vector_consistency");
 }
 
-/// after_index = 0 with any readConcern level is always valid (no fence).
+/// No causal bound is valid with any readConcern level.
 #[tokio::test]
-async fn causal_after_index_zero_always_valid() {
+async fn no_causal_bound_is_valid_with_any_level() {
     let (svc, _dir) = test_service();
 
     for level in [0u32, 1, 2, 4] {
@@ -2118,8 +2128,7 @@ async fn causal_after_index_zero_always_valid() {
                 read_preference: 0,
                 read_concern: Some(crate::proto::replication::ReadConcern {
                     level: level as i32,
-                    after_index: 0,
-                    at_timestamp: 0,
+                    ..Default::default()
                 }),
                 write_concern: None,
                 ..Default::default()
@@ -2127,7 +2136,7 @@ async fn causal_after_index_zero_always_valid() {
             .await;
         assert!(
             result.is_ok(),
-            "level={level} with after_index=0 should succeed, got: {:?}",
+            "level={level} with no causal bound should succeed, got: {:?}",
             result.err()
         );
     }
@@ -2136,9 +2145,9 @@ async fn causal_after_index_zero_always_valid() {
 // ── Write-concern validation in causal sessions ───────────────────────────
 
 /// A causal write that names no write concern is accepted: the default is
-/// majority, which is exactly what a causal session needs. `after_index > 0`
+/// majority, which is exactly what a causal session needs. A causal bound
 /// signals the causal session; only a write that explicitly asks for less than
-/// majority can leave a dangling applied index, and that case is rejected below.
+/// majority can leave a dangling receipt, and that case is rejected below.
 #[tokio::test]
 async fn causal_write_without_concern_uses_the_majority_default() {
     let (svc, _dir) = test_service();
@@ -2150,8 +2159,8 @@ async fn causal_write_without_concern_uses_the_majority_default() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 2, // MAJORITY
-                after_index: 1,
-                at_timestamp: 0,
+                after_ts: 1,
+                ..Default::default()
             }),
             write_concern: None, // omitted → the majority default
             ..Default::default()
@@ -2168,7 +2177,7 @@ async fn causal_write_without_concern_uses_the_majority_default() {
 /// Causal write with `w: 1` is rejected with FailedPrecondition.
 ///
 /// The leader alone is insufficient for causal sessions: the leader may
-/// crash before the write is replicated, making the applied_index a dangling
+/// crash before the write is replicated, making its receipt a dangling
 /// dependency that followers can never satisfy.
 #[tokio::test]
 async fn causal_write_with_w1_rejected() {
@@ -2181,8 +2190,8 @@ async fn causal_write_with_w1_rejected() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 2, // MAJORITY
-                after_index: 5,
-                at_timestamp: 0,
+                after_ts: 1,
+                ..Default::default()
             }),
             write_concern: Some(crate::proto::replication::WriteConcern {
                 w: Some(replication::write_concern::W::Acks(1)),
@@ -2216,8 +2225,8 @@ async fn causal_write_with_majority_accepted() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 2, // MAJORITY
-                after_index: 7,
-                at_timestamp: 0,
+                after_ts: 1,
+                ..Default::default()
             }),
             write_concern: Some(crate::proto::replication::WriteConcern {
                 w: Some(replication::write_concern::W::Mode(
@@ -2275,8 +2284,8 @@ async fn causal_gate_classifies_a_call_by_its_procedure_mode() {
         read_preference: 0,
         read_concern: Some(crate::proto::replication::ReadConcern {
             level: 2, // MAJORITY
-            after_index: 5,
-            at_timestamp: 0,
+            after_ts: 1,
+            ..Default::default()
         }),
         write_concern: Some(crate::proto::replication::WriteConcern {
             w: Some(replication::write_concern::W::Acks(1)),
@@ -2356,8 +2365,8 @@ async fn causal_read_without_write_concern_accepted() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 2, // MAJORITY
-                after_index: 10,
-                at_timestamp: 0,
+                after_ts: 1,
+                ..Default::default()
             }),
             write_concern: None, // read-only — write_concern irrelevant
             ..Default::default()
@@ -2534,8 +2543,8 @@ async fn grpc_at_timestamp_rejected_without_snapshot_level() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 2, // MAJORITY, not SNAPSHOT
-                after_index: 0,
                 at_timestamp: 1_700_000_000_000_000,
+                ..Default::default()
             }),
             write_concern: None,
             ..Default::default()
@@ -2574,8 +2583,8 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 4, // SNAPSHOT
-                after_index: 0,
                 at_timestamp: 1,
+                ..Default::default()
             }),
             write_concern: None,
             ..Default::default()
@@ -2606,8 +2615,8 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 4,
-                after_index: 0,
                 at_timestamp: ts,
+                ..Default::default()
             }),
             write_concern: None,
             ..Default::default()
@@ -2961,8 +2970,8 @@ async fn grpc_at_timestamp_max_sees_latest() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 4, // SNAPSHOT
-                after_index: 0,
                 at_timestamp: u64::MAX,
+                ..Default::default()
             }),
             write_concern: None,
             ..Default::default()
@@ -2988,9 +2997,9 @@ async fn grpc_snapshot_without_at_timestamp_returns_latest() {
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
-                level: 4, // SNAPSHOT
-                after_index: 0,
+                level: 4,        // SNAPSHOT
                 at_timestamp: 0, // no pin → latest
+                ..Default::default()
             }),
             write_concern: None,
             ..Default::default()
@@ -3032,9 +3041,9 @@ async fn grpc_write_concern_memory_accepted() {
 }
 
 /// A write answered before its commit (`j:memory` on a Raft-backed service)
-/// carries no causal index: it has none of its own yet, and the node's
-/// applied index sampled before it would name a position that does not
-/// cover it. `0` means "no token" to every client.
+/// carries no causal receipt: it has no entry of its own yet, may still be
+/// lost, and the node's applied index sampled before it would name a
+/// position that does not cover it. Operation time `0` is "no bound".
 #[tokio::test(flavor = "multi_thread")]
 async fn an_early_answered_write_carries_no_causal_index() {
     let (svc, node, _dir) = test_service_raft().await;
@@ -3056,20 +3065,21 @@ async fn an_early_answered_write_carries_no_causal_index() {
         .expect("memory write");
     let stats = resp.into_inner().stats.expect("stats");
     assert_eq!(stats.nodes_created, 1);
-    assert_eq!(
-        stats.applied_index, 0,
-        "an early answer named a causal index"
+    let receipt = stats.receipt.expect("a receipt, empty");
+    assert_eq!(receipt.operation_time, 0, "an early answer named a time");
+    assert!(
+        receipt.position.is_none(),
+        "an early answer named a position"
     );
     node.shutdown().await.expect("shutdown");
 }
 
-/// after_index + at_timestamp are mutually exclusive: a snapshot pin is
-/// incompatible with a causal fence. The executor's `ReadConcern::validate`
+/// A causal bound and at_timestamp are mutually exclusive: a snapshot pin is
+/// incompatible with a lower bound. The executor's `ReadConcern::validate`
 /// catches this, but the boundary should surface it as a semantic error
-/// (InvalidArgument) rather than letting the executor produce a generic
-/// internal error.
+/// rather than letting the executor produce a generic internal error.
 #[tokio::test]
-async fn grpc_after_index_and_at_timestamp_mutually_exclusive() {
+async fn grpc_causal_bound_and_at_timestamp_mutually_exclusive() {
     let (svc, _dir) = test_service();
     let result = svc
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
@@ -3078,8 +3088,9 @@ async fn grpc_after_index_and_at_timestamp_mutually_exclusive() {
             read_preference: 0,
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 4, // SNAPSHOT — only level where both fields are individually accepted
-                after_index: 42,
+                after_ts: 42,
                 at_timestamp: 1_700_000_000_000_000,
+                ..Default::default()
             }),
             write_concern: None,
             ..Default::default()
@@ -3087,8 +3098,7 @@ async fn grpc_after_index_and_at_timestamp_mutually_exclusive() {
         .await;
     let err = result.expect_err("must reject combination");
     assert!(
-        err.message().to_lowercase().contains("mutually exclusive")
-            || err.message().to_lowercase().contains("after_index"),
+        err.message().to_lowercase().contains("mutually exclusive"),
         "error must mention the conflict, got: {}",
         err.message()
     );

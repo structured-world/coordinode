@@ -18,7 +18,7 @@
 //! - `Local`: whatever the node has applied (always safe in Raft — followers
 //!   only apply committed entries)
 //! - `Majority`: same as Local in CE Raft (all applied data is majority-committed);
-//!   distinction matters with `after_index` (causal sessions)
+//!   a causal bound on top of it is established by [`ReadFence::await_causal`]
 //! - `Linearizable`: leader-only lease read — guarantees reading after all prior
 //!   commits. Adds ~1 heartbeat RTT
 //! - `Snapshot`: MVCC snapshot at current applied index (CE = same as Majority)
@@ -89,8 +89,8 @@ pub enum ReadConcern {
     #[default]
     Local,
     /// Return data acknowledged by majority. In CE Raft, this is equivalent to
-    /// `Local` (all applied data is already committed). Distinction matters when
-    /// the client provides an `after_index` for causal consistency.
+    /// `Local` (all applied data is already committed). A causal bound is the
+    /// read's own setting, checked by [`ReadFence::await_causal`].
     Majority,
     /// Strongest guarantee: node must be leader and confirm lease before reading.
     /// Returns data after all prior commits. Adds ~1 heartbeat RTT.
@@ -175,6 +175,40 @@ pub enum ReadFenceError {
     /// position) is refused.
     #[error("this member is read-only and cannot prove its reads current: {0}")]
     ReadOnly(coordinode_core::version::Mismatch),
+
+    /// The read's causal bound is not met here: not every commit at or below
+    /// `after_ts` is applied yet, or the log has not reached the read's
+    /// position. Refused at once unless the read asked to wait, and after
+    /// its wait otherwise; never answered at an earlier point.
+    #[error(
+        "this member is not ready for the read's causal bound: {missing}. \
+         Retry, read on another member, or allow the read to wait"
+    )]
+    NotReady {
+        /// What is missing, for the message.
+        missing: String,
+        /// Whether the read waited for it.
+        waited: bool,
+    },
+
+    /// The read's causal position counts entries of another history than
+    /// this member's (another deployment or group): it cannot be compared
+    /// with this member's log.
+    #[error(
+        "the read's causal position is in another history ({requested}) than this \
+         member's ({serving}); positions of different histories are not comparable"
+    )]
+    ForeignHistory {
+        /// The history the read's position names.
+        requested: String,
+        /// This member's history, or what is unknown about it.
+        serving: String,
+    },
+}
+
+/// A history in text: its deployment and group.
+fn history_text(history: &coordinode_core::txn::read_concern::HistoryId) -> String {
+    format!("deployment {} {}", history.deployment, history.group)
 }
 
 /// Per-request read fence handle.
@@ -210,6 +244,11 @@ pub struct ReadFence {
     /// This member's version view; a member that does not run its group's
     /// version serves only reads that need no proof of currency.
     version: Option<Arc<crate::cluster::version::VersionGate>>,
+    /// The store, whose closed bound tells which commits are all applied.
+    engine: Option<crate::engine_hold::EngineHold>,
+    /// The history this member's log belongs to; `None` before its
+    /// deployment is known.
+    history: Option<coordinode_core::txn::read_concern::HistoryId>,
 }
 
 impl ReadFence {
@@ -226,7 +265,34 @@ impl ReadFence {
             staleness_threshold: None,
             staleness_lag_override: None,
             version: None,
+            engine: None,
+            history: None,
         }
+    }
+
+    /// Judge causal bounds against `engine`'s closed bound and this member's
+    /// `history`.
+    pub(crate) fn with_causal_source(
+        mut self,
+        engine: crate::engine_hold::EngineHold,
+        history: Option<coordinode_core::txn::read_concern::HistoryId>,
+    ) -> Self {
+        self.engine = Some(engine);
+        self.history = history;
+        self
+    }
+
+    /// The last commit timestamp at or below which every commit is applied
+    /// here; `None` while nothing is known complete.
+    pub fn complete_through(&self) -> Option<u64> {
+        self.engine
+            .as_ref()
+            .and_then(|engine| engine.complete_cut())
+    }
+
+    /// This member's history, `None` before its deployment is known.
+    pub fn history(&self) -> Option<coordinode_core::txn::read_concern::HistoryId> {
+        self.history
     }
 
     /// Hold reads to what `gate` says this member may serve.
@@ -365,7 +431,7 @@ impl ReadFence {
             }
             ReadConcern::Majority => {
                 // In Raft, all applied entries on any node are already majority-committed.
-                // No blocking fence needed without an explicit `after_index`.
+                // No blocking fence: a causal bound is checked on its own.
                 // CE: equivalent to Local.
             }
             ReadConcern::Snapshot => {
@@ -402,51 +468,100 @@ impl ReadFence {
         self.apply(preference, concern, READ_FENCE_TIMEOUT).await
     }
 
-    /// Wait until the applied index reaches at least `target`.
+    /// Establish the read's causal bounds here: every commit at or below
+    /// `after_ts` applied (the store's closed bound past it, which a later
+    /// clock alone never gives), and the log applied through
+    /// `after_position`, which must count entries of this member's history.
     ///
-    /// Used by causal sessions: the client provides an `after_index`
-    /// from a prior write, and the follower waits before returning results.
-    pub async fn wait_for_index(
+    /// A bound not met is refused at once as not ready, unless `wait` asks
+    /// the read to wait for it: then it waits up to `wait` as entries apply,
+    /// and is refused the same way if it is still not met. It is never
+    /// answered at an earlier point.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadFenceError::ForeignHistory`] for a position of another history,
+    /// [`ReadFenceError::NotReady`] for a bound not met (after the wait),
+    /// [`ReadFenceError::ReadOnly`] on a member that receives nothing.
+    pub async fn await_causal(
         &mut self,
-        target: u64,
-        timeout: Duration,
+        after_ts: Option<u64>,
+        after_position: Option<coordinode_core::txn::read_concern::HistoryPosition>,
+        wait: Option<Duration>,
     ) -> Result<(), ReadFenceError> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        if let Some(position) = after_position
+            && self.history != Some(position.history)
+        {
+            return Err(ReadFenceError::ForeignHistory {
+                requested: history_text(&position.history),
+                serving: self
+                    .history
+                    .as_ref()
+                    .map_or_else(|| "not yet known".to_owned(), history_text),
+            });
+        }
+        let deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
         loop {
-            let current = *self.applied_rx.borrow();
-            if current >= target {
+            let Some(missing) = self.causal_gap(after_ts, after_position) else {
                 return Ok(());
-            }
-            // A read-only member receives nothing, so a later position never
-            // arrives: refuse by name instead of waiting out the timeout.
+            };
+            // A read-only member receives nothing, so a later point never
+            // arrives: refuse by name instead of waiting out the bound.
             if let Some(m) = self.read_only() {
                 metrics::counter!("coordinode_version_refused_reads_total").increment(1);
                 return Err(ReadFenceError::ReadOnly(m));
             }
-            let changed = tokio::time::timeout_at(deadline, self.applied_rx.changed()).await;
-            match changed {
-                Ok(Ok(())) => continue,
-                Ok(Err(_)) => {
-                    // Sender dropped — state machine shut down.
-                    return Err(ReadFenceError::Timeout {
-                        target,
-                        current: *self.applied_rx.borrow(),
-                    });
-                }
-                Err(_) => {
-                    return Err(ReadFenceError::Timeout {
-                        target,
-                        current: *self.applied_rx.borrow(),
+            let Some(deadline) = deadline else {
+                return Err(ReadFenceError::NotReady {
+                    missing,
+                    waited: false,
+                });
+            };
+            // A closed state machine applies nothing more, like a passed
+            // deadline.
+            match tokio::time::timeout_at(deadline, self.applied_rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    return Err(ReadFenceError::NotReady {
+                        missing,
+                        waited: true,
                     });
                 }
             }
         }
     }
 
-    /// Return the current applied log index on this node.
-    ///
-    /// Include in query responses as `QueryStats.applied_index` so clients
-    /// can use it for causal reads (`after_index`).
+    /// What of the causal bounds is not met here, `None` when both are.
+    fn causal_gap(
+        &self,
+        after_ts: Option<u64>,
+        after_position: Option<coordinode_core::txn::read_concern::HistoryPosition>,
+    ) -> Option<String> {
+        if let Some(ts) = after_ts {
+            let complete = self.complete_through();
+            if complete.is_none_or(|through| through < ts) {
+                return Some(match complete {
+                    Some(through) => format!(
+                        "commits at or below {ts} are not all applied (complete through {through})"
+                    ),
+                    None => format!("commits at or below {ts} are not known to be applied"),
+                });
+            }
+        }
+        if let Some(position) = after_position {
+            let applied = *self.applied_rx.borrow();
+            if applied < position.index {
+                return Some(format!(
+                    "the log is applied through {applied}, the read needs {}",
+                    position.index
+                ));
+            }
+        }
+        None
+    }
+
+    /// Return the current applied log index on this node, a position in
+    /// [`Self::history`].
     pub fn applied_index(&self) -> u64 {
         *self.applied_rx.borrow()
     }

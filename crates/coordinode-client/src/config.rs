@@ -23,6 +23,10 @@ pub struct ClientConfig {
 
     /// How statements reach the server.
     pub(crate) transport: Transport,
+
+    /// How long a causal read may wait on the serving member for its bound;
+    /// `None` refuses a read whose bound is not met yet at once.
+    pub(crate) causal_wait: Option<std::time::Duration>,
 }
 
 /// How the client carries statements to the server.
@@ -68,6 +72,7 @@ pub struct CoordinodeClientBuilder {
     pub(crate) app_name: String,
     pub(crate) app_version: String,
     pub(crate) transport: Transport,
+    pub(crate) causal_wait: Option<std::time::Duration>,
 }
 
 impl CoordinodeClientBuilder {
@@ -79,7 +84,19 @@ impl CoordinodeClientBuilder {
             app_name: String::new(),
             app_version: String::new(),
             transport: Transport::default(),
+            causal_wait: None,
         }
+    }
+
+    /// Let a causal read wait up to `wait` on the serving member for a bound
+    /// it does not meet yet, for example a follower still applying the write
+    /// the read depends on. Without it such a read is refused at once with
+    /// `UNAVAILABLE`, reason `READ_NOT_READY`, and the caller decides whether
+    /// to retry; with it the same refusal comes once the wait runs out. The
+    /// read is never answered from before its bound.
+    pub fn causal_wait(mut self, wait: std::time::Duration) -> Self {
+        self.causal_wait = Some(wait);
+        self
     }
 
     /// Choose how statements reach the server: over the persistent session
@@ -123,6 +140,7 @@ impl CoordinodeClientBuilder {
             app_name: self.app_name,
             app_version: self.app_version,
             transport: self.transport,
+            causal_wait: self.causal_wait,
         };
         super::CoordinodeClient::connect_with_config(config).await
     }

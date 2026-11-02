@@ -377,6 +377,7 @@ impl Database {
         let session = QuerySession {
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
             snapshot_read_ts: None,
+            causal: super::CausalBound::default(),
             write_concern: coordinode_core::txn::write_concern::WriteConcern::default(),
             // A trigger body follows its own query's consistency, not a session,
             // and waits for an index under the database's bound.

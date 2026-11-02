@@ -148,6 +148,10 @@ pub struct StorageEngine {
     /// below it is in an entry applied on this node. `0` while no entry
     /// carrying one has applied. Mirrors [`CLOSURE_KEY`].
     closure_frontier: AtomicU64,
+    /// The highest commit timestamp of a Raft entry applied here since the
+    /// store opened; `0` before any. Every such commit is in the log, so a
+    /// closed bound reaches it once the leader covers it.
+    raft_applied_ts: AtomicU64,
     /// How long a snapshot waits for those commits before stepping behind
     /// them. Runtime-settable: it trades read latency against freshness, and
     /// which side a deployment wants is not known at compile time.
@@ -1503,6 +1507,7 @@ impl StorageEngine {
             field_dictionary_epoch: AtomicU64::new(0),
             pending_commits,
             closure_frontier: AtomicU64::new(0),
+            raft_applied_ts: AtomicU64::new(0),
             snapshot_wait: std::sync::atomic::AtomicU64::new(config.snapshot_wait_ms),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
@@ -5703,6 +5708,30 @@ impl StorageEngine {
         if below > previous {
             self.applied_feed.closed(index, below - 1);
         }
+    }
+
+    /// The latest commit a read here can have seen that a member applying
+    /// the same log can also be brought to see: on a Raft store, the larger
+    /// of the complete cut and the highest commit applied here, which the
+    /// leader's closed bound covers once it is handed out; `None` for a
+    /// store without Raft, whose own clock bounds every commit it holds.
+    ///
+    /// A read's causal receipt stops here rather than at its snapshot
+    /// timestamp: a snapshot taken from the clock can be later than any
+    /// commit, and an idle group never closes a bound up to it, so a later
+    /// read bounded by it would never be ready.
+    pub fn observed_commit_ceiling(&self) -> Option<u64> {
+        self.raft_fence()?;
+        let applied = self
+            .raft_applied_ts
+            .load(std::sync::atomic::Ordering::Acquire);
+        Some(self.complete_cut().map_or(applied, |cut| cut.max(applied)))
+    }
+
+    /// Record that a Raft entry carrying `commit_ts` applied here.
+    pub(crate) fn note_raft_applied(&self, commit_ts: u64) {
+        self.raft_applied_ts
+            .fetch_max(commit_ts, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Read the closed bound from its stored record: when the store opens

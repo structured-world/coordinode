@@ -85,7 +85,28 @@ let receipt = db.commit_transaction(tx)?;
 
 **Idle timeout and its outcome.** A transaction nobody sends a command to for `interactive_txn_idle_timeout_secs` (default 30 s) ends with the session's timeout outcome. `ROLLBACK`, the default, discards it (`end = IDLE_EXPIRED`). `COMMIT` commits what it holds, for a client that would rather keep the work done so far than lose it to a stall; such a transaction must name its operation reference at `Begin` (`Begin.operation`), so that a client which never heard the commit can resolve it, and a start without one is refused with `INVALID_ARGUMENT`, `reason = OPERATION_REQUIRED`, before the statement carrying it runs. A commit the client sends later under another reference is refused with `OPERATION_DIFFERS`. The transaction ends once that commit's result is known; a command arriving meanwhile waits for it and is then told how it ended. A command reaching a transaction committed on timeout is refused with `FAILED_PRECONDITION`, `reason = TRANSACTION_COMMITTED_ON_TIMEOUT`, and `ResolveOperation` reports its commit timestamp. One whose commit was refused (a conflict, for example) applied nothing and is refused with `TRANSACTION_ABORTED`, `end = IDLE_COMMIT_REFUSED`. A commit answered before it was applied, as a write concern of `acks: 0` or `acks: 1` answers, has not proved it committed either. One whose commit failed, or was answered without proving it applied, is refused with `FAILED_PRECONDITION`, `reason = TRANSACTION_OUTCOME_UNKNOWN`: resolve its operation (with `exclude = true` for a final answer) rather than running it again. The same holds when the leader changes while that commit is in flight: later commands are refused with `UNKNOWN_TRANSACTION`, and the operation, not that answer, says whether the commit applied. A transaction a statement error has aborted is never committed on timeout. The server-wide default is `interactive_txn_timeout_outcome`; a session sets its own with `Configure.timeout_outcome`, and the embedded API with `TransactionOptions::timeout_outcome` or `Database::set_interactive_timeout_outcome`. An ID naming nothing open on the leader, or a transaction of another caller, is refused with `NOT_FOUND`, `reason = UNKNOWN_TRANSACTION`. `SHOW TRANSACTIONS` lists the transactions a member holds, with the session attached to each or none when no stream is, the timeout outcome and the time left before the timeout (`expires_in_ms`).
 
-On the session stream the same receipt is `Committed { applied_index, commit_ts }`. Pass `commit_ts` as `ReadConcern.at_timestamp` (level `SNAPSHOT`) to read exactly the state this commit produced.
+On the session stream the same receipt is `Committed { commit_ts, position }`: `position` is where the commit's entry is in its group's log, qualified by the deployment and group it counts entries of, and absent outside a replicated group. Pass `commit_ts` as `ReadConcern.at_timestamp` (level `SNAPSHOT`) to read exactly the state this commit produced, or as `ReadConcern.after_ts` to read at or after it (see [Causal reads](#causal-reads)).
+
+## Causal Reads
+
+Every statement answers with a causal receipt (`QueryStats.receipt`): its `operation_time` is a write's own commit timestamp, or the timestamp a read's view was taken at, and a write in a replicated group also names its entry's `position`. A client that keeps the largest `operation_time` it has received, from writes and reads alike, and passes it as `ReadConcern.after_ts` on its next read gets read-your-writes and monotonic reads, on the leader or on a follower:
+
+```python
+w = client.execute_cypher(query="CREATE (n:Order {id: 1})")
+token = w.stats.receipt.operation_time
+r = client.execute_cypher(
+    query="MATCH (n:Order) RETURN n",
+    read_preference=ReadPreference.SECONDARY,
+    read_concern=ReadConcern(level=ReadConcernLevel.MAJORITY, after_ts=token, wait_ms=500),
+)
+token = max(token, r.stats.receipt.operation_time)
+```
+
+A member serves the read only where every commit at or below `after_ts` is applied; a later clock on that member is not enough, so a follower that has not applied a write the session depends on does not answer from before it. `after_position` bounds the read by a log position instead; it must name the serving member's own history, and a position of another deployment or group, or one sent to a standalone server, is refused with `FAILED_PRECONDITION`.
+
+Waiting is opt-in. A bound the member does not meet yet is refused at once with `UNAVAILABLE`, `reason = READ_NOT_READY`, so the client retries, reads elsewhere, or allows a wait: `wait_ms` lets the member wait up to that long for the bound, and the same refusal comes once it runs out. The read is never answered from before its bound. Ordinary reads with no bound are never held back by writes still in flight.
+
+Constraints: a causal bound needs level `MAJORITY` or `SNAPSHOT` (`LOCAL` and `LINEARIZABLE` are refused with `FAILED_PRECONDITION`), excludes `at_timestamp`, and a write carrying one must be majority-journaled: a write answered earlier may still be lost and reports `operation_time = 0`, no dependency. The Rust client's `execute_causal_write` and `execute_causal_read` carry the token, and `CoordinodeClientBuilder::causal_wait` sets the wait; the embedded API takes the same bounds in `ReadConcern { after_ts, after_position, wait }` and reports a read's timestamp in `WriteStats::read_ts`.
 
 ## Time-Travel Queries
 
@@ -115,7 +136,7 @@ client.execute_cypher(
 Constraints:
 
 - `at_timestamp` is only valid with `level = SNAPSHOT`. Combining it with `MAJORITY` / `LOCAL` / `LINEARIZABLE` returns `FAILED_PRECONDITION`.
-- `at_timestamp` and `after_index` are mutually exclusive — pinning to a specific HLC and waiting for a Raft index are contradictory. The server returns `InvalidArgument` if both are non-zero.
+- `at_timestamp` and a causal bound (`after_ts`, `after_position`) are mutually exclusive: a pin names one exact time, a bound accepts any eligible time after it.
 - Reads older than the MVCC retention horizon return `OUT_OF_RANGE` with `ErrorInfo.reason = OUTSIDE_RETENTION` and `oldest_readable_ts` in the metadata: the earliest timestamp the same read succeeds at. The horizon is `now - retention_window_secs` (default five minutes), held further back only while a live snapshot pin still needs older history. The refusal is deliberate: history below the horizon may already be collected, and a read there could otherwise answer with a newer version or nothing. The same applies to `AS OF TIMESTAMP` in Cypher, with one exception: a Cypher read whose every node is of a `TEMPORAL` type is answered past the horizon from the history those types keep (see `AS OF TIMESTAMP` in the Cypher extensions); a store missing history it should hold refuses it with `FAILED_PRECONDITION`, reason `HISTORY_UNCOVERED` (`DatabaseError::HistoryUncovered` in the embedded API).
 
 Typical use: auditing, debugging, time-aligned analytics across multiple queries that must observe the same database state.

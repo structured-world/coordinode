@@ -51,17 +51,30 @@ fn an_unservable_combination_is_refused_before_it_runs() {
     let (admitter, _dir) = standalone(AdmissionDefaults::default());
     let causal = |level| Requested {
         read_concern: Some(level),
-        after_index: 1,
+        after_ts: 1,
+        ..Requested::default()
+    };
+    let by_position = |level| Requested {
+        read_concern: Some(level),
+        after_position: Some(coordinode_core::txn::read_concern::HistoryPosition {
+            history: coordinode_core::txn::read_concern::HistoryId {
+                deployment: coordinode_core::group::DeploymentId([1; 16]),
+                group: coordinode_core::group::GroupId(0),
+            },
+            index: 1,
+        }),
         ..Requested::default()
     };
     for level in [ReadConcernLevel::Local, ReadConcernLevel::Linearizable] {
-        let refused = admitter
-            .check("RETURN 1", &causal(level))
-            .expect_err("a causal read needs MAJORITY or SNAPSHOT");
-        assert!(
-            matches!(refused, DatabaseError::SettingsRefused(_)),
-            "{refused:?}"
-        );
+        for requested in [causal(level), by_position(level)] {
+            let refused = admitter
+                .check("RETURN 1", &requested)
+                .expect_err("a causal read needs MAJORITY or SNAPSHOT");
+            assert!(
+                matches!(refused, DatabaseError::SettingsRefused(_)),
+                "{refused:?}"
+            );
+        }
     }
 
     let lossy_write = Requested {
@@ -156,6 +169,7 @@ async fn a_standalone_member_runs_everything_here() {
     {
         Admission::Run(admitted) => {
             assert_eq!(admitted.applied_index, 0);
+            assert_eq!(admitted.history, None, "a standalone member has no log");
             assert!(!admitted.served_by_leader);
         }
         Admission::Forward(leader) => panic!("a standalone member forwarded to {leader}"),

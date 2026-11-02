@@ -8,6 +8,7 @@ fn make_config(tracking: bool) -> ClientConfig {
         app_name: "test-app".into(),
         app_version: "v1.0.0".into(),
         transport: crate::Transport::default(),
+        causal_wait: None,
     }
 }
 
@@ -42,6 +43,7 @@ fn skips_empty_app_fields() {
         app_name: String::new(),
         app_version: String::new(),
         transport: crate::Transport::default(),
+        causal_wait: None,
     };
 
     inject_grpc_metadata(&mut meta, loc, &config);

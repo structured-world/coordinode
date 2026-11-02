@@ -644,6 +644,9 @@ struct QuerySession {
     /// taken out of `Database.snapshot_read_ts` when the session
     /// was captured).
     snapshot_read_ts: Option<u64>,
+    /// The statement's causal bounds, which its read must meet: refused as
+    /// not ready otherwise, after a wait only when one is set.
+    causal: CausalBound,
     write_concern: coordinode_core::txn::write_concern::WriteConcern,
     /// The session's vector consistency, when it set one.
     vector_consistency: Option<VectorConsistencyMode>,
@@ -662,6 +665,36 @@ struct QuerySession {
         crate::operation::OperationId,
         crate::operation::IntentDigest,
     )>,
+}
+
+/// A statement's causal bounds: what of a read concern its read must meet.
+#[derive(Debug, Clone, Copy, Default)]
+struct CausalBound {
+    /// Every commit at or below this timestamp must be in the read's view.
+    after_ts: Option<u64>,
+    /// The log entry the read's member must have applied.
+    after_position: Option<coordinode_core::txn::read_concern::HistoryPosition>,
+    /// How long the read may wait for a bound not met yet.
+    wait: Option<Duration>,
+}
+
+impl QuerySession {
+    /// Take the level, the snapshot pin and the causal bounds of `rc`.
+    fn apply_read_concern(
+        &mut self,
+        rc: &coordinode_core::txn::read_concern::ReadConcern,
+    ) -> Result<(), DatabaseError> {
+        rc.validate()
+            .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
+        self.read_concern = rc.level;
+        self.snapshot_read_ts = rc.at_timestamp;
+        self.causal = CausalBound {
+            after_ts: rc.after_ts,
+            after_position: rc.after_position,
+            wait: rc.wait,
+        };
+        Ok(())
+    }
 }
 
 /// Nanoseconds on the process's monotonic clock: the clock statement
@@ -1569,6 +1602,7 @@ impl Database {
         QuerySession {
             read_concern: self.read_concern,
             snapshot_read_ts: self.snapshot_read_ts.take(),
+            causal: CausalBound::default(),
             write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
             vector_build_wait: self.vector_build_wait,
@@ -1777,10 +1811,7 @@ impl Database {
         }
         let mut session = self.capture_session();
         if let Some(ref rc) = read_concern {
-            rc.validate()
-                .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
-            session.read_concern = rc.level;
-            session.snapshot_read_ts = rc.at_timestamp;
+            session.apply_read_concern(rc)?;
         }
         if let Some(wc) = write_concern {
             session.write_concern = wc;
@@ -1806,6 +1837,45 @@ impl Database {
     /// A read concern that must not see a write a crash can still take back
     /// (`majority`, `snapshot`, `linearizable`) reads the durable view below
     /// it: chosen from what is in memory, with no sync and no wait.
+    /// Check what of a statement's causal bounds this store judges before its
+    /// read, and the timestamp bound its view must meet.
+    ///
+    /// A replicated member's read fence has already established both bounds
+    /// against the applied log and the closed bound, waiting only when the
+    /// read allowed it. A standalone store has no log, so a position cannot
+    /// name its history; its timestamp bound is met once no commit at or
+    /// below it is in flight, which a read that allows a wait waits for here.
+    /// The clock is not advanced to the bound: a bound this store's clock has
+    /// not reached was not issued here, and moving the clock would not apply
+    /// what was committed under another.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::SettingsRefused`] for a position on a standalone store.
+    fn prepare_causal_read(&self, causal: &CausalBound) -> Result<Option<u64>, DatabaseError> {
+        let replicated = self.engine.raft_fence().is_some();
+        if causal.after_position.is_some() && !replicated {
+            return Err(DatabaseError::SettingsRefused(
+                "a causal position counts entries of a consensus history, and this database \
+                 runs without one: bound the read by the receipt's operation time instead"
+                    .to_owned(),
+            ));
+        }
+        let Some(bound) = causal.after_ts else {
+            return Ok(None);
+        };
+        if !replicated
+            && let Some(wait) = causal.wait
+            && let Err(blocking) = self.engine.pending_commits().await_complete_at(bound, wait)
+        {
+            return Err(DatabaseError::ReadNotReady {
+                requested: bound,
+                ready_through: blocking.checked_sub(1),
+            });
+        }
+        Ok(Some(bound))
+    }
+
     fn fresh_pinned_read_ts(
         &self,
         hold: &mut Option<coordinode_storage::engine::coordinator::SnapshotPin>,
@@ -2236,6 +2306,7 @@ impl Database {
         let mut session = QuerySession {
             read_concern: self.read_concern,
             snapshot_read_ts: None,
+            causal: CausalBound::default(),
             write_concern: self.write_concern,
             vector_consistency: options.vector_consistency.or(self.vector_consistency),
             vector_build_wait: options.vector_build_wait.unwrap_or(self.vector_build_wait),
@@ -2244,10 +2315,7 @@ impl Database {
             operation: None,
         };
         if let Some(rc) = &options.read_concern {
-            rc.validate()
-                .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
-            session.read_concern = rc.level;
-            session.snapshot_read_ts = rc.at_timestamp;
+            session.apply_read_concern(rc)?;
         }
         if let Some(wc) = options.write_concern {
             session.write_concern = wc;
@@ -2315,6 +2383,7 @@ impl Database {
         let session = QuerySession {
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Snapshot,
             snapshot_read_ts: Some(pinned),
+            causal: CausalBound::default(),
             write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
             vector_build_wait: self.vector_build_wait,
@@ -2442,8 +2511,7 @@ impl Database {
         }
 
         let mut session = self.capture_session();
-        session.read_concern = read_concern.level;
-        session.snapshot_read_ts = read_concern.at_timestamp;
+        session.apply_read_concern(&read_concern)?;
 
         self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit, &mut None)
             .map(|(r, _, _)| r)
@@ -2564,6 +2632,7 @@ impl Database {
             && session.snapshot_read_ts.is_none()
             && scan_paging.is_none();
         let interactive = matches!(txn_mode, TxnMode::Interactive(_));
+        let causal_after_ts = self.prepare_causal_read(&session.causal)?;
         let mut txn_mode = Some(txn_mode);
         let mut attempt_once = |txn_mode: TxnMode| -> Result<
             (
@@ -2653,6 +2722,23 @@ impl Database {
                     self.fresh_pinned_read_ts(&mut retention_pin, session.read_concern.is_durable())
                 }
             };
+            // The view's inclusive timestamp. A causal bound above it is not
+            // met here: the read is refused rather than answered from before
+            // the bound.
+            let view_through = read_ts.as_raw().checked_sub(1);
+            if let Some(bound) = causal_after_ts
+                && view_through.is_none_or(|through| through < bound)
+            {
+                return Err(DatabaseError::ReadNotReady {
+                    requested: bound,
+                    ready_through: view_through,
+                });
+            }
+            // The receipt: no commit the view holds is later than this, and
+            // nothing later than a member applying the same log can be
+            // brought to, so it can meet it as a later read's bound.
+            let ceiling = self.engine.observed_commit_ceiling();
+            let observed = view_through.map(|through| ceiling.map_or(through, |c| through.min(c)));
             let _retention_pin = retention_pin.take();
             // Build the transaction up front: a fresh one for auto-commit, or
             // the resumed parked state for an interactive statement. `interactive`
@@ -2797,7 +2883,8 @@ impl Database {
             };
             let duration_us = start.elapsed().as_micros() as u64;
 
-            let write_stats = ctx.write_stats.clone();
+            let mut write_stats = ctx.write_stats.clone();
+            write_stats.read_ts = observed;
             // Hand the executor-updated keyset state (last_key + exhausted) back to
             // the caller through the in/out channel. `None` stays `None` for a
             // non-paged execution; the cursor path reads this to build the next

@@ -1,4 +1,5 @@
 pub mod blob;
+pub(crate) mod causal;
 pub mod cdc;
 pub mod cluster;
 pub mod cypher;

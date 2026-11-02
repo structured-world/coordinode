@@ -104,8 +104,7 @@ async fn local_seqs(port: u16) -> Result<BTreeSet<i64>, String> {
             read_preference: 5, // NEAREST: answered where the request lands
             read_concern: Some(ReadConcern {
                 level: 1, // LOCAL
-                after_index: 0,
-                at_timestamp: 0,
+                ..Default::default()
             }),
             write_concern: None,
             ..Default::default()

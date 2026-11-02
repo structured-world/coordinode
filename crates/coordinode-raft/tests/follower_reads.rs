@@ -9,8 +9,9 @@
 //! - `ReadConcern::Linearizable` passes on leader
 //! - `ReadConcern::Linearizable` fails on follower (`LinearizableRequiresLeader`)
 //! - `staleness_entries()` returns 0 on a caught-up single node
-//! - `wait_for_index()` returns immediately when target <= applied_index
-//! - `wait_for_index()` times out when target > applied_index (no further writes)
+//! - `await_causal()` meets an applied position at once, refuses one not
+//!   applied as not ready (at once, or after an explicit wait), refuses a
+//!   position of another history, and refuses a timestamp past the closed bound
 //! - `applied_index()` returns 0 on fresh node, advances after commit
 //! - `from_proto()` round-trips for ReadPreference and ReadConcern
 
@@ -20,6 +21,7 @@ use std::time::Duration;
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
+use coordinode_core::txn::read_concern::{HistoryId, HistoryPosition};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_raft::read_fence::{
@@ -424,11 +426,11 @@ async fn applied_index_advances_after_commit() {
     drop(engine_ref); // suppress unused
 }
 
-// ── wait_for_index ─────────────────────────────────────────────────────────────
+// ── causal bounds ─────────────────────────────────────────────────────────────
 
-/// wait_for_index returns immediately when target <= current applied.
+/// A position this member's history already applied is met at once.
 #[tokio::test(flavor = "multi_thread")]
-async fn wait_for_index_immediate_when_caught_up() {
+async fn a_causal_position_already_applied_is_met_at_once() {
     let (_dir, node) = bootstrap_leader().await;
 
     // Apply one entry so applied_index >= 1.
@@ -447,33 +449,109 @@ async fn wait_for_index_immediate_when_caught_up() {
     node.pipeline()
         .propose_and_wait(&proposal)
         .expect("propose");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let current_applied = node.read_fence().applied_index();
-    assert!(current_applied >= 1, "need at least one applied entry");
 
     let mut fence = node.read_fence();
+    let history = fence.history().expect("a formed group knows its history");
+    let current_applied = fence.applied_index();
+    assert!(current_applied >= 1, "need at least one applied entry");
+    let position = HistoryPosition {
+        history,
+        index: current_applied,
+    };
     fence
-        .wait_for_index(current_applied, Duration::from_millis(500))
+        .await_causal(None, Some(position), None)
         .await
-        .expect("wait_for_index for already-applied index should succeed immediately");
+        .expect("an applied position is met without waiting");
 }
 
-/// wait_for_index times out when target > current applied with no new writes.
+/// A position beyond what is applied is refused at once as not ready when the
+/// read did not ask to wait, and after the wait when it did: never served
+/// short of it, never a plain timeout.
 #[tokio::test(flavor = "multi_thread")]
-async fn wait_for_index_times_out() {
+async fn a_causal_position_not_applied_is_refused_without_or_after_a_wait() {
     let (_dir, node) = bootstrap_leader().await;
-    let applied = node.read_fence().applied_index();
+    let mut fence = node.read_fence();
+    let position = HistoryPosition {
+        history: fence.history().expect("history"),
+        index: fence.applied_index() + 10_000,
+    };
 
+    let started = std::time::Instant::now();
+    let err = fence
+        .await_causal(None, Some(position), None)
+        .await
+        .expect_err("not applied");
+    assert!(
+        matches!(err, ReadFenceError::NotReady { waited: false, .. }),
+        "refused at once as not ready, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "no wait was asked for, yet it took {:?}",
+        started.elapsed()
+    );
+
+    let err = fence
+        .await_causal(None, Some(position), Some(Duration::from_millis(200)))
+        .await
+        .expect_err("still not applied after the wait");
+    assert!(
+        matches!(err, ReadFenceError::NotReady { waited: true, .. }),
+        "refused as not ready after the wait, got {err:?}"
+    );
+}
+
+/// A position counted in another history (another deployment or group) is
+/// refused: positions of different histories are not comparable, however
+/// small the index.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_causal_position_of_another_history_is_refused() {
+    let (_dir, node) = bootstrap_leader().await;
+    let mut fence = node.read_fence();
+    let ours = fence.history().expect("history");
+    for history in [
+        HistoryId {
+            deployment: coordinode_core::group::DeploymentId([0xAB; 16]),
+            ..ours
+        },
+        HistoryId {
+            group: coordinode_core::group::GroupId(ours.group.raw() + 1),
+            ..ours
+        },
+    ] {
+        let err = fence
+            .await_causal(None, Some(HistoryPosition { history, index: 0 }), None)
+            .await
+            .expect_err("another history");
+        assert!(
+            matches!(err, ReadFenceError::ForeignHistory { .. }),
+            "refused as another history, got {err:?}"
+        );
+    }
+}
+
+/// A causal timestamp no closed bound here covers is refused as not ready, at
+/// once without a wait and after a bounded one with it, never answered short
+/// of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_causal_timestamp_past_the_closed_bound_is_not_ready() {
+    let (_dir, node) = bootstrap_leader().await;
     let mut fence = node.read_fence();
     let err = fence
-        .wait_for_index(applied + 10_000, Duration::from_millis(200))
+        .await_causal(Some(u64::MAX), None, None)
         .await
-        .expect_err("should timeout when target is far ahead");
-
+        .expect_err("past every commit applied here");
     assert!(
-        matches!(err, ReadFenceError::Timeout { .. }),
-        "expected Timeout, got {err:?}"
+        matches!(err, ReadFenceError::NotReady { waited: false, .. }),
+        "refused as not ready, got {err:?}"
+    );
+    let err = fence
+        .await_causal(Some(u64::MAX), None, Some(Duration::from_millis(200)))
+        .await
+        .expect_err("still past it after the wait");
+    assert!(
+        matches!(err, ReadFenceError::NotReady { waited: true, .. }),
+        "refused as not ready after the wait, got {err:?}"
     );
 }
 

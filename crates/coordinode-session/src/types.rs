@@ -10,6 +10,7 @@ use std::time::Duration;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 use coordinode_core::txn::command::{ExpectedVersion, TimeoutOutcome, TransactionId};
 use coordinode_core::txn::operation::OperationDescriptor;
+use coordinode_core::txn::read_concern::{CausalReceipt, HistoryPosition};
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_core::txn::write_concern::WriteConcern;
 
@@ -86,8 +87,14 @@ pub struct StatementSource {
 pub struct ConnectionSettings {
     /// Default read concern level for statements that carry none.
     pub read_concern: Option<u8>,
-    /// Fence index applied to reads that carry no concern of their own.
-    pub after_index: Option<u64>,
+    /// Causal lower bound (commit timestamp) applied to reads that carry no
+    /// concern of their own.
+    pub after_ts: Option<u64>,
+    /// Causal log position applied to reads that carry no concern of their
+    /// own.
+    pub after_position: Option<HistoryPosition>,
+    /// How long a read may wait for a causal bound not met yet.
+    pub causal_wait: Option<Duration>,
     /// Snapshot pin applied to reads that carry no concern of their own.
     pub at_timestamp: Option<u64>,
     /// Default write concern for statements that carry none.
@@ -117,8 +124,14 @@ impl ConnectionSettings {
         if change.read_concern.is_some() {
             self.read_concern = change.read_concern;
         }
-        if change.after_index.is_some() {
-            self.after_index = change.after_index;
+        if change.after_ts.is_some() {
+            self.after_ts = change.after_ts;
+        }
+        if change.after_position.is_some() {
+            self.after_position = change.after_position;
+        }
+        if change.causal_wait.is_some() {
+            self.causal_wait = change.causal_wait;
         }
         if change.at_timestamp.is_some() {
             self.at_timestamp = change.at_timestamp;
@@ -155,7 +168,9 @@ impl ConnectionSettings {
     /// which a statement inside a transaction may not.
     pub fn names_concern(&self) -> bool {
         self.read_concern.is_some()
-            || self.after_index.is_some()
+            || self.after_ts.is_some()
+            || self.after_position.is_some()
+            || self.causal_wait.is_some()
             || self.at_timestamp.is_some()
             || self.write_concern.is_some()
             || self.read_preference.is_some()
@@ -198,9 +213,9 @@ pub struct SessionStats {
     pub properties_set: i64,
     /// Wall-clock execution time, in milliseconds.
     pub execution_time_ms: i64,
-    /// Raft index the statement was applied at (causal token); zero in embedded
-    /// mode.
-    pub applied_index: u64,
+    /// The statement's causal receipt: its write's commit timestamp or its
+    /// read's timestamp, and its write's log position in a replicated group.
+    pub receipt: CausalReceipt,
     /// Whether the read was served by the Raft leader.
     pub served_by_leader: bool,
     /// The timestamp this statement's writes landed at, when it committed on

@@ -815,6 +815,15 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 ReadFenceFailure::Role => Status::failed_precondition(rendered),
                 ReadFenceFailure::Stale => Status::unavailable(rendered),
                 ReadFenceFailure::Timeout => Status::deadline_exceeded(rendered),
+                // A causal bound not met on this member yet: like a named
+                // timestamp not ready, the same read succeeds shortly or on
+                // another member.
+                ReadFenceFailure::NotReady => status_with_reason(
+                    Code::Unavailable,
+                    rendered,
+                    Reason::ReadNotReady,
+                    std::iter::empty(),
+                ),
             };
         }
         // Nothing ran at the member that had to run it: the same command
@@ -1115,7 +1124,7 @@ impl CypherServiceImpl {
             .route(leader, statement, &AdmissionSignal::new(|| {}))
             .await
             .map_err(db_error_to_status)?;
-        Ok(routed_response(answer, start))
+        Ok(routed_response(answer, start, self.executor.history()))
     }
 }
 
@@ -1125,19 +1134,20 @@ fn time_left(deadline: Option<std::time::Instant>) -> Option<Duration> {
 }
 
 /// A routed statement's answer as this member's response: the leader ran it,
-/// which a statement is only ever routed to. A write reports its own commit's
-/// index, one answered before its commit reports none, and a read the index
-/// it was served at, as on the local path.
+/// which a statement is only ever routed to, in this member's own history.
+/// The receipt is built as on the local path.
 fn routed_response(
     answer: RoutedAnswer,
     start: std::time::Instant,
+    history: Option<coordinode_core::txn::read_concern::HistoryId>,
 ) -> Response<query::ExecuteCypherResponse> {
     let stats = answer.stats;
-    let applied_index = match (stats.applied_index, stats.commit_ts) {
-        (0, 0) => stats.read_index,
-        (0, _) => 0,
-        (own, _) => own,
-    };
+    let receipt = super::causal::receipt(
+        (stats.commit_ts > 0).then_some(stats.commit_ts),
+        (stats.applied_index > 0).then_some(stats.applied_index),
+        (stats.read_ts > 0).then_some(stats.read_ts),
+        history,
+    );
     let mut response = Response::new(query::ExecuteCypherResponse {
         columns: answer.columns,
         rows: answer
@@ -1154,7 +1164,7 @@ fn routed_response(
             edges_deleted: stats.edges_deleted,
             properties_set: stats.properties_set,
             execution_time_ms: start.elapsed().as_millis() as i64,
-            applied_index,
+            receipt: Some(super::causal::receipt_to_proto(receipt)),
             served_by_leader: true,
             commit_ts: stats.commit_ts,
             read_as_of_ts: stats.read_as_of_ts,
@@ -1227,7 +1237,12 @@ fn requested_from_proto(
             Some(rc) => read_concern_level("read_concern.level", rc.level)?,
             None => None,
         },
-        after_index: rc.map_or(0, |rc| rc.after_index),
+        after_ts: rc.map_or(0, |rc| rc.after_ts),
+        after_position: super::causal::position_from_proto(
+            "read_concern.after_position",
+            rc.and_then(|rc| rc.after_position.as_ref()),
+        )?,
+        causal_wait: rc.and_then(|rc| super::causal::wait_from_proto(rc.wait_ms)),
         at_timestamp: rc.map_or(0, |rc| rc.at_timestamp),
         read_preference: read_preference("read_preference", req.read_preference)?,
         write_concern: req
@@ -1306,22 +1321,19 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         let result_rows = exec_result.rows;
         let write_stats = exec_result.write_stats;
         let Admitted {
-            applied_index,
             served_by_leader,
             read_as_of_ts,
+            history,
             ..
-        } = admitted;
-
-        // Causal operationTime: a replicated write reports its OWN committed
-        // Raft index, not the node's applied index sampled by the read fence,
-        // which does not cover this write. A write answered before its commit
-        // (a volatile journal, fewer acks than a majority) has no index of its
-        // own yet and reports none. Reads keep the fence value.
-        let applied_index = match (write_stats.applied_index, write_stats.commit_ts) {
-            (Some(own), _) => own,
-            (None, Some(_)) => 0,
-            (None, None) => applied_index,
-        };
+        } = *admitted;
+        // A write reports its own commit and entry, never the index the read
+        // fence sampled, which does not cover it; a read its view.
+        let receipt = super::causal::receipt(
+            write_stats.commit_ts,
+            write_stats.applied_index,
+            write_stats.read_ts,
+            history,
+        );
 
         let duration_ms = start.elapsed().as_millis() as u64;
         self.executor.record(&req.query, source_ctx.as_ref(), start);
@@ -1358,7 +1370,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 edges_deleted: write_stats.edges_deleted as i64,
                 properties_set: write_stats.properties_set as i64,
                 execution_time_ms: duration_ms as i64,
-                applied_index,
+                receipt: Some(super::causal::receipt_to_proto(receipt)),
                 served_by_leader,
                 // The version of what this statement wrote; zero for a read.
                 commit_ts: write_stats.commit_ts.unwrap_or(0),

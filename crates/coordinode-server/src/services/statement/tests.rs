@@ -301,7 +301,7 @@ fn an_unservable_combination_is_refused_before_it_runs() {
     let (executor, _dir) = standalone();
     let causal = |level| Requested {
         read_concern: Some(level),
-        after_index: 1,
+        after_ts: 1,
         ..Requested::default()
     };
     for level in [

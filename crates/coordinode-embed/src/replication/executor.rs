@@ -86,6 +86,7 @@ pub fn stats(ws: &WriteStats, admitted: &Admitted) -> RoutedStats {
         commit_ts: ws.commit_ts.unwrap_or(0),
         read_index: admitted.applied_index,
         read_as_of_ts: admitted.read_as_of_ts,
+        read_ts: ws.read_ts.unwrap_or(0),
     }
 }
 
@@ -183,7 +184,9 @@ pub fn write_paged(
 pub fn routed_settings(requested: &Requested) -> RoutedSettings {
     RoutedSettings {
         read_concern: requested.read_concern,
-        after_index: (requested.after_index > 0).then_some(requested.after_index),
+        after_ts: (requested.after_ts > 0).then_some(requested.after_ts),
+        after_position: requested.after_position,
+        causal_wait: requested.causal_wait,
         at_timestamp: (requested.at_timestamp > 0).then_some(requested.at_timestamp),
         write_concern: requested.write_concern,
         vector_consistency: requested.vector_consistency,
@@ -199,7 +202,9 @@ pub fn routed_requested(statement: &RoutedStatement, cancel: &CancelFlag) -> Req
     let settings = &statement.settings;
     Requested {
         read_concern: settings.read_concern,
-        after_index: settings.after_index.unwrap_or(0),
+        after_ts: settings.after_ts.unwrap_or(0),
+        after_position: settings.after_position,
+        causal_wait: settings.causal_wait,
         at_timestamp: settings.at_timestamp.unwrap_or(0),
         read_preference: Some(ReadPreference::Primary),
         write_concern: settings.write_concern,

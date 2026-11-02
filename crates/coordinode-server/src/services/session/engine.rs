@@ -82,7 +82,9 @@ impl DatabaseCursorEngine {
             .check(query, requested)
             .map_err(engine_error)?;
         if !self.executor.needs_fence() {
-            return Ok(Admission::Run(self.executor.admit_standalone(checked)));
+            return Ok(Admission::Run(Box::new(
+                self.executor.admit_standalone(checked),
+            )));
         }
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|e| EngineError::internal(format!("no runtime to fence the read on: {e}")))?;
@@ -111,6 +113,7 @@ impl DatabaseCursorEngine {
             rows,
             cancel: cancel.clone(),
             led,
+            history: self.executor.history(),
         }))
     }
 
@@ -283,7 +286,6 @@ impl CursorEngine for DatabaseCursorEngine {
             }
         };
         let fenced = SessionStats {
-            applied_index: admitted.applied_index,
             served_by_leader: admitted.served_by_leader,
             read_as_of_ts: admitted.read_as_of_ts,
             ..SessionStats::default()
@@ -300,6 +302,17 @@ impl CursorEngine for DatabaseCursorEngine {
                 admitted.read_concern.at_timestamp,
                 fenced,
             )?;
+            // The cursor pins the latest complete snapshot, which a causal
+            // bound past it is not met by: refused like any read below its
+            // bound, never served from before it.
+            if let Some(bound) = admitted.read_concern.after_ts
+                && cursor.read_ts.is_none_or(|pinned| pinned < bound)
+            {
+                return Err(engine_error(DatabaseError::ReadNotReady {
+                    requested: bound,
+                    ready_through: cursor.read_ts,
+                }));
+            }
             // Counted at its first page; later pages are served as the
             // client asks for them.
             crate::services::statement::observe_query(
@@ -338,12 +351,13 @@ impl CursorEngine for DatabaseCursorEngine {
             rows,
             pos: 0,
             stats: SessionStats {
-                // A replicated write reports its own committed index, a read
-                // the index the fence saw.
-                applied_index: result
-                    .write_stats
-                    .applied_index
-                    .unwrap_or(fenced.applied_index),
+                // A write reports its own commit and entry, a read its view.
+                receipt: crate::services::causal::receipt(
+                    result.write_stats.commit_ts,
+                    result.write_stats.applied_index,
+                    result.write_stats.read_ts,
+                    admitted.history,
+                ),
                 execution_time_ms: start.elapsed().as_millis() as i64,
                 served_by_leader: fenced.served_by_leader,
                 read_as_of_ts: fenced.read_as_of_ts,
@@ -520,7 +534,9 @@ fn requested(
         read_concern: settings
             .read_concern
             .and_then(|level| read_concern_level("", i32::from(level)).ok().flatten()),
-        after_index: settings.after_index.unwrap_or(0),
+        after_ts: settings.after_ts.unwrap_or(0),
+        after_position: settings.after_position,
+        causal_wait: settings.causal_wait,
         at_timestamp: settings.at_timestamp.unwrap_or(0),
         read_preference: settings
             .read_preference
@@ -616,8 +632,10 @@ impl KeysetCursor {
         self.read_ts = Some(page.read_ts);
         self.resume = page.last_key;
         self.exhausted = page.exhausted;
+        // The page's view is the cursor's pinned snapshot, the same for every
+        // page, so its receipt holds for the whole scan.
         self.stats = SessionStats {
-            applied_index: self.fenced.applied_index,
+            receipt: crate::services::causal::receipt(None, None, page.write_stats.read_ts, None),
             served_by_leader: self.fenced.served_by_leader,
             read_as_of_ts: self.fenced.read_as_of_ts,
             execution_time_ms: self.busy.as_millis() as i64,
@@ -688,6 +706,8 @@ struct RoutedCursor {
     cancel: coordinode_core::budget::CancelFlag,
     /// The statement ran at the leader on its own, not in a transaction.
     led: bool,
+    /// The history the leader's log positions count entries of.
+    history: Option<coordinode_core::txn::read_concern::HistoryId>,
 }
 
 impl QueryCursor for RoutedCursor {
@@ -721,13 +741,14 @@ impl QueryCursor for RoutedCursor {
             edges_created: stats.edges_created,
             edges_deleted: stats.edges_deleted,
             properties_set: stats.properties_set,
-            // A write reports its own commit's index, one answered before
-            // its commit none, a read the index it was served at.
-            applied_index: match (stats.applied_index, stats.commit_ts) {
-                (0, 0) => stats.read_index,
-                (0, _) => 0,
-                (own, _) => own,
-            },
+            // Built as on the local path; the leader that ran it counts its
+            // entries in this member's history.
+            receipt: crate::services::causal::receipt(
+                (stats.commit_ts > 0).then_some(stats.commit_ts),
+                (stats.applied_index > 0).then_some(stats.applied_index),
+                (stats.read_ts > 0).then_some(stats.read_ts),
+                self.history,
+            ),
             served_by_leader: self.led,
             commit_ts: stats.commit_ts,
             read_as_of_ts: stats.read_as_of_ts,

@@ -114,7 +114,7 @@ fn the_count_sees_its_own_transaction() {
 /// in the query counts by scan.
 #[test]
 fn a_past_count_is_the_count_of_then() {
-    use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
+    use coordinode_core::txn::read_concern::ReadConcern;
 
     let (mut db, _dir) = open_db();
     db.execute_cypher("UNWIND range(1, 3) AS i CREATE (:Project {i: i})")
@@ -126,11 +126,7 @@ fn a_past_count_is_the_count_of_then() {
     let at_then = db
         .execute_cypher_with_read_concern(
             "MATCH (n:Project) RETURN count(n) AS n",
-            ReadConcern {
-                level: ReadConcernLevel::Snapshot,
-                after_index: None,
-                at_timestamp: Some(then),
-            },
+            ReadConcern::snapshot_at(then),
         )
         .expect("count then");
     assert_eq!(at_then[0].get("n"), Some(&Value::Int(3)));

@@ -73,36 +73,37 @@ pub use subscription::{
 };
 pub use value::Value;
 
-/// Opaque causal consistency token.
+/// Causal consistency token: the latest operation time a causal session has
+/// observed.
 ///
-/// Returned by [`CoordinodeClient::execute_causal_write`] and consumed by
-/// [`CoordinodeClient::execute_causal_read`] to enforce read-your-writes
-/// ordering in a cluster.
+/// Returned by [`CoordinodeClient::execute_causal_write`] and
+/// [`CoordinodeClient::execute_causal_read`], and passed to the next causal
+/// read. It wraps an operation time: a write's commit timestamp, or the
+/// timestamp a read's view was taken at. A read bounded by it is served only
+/// where every commit at or below it is applied, on the leader or a follower
+/// alike, which gives read-your-writes and monotonic reads. A session keeps
+/// the largest token it has received; tokens order by time, so
+/// `a.max(b)` combines two.
 ///
-/// The token wraps the Raft log index (`applied_index`) that the write was
-/// committed at on the serving leader. Passing it to a subsequent read
-/// guarantees that read will not be served until the replica has applied at
-/// least that log entry — even if the request is routed to a follower.
+/// A member that does not meet the bound yet refuses the read with
+/// `UNAVAILABLE`, reason `READ_NOT_READY`, unless the client allows a wait
+/// ([`CoordinodeClientBuilder::causal_wait`]). The same holds standalone,
+/// where the token is the write's commit timestamp, never zero.
 ///
-/// ## Standalone / embedded mode
-///
-/// In non-cluster deployments the server always returns `applied_index = 0`.
-/// Reads with a zero-valued token have no fence effect — they succeed
-/// immediately. You can safely use the causal API in standalone mode; it just
-/// has no observable effect on ordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// [`CoordinodeClientBuilder::causal_wait`]: config::CoordinodeClientBuilder::causal_wait
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct CausalToken(u64);
 
 impl CausalToken {
-    /// The underlying Raft log index.
+    /// The operation time, in the server's HLC microseconds.
     pub fn as_u64(self) -> u64 {
         self.0
     }
 }
 
 impl From<u64> for CausalToken {
-    fn from(index: u64) -> Self {
-        Self(index)
+    fn from(operation_time: u64) -> Self {
+        Self(operation_time)
     }
 }
 
@@ -382,19 +383,14 @@ impl CoordinodeClient {
 
     /// Execute a write with **majority durability**, returning a causal token.
     ///
-    /// The write is acknowledged only after a quorum of replicas has applied
-    /// it to their Raft log. The returned [`CausalToken`] wraps the committed
-    /// log index and can be passed to [`execute_causal_read`] to enforce
-    /// read-your-writes ordering — even when the read is served by a follower.
-    ///
-    /// **Standalone / embedded mode:** the token is always `0` (the server
-    /// operates without Raft). Passing it to a causal read has no fence effect.
+    /// The write is acknowledged only after a quorum of replicas holds it
+    /// journaled. The returned [`CausalToken`] is its commit timestamp; pass
+    /// it to [`execute_causal_read`] for read-your-writes, even when the read
+    /// is served by a follower.
     ///
     /// # Errors
     ///
-    /// Returns `ClientError::Grpc` if the server rejects the request (e.g. the
-    /// node is not the Raft leader, or `read_concern.after_index` is set with
-    /// a non-majority write concern).
+    /// Returns `ClientError::Grpc` if the server rejects the request.
     ///
     /// [`execute_causal_read`]: CoordinodeClient::execute_causal_read
     #[track_caller]
@@ -429,27 +425,30 @@ impl CoordinodeClient {
         self.execute_causal_write_inner(query.into(), params, location)
     }
 
-    /// Execute a read that is guaranteed to observe the write identified by
-    /// `after`.
+    /// Execute a read that observes everything up to `after`, and return the
+    /// session's token after it.
     ///
-    /// The serving node waits until its applied log index is ≥ `after.as_u64()`
-    /// before executing the read. This guarantees **read-your-writes** and
-    /// **monotonic reads** when the write was issued with
-    /// [`execute_causal_write`].
+    /// The read is served only where every commit at or below `after` is
+    /// applied, which gives **read-your-writes** for a token from
+    /// [`execute_causal_write`] and **monotonic reads** for one from an
+    /// earlier causal read. The returned token is the larger of `after` and
+    /// the time this read was taken at: pass it to the next causal read.
     ///
-    /// Use `ReadPreference::SECONDARY_PREFERRED` in combination with this
-    /// method to scale out reads while preserving causal ordering.
+    /// # Errors
     ///
-    /// **Standalone / embedded mode:** the fence has no effect (the server
-    /// returns immediately).
+    /// `ClientError::Grpc` with `UNAVAILABLE`, reason `READ_NOT_READY`, when
+    /// the serving member does not meet `after` (after the wait the client
+    /// allows, see [`CoordinodeClientBuilder::causal_wait`]); any other
+    /// refusal of the server.
     ///
     /// [`execute_causal_write`]: CoordinodeClient::execute_causal_write
+    /// [`CoordinodeClientBuilder::causal_wait`]: config::CoordinodeClientBuilder::causal_wait
     #[track_caller]
     pub fn execute_causal_read(
         &mut self,
         query: impl Into<String>,
         after: CausalToken,
-    ) -> impl Future<Output = Result<Vec<Row>, ClientError>> + '_ {
+    ) -> impl Future<Output = Result<(Vec<Row>, CausalToken), ClientError>> + '_ {
         let location = if self.config.debug_source_tracking {
             Some(Location::caller())
         } else {
@@ -469,7 +468,7 @@ impl CoordinodeClient {
         query: impl Into<String>,
         params: HashMap<String, Value>,
         after: CausalToken,
-    ) -> impl Future<Output = Result<Vec<Row>, ClientError>> + '_ {
+    ) -> impl Future<Output = Result<(Vec<Row>, CausalToken), ClientError>> + '_ {
         let location = if self.config.debug_source_tracking {
             Some(Location::caller())
         } else {
@@ -515,10 +514,10 @@ impl CoordinodeClient {
             journal: Journal::Journal as i32,
             timeout_ms: 0,
         });
-        let (rows, applied_index) = self
+        let (rows, operation_time) = self
             .execute_request(query, params, 0, None, write_concern, location)
             .await?;
-        Ok((rows, CausalToken(applied_index)))
+        Ok((rows, CausalToken(operation_time)))
     }
 
     async fn execute_causal_read_inner(
@@ -527,23 +526,29 @@ impl CoordinodeClient {
         params: HashMap<String, Value>,
         after: CausalToken,
         location: Option<&'static Location<'static>>,
-    ) -> Result<Vec<Row>, ClientError> {
+    ) -> Result<(Vec<Row>, CausalToken), ClientError> {
         let read_concern = Some(ReadConcern {
             level: ReadConcernLevel::Majority as i32,
-            after_index: after.as_u64(),
-            at_timestamp: 0, // causal read uses fence, not snapshot pin
+            after_ts: after.as_u64(),
+            after_position: None,
+            wait_ms: self
+                .config
+                .causal_wait
+                .map_or(0, |w| u32::try_from(w.as_millis()).unwrap_or(u32::MAX)),
+            at_timestamp: 0,
         });
-        let (rows, _applied_index) = self
+        let (rows, operation_time) = self
             .execute_request(query, params, 0, read_concern, None, location)
             .await?;
-        Ok(rows)
+        Ok((rows, after.max(CausalToken(operation_time))))
     }
 
     /// Low-level request executor shared by all public methods.
     ///
-    /// Returns the decoded rows **and** the `applied_index` from `QueryStats`
-    /// so causal methods can wrap it in a [`CausalToken`]. A `read_preference`
-    /// of zero and an absent concern leave the setting to the server.
+    /// Returns the decoded rows **and** the receipt's operation time from
+    /// `QueryStats` so causal methods can wrap it in a [`CausalToken`]. A
+    /// `read_preference` of zero and an absent concern leave the setting to
+    /// the server.
     async fn execute_request(
         &mut self,
         query: String,
@@ -602,7 +607,7 @@ impl CoordinodeClient {
         let response = self.cypher.execute_cypher(request).await?;
         let body = response.into_inner();
 
-        let applied_index = body.stats.as_ref().map_or(0, |s| s.applied_index);
+        let operation_time = operation_time(body.stats.as_ref());
 
         let columns = body.columns;
         let rows = body
@@ -617,8 +622,15 @@ impl CoordinodeClient {
             })
             .collect();
 
-        Ok((rows, applied_index))
+        Ok((rows, operation_time))
     }
+}
+
+/// The operation time a statement's receipt names; zero when it names none.
+fn operation_time(stats: Option<&proto::query::QueryStats>) -> u64 {
+    stats
+        .and_then(|s| s.receipt.as_ref())
+        .map_or(0, |r| r.operation_time)
 }
 
 /// Rows of one statement buffered in the session before its reader is waited
@@ -651,8 +663,7 @@ async fn execute_on_session(
                     }));
                 }
                 Some(server_frame::Event::CursorEnd(end)) => {
-                    let applied_index = end.stats.map_or(0, |s| s.applied_index);
-                    return Ok((rows, applied_index));
+                    return Ok((rows, operation_time(end.stats.as_ref())));
                 }
                 Some(server_frame::Event::Error(error)) => {
                     return Err(ClientError::Grpc(session::error_status(error)));

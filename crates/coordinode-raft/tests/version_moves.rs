@@ -290,11 +290,18 @@ async fn a_group_moves_by_majority_one_member_at_a_time() {
                 "{preference:?}/{concern:?}: {refused:?}"
             );
         }
+        let mut fence = m3.node().read_fence();
+        let far =
+            fence.history().map(
+                |history| coordinode_core::txn::read_concern::HistoryPosition {
+                    history,
+                    index: u64::MAX,
+                },
+            );
         assert!(
             matches!(
-                m3.node()
-                    .read_fence()
-                    .wait_for_index(u64::MAX, Duration::from_secs(30))
+                fence
+                    .await_causal(None, far, Some(Duration::from_secs(30)))
                     .await,
                 Err(ReadFenceError::ReadOnly(_))
             ),

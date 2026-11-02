@@ -55,6 +55,9 @@ pub struct SessionSvc {
     manager: SessionManager,
     /// What subscriptions read through; without it a subscription is refused.
     change_streams: Option<Arc<ChangeEventServiceImpl>>,
+    /// The cluster this node belongs to, whose history qualifies the log
+    /// position of a commit; `None` for a standalone node.
+    cluster: Option<Arc<RaftNode>>,
 }
 
 impl SessionSvc {
@@ -67,6 +70,7 @@ impl SessionSvc {
         Self {
             manager: SessionManager::new(engine, registry),
             change_streams: None,
+            cluster: None,
         }
     }
 
@@ -86,6 +90,7 @@ impl SessionSvc {
     /// "your writes are failing" into "your node reached a leader again".
     pub fn with_cluster(mut self, raft: Arc<RaftNode>) -> Self {
         let (tx, rx) = watch::channel(connection_state(&raft));
+        self.cluster = Some(Arc::clone(&raft));
         tokio::spawn(async move {
             let mut seen = (None, 0u64);
             loop {
@@ -205,6 +210,7 @@ impl SessionServiceTrait for SessionSvc {
         // soon as the client is gone, not at its next event: dropping the
         // events' receiver is how the core learns a statement's answer has
         // nowhere to go.
+        let cluster = self.cluster.clone();
         tokio::spawn(async move {
             loop {
                 let (request_id, event) = tokio::select! {
@@ -214,8 +220,9 @@ impl SessionServiceTrait for SessionSvc {
                     },
                     () = frame_tx.closed() => break,
                 };
+                let history = cluster.as_ref().and_then(|node| node.history());
                 if frame_tx
-                    .send(Ok(event_to_frame(request_id, event)))
+                    .send(Ok(event_to_frame(request_id, event, history)))
                     .await
                     .is_err()
                 {
@@ -434,10 +441,20 @@ fn settings_from_proto(c: &Configure) -> Result<ConnectionSettings, Status> {
             .as_ref()
             .map(|rc| known_level("read_concern.level", rc.level))
             .transpose()?,
-        after_index: c
+        after_ts: c
             .read_concern
             .as_ref()
-            .and_then(|rc| (rc.after_index != 0).then_some(rc.after_index)),
+            .and_then(|rc| (rc.after_ts != 0).then_some(rc.after_ts)),
+        after_position: super::causal::position_from_proto(
+            "read_concern.after_position",
+            c.read_concern
+                .as_ref()
+                .and_then(|rc| rc.after_position.as_ref()),
+        )?,
+        causal_wait: c
+            .read_concern
+            .as_ref()
+            .and_then(|rc| super::causal::wait_from_proto(rc.wait_ms)),
         at_timestamp: c
             .read_concern
             .as_ref()
@@ -476,7 +493,12 @@ fn statement_settings(e: &Execute) -> Result<ConnectionSettings, Status> {
             .map(|rc| known_level("read_concern.level", rc.level))
             .transpose()?
             .filter(|&level| level != 0),
-        after_index: rc.and_then(|rc| (rc.after_index != 0).then_some(rc.after_index)),
+        after_ts: rc.and_then(|rc| (rc.after_ts != 0).then_some(rc.after_ts)),
+        after_position: super::causal::position_from_proto(
+            "read_concern.after_position",
+            rc.and_then(|rc| rc.after_position.as_ref()),
+        )?,
+        causal_wait: rc.and_then(|rc| super::causal::wait_from_proto(rc.wait_ms)),
         at_timestamp: rc.and_then(|rc| (rc.at_timestamp != 0).then_some(rc.at_timestamp)),
         write_concern: e
             .write_concern
@@ -554,12 +576,19 @@ impl ClientApp {
 fn settings_to_proto(s: &ConnectionSettings) -> Configure {
     // A fence or a pin set without a level is still in effect, so the read
     // concern is reported when any of its parts is.
-    let read_concern_set =
-        s.read_concern.is_some() || s.after_index.is_some() || s.at_timestamp.is_some();
+    let read_concern_set = s.read_concern.is_some()
+        || s.after_ts.is_some()
+        || s.after_position.is_some()
+        || s.causal_wait.is_some()
+        || s.at_timestamp.is_some();
     Configure {
         read_concern: read_concern_set.then(|| replication::ReadConcern {
             level: s.read_concern.map_or(0, i32::from),
-            after_index: s.after_index.unwrap_or(0),
+            after_ts: s.after_ts.unwrap_or(0),
+            after_position: s.after_position.map(super::causal::position_to_proto),
+            wait_ms: s
+                .causal_wait
+                .map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
             at_timestamp: s.at_timestamp.unwrap_or(0),
         }),
         write_concern: s.write_concern.as_ref().map(write_concern_to_proto),
@@ -580,8 +609,13 @@ fn settings_to_proto(s: &ConnectionSettings) -> Configure {
     }
 }
 
-/// Map a neutral event back to a gRPC server frame.
-fn event_to_frame(request_id: u64, event: SessionEvent) -> ServerFrame {
+/// Map a neutral event back to a gRPC server frame; `history` qualifies a
+/// commit's log position.
+fn event_to_frame(
+    request_id: u64,
+    event: SessionEvent,
+    history: Option<coordinode_core::txn::read_concern::HistoryId>,
+) -> ServerFrame {
     let event = match event {
         SessionEvent::CursorOpen { columns } => Event::CursorOpen(CursorOpen { columns }),
         SessionEvent::Rows { rows } => Event::Rows(RowBatch {
@@ -595,11 +629,15 @@ fn event_to_frame(request_id: u64, event: SessionEvent) -> ServerFrame {
         SessionEvent::CursorEnd { stats } => Event::CursorEnd(CursorEnd {
             stats: Some(stats_to_proto(stats)),
         }),
-        // `applied_index` 0 = no Raft log (embedded); `commit_ts` is present
-        // in every mode.
+        // `commit_ts` is present in every mode; a position only where there
+        // is a log, qualified by its history.
         SessionEvent::Committed { receipt } => Event::Committed(Committed {
-            applied_index: receipt.applied_index.unwrap_or(0),
             commit_ts: receipt.commit_ts.as_raw(),
+            position: history.zip(receipt.applied_index).map(|(history, index)| {
+                super::causal::position_to_proto(
+                    coordinode_core::txn::read_concern::HistoryPosition { history, index },
+                )
+            }),
         }),
         SessionEvent::Error(f) => Event::Error(session_error(&status(f))),
         SessionEvent::ConnectionStatus { state, settings } => {
@@ -629,7 +667,7 @@ fn stats_to_proto(stats: SessionStats) -> query::QueryStats {
         edges_deleted: stats.edges_deleted,
         properties_set: stats.properties_set,
         execution_time_ms: stats.execution_time_ms,
-        applied_index: stats.applied_index,
+        receipt: Some(super::causal::receipt_to_proto(stats.receipt)),
         served_by_leader: stats.served_by_leader,
         commit_ts: stats.commit_ts,
         read_as_of_ts: stats.read_as_of_ts,

@@ -351,6 +351,7 @@ impl Database {
         let session = QuerySession {
             read_concern: self.read_concern,
             snapshot_read_ts: None,
+            causal: super::CausalBound::default(),
             write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
             vector_build_wait: self.vector_build_wait,

@@ -12,12 +12,12 @@ use std::time::{Duration, Instant};
 use coordinode_core::budget::CancelFlag;
 use coordinode_core::graph::types::VectorConsistencyMode;
 use coordinode_core::txn::operation::OperationDescriptor;
-use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
+use coordinode_core::txn::read_concern::{
+    HistoryId, HistoryPosition, ReadConcern, ReadConcernLevel,
+};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_raft::cluster::RaftNode;
-use coordinode_raft::read_fence::{
-    READ_FENCE_TIMEOUT, ReadConcern as FenceConcern, ReadFenceError, ReadPreference,
-};
+use coordinode_raft::read_fence::{ReadConcern as FenceConcern, ReadFenceError, ReadPreference};
 use coordinode_wire::peer::PeerTarget;
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
@@ -42,8 +42,14 @@ pub struct AdmissionDefaults {
 pub struct Requested {
     /// What the read may observe.
     pub read_concern: Option<ReadConcernLevel>,
-    /// Log position the read waits for; zero waits for nothing.
-    pub after_index: u64,
+    /// Causal lower bound: the read is taken where every commit at or below
+    /// this timestamp is applied; zero is no bound.
+    pub after_ts: u64,
+    /// Causal position in one history's log; `None` is no bound.
+    pub after_position: Option<HistoryPosition>,
+    /// How long the read may wait for a causal bound not met yet; `None`
+    /// refuses it as not ready at once.
+    pub causal_wait: Option<Duration>,
     /// Snapshot timestamp the read is pinned to; zero pins none.
     pub at_timestamp: u64,
     /// Which member may serve the read.
@@ -105,6 +111,8 @@ pub struct Admitted {
     pub operation: Option<OperationDescriptor>,
     /// The applied log index the read was served at; zero outside a group.
     pub applied_index: u64,
+    /// The history `applied_index` counts entries of; `None` outside a group.
+    pub history: Option<HistoryId>,
     /// Whether this member led when it served the statement.
     pub served_by_leader: bool,
     /// What a read on a read-only member is as of; zero otherwise.
@@ -131,8 +139,9 @@ impl Admitted {
 /// What to do with a checked statement.
 #[derive(Debug)]
 pub enum Admission {
-    /// Run it here.
-    Run(Admitted),
+    /// Run it here. Boxed: the admission is moved through every statement's
+    /// path, and the settings it carries dwarf the other variant.
+    Run(Box<Admitted>),
     /// It needs the leader, which is another member: route it there.
     Forward(u64),
 }
@@ -187,6 +196,12 @@ impl Admitter {
         self.node.as_ref()
     }
 
+    /// The history this member's log positions count entries of; `None`
+    /// standalone and before the deployment is known.
+    pub fn history(&self) -> Option<HistoryId> {
+        self.node.as_ref().and_then(|node| node.history())
+    }
+
     /// Whether a fence has to wait on the consensus node, which needs a
     /// runtime; a standalone statement is admitted without waiting.
     pub fn needs_fence(&self) -> bool {
@@ -211,16 +226,16 @@ impl Admitter {
             ));
         }
         let level = requested.read_concern.unwrap_or(self.defaults.read_concern);
-        let after_index = requested.after_index;
+        let causal = requested.after_ts > 0 || requested.after_position.is_some();
         // Known before it runs, from the parse execution reuses. A query that
         // does not parse runs on and fails there with the richer error.
         let writes = self.database.read().statement_writes(query) == Some(true);
 
-        // A causal read waits for a position a majority committed. A LOCAL
-        // read promises nothing about majority, so a fence on top of it is
+        // A causal read is bounded by what a majority committed. A LOCAL
+        // read promises nothing about majority, so a bound on top of it is
         // unsound; LINEARIZABLE already reads the latest committed state, so
-        // a fence adds nothing and asking for both is a client error.
-        if after_index > 0 {
+        // a bound adds nothing and asking for both is a client error.
+        if causal {
             match level {
                 ReadConcernLevel::Local => {
                     return Err(refused(
@@ -252,7 +267,7 @@ impl Admitter {
                         "Causal sessions require writeConcern w:majority with \
                          j:journal for write statements. A weaker write (w:1, w:0, \
                          or a volatile journal level) may be lost before replication: \
-                         the resulting applied_index would be a dangling causal \
+                         the resulting operation time would be a dangling causal \
                          dependency that followers can never satisfy. Use a \
                          non-causal session for such writes, or upgrade to \
                          w:majority.",
@@ -272,8 +287,10 @@ impl Admitter {
         Ok(Checked {
             read_concern: ReadConcern {
                 level,
-                after_index: (after_index > 0).then_some(after_index),
+                after_ts: (requested.after_ts > 0).then_some(requested.after_ts),
+                after_position: requested.after_position,
                 at_timestamp: (requested.at_timestamp > 0).then_some(requested.at_timestamp),
+                wait: requested.causal_wait,
             },
             read_preference: requested
                 .read_preference
@@ -302,6 +319,7 @@ impl Admitter {
             cancel: checked.cancel,
             operation: checked.operation,
             applied_index: 0,
+            history: None,
             served_by_leader: false,
             read_as_of_ts: 0,
         }
@@ -320,7 +338,7 @@ impl Admitter {
         already_forwarded: bool,
     ) -> Result<Admission, DatabaseError> {
         let Some(node) = self.node.as_ref() else {
-            return Ok(Admission::Run(self.admit_standalone(checked)));
+            return Ok(Admission::Run(Box::new(self.admit_standalone(checked))));
         };
         // A write only the leader can take goes there before anything of it
         // runs here, whatever the read preference says: run here, it would be
@@ -342,15 +360,20 @@ impl Admitter {
         {
             return fence_refusal(e, node.current_leader(), already_forwarded);
         }
-        if let Some(after_index) = checked.read_concern.after_index {
+        if checked.read_concern.is_causal() {
             fence
-                .wait_for_index(after_index, READ_FENCE_TIMEOUT)
+                .await_causal(
+                    checked.read_concern.after_ts,
+                    checked.read_concern.after_position,
+                    checked.read_concern.wait,
+                )
                 .await
                 .map_err(fence_error)?;
         }
         let applied_index = fence.applied_index();
+        let history = fence.history();
         let served_by_leader = fence.locally_leads();
-        Ok(Admission::Run(Admitted {
+        Ok(Admission::Run(Box::new(Admitted {
             read_concern: checked.read_concern,
             write_concern: checked.write_concern,
             vector_consistency: checked.vector_consistency,
@@ -360,9 +383,10 @@ impl Admitter {
             cancel: checked.cancel,
             operation: checked.operation,
             applied_index,
+            history,
             served_by_leader,
             read_as_of_ts: fence.as_of().unwrap_or(0),
-        }))
+        })))
     }
 
     /// Check and fence in one step.
@@ -515,6 +539,12 @@ fn fence_error(err: ReadFenceError) -> DatabaseError {
         ReadFenceError::StaleReplica { .. } => fence(ReadFenceFailure::Stale),
         ReadFenceError::Timeout { .. } | ReadFenceError::LeaseTimeout { .. } => {
             fence(ReadFenceFailure::Timeout)
+        }
+        ReadFenceError::NotReady { .. } => fence(ReadFenceFailure::NotReady),
+        // The request names a position that cannot be compared here: a
+        // refused setting, not a state of this member.
+        foreign @ ReadFenceError::ForeignHistory { .. } => {
+            DatabaseError::SettingsRefused(foreign.to_string())
         }
         ReadFenceError::Raft(e) => DatabaseError::Other(format!("Raft error: {e}")),
         // Named like a refused write: the same fields say why this member is

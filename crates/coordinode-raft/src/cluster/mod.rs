@@ -2352,6 +2352,18 @@ impl RaftNode {
     pub fn read_fence(&self) -> crate::read_fence::ReadFence {
         crate::read_fence::ReadFence::new(self.applied_rx.clone(), Arc::clone(&self.raft))
             .with_version_gate(Arc::clone(&self.version))
+            .with_causal_source(self.engine.share("read fence"), self.history())
+    }
+
+    /// The history this member's log belongs to, which qualifies its log
+    /// positions: its deployment and group. `None` before the deployment is
+    /// known.
+    pub fn history(&self) -> Option<coordinode_core::txn::read_concern::HistoryId> {
+        self.deployment()
+            .map(|deployment| coordinode_core::txn::read_concern::HistoryId {
+                deployment,
+                group: self.version.group(),
+            })
     }
 
     /// Get this node's ID.

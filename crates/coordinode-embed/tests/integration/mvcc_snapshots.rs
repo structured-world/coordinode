@@ -11,7 +11,7 @@
 
 use coordinode_core::graph::node::NodeRecord;
 use coordinode_core::graph::types::Value;
-use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
+use coordinode_core::txn::read_concern::ReadConcern;
 use coordinode_embed::Database;
 use coordinode_storage::engine::partition::Partition;
 
@@ -281,11 +281,7 @@ fn as_of_timestamp_returns_historical_data() {
     assert_eq!(current[0].get("v"), Some(&Value::Int(3)));
 
     // Time-travel to ts_after_v1: should see version 1
-    let rc_v1 = ReadConcern {
-        level: ReadConcernLevel::Snapshot,
-        after_index: None,
-        at_timestamp: Some(ts_after_v1),
-    };
+    let rc_v1 = ReadConcern::snapshot_at(ts_after_v1);
     let at_v1 = db
         .execute_cypher_with_read_concern(
             "MATCH (n:TimeTraveler {name: 'doc'}) RETURN n.version AS v",
@@ -300,11 +296,7 @@ fn as_of_timestamp_returns_historical_data() {
     );
 
     // Time-travel to ts_after_v2: should see version 2
-    let rc_v2 = ReadConcern {
-        level: ReadConcernLevel::Snapshot,
-        after_index: None,
-        at_timestamp: Some(ts_after_v2),
-    };
+    let rc_v2 = ReadConcern::snapshot_at(ts_after_v2);
     let at_v2 = db
         .execute_cypher_with_read_concern(
             "MATCH (n:TimeTraveler {name: 'doc'}) RETURN n.version AS v",
@@ -492,11 +484,7 @@ fn edge_time_travel_via_read_concern_snapshot() {
 
     // Time-travel to snap_after_ab: should see ONLY 1 edge (A→B).
     // Edge A→C was written after the snapshot.
-    let rc = ReadConcern {
-        level: ReadConcernLevel::Snapshot,
-        after_index: None,
-        at_timestamp: Some(snap_after_ab),
-    };
+    let rc = ReadConcern::snapshot_at(snap_after_ab);
     let historical = db
         .execute_cypher_with_read_concern(
             "MATCH (a:TT {name: 'A'})-[:LINK]->(t) RETURN t.name AS name",

@@ -565,8 +565,8 @@ fn read_concern_snapshot_pins_to_timestamp() {
     // Verify read concern validation works
     let invalid = ReadConcern {
         level: ReadConcernLevel::Majority,
-        after_index: None,
         at_timestamp: Some(100), // at_timestamp only valid with Snapshot
+        ..Default::default()
     };
     let err = db.execute_cypher_with_read_concern("MATCH (n) RETURN n", invalid);
     assert!(err.is_err(), "invalid read concern should fail validation");

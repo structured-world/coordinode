@@ -458,7 +458,7 @@ async fn a_session_write_is_checked_with_its_settings() {
     let database = seeded_db(0);
     let causal = |write_concern| ConnectionSettings {
         read_concern: Some(2), // MAJORITY
-        after_index: Some(1),
+        after_ts: Some(1),
         write_concern,
         ..unset()
     };
@@ -626,7 +626,9 @@ async fn a_session_read_is_fenced_and_says_where_it_was_served() {
     match events.last() {
         Some(SessionEvent::CursorEnd { stats }) => {
             assert!(stats.served_by_leader, "{stats:?}");
-            assert!(stats.applied_index > 0, "{stats:?}");
+            // A read reports the time it read at, and no log position.
+            assert!(stats.receipt.operation_time > 0, "{stats:?}");
+            assert!(stats.receipt.position.is_none(), "{stats:?}");
         }
         other => panic!("expected the read served, got {other:?}"),
     }

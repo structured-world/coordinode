@@ -101,6 +101,12 @@ impl StatementExecutor {
         self.writer.database()
     }
 
+    /// The history this member's log positions count entries of; `None`
+    /// outside a cluster.
+    pub(crate) fn history(&self) -> Option<coordinode_core::txn::read_concern::HistoryId> {
+        self.admitter.history()
+    }
+
     /// Whether a fence has to wait on the consensus node, which needs a
     /// runtime; outside a cluster a statement is admitted without waiting.
     pub(crate) fn needs_fence(&self) -> bool {

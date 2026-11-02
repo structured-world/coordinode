@@ -63,8 +63,8 @@ pub struct WriteStats {
 /// timestamp: nothing was written, so "as of this point" is the only honest
 /// answer.
 ///
-/// `applied_index` is the committed Raft log index in cluster mode, the causal
-/// `operationTime` token a client passes as `after_index` on later reads;
+/// `applied_index` is the committed Raft log index in cluster mode, which the
+/// serving member qualifies with its history to give a causal position;
 /// `None` in embedded / single-node mode, where there is no Raft log to index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitReceipt {

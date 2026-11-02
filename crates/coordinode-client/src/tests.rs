@@ -11,7 +11,12 @@ fn builder_defaults() {
         app_name: builder.app_name.clone(),
         app_version: builder.app_version.clone(),
         transport: builder.transport,
+        causal_wait: builder.causal_wait,
     };
+    assert_eq!(
+        config.causal_wait, None,
+        "a causal read waits for nothing unless the client allows it"
+    );
     assert!(
         !config.debug_source_tracking,
         "tracking disabled by default"
@@ -31,8 +36,13 @@ fn builder_custom() {
     let builder = CoordinodeClient::builder("http://prod:7080")
         .debug_source_tracking(true)
         .app_name("my-svc")
-        .app_version("v2.0");
+        .app_version("v2.0")
+        .causal_wait(std::time::Duration::from_millis(300));
 
+    assert_eq!(
+        builder.causal_wait,
+        Some(std::time::Duration::from_millis(300))
+    );
     assert!(builder.debug_source_tracking);
     assert_eq!(builder.app_name, "my-svc");
     assert_eq!(builder.app_version, "v2.0");
@@ -50,6 +60,7 @@ fn source_tracking_flag_reflects_config() {
         app_name: String::new(),
         app_version: String::new(),
         transport: Transport::default(),
+        causal_wait: None,
     };
     let config_off = ClientConfig {
         debug_source_tracking: false,
@@ -126,7 +137,7 @@ async fn connect_invalid_endpoint_returns_error() {
 
 // ── CausalToken tests ─────────────────────────────────────────────────────
 
-/// CausalToken wraps the log index and exposes it via as_u64.
+/// CausalToken wraps the operation time and exposes it via as_u64.
 #[test]
 fn causal_token_as_u64() {
     let token = CausalToken(42);
@@ -140,21 +151,39 @@ fn causal_token_from_u64() {
     assert_eq!(token.as_u64(), 100);
 }
 
-/// Zero token (standalone mode) is a valid value.
+/// The default token bounds nothing: a session that has observed nothing.
 #[test]
-fn causal_token_zero() {
-    let token = CausalToken::from(0);
-    assert_eq!(token.as_u64(), 0);
+fn causal_token_default_is_no_bound() {
+    assert_eq!(CausalToken::default().as_u64(), 0);
 }
 
-/// CausalToken ordering: higher index = happens-after.
+/// Tokens order by time, and a session keeps the later of two: an older
+/// receipt never lowers its bound.
 #[test]
 fn causal_token_ordering() {
     let earlier = CausalToken(10);
     let later = CausalToken(20);
     assert!(later > earlier);
-    assert!(earlier < later);
-    assert_eq!(earlier, CausalToken(10));
+    assert_eq!(earlier.max(later), later);
+    assert_eq!(later.max(earlier), later);
+}
+
+/// The operation time is read from the statement's receipt, zero without one.
+#[test]
+fn operation_time_comes_from_the_receipt() {
+    let stats = proto::query::QueryStats {
+        receipt: Some(proto::replication::CausalReceipt {
+            operation_time: 1234,
+            position: None,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(operation_time(Some(&stats)), 1234);
+    assert_eq!(
+        operation_time(Some(&proto::query::QueryStats::default())),
+        0
+    );
+    assert_eq!(operation_time(None), 0);
 }
 
 /// CausalToken is Copy: can be used multiple times without moving.

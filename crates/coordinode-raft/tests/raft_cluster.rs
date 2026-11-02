@@ -2295,8 +2295,14 @@ async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
         .await;
 
         let mut fence = n3.read_fence();
+        let position = coordinode_core::txn::read_concern::HistoryPosition {
+            history: fence
+                .history()
+                .expect("the installed state names its history"),
+            index: last,
+        };
         fence
-            .wait_for_index(last, Duration::from_secs(3))
+            .await_causal(None, Some(position), None)
             .await
             .expect("the snapshot already holds the index");
         assert!(n3.applied_through() > last);

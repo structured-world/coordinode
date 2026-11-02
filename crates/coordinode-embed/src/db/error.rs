@@ -611,6 +611,9 @@ pub enum ReadFenceFailure {
     Stale,
     /// The fence did not reach the position or lease it waits for in time.
     Timeout,
+    /// The read's causal bound is not met on this member: refused at once
+    /// when the read did not ask to wait, after its wait otherwise.
+    NotReady,
 }
 
 /// How the answer of a routed command was lost.

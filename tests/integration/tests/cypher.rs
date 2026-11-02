@@ -78,7 +78,7 @@ fn int_val(row: &HashMap<String, PropertyValue>, col: &str) -> Option<i64> {
 ///
 /// Full production path:
 ///   gRPC client → CypherService::execute_cypher()
-///     → after_index > 0, is_write() == true, write_concern == None
+///     → a causal bound, is_write() == true, write_concern == None
 ///       → the majority default → OK
 #[tokio::test]
 async fn causal_write_without_concern_uses_the_majority_default() {
@@ -90,11 +90,7 @@ async fn causal_write_without_concern_uses_the_majority_default() {
             query: "CREATE (n:CausalWrite {x: 1})".to_string(),
             parameters: HashMap::new(),
             read_preference: 0,
-            read_concern: Some(ReadConcern {
-                level: 2, // MAJORITY
-                after_index: 1,
-                at_timestamp: 0,
-            }),
+            read_concern: Some(met_causal_bound()),
             write_concern: None, // omitted → the majority default
             ..Default::default()
         })
@@ -110,7 +106,7 @@ async fn causal_write_without_concern_uses_the_majority_default() {
 /// Causal write with `w: 1` is rejected end-to-end (gRPC path).
 ///
 /// The leader alone is insufficient for causal sessions: the write may never
-/// replicate, making the returned applied_index a dangling dependency.
+/// replicate, making its receipt a dangling dependency.
 #[tokio::test]
 async fn causal_write_with_w1_rejected() {
     let server = CoordinodeProcess::start().await;
@@ -121,11 +117,7 @@ async fn causal_write_with_w1_rejected() {
             query: "MERGE (n:CausalWrite {x: 2})".to_string(),
             parameters: HashMap::new(),
             read_preference: 0,
-            read_concern: Some(ReadConcern {
-                level: 2, // MAJORITY
-                after_index: 5,
-                at_timestamp: 0,
-            }),
+            read_concern: Some(met_causal_bound()),
             write_concern: Some(WriteConcern {
                 w: Some(W::Acks(1)),
                 journal: Journal::Journal as i32,
@@ -154,18 +146,13 @@ async fn causal_write_with_majority_accepted() {
     let server = CoordinodeProcess::start().await;
     let mut client = server.cypher_client().await;
 
-    // after_index: 1 triggers the causal write-concern gate (after_index > 0) but is immediately
-    // satisfied because standalone Raft has applied_index >= 1 after election.
+    // A causal bound puts the write through the causal write-concern gate.
     let result = client
         .execute_cypher(ExecuteCypherRequest {
             query: "CREATE (n:CausalWrite {x: 3})".to_string(),
             parameters: HashMap::new(),
             read_preference: 0,
-            read_concern: Some(ReadConcern {
-                level: 2, // MAJORITY
-                after_index: 1,
-                at_timestamp: 0,
-            }),
+            read_concern: Some(met_causal_bound()),
             write_concern: Some(WriteConcern {
                 w: Some(W::Mode(WriteConcernMode::Majority as i32)),
                 journal: Journal::Journal as i32,
@@ -229,18 +216,12 @@ async fn causal_read_without_majority_accepted() {
     let server = CoordinodeProcess::start().await;
     let mut client = server.cypher_client().await;
 
-    // after_index: 1 reaches the causal write-concern gate (after_index > 0) and is
-    // immediately satisfied on standalone (applied_index >= 1 after election).
     let result = client
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (n:CausalWrite) RETURN n".to_string(),
             parameters: HashMap::new(),
             read_preference: 0,
-            read_concern: Some(ReadConcern {
-                level: 2, // MAJORITY
-                after_index: 1,
-                at_timestamp: 0,
-            }),
+            read_concern: Some(met_causal_bound()),
             write_concern: None, // read-only — write_concern irrelevant
             ..Default::default()
         })
@@ -251,6 +232,82 @@ async fn causal_read_without_majority_accepted() {
         "causal read without write_concern must succeed, got: {:?}",
         result.err()
     );
+}
+
+/// A majority read concern with a causal bound every member meets: a
+/// timestamp no commit precedes, with a wait for the first closed bound the
+/// group publishes after it forms.
+fn met_causal_bound() -> ReadConcern {
+    ReadConcern {
+        level: 2, // MAJORITY
+        after_ts: 1,
+        wait_ms: 10_000,
+        ..Default::default()
+    }
+}
+
+/// Read-your-writes over the wire: a write's receipt names its commit time,
+/// and a read bounded by it observes the write and reports a time no
+/// earlier. Without a wait, a bound past anything committed is refused as
+/// not ready rather than answered from before it.
+#[tokio::test]
+async fn a_causal_read_bounded_by_a_write_receipt_sees_the_write() {
+    let server = CoordinodeProcess::start().await;
+    let mut client = server.cypher_client().await;
+
+    let written = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE (n:Ryw {v: 7})".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("write")
+        .into_inner()
+        .stats
+        .and_then(|s| s.receipt)
+        .expect("a write reports its receipt");
+    assert!(written.operation_time > 0, "{written:?}");
+
+    let read = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:Ryw) RETURN n.v AS v".to_string(),
+            read_concern: Some(ReadConcern {
+                level: 2,
+                after_ts: written.operation_time,
+                wait_ms: 10_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("read")
+        .into_inner();
+    assert_eq!(read.rows.len(), 1, "the read sees its session's write");
+    let seen = read
+        .stats
+        .and_then(|s| s.receipt)
+        .expect("a read reports its receipt");
+    assert!(
+        seen.operation_time >= written.operation_time,
+        "the read's time {} is before the write it saw {}",
+        seen.operation_time,
+        written.operation_time
+    );
+    assert!(seen.position.is_none(), "a read names no log position");
+
+    let status = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:Ryw) RETURN n.v AS v".to_string(),
+            read_concern: Some(ReadConcern {
+                level: 2,
+                after_ts: u64::MAX,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect_err("a bound never met here");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
 }
 
 // ── MATCH+SET property change must persist across query boundaries ────────────

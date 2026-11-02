@@ -28,7 +28,7 @@ use coordinode_core::txn::command::{
     ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,
 };
 use coordinode_core::txn::operation::OperationDescriptor;
-use coordinode_core::txn::read_concern::ReadConcernLevel;
+use coordinode_core::txn::read_concern::{HistoryId, HistoryPosition, ReadConcernLevel};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
@@ -194,8 +194,12 @@ struct Slot {
 pub struct RoutedSettings {
     /// What the read may observe.
     pub read_concern: Option<ReadConcernLevel>,
-    /// Log index the read waits for.
-    pub after_index: Option<u64>,
+    /// Causal lower bound in commit timestamps.
+    pub after_ts: Option<u64>,
+    /// Causal position in one history's log.
+    pub after_position: Option<HistoryPosition>,
+    /// How long the read may wait for a causal bound not met yet.
+    pub causal_wait: Option<Duration>,
     /// Timestamp a snapshot read is pinned to.
     pub at_timestamp: Option<u64>,
     /// When a write is acknowledged.
@@ -281,6 +285,8 @@ pub struct RoutedStats {
     pub read_index: u64,
     /// What a read on a read-only member is as of; zero otherwise.
     pub read_as_of_ts: u64,
+    /// The timestamp it read at; zero for none.
+    pub read_ts: u64,
 }
 
 /// A statement's answer: its columns, its rows in column order and its
@@ -2108,7 +2114,15 @@ fn vector_consistency_from_wire(mode: u32) -> Result<Option<VectorConsistencyMod
 fn settings_to_wire(settings: RoutedSettings) -> wire::RoutedSettings {
     wire::RoutedSettings {
         read_concern_level: read_level_to_wire(settings.read_concern),
-        after_index: settings.after_index.unwrap_or(0),
+        after_ts: settings.after_ts.unwrap_or(0),
+        after_position: settings.after_position.map(|p| wire::RoutedPosition {
+            deployment: p.history.deployment.0.to_vec(),
+            group: p.history.group.raw(),
+            index: p.index,
+        }),
+        causal_wait_ms: settings
+            .causal_wait
+            .map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
         at_timestamp: settings.at_timestamp.unwrap_or(0),
         write_concern: settings.write_concern.map(write_concern_to_wire),
         vector_consistency: vector_consistency_to_wire(settings.vector_consistency),
@@ -2125,7 +2139,24 @@ fn settings_from_wire(settings: Option<wire::RoutedSettings>) -> Result<RoutedSe
     };
     Ok(RoutedSettings {
         read_concern: read_level_from_wire(settings.read_concern_level)?,
-        after_index: (settings.after_index > 0).then_some(settings.after_index),
+        after_ts: (settings.after_ts > 0).then_some(settings.after_ts),
+        after_position: settings
+            .after_position
+            .map(|p| {
+                let deployment = <[u8; 16]>::try_from(p.deployment.as_slice()).map_err(|_| {
+                    Status::invalid_argument("a causal position names a deployment of 16 bytes")
+                })?;
+                Ok::<_, Status>(HistoryPosition {
+                    history: HistoryId {
+                        deployment: DeploymentId(deployment),
+                        group: coordinode_core::group::GroupId(p.group),
+                    },
+                    index: p.index,
+                })
+            })
+            .transpose()?,
+        causal_wait: (settings.causal_wait_ms > 0)
+            .then(|| Duration::from_millis(u64::from(settings.causal_wait_ms))),
         at_timestamp: (settings.at_timestamp > 0).then_some(settings.at_timestamp),
         write_concern: settings
             .write_concern
@@ -2250,6 +2281,7 @@ fn stats_to_wire(stats: RoutedStats) -> wire::RoutedStats {
         commit_ts: stats.commit_ts,
         read_index: stats.read_index,
         read_as_of_ts: stats.read_as_of_ts,
+        read_ts: stats.read_ts,
     }
 }
 
@@ -2264,6 +2296,7 @@ fn stats_from_wire(stats: wire::RoutedStats) -> RoutedStats {
         commit_ts: stats.commit_ts,
         read_index: stats.read_index,
         read_as_of_ts: stats.read_as_of_ts,
+        read_ts: stats.read_ts,
     }
 }
 

@@ -465,7 +465,15 @@ fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
         params: HashMap::from([("limit".to_string(), Value::Int(3))]),
         settings: RoutedSettings {
             read_concern: Some(ReadConcernLevel::Majority),
-            after_index: Some(9),
+            after_ts: Some(9_000),
+            after_position: Some(coordinode_core::txn::read_concern::HistoryPosition {
+                history: coordinode_core::txn::read_concern::HistoryId {
+                    deployment: DeploymentId([5; 16]),
+                    group: coordinode_core::group::GroupId(2),
+                },
+                index: 9,
+            }),
+            causal_wait: Some(Duration::from_millis(75)),
             at_timestamp: None,
             write_concern: Some(WriteConcern {
                 w: WriteAck::Acks(2),

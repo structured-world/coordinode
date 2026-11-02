@@ -304,8 +304,7 @@ async fn rows_on(node: &CoordinodeProcess) -> Option<usize> {
             read_preference: 5, // NEAREST
             read_concern: Some(ReadConcern {
                 level: 1, // LOCAL
-                after_index: 0,
-                at_timestamp: 0,
+                ..Default::default()
             }),
             ..Default::default()
         })

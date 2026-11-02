@@ -278,8 +278,7 @@ async fn a_standalone_server_with_data_grows_into_a_cluster() {
                 read_preference: 3, // SECONDARY
                 read_concern: Some(ReadConcern {
                     level: 1, // LOCAL
-                    after_index: 0,
-                    at_timestamp: 0,
+                    ..Default::default()
                 }),
                 write_concern: None,
                 ..Default::default()
@@ -399,8 +398,7 @@ async fn a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor() {
                 read_preference,
                 read_concern: Some(ReadConcern {
                     level: 1, // LOCAL
-                    after_index: 0,
-                    at_timestamp: 0,
+                    ..Default::default()
                 }),
                 write_concern: None,
                 ..Default::default()
@@ -571,8 +569,7 @@ async fn a_member_restarts_into_its_group_with_its_data() {
                     read_preference: 5, // NEAREST
                     read_concern: Some(ReadConcern {
                         level: 1, // LOCAL
-                        after_index: 0,
-                        at_timestamp: 0,
+                        ..Default::default()
                     }),
                     write_concern: None,
                     ..Default::default()
@@ -630,8 +627,7 @@ async fn local_read(
             read_preference: 5, // NEAREST
             read_concern: Some(ReadConcern {
                 level: 1, // LOCAL
-                after_index: 0,
-                at_timestamp: 0,
+                ..Default::default()
             }),
             write_concern: None,
             ..Default::default()
@@ -988,8 +984,7 @@ async fn a_text_index_created_on_the_leader_serves_searches_on_a_follower() {
                 read_preference: 3, // SECONDARY
                 read_concern: Some(ReadConcern {
                     level: 1, // LOCAL
-                    after_index: 0,
-                    at_timestamp: 0,
+                    ..Default::default()
                 }),
                 write_concern: None,
                 ..Default::default()
@@ -1259,7 +1254,71 @@ async fn a_write_through_a_follower_runs_at_the_leader() {
     let stats = answer.stats.expect("stats");
     assert_eq!(stats.nodes_created, 1);
     assert!(stats.served_by_leader);
-    assert!(stats.applied_index > 0, "the write's own index comes back");
+    let receipt = stats.receipt.expect("the write's receipt comes back");
+    assert!(receipt.operation_time > 0, "its commit time: {receipt:?}");
+    let position = receipt.position.expect("its own entry");
+    assert!(position.index > 0, "{position:?}");
+    assert_eq!(
+        position.history.as_ref().map(|h| h.deployment.len()),
+        Some(16),
+        "qualified by the deployment it counts entries of"
+    );
+
+    // Read-your-writes on the follower that passed the write on: a read
+    // bounded by the write's commit time sees it there, and one bounded by
+    // its position too.
+    for (after_ts, after_position) in [(receipt.operation_time, None), (0, Some(position.clone()))]
+    {
+        let read = n2
+            .cypher_client()
+            .await
+            .execute_cypher(ExecuteCypherRequest {
+                query: "MATCH (n:ViaFollower) RETURN n.k AS k".to_string(),
+                read_preference: 3, // SECONDARY
+                read_concern: Some(ReadConcern {
+                    level: 2, // MAJORITY
+                    after_ts,
+                    after_position,
+                    wait_ms: 10_000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("the follower meets the bound");
+        let read = read.into_inner();
+        assert_eq!(read.rows.len(), 1, "the follower read sees the write");
+        assert!(
+            !read.stats.expect("stats").served_by_leader,
+            "served by the follower"
+        );
+    }
+
+    // A position of another history is refused, however small its index.
+    let mut foreign = position.clone();
+    if let Some(history) = foreign.history.as_mut() {
+        history.deployment = vec![0xEE; 16];
+    }
+    let refused = n2
+        .cypher_client()
+        .await
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:ViaFollower) RETURN n.k AS k".to_string(),
+            read_preference: 3, // SECONDARY
+            read_concern: Some(ReadConcern {
+                level: 2,
+                after_position: Some(foreign),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect_err("a position of another history");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
     assert_eq!(
         metadata
             .get("x-coordinode-hops")

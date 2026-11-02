@@ -679,8 +679,7 @@ async fn session_reports_connection_status_and_confirms_settings() {
             // Ask for MAJORITY reads by default on this connection.
             read_concern: Some(coordinode_integration::proto::replication::ReadConcern {
                 level: 2,
-                after_index: 0,
-                at_timestamp: 0,
+                ..Default::default()
             }),
             ..Default::default()
         })),

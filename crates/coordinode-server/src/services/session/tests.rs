@@ -323,7 +323,7 @@ fn a_failure_keeps_its_code_and_reason_through_the_session() {
         crate::services::error_details::Reason::NotLeader,
         [("leader_id", "3".to_string())],
     );
-    let frame = event_to_frame(9, SessionEvent::Error(failure(&original)));
+    let frame = event_to_frame(9, SessionEvent::Error(failure(&original)), None);
     let Some(Event::Error(e)) = frame.event else {
         panic!("expected Error, got {:?}", frame.event);
     };
@@ -361,6 +361,7 @@ fn event_to_frame_tags_the_request_id_and_maps_each_event() {
         SessionEvent::CursorOpen {
             columns: vec!["c".to_string()],
         },
+        None,
     );
     match open.event {
         Some(Event::CursorOpen(CursorOpen { columns })) => {
@@ -372,11 +373,55 @@ fn event_to_frame_tags_the_request_id_and_maps_each_event() {
     let error = event_to_frame(
         7,
         SessionEvent::Error(Failure::new(ErrorCode::InvalidArgument, "bad")),
+        None,
     );
     match error.event {
         Some(Event::Error(e)) => assert_eq!(e.code, Code::InvalidArgument as u32),
         other => panic!("expected Error, got {other:?}"),
     }
+}
+
+/// A commit's frame carries its commit time always, and its log position
+/// only where there is a log, qualified by the member's history.
+#[test]
+fn a_committed_frame_qualifies_its_position_by_the_history() {
+    use coordinode_core::txn::read_concern::HistoryId;
+    use coordinode_core::txn::timestamp::Timestamp;
+    use coordinode_core::txn::transaction::CommitReceipt;
+
+    let receipt = CommitReceipt {
+        commit_ts: Timestamp::from_raw(900),
+        applied_index: Some(31),
+    };
+    let history = HistoryId {
+        deployment: coordinode_core::group::DeploymentId([4; 16]),
+        group: coordinode_core::group::GroupId(0),
+    };
+    let frame = event_to_frame(1, SessionEvent::Committed { receipt }, Some(history));
+    let Some(Event::Committed(committed)) = frame.event else {
+        panic!("expected Committed, got {:?}", frame.event);
+    };
+    assert_eq!(committed.commit_ts, 900);
+    let position = committed.position.expect("a position");
+    assert_eq!(position.index, 31);
+    assert_eq!(position.history.map(|h| h.deployment), Some(vec![4; 16]));
+
+    // Standalone: no history, so no position, and still the commit time.
+    let frame = event_to_frame(
+        2,
+        SessionEvent::Committed {
+            receipt: CommitReceipt {
+                commit_ts: Timestamp::from_raw(901),
+                applied_index: None,
+            },
+        },
+        None,
+    );
+    let Some(Event::Committed(committed)) = frame.event else {
+        panic!("expected Committed, got {:?}", frame.event);
+    };
+    assert_eq!(committed.commit_ts, 901);
+    assert!(committed.position.is_none());
 }
 
 #[test]
@@ -422,8 +467,7 @@ fn to_op_reads_a_statements_own_settings_and_source() {
         query: "RETURN 1".to_string(),
         read_concern: Some(replication::ReadConcern {
             level: replication::ReadConcernLevel::Majority as i32,
-            after_index: 0,
-            at_timestamp: 0,
+            ..Default::default()
         }),
         write_concern: Some(replication::WriteConcern {
             w: Some(replication::write_concern::W::Acks(1)),
@@ -480,17 +524,18 @@ fn an_unknown_level_or_preference_is_refused_not_downgraded() {
             ..Default::default()
         }))
     };
-    let unknown_level = Some(replication::ReadConcern {
-        level: 99,
-        after_index: 0,
-        at_timestamp: 0,
-    });
+    let unknown_level = || {
+        Some(replication::ReadConcern {
+            level: 99,
+            ..Default::default()
+        })
+    };
     for (op, field) in [
-        (execute(unknown_level, None), "read_concern.level"),
+        (execute(unknown_level(), None), "read_concern.level"),
         (execute(None, Some(42)), "read_preference"),
         (
             Some(client_frame::Op::Configure(Configure {
-                read_concern: unknown_level,
+                read_concern: unknown_level(),
                 ..Default::default()
             })),
             "read_concern.level",
@@ -525,6 +570,7 @@ fn event_to_frame_maps_rows_through_value_conversion() {
         SessionEvent::Rows {
             rows: vec![vec![Value::Int(7), Value::String("x".to_string())]],
         },
+        None,
     );
     match frame.event {
         Some(Event::Rows(RowBatch { rows })) => {
