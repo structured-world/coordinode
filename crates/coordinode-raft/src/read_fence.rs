@@ -508,7 +508,24 @@ impl ReadFence {
         let deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
         loop {
             let missing = match self.causal_gap(after_ts, after_position) {
-                Ok(bound) => return Ok(bound),
+                Ok(bound) => {
+                    // A position met, the read allowed a wait and the
+                    // prefix is not closed yet: a view chosen at the closed
+                    // bound would leave part of it out, so the wait goes on
+                    // until it is closed too. Running out of it refuses
+                    // nothing here: a latest view holds the prefix already,
+                    // and a lower one is refused where it is chosen.
+                    if let (Some(deadline), Some(ts)) = (deadline, bound)
+                        && self.complete_through().is_none_or(|through| through < ts)
+                        && matches!(
+                            tokio::time::timeout_at(deadline, self.applied_rx.changed()).await,
+                            Ok(Ok(()))
+                        )
+                    {
+                        continue;
+                    }
+                    return Ok(bound);
+                }
                 Err(missing) => missing,
             };
             // A read-only member receives nothing, so a later point never
@@ -544,25 +561,7 @@ impl ReadFence {
         after_ts: Option<u64>,
         after_position: Option<coordinode_core::txn::read_concern::HistoryPosition>,
     ) -> Result<Option<u64>, String> {
-        let mut bound = after_ts;
-        if let Some(position) = after_position {
-            let applied = *self.applied_rx.borrow();
-            if applied < position.index {
-                return Err(format!(
-                    "the log is applied through {applied}, the read needs {}",
-                    position.index
-                ));
-            }
-            // Applied through the position is not yet visible at a view
-            // taken at the closed bound: the prefix's commits must be under
-            // it too.
-            let prefix = self
-                .engine
-                .as_ref()
-                .map(|engine| engine.commit_ceiling_through(position.index));
-            bound = bound.max(prefix);
-        }
-        if let Some(ts) = bound {
+        if let Some(ts) = after_ts {
             let complete = self.complete_through();
             if complete.is_none_or(|through| through < ts) {
                 return Err(match complete {
@@ -572,6 +571,27 @@ impl ReadFence {
                     None => format!("commits at or below {ts} are not known to be applied"),
                 });
             }
+        }
+        let mut bound = after_ts;
+        if let Some(position) = after_position {
+            let applied = *self.applied_rx.borrow();
+            if applied < position.index {
+                return Err(format!(
+                    "the log is applied through {applied}, the read needs {}",
+                    position.index
+                ));
+            }
+            // Applied through the position, the prefix is in this member's
+            // latest view. A view chosen lower (at the closed bound) holds it
+            // only up to the prefix's commit ceiling, which the read carries
+            // on as the timestamp its view must reach; it is not required
+            // complete here, since a latest view needs no closed bound.
+            let prefix = self
+                .engine
+                .as_ref()
+                .map(|engine| engine.commit_ceiling_through(position.index))
+                .filter(|ceiling| *ceiling > 0);
+            bound = bound.max(prefix);
         }
         Ok(bound)
     }

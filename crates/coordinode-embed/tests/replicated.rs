@@ -1812,8 +1812,16 @@ async fn a_host_works_through_any_member() {
         }
 
         // The default preference reads from the leader: the follower routes.
+        // The read depends on the write, so it carries the write's commit as
+        // its causal bound: a view chosen complete may otherwise still be
+        // below a commit the leader is closing.
+        let mut dependent = Statement::new("MATCH (n:ViaFollower) RETURN n.k AS k");
+        dependent.requested.read_concern =
+            Some(coordinode_core::txn::read_concern::ReadConcernLevel::Majority);
+        dependent.requested.after_ts = written.value.stats.commit_ts;
+        dependent.requested.causal_wait = Some(std::time::Duration::from_secs(10));
         let read = members[2]
-            .execute(Statement::new("MATCH (n:ViaFollower) RETURN n.k AS k"))
+            .execute(dependent)
             .await
             .expect("a follower's read is answered");
         assert_eq!(read.value.columns, vec!["k".to_owned()]);
