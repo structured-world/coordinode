@@ -8180,3 +8180,59 @@ async fn a_member_cut_off_from_its_leader_does_not_depose_it_on_return() {
         "TIMED OUT: a_member_cut_off_from_its_leader_does_not_depose_it_on_return"
     );
 }
+
+/// A disk whose log syncs stall for longer than any election timeout, under
+/// a burst of writes, does not cost the group its leader: heartbeats and
+/// votes need no sync, so every member keeps the term while the writes wait
+/// on the disk, and the writes commit once it answers.
+#[cfg(feature = "test-faults")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_log_sync_keeps_the_leader() {
+    use coordinode_storage::oplog::segment::SYNC_STALL_MS;
+    use std::sync::atomic::Ordering;
+    // Past the longest election timeout either timing profile runs with.
+    const STALL_MS: u64 = 4_000;
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let members = clocked_group(&dirs).await;
+        let (leader, _) = propose_through_leader(&members, b"node:before").await;
+        let term = members[leader].node.current_term();
+
+        SYNC_STALL_MS.store(STALL_MS, Ordering::Relaxed);
+        let burst = spawn_writes(&members[leader], "stalled", 16);
+        // Watch the group through two stalls.
+        let until = std::time::Instant::now() + Duration::from_millis(2 * STALL_MS + 500);
+        let mut changed = None;
+        while std::time::Instant::now() < until && changed.is_none() {
+            changed = members
+                .iter()
+                .find(|m| m.node.current_term() != term)
+                .map(|m| (m.id, m.node.current_term()));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        SYNC_STALL_MS.store(0, Ordering::Relaxed);
+        assert_eq!(changed, None, "an election ran while the log syncs stalled");
+        assert!(
+            members[leader].node.is_leader().await,
+            "the leader keeps leading"
+        );
+        for write in burst {
+            let (key, ts, outcome) = write.await.expect("write task");
+            assert!(
+                outcome.is_ok(),
+                "the write of {} at {ts} failed: {outcome:?}",
+                String::from_utf8_lossy(&key)
+            );
+        }
+    })
+    .await;
+    // A timeout leaves the stall set: later tests of the process must not see it.
+    SYNC_STALL_MS.store(0, Ordering::Relaxed);
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_stalled_log_sync_keeps_the_leader"
+    );
+}

@@ -597,8 +597,20 @@ impl SyncHandle {
     }
 }
 
+/// Milliseconds every segment sync of this process waits before it runs, as
+/// a stalled disk makes it; zero waits nothing.
+#[cfg(any(test, feature = "test-faults"))]
+pub static SYNC_STALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Make everything written to `file` durable under `sync`.
 fn sync_file(file: &std::fs::File, sync: SyncMethod) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-faults"))]
+    {
+        let stall = SYNC_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if stall > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(stall));
+        }
+    }
     match sync {
         // Each write already went out with O_DSYNC / write-through.
         SyncMethod::OpenDatasync => Ok(()),
