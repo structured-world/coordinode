@@ -1,0 +1,9 @@
+# Link with mold on Linux: the test binaries are large, and mold links them
+# with fewer threads and less random writing than the default lld. A
+# RUSTFLAGS set in the environment replaces these flags, so the CI jobs and
+# scripts that set one carry the same two flags in it.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "linker-features=-lld", "-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

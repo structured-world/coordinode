@@ -278,11 +278,15 @@ echo done >> ../status.txt" || true
   exit
 fi
 
+# Warnings are errors, and the build links with mold: an exported RUSTFLAGS
+# replaces the project's cargo config, which selects mold, so it says so too.
+rustflags='-D warnings -C linker-features=-lld -C link-arg=-fuse-ld=mold'
+
 if [ -n "$only_nextest" ]; then
   ssh "$host" "set -u
 cd '$remote_root'
 $checkout
-export RUSTFLAGS='-D warnings' COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 CARGO_TARGET_DIR='$remote_root/target'
+export RUSTFLAGS='$rustflags' COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 CARGO_TARGET_DIR='$remote_root/target'
 cargo nextest run --all-features --workspace --no-fail-fast --failure-output final $only_nextest > ../test.log 2>&1
 code=\$?
 # A stress run (--stress-count) exits 0 when some of its iterations failed
@@ -304,7 +308,7 @@ fi
 ssh "$host" "set -u
 cd '$remote_root'
 $checkout
-export RUSTFLAGS='-D warnings' COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 CARGO_TARGET_DIR='$remote_root/target'
+export RUSTFLAGS='$rustflags' COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 CARGO_TARGET_DIR='$remote_root/target'
 cargo clippy --workspace --all-targets --all-features -- -D warnings > ../clippy.log 2>&1
 echo clippy=\$? >> ../status.txt
 cargo build --all-features -p coordinode-server > ../build.log 2>&1

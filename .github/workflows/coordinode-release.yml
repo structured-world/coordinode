@@ -166,9 +166,10 @@ jobs:
           toolchain: stable
           components: rustfmt,clippy
       - name: Install source and release-configuration tools
+        # mold: the project's cargo config links with it on Linux.
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv mold
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
           tool: cargo-semver-checks@0.50.0

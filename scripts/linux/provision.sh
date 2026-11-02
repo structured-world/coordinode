@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Prepare a Linux machine for scripts/linux/check.sh: the packages the build
-# needs, rustup with the channel rust-toolchain.toml names, cargo-nextest and a
-# compilation cache. Safe to run again: whatever is already there is kept.
+# needs (the mold linker among them, which the project's cargo config selects
+# on Linux), rustup with the channel rust-toolchain.toml names, cargo-nextest
+# and a compilation cache. Safe to run again: whatever is already there is kept.
 #
 # Usage: COORDINODE_LINUX_HOST=<ssh target> [COORDINODE_SCCACHE_DIR=<dir>] \
 #          scripts/linux/provision.sh
@@ -37,10 +38,10 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if command -v dnf >/dev/null 2>&1; then
-  $sudo dnf install -y -q git gcc gcc-c++ clang make protobuf-compiler protobuf-devel rustup sccache
+  $sudo dnf install -y -q git gcc gcc-c++ clang make mold protobuf-compiler protobuf-devel rustup sccache
 elif command -v apt-get >/dev/null 2>&1; then
   $sudo apt-get update -q
-  $sudo apt-get install -y -q git build-essential clang protobuf-compiler libprotobuf-dev rustup sccache
+  $sudo apt-get install -y -q git build-essential clang mold protobuf-compiler libprotobuf-dev rustup sccache
 else
   echo "neither dnf nor apt-get found; install the packages by hand" >&2
   exit 1
@@ -147,5 +148,6 @@ echo "sccache: $cache_dir, ${cache_gib}G"
 echo "rust $(rustup run "$channel" rustc --version)"
 echo "$(rustup run "$channel" cargo nextest --version | head -n 1)"
 echo "$(protoc --version)"
+echo "$(mold --version)"
 echo "$(sccache --version)"
 REMOTE

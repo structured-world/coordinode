@@ -55,8 +55,9 @@ jobs:
         with:
           components: miri
 
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Install protobuf compiler and mold
+        # mold: the project's cargo config links with it on Linux.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - uses: Swatinem/rust-cache@v2
 

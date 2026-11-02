@@ -10,11 +10,12 @@ runs:
     - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
       with:
         tool: cargo-hakari@0.9.39,cargo-local-registry@0.2.12
-    - name: Install the source-only protobuf compiler
+    - name: Install the source-only protobuf compiler and mold
+      # mold: the project's cargo config links with it on Linux.
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv
+        sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv mold
     - name: Prepare archives and qualify their external consumer
       shell: bash
       env:

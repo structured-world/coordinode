@@ -111,6 +111,10 @@ jobs:
     runs-on:
       - self-hosted
       - coordinode
+    env:
+      # The workflow's RUSTFLAGS replaces the project's cargo config, which
+      # links with mold on Linux; the linker flags are repeated here.
+      RUSTFLAGS: "-D warnings -C linker-features=-lld -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -125,7 +129,7 @@ jobs:
             echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           fi
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check protobuf compiler and well-known types
+      - name: Check protobuf compiler, well-known types and mold
         # The self-hosted runner gets its packages from
         # scripts/linux/provision.sh; the job cannot install them (dnf, and
         # sudo would ask for a password). The protos import
@@ -138,7 +142,12 @@ jobs:
             echo "::error::protoc or the protobuf well-known types are missing on this runner; run scripts/linux/provision.sh against it"
             exit 1
           fi
+          if ! command -v mold >/dev/null 2>&1; then
+            echo "::error::the mold linker is missing on this runner; run scripts/linux/provision.sh against it"
+            exit 1
+          fi
           echo "protoc: $(protoc --version)"
+          echo "$(mold --version)"
       - uses: Swatinem/rust-cache@v2
         with:
           # The runner's $CARGO_HOME/bin is its own and outlives the job:
@@ -177,6 +186,9 @@ jobs:
     runs-on:
       - self-hosted
       - coordinode
+    env:
+      # See the `test` job: linked with mold.
+      RUSTFLAGS: "-D warnings -C linker-features=-lld -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -189,13 +201,17 @@ jobs:
             echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           fi
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check protobuf compiler and well-known types
+      - name: Check protobuf compiler, well-known types and mold
         # See the `test` job: the runner is provisioned, not the job.
         run: |
           if ! command -v protoc >/dev/null 2>&1 \
             || { [ ! -f /usr/include/google/protobuf/empty.proto ] \
               && [ ! -f /usr/local/include/google/protobuf/empty.proto ]; }; then
             echo "::error::protoc or the protobuf well-known types are missing on this runner; run scripts/linux/provision.sh against it"
+            exit 1
+          fi
+          if ! command -v mold >/dev/null 2>&1; then
+            echo "::error::the mold linker is missing on this runner; run scripts/linux/provision.sh against it"
             exit 1
           fi
           echo "protoc: $(protoc --version)"
@@ -344,18 +360,24 @@ jobs:
     # consensus, no inter-node channel, no async runtime compiled in, and its
     # tests passing without them.
     runs-on: ubuntu-latest
+    env:
+      # See the `test` job: linked with mold.
+      RUSTFLAGS: "-D warnings -C linker-features=-lld -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protobuf compiler (skip if present)
+      - name: Install protobuf compiler and mold (skip if present)
         run: |
-          if command -v protoc >/dev/null 2>&1; then
-            echo "protoc already installed: $(protoc --version)"
-          else
-            sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          missing=''
+          command -v protoc >/dev/null 2>&1 || missing="$missing protobuf-compiler libprotobuf-dev"
+          command -v mold >/dev/null 2>&1 || missing="$missing mold"
+          if [ -n "$missing" ]; then
+            sudo apt-get update && sudo apt-get install -y $missing
           fi
+          echo "protoc: $(protoc --version)"
+          echo "$(mold --version)"
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -376,6 +398,9 @@ jobs:
       - self-hosted
       - coordinode
     needs: [fmt, clippy, test]
+    env:
+      # See the `test` job: linked with mold.
+      RUSTFLAGS: "-D warnings -C linker-features=-lld -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -388,13 +413,17 @@ jobs:
             echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           fi
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check protobuf compiler and well-known types
+      - name: Check protobuf compiler, well-known types and mold
         # See the `test` job: the runner is provisioned, not the job.
         run: |
           if ! command -v protoc >/dev/null 2>&1 \
             || { [ ! -f /usr/include/google/protobuf/empty.proto ] \
               && [ ! -f /usr/local/include/google/protobuf/empty.proto ]; }; then
             echo "::error::protoc or the protobuf well-known types are missing on this runner; run scripts/linux/provision.sh against it"
+            exit 1
+          fi
+          if ! command -v mold >/dev/null 2>&1; then
+            echo "::error::the mold linker is missing on this runner; run scripts/linux/provision.sh against it"
             exit 1
           fi
           echo "protoc: $(protoc --version)"

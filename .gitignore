@@ -49,9 +49,6 @@ Thumbs.db
 *.plan.md
 /memory/
 
-# Local cargo overrides (path deps for development)
-.cargo/config.toml
-
 # Local editor and tooling config
 /CLAUDE.md
 .claude/
