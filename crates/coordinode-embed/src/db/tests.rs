@@ -2482,3 +2482,49 @@ fn the_text_index_loader_refuses_an_unreadable_definition() {
         Ok(_) => panic!("loaded without the definition it cannot read"),
     }
 }
+
+/// An ordinary read is answered while an unrelated commit is in flight and
+/// never waits for it. A read bounded at that commit's timestamp is refused
+/// as not ready at once, since the commit it depends on has not landed, and
+/// is met once it has; it is never answered from a view missing it.
+#[test]
+fn an_ordinary_read_does_not_wait_for_a_commit_in_flight() {
+    use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    db.execute_cypher_shared("CREATE (:Seen {k: 1})", None, None, None, None)
+        .expect("seed");
+    let pending = Arc::clone(db.engine().pending_commits());
+    let (in_flight, admission) = pending
+        .admit_allocated(|| db.oracle.next().as_raw(), Vec::new(), Vec::new())
+        .expect("admit an unrelated commit");
+
+    let majority = ReadConcern::majority();
+    let started = Instant::now();
+    let rows = db
+        .execute_cypher_shared("MATCH (n:Seen) RETURN n", None, None, Some(&majority), None)
+        .expect("an ordinary read");
+    assert_eq!(rows.rows.len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the ordinary read waited {:?} for a commit it does not depend on",
+        started.elapsed()
+    );
+
+    let bounded = ReadConcern {
+        level: ReadConcernLevel::Majority,
+        after_ts: Some(in_flight),
+        ..ReadConcern::default()
+    };
+    let refused =
+        db.execute_cypher_shared("MATCH (n:Seen) RETURN n", None, None, Some(&bounded), None);
+    assert!(
+        matches!(refused, Err(DatabaseError::ReadNotReady { requested, .. }) if requested == in_flight),
+        "a read bounded at a commit in flight is not ready: {refused:?}"
+    );
+
+    drop(admission);
+    db.execute_cypher_shared("MATCH (n:Seen) RETURN n", None, None, Some(&bounded), None)
+        .expect("met once the commit is no longer in flight");
+}

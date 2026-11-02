@@ -8242,3 +8242,150 @@ async fn a_stalled_log_sync_keeps_the_leader() {
         "TIMED OUT: a_stalled_log_sync_keeps_the_leader"
     );
 }
+
+/// A follower that has not applied a write is not ready for a read bounded
+/// by it, however far its clock has moved past the write: a later clock is
+/// no proof the commits under it are applied. Without a wait it is refused at
+/// once; once it applies the write, the same bound is met, and met again at
+/// the same timestamp on the next read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_behind_a_write_is_not_ready_whatever_its_clock() {
+    use coordinode_raft::read_fence::ReadFenceError;
+
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let members = clocked_group(&dirs).await;
+        let (leader, _) = propose_through_leader(&members, b"node:before").await;
+        let behind = &members[(leader + 1) % members.len()];
+
+        // Hold the follower's applies: it keeps receiving the log, the other
+        // two members still commit, and nothing more applies on it.
+        let fence = behind.engine.raft_fence().expect("a Raft member");
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            fence.with_applies_paused(&mut |_, _| {
+                held_tx.send(()).expect("report held");
+                release_rx.recv().expect("released");
+                Ok(())
+            })
+        });
+        tokio::task::spawn_blocking(move || held_rx.recv())
+            .await
+            .expect("join")
+            .expect("applies held");
+
+        let (_, written) = propose_through_leader(&members, b"node:after").await;
+        // Its clock is past the write, by gossip or by its own wall time.
+        behind
+            .oracle
+            .advance_to(Timestamp::from_raw(written + 1_000_000));
+        let mut reads = behind.node.read_fence();
+        let refused = reads
+            .await_causal(Some(written), None, None)
+            .await
+            .expect_err("the write is not applied here");
+        assert!(
+            matches!(refused, ReadFenceError::NotReady { waited: false, .. }),
+            "refused at once as not ready: {refused:?}"
+        );
+        let refused = reads
+            .await_causal(Some(written), None, Some(Duration::from_millis(300)))
+            .await
+            .expect_err("still held after the wait");
+        assert!(
+            matches!(refused, ReadFenceError::NotReady { waited: true, .. }),
+            "refused after the wait: {refused:?}"
+        );
+
+        release_tx.send(()).expect("release");
+        tokio::task::spawn_blocking(move || holder.join())
+            .await
+            .expect("join")
+            .expect("holder")
+            .expect("paused work");
+        reads
+            .await_causal(Some(written), None, Some(Duration::from_secs(15)))
+            .await
+            .expect("met once the follower applies the write");
+        // Continuing at the same timestamp: the bound stays met.
+        reads
+            .await_causal(Some(written), None, None)
+            .await
+            .expect("the same bound is met again without a wait");
+        let through = reads.complete_through().expect("a complete cut");
+        assert!(through >= written, "{through} < {written}");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_follower_behind_a_write_is_not_ready_whatever_its_clock"
+    );
+}
+
+/// A causal bound outlives the member that issued it: after the leader that
+/// committed a write is lost, every survivor meets a read bounded by the
+/// write's time and by its log position, which counts entries of the same
+/// history under the new leader; a write after the failover gives a later
+/// bound the survivors meet too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_causal_bound_is_met_after_its_leader_is_lost() {
+    use coordinode_core::txn::read_concern::HistoryPosition;
+
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let mut members = clocked_group(&dirs).await;
+        let (leader, written) = propose_through_leader(&members, b"node:before-loss").await;
+        let issued = members[leader].node.read_fence();
+        let position = HistoryPosition {
+            history: issued.history().expect("the leader knows its history"),
+            // At or past the write's own entry.
+            index: issued.applied_index(),
+        };
+
+        let lost = members.remove(leader);
+        lost.node.shutdown().await.expect("stop the leader");
+        drop(lost);
+
+        let next = await_ready_leader(&members).await;
+        for m in &members {
+            let mut reads = m.node.read_fence();
+            assert_eq!(
+                reads.history(),
+                Some(position.history),
+                "the same history under the new leader"
+            );
+            reads
+                .await_causal(Some(written), Some(position), Some(Duration::from_secs(15)))
+                .await
+                .expect("a survivor meets the lost leader's bound");
+        }
+
+        let after = propose_held(
+            &members[next].node,
+            &members[next].engine,
+            &members[next].oracle,
+            b"node:after-loss",
+        );
+        assert!(
+            after > written,
+            "the new leader stamps later: {after} <= {written}"
+        );
+        for m in &members {
+            m.node
+                .read_fence()
+                .await_causal(Some(after), None, Some(Duration::from_secs(15)))
+                .await
+                .expect("a survivor meets the new leader's bound");
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_causal_bound_is_met_after_its_leader_is_lost"
+    );
+}

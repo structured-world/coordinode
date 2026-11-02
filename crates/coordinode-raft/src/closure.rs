@@ -133,11 +133,15 @@ pub(crate) fn spawn_closer(
             let Ok(count) = woke else {
                 return;
             };
-            if count == seen {
+            // A commit applied here and not covered is closed too: one a lost
+            // leader confirmed but never covered is in no withdrawal here.
+            if count == seen && !engine.applied_past_closure() {
                 continue;
             }
-            seen = count;
-            tokio::time::sleep(settle).await;
+            if count != seen {
+                seen = count;
+                tokio::time::sleep(settle).await;
+            }
             let Some(oracle) = engine.oracle() else {
                 continue;
             };
@@ -151,7 +155,7 @@ pub(crate) fn spawn_closer(
             let due = engine
                 .pending_commits()
                 .closure_due(|| oracle.current().as_raw());
-            if due.is_none() {
+            if due.is_none() && !engine.applied_past_closure() {
                 continue;
             }
             let mut request = Request::closing(0);

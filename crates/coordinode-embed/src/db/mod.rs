@@ -2726,13 +2726,21 @@ impl Database {
             // met here: the read is refused rather than answered from before
             // the bound.
             let view_through = read_ts.as_raw().checked_sub(1);
-            if let Some(bound) = causal_after_ts
-                && view_through.is_none_or(|through| through < bound)
-            {
-                return Err(DatabaseError::ReadNotReady {
-                    requested: bound,
-                    ready_through: view_through,
-                });
+            if let Some(bound) = causal_after_ts {
+                // Below every commit still in flight, whatever the store
+                // keeps in a journal: the bound needs each commit at or below
+                // it in the view, and one in flight under the view is not.
+                let ready_through = self
+                    .engine
+                    .pending_commits()
+                    .durable_floor(read_ts.as_raw())
+                    .checked_sub(1);
+                if ready_through.is_none_or(|through| through < bound) {
+                    return Err(DatabaseError::ReadNotReady {
+                        requested: bound,
+                        ready_through,
+                    });
+                }
             }
             // The receipt: no commit the view holds is later than this, and
             // nothing later than a member applying the same log can be

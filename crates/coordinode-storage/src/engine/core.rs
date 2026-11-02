@@ -5728,6 +5728,16 @@ impl StorageEngine {
         Some(self.complete_cut().map_or(applied, |cut| cut.max(applied)))
     }
 
+    /// Whether a Raft entry applied here carries a commit the closed bound
+    /// does not cover yet. A leader that took over from one lost before it
+    /// covered its last commits closes them: nothing else would, while no
+    /// new write comes.
+    pub fn applied_past_closure(&self) -> bool {
+        self.raft_applied_ts
+            .load(std::sync::atomic::Ordering::Acquire)
+            >= self.closure_frontier()
+    }
+
     /// Record that a Raft entry carrying `commit_ts` applied here.
     pub(crate) fn note_raft_applied(&self, commit_ts: u64) {
         self.raft_applied_ts
