@@ -136,6 +136,10 @@ impl CommandExecutor for Scripted {
         assert_eq!(begin.write_concern, None);
         assert_eq!(begin.timeout_outcome, Some(TimeoutOutcome::Commit));
         assert_eq!(begin.operation, Some(operation(1)));
+        // The causal bound and its wait cross as well: the leader pins the
+        // transaction's snapshot no earlier than the bound.
+        assert_eq!(begin.after_ts, Some(77));
+        assert_eq!(begin.causal_wait, Some(Duration::from_millis(5)));
         Ok(())
     }
 
@@ -513,6 +517,8 @@ fn a_start_crosses_unchanged() {
             }),
             timeout_outcome: Some(TimeoutOutcome::Commit),
             operation: Some(operation(7)),
+            after_ts: Some(4_242),
+            causal_wait: Some(Duration::from_millis(30)),
         },
     ] {
         let sent = RoutedStatement {
@@ -1092,6 +1098,8 @@ async fn transaction_commands_cross_both_ways() {
             write_concern: None,
             timeout_outcome: Some(TimeoutOutcome::Commit),
             operation: Some(operation(1)),
+            after_ts: Some(77),
+            causal_wait: Some(Duration::from_millis(5)),
         })
         .await
         .expect("begun");

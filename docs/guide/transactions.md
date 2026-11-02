@@ -106,6 +106,8 @@ A member serves the read only where every commit at or below `after_ts` is appli
 
 Waiting is opt-in. A bound the member does not meet yet is refused at once with `UNAVAILABLE`, `reason = READ_NOT_READY`, so the client retries, reads elsewhere, or allows a wait: `wait_ms` lets the member wait up to that long for the bound, and the same refusal comes once it runs out. The read is never answered from before its bound. Ordinary reads with no bound are never held back by writes still in flight.
 
+An interactive transaction takes the session's bound when it begins (`Configure.read_concern.after_ts`, `TransactionOptions::after_ts` embedded): its snapshot is pinned no earlier than the bound, or the start is refused as not ready and nothing is opened, under the same wait rule.
+
 Constraints: a causal bound needs level `MAJORITY` or `SNAPSHOT` (`LOCAL` and `LINEARIZABLE` are refused with `FAILED_PRECONDITION`), excludes `at_timestamp`, and a write carrying one must be majority-journaled: a write answered earlier may still be lost and reports `operation_time = 0`, no dependency. The Rust client's `execute_causal_write` and `execute_causal_read` carry the token, and `CoordinodeClientBuilder::causal_wait` sets the wait; the embedded API takes the same bounds in `ReadConcern { after_ts, after_position, wait }` and reports a read's timestamp in `WriteStats::read_ts`.
 
 ## Time-Travel Queries

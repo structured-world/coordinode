@@ -321,6 +321,8 @@ pub fn begin(db: &Database, begin: RoutedBegin) -> Result<(), DatabaseError> {
             write_concern: begin.write_concern,
             timeout_outcome: begin.timeout_outcome,
             operation: begin.operation,
+            after_ts: begin.after_ts,
+            causal_wait: begin.causal_wait,
         },
     )
 }
@@ -461,6 +463,12 @@ impl CommandExecutor for MemberCommandExecutor {
         answer: &mut AnswerWriter,
     ) -> Result<RoutedStats, DatabaseError> {
         if statement.transaction.is_some() {
+            if let Some(start) = &statement.start {
+                self.runtime.block_on(
+                    self.admitter
+                        .await_start_bound(start.after_ts, start.causal_wait),
+                )?;
+            }
             return write_in_transaction(
                 self.admitter.database(),
                 statement,
@@ -496,6 +504,10 @@ impl CommandExecutor for MemberCommandExecutor {
     }
 
     fn begin(&self, call: RoutedBegin) -> Result<(), DatabaseError> {
+        self.runtime.block_on(
+            self.admitter
+                .await_start_bound(call.after_ts, call.causal_wait),
+        )?;
         begin(&self.admitter.database().read(), call)
     }
 

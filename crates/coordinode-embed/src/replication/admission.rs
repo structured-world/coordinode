@@ -389,6 +389,28 @@ impl Admitter {
         })))
     }
 
+    /// Establish a transaction start's causal bound on this member's log, as
+    /// a causal read's: met at once, after `wait` when one is allowed, or
+    /// refused as not ready. Nothing to establish standalone, where the
+    /// database checks the bound against the snapshot it pins.
+    ///
+    /// # Errors
+    ///
+    /// The read fence's refusal, as for a read.
+    pub async fn await_start_bound(
+        &self,
+        after_ts: Option<u64>,
+        wait: Option<Duration>,
+    ) -> Result<(), DatabaseError> {
+        let (Some(node), Some(after_ts)) = (self.node.as_ref(), after_ts) else {
+            return Ok(());
+        };
+        node.read_fence()
+            .await_causal(Some(after_ts), None, wait)
+            .await
+            .map_err(fence_error)
+    }
+
     /// Check and fence in one step.
     ///
     /// # Errors

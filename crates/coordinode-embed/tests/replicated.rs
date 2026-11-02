@@ -1748,6 +1748,8 @@ fn begin_of(id: TransactionId) -> RoutedBegin {
         write_concern: None,
         timeout_outcome: None,
         operation: None,
+        after_ts: None,
+        causal_wait: None,
     }
 }
 

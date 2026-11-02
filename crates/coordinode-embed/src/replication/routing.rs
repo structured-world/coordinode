@@ -248,6 +248,10 @@ pub struct TransactionStart {
     pub timeout_outcome: Option<TimeoutOutcome>,
     /// The client operation its commit carries out.
     pub operation: Option<OperationDescriptor>,
+    /// Causal lower bound of its snapshot; none when `None`.
+    pub after_ts: Option<u64>,
+    /// How long its start may wait for that bound.
+    pub causal_wait: Option<Duration>,
 }
 
 impl RoutedBegin {
@@ -260,6 +264,20 @@ impl RoutedBegin {
             write_concern: start.write_concern,
             timeout_outcome: start.timeout_outcome,
             operation: start.operation,
+            after_ts: start.after_ts,
+            causal_wait: start.causal_wait,
+        }
+    }
+
+    /// How the transaction opens, as a start says it.
+    pub fn start(&self) -> TransactionStart {
+        TransactionStart {
+            read_concern: self.read_concern,
+            write_concern: self.write_concern,
+            timeout_outcome: self.timeout_outcome,
+            operation: self.operation,
+            after_ts: self.after_ts,
+            causal_wait: self.causal_wait,
         }
     }
 }
@@ -317,6 +335,10 @@ pub struct RoutedBegin {
     pub timeout_outcome: Option<TimeoutOutcome>,
     /// The client operation its commit carries out.
     pub operation: Option<OperationDescriptor>,
+    /// Causal lower bound of its snapshot; none when `None`.
+    pub after_ts: Option<u64>,
+    /// How long its start may wait for that bound.
+    pub causal_wait: Option<Duration>,
 }
 
 /// Commit an interactive transaction at the leader.
@@ -2205,6 +2227,8 @@ fn start_to_wire(start: TransactionStart) -> wire::RoutedStart {
         settings: Some(settings_to_wire(RoutedSettings {
             read_concern: start.read_concern,
             write_concern: start.write_concern,
+            after_ts: start.after_ts,
+            causal_wait: start.causal_wait,
             ..RoutedSettings::default()
         })),
         timeout_outcome: timeout_outcome_to_wire(start.timeout_outcome),
@@ -2219,6 +2243,8 @@ fn start_from_wire(start: wire::RoutedStart) -> Result<TransactionStart, Status>
         write_concern: settings.write_concern,
         timeout_outcome: timeout_outcome_from_wire(start.timeout_outcome)?,
         operation: operation_from_wire(&start.operation)?,
+        after_ts: settings.after_ts,
+        causal_wait: settings.causal_wait,
     })
 }
 
@@ -2307,6 +2333,8 @@ fn begin_to_wire(begin: RoutedBegin) -> wire::RoutedBegin {
         settings: Some(settings_to_wire(RoutedSettings {
             read_concern: begin.read_concern,
             write_concern: begin.write_concern,
+            after_ts: begin.after_ts,
+            causal_wait: begin.causal_wait,
             ..RoutedSettings::default()
         })),
         timeout_outcome: timeout_outcome_to_wire(begin.timeout_outcome),
@@ -2323,6 +2351,8 @@ fn begin_from_wire(begin: wire::RoutedBegin) -> Result<RoutedBegin, Status> {
         write_concern: settings.write_concern,
         timeout_outcome: timeout_outcome_from_wire(begin.timeout_outcome)?,
         operation: operation_from_wire(&begin.operation)?,
+        after_ts: settings.after_ts,
+        causal_wait: settings.causal_wait,
     })
 }
 

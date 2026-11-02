@@ -100,6 +100,14 @@ pub struct TransactionOptions {
     /// The client operation its commit carries out. Required when it
     /// commits at idle expiry, so that its client can resolve that commit.
     pub operation: Option<OperationDescriptor>,
+    /// Causal lower bound of its snapshot: every commit at or below this
+    /// timestamp is in what its statements read. Refused as not ready when
+    /// the snapshot it would pin is earlier.
+    pub after_ts: Option<u64>,
+    /// How long the start may wait, standalone, for commits still in flight
+    /// at or below `after_ts`; a replicated member waits in its read fence
+    /// before the start reaches here.
+    pub causal_wait: Option<Duration>,
 }
 
 impl TransactionOptions {
@@ -606,6 +614,11 @@ impl Database {
         self.reap_idle_transactions(self.interactive_idle_timeout);
         let tenure = self.interactive.current()?;
         let read_concern = options.read_concern.unwrap_or(self.read_concern);
+        let causal_after_ts = self.prepare_causal_read(&super::CausalBound {
+            after_ts: options.after_ts,
+            after_position: None,
+            wait: options.causal_wait,
+        })?;
         let read_ts = self.oracle.next();
         // The view is the engine's complete snapshot, not the timestamp just
         // allocated: a fresh number from the clock can already cover a commit
@@ -627,10 +640,22 @@ impl Database {
                 read_ts,
             )
         };
+        let state = txn.take_state();
+        // Every statement reads this snapshot, so a causal bound past it is
+        // refused here rather than answered from before it.
+        let view_through = state.read_ts().as_raw().checked_sub(1);
+        if let Some(bound) = causal_after_ts
+            && view_through.is_none_or(|through| through < bound)
+        {
+            return Err(DatabaseError::ReadNotReady {
+                requested: bound,
+                ready_through: view_through,
+            });
+        }
         let now = Instant::now();
         let context = Context {
             id,
-            state: Some(txn.take_state()),
+            state: Some(state),
             begun: now,
             touched: now,
             chain: crate::operation::EMPTY_CHAIN,

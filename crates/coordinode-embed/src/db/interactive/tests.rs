@@ -1186,3 +1186,50 @@ fn a_transaction_keeps_the_concerns_it_began_with() {
         .check_in(&id, checked.state, checked.chain)
         .expect("check in");
 }
+
+/// A transaction started with a causal bound pins a snapshot no earlier than
+/// it: bounded by a write's commit time it sees that write; bounded past
+/// anything this store committed it is refused as not ready, opening nothing,
+/// rather than reading from before its bound.
+#[test]
+fn a_causal_start_pins_no_earlier_than_its_bound() {
+    let (db, _dir) = open();
+    let written = db
+        .execute_cypher_shared("CREATE (:Bounded {k: 1})", None, None, None, None)
+        .expect("write")
+        .write_stats
+        .commit_ts
+        .expect("its commit time");
+
+    let id = db
+        .begin_transaction_with(&TransactionOptions {
+            read_concern: Some(ReadConcernLevel::Majority),
+            after_ts: Some(written),
+            ..TransactionOptions::trusted()
+        })
+        .expect("a bound already met");
+    let rows = db
+        .execute_in_transaction(id, "MATCH (n:Bounded) RETURN n.k AS k", None)
+        .expect("read");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the transaction sees the write it is bounded by"
+    );
+    db.rollback_transaction(id).expect("rollback");
+
+    let refused = db.begin_transaction_with(&TransactionOptions {
+        read_concern: Some(ReadConcernLevel::Majority),
+        after_ts: Some(u64::MAX - 1),
+        causal_wait: Some(Duration::from_millis(20)),
+        ..TransactionOptions::trusted()
+    });
+    assert!(
+        matches!(refused, Err(DatabaseError::ReadNotReady { requested, .. }) if requested == u64::MAX - 1),
+        "{refused:?}"
+    );
+    assert!(
+        db.transactions_view().transactions().is_empty(),
+        "a refused start opens nothing"
+    );
+}

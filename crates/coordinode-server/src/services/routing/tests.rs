@@ -173,6 +173,8 @@ async fn transaction_control_fails_the_same_way_on_both_paths() {
         write_concern: None,
         timeout_outcome: None,
         operation: None,
+        after_ts: None,
+        causal_wait: None,
     };
     router.begin(begin()).await.expect("begun");
 

@@ -107,6 +107,16 @@ impl StatementExecutor {
         self.admitter.history()
     }
 
+    /// Establish a transaction start's causal bound on this member's log;
+    /// see [`coordinode_embed::replication::admission::Admitter::await_start_bound`].
+    pub(crate) async fn await_start_bound(
+        &self,
+        after_ts: Option<u64>,
+        wait: Option<std::time::Duration>,
+    ) -> Result<(), DatabaseError> {
+        self.admitter.await_start_bound(after_ts, wait).await
+    }
+
     /// Whether a fence has to wait on the consensus node, which needs a
     /// runtime; outside a cluster a statement is admitted without waiting.
     pub(crate) fn needs_fence(&self) -> bool {

@@ -33,6 +33,22 @@ impl ServerCommandExecutor {
     pub fn new(executor: StatementExecutor) -> Self {
         Self { executor }
     }
+
+    /// Establish a transaction start's causal bound here before its snapshot
+    /// is pinned. Called from the blocking pool, where waiting on the runtime
+    /// is allowed.
+    fn await_start_bound(
+        &self,
+        after_ts: Option<u64>,
+        wait: Option<std::time::Duration>,
+    ) -> Result<(), DatabaseError> {
+        if after_ts.is_none() || !self.executor.needs_fence() {
+            return Ok(());
+        }
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|e| DatabaseError::Other(format!("no runtime to fence the start on: {e}")))?;
+        runtime.block_on(self.executor.await_start_bound(after_ts, wait))
+    }
 }
 
 impl CommandExecutor for ServerCommandExecutor {
@@ -44,6 +60,9 @@ impl CommandExecutor for ServerCommandExecutor {
         answer: &mut AnswerWriter,
     ) -> Result<RoutedStats, DatabaseError> {
         if statement.transaction.is_some() {
+            if let Some(start) = statement.start {
+                self.await_start_bound(start.after_ts, start.causal_wait)?;
+            }
             return executor::write_in_transaction(
                 self.executor.database(),
                 statement,
@@ -101,6 +120,7 @@ impl CommandExecutor for ServerCommandExecutor {
     }
 
     fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
+        self.await_start_bound(begin.after_ts, begin.causal_wait)?;
         executor::begin(&self.executor.database().read(), begin)
     }
 

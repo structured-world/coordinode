@@ -182,6 +182,8 @@ fn transaction_start(
         write_concern: settings.write_concern,
         timeout_outcome: settings.timeout_outcome,
         operation: operation.copied(),
+        after_ts: settings.after_ts,
+        causal_wait: settings.causal_wait,
     }
 }
 
@@ -440,6 +442,19 @@ impl DatabaseCursorEngine {
         transaction: TransactionId,
         start: RoutedStart,
     ) -> Result<(), EngineError> {
+        // A causal bound is established on the log before the snapshot is
+        // pinned, as for a read; the database then checks the snapshot.
+        if start.after_ts.is_some() && self.executor.needs_fence() {
+            let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+                EngineError::internal(format!("no runtime to fence the start on: {e}"))
+            })?;
+            runtime
+                .block_on(
+                    self.executor
+                        .await_start_bound(start.after_ts, start.causal_wait),
+                )
+                .map_err(engine_error)?;
+        }
         self.database()
             .read()
             .begin_transaction_as(
@@ -449,6 +464,8 @@ impl DatabaseCursorEngine {
                     write_concern: start.write_concern,
                     timeout_outcome: start.timeout_outcome,
                     operation: start.operation,
+                    after_ts: start.after_ts,
+                    causal_wait: start.causal_wait,
                     ..TransactionOptions::trusted()
                 },
             )
