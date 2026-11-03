@@ -8188,6 +8188,204 @@ async fn a_member_cut_off_from_its_leader_does_not_depose_it_on_return() {
     );
 }
 
+/// A replication stream a leader opened in one term and that was held up
+/// across two elections can deliver that term's vote and an entry the group
+/// has since overwritten together with a commit made in a later term. A
+/// member that missed both elections stores the entry but does not apply it:
+/// the commit comes from a leader it has not followed, so the entry may still
+/// be replaced, and it is once the member hears the current leader. The hold
+/// up happens inside the consensus library and cannot be timed from outside,
+/// so the member is handed the request such a stream builds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_stream_with_a_later_commit_does_not_apply_an_overwritten_entry() {
+    use coordinode_raft::storage::{Entry, LogId, Request};
+    use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse};
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let members = clocked_group(&dirs).await;
+        let (leader, ts) = propose_through_leader(&members, b"node:prefix").await;
+        // Every member applied the write and the entry closing it, so the
+        // leader has nothing left to append in its term.
+        await_closed_past(&members, ts, "every member closes past the prefix").await;
+        let old_term = members[leader].node.current_term();
+        let leader_id = members[leader].id;
+        let behind = (leader + 1) % members.len();
+        let other = (leader + 2) % members.len();
+        let leader_last = members[leader]
+            .node
+            .raft()
+            .metrics()
+            .borrow_watched()
+            .last_log_index;
+        await_condition(
+            Duration::from_secs(15),
+            "the member to cut off holds the leader's log in its term",
+            || {
+                let metrics = members[behind].node.raft().metrics();
+                let m = metrics.borrow_watched();
+                m.last_log_index == leader_last
+                    && m.vote.leader_id().term == old_term
+                    && members[behind].node.current_leader() == Some(leader_id)
+            },
+        )
+        .await;
+        coordinode_raft::cluster::nemesis::isolate(
+            members[behind].id,
+            &[members[leader].id, members[other].id],
+        );
+        let (vote, prefix_end) = {
+            let metrics = members[behind].node.raft().metrics();
+            let m = metrics.borrow_watched();
+            (m.vote, m.last_log_index.expect("the member holds a log"))
+        };
+        let prefix_end = members[behind]
+            .node
+            .raft()
+            .with_raft_state(move |st| st.log_ids.get(prefix_end))
+            .await
+            .expect("raft state")
+            .expect("the member's last log id");
+
+        // Two elections the cut-off member does not hear of: the lead moves
+        // away and comes back, as for a leader whose stream was held up.
+        members[leader]
+            .node
+            .transfer_leadership_to(members[other].id)
+            .await
+            .expect("first transfer");
+        members[other]
+            .node
+            .transfer_leadership_to(leader_id)
+            .await
+            .expect("second transfer");
+        let (now, _) = propose_through_leader(&members, b"node:canonical").await;
+        let new_term = members[now].node.current_term();
+        assert!(
+            new_term >= old_term + 2,
+            "two elections ran: term {old_term} then {new_term}"
+        );
+        let later_commit = members[now]
+            .node
+            .raft()
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .expect("the leader applied its write");
+        assert_eq!(later_commit.leader_id.term, new_term);
+        // The entry after the member's log was written in a later term: the
+        // stale entry at that index is one the group overwrote.
+        let replaced_at = prefix_end.index + 1;
+        let canonical = members[now]
+            .node
+            .raft()
+            .with_raft_state(move |st| st.log_ids.get(replaced_at))
+            .await
+            .expect("raft state")
+            .expect("the leader holds the index");
+        assert!(
+            canonical.leader_id.term > old_term,
+            "the group's entry at {replaced_at} is from term {}, not past {old_term}",
+            canonical.leader_id.term
+        );
+
+        // The held-up stream: the old term's vote and entry, the later commit.
+        let stale = Entry {
+            log_id: LogId {
+                leader_id: prefix_end.leader_id,
+                index: replaced_at,
+            },
+            payload: openraft::impls::EntryPayload::Normal(Request::single(RaftProposal {
+                id: ProposalIdGenerator::with_base(9 << 48).next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:overwritten".to_vec(),
+                    value: b"v".to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(ts + 1),
+                start_ts: Timestamp::from_raw(ts + 1),
+                bypass_rate_limiter: false,
+            })),
+        };
+        let answer = members[behind]
+            .node
+            .raft()
+            .append_entries(AppendEntriesRequest {
+                vote,
+                prev_log_id: Some(prefix_end),
+                entries: vec![stale],
+                leader_commit: Some(later_commit),
+            })
+            .await
+            .expect("an answer");
+        assert_eq!(answer, AppendEntriesResponse::Success);
+        members[behind]
+            .node
+            .raft()
+            .wait(Some(Duration::from_secs(5)))
+            .log_index(Some(replaced_at), "the member stores the stale entry")
+            .await
+            .expect("stored");
+        let applied = members[behind]
+            .node
+            .raft()
+            .wait(Some(Duration::from_secs(2)))
+            .applied_index_at_least(Some(replaced_at), "the stale entry stays unapplied")
+            .await;
+        assert!(
+            applied.is_err(),
+            "the member applied the overwritten entry at {replaced_at}"
+        );
+        assert_eq!(
+            members[behind]
+                .engine
+                .get(Partition::Node, b"node:overwritten")
+                .expect("read"),
+            None
+        );
+
+        // Back with the group, the member replaces the entry and applies the
+        // group's log: every member holds the same writes.
+        coordinode_raft::cluster::nemesis::heal();
+        members[behind]
+            .node
+            .raft()
+            .wait(Some(Duration::from_secs(30)))
+            .applied_index_at_least(
+                Some(later_commit.index),
+                "the member applies the group's log",
+            )
+            .await
+            .expect("caught up");
+        for m in &members {
+            assert!(
+                m.engine
+                    .get(Partition::Node, b"node:canonical")
+                    .expect("read")
+                    .is_some(),
+                "member {} lacks the group's write",
+                m.id
+            );
+            assert_eq!(
+                m.engine
+                    .get(Partition::Node, b"node:overwritten")
+                    .expect("read"),
+                None,
+                "member {} holds the overwritten entry",
+                m.id
+            );
+        }
+    })
+    .await;
+    coordinode_raft::cluster::nemesis::heal();
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_stale_stream_with_a_later_commit_does_not_apply_an_overwritten_entry"
+    );
+}
+
 /// A disk whose log syncs stall for longer than any election timeout, under
 /// a burst of writes, does not cost the group its leader: heartbeats and
 /// votes need no sync, so every member keeps the term while the writes wait

@@ -3645,7 +3645,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "openraft"
 version = "0.10.0-alpha.37"
-source = "git+https://github.com/structured-world/openraft?rev=462f2e7f08871dff6e5900f586b822b59953955d#462f2e7f08871dff6e5900f586b822b59953955d"
+source = "git+https://github.com/structured-world/openraft?rev=6b09498c25cc023b759a941beeb30f53e6ade525#6b09498c25cc023b759a941beeb30f53e6ade525"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -3674,7 +3674,7 @@ dependencies = [
 [[package]]
 name = "openraft-macros"
 version = "0.10.0-alpha.37"
-source = "git+https://github.com/structured-world/openraft?rev=462f2e7f08871dff6e5900f586b822b59953955d#462f2e7f08871dff6e5900f586b822b59953955d"
+source = "git+https://github.com/structured-world/openraft?rev=6b09498c25cc023b759a941beeb30f53e6ade525#6b09498c25cc023b759a941beeb30f53e6ade525"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -3686,7 +3686,7 @@ dependencies = [
 [[package]]
 name = "openraft-rt"
 version = "0.10.0-alpha.37"
-source = "git+https://github.com/structured-world/openraft?rev=462f2e7f08871dff6e5900f586b822b59953955d#462f2e7f08871dff6e5900f586b822b59953955d"
+source = "git+https://github.com/structured-world/openraft?rev=6b09498c25cc023b759a941beeb30f53e6ade525#6b09498c25cc023b759a941beeb30f53e6ade525"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -3698,7 +3698,7 @@ dependencies = [
 [[package]]
 name = "openraft-rt-tokio"
 version = "0.10.0-alpha.37"
-source = "git+https://github.com/structured-world/openraft?rev=462f2e7f08871dff6e5900f586b822b59953955d#462f2e7f08871dff6e5900f586b822b59953955d"
+source = "git+https://github.com/structured-world/openraft?rev=6b09498c25cc023b759a941beeb30f53e6ade525#6b09498c25cc023b759a941beeb30f53e6ade525"
 dependencies = [
  "futures-util",
  "openraft-rt",

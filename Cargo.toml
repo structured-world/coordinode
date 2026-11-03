@@ -227,13 +227,16 @@ strip = true
 panic = "abort"
 opt-level = 3
 
-# openraft 0.10.0-alpha.37 answers a heartbeat only after every log entry
-# accepted before it is flushed, so a slow disk on the followers costs the
-# leader its lease. The structured-world fork carries the fix (heartbeats wait
-# only for their own prev_log_id) on top of alpha.37 until an openraft release
-# includes it; the whole workspace comes from the same revision.
+# openraft 0.10.0-alpha.37, the latest release, carries two defects fixed
+# upstream since: a replication stream descheduled across two elections can
+# send an old term's entries with a later term's commit, and a follower then
+# applies an entry the cluster overwrote (openraft #2245); and a heartbeat is
+# answered only after every log entry accepted before it is flushed, so a slow
+# disk on the followers costs the leader its lease. The structured-world fork
+# carries both fixes on top of alpha.37 until an openraft release includes
+# them; the whole workspace comes from the same revision.
 [patch.crates-io]
-openraft = { git = "https://github.com/structured-world/openraft", rev = "462f2e7f08871dff6e5900f586b822b59953955d" }
-openraft-macros = { git = "https://github.com/structured-world/openraft", rev = "462f2e7f08871dff6e5900f586b822b59953955d" }
-openraft-rt = { git = "https://github.com/structured-world/openraft", rev = "462f2e7f08871dff6e5900f586b822b59953955d" }
-openraft-rt-tokio = { git = "https://github.com/structured-world/openraft", rev = "462f2e7f08871dff6e5900f586b822b59953955d" }
+openraft = { git = "https://github.com/structured-world/openraft", rev = "6b09498c25cc023b759a941beeb30f53e6ade525" }
+openraft-macros = { git = "https://github.com/structured-world/openraft", rev = "6b09498c25cc023b759a941beeb30f53e6ade525" }
+openraft-rt = { git = "https://github.com/structured-world/openraft", rev = "6b09498c25cc023b759a941beeb30f53e6ade525" }
+openraft-rt-tokio = { git = "https://github.com/structured-world/openraft", rev = "6b09498c25cc023b759a941beeb30f53e6ade525" }
