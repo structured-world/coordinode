@@ -1281,8 +1281,11 @@ pub(crate) async fn serve(
         match pg_addr.parse::<SocketAddr>() {
             Ok(pg_sockaddr) => {
                 let pg_db = Arc::clone(&database);
+                // SQL statements run in the member's slots, as every other
+                // command does.
+                let pg_slots = member.command_slots().clone();
                 tokio::spawn(async move {
-                    if let Err(e) = pg::serve(pg_sockaddr, pg_db).await {
+                    if let Err(e) = pg::serve(pg_sockaddr, pg_db, pg_slots).await {
                         tracing::error!("PostgreSQL wire server error: {e}");
                     }
                 });

@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
+use coordinode_session::{CommandSlots, SessionSlots};
 
 mod catalog;
 
@@ -46,6 +47,9 @@ mod catalog;
 /// for the trusted, low-concurrency access this binding currently targets.
 struct PgBackend {
     database: Arc<RwLock<Database>>,
+    /// This connection's slots within the member's, the ones every other
+    /// way a command reaches the member takes too.
+    slots: SessionSlots,
 }
 
 /// Map a CoordiNode [`Value`] to the Postgres type advertised in `RowDescription`.
@@ -235,15 +239,21 @@ impl SimpleQueryHandler for PgBackend {
             return Ok(vec![query_response(&rows)?]);
         }
 
-        let rows = crate::services::blocking(|| self.database.write().execute_sql(query)).map_err(
-            |e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    sqlstate(&e).to_owned(),
-                    e.to_string(),
-                )))
-            },
-        )?;
+        let refused = |e: coordinode_embed::db::DatabaseError| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                sqlstate(&e).to_owned(),
+                e.to_string(),
+            )))
+        };
+        // Held until the statement ends; one past the member's or this
+        // connection's slots did not run.
+        let _slot = self
+            .slots
+            .take()
+            .ok_or_else(|| refused(coordinode_embed::db::DatabaseError::MemberBusy))?;
+        let rows = crate::services::blocking(|| self.database.write().execute_sql(query))
+            .map_err(refused)?;
 
         if !returns_rows(query) {
             return Ok(vec![Response::Execution(command_tag(query))]);
@@ -266,15 +276,17 @@ impl PgWireServerHandlers for PgHandlers {
 }
 
 /// Bind the Postgres wire listener on `addr` and serve connections until the
-/// task is dropped. Each accepted socket is handled on its own task.
+/// task is dropped. Each accepted socket is handled on its own task, its
+/// statements running in a session of `slots`, the member's.
 ///
 /// # Errors
 ///
 /// Returns an error if the listen address cannot be bound.
-pub async fn serve(addr: SocketAddr, database: Arc<RwLock<Database>>) -> std::io::Result<()> {
-    let handlers = Arc::new(PgHandlers {
-        backend: Arc::new(PgBackend { database }),
-    });
+pub async fn serve(
+    addr: SocketAddr,
+    database: Arc<RwLock<Database>>,
+    slots: CommandSlots,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(port = addr.port(), "PostgreSQL wire server listening");
     loop {
@@ -285,7 +297,13 @@ pub async fn serve(addr: SocketAddr, database: Arc<RwLock<Database>>) -> std::io
                 continue;
             }
         };
-        let handlers = Arc::clone(&handlers);
+        // A connection is a session: its own slots within the member's.
+        let handlers = Arc::new(PgHandlers {
+            backend: Arc::new(PgBackend {
+                database: Arc::clone(&database),
+                slots: slots.session(),
+            }),
+        });
         tokio::spawn(async move {
             if let Err(e) = process_socket(socket, None, handlers).await {
                 error!(%peer, error = %e, "pg: connection error");

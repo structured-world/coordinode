@@ -13,6 +13,14 @@ use coordinode_embed::Database;
 /// Open a database, bind the pg listener on an ephemeral port, and return a
 /// connected client plus the temp dir (kept alive for the test's duration).
 async fn connect() -> (tokio_postgres::Client, TempDir) {
+    connect_in(
+        coordinode_embed::replication::routing::CheckedRoutingLimits::default().command_slots(),
+    )
+    .await
+}
+
+/// [`connect`] with the member's commands running in `slots`.
+async fn connect_in(slots: coordinode_session::CommandSlots) -> (tokio_postgres::Client, TempDir) {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::open(dir.path()).expect("open db");
     let database = Arc::new(RwLock::new(db));
@@ -22,13 +30,15 @@ async fn connect() -> (tokio_postgres::Client, TempDir) {
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    let handlers = Arc::new(super::PgHandlers {
-        backend: Arc::new(super::PgBackend { database }),
-    });
     tokio::spawn(async move {
         loop {
             let (socket, _) = listener.accept().await.expect("accept");
-            let handlers = Arc::clone(&handlers);
+            let handlers = Arc::new(super::PgHandlers {
+                backend: Arc::new(super::PgBackend {
+                    database: Arc::clone(&database),
+                    slots: slots.session(),
+                }),
+            });
             tokio::spawn(async move {
                 let _ = pgwire::tokio::process_socket(socket, None, handlers).await;
             });
@@ -348,4 +358,47 @@ async fn key_errors_carry_their_sqlstate() {
         Some(&SqlState::INVALID_COLUMN_REFERENCE),
         "{err:?}"
     );
+}
+
+/// A SQL statement takes one of the member's command slots, as every other
+/// command does: with the only one held elsewhere it is refused before it
+/// runs as insufficient_resources, and runs once the slot is free.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_statement_past_the_members_slots_is_refused_before_it_runs() {
+    use coordinode_session::{CommandSlots, SlotCount};
+    use tokio_postgres::error::SqlState;
+
+    let one = SlotCount::new(1).expect("one slot");
+    let slots = CommandSlots::new(one, one);
+    let (client, _dir) = connect_in(slots.clone()).await;
+    client
+        .simple_query("CREATE TABLE Busy (id BIGINT PRIMARY KEY)")
+        .await
+        .expect("create");
+
+    let held = slots
+        .take()
+        .expect("another command holds the member's one slot");
+    let err = client
+        .simple_query("INSERT INTO Busy (id) VALUES (1)")
+        .await
+        .expect_err("no slot is free");
+    assert_eq!(
+        err.code(),
+        Some(&SqlState::INSUFFICIENT_RESOURCES),
+        "{err:?}"
+    );
+
+    drop(held);
+    client
+        .simple_query("INSERT INTO Busy (id) VALUES (2)")
+        .await
+        .expect("runs once the slot is free");
+    let rows = data_rows(
+        &client
+            .simple_query("SELECT id FROM Busy")
+            .await
+            .expect("select"),
+    );
+    assert_eq!(rows.len(), 1, "the refused insert did not run");
 }
