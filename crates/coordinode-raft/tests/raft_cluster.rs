@@ -8103,6 +8103,85 @@ async fn the_closed_bound_survives_a_restart() {
     );
 }
 
+/// A read bounded by a log position a follower applied and closed before it
+/// restarted needs the commits of that prefix only. With the leader holding
+/// a lower timestamp open and a later commit applied above it, the restarted
+/// follower meets the read at once with a view it can already serve, and
+/// waits on neither of them: the prefix's ceiling survives the restart
+/// exactly, not as the highest commit applied or the clock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_position_read_after_a_restart_waits_on_no_later_commit() {
+    use coordinode_core::txn::read_concern::HistoryPosition;
+
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let mut members = clocked_group(&dirs).await;
+        let (leader, early) = propose_through_leader(&members, b"node:early").await;
+        await_closed_past(&members, early, "every member closes past the early write").await;
+        let follower = (leader + 1) % members.len();
+        let index = members[follower].node.read_fence().applied_index();
+
+        // The leader holds a timestamp it has not handed over, so no bound
+        // passes it; a later write applies above it on every member.
+        let (open, held) = members[leader]
+            .engine
+            .pending_commits()
+            .obligate(|| members[leader].oracle.next().as_raw());
+        let later = propose_held(
+            &members[leader].node,
+            &members[leader].engine,
+            &members[leader].oracle,
+            b"node:later",
+        );
+        assert!(later > open && open > early);
+        let through = members[leader].node.read_fence().applied_index();
+        await_condition(
+            Duration::from_secs(10),
+            "the follower applies the later write",
+            || members[follower].node.read_fence().applied_index() >= through,
+        )
+        .await;
+
+        let gone = members.swap_remove(follower);
+        let (id, port) = (gone.id, gone.port);
+        let dir = dirs[usize::try_from(id - 1).expect("small id")].path();
+        gone.node.shutdown().await.expect("stop the follower");
+        drop(gone);
+        let back = open_clocked(id, dir, port, None).await;
+        await_condition(
+            Duration::from_secs(20),
+            "the follower applies its log again",
+            || back.node.read_fence().applied_index() >= index,
+        )
+        .await;
+
+        let mut fence = back.node.read_fence();
+        let history = fence.history().expect("history");
+        let bound = fence
+            .await_causal(None, Some(HistoryPosition { history, index }), None)
+            .await
+            .expect("an applied position is met");
+        let complete = back.engine.complete_cut();
+        assert!(
+            bound.is_some_and(|b| b >= early),
+            "the bound {bound:?} leaves out the prefix's commit {early}"
+        );
+        assert!(
+            bound.is_some_and(|b| complete.is_some_and(|c| c >= b)),
+            "the bound {bound:?} asks for more than the complete cut {complete:?}: \
+             the read would wait on {open} or {later}"
+        );
+        drop(held);
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_closed_position_read_after_a_restart_waits_on_no_later_commit"
+    );
+}
+
 /// A member cut off from its leader does not raise its term while it cannot
 /// win, and on its return the leader keeps leading in the same term: each of
 /// its candidacies first asks the others in a pre-vote they refuse, since

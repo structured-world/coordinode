@@ -1888,3 +1888,17 @@ fn partition_trees_sync_as_durably_as_the_oplog() {
         }
     }
 }
+
+/// A log position closed long ago keeps a ceiling of its own commits however
+/// many entries applied after it: never the highest commit applied since,
+/// which would make a read at that position wait on later writers.
+#[test]
+fn an_old_closed_position_keeps_its_own_ceiling() {
+    let engine = test_engine_memfs();
+    engine.note_raft_applied(1, 10);
+    engine.raise_closure_frontier(11, 1);
+    for index in 2..=20_000 {
+        engine.note_raft_applied(index, 10_000 + index);
+    }
+    assert_eq!(engine.commit_ceiling_through(1), 10);
+}

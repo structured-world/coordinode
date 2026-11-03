@@ -148,16 +148,16 @@ pub struct StorageEngine {
     /// below it is in an entry applied on this node. `0` while no entry
     /// carrying one has applied. Mirrors [`CLOSURE_KEY`].
     closure_frontier: AtomicU64,
-    /// The highest commit timestamp of a Raft entry applied here since the
-    /// store opened; `0` before any. Every such commit is in the log, so a
-    /// closed bound reaches it once the leader covers it.
+    /// The highest commit timestamp of the Raft log applied here; `0` before
+    /// any. Every such commit is in the log, so a closed bound reaches it
+    /// once the leader covers it. Mirrors the ledger in `closure`.
     raft_applied_ts: AtomicU64,
-    /// For the latest Raft entries applied here, in log order: an entry's
-    /// index and the highest commit timestamp in it and every entry before
-    /// it. Turns a log position into the commits a read at that position
-    /// must hold; see [`Self::commit_ceiling_through`].
-    // no-std: spin::Mutex; held for one push or one search.
-    raft_applied_prefix: parking_lot::Mutex<std::collections::VecDeque<(u64, u64)>>,
+    /// The closed bound and the commit ceilings of the Raft log applied
+    /// here, as its [`CLOSURE_KEY`] record holds them, and whether entries
+    /// applied since the record last landed changed it; see
+    /// [`Self::commit_ceiling_through`].
+    // no-std: spin::Mutex; held for one update or one search.
+    closure: parking_lot::Mutex<(crate::engine::closure_ledger::ClosureLedger, bool)>,
     /// How long a snapshot waits for those commits before stepping behind
     /// them. Runtime-settable: it trades read latency against freshness, and
     /// which side a deployment wants is not known at compile time.
@@ -1514,7 +1514,10 @@ impl StorageEngine {
             pending_commits,
             closure_frontier: AtomicU64::new(0),
             raft_applied_ts: AtomicU64::new(0),
-            raft_applied_prefix: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            closure: parking_lot::Mutex::new((
+                crate::engine::closure_ledger::ClosureLedger::default(),
+                false,
+            )),
             snapshot_wait: std::sync::atomic::AtomicU64::new(config.snapshot_wait_ms),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
@@ -5704,11 +5707,41 @@ impl StorageEngine {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Raise the closed bound to `below` once the entry carrying it has
-    /// applied, its [`CLOSURE_KEY`] record included. Notify every partition's
-    /// applied consumers afterwards, even if the entry changed no keys there.
+    /// The [`CLOSURE_KEY`] record entry `index` writes after its proposals,
+    /// with the timestamp to write it at, when the entry changes what it
+    /// holds: the closed bound `below` it carries (`0` for none), or a commit
+    /// ceiling its proposals raised. `None` when the record stays as it is.
+    ///
+    /// The timestamp is the larger of the commit ceiling and the bound less
+    /// one: no earlier than the entry's own writes, and below every commit
+    /// the bound leaves open.
+    pub fn closure_record(&self, below: u64, index: u64) -> Option<(Vec<u8>, u64)> {
+        let state = self.closure.lock();
+        let mut next = state.0.clone();
+        let raised = below > 0 && next.close(below, index);
+        if !(raised || state.1) {
+            return None;
+        }
+        let ceiling = next.applied_ceiling();
+        let at = next
+            .below()
+            .checked_sub(1)
+            .map_or(ceiling, |b| b.max(ceiling));
+        Some((next.encode(), at))
+    }
+
+    /// Account for entry `index` once its [`Self::closure_record`] landed:
+    /// raise the closed bound to `below` (`0` for none). Notify every
+    /// partition's applied consumers when it rose, even if the entry changed
+    /// no keys there.
     pub fn raise_closure_frontier(&self, below: u64, index: u64) {
-        debug_assert!(below > 0);
+        let mut state = self.closure.lock();
+        state.1 = false;
+        if below == 0 || !state.0.close(below, index) {
+            return;
+        }
+        let below = state.0.below();
+        drop(state);
         let previous = self
             .closure_frontier
             .fetch_max(below, std::sync::atomic::Ordering::AcqRel);
@@ -5748,70 +5781,46 @@ impl StorageEngine {
     /// Record that the Raft entry at `index` carrying `commit_ts` applied
     /// here. Entries apply in log order, so the prefix's ceiling only grows.
     pub(crate) fn note_raft_applied(&self, index: u64, commit_ts: u64) {
-        let ceiling = self
-            .raft_applied_ts
-            .fetch_max(commit_ts, std::sync::atomic::Ordering::AcqRel)
-            .max(commit_ts);
-        let mut prefix = self.raft_applied_prefix.lock();
-        match prefix.back_mut() {
-            Some((last, at)) if *last == index => *at = (*at).max(ceiling),
-            _ => {
-                prefix.push_back((index, ceiling));
-                if prefix.len() > APPLIED_PREFIX_ENTRIES {
-                    prefix.pop_front();
-                }
-            }
+        let mut state = self.closure.lock();
+        if state.0.commit(index, commit_ts) {
+            state.1 = true;
+            self.raft_applied_ts.store(
+                state.0.applied_ceiling(),
+                std::sync::atomic::Ordering::Release,
+            );
         }
     }
 
-    /// The highest commit timestamp in the Raft log through `index`, an
-    /// index this member has applied: a read that must hold the effects of
-    /// that prefix holds every commit at or below it. Exact for the latest
-    /// entries; for an older index, or one applied before the store
-    /// reopened, the highest commit applied here, which is above it and so
-    /// asks for no less than the prefix needs.
+    /// The commit timestamp a read must reach to hold every commit of the
+    /// Raft log through `index`, an index this member has applied. For a
+    /// prefix the closed bound has not passed, its own highest commit; for
+    /// one it passed, the highest commit of the last prefix it passed, which
+    /// is below the bound. Never a commit after the prefix that is still
+    /// open: a read at an old position waits on no later writer.
     pub fn commit_ceiling_through(&self, index: u64) -> u64 {
-        let prefix = self.raft_applied_prefix.lock();
-        let exact = match prefix.front() {
-            Some((first, _)) if *first <= index => prefix
-                .iter()
-                .rev()
-                .find(|(at, _)| *at <= index)
-                .map(|(_, ceiling)| *ceiling),
-            _ => None,
-        };
-        drop(prefix);
-        exact.unwrap_or_else(|| {
-            self.raft_applied_ts
-                .load(std::sync::atomic::Ordering::Acquire)
-        })
+        self.closure.lock().0.ceiling_through(index)
     }
 
-    /// Read the closed bound from its stored record: when the store opens
-    /// and when a snapshot replaced it. A store whose applied entries carried
-    /// none knows of no bound.
-    ///
-    /// The commits applied before are not known one by one: they are taken
-    /// to reach the clock, which is past each of them, so a bound or a
-    /// closing entry covering them asks for no less than they need.
+    /// Read the closed bound and the commit ceilings of the log applied here
+    /// from their stored record: when the store opens and when a snapshot
+    /// replaced it. A store whose applied entries carried no commit and no
+    /// bound has none.
     ///
     /// # Errors
     ///
     /// The record cannot be read or is malformed.
     pub fn reload_closure_frontier(&self) -> StorageResult<()> {
-        let below = match self.get(Partition::Schema, CLOSURE_KEY)? {
-            Some(bytes) => decode_closure(&bytes)?,
-            None => 0,
+        let ledger = match self.get(Partition::Schema, CLOSURE_KEY)? {
+            Some(bytes) => crate::engine::closure_ledger::ClosureLedger::decode(&bytes)?,
+            None => crate::engine::closure_ledger::ClosureLedger::default(),
         };
         self.closure_frontier
-            .store(below, std::sync::atomic::Ordering::Release);
-        self.raft_applied_prefix.lock().clear();
-        if let Some(oracle) = self.oracle() {
-            self.raft_applied_ts.fetch_max(
-                oracle.current().as_raw(),
-                std::sync::atomic::Ordering::AcqRel,
-            );
-        }
+            .store(ledger.below(), std::sync::atomic::Ordering::Release);
+        self.raft_applied_ts.store(
+            ledger.applied_ceiling(),
+            std::sync::atomic::Ordering::Release,
+        );
+        *self.closure.lock() = (ledger, false);
         Ok(())
     }
 
@@ -6893,31 +6902,12 @@ fn new_maintenance_budget(
 /// rebuild is in progress, named after the partition.
 const REBUILD_INTENT_DIR: &str = "rebuild";
 
-/// Schema record of the Raft log's closed bound as applied here, written by
-/// the apply of the entry carrying it. It is replicated data, so a snapshot
-/// carries it and a restart finds it with the entries its tree holds.
+/// Schema record of the Raft log's closed bound and its prefixes' commit
+/// ceilings as applied here, written by the apply of each entry that changes
+/// them; see [`StorageEngine::closure_record`]. It is replicated data, a
+/// function of the log alone, so a snapshot carries it and a restart finds
+/// it with the entries its tree holds.
 pub const CLOSURE_KEY: &[u8] = b"closure:below";
-
-/// How many of the latest applied Raft entries keep their prefix's exact
-/// commit ceiling (16 bytes each): positions further back than this ask for
-/// the highest commit applied, which is still enough.
-const APPLIED_PREFIX_ENTRIES: usize = 16_384;
-
-/// The stored form of a closed bound.
-#[must_use]
-pub fn encode_closure(below: u64) -> Vec<u8> {
-    below.to_be_bytes().to_vec()
-}
-
-fn decode_closure(bytes: &[u8]) -> StorageResult<u64> {
-    let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
-        StorageError::Serialization(format!(
-            "the closed bound record holds {} bytes, not 8",
-            bytes.len()
-        ))
-    })?;
-    Ok(u64::from_be_bytes(bytes))
-}
 
 /// A journalled op applied without deriving its entry first: the entry's
 /// DERIVED work would otherwise be skipped silently.

@@ -2318,15 +2318,16 @@ impl CoordinodeStateMachine {
         })
     }
 
-    /// Record `closed_below`, the bound entry `index` carries, after its
-    /// proposals: every commit stamped below it applied here before it.
+    /// Record what entry `index` changed in the closed bound and the commit
+    /// ceilings of the log, after its proposals: `closed_below` (`0` for
+    /// none), every commit stamped below which applied here before it, and
+    /// the ceiling its proposals raised.
     ///
     /// The record lands as position `sub` of the entry, with its coverage
     /// marker like a proposal, so a replay skips it where the Schema tree
-    /// holds it and a snapshot carries it. It is written at `closed_below -
-    /// 1`, below every commit the bound leaves open and above every earlier
-    /// bound. The oracle is raised to the same value, so this node, once it
-    /// leads, stamps nothing at or below a bound a past leader handed out.
+    /// holds it and a snapshot carries it. The oracle is raised to the bound
+    /// less one, so this node, once it leads, stamps nothing at or below a
+    /// bound a past leader handed out.
     fn apply_closure(
         &self,
         closed_below: u64,
@@ -2334,28 +2335,29 @@ impl CoordinodeStateMachine {
         sub: u32,
         applies: &RaftApplyState,
     ) -> Result<(), io::Error> {
-        // `closed_below > 0` at the caller.
-        let at = closed_below - 1;
-        let replay = self
-            .replay_skip
-            .as_ref()
-            .filter(|_| index < self.skip_until);
-        self.engine
-            .apply_raft_proposal(
-                &[Mutation::Put {
-                    partition: coordinode_core::txn::proposal::PartitionId::Schema,
-                    key: coordinode_storage::engine::core::CLOSURE_KEY.to_vec(),
-                    value: coordinode_storage::engine::core::encode_closure(closed_below),
-                }],
-                at,
-                index,
-                sub,
-                |part| {
-                    applies.skips(part, index) || replay.is_some_and(|c| c.holds(part, index, sub))
-                },
-            )
-            .map_err(|e| io::Error::other(format!("record the closed bound: {e}")))?;
-        if let Some(ref oracle) = self.oracle {
+        if let Some((record, at)) = self.engine.closure_record(closed_below, index) {
+            let replay = self
+                .replay_skip
+                .as_ref()
+                .filter(|_| index < self.skip_until);
+            self.engine
+                .apply_raft_proposal(
+                    &[Mutation::Put {
+                        partition: coordinode_core::txn::proposal::PartitionId::Schema,
+                        key: coordinode_storage::engine::core::CLOSURE_KEY.to_vec(),
+                        value: record,
+                    }],
+                    at,
+                    index,
+                    sub,
+                    |part| {
+                        applies.skips(part, index)
+                            || replay.is_some_and(|c| c.holds(part, index, sub))
+                    },
+                )
+                .map_err(|e| io::Error::other(format!("record the closed bound: {e}")))?;
+        }
+        if let (Some(oracle), Some(at)) = (&self.oracle, closed_below.checked_sub(1)) {
             oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
         }
         self.engine.raise_closure_frontier(closed_below, index);
@@ -2544,12 +2546,10 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                     if records_deployment {
                         self.refresh_deployment()?;
                     }
-                    if request.closed_below > 0 {
-                        let sub = u32::try_from(request.proposals.len()).map_err(|_| {
-                            io::Error::other(format!("entry {index} carries over 2^32 proposals"))
-                        })?;
-                        self.apply_closure(request.closed_below, index, sub, &gate.applies)?;
-                    }
+                    let sub = u32::try_from(request.proposals.len()).map_err(|_| {
+                        io::Error::other(format!("entry {index} carries over 2^32 proposals"))
+                    })?;
+                    self.apply_closure(request.closed_below, index, sub, &gate.applies)?;
                     Response {
                         mutations_applied: total,
                     }

@@ -38,14 +38,18 @@ fn a_closed_bound_notifies_partitions_without_changed_keys() {
     let engine = engine(&dir);
     let node = engine.subscribe_applied_retained(Partition::Node, 4);
     let edge = engine.subscribe_applied_retained(Partition::EdgeProp, 4);
+    let (record, at) = engine
+        .closure_record(200, 2)
+        .expect("a bound changes the record");
+    assert_eq!(at, 199);
     engine
         .apply_raft_proposal(
             &[Mutation::Put {
                 partition: PartitionId::Schema,
                 key: crate::engine::core::CLOSURE_KEY.to_vec(),
-                value: crate::engine::core::encode_closure(200),
+                value: record,
             }],
-            199,
+            at,
             2,
             0,
             |_| false,

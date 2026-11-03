@@ -5,6 +5,7 @@ pub mod batch;
 pub mod capacity;
 pub mod cardinality;
 pub mod claims;
+pub(crate) mod closure_ledger;
 pub(crate) mod compaction;
 pub mod config;
 pub mod coordinator;
