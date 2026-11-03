@@ -11,7 +11,9 @@
 //!   and the stopped member's reopen until it has caught up;
 //! - `closure`: a write's cost to the closed bound, sealed into its entry
 //!   and not: log entries per write, its answer, and the time until a read
-//!   at its own time is answered, for isolated writes and a burst.
+//!   at its own time is answered, for isolated writes and a burst;
+//! - `stamp`: stamping one entry's closed bound for a batch of proposals,
+//!   each sealed into it, beside as many other writers' registrations.
 //!
 //! Latencies are distributions; a P99 is printed only from 100 samples or
 //! more, below that the median, the maximum and the samples themselves.
@@ -376,6 +378,49 @@ async fn closure_costs() {
         report(&format!("closure {mode} burst answer"), answered, None);
         report(&format!("closure {mode} burst closed"), closed, None);
         node.shutdown().await.expect("stop");
+    }
+}
+
+/// What stamping one entry's closed bound costs the leader for a batch of
+/// `batch` proposals, each with its timestamp sealed into it, beside as many
+/// registrations of other writers: the hand-over cost a coalesced entry adds.
+fn stamp_costs() {
+    for batch in [1usize, 16, 256, 1024] {
+        let store = Store::new();
+        let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+        let engine =
+            StorageEngine::open_with_oracle(&store.config, Arc::clone(&oracle)).expect("open");
+        let pending = engine.pending_commits();
+        let ids = ProposalIdGenerator::new();
+        let mut held = Vec::with_capacity(batch * 2);
+        let mut proposals = Vec::with_capacity(batch);
+        for _ in 0..batch {
+            let (ts, hold) = pending.obligate(|| oracle.next().as_raw());
+            let proposal = RaftProposal {
+                commit_ts: Timestamp::from_raw(ts),
+                start_ts: Timestamp::from_raw(ts),
+                ..put(&ids, ts)
+            };
+            hold.seal(proposal.id);
+            held.push(hold);
+            proposals.push(proposal);
+        }
+        for _ in 0..batch {
+            held.push(pending.obligate(|| oracle.next().as_raw()).1);
+        }
+        let request = coordinode_raft::storage::Request::batch(proposals);
+        let mut samples = Vec::new();
+        for _ in 0..ops(2_000) {
+            let t = Instant::now();
+            // As the leader's stamp does: the entry's proposals, then the bound.
+            let sealed: Vec<_> = request.proposals.iter().map(|p| p.id).collect();
+            std::hint::black_box(
+                pending.stamp_closed_below_sealing(&sealed, || oracle.current().as_raw()),
+            );
+            samples.push(t.elapsed());
+        }
+        report(&format!("stamp batch of {batch}"), samples, None);
+        drop(held);
     }
 }
 
@@ -1183,6 +1228,9 @@ fn main() {
         }
         if runs("closure") {
             closure_costs().await;
+        }
+        if runs("stamp") {
+            stamp_costs();
         }
     });
 }
