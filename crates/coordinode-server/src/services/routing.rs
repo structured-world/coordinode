@@ -35,19 +35,24 @@ impl ServerCommandExecutor {
     }
 
     /// Establish a transaction start's causal bound here before its snapshot
-    /// is pinned. Called from the blocking pool, where waiting on the runtime
-    /// is allowed.
+    /// is pinned, within the command's `deadline` and `cancel`. Called from
+    /// the blocking pool, where waiting on the runtime is allowed.
     fn await_start_bound(
         &self,
         after_ts: Option<u64>,
         wait: Option<std::time::Duration>,
+        deadline: Option<Instant>,
+        cancel: Option<&CancelFlag>,
     ) -> Result<(), DatabaseError> {
         if after_ts.is_none() || !self.executor.needs_fence() {
             return Ok(());
         }
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|e| DatabaseError::Other(format!("no runtime to fence the start on: {e}")))?;
-        runtime.block_on(self.executor.await_start_bound(after_ts, wait))
+        runtime.block_on(
+            self.executor
+                .await_start_bound(after_ts, wait, deadline, cancel),
+        )
     }
 }
 
@@ -60,8 +65,13 @@ impl CommandExecutor for ServerCommandExecutor {
         answer: &mut AnswerWriter,
     ) -> Result<RoutedStats, DatabaseError> {
         if statement.transaction.is_some() {
-            if let Some(start) = statement.start {
-                self.await_start_bound(start.after_ts, start.causal_wait)?;
+            if let Some(start) = &statement.start {
+                self.await_start_bound(
+                    start.after_ts,
+                    start.causal_wait,
+                    executor::deadline_after(statement.deadline),
+                    Some(cancel),
+                )?;
             }
             return executor::write_in_transaction(
                 self.executor.database(),
@@ -120,7 +130,7 @@ impl CommandExecutor for ServerCommandExecutor {
     }
 
     fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
-        self.await_start_bound(begin.after_ts, begin.causal_wait)?;
+        self.await_start_bound(begin.after_ts, begin.causal_wait, None, None)?;
         executor::begin(&self.executor.database().read(), begin)
     }
 

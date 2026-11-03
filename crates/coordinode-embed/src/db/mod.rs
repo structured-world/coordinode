@@ -697,6 +697,10 @@ impl QuerySession {
     }
 }
 
+/// The longest a standalone causal wait goes without asking the statement's
+/// budget whether its deadline passed or it was cancelled.
+const BUDGET_CHECK_SLICE: Duration = Duration::from_millis(50);
+
 /// Nanoseconds on the process's monotonic clock: the clock statement
 /// deadlines are read on.
 fn monotonic_nanos() -> u64 {
@@ -1847,12 +1851,19 @@ impl Database {
     /// below it is in flight, which a read that allows a wait waits for here.
     /// The clock is not advanced to the bound: a bound this store's clock has
     /// not reached was not issued here, and moving the clock would not apply
-    /// what was committed under another.
+    /// what was committed under another. The wait ends with the statement's
+    /// `budget`, when its deadline passes or it is cancelled.
     ///
     /// # Errors
     ///
-    /// [`DatabaseError::SettingsRefused`] for a position on a standalone store.
-    fn prepare_causal_read(&self, causal: &CausalBound) -> Result<Option<u64>, DatabaseError> {
+    /// [`DatabaseError::SettingsRefused`] for a position on a standalone store;
+    /// [`DatabaseError::ReadNotReady`] after the wait;
+    /// [`DatabaseError::Budget`] when the budget ends the wait.
+    fn prepare_causal_read(
+        &self,
+        causal: &CausalBound,
+        budget: Option<&coordinode_core::budget::QueryBudget>,
+    ) -> Result<Option<u64>, DatabaseError> {
         let replicated = self.engine.raft_fence().is_some();
         if causal.after_position.is_some() && !replicated {
             return Err(DatabaseError::SettingsRefused(
@@ -1864,14 +1875,32 @@ impl Database {
         let Some(bound) = causal.after_ts else {
             return Ok(None);
         };
-        if !replicated
-            && let Some(wait) = causal.wait
-            && let Err(blocking) = self.engine.pending_commits().await_complete_at(bound, wait)
-        {
-            return Err(DatabaseError::ReadNotReady {
-                requested: bound,
-                ready_through: blocking.checked_sub(1),
-            });
+        if !replicated && let Some(wait) = causal.wait {
+            // Waited in slices: a commit finishing wakes the wait, and between
+            // slices the budget says whether the statement's deadline passed
+            // or it was cancelled, which nothing else would wake.
+            let until = Instant::now() + wait;
+            loop {
+                let slice = until
+                    .saturating_duration_since(Instant::now())
+                    .min(BUDGET_CHECK_SLICE);
+                let Err(blocking) = self
+                    .engine
+                    .pending_commits()
+                    .await_complete_at(bound, slice)
+                else {
+                    break;
+                };
+                if let Some(budget) = budget {
+                    budget.check()?;
+                }
+                if Instant::now() >= until {
+                    return Err(DatabaseError::ReadNotReady {
+                        requested: bound,
+                        ready_through: blocking.checked_sub(1),
+                    });
+                }
+            }
         }
         Ok(Some(bound))
     }
@@ -2697,7 +2726,7 @@ impl Database {
             && session.snapshot_read_ts.is_none()
             && scan_paging.is_none();
         let interactive = matches!(txn_mode, TxnMode::Interactive(_));
-        let causal_after_ts = self.prepare_causal_read(&session.causal)?;
+        let causal_after_ts = self.prepare_causal_read(&session.causal, Some(&session.budget))?;
         let mut txn_mode = Some(txn_mode);
         let mut attempt_once = |txn_mode: TxnMode| -> Result<
             (

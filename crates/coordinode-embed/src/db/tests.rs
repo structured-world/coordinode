@@ -67,6 +67,93 @@ fn an_auto_commit_statement_outwaits_a_slow_commit_in_flight() {
     assert_eq!(rows[0].get("n"), Some(&Value::Int(2)));
 }
 
+/// A standalone causal wait lasts no longer than its statement: a read
+/// allowed a minute to see a commit still in flight ends with the deadline's
+/// outcome once its deadline passes, and with the cancel's once it is
+/// cancelled, while the commit stays in flight. Neither reads below the bound.
+#[test]
+fn a_standalone_causal_wait_ends_at_its_deadline_or_cancel() {
+    use coordinode_core::budget::{BudgetStop, CancelFlag};
+    use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let pending = Arc::clone(db.engine().pending_commits());
+    let oracle = Arc::clone(&db.oracle);
+    let (held, holding) = std::sync::mpsc::channel::<u64>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let (ts, admission) = pending
+                .admit_allocated(|| oracle.next().as_raw(), Vec::new(), Vec::new())
+                .expect("admit the commit in flight");
+            held.send(ts).expect("signal");
+            released
+                .recv_timeout(Duration::from_secs(60))
+                .expect("released by the test");
+            drop(admission);
+        });
+        let in_flight = holding.recv_timeout(Duration::from_secs(10)).expect("held");
+        let bounded = |deadline, cancel| StatementOptions {
+            read_concern: Some(ReadConcern {
+                level: ReadConcernLevel::Majority,
+                after_ts: Some(in_flight),
+                after_position: None,
+                at_timestamp: None,
+                wait: Some(Duration::from_secs(60)),
+            }),
+            deadline,
+            cancel,
+            ..StatementOptions::default()
+        };
+        let well_inside_the_wait = Duration::from_secs(20);
+
+        let started = Instant::now();
+        let timed = db.execute_cypher_shared_with(
+            "MATCH (n) RETURN count(n) AS c",
+            None,
+            None,
+            &bounded(Some(Instant::now() + Duration::from_millis(300)), None),
+        );
+        assert!(
+            matches!(timed, Err(DatabaseError::Budget(BudgetStop::Deadline))),
+            "the deadline ends the wait, got {timed:?}"
+        );
+        assert!(
+            started.elapsed() < well_inside_the_wait,
+            "{:?}",
+            started.elapsed()
+        );
+
+        let cancel = CancelFlag::new();
+        let started = Instant::now();
+        let cancelled = std::thread::scope(|inner| {
+            let thrower = cancel.clone();
+            inner.spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                thrower.cancel();
+            });
+            db.execute_cypher_shared_with(
+                "MATCH (n) RETURN count(n) AS c",
+                None,
+                None,
+                &bounded(None, Some(cancel.clone())),
+            )
+        });
+        assert!(
+            matches!(cancelled, Err(DatabaseError::Budget(BudgetStop::Cancelled))),
+            "the cancel ends the wait, got {cancelled:?}"
+        );
+        assert!(
+            started.elapsed() < well_inside_the_wait,
+            "{:?}",
+            started.elapsed()
+        );
+
+        release.send(()).expect("release the commit in flight");
+    });
+}
+
 /// With a single attempt configured, the same statement returns the first
 /// refusal instead of running again.
 #[test]

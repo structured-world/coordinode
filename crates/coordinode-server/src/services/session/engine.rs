@@ -254,7 +254,7 @@ impl CursorEngine for DatabaseCursorEngine {
                 return self.routed(leader, statement, &transaction.admission, cancel);
             }
             if let Some(start) = start {
-                self.begin_here(transaction.id, start)?;
+                self.begin_here(transaction.id, start, Some(cancel))?;
             }
             let options = StatementOptions {
                 vector_consistency: settings.vector_consistency,
@@ -384,7 +384,7 @@ impl CursorEngine for DatabaseCursorEngine {
                 router.begin(RoutedBegin::new(transaction, ActingContext::Trusted, start)),
             );
         }
-        self.begin_here(transaction, start)
+        self.begin_here(transaction, start, None)
     }
 
     fn commit_transaction(
@@ -436,11 +436,13 @@ impl CursorEngine for DatabaseCursorEngine {
 }
 
 impl DatabaseCursorEngine {
-    /// Open `transaction` on this member, which leads, as `start` says.
+    /// Open `transaction` on this member, which leads, as `start` says; a
+    /// wait for its causal bound ends with `cancel`.
     fn begin_here(
         &self,
         transaction: TransactionId,
         start: RoutedStart,
+        cancel: Option<&coordinode_core::budget::CancelFlag>,
     ) -> Result<(), EngineError> {
         // A causal bound is established on the log before the snapshot is
         // pinned, as for a read; the database then checks the snapshot.
@@ -449,10 +451,12 @@ impl DatabaseCursorEngine {
                 EngineError::internal(format!("no runtime to fence the start on: {e}"))
             })?;
             runtime
-                .block_on(
-                    self.executor
-                        .await_start_bound(start.after_ts, start.causal_wait),
-                )
+                .block_on(self.executor.await_start_bound(
+                    start.after_ts,
+                    start.causal_wait,
+                    None,
+                    cancel,
+                ))
                 .map_err(engine_error)?;
         }
         self.database()

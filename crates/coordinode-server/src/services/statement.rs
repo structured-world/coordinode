@@ -113,8 +113,12 @@ impl StatementExecutor {
         &self,
         after_ts: Option<u64>,
         wait: Option<std::time::Duration>,
+        deadline: Option<Instant>,
+        cancel: Option<&coordinode_core::budget::CancelFlag>,
     ) -> Result<(), DatabaseError> {
-        self.admitter.await_start_bound(after_ts, wait).await
+        self.admitter
+            .await_start_bound(after_ts, wait, deadline, cancel)
+            .await
     }
 
     /// Whether a fence has to wait on the consensus node, which needs a

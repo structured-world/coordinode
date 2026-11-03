@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use coordinode_core::budget::CancelFlag;
+use coordinode_core::budget::{BudgetStop, CancelFlag};
 use coordinode_core::graph::types::VectorConsistencyMode;
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::read_concern::{
@@ -365,14 +365,14 @@ impl Admitter {
             // A position becomes the commit timestamp bound its prefix needs,
             // which the database's view must reach; the position itself is
             // established here.
-            read_concern.after_ts = fence
-                .await_causal(
-                    read_concern.after_ts,
-                    read_concern.after_position,
-                    read_concern.wait,
-                )
-                .await
-                .map_err(fence_error)?;
+            let (after_ts, after_position) = (read_concern.after_ts, read_concern.after_position);
+            read_concern.after_ts = within_operation(
+                read_concern.wait,
+                checked.deadline,
+                checked.cancel.as_ref(),
+                |wait| fence.await_causal(after_ts, after_position, wait),
+            )
+            .await?;
         } else if read_concern.level == ReadConcernLevel::Linearizable {
             // The barrier proved authority and applied the log through it;
             // what is left is a view holding that prefix, the same bound a
@@ -401,25 +401,30 @@ impl Admitter {
 
     /// Establish a transaction start's causal bound on this member's log, as
     /// a causal read's: met at once, after `wait` when one is allowed, or
-    /// refused as not ready. Nothing to establish standalone, where the
+    /// refused as not ready. The wait ends with the start's `deadline` or
+    /// `cancel`, as a read's does. Nothing to establish standalone, where the
     /// database checks the bound against the snapshot it pins.
     ///
     /// # Errors
     ///
-    /// The read fence's refusal, as for a read.
+    /// The read fence's refusal, as for a read; the deadline's or the
+    /// cancel's outcome when either ends the wait.
     pub async fn await_start_bound(
         &self,
         after_ts: Option<u64>,
         wait: Option<Duration>,
+        deadline: Option<Instant>,
+        cancel: Option<&CancelFlag>,
     ) -> Result<(), DatabaseError> {
         let (Some(node), Some(after_ts)) = (self.node.as_ref(), after_ts) else {
             return Ok(());
         };
-        node.read_fence()
-            .await_causal(Some(after_ts), None, wait)
-            .await
-            .map(|_| ())
-            .map_err(fence_error)
+        let mut fence = node.read_fence();
+        within_operation(wait, deadline, cancel, |wait| {
+            fence.await_causal(Some(after_ts), None, wait)
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Check and fence in one step.
@@ -558,6 +563,44 @@ fn fence_refusal(
         // knows, and the ingress decides what to do with it.
         leader_id if needs_leader => Err(DatabaseError::NotLeader { leader_id }),
         _ => Err(fence_error(err)),
+    }
+}
+
+/// Wait for a causal bound through `wait_for`, which waits at most the
+/// duration it is handed: the request's own `wait`, cut at the operation's
+/// `deadline`, and given up once `cancel` is thrown. A wait the deadline cut
+/// short ends with the deadline's outcome, as the statement itself would; one
+/// that ran its own course is refused as not ready. Neither is answered below
+/// the bound.
+async fn within_operation<T, F>(
+    wait: Option<Duration>,
+    deadline: Option<Instant>,
+    cancel: Option<&CancelFlag>,
+    wait_for: impl FnOnce(Option<Duration>) -> F,
+) -> Result<T, DatabaseError>
+where
+    F: std::future::Future<Output = Result<T, ReadFenceError>>,
+{
+    // The time left is zero once the deadline has passed: no wait at all.
+    let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+    let (wait, cut) = match (wait, left) {
+        (Some(wait), Some(left)) if left < wait => (Some(left), true),
+        (wait, _) => (wait, false),
+    };
+    let waited = wait_for(wait);
+    let outcome = match cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            () = cancel.thrown() => return Err(DatabaseError::Budget(BudgetStop::Cancelled)),
+            outcome = waited => outcome,
+        },
+        None => waited.await,
+    };
+    match outcome {
+        Err(ReadFenceError::NotReady { .. }) if cut => {
+            Err(DatabaseError::Budget(BudgetStop::Deadline))
+        }
+        outcome => outcome.map_err(fence_error),
     }
 }
 

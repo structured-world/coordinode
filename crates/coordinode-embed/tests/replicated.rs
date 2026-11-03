@@ -2924,3 +2924,80 @@ async fn a_leader_cut_off_from_its_group_takes_nothing_more() {
     nemesis::heal();
     assert!(result.is_ok(), "TIMED OUT");
 }
+
+/// An explicitly requested causal wait lasts no longer than its operation: a
+/// read allowed to wait a minute for a bound no commit here reaches ends with
+/// the deadline's own outcome when its deadline passes, and with the cancel's
+/// when its statement is cancelled while it waits. Neither is answered below
+/// the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_causal_wait_ends_at_its_deadline_or_cancel() {
+    use coordinode_core::budget::BudgetStop;
+    use coordinode_core::txn::read_concern::ReadConcernLevel;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs = vec![tempfile::tempdir().unwrap()];
+        let (members, _ports) = group(&dirs, None).await;
+        wait_until("the member leads", || members[0].leader() == Some(1)).await;
+        // Far past any commit this member makes during the test.
+        let unmet = |requested: Requested| Statement {
+            requested: Requested {
+                read_concern: Some(ReadConcernLevel::Majority),
+                after_ts: u64::MAX / 2,
+                causal_wait: Some(Duration::from_secs(60)),
+                ..requested
+            },
+            ..Statement::new("MATCH (n) RETURN count(n) AS c")
+        };
+        let well_inside_the_wait = Duration::from_secs(20);
+
+        let started = Instant::now();
+        let timed = members[0]
+            .execute(unmet(Requested {
+                deadline: Some(Instant::now() + Duration::from_millis(300)),
+                ..Requested::default()
+            }))
+            .await;
+        assert!(
+            matches!(timed, Err(DatabaseError::Budget(BudgetStop::Deadline))),
+            "the deadline ends the wait, got {timed:?}"
+        );
+        assert!(
+            started.elapsed() < well_inside_the_wait,
+            "ended by the deadline, not by the requested wait: {:?}",
+            started.elapsed()
+        );
+
+        let cancel = CancelFlag::new();
+        let thrower = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                cancel.cancel();
+            })
+        };
+        let started = Instant::now();
+        let cancelled = members[0]
+            .execute(unmet(Requested {
+                cancel: Some(cancel),
+                ..Requested::default()
+            }))
+            .await;
+        thrower.await.unwrap();
+        assert!(
+            matches!(cancelled, Err(DatabaseError::Budget(BudgetStop::Cancelled))),
+            "the cancel ends the wait, got {cancelled:?}"
+        );
+        assert!(
+            started.elapsed() < well_inside_the_wait,
+            "ended by the cancel, not by the requested wait: {:?}",
+            started.elapsed()
+        );
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}

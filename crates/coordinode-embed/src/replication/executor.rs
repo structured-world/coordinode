@@ -219,7 +219,7 @@ pub fn routed_requested(statement: &RoutedStatement, cancel: &CancelFlag) -> Req
 
 /// The instant `left` from now; a span past what the clock can name bounds
 /// nothing.
-fn deadline_after(left: Option<std::time::Duration>) -> Option<std::time::Instant> {
+pub fn deadline_after(left: Option<std::time::Duration>) -> Option<std::time::Instant> {
     left.and_then(|left| std::time::Instant::now().checked_add(left))
 }
 
@@ -464,10 +464,12 @@ impl CommandExecutor for MemberCommandExecutor {
     ) -> Result<RoutedStats, DatabaseError> {
         if statement.transaction.is_some() {
             if let Some(start) = &statement.start {
-                self.runtime.block_on(
-                    self.admitter
-                        .await_start_bound(start.after_ts, start.causal_wait),
-                )?;
+                self.runtime.block_on(self.admitter.await_start_bound(
+                    start.after_ts,
+                    start.causal_wait,
+                    deadline_after(statement.deadline),
+                    Some(cancel),
+                ))?;
             }
             return write_in_transaction(
                 self.admitter.database(),
@@ -504,10 +506,12 @@ impl CommandExecutor for MemberCommandExecutor {
     }
 
     fn begin(&self, call: RoutedBegin) -> Result<(), DatabaseError> {
-        self.runtime.block_on(
-            self.admitter
-                .await_start_bound(call.after_ts, call.causal_wait),
-        )?;
+        self.runtime.block_on(self.admitter.await_start_bound(
+            call.after_ts,
+            call.causal_wait,
+            None,
+            None,
+        ))?;
         begin(&self.admitter.database().read(), call)
     }
 

@@ -614,11 +614,14 @@ impl Database {
         self.reap_idle_transactions(self.interactive_idle_timeout);
         let tenure = self.interactive.current()?;
         let read_concern = options.read_concern.unwrap_or(self.read_concern);
-        let causal_after_ts = self.prepare_causal_read(&super::CausalBound {
-            after_ts: options.after_ts,
-            after_position: None,
-            wait: options.causal_wait,
-        })?;
+        let causal_after_ts = self.prepare_causal_read(
+            &super::CausalBound {
+                after_ts: options.after_ts,
+                after_position: None,
+                wait: options.causal_wait,
+            },
+            None,
+        )?;
         let read_ts = self.oracle.next();
         // The view is the engine's complete snapshot, not the timestamp just
         // allocated: a fresh number from the clock can already cover a commit
