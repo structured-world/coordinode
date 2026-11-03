@@ -396,11 +396,16 @@ impl Session {
                     self.registry.detach(self.session_id, &transaction);
                     return;
                 }
+                // A rollback only ends work: a member busy with other commands
+                // still runs it, in one of the session's slots for that.
+                let Some(ending) = self.slots.take_ending() else {
+                    send_error(out, request_id, self.engine.busy()).await;
+                    return;
+                };
                 let lane = lanes.step(transaction);
                 let session_id = self.session_id;
-                // No slot: a rollback ends work and is never refused for want
-                // of room to do more.
                 self.spawn(out, None, move |engine, registry, _, _| async move {
+                    let _ending = ending;
                     lane.after_previous().await;
                     let admission = lane.signal();
                     let _ = blocking(move || engine.rollback_transaction(transaction, &admission))

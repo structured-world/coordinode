@@ -48,6 +48,27 @@ fn a_session_at_its_bound_takes_nothing_of_the_member() {
     );
 }
 
+/// A command that only ends work runs on a member out of slots, takes none of
+/// them, and a session runs no more such commands at once than its own bound.
+#[test]
+fn an_ending_runs_on_a_full_member_within_its_sessions_bound() {
+    let slots = slots(1, 2);
+    let session = slots.session();
+    let _busy = slots.take().expect("the member's one slot");
+    let first = session.take_ending().expect("an ending on a full member");
+    let _second = session.take_ending().expect("a second within the bound");
+    assert!(
+        session.take_ending().is_none(),
+        "a third past the session's bound is refused"
+    );
+    assert_eq!(slots.available(), 0, "endings took no member slot");
+    drop(first);
+    assert!(
+        session.take_ending().is_some(),
+        "a freed one is taken again"
+    );
+}
+
 /// No slots, or more than can be counted, is no count.
 #[test]
 fn a_count_of_none_or_too_many_is_refused() {

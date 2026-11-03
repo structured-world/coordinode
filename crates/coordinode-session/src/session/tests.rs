@@ -1249,6 +1249,60 @@ async fn a_command_past_the_sessions_slots_is_refused_before_it_runs() {
     assert_eq!(slots.available(), 8, "every slot came back");
 }
 
+/// A rollback only ends work: on a member whose every slot is held it still
+/// reaches the engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollback_runs_on_a_member_out_of_slots() {
+    let recording = Arc::new(RecordingEngine::default());
+    let one = SlotCount::new(1).expect("one slot");
+    let slots = CommandSlots::new(one, one);
+    let manager = SessionManager::new(
+        Arc::clone(&recording) as Arc<dyn CursorEngine>,
+        Arc::new(SessionRegistry::new()),
+    )
+    .with_command_slots(slots.clone());
+    let held = slots.take().expect("the member's one slot");
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    let run = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+    op_tx
+        .send((1, statement("open", Some(txid(6)))))
+        .await
+        .unwrap();
+    op_tx
+        .send((
+            2,
+            SessionOp::Rollback {
+                transaction: txid(6),
+            },
+        ))
+        .await
+        .unwrap();
+    drop(op_tx);
+    let mut events = Vec::new();
+    while let Some(event) = ev_rx.recv().await {
+        events.push(event);
+    }
+    run.await.unwrap();
+    assert!(
+        !events.iter().any(|(id, _)| *id == 2),
+        "the rollback was answered, so refused: {events:?}"
+    );
+    // Silent: it reaches the engine on its own task, after the stream ends.
+    let reached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !recording
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Rollback(id) if *id == txid(6)))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(reached.is_ok(), "{:?}", recording.calls());
+    drop(held);
+}
+
 /// A commit that opens its own transaction is one command in one slot: with a
 /// single slot an empty transaction begins and commits, and a commit refused
 /// for want of the slot keeps its begin, so the commit sent again opens and

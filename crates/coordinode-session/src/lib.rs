@@ -21,7 +21,7 @@ pub use engine::{
 };
 pub use registry::SessionRegistry;
 pub use session::{InOp, OutEvent, Session, SessionManager};
-pub use slots::{CommandSlot, CommandSlots, SessionSlots, SlotCount};
+pub use slots::{CommandSlot, CommandSlots, EndingSlot, SessionSlots, SlotCount};
 pub use types::{
     ConnectionSettings, ConnectionState, ErrorCode, Failure, SessionEvent, SessionOp, SessionStats,
     StatementSource,

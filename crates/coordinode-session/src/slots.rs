@@ -62,6 +62,7 @@ impl CommandSlots {
         SessionSlots {
             member: Arc::clone(&self.member),
             session: Arc::new(Semaphore::new(self.session_commands.get())),
+            endings: Arc::new(Semaphore::new(self.session_commands.get())),
         }
     }
 
@@ -86,6 +87,8 @@ impl CommandSlots {
 pub struct SessionSlots {
     member: Arc<Semaphore>,
     session: Arc<Semaphore>,
+    /// The session's slots for commands that only end work.
+    endings: Arc<Semaphore>,
 }
 
 impl SessionSlots {
@@ -101,6 +104,22 @@ impl SessionSlots {
             _session: Some(session),
         })
     }
+
+    /// A slot for a command that only ends work, a rollback: none of the
+    /// member's, so a member busy with other commands still runs it, and at
+    /// most the session's number of them at once.
+    pub fn take_ending(&self) -> Option<EndingSlot> {
+        Some(EndingSlot {
+            _permit: Arc::clone(&self.endings).try_acquire_owned().ok()?,
+        })
+    }
+}
+
+/// A slot a command that only ends work holds until it ends; dropping it
+/// frees it.
+#[derive(Debug)]
+pub struct EndingSlot {
+    _permit: OwnedSemaphorePermit,
 }
 
 /// A slot a command holds until it ends; dropping it frees it.

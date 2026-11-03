@@ -1647,6 +1647,44 @@ async fn a_routed_command_shares_the_members_slots_with_its_own_clients() {
         .expect("runs once the slot is free");
 }
 
+/// A routed rollback only ends work, so a member out of slots still runs it:
+/// with the member's one slot held by a local command the rollback reaches the
+/// executor, and once the slot is free the next command runs.
+#[tokio::test]
+async fn a_routed_rollback_runs_on_a_member_out_of_slots() {
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer::default()));
+    let one = SlotCount::new(1).expect("one slot");
+    let slots = CommandSlots::new(one, one);
+    let router =
+        serve_handler(CommandRoutingHandler::new(Arc::clone(&executor)).sharing(slots.clone()))
+            .await;
+    let local = slots
+        .take()
+        .expect("a local command holds the member's one slot");
+
+    let err = router
+        .rollback(RoutedRollback {
+            actor: principal(),
+            transaction: txid(),
+            abandoned: false,
+        })
+        .await
+        .expect_err("the scripted executor knows no transaction");
+    assert!(
+        matches!(err, DatabaseError::UnknownTransaction(id) if id == txid()),
+        "the rollback ran rather than being refused as busy: {err:?}"
+    );
+    assert_eq!(executor.rollbacks.lock().unwrap().len(), 1);
+
+    drop(local);
+    router
+        .execute(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect("runs once the slot is free");
+    assert_eq!(slots.available(), 1, "every slot came back");
+}
+
 /// A routed command waiting before it runs (for its fence or a causal bound)
 /// holds no thread meanwhile: with a single blocking thread, another command
 /// of the session runs and answers while it waits. A Cancel ends the wait, a

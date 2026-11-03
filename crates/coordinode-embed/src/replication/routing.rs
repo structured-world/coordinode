@@ -977,6 +977,31 @@ impl<E: CommandExecutor> ServedSession<E> {
             self.refuse(call, "admission", status.message().to_owned());
             return;
         }
+        // A rollback only ends work: a member busy with other commands still
+        // runs it, in one of the session's slots for that.
+        if let Some(R::Rollback(rollback)) = request.request {
+            let Some(slot) = self.slots.take_ending() else {
+                self.refuse(
+                    call,
+                    REFUSED_BUSY,
+                    "the session ends as many transactions at once as it takes".to_owned(),
+                );
+                return;
+            };
+            match rollback_from_wire(rollback) {
+                Ok(rollback) => self.answer(call, slot, move |e| {
+                    wire::routed_reply::Reply::RolledBack(wire::RoutedRolledBack {
+                        error: e
+                            .rollback(rollback)
+                            .err()
+                            .map(errors::encode)
+                            .unwrap_or_default(),
+                    })
+                }),
+                Err(status) => self.refuse(call, "request", status.message().to_owned()),
+            }
+            return;
+        }
         // Taken without waiting: a reader that waited for a slot would hold
         // back the credits and cancellations that free one.
         let Some(slot) = self.slot() else {
@@ -1022,17 +1047,6 @@ impl<E: CommandExecutor> ServedSession<E> {
                     })
                 });
             }),
-            Some(R::Rollback(rollback)) => rollback_from_wire(rollback).map(|rollback| {
-                self.answer(call, slot, move |e| {
-                    wire::routed_reply::Reply::RolledBack(wire::RoutedRolledBack {
-                        error: e
-                            .rollback(rollback)
-                            .err()
-                            .map(errors::encode)
-                            .unwrap_or_default(),
-                    })
-                });
-            }),
             Some(R::Operation(operation)) => actor_from_wire(operation.actor)
                 .and_then(|actor| Ok((actor, operation_call_from_wire(operation.call)?)))
                 .map(|(actor, operation)| {
@@ -1047,7 +1061,7 @@ impl<E: CommandExecutor> ServedSession<E> {
                         })
                     });
                 }),
-            Some(R::Credit(_) | R::Cancel(_)) => Ok(()),
+            Some(R::Credit(_) | R::Cancel(_) | R::Rollback(_)) => Ok(()),
             None => Err(Status::invalid_argument(
                 "a routed request names no command",
             )),
@@ -1068,7 +1082,7 @@ impl<E: CommandExecutor> ServedSession<E> {
     fn answer(
         &self,
         call: u64,
-        slot: CommandSlot,
+        slot: impl Send + 'static,
         run: impl FnOnce(&E) -> wire::routed_reply::Reply + Send + 'static,
     ) {
         let executor = Arc::clone(&self.executor);
