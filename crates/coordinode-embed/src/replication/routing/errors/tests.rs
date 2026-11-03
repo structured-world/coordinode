@@ -306,6 +306,7 @@ fn every_variant() -> Vec<DatabaseError> {
             limit: 200,
         },
         E::WriteBackpressure,
+        E::MemberBusy,
         E::CapacityExhausted {
             endpoint_id: "hot".into(),
             used_bytes: 10,

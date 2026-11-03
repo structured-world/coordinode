@@ -205,7 +205,11 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         // statement succeeds once it has.
         // A unique value not proved free while its index is being built is
         // the same: the statement succeeds once the build has caught up.
-        DatabaseError::WriteBackpressure | DatabaseError::UniquenessUnresolved { .. } => "53000",
+        // So is a member running as many commands as it takes: the statement
+        // did not run, and runs once a slot frees.
+        DatabaseError::WriteBackpressure
+        | DatabaseError::UniquenessUnresolved { .. }
+        | DatabaseError::MemberBusy => "53000",
         // disk_full: the disk is below its reserve, writes wait for space.
         DatabaseError::StorageFull { .. } => "53100",
         // read_only_sql_transaction: this member takes no writes, the leader

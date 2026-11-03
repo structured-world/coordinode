@@ -158,6 +158,9 @@ pub struct Member {
     handler: Option<RaftGrpcHandler>,
     preference: ElectionPreference,
     routing: routing::CheckedRoutingLimits,
+    /// The slots every command runs in here, routed by a peer or sent by
+    /// this member's own clients.
+    command_slots: routing::CommandSlots,
     follower: Option<follower::IndexDefinitionFollower>,
     background: Vec<tokio::task::JoinHandle<()>>,
     /// Tells the background tasks to finish: each stops between passes, so
@@ -308,6 +311,7 @@ impl Member {
             engine,
             handler,
             preference,
+            command_slots: checked_routing.command_slots(),
             routing: checked_routing,
             follower: None,
             background: vec![tenure, reaper],
@@ -446,11 +450,19 @@ impl Member {
         }
         routes.add_service(InterceptedService::new(
             routing::CommandRoutingHandler::limited(executor, self.routing)
+                .sharing(self.command_slots.clone())
                 .admitting(coordinode_raft::cluster::admission::node_admitted)
                 .into_service(routing::MAX_ROUTED_MESSAGE),
             nodes_only,
         ));
         true
+    }
+
+    /// The slots every command runs in on this member: a server takes one
+    /// for each command its own clients send, from the same slots the
+    /// commands its peers route here take theirs.
+    pub fn command_slots(&self) -> &routing::CommandSlots {
+        &self.command_slots
     }
 }
 

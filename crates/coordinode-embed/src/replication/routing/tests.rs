@@ -1569,6 +1569,40 @@ async fn the_member_bound_spans_sessions() {
     }
 }
 
+/// Routed commands run in the member's slots, the ones its own clients'
+/// commands take: while a local command holds the only one, a routed command
+/// is refused before it runs, and the member that routed it answers its
+/// client with the same retryable refusal. Once the slot is free it runs.
+#[tokio::test]
+async fn a_routed_command_shares_the_members_slots_with_its_own_clients() {
+    let executor = Arc::new(Scripted::default());
+    *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer::default()));
+    let one = SlotCount::new(1).expect("one slot");
+    let slots = CommandSlots::new(one, one);
+    let router =
+        serve_handler(CommandRoutingHandler::new(Arc::clone(&executor)).sharing(slots.clone()))
+            .await;
+    let local = slots
+        .take()
+        .expect("a local command holds the member's one slot");
+
+    let err = router
+        .execute(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect_err("no slot is free");
+    assert!(matches!(err, DatabaseError::MemberBusy), "{err:?}");
+    assert!(
+        executor.statements.lock().unwrap().is_empty(),
+        "the refused command did not run"
+    );
+
+    drop(local);
+    router
+        .execute(statement(None), &AdmissionSignal::new(|| {}))
+        .await
+        .expect("runs once the slot is free");
+}
+
 /// The frame that ends an answer goes out without credit, so a statement
 /// whose ingress has taken nothing yet still ends and gives its slot back;
 /// the batch size and credit are the ones the limits set.

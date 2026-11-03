@@ -429,6 +429,12 @@ pub enum DatabaseError {
     )]
     WriteBackpressure,
 
+    /// The member runs as many commands at once as it takes, or the
+    /// command's session does: the command was refused before anything of it
+    /// ran, and may be sent again.
+    #[error("the member runs as many commands as it takes; this one did not run, retry it shortly")]
+    MemberBusy,
+
     /// The write does not fit a storage endpoint's total owned footprint, its
     /// `hard_limit_bytes`: journal, tables, indexes and metadata together,
     /// with what admitted writes are promised. Nothing was applied; the write

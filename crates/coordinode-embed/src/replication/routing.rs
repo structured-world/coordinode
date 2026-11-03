@@ -35,6 +35,7 @@ use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 use coordinode_query::advisor::source::SourceContext;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proto::internode::routing as wire;
+pub use coordinode_session::{CommandSlot, CommandSlots, SessionSlots, SlotCount};
 use coordinode_wire::peer::PeerConnectInfo;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
@@ -64,26 +65,40 @@ const ROW_BATCH_BYTES: usize = 1 << 20;
 const FRAMES_AHEAD: u32 = 4;
 
 /// The default of [`RoutingLimits::commands`]: tokio's default bound on
-/// blocking threads, which is where routed commands run.
+/// blocking threads, which is where commands run.
 const COMMANDS: usize = 512;
 
 /// The default of [`RoutingLimits::session_commands`]: half of
-/// [`COMMANDS`], so one peer leaves room for the others.
+/// [`COMMANDS`], so one session leaves room for the others.
 const SESSION_COMMANDS: usize = 256;
+
+/// [`COMMANDS`] as slots.
+const COMMAND_SLOTS: SlotCount = match SlotCount::new(COMMANDS) {
+    Some(slots) => slots,
+    None => unreachable!(),
+};
+
+/// [`SESSION_COMMANDS`] as slots.
+const SESSION_COMMAND_SLOTS: SlotCount = match SlotCount::new(SESSION_COMMANDS) {
+    Some(slots) => slots,
+    None => unreachable!(),
+};
 
 /// The largest message a member takes from another on this service: a batch
 /// of rows that holds one very large row.
 pub const MAX_ROUTED_MESSAGE: usize = 64 << 20;
 
-/// What the executing member lets routed commands hold. A command past a
-/// bound on running commands is refused before it runs, and its ingress
-/// learns it did not run; what is queued for a session's replies is bounded
-/// by these together.
+/// What the executing member lets commands hold. A command past a bound on
+/// running commands is refused before it runs, and its sender learns it did
+/// not run; what is queued for a routing session's replies is bounded by
+/// these together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingLimits {
-    /// Commands from all peers running on this member at once.
+    /// Commands running on this member at once: routed by its peers and
+    /// sent by a server's own clients together.
     pub commands: usize,
-    /// Commands of one session, that is of one peer, running at once.
+    /// Commands of one session running at once: one peer's routing session,
+    /// or one client's session.
     pub session_commands: usize,
     /// Frames of one answer sent ahead of the ingress taking them.
     pub frames_ahead: u32,
@@ -104,17 +119,16 @@ impl RoutingLimits {
     /// [`InvalidRoutingLimits`] naming a bound that is zero, more commands
     /// than a semaphore counts, or a reply bound past `usize`.
     pub fn check(self) -> Result<CheckedRoutingLimits, InvalidRoutingLimits> {
-        for (name, commands) in [
-            ("commands", self.commands),
-            ("session_commands", self.session_commands),
-        ] {
-            if commands == 0 || commands > tokio::sync::Semaphore::MAX_PERMITS {
-                return Err(InvalidRoutingLimits(format!(
+        let slots = |name: &str, commands: usize| {
+            SlotCount::new(commands).ok_or_else(|| {
+                InvalidRoutingLimits(format!(
                     "{name} is {commands}; it must be from 1 to {}",
-                    tokio::sync::Semaphore::MAX_PERMITS
-                )));
-            }
-        }
+                    SlotCount::MAX
+                ))
+            })
+        };
+        let command_slots = slots("commands", self.commands)?;
+        let session_command_slots = slots("session_commands", self.session_commands)?;
         if self.frames_ahead == 0 {
             return Err(InvalidRoutingLimits("frames_ahead is 0".to_owned()));
         }
@@ -130,6 +144,8 @@ impl RoutingLimits {
         Ok(CheckedRoutingLimits {
             limits: self,
             session_replies,
+            command_slots,
+            session_command_slots,
         })
     }
 
@@ -151,12 +167,20 @@ impl RoutingLimits {
 pub struct CheckedRoutingLimits {
     limits: RoutingLimits,
     session_replies: usize,
+    command_slots: SlotCount,
+    session_command_slots: SlotCount,
 }
 
 impl CheckedRoutingLimits {
     /// The limits checked.
     pub fn limits(&self) -> RoutingLimits {
         self.limits
+    }
+
+    /// New slots for the commands these limits allow, member-wide and per
+    /// session.
+    pub fn command_slots(&self) -> CommandSlots {
+        CommandSlots::new(self.command_slots, self.session_command_slots)
     }
 }
 
@@ -166,6 +190,8 @@ impl Default for CheckedRoutingLimits {
             limits: RoutingLimits::default(),
             // The defaults are small constants: no bound overflows.
             session_replies: (FRAMES_AHEAD as usize + 3) * SESSION_COMMANDS,
+            command_slots: COMMAND_SLOTS,
+            session_command_slots: SESSION_COMMAND_SLOTS,
         }
     }
 }
@@ -179,13 +205,6 @@ impl Default for RoutingLimits {
             row_batch_bytes: ROW_BATCH_BYTES,
         }
     }
-}
-
-/// A slot a running command holds until it ends: one of the member's and
-/// one of its session's.
-struct Slot {
-    _member: tokio::sync::OwnedSemaphorePermit,
-    _session: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// The settings a routed statement runs under, as its ingress resolved them.
@@ -474,6 +493,9 @@ pub trait CommandExecutor: Send + Sync + 'static {
     ) -> Result<RoutedOperationAnswer, DatabaseError>;
 }
 
+/// The refusal reason of a command the executing member had no slot for.
+const REFUSED_BUSY: &str = "busy";
+
 /// Decides, before each command of a session, whether the connection it
 /// arrived on may still route commands here.
 pub type CommandAdmission = fn(Option<&PeerConnectInfo>) -> Result<(), Status>;
@@ -485,8 +507,9 @@ pub struct CommandRoutingHandler<E> {
     limits: RoutingLimits,
     /// Replies one session may leave unread.
     session_replies: usize,
-    /// The member's slots for running commands, shared by its sessions.
-    slots: Arc<tokio::sync::Semaphore>,
+    /// The member's slots for running commands, shared by its sessions and
+    /// by the member's own clients.
+    slots: CommandSlots,
 }
 
 impl<E: CommandExecutor> CommandRoutingHandler<E> {
@@ -497,15 +520,23 @@ impl<E: CommandExecutor> CommandRoutingHandler<E> {
     }
 
     /// A handler that runs routed commands through `executor` within
-    /// `limits`.
+    /// `limits`, in slots of its own.
     pub fn limited(executor: Arc<E>, limits: CheckedRoutingLimits) -> Self {
         Self {
             executor,
             admit: None,
             session_replies: limits.session_replies,
-            slots: Arc::new(tokio::sync::Semaphore::new(limits.limits.commands)),
+            slots: limits.command_slots(),
             limits: limits.limits,
         }
+    }
+
+    /// Run routed commands in `slots`, the member's, shared with its own
+    /// clients' commands, instead of slots of the handler's own.
+    #[must_use]
+    pub fn sharing(mut self, slots: CommandSlots) -> Self {
+        self.slots = slots;
+        self
     }
 
     /// Check every command of a session with `admit` before it runs, not
@@ -817,10 +848,8 @@ struct ServedSession<E> {
     replies: Replies,
     running: RunningCalls,
     limits: RoutingLimits,
-    /// The member's slots, shared with its other sessions.
-    member_slots: Arc<tokio::sync::Semaphore>,
-    /// This session's own slots.
-    session_slots: Arc<tokio::sync::Semaphore>,
+    /// This session's slots, within the member's.
+    slots: SessionSlots,
 }
 
 impl<E> Drop for ServedSession<E> {
@@ -898,8 +927,8 @@ impl<E: CommandExecutor> ServedSession<E> {
         let Some(slot) = self.slot() else {
             self.refuse(
                 call,
-                "busy",
-                "the member runs as many routed commands as it takes".to_owned(),
+                REFUSED_BUSY,
+                "the member runs as many commands as it takes".to_owned(),
             );
             return;
         };
@@ -966,13 +995,8 @@ impl<E: CommandExecutor> ServedSession<E> {
 
     /// A slot for one more command, when the member and this session both
     /// have one free.
-    fn slot(&self) -> Option<Slot> {
-        let member = Arc::clone(&self.member_slots).try_acquire_owned().ok()?;
-        let session = Arc::clone(&self.session_slots).try_acquire_owned().ok()?;
-        Some(Slot {
-            _member: member,
-            _session: session,
-        })
+    fn slot(&self) -> Option<CommandSlot> {
+        self.slots.take()
     }
 
     /// Run a short command on the blocking pool and queue its one reply.
@@ -980,7 +1004,7 @@ impl<E: CommandExecutor> ServedSession<E> {
     fn answer(
         &self,
         call: u64,
-        slot: Slot,
+        slot: CommandSlot,
         run: impl FnOnce(&E) -> wire::routed_reply::Reply + Send + 'static,
     ) {
         let executor = Arc::clone(&self.executor);
@@ -996,7 +1020,7 @@ impl<E: CommandExecutor> ServedSession<E> {
 
     /// Start `statement` on the blocking pool; its answer streams under
     /// `call`, and it holds `slot` until it ends.
-    fn execute(&self, call: u64, statement: RoutedStatement, slot: Slot) {
+    fn execute(&self, call: u64, statement: RoutedStatement, slot: CommandSlot) {
         let cancel = CancelFlag::new();
         let credit = Arc::new(Credit::new(self.limits.frames_ahead));
         {
@@ -1101,8 +1125,7 @@ impl<E: CommandExecutor> CommandRoutingService for CommandRoutingHandler<E> {
             replies,
             running: RunningCalls::default(),
             limits: self.limits,
-            member_slots: Arc::clone(&self.slots),
-            session_slots: Arc::new(tokio::sync::Semaphore::new(self.limits.session_commands)),
+            slots: self.slots.session(),
         };
         tokio::spawn(session.run(request.into_inner()));
         Ok(Response::new(answers))
@@ -1818,6 +1841,14 @@ impl Call {
             None => self.replies.recv().await,
         };
         match arrival {
+            // A member out of slots answers as this one does when it is: the
+            // command did not run, and runs once a slot frees.
+            Some(Arrival::Reply(wire::routed_reply::Reply::Refused(refusal)))
+                if refusal.reason == REFUSED_BUSY =>
+            {
+                self.open = false;
+                Err(DatabaseError::MemberBusy)
+            }
             Some(Arrival::Reply(wire::routed_reply::Reply::Refused(refusal))) => {
                 self.open = false;
                 Err(DatabaseError::PeerUnreachable {

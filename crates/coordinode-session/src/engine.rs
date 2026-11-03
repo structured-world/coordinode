@@ -13,7 +13,7 @@ use coordinode_core::txn::command::{AdmissionSignal, ExpectedVersion, Transactio
 use coordinode_core::txn::operation::OperationDescriptor;
 use coordinode_core::txn::transaction::CommitReceipt;
 
-use crate::types::{ConnectionSettings, Failure, SessionStats, StatementSource};
+use crate::types::{ConnectionSettings, ErrorCode, Failure, SessionStats, StatementSource};
 
 /// The transaction a statement runs in, as the session hands it on.
 #[derive(Debug, Clone)]
@@ -148,6 +148,16 @@ pub trait CursorEngine: Send + Sync {
     /// reach its client: the client cannot know what the statement did, and
     /// a statement never runs twice. Later commands for it are told so.
     fn abandon_transaction(&self, transaction: TransactionId) -> Result<(), EngineError>;
+
+    /// The failure of a command refused because the member, or its session,
+    /// runs as many commands as it takes: nothing of it ran, and it may be
+    /// sent again. A binding answers with its own structured details.
+    fn busy(&self) -> Failure {
+        Failure::new(
+            ErrorCode::ResourceExhausted,
+            "the member runs as many commands as it takes; this one did not run, retry it shortly",
+        )
+    }
 }
 
 /// A live server-side cursor: a column header plus paged row batches.

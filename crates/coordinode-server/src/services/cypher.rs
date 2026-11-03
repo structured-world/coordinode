@@ -741,6 +741,11 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
+        // Nothing of the command ran: RESOURCE_EXHAUSTED with retry advice,
+        // as for backpressure, because a slot frees when a command ends.
+        DatabaseError::MemberBusy => {
+            return status_with_reason(Code::ResourceExhausted, rendered, Reason::MemberBusy, []);
+        }
         // A write that reached a node which is not the leader.
         // FAILED_PRECONDITION rather than UNAVAILABLE: the server is
         // perfectly available, it is the request that came to the wrong node,
@@ -1265,6 +1270,13 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         request: Request<query::ExecuteCypherRequest>,
     ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
+        // Held until the call ends, a causal wait and a statement passed to
+        // the leader included; a call past the member's slots did not run.
+        let _slot = self
+            .executor
+            .command_slots()
+            .take()
+            .ok_or_else(|| db_error_to_status(DatabaseError::MemberBusy))?;
         let source_ctx = extract_source_context(&request);
         let deadline = grpc_deadline(request.metadata());
         let cancel = coordinode_core::budget::CancelFlag::new();

@@ -1198,6 +1198,55 @@ impl CursorEngine for Gated {
     }
 }
 
+/// A session runs no more commands at once than its slots: while its one
+/// slot is held by a running statement, the next is refused before it runs as
+/// retryable, and a slot freed when the statement ends is taken by the one
+/// after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_past_the_sessions_slots_is_refused_before_it_runs() {
+    let (gated, _abandoned) = Gated::new();
+    let slots = CommandSlots::new(
+        SlotCount::new(8).expect("member slots"),
+        SlotCount::new(1).expect("session slots"),
+    );
+    let manager = SessionManager::new(
+        Arc::clone(&gated) as Arc<dyn CursorEngine>,
+        Arc::new(SessionRegistry::new()),
+    )
+    .with_command_slots(slots.clone());
+    let session = manager.open("test".into());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    let run = tokio::spawn(session.run(op_rx, ev_tx));
+
+    op_tx.send((1, statement("held", None))).await.unwrap();
+    op_tx.send((2, statement("refused", None))).await.unwrap();
+    let (rid, refused) = ev_rx.recv().await.expect("the refusal comes first");
+    assert_eq!(rid, 2);
+    assert!(
+        matches!(&refused, SessionEvent::Error(f) if f.code == ErrorCode::ResourceExhausted),
+        "{refused:?}"
+    );
+    assert_eq!(slots.available(), 7, "the running statement holds one slot");
+
+    gated.gate.add_permits(1);
+    while !matches!(
+        ev_rx.recv().await,
+        Some((1, SessionEvent::CursorEnd { .. }))
+    ) {}
+    op_tx.send((3, statement("after", None))).await.unwrap();
+    drop(op_tx);
+    while ev_rx.recv().await.is_some() {}
+    run.await.unwrap();
+
+    assert_eq!(
+        gated.order.lock().as_slice(),
+        ["held", "after"],
+        "the refused statement never ran; the next took the freed slot"
+    );
+    assert_eq!(slots.available(), 8, "every slot came back");
+}
+
 /// The commands one stream sends for one transaction reach its owner in the
 /// order sent: one held before it got its place holds back the next, even
 /// when they run on separate tasks; a statement of another transaction, or

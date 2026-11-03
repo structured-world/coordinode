@@ -433,6 +433,10 @@ impl CursorEngine for DatabaseCursorEngine {
     fn abandon_transaction(&self, transaction: TransactionId) -> Result<(), EngineError> {
         self.end_transaction(transaction, None, TransactionEnd::StreamLost)
     }
+
+    fn busy(&self) -> coordinode_session::Failure {
+        engine_error(DatabaseError::MemberBusy).0
+    }
 }
 
 impl DatabaseCursorEngine {

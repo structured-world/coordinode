@@ -66,9 +66,12 @@ impl SessionSvc {
     /// session in the shared `registry` so it is visible to `SHOW SESSIONS` /
     /// `SHOW TRANSACTIONS`.
     pub fn new(executor: StatementExecutor, registry: Arc<SessionRegistry>) -> Self {
+        // A session's commands take the member's slots, as unary calls and
+        // the commands peers route here do.
+        let slots = executor.command_slots().clone();
         let engine = Arc::new(DatabaseCursorEngine::from_executor(executor));
         Self {
-            manager: SessionManager::new(engine, registry),
+            manager: SessionManager::new(engine, registry).with_command_slots(slots),
             change_streams: None,
             cluster: None,
         }

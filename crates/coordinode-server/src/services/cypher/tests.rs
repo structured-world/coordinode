@@ -3712,3 +3712,91 @@ async fn a_replicated_lookup_through_a_wrong_entry_answers_within_the_request_li
 
     node.shutdown().await.expect("shutdown");
 }
+
+/// A member runs no more commands at once than its slots, whichever way they
+/// arrive: with its one slot held, a unary call and a statement on a session
+/// of the same member are both refused before anything of them runs, as a
+/// retryable RESOURCE_EXHAUSTED / MEMBER_BUSY; once the slot is free the
+/// call runs.
+#[tokio::test]
+async fn a_member_out_of_command_slots_refuses_every_command_before_it_runs() {
+    use coordinode_session::{
+        CommandSlots, SessionEvent, SessionManager, SessionOp, SessionRegistry, SlotCount,
+    };
+    use tonic_types::StatusExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let database = Arc::new(RwLock::new(
+        Database::open(dir.path()).expect("open database"),
+    ));
+    let one = SlotCount::new(1).expect("one slot");
+    let executor = crate::services::statement::StatementExecutor::new(Arc::clone(&database))
+        .with_command_slots(CommandSlots::new(one, one));
+    let svc = CypherServiceImpl::from_executor(executor.clone());
+    let held = executor
+        .command_slots()
+        .take()
+        .expect("the member's one slot");
+
+    let refused = svc
+        .execute_cypher(cypher_request("CREATE (:Busy {via: 'unary'})"))
+        .await
+        .expect_err("no slot is free");
+    assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+    let details = refused.get_error_details();
+    assert_eq!(
+        details.error_info().expect("ErrorInfo").reason,
+        "MEMBER_BUSY"
+    );
+    assert!(
+        details.retry_info().is_some(),
+        "the refusal says when to retry"
+    );
+
+    let manager = SessionManager::new(
+        Arc::new(session_engine(&svc)),
+        Arc::new(SessionRegistry::new()),
+    )
+    .with_command_slots(executor.command_slots().clone());
+    let (op_tx, op_rx) = tokio::sync::mpsc::channel(8);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(8);
+    let session = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+    op_tx
+        .send((
+            1,
+            SessionOp::Execute {
+                query: "CREATE (:Busy {via: 'session'})".to_owned(),
+                params: std::collections::HashMap::new(),
+                transaction: None,
+                settings: coordinode_session::ConnectionSettings::default(),
+                source: None,
+                operation: None,
+            },
+        ))
+        .await
+        .expect("send");
+    drop(op_tx);
+    let mut events = Vec::new();
+    while let Some((_, event)) = ev_rx.recv().await {
+        events.push(event);
+    }
+    session.await.expect("session task");
+    match events.as_slice() {
+        [SessionEvent::Error(failure)] => assert_eq!(
+            failure.code,
+            coordinode_session::ErrorCode::ResourceExhausted,
+            "{failure:?}"
+        ),
+        other => panic!("the session's statement is refused alone, got {other:?}"),
+    }
+
+    drop(held);
+    svc.execute_cypher(cypher_request("CREATE (:Busy {via: 'unary'})"))
+        .await
+        .expect("the call runs once a slot is free");
+    let rows = database
+        .write()
+        .execute_cypher("MATCH (n:Busy) RETURN n.via AS via")
+        .expect("read");
+    assert_eq!(rows.len(), 1, "nothing of the refused commands ran");
+}

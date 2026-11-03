@@ -91,20 +91,28 @@ On the session stream the same receipt is `Committed { commit_ts, position }`: `
 
 Every statement answers with a causal receipt (`QueryStats.receipt`): its `operation_time` is a write's own commit timestamp, or the timestamp a read's view was taken at, and a write in a replicated group also names its entry's `position`. A client that keeps the largest `operation_time` it has received, from writes and reads alike, and passes it as `ReadConcern.after_ts` on its next read gets read-your-writes and monotonic reads, on the leader or on a follower:
 
-```python
-w = client.execute_cypher(query="CREATE (n:Order {id: 1})")
-token = w.stats.receipt.operation_time
-r = client.execute_cypher(
-    query="MATCH (n:Order) RETURN n",
-    read_preference=ReadPreference.SECONDARY,
-    read_concern=ReadConcern(level=ReadConcernLevel.MAJORITY, after_ts=token, wait_ms=500),
-)
-token = max(token, r.stats.receipt.operation_time)
+```rust
+use std::time::Duration;
+use coordinode_client::CoordinodeClient;
+
+let mut client = CoordinodeClient::builder("http://node2:7080")
+    .causal_wait(Duration::from_millis(500))
+    .build()
+    .await?;
+let (_, mut token) = client
+    .execute_causal_write("CREATE (n:Order {id: 1})")
+    .await?;
+let (rows, seen) = client
+    .execute_causal_read("MATCH (n:Order) RETURN n", token)
+    .await?;
+token = token.max(seen);
 ```
 
 A member serves the read only where every commit at or below `after_ts` is applied; a later clock on that member is not enough, so a follower that has not applied a write the session depends on does not answer from before it. `after_position` bounds the read by a log position instead; it must name the serving member's own history, and a position of another deployment or group, or one sent to a standalone server, is refused with `FAILED_PRECONDITION`.
 
 Waiting is opt-in. A bound the member does not meet yet is refused at once with `UNAVAILABLE`, `reason = READ_NOT_READY`, so the client retries, reads elsewhere, or allows a wait: `wait_ms` lets the member wait up to that long for the bound, and the same refusal comes once it runs out. The read is never answered from before its bound. Ordinary reads with no bound are never held back by writes still in flight.
+
+A wait lasts no longer than its operation. The call's own deadline (the gRPC timeout) ends it with `DEADLINE_EXCEEDED`, reason `QUERY_DEADLINE_EXCEEDED`, and cancelling the call or the session statement ends it with `CANCELLED`, reason `QUERY_CANCELLED`; the server sets no limit of its own on `wait_ms`. A waiting read holds one of the member's command places for its whole wait, so a member out of them refuses the next command before it runs with `RESOURCE_EXHAUSTED`, reason `MEMBER_BUSY` (see `commands_max` in [Config-file-only settings](./configuration#config-file-only-settings-no-cli-flag)).
 
 An interactive transaction takes the session's bound when it begins (`Configure.read_concern.after_ts`, `TransactionOptions::after_ts` embedded): its snapshot is pinned no earlier than the bound, or the start is refused as not ready and nothing is opened, under the same wait rule.
 

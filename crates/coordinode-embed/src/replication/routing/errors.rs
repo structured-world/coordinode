@@ -111,6 +111,7 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::RevisionMismatch { .. } => "RevisionMismatch",
         E::TransactionTooLarge { .. } => "TransactionTooLarge",
         E::WriteBackpressure => "WriteBackpressure",
+        E::MemberBusy => "MemberBusy",
         E::CapacityExhausted { .. } => "CapacityExhausted",
         E::StorageFull { .. } => "StorageFull",
         E::NotLeader { .. } => "NotLeader",
@@ -580,6 +581,7 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             limit,
         }),
         E::WriteBackpressure => Kind::WriteBackpressure(wire::Empty {}),
+        E::MemberBusy => Kind::MemberBusy(wire::Empty {}),
         E::CapacityExhausted {
             endpoint_id,
             used_bytes,
@@ -971,6 +973,7 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             limit: t.limit,
         },
         Kind::WriteBackpressure(_) => E::WriteBackpressure,
+        Kind::MemberBusy(_) => E::MemberBusy,
         Kind::CapacityExhausted(c) => E::CapacityExhausted {
             endpoint_id: c.endpoint_id,
             used_bytes: c.used_bytes,

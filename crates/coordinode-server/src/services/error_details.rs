@@ -142,6 +142,10 @@ pub enum Reason {
     /// new writes until compaction catches up. Nothing was applied; retry
     /// after the advised delay.
     WriteBackpressure,
+    /// The member runs as many commands at once as it takes, or the
+    /// command's session does. The command was refused before anything of it
+    /// ran; retry after the advised delay.
+    MemberBusy,
     /// The write reached a node that is not the leader. Nothing was applied.
     /// Metadata carries `leader_id` when the cluster has named one, so the
     /// caller can retry at the right node instead of guessing.
@@ -328,6 +332,7 @@ impl Reason {
             Reason::StorageFull => "STORAGE_FULL",
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
+            Reason::MemberBusy => "MEMBER_BUSY",
             Reason::NotLeader => "NOT_LEADER",
             Reason::MemberReadOnly => "MEMBER_READ_ONLY",
             Reason::OutsideRetention => "OUTSIDE_RETENTION",
@@ -399,6 +404,8 @@ impl Reason {
             // a short floor keeps a pipelining client from spinning on it.
             Reason::TransactionBusy => Some(std::time::Duration::from_millis(10)),
             Reason::WriteBackpressure => Some(std::time::Duration::from_millis(500)),
+            // A slot frees as soon as any running command ends.
+            Reason::MemberBusy => Some(std::time::Duration::from_millis(50)),
             // The commits a named timestamp covers land within microseconds
             // and become durable within the journal's flush interval.
             Reason::ReadNotReady => Some(std::time::Duration::from_millis(50)),

@@ -21,6 +21,7 @@ replication = [
     "dep:coordinode-raft",
     "dep:coordinode-wire",
     "dep:coordinode-replicate",
+    "dep:coordinode-session",
     "dep:tokio",
     "dep:tokio-stream",
     "dep:tonic",
@@ -37,6 +38,8 @@ coordinode-raft = { workspace = true, optional = true }
 # The inter-node channel: node identity, the listener, segment transfer.
 coordinode-wire = { workspace = true, optional = true }
 coordinode-replicate = { workspace = true, optional = true }
+# The slots routed commands run in, shared with the member's own clients.
+coordinode-session = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 # The answer of a routed statement streams to the member that sent it.
 tokio-stream = { version = "0.1", optional = true }

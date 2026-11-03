@@ -217,8 +217,8 @@ pub(crate) async fn serve(
         raft_snapshot_entries,
         raft_snapshot_log_bytes,
         raft_snapshot_min_interval_secs,
-        routed_commands_max,
-        routed_session_commands_max,
+        commands_max,
+        session_commands_max,
         routed_frames_ahead,
         routed_row_batch_bytes,
         // Already captured above (election_timing / _preference) before the move.
@@ -451,8 +451,8 @@ pub(crate) async fn serve(
     };
     let routing = coordinode_embed::replication::routing::RoutingLimits::default();
     member_options.routing = coordinode_embed::replication::routing::RoutingLimits {
-        commands: routed_commands_max.map_or(routing.commands, |n| n.get()),
-        session_commands: routed_session_commands_max.map_or(routing.session_commands, |n| n.get()),
+        commands: commands_max.map_or(routing.commands, |n| n.get()),
+        session_commands: session_commands_max.map_or(routing.session_commands, |n| n.get()),
         frames_ahead: routed_frames_ahead.map_or(routing.frames_ahead, |n| n.get()),
         row_batch_bytes: routed_row_batch_bytes.map_or(routing.row_batch_bytes, |n| n.get()),
     };
@@ -1063,6 +1063,9 @@ pub(crate) async fn serve(
         let executor = services::statement::StatementExecutor::new(Arc::clone(&database))
             .with_advisor(Arc::clone(&query_registry), Arc::clone(&nplus1_detector))
             .with_statement_defaults(statement_defaults)
+            // The member's slots: its clients' commands and the ones its
+            // peers route here run in the same ones.
+            .with_command_slots(member.command_slots().clone())
             .with_slow_query_threshold(Some(slow_query_ms.map_or(
                 services::statement::DEFAULT_SLOW_QUERY,
                 std::time::Duration::from_millis,

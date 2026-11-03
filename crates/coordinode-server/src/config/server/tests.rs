@@ -239,15 +239,15 @@ fn raft_snapshot_settings_parse_from_the_config_file() {
     }
 }
 
-/// The bounds on commands peers route here: unset they leave the member's
-/// defaults, set they carry the values given, and a zero, which would refuse
-/// every routed command or stall every routed answer, is refused.
+/// The bounds on running commands and on routed answers: unset they leave
+/// the member's defaults, set they carry the values given, and a zero, which
+/// would refuse every command or stall every routed answer, is refused.
 #[test]
-fn routed_command_limits_parse_from_the_config_file() {
+fn command_limits_parse_from_the_config_file() {
     let d = ServerConfig::default();
     assert!(
-        d.routed_commands_max.is_none()
-            && d.routed_session_commands_max.is_none()
+        d.commands_max.is_none()
+            && d.session_commands_max.is_none()
             && d.routed_frames_ahead.is_none()
             && d.routed_row_batch_bytes.is_none()
     );
@@ -255,18 +255,18 @@ fn routed_command_limits_parse_from_the_config_file() {
     let path = dir.path().join("c.yaml");
     std::fs::write(
         &path,
-        "routed_commands_max: 64\nrouted_session_commands_max: 16\nrouted_frames_ahead: 8\nrouted_row_batch_bytes: 65536\n",
+        "commands_max: 64\nsession_commands_max: 16\nrouted_frames_ahead: 8\nrouted_row_batch_bytes: 65536\n",
     )
     .unwrap();
     let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
-    assert_eq!(c.routed_commands_max.map(|v| v.get()), Some(64));
-    assert_eq!(c.routed_session_commands_max.map(|v| v.get()), Some(16));
+    assert_eq!(c.commands_max.map(|v| v.get()), Some(64));
+    assert_eq!(c.session_commands_max.map(|v| v.get()), Some(16));
     assert_eq!(c.routed_frames_ahead.map(|v| v.get()), Some(8));
     assert_eq!(c.routed_row_batch_bytes.map(|v| v.get()), Some(65_536));
 
     for zero in [
-        "routed_commands_max: 0\n",
-        "routed_session_commands_max: 0\n",
+        "commands_max: 0\n",
+        "session_commands_max: 0\n",
         "routed_frames_ahead: 0\n",
         "routed_row_batch_bytes: 0\n",
     ] {

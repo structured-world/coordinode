@@ -32,6 +32,7 @@ use coordinode_core::txn::operation::OperationDescriptor;
 
 use crate::engine::{CursorEngine, EngineError, InTransaction, TransactionStart};
 use crate::registry::SessionRegistry;
+use crate::slots::{CommandSlot, CommandSlots, SessionSlots, SlotCount};
 use crate::types::{
     ConnectionSettings, ConnectionState, ErrorCode, Failure, SessionEvent, SessionOp, SessionStats,
     StatementSource,
@@ -51,6 +52,8 @@ pub struct SessionManager {
     engine: Arc<dyn CursorEngine>,
     registry: Arc<SessionRegistry>,
     connection: watch::Receiver<ConnectionState>,
+    /// The member's slots its sessions' commands run in.
+    slots: CommandSlots,
 }
 
 impl SessionManager {
@@ -75,7 +78,17 @@ impl SessionManager {
             engine,
             registry,
             connection: rx,
+            // As many as can be counted: the binding that serves clients
+            // names the member's own with `with_command_slots`.
+            slots: CommandSlots::new(UNBOUNDED, UNBOUNDED),
         }
+    }
+
+    /// Run every session's commands in `slots`, the member's: a command past
+    /// the member's or its session's slots is refused before it runs.
+    pub fn with_command_slots(mut self, slots: CommandSlots) -> Self {
+        self.slots = slots;
+        self
     }
 
     /// Report connection state from `connection` instead of assuming a
@@ -100,9 +113,16 @@ impl SessionManager {
             connection: self.connection.clone(),
             settings: Mutex::new(ConnectionSettings::default()),
             cancels: Cancels::default(),
+            slots: self.slots.session(),
         }
     }
 }
+
+/// The most slots there can be.
+const UNBOUNDED: SlotCount = match SlotCount::new(SlotCount::MAX) {
+    Some(slots) => slots,
+    None => unreachable!(),
+};
 
 /// A live multiplexed session.
 ///
@@ -123,6 +143,8 @@ pub struct Session {
     settings: Mutex<ConnectionSettings>,
     /// The statements in flight, for a Cancel to reach.
     cancels: Cancels,
+    /// The slots this session's commands run in, within the member's.
+    slots: SessionSlots,
 }
 
 impl Session {
@@ -245,6 +267,12 @@ impl Session {
                 source,
                 operation,
             } => {
+                // Taken before anything of the statement is placed: a refused
+                // one leaves its transaction's order and begin as they were.
+                let Some(slot) = self.slots.take() else {
+                    send_error(out, request_id, self.engine.busy()).await;
+                    return;
+                };
                 let statement = Statement {
                     request_id,
                     query,
@@ -255,7 +283,7 @@ impl Session {
                     cancel: self.cancels.register(request_id),
                 };
                 match transaction {
-                    None => self.spawn(out, |engine, _, out| async move {
+                    None => self.spawn(out, Some(slot), |engine, _, out| async move {
                         execute(&engine, statement, None, &out).await;
                     }),
                     Some(id) => {
@@ -263,7 +291,7 @@ impl Session {
                         let start = lanes.starts.remove(&id).map(|pending| pending.start);
                         let lane = lanes.step(id);
                         self.registry.attach(self.session_id, id);
-                        self.spawn(out, move |engine, _, out| async move {
+                        self.spawn(out, Some(slot), move |engine, _, out| async move {
                             lane.after_previous().await;
                             let transaction = InTransaction {
                                 id,
@@ -325,13 +353,19 @@ impl Session {
                 operation,
                 expect,
             } => {
+                // Refused before the transaction's order moves: the commit can
+                // be sent again, and runs after the same commands.
+                let Some(slot) = self.slots.take() else {
+                    send_error(out, request_id, self.engine.busy()).await;
+                    return;
+                };
                 // A transaction whose begin no statement carried opens first.
                 if let Some(pending) = lanes.starts.remove(&transaction) {
                     self.open(transaction, pending, lanes, out);
                 }
                 let lane = lanes.step(transaction);
                 let session_id = self.session_id;
-                self.spawn(out, move |engine, registry, out| async move {
+                self.spawn(out, Some(slot), move |engine, registry, out| async move {
                     lane.after_previous().await;
                     let admission = lane.signal();
                     let committed = blocking(move || {
@@ -364,7 +398,9 @@ impl Session {
                 }
                 let lane = lanes.step(transaction);
                 let session_id = self.session_id;
-                self.spawn(out, move |engine, registry, _| async move {
+                // No slot: a rollback ends work and is never refused for want
+                // of room to do more.
+                self.spawn(out, None, move |engine, registry, _| async move {
                     lane.after_previous().await;
                     let admission = lane.signal();
                     let _ = blocking(move || engine.rollback_transaction(transaction, &admission))
@@ -407,8 +443,18 @@ impl Session {
         lanes: &mut Lanes,
         out: &mpsc::Sender<OutEvent>,
     ) {
+        // A start waits for its causal bound like a read: it runs in a slot.
+        // Refused, it opens nothing, and the begin's request says why.
+        let Some(slot) = self.slots.take() else {
+            self.registry.detach(self.session_id, &transaction);
+            let (out, failure) = (out.clone(), self.engine.busy());
+            tokio::spawn(async move {
+                send_error(&out, pending.request_id, failure).await;
+            });
+            return;
+        };
         let lane = lanes.step(transaction);
-        self.spawn(out, move |engine, _, out| async move {
+        self.spawn(out, Some(slot), move |engine, _, out| async move {
             lane.after_previous().await;
             let PendingStart { start, request_id } = pending;
             let begun = blocking(move || {
@@ -422,8 +468,9 @@ impl Session {
         });
     }
 
-    /// Run `request` on its own task, counted as in flight for its lifetime.
-    fn spawn<F, Fut>(&self, out: &mpsc::Sender<OutEvent>, request: F)
+    /// Run `request` on its own task, counted as in flight for its lifetime
+    /// and holding `slot` until it ends.
+    fn spawn<F, Fut>(&self, out: &mpsc::Sender<OutEvent>, slot: Option<CommandSlot>, request: F)
     where
         F: FnOnce(Arc<dyn CursorEngine>, Arc<SessionRegistry>, mpsc::Sender<OutEvent>) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -438,6 +485,7 @@ impl Session {
         );
         tokio::spawn(async move {
             work.await;
+            drop(slot);
             registry.request_finished(session_id);
         });
     }

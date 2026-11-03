@@ -12,11 +12,13 @@
 mod engine;
 mod registry;
 mod session;
+mod slots;
 mod types;
 
 pub use engine::{CursorEngine, EngineError, InTransaction, QueryCursor, TransactionStart};
 pub use registry::SessionRegistry;
 pub use session::{InOp, OutEvent, Session, SessionManager};
+pub use slots::{CommandSlot, CommandSlots, SessionSlots, SlotCount};
 pub use types::{
     ConnectionSettings, ConnectionState, ErrorCode, Failure, SessionEvent, SessionOp, SessionStats,
     StatementSource,

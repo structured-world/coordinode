@@ -22,7 +22,7 @@ pub(crate) use coordinode_embed::replication::admission::{
 use coordinode_embed::replication::admission::{AdmissionDefaults, Admitter};
 pub(crate) use coordinode_embed::replication::executor::columns_and_values;
 use coordinode_embed::replication::routing::{
-    CommandRouter, RoutedAnswer, RoutedRows, RoutedStatement,
+    CheckedRoutingLimits, CommandRouter, CommandSlots, RoutedAnswer, RoutedRows, RoutedStatement,
 };
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::QueryRegistry;
@@ -49,6 +49,8 @@ pub struct StatementExecutor {
     nplus1_detector: Arc<NPlus1Detector>,
     /// Statements running at least this long are logged; `None` logs none.
     slow_query: Option<Duration>,
+    /// The member's slots every command runs in, whichever way it arrives.
+    slots: CommandSlots,
 }
 
 impl StatementExecutor {
@@ -61,7 +63,20 @@ impl StatementExecutor {
             query_registry: Arc::new(QueryRegistry::new()),
             nplus1_detector: Arc::new(NPlus1Detector::new()),
             slow_query: Some(DEFAULT_SLOW_QUERY),
+            slots: CheckedRoutingLimits::default().command_slots(),
         }
+    }
+
+    /// Run commands in `slots`, the member's: the ones its peers' routed
+    /// commands take theirs from too.
+    pub fn with_command_slots(mut self, slots: CommandSlots) -> Self {
+        self.slots = slots;
+        self
+    }
+
+    /// The member's slots every command runs in.
+    pub(crate) fn command_slots(&self) -> &CommandSlots {
+        &self.slots
     }
 
     /// Log statements that run at least `threshold`; `None` logs none.
