@@ -191,8 +191,10 @@ if ! take_lock; then
   held_by="$(ssh "$host" "cat '$remote_root/owner' 2>/dev/null" || true)"
   held_host="${held_by% *}"
   held_pid="${held_by##* }"
+  # Only a connection to this host counts as a run still in progress: a run
+  # on another host uses the same directory name there.
   if [ "$held_host" = "$(hostname)" ] && [ -n "$held_pid" ] && ! kill -0 "$held_pid" 2>/dev/null &&
-    ! pgrep -f "$remote_root" >/dev/null; then
+    ! pgrep -f "$host.*$remote_root" >/dev/null; then
     echo "the run that held $remote_root on $host (pid $held_pid) is gone; taking the lock over" >&2
     remove_root
     take_lock || {
