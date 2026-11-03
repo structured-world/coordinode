@@ -2925,6 +2925,105 @@ async fn a_leader_cut_off_from_its_group_takes_nothing_more() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A read served by a replica that is then lost continues at the same T on
+/// another: the replacement answers exactly what the lost replica answered
+/// at T, a write committed after T included nowhere in it, and the later
+/// write is there for a read that does not name T.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_continues_at_its_timestamp_on_a_replacement_replica() {
+    use coordinode_core::txn::read_concern::ReadConcernLevel;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (mut members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let ks =
+            |rows: &[Vec<Value>]| -> Vec<Value> { rows.iter().map(|r| r[0].clone()).collect() };
+        let query = "MATCH (n:Cont) RETURN n.k AS k ORDER BY k";
+
+        let written = members[0]
+            .execute(Statement::new("CREATE (:Cont {k: 1}), (:Cont {k: 2})"))
+            .await
+            .expect("the first write");
+        let mut first = Statement::new(query);
+        first.requested = Requested {
+            read_concern: Some(ReadConcernLevel::Majority),
+            after_ts: written.value.stats.commit_ts,
+            causal_wait: Some(Duration::from_secs(10)),
+            read_preference: Some(ReadPreference::Nearest),
+            ..Requested::default()
+        };
+        let served = members[1].execute(first).await.expect("a replica's read");
+        assert_eq!(served.forwarded_to, None, "the replica served it itself");
+        assert_eq!(ks(&served.value.rows), vec![Value::Int(1), Value::Int(2)]);
+        let at = served.value.stats.read_ts;
+        assert!(at > 0, "the read names the timestamp it read at");
+
+        members[0]
+            .execute(Statement::new("CREATE (:Cont {k: 3})"))
+            .await
+            .expect("a write after the read");
+        wait_until("the later write reaches the replacement", || {
+            count(&members[2], "Cont") == 3
+        })
+        .await;
+        members
+            .remove(1)
+            .shutdown()
+            .await
+            .expect("the serving replica is lost");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let continued = loop {
+            let mut again = Statement::new(query);
+            again.requested = Requested {
+                read_concern: Some(ReadConcernLevel::Snapshot),
+                at_timestamp: at,
+                read_preference: Some(ReadPreference::Nearest),
+                ..Requested::default()
+            };
+            match members[1].execute(again).await {
+                Ok(answer) => break answer,
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "never ready at T: {e:?}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        assert_eq!(
+            continued.forwarded_to, None,
+            "the replacement served it itself"
+        );
+        assert_eq!(
+            ks(&continued.value.rows),
+            vec![Value::Int(1), Value::Int(2)],
+            "the same answer at T, without the write after it"
+        );
+        assert_eq!(continued.value.stats.read_ts, at, "read at the same T");
+
+        let latest = members[1]
+            .execute(Statement {
+                requested: Requested {
+                    read_preference: Some(ReadPreference::Nearest),
+                    ..Requested::default()
+                },
+                ..Statement::new(query)
+            })
+            .await
+            .expect("a read of the latest state");
+        assert_eq!(
+            ks(&latest.value.rows),
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)]
+        );
+
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// An explicitly requested causal wait lasts no longer than its operation: a
 /// read allowed to wait a minute for a bound no commit here reaches ends with
 /// the deadline's own outcome when its deadline passes, and with the cancel's
