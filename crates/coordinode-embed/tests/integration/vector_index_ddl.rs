@@ -266,6 +266,55 @@ fn a_transaction_ranks_its_own_uncommitted_vectors() {
     );
 }
 
+/// A transaction ranks at the snapshot it began on, though the index has
+/// folded later commits since: a node moved after the snapshot ranks by its
+/// vector then, and a node created after it is not a candidate. Enough other
+/// nodes sit between the query and the moved vector that the index alone no
+/// longer offers the moved node as a candidate.
+#[test]
+fn a_transaction_ranks_at_its_own_snapshot() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(r#"CREATE VECTOR INDEX l2_idx ON :Embed(vec) OPTIONS {metric: "l2"}"#)
+        .expect("create l2 index");
+    db.execute_cypher("CREATE (:Embed {name: 'near', vec: [1.0, 0.0, 0.0]})")
+        .expect("create near");
+    db.execute_cypher(
+        "UNWIND range(1, 400) AS i \
+         CREATE (:Embed {name: 'filler', vec: [0.0, 1.0 + toFloat(i) / 1000.0, 0.0]})",
+    )
+    .expect("create fillers");
+    await_folded(&db);
+
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_cypher("MATCH (n:Embed {name: 'near'}) SET n.vec = [0.0, 0.0, 5.0]")
+        .expect("move near away after the snapshot");
+    db.execute_cypher("CREATE (:Embed {name: 'late', vec: [0.9, 0.0, 0.0]})")
+        .expect("create late after the snapshot");
+    // The index now holds both later commits.
+    await_folded(&db);
+
+    let query = "MATCH (n:Embed) WITH n, vector_distance(n.vec, [1.0, 0.0, 0.0]) AS d \
+                 ORDER BY d LIMIT 1 RETURN n.name AS name";
+    let first = |rows: Vec<std::collections::BTreeMap<String, Value>>| match rows[0].get("name") {
+        Some(Value::String(s)) => s.clone(),
+        other => panic!("name: {other:?}"),
+    };
+    assert_eq!(
+        first(db.execute_cypher(query).expect("search now")),
+        "late",
+        "the current read"
+    );
+    assert_eq!(
+        first(
+            db.execute_in_transaction(tx, query, None)
+                .expect("search in the transaction")
+        ),
+        "near",
+        "the snapshot's nearest"
+    );
+    db.rollback_transaction(tx).expect("rollback");
+}
+
 /// When the writes the graph lacks are not known (an event was dropped), an
 /// index search ranks every node of the label from the store.
 #[test]

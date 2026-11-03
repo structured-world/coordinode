@@ -2098,19 +2098,19 @@ async fn no_read_is_answered_from_a_hole_below_an_applied_commit() {
         tonic::Code::Unavailable,
         "{by_position:?}"
     );
-    let mut linearizable = cypher_request(aligned);
-    linearizable.get_mut().read_concern = Some(crate::proto::replication::ReadConcern {
-        level: 3, // LINEARIZABLE
-        ..Default::default()
-    });
-    match svc.execute_cypher(linearizable).await {
-        Ok(answer) => assert_eq!(
-            answer.into_inner().rows.len(),
-            1,
-            "a linearizable read answered without the acknowledged H"
-        ),
-        Err(status) => assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}"),
-    }
+    let linearizable = || {
+        let mut request = cypher_request(aligned);
+        request.get_mut().read_concern = Some(crate::proto::replication::ReadConcern {
+            level: 3, // LINEARIZABLE
+            ..Default::default()
+        });
+        request
+    };
+    let refused = svc
+        .execute_cypher(linearizable())
+        .await
+        .expect_err("a linearizable read holds the acknowledged H, so not below L");
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
 
     // L released: the closed bound passes H, and the bounds are met.
     drop(held);
@@ -2139,6 +2139,12 @@ async fn no_read_is_answered_from_a_hole_below_an_applied_commit() {
         .expect("at_timestamp H once every commit at or below it is applied")
         .into_inner();
     assert_eq!(at_high.rows.len(), 1, "at_timestamp H holds H");
+    let after = svc
+        .execute_cypher(linearizable())
+        .await
+        .expect("a linearizable read once every commit below H is applied")
+        .into_inner();
+    assert_eq!(after.rows.len(), 1, "a linearizable read holds H");
 
     node.shutdown().await.expect("shutdown");
 }

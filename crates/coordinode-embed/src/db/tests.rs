@@ -2528,3 +2528,114 @@ fn an_ordinary_read_does_not_wait_for_a_commit_in_flight() {
     db.execute_cypher_shared("MATCH (n:Seen) RETURN n", None, None, Some(&bounded), None)
         .expect("met once the commit is no longer in flight");
 }
+
+/// A Raft fence that never pauses anything: marks the store as one whose
+/// commits arrive through a consensus log, as a replicated member's is.
+struct LogApplied;
+
+impl coordinode_storage::engine::core::RaftApplyFence for LogApplied {
+    fn with_applies_paused(
+        &self,
+        _work: &mut dyn FnMut(
+            &mut coordinode_storage::engine::core::RaftApplyState,
+            &[u8],
+        ) -> coordinode_storage::error::StorageResult<()>,
+    ) -> coordinode_storage::error::StorageResult<()> {
+        Ok(())
+    }
+}
+
+/// A replicated member whose log has carried no closed bound yet (just
+/// joined, or reopened) knows no state complete: every read that must answer
+/// from a complete view is refused as not ready rather than answered from
+/// whatever it holds, while an ordinary read is answered.
+#[test]
+fn a_member_with_no_closed_bound_answers_no_aligned_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    db.execute_cypher_shared("CREATE (:Held {k: 1})", None, None, None, None)
+        .expect("seed");
+    db.engine().register_raft_fence(Arc::new(LogApplied));
+    assert_eq!(db.engine().closure_frontier(), 0, "no closed bound yet");
+
+    let not_ready = |what: &str, result: Result<(), DatabaseError>| {
+        assert!(
+            matches!(result, Err(DatabaseError::ReadNotReady { .. })),
+            "{what}: {result:?}"
+        );
+    };
+    not_ready(
+        "an aligned read",
+        db.execute_cypher_shared(
+            "MATCH (n:Held) RETURN n /*+ read_consistency('snapshot') */",
+            None,
+            None,
+            None,
+            None,
+        )
+        .map(drop),
+    );
+    not_ready(
+        "a cursor's first page",
+        db.execute_cypher_paged("MATCH (n:Held) RETURN n", None, None, None, 10)
+            .map(drop),
+    );
+    not_ready("a transaction's begin", db.begin_transaction().map(drop));
+    let now = db.oracle.current().as_raw();
+    not_ready(
+        "a named time",
+        db.execute_cypher_shared(
+            &format!("MATCH (n:Held) RETURN n AS OF TIMESTAMP {now}"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .map(drop),
+    );
+    let current = db
+        .execute_cypher_shared("MATCH (n:Held) RETURN n", None, None, None, None)
+        .expect("an ordinary read is answered");
+    assert_eq!(current.rows.len(), 1);
+}
+
+/// Standalone, an aligned read is taken below every commit still in flight:
+/// a later commit already applied is left out with the earlier one rather
+/// than read beside the hole the earlier one leaves. Once the earlier commit
+/// is no longer in flight, the view includes the later one.
+#[test]
+fn a_standalone_aligned_read_is_taken_below_a_commit_in_flight() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let pending = Arc::clone(db.engine().pending_commits());
+    let (low, admission) = pending
+        .admit_allocated(|| db.oracle.next().as_raw(), Vec::new(), Vec::new())
+        .expect("admit an earlier commit");
+    let high = db
+        .execute_cypher_shared("CREATE (:Later {k: 1})", None, None, None, None)
+        .expect("a later commit lands")
+        .commit_ts()
+        .expect("its timestamp");
+    assert!(high > low, "{high} after {low}");
+
+    let aligned = "MATCH (n:Later) RETURN n /*+ read_consistency('snapshot') */";
+    let read = db
+        .execute_cypher_shared(aligned, None, None, None, None)
+        .expect("an aligned read is answered without waiting");
+    assert!(
+        read.rows.is_empty(),
+        "the later commit read beside the hole"
+    );
+    let read_at = read.write_stats.read_ts.expect("its timestamp");
+    assert!(read_at < low, "read at {read_at}, at or past {low}");
+
+    drop(admission);
+    let read = db
+        .execute_cypher_shared(aligned, None, None, None, None)
+        .expect("an aligned read");
+    assert_eq!(
+        read.rows.len(),
+        1,
+        "the earlier commit is no longer in flight"
+    );
+}

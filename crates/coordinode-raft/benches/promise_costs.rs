@@ -8,7 +8,10 @@
 //!   shutdown, separately;
 //! - `failover`: a three-member group, from the leader's stop to a new
 //!   leader as its metrics show it and as a read of its lease confirms it,
-//!   and the stopped member's reopen until it has caught up.
+//!   and the stopped member's reopen until it has caught up;
+//! - `closure`: a write's cost to the closed bound, sealed into its entry
+//!   and not: log entries per write, its answer, and the time until a read
+//!   at its own time is answered, for isolated writes and a burst.
 //!
 //! Latencies are distributions; a P99 is printed only from 100 samples or
 //! more, below that the median, the maximum and the samples themselves.
@@ -245,6 +248,135 @@ async fn released(engine: Arc<StorageEngine>) {
         1,
         "a stopped node still holds its engine"
     );
+}
+
+/// One write's cost to the closed bound: its answer, and the time until the
+/// bound passes it (a read at its own time can be answered).
+struct ClosedWrite {
+    answered: Duration,
+    closed: Duration,
+}
+
+/// A write through `pipeline` as a commit makes one: its timestamp held
+/// until handed over, sealed into its proposal when `sealed`.
+fn closed_write(
+    engine: &StorageEngine,
+    oracle: &coordinode_core::txn::timestamp::TimestampOracle,
+    pipeline: &coordinode_raft::proposal::RaftProposalPipeline,
+    id_gen: &ProposalIdGenerator,
+    n: u64,
+    sealed: bool,
+) -> ClosedWrite {
+    let t = Instant::now();
+    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let proposal = RaftProposal {
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts),
+        ..put(id_gen, n)
+    };
+    if sealed {
+        held.seal(proposal.id);
+    }
+    pipeline.propose_and_wait(&proposal).expect("commit");
+    drop(held);
+    let answered = t.elapsed();
+    // Polled: the bound is no metric a watcher can wait on, and the poll
+    // costs the write nothing.
+    while engine.closure_frontier() <= ts {
+        std::thread::sleep(Duration::from_micros(20));
+    }
+    ClosedWrite {
+        answered,
+        closed: t.elapsed(),
+    }
+}
+
+/// What closing each write costs, with the write sealed into its entry and
+/// without (the entry then closes only what is below it, and a following
+/// entry or a closing one closes the write): log entries per write, the
+/// answer's latency and the latency until a read at the write's own time is
+/// answered. Isolated writes leave the group idle between them; the burst
+/// runs 32 writers at once.
+async fn closure_costs() {
+    for sealed in [false, true] {
+        let mode = if sealed { "sealed" } else { "unsealed" };
+        let store = Store::new();
+        let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+        let engine = Arc::new(
+            StorageEngine::open_with_oracle(&store.config, Arc::clone(&oracle)).expect("open"),
+        );
+        let node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+            .await
+            .expect("open");
+        await_leadership(&node).await;
+        let pipeline = Arc::new(node.pipeline());
+        let id_gen = Arc::new(ProposalIdGenerator::with_base(1 << 40));
+        let last_log = |node: &RaftNode| node.raft().metrics().borrow_watched().last_log_index;
+
+        let isolated = ops(300);
+        let before = last_log(&node).unwrap_or(0);
+        let mut answered = Vec::new();
+        let mut closed = Vec::new();
+        for n in 0..isolated {
+            let w = tokio::task::block_in_place(|| {
+                closed_write(&engine, &oracle, &pipeline, &id_gen, n, sealed)
+            });
+            answered.push(w.answered);
+            closed.push(w.closed);
+            // Idle, so no following write closes this one.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let entries = last_log(&node).unwrap_or(0) - before;
+        println!(
+            "closure {mode:<8} isolated: log entries per write {:.2}",
+            entries as f64 / isolated as f64
+        );
+        report(&format!("closure {mode} isolated answer"), answered, None);
+        report(&format!("closure {mode} isolated closed"), closed, None);
+
+        let writers = 32u64;
+        let each = (ops(300) / writers).max(1);
+        let before = last_log(&node).unwrap_or(0);
+        let mut tasks = Vec::new();
+        for w in 0..writers {
+            let (engine, oracle, pipeline, id_gen) = (
+                Arc::clone(&engine),
+                Arc::clone(&oracle),
+                Arc::clone(&pipeline),
+                Arc::clone(&id_gen),
+            );
+            tasks.push(tokio::task::spawn_blocking(move || {
+                (0..each)
+                    .map(|i| {
+                        closed_write(
+                            &engine,
+                            &oracle,
+                            &pipeline,
+                            &id_gen,
+                            1_000_000 + w * each + i,
+                            sealed,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut answered = Vec::new();
+        let mut closed = Vec::new();
+        for task in tasks {
+            for w in task.await.expect("a writer") {
+                answered.push(w.answered);
+                closed.push(w.closed);
+            }
+        }
+        let entries = last_log(&node).unwrap_or(0) - before;
+        println!(
+            "closure {mode:<8} burst of {writers}: log entries per write {:.2}",
+            entries as f64 / (writers * each) as f64
+        );
+        report(&format!("closure {mode} burst answer"), answered, None);
+        report(&format!("closure {mode} burst closed"), closed, None);
+        node.shutdown().await.expect("stop");
+    }
 }
 
 fn put(id_gen: &ProposalIdGenerator, n: u64) -> RaftProposal {
@@ -1048,6 +1180,9 @@ fn main() {
         }
         if runs("read") {
             reads().await;
+        }
+        if runs("closure") {
+            closure_costs().await;
         }
     });
 }
