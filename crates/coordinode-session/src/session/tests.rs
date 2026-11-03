@@ -1249,6 +1249,70 @@ async fn a_command_past_the_sessions_slots_is_refused_before_it_runs() {
     assert_eq!(slots.available(), 8, "every slot came back");
 }
 
+/// A commit that opens its own transaction is one command in one slot: with a
+/// single slot an empty transaction begins and commits, and a commit refused
+/// for want of the slot keeps its begin, so the commit sent again opens and
+/// commits it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_that_opens_its_transaction_takes_one_slot() {
+    let recording = Arc::new(RecordingEngine::default());
+    let one = SlotCount::new(1).expect("one slot");
+    let slots = CommandSlots::new(one, one);
+    let manager = SessionManager::new(
+        Arc::clone(&recording) as Arc<dyn CursorEngine>,
+        Arc::new(SessionRegistry::new()),
+    )
+    .with_command_slots(slots.clone());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    let run = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+    async fn answer_to(ev_rx: &mut mpsc::Receiver<OutEvent>, rid: u64) -> SessionEvent {
+        loop {
+            let (id, event) = ev_rx.recv().await.expect("an answer");
+            if id == rid {
+                return event;
+            }
+        }
+    }
+
+    op_tx.send((1, begin(txid(4)))).await.unwrap();
+    op_tx.send((2, commit(txid(4)))).await.unwrap();
+    let committed = answer_to(&mut ev_rx, 2).await;
+    assert!(
+        matches!(committed, SessionEvent::Committed { .. }),
+        "{committed:?}"
+    );
+
+    let held = slots.take().expect("the one slot");
+    op_tx.send((3, begin(txid(5)))).await.unwrap();
+    op_tx.send((4, commit(txid(5)))).await.unwrap();
+    let refused = answer_to(&mut ev_rx, 4).await;
+    assert!(
+        matches!(&refused, SessionEvent::Error(f) if f.code == ErrorCode::ResourceExhausted),
+        "{refused:?}"
+    );
+    drop(held);
+    op_tx.send((5, commit(txid(5)))).await.unwrap();
+    let retried = answer_to(&mut ev_rx, 5).await;
+    assert!(
+        matches!(retried, SessionEvent::Committed { .. }),
+        "the retried commit opens the begin it kept: {retried:?}"
+    );
+
+    drop(op_tx);
+    while ev_rx.recv().await.is_some() {}
+    run.await.unwrap();
+    let calls = recording.calls();
+    for id in [txid(4), txid(5)] {
+        let begun = calls
+            .iter()
+            .filter(|call| matches!(call, Call::Begin(t, ..) if *t == id))
+            .count();
+        assert_eq!(begun, 1, "{id:?} opened once: {calls:?}");
+    }
+    assert_eq!(slots.available(), 1, "every slot came back");
+}
+
 /// The commands one stream sends for one transaction reach its owner in the
 /// order sent: one held before it got its place holds back the next, even
 /// when they run on separate tasks; a statement of another transaction, or

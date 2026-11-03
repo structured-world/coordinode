@@ -334,9 +334,9 @@ impl Session {
                 // request as a start naming an open ID, as when the first
                 // had run.
                 if let Some(earlier) = lanes.starts.insert(transaction, pending) {
-                    self.open(transaction, earlier, lanes, out);
+                    self.open_alone(transaction, earlier, lanes, out);
                     if let Some(this) = lanes.starts.remove(&transaction) {
-                        self.open(transaction, this, lanes, out);
+                        self.open_alone(transaction, this, lanes, out);
                     }
                 }
             }
@@ -352,9 +352,11 @@ impl Session {
                     send_error(out, request_id, self.engine.busy()).await;
                     return;
                 };
-                // A transaction whose begin no statement carried opens first.
+                // A transaction whose begin no statement carried opens first,
+                // as part of this command: the commit's slot, held while it
+                // waits behind the begin in the lane, covers both.
                 if let Some(pending) = lanes.starts.remove(&transaction) {
-                    self.open(transaction, pending, lanes, out);
+                    self.open(transaction, pending, None, lanes, out);
                 }
                 let lane = lanes.step(transaction);
                 let session_id = self.session_id;
@@ -431,10 +433,10 @@ impl Session {
         }
     }
 
-    /// Open `transaction` with `pending` as a command of its own, in its lane:
-    /// for a transaction whose first command is not a statement. Only a
-    /// refusal answers, on the begin's request.
-    fn open(
+    /// Open `transaction` with `pending` as a command of its own, in a slot of
+    /// its own. Refused for want of one, it opens nothing, and the begin's
+    /// request says why.
+    fn open_alone(
         &self,
         transaction: TransactionId,
         pending: PendingStart,
@@ -442,7 +444,6 @@ impl Session {
         out: &mpsc::Sender<OutEvent>,
     ) {
         // A start waits for its causal bound like a read: it runs in a slot.
-        // Refused, it opens nothing, and the begin's request says why.
         let Some(slot) = self.slots.take() else {
             self.registry.detach(self.session_id, &transaction);
             let (out, failure) = (out.clone(), self.engine.busy());
@@ -451,8 +452,23 @@ impl Session {
             });
             return;
         };
+        self.open(transaction, pending, Some(slot), lanes, out);
+    }
+
+    /// Open `transaction` with `pending` in its lane: for a transaction whose
+    /// first command is not a statement. `slot` is the begin's own, or `None`
+    /// when the command that carries it holds one for both. Only a refusal
+    /// answers, on the begin's request.
+    fn open(
+        &self,
+        transaction: TransactionId,
+        pending: PendingStart,
+        slot: Option<CommandSlot>,
+        lanes: &mut Lanes,
+        out: &mpsc::Sender<OutEvent>,
+    ) {
         let lane = lanes.step(transaction);
-        self.spawn(out, Some(slot), move |engine, _, out, slot| async move {
+        self.spawn(out, slot, move |engine, _, out, slot| async move {
             lane.after_previous().await;
             let PendingStart { start, request_id } = pending;
             // The start's wait runs on the runtime, holding no thread, and
