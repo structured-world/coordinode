@@ -10,11 +10,12 @@ use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::DatabaseError;
 use coordinode_embed::replication::executor;
 use coordinode_embed::replication::routing::{
-    AnswerWriter, CommandExecutor, RoutedBegin, RoutedCommit, RoutedOperationAnswer,
-    RoutedOperationCall, RoutedRollback, RoutedStatement, RoutedStats,
+    AnswerWriter, CommandExecutor, PreparedRouted, RoutedBegin, RoutedCommit,
+    RoutedOperationAnswer, RoutedOperationCall, RoutedPreparing, RoutedRollback, RoutedStatement,
+    RoutedStats, RoutedWait,
 };
 
-use crate::services::statement::{Admission, StatementExecutor};
+use crate::services::statement::{Admission, Admitted, StatementExecutor};
 
 /// Runs routed commands through this member's [`StatementExecutor`]. A
 /// member serves it to its peers with
@@ -88,45 +89,8 @@ impl CommandExecutor for ServerCommandExecutor {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|e| DatabaseError::Other(format!("no runtime to fence the read on: {e}")))?;
         let fenced =
-            match runtime.block_on(self.executor.admit(&statement.query, &requested, true))? {
-                Admission::Run(fenced) => fenced,
-                // An admission that may not route on never asks to.
-                Admission::Forward(leader) => {
-                    return Err(DatabaseError::NotLeader {
-                        leader_id: Some(leader),
-                    });
-                }
-            };
-        let RoutedStatement {
-            query,
-            params,
-            source,
-            ..
-        } = statement;
-        let params = (!params.is_empty()).then_some(params);
-        let start = Instant::now();
-        // A read that pages is answered page by page, as a session here
-        // pages it: one page of memory whatever the result size.
-        if self.executor.database().read().keyset_pageable(&query) {
-            let stats =
-                executor::write_paged(self.executor.database(), &query, params, &fenced, answer);
-            crate::services::statement::observe_query(
-                if stats.is_ok() {
-                    crate::services::statement::QueryKind::Read
-                } else {
-                    crate::services::statement::QueryKind::Failed
-                },
-                start,
-            );
-            self.executor.record(&query, source.as_ref(), start);
-            return stats;
-        }
-        let result = self
-            .executor
-            .execute(&query, params, source.as_ref(), &fenced)?;
-        self.executor.record(&query, source.as_ref(), start);
-        executor::write_rows(&result.rows, answer);
-        Ok(executor::stats(&result.write_stats, &fenced))
+            leading(runtime.block_on(self.executor.admit(&statement.query, &requested, true))?)?;
+        run_fenced(&self.executor, statement, &fenced, answer)
     }
 
     fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
@@ -149,6 +113,164 @@ impl CommandExecutor for ServerCommandExecutor {
     fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError> {
         executor::rollback(&self.executor.database().read(), rollback)
     }
+
+    fn prepare(
+        &self,
+        slot: &mut Option<RoutedStatement>,
+        cancel: &CancelFlag,
+    ) -> Option<RoutedPreparing> {
+        if !self.executor.needs_fence() {
+            return None;
+        }
+        let executor = self.executor.clone();
+        let cancel = cancel.clone();
+        if slot.as_ref()?.transaction.is_some() {
+            // A transaction's first statement waits here for its start's
+            // causal bound, which the start then meets at once.
+            let waits = slot
+                .as_ref()?
+                .start
+                .as_ref()
+                .is_some_and(|start| start.after_ts.is_some());
+            if !waits {
+                return None;
+            }
+            let statement = slot.take()?;
+            return Some(Box::pin(async move {
+                if let Some(start) = &statement.start {
+                    executor
+                        .await_start_bound(
+                            start.after_ts,
+                            start.causal_wait,
+                            executor::deadline_after(statement.deadline),
+                            Some(&cancel),
+                        )
+                        .await?;
+                }
+                Ok(Box::new(Started {
+                    executor,
+                    statement,
+                    cancel,
+                }) as Box<dyn PreparedRouted>)
+            }));
+        }
+        let statement = slot.take()?;
+        Some(Box::pin(async move {
+            let requested = executor::routed_requested(&statement, &cancel);
+            let fenced = leading(executor.admit(&statement.query, &requested, true).await?)?;
+            Ok(Box::new(Fenced {
+                executor,
+                statement,
+                fenced,
+            }) as Box<dyn PreparedRouted>)
+        }))
+    }
+
+    fn prepare_begin(&self, begin: &RoutedBegin, cancel: &CancelFlag) -> Option<RoutedWait> {
+        if begin.after_ts.is_none() || !self.executor.needs_fence() {
+            return None;
+        }
+        let (executor, cancel) = (self.executor.clone(), cancel.clone());
+        let (after_ts, wait) = (begin.after_ts, begin.causal_wait);
+        Some(Box::pin(async move {
+            executor
+                .await_start_bound(after_ts, wait, None, Some(&cancel))
+                .await
+        }))
+    }
+}
+
+/// The admission of a statement that may not be routed on: run here.
+fn leading(admission: Admission) -> Result<Box<Admitted>, DatabaseError> {
+    match admission {
+        Admission::Run(fenced) => Ok(fenced),
+        // An admission that may not route on never asks to.
+        Admission::Forward(leader) => Err(DatabaseError::NotLeader {
+            leader_id: Some(leader),
+        }),
+    }
+}
+
+/// A routed autonomous statement fenced on the runtime.
+struct Fenced {
+    executor: StatementExecutor,
+    statement: RoutedStatement,
+    fenced: Box<Admitted>,
+}
+
+impl PreparedRouted for Fenced {
+    fn run(
+        self: Box<Self>,
+        _admitted: &AdmissionSignal,
+        answer: &mut AnswerWriter,
+    ) -> Result<RoutedStats, DatabaseError> {
+        let Self {
+            executor,
+            statement,
+            fenced,
+        } = *self;
+        run_fenced(&executor, statement, &fenced, answer)
+    }
+}
+
+/// A routed transaction's first statement whose start's causal bound was met
+/// on the runtime.
+struct Started {
+    executor: StatementExecutor,
+    statement: RoutedStatement,
+    cancel: CancelFlag,
+}
+
+impl PreparedRouted for Started {
+    fn run(
+        self: Box<Self>,
+        admitted: &AdmissionSignal,
+        answer: &mut AnswerWriter,
+    ) -> Result<RoutedStats, DatabaseError> {
+        let Self {
+            executor,
+            statement,
+            cancel,
+        } = *self;
+        executor::write_in_transaction(executor.database(), statement, &cancel, admitted, answer)
+    }
+}
+
+/// Run an autonomous statement this member fenced, on the path its own
+/// clients' statements take: recorded for the advisor and the query metrics.
+fn run_fenced(
+    executor: &StatementExecutor,
+    statement: RoutedStatement,
+    fenced: &Admitted,
+    answer: &mut AnswerWriter,
+) -> Result<RoutedStats, DatabaseError> {
+    let RoutedStatement {
+        query,
+        params,
+        source,
+        ..
+    } = statement;
+    let params = (!params.is_empty()).then_some(params);
+    let start = Instant::now();
+    // A read that pages is answered page by page, as a session here pages
+    // it: one page of memory whatever the result size.
+    if executor.database().read().keyset_pageable(&query) {
+        let stats = executor::write_paged(executor.database(), &query, params, fenced, answer);
+        crate::services::statement::observe_query(
+            if stats.is_ok() {
+                crate::services::statement::QueryKind::Read
+            } else {
+                crate::services::statement::QueryKind::Failed
+            },
+            start,
+        );
+        executor.record(&query, source.as_ref(), start);
+        return stats;
+    }
+    let result = executor.execute(&query, params, source.as_ref(), fenced)?;
+    executor.record(&query, source.as_ref(), start);
+    executor::write_rows(&result.rows, answer);
+    Ok(executor::stats(&result.write_stats, fenced))
 }
 
 #[cfg(test)]

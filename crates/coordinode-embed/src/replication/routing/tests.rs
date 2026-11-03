@@ -58,7 +58,17 @@ struct Scripted {
     rollbacks: Mutex<Vec<RoutedRollback>>,
     /// Rows written to answers so far.
     written: AtomicUsize,
+    /// Set when a statement held in its admission ([`HELD_QUERY`]) was let go
+    /// by its cancel.
+    admission_cancelled: Arc<AtomicBool>,
+    /// Whether a begin waits before it runs, holding no thread, until it is
+    /// cancelled.
+    hold_begin: AtomicBool,
 }
+
+/// The statement text the scripted executor holds in its admission, as one
+/// waiting for a causal bound is held, until it is cancelled.
+const HELD_QUERY: &str = "RETURN 'held' AS h";
 
 impl Scripted {
     /// Write `rows` under `columns` to `answer`, counting each.
@@ -201,6 +211,40 @@ impl CommandExecutor for Scripted {
                 RoutedOperationAnswer::Outcome(OperationOutcome::Retired)
             }
         })
+    }
+
+    /// A [`HELD_QUERY`] statement waits for its cancel here, as one waiting
+    /// for a causal bound would; the others run whole.
+    fn prepare(
+        &self,
+        statement: &mut Option<RoutedStatement>,
+        cancel: &CancelFlag,
+    ) -> Option<RoutedPreparing> {
+        if statement.as_ref()?.query != HELD_QUERY {
+            return None;
+        }
+        statement.take()?;
+        let (cancel, cancelled) = (cancel.clone(), Arc::clone(&self.admission_cancelled));
+        Some(Box::pin(async move {
+            cancel.thrown().await;
+            cancelled.store(true, Ordering::Release);
+            Err(DatabaseError::Budget(
+                coordinode_core::budget::BudgetStop::Cancelled,
+            ))
+        }))
+    }
+
+    fn prepare_begin(&self, _begin: &RoutedBegin, cancel: &CancelFlag) -> Option<RoutedWait> {
+        if !self.hold_begin.load(Ordering::Acquire) {
+            return None;
+        }
+        let cancel = cancel.clone();
+        Some(Box::pin(async move {
+            cancel.thrown().await;
+            Err(DatabaseError::Budget(
+                coordinode_core::budget::BudgetStop::Cancelled,
+            ))
+        }))
     }
 }
 
@@ -1601,6 +1645,95 @@ async fn a_routed_command_shares_the_members_slots_with_its_own_clients() {
         .execute(statement(None), &AdmissionSignal::new(|| {}))
         .await
         .expect("runs once the slot is free");
+}
+
+/// A routed command waiting before it runs (for its fence or a causal bound)
+/// holds no thread meanwhile: with a single blocking thread, another command
+/// of the session runs and answers while it waits. A Cancel ends the wait, a
+/// begin's as a statement's, and nothing of either ran.
+#[test]
+fn a_routed_command_waiting_to_run_holds_no_thread() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let executor = Arc::new(Scripted::default());
+        *executor.answer.lock().unwrap() = Some(Script::Rows(RoutedAnswer::default()));
+        executor.hold_begin.store(true, Ordering::Release);
+        let router = serve(Arc::clone(&executor)).await;
+        let (requests, mut replies) = open_session(&router, ERROR_CODEC_VERSION)
+            .await
+            .expect("opened");
+
+        requests
+            .send(wire::RoutedRequest {
+                call: 1,
+                request: Some(wire::routed_request::Request::Execute(Box::new(
+                    statement_to_wire(RoutedStatement {
+                        query: HELD_QUERY.to_owned(),
+                        ..statement(None)
+                    })
+                    .expect("encoded"),
+                ))),
+            })
+            .expect("sent");
+        requests
+            .send(wire::RoutedRequest {
+                call: 3,
+                request: Some(wire::routed_request::Request::Begin(begin_to_wire(
+                    RoutedBegin {
+                        transaction: txid(),
+                        actor: principal(),
+                        read_concern: None,
+                        write_concern: None,
+                        timeout_outcome: None,
+                        operation: None,
+                        after_ts: Some(77),
+                        causal_wait: Some(Duration::from_secs(60)),
+                    },
+                ))),
+            })
+            .expect("sent");
+        requests.send(execute_request(2)).expect("sent");
+        let ran = tokio::time::timeout(Duration::from_secs(20), end_of(&mut replies, 2))
+            .await
+            .expect("the second command answers while the others wait");
+        assert!(ends(&ran), "{ran:?}");
+
+        for call in [1, 3] {
+            requests
+                .send(wire::RoutedRequest {
+                    call,
+                    request: Some(wire::routed_request::Request::Cancel(wire::RoutedCancel {})),
+                })
+                .expect("cancel sent");
+        }
+        // A cancelled statement's answer is not sent, its ingress having
+        // given it up; a begin is answered with the refusal.
+        let begun = tokio::time::timeout(Duration::from_secs(20), reply_to(&mut replies, 3))
+            .await
+            .expect("the cancel ends the begin's wait");
+        assert!(
+            matches!(&begun, wire::routed_reply::Reply::Begun(b) if !b.error.is_empty()),
+            "{begun:?}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !executor.admission_cancelled.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held statement never let go"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            executor.statements.lock().unwrap().len(),
+            1,
+            "only the second command ran"
+        );
+    });
 }
 
 /// The frame that ends an answer goes out without credit, so a statement

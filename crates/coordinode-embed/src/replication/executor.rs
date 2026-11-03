@@ -20,8 +20,9 @@ use parking_lot::RwLock;
 
 use super::admission::{Admission, Admitted, Admitter, Requested};
 use super::routing::{
-    AnswerWriter, CommandExecutor, RoutedAnswer, RoutedBegin, RoutedCommit, RoutedOperationAnswer,
-    RoutedOperationCall, RoutedRollback, RoutedSettings, RoutedStatement, RoutedStats,
+    AnswerWriter, CommandExecutor, PreparedRouted, RoutedAnswer, RoutedBegin, RoutedCommit,
+    RoutedOperationAnswer, RoutedOperationCall, RoutedPreparing, RoutedRollback, RoutedSettings,
+    RoutedStatement, RoutedStats, RoutedWait,
 };
 use crate::db::{
     CommitOptions, CypherResult, RollbackOptions, StatementOptions, TransactionOptions,
@@ -529,5 +530,128 @@ impl CommandExecutor for MemberCommandExecutor {
         call: RoutedOperationCall,
     ) -> Result<RoutedOperationAnswer, DatabaseError> {
         run_operation(&self.admitter.database().read(), call)
+    }
+
+    fn prepare(
+        &self,
+        slot: &mut Option<RoutedStatement>,
+        cancel: &CancelFlag,
+    ) -> Option<RoutedPreparing> {
+        let admitter = self.admitter.clone();
+        let cancel = cancel.clone();
+        if slot.as_ref()?.transaction.is_some() {
+            // A transaction's first statement waits here for its start's
+            // causal bound, which the start then meets at once.
+            let waits = slot
+                .as_ref()?
+                .start
+                .as_ref()
+                .is_some_and(|start| start.after_ts.is_some());
+            if !waits || !admitter.needs_fence() {
+                return None;
+            }
+            let statement = slot.take()?;
+            return Some(Box::pin(async move {
+                if let Some(start) = &statement.start {
+                    admitter
+                        .await_start_bound(
+                            start.after_ts,
+                            start.causal_wait,
+                            deadline_after(statement.deadline),
+                            Some(&cancel),
+                        )
+                        .await?;
+                }
+                Ok(Box::new(MemberStarted {
+                    admitter,
+                    statement,
+                    cancel,
+                }) as Box<dyn PreparedRouted>)
+            }));
+        }
+        let statement = slot.take()?;
+        Some(Box::pin(async move {
+            // A statement routed here needs this member to lead: it is
+            // fenced as such and never routed on.
+            let requested = routed_requested(&statement, &cancel);
+            let fenced = match admitter.admit(&statement.query, &requested, true).await? {
+                Admission::Run(fenced) => fenced,
+                Admission::Forward(leader) => {
+                    return Err(DatabaseError::NotLeader {
+                        leader_id: Some(leader),
+                    });
+                }
+            };
+            Ok(Box::new(MemberFenced {
+                admitter,
+                statement,
+                fenced,
+            }) as Box<dyn PreparedRouted>)
+        }))
+    }
+
+    fn prepare_begin(&self, begin: &RoutedBegin, cancel: &CancelFlag) -> Option<RoutedWait> {
+        if begin.after_ts.is_none() || !self.admitter.needs_fence() {
+            return None;
+        }
+        let (admitter, cancel) = (self.admitter.clone(), cancel.clone());
+        let (after_ts, wait) = (begin.after_ts, begin.causal_wait);
+        Some(Box::pin(async move {
+            admitter
+                .await_start_bound(after_ts, wait, None, Some(&cancel))
+                .await
+        }))
+    }
+}
+
+/// A routed autonomous statement this member fenced on the runtime.
+struct MemberFenced {
+    admitter: Admitter,
+    statement: RoutedStatement,
+    fenced: Box<Admitted>,
+}
+
+impl PreparedRouted for MemberFenced {
+    fn run(
+        self: Box<Self>,
+        _admitted: &AdmissionSignal,
+        answer: &mut AnswerWriter,
+    ) -> Result<RoutedStats, DatabaseError> {
+        let Self {
+            admitter,
+            statement,
+            fenced,
+        } = *self;
+        write_admitted(
+            admitter.database(),
+            &statement.query,
+            statement.params,
+            statement.source.as_ref(),
+            &fenced,
+            answer,
+        )
+    }
+}
+
+/// A routed transaction's first statement whose start's causal bound was met
+/// on the runtime.
+struct MemberStarted {
+    admitter: Admitter,
+    statement: RoutedStatement,
+    cancel: CancelFlag,
+}
+
+impl PreparedRouted for MemberStarted {
+    fn run(
+        self: Box<Self>,
+        admitted: &AdmissionSignal,
+        answer: &mut AnswerWriter,
+    ) -> Result<RoutedStats, DatabaseError> {
+        let Self {
+            admitter,
+            statement,
+            cancel,
+        } = *self;
+        write_in_transaction(admitter.database(), statement, &cancel, admitted, answer)
     }
 }

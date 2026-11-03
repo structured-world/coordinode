@@ -491,7 +491,62 @@ pub trait CommandExecutor: Send + Sync + 'static {
         actor: ActingContext,
         call: RoutedOperationCall,
     ) -> Result<RoutedOperationAnswer, DatabaseError>;
+
+    /// Admit the statement in `statement` on the runtime before it runs:
+    /// its read fence and any causal wait it allows run there, holding no
+    /// thread, until `cancel` is thrown. An executor that admits it takes it
+    /// out of `statement` and returns the admission, whose
+    /// [`PreparedRouted::run`] runs what is left on the blocking pool; one
+    /// that does not leaves it, and the statement runs through
+    /// [`Self::execute`] as a whole.
+    ///
+    /// The returned future fails with the admission's refusal.
+    fn prepare(
+        &self,
+        _statement: &mut Option<RoutedStatement>,
+        _cancel: &CancelFlag,
+    ) -> Option<RoutedPreparing> {
+        None
+    }
+
+    /// Wait on the runtime, holding no thread, for what `begin` waits for
+    /// before [`Self::begin`] runs (its causal bound), until `cancel` is
+    /// thrown; `None` when nothing does. The start's own wait is then met at
+    /// once.
+    fn prepare_begin(&self, _begin: &RoutedBegin, _cancel: &CancelFlag) -> Option<RoutedWait> {
+        None
+    }
 }
+
+/// A routed statement [`CommandExecutor::prepare`] admitted: what is left of
+/// it runs on the blocking pool.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an admitted routed statement",
+    label = "needs `PreparedRouted`",
+    note = "a `CommandExecutor` returns one from `prepare`"
+)]
+pub trait PreparedRouted: Send {
+    /// Run the statement, writing its rows to `answer`, and return its
+    /// statistics, as [`CommandExecutor::execute`] does. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// What the statement failed with.
+    fn run(
+        self: Box<Self>,
+        admitted: &AdmissionSignal,
+        answer: &mut AnswerWriter,
+    ) -> Result<RoutedStats, DatabaseError>;
+}
+
+/// What [`CommandExecutor::prepare`] returns when it admits a statement.
+pub type RoutedPreparing = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Box<dyn PreparedRouted>, DatabaseError>> + Send>,
+>;
+
+/// What [`CommandExecutor::prepare_begin`] returns when a start waits.
+pub type RoutedWait =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DatabaseError>> + Send>>;
 
 /// The refusal reason of a command the executing member had no slot for.
 const REFUSED_BUSY: &str = "busy";
@@ -937,9 +992,18 @@ impl<E: CommandExecutor> ServedSession<E> {
                 statement_from_wire(*statement).map(|statement| self.execute(call, statement, slot))
             }
             Some(R::Begin(begin)) => begin_from_wire(begin).map(|begin| {
-                self.answer(call, slot, move |e| {
+                let cancel = CancelFlag::new();
+                let waiting = self
+                    .executor
+                    .prepare_begin(&begin, &cancel)
+                    .map(|wait| (wait, cancel));
+                self.answer_after(call, slot, waiting, move |e, waited| {
                     wire::routed_reply::Reply::Begun(wire::RoutedBegun {
-                        error: e.begin(begin).err().map(errors::encode).unwrap_or_default(),
+                        error: waited
+                            .and_then(|()| e.begin(begin))
+                            .err()
+                            .map(errors::encode)
+                            .unwrap_or_default(),
                     })
                 });
             }),
@@ -1018,6 +1082,58 @@ impl<E: CommandExecutor> ServedSession<E> {
         });
     }
 
+    /// Run a short command whose start may first wait on the runtime, holding
+    /// no thread: `waiting`, until its cancel is thrown by a Cancel or the
+    /// session's end. Then `run` takes what the wait came to on the blocking
+    /// pool, and its one reply is queued. The command holds `slot` until it
+    /// is done.
+    fn answer_after(
+        &self,
+        call: u64,
+        slot: CommandSlot,
+        waiting: Option<(RoutedWait, CancelFlag)>,
+        run: impl FnOnce(&E, Result<(), DatabaseError>) -> wire::routed_reply::Reply + Send + 'static,
+    ) {
+        let Some((wait, cancel)) = waiting else {
+            return self.answer(call, slot, move |e| run(e, Ok(())));
+        };
+        {
+            let mut running = self.running.lock();
+            if running.contains_key(&call) {
+                drop(running);
+                self.refuse(
+                    call,
+                    "duplicate",
+                    format!("command {call} is already running on this session"),
+                );
+                return;
+            }
+            running.insert(
+                call,
+                Running {
+                    cancel,
+                    credit: Arc::new(Credit::new(self.limits.frames_ahead)),
+                },
+            );
+        }
+        let executor = Arc::clone(&self.executor);
+        let replies = self.replies.clone();
+        let running = Arc::clone(&self.running);
+        tokio::spawn(async move {
+            let waited = wait.await;
+            let ran = tokio::task::spawn_blocking(move || {
+                let answer = run(&executor, waited);
+                drop(slot);
+                running.lock().remove(&call);
+                queue(&replies, call, answer);
+            })
+            .await;
+            if let Err(lost) = ran {
+                tracing::error!(%lost, "a routed command's run was lost");
+            }
+        });
+    }
+
     /// Start `statement` on the blocking pool; its answer streams under
     /// `call`, and it holds `slot` until it ends.
     fn execute(&self, call: u64, statement: RoutedStatement, slot: CommandSlot) {
@@ -1077,31 +1193,54 @@ impl<E: CommandExecutor> ServedSession<E> {
         let replies = self.replies.clone();
         let running = Arc::clone(&self.running);
         let row_batch_bytes = self.limits.row_batch_bytes;
-        tokio::task::spawn_blocking(move || {
-            let mut answer = AnswerWriter::new(Some(AnswerOut {
-                call,
-                replies,
-                credit,
-                row_batch_bytes,
-            }));
-            let result = executor.execute(statement, &cancel, &admitted, &mut answer);
-            drop(admitted);
-            // Free before the answer ends, as for a short command: the last
-            // frame waits for no credit, so nothing runs past this point but
-            // the rollback of an abandoned transaction, one per statement that
-            // just gave its slot back.
-            drop(slot);
-            let delivered = answer.finish(result);
-            running.lock().remove(&call);
-            if !delivered {
-                tracing::debug!("a routed statement's ingress left before its answer");
-                if let Some(rollback) = abandon {
-                    // A transaction the failed statement already ended is
-                    // refused here, which is the outcome wanted.
-                    if let Err(err) = executor.rollback(rollback) {
-                        tracing::debug!(%err, "abandoned transaction already ended");
+        // Admitted on the runtime first, where waiting for a fence or a
+        // causal bound holds no thread; then run on the blocking pool.
+        tokio::spawn(async move {
+            let mut pending = Some(statement);
+            let preparing = executor.prepare(&mut pending, &cancel);
+            let prepared = match preparing {
+                Some(preparing) => Some(preparing.await),
+                None => None,
+            };
+            let ran = tokio::task::spawn_blocking(move || {
+                let mut answer = AnswerWriter::new(Some(AnswerOut {
+                    call,
+                    replies,
+                    credit,
+                    row_batch_bytes,
+                }));
+                let result = match (prepared, pending) {
+                    (Some(Ok(prepared)), _) => prepared.run(&admitted, &mut answer),
+                    (Some(Err(refused)), _) => Err(refused),
+                    (None, Some(statement)) => {
+                        executor.execute(statement, &cancel, &admitted, &mut answer)
+                    }
+                    (None, None) => Err(DatabaseError::Other(
+                        "the executor took the statement and admitted nothing".to_owned(),
+                    )),
+                };
+                drop(admitted);
+                // Free before the answer ends, as for a short command: the
+                // last frame waits for no credit, so nothing runs past this
+                // point but the rollback of an abandoned transaction, one per
+                // statement that just gave its slot back.
+                drop(slot);
+                let delivered = answer.finish(result);
+                running.lock().remove(&call);
+                if !delivered {
+                    tracing::debug!("a routed statement's ingress left before its answer");
+                    if let Some(rollback) = abandon {
+                        // A transaction the failed statement already ended is
+                        // refused here, which is the outcome wanted.
+                        if let Err(err) = executor.rollback(rollback) {
+                            tracing::debug!(%err, "abandoned transaction already ended");
+                        }
                     }
                 }
+            })
+            .await;
+            if let Err(lost) = ran {
+                tracing::error!(%lost, "a routed statement's run was lost");
             }
         });
     }
