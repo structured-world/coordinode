@@ -413,9 +413,9 @@ fn stamp_costs() {
         for _ in 0..ops(2_000) {
             let t = Instant::now();
             // As the leader's stamp does: the entry's proposals, then the bound.
-            let sealed: Vec<_> = request.proposals.iter().map(|p| p.id).collect();
+            let mut sealed: Vec<_> = request.proposals.iter().map(|p| p.id).collect();
             std::hint::black_box(
-                pending.stamp_closed_below_sealing(&sealed, || oracle.current().as_raw()),
+                pending.stamp_closed_below_sealing(&mut sealed, || oracle.current().as_raw()),
             );
             samples.push(t.elapsed());
         }

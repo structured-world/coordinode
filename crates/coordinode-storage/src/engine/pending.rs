@@ -544,7 +544,7 @@ impl PendingCommits {
     /// clock cannot pass a timestamp between its allocation and its
     /// registration.
     pub fn stamp_closed_below(&self, read_clock: impl FnOnce() -> u64) -> u64 {
-        self.stamp_closed_below_sealing(&[], read_clock)
+        self.stamp_closed_below_sealing(&mut [], read_clock)
     }
 
     /// [`Self::stamp_closed_below`] for the entry carrying the proposals
@@ -553,11 +553,15 @@ impl PendingCommits {
     /// since a member applies every proposal of the entry before its bound.
     /// The registration itself stays: every other entry's bound, and every
     /// overlap check, still sees it until it is withdrawn.
+    ///
+    /// `sealed` is sorted in place, so each registration is checked against
+    /// a batch entry's proposals by search rather than by a scan of them.
     pub fn stamp_closed_below_sealing(
         &self,
-        sealed: &[ProposalId],
+        sealed: &mut [ProposalId],
         read_clock: impl FnOnce() -> u64,
     ) -> u64 {
+        sealed.sort_unstable_by_key(|p| p.as_raw());
         let mut table = self.inner.lock();
         let latest = read_clock();
         let bound = Self::closed_below_except(&table, latest, sealed);
@@ -594,13 +598,14 @@ impl PendingCommits {
     }
 
     /// The bound below every registration except those sealed into one of
-    /// the proposals `sealed`.
+    /// the proposals `sealed`, which is sorted by id.
     fn closed_below_except(table: &Table, latest: u64, sealed: &[ProposalId]) -> u64 {
         let held_elsewhere = |id: &u64| {
-            table
-                .sealed
-                .get(id)
-                .is_none_or(|proposal| !sealed.contains(proposal))
+            table.sealed.get(id).is_none_or(|proposal| {
+                sealed
+                    .binary_search_by_key(&proposal.as_raw(), |p| p.as_raw())
+                    .is_err()
+            })
         };
         let held = table
             .admitted

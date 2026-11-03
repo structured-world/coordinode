@@ -494,12 +494,12 @@ fn an_entry_closes_the_commit_sealed_into_it_and_nothing_else() {
     let admitted = admit_at(&pending, 60, key(Partition::Node, b"a")).expect("admit");
     admitted.seal(own);
     assert_eq!(
-        pending.stamp_closed_below_sealing(&[own], || 70),
+        pending.stamp_closed_below_sealing(&mut [own], || 70),
         71,
         "its own entry closes past it"
     );
     assert_eq!(
-        pending.stamp_closed_below_sealing(&[other], || 70),
+        pending.stamp_closed_below_sealing(&mut [other], || 70),
         60,
         "another entry does not"
     );
@@ -507,22 +507,22 @@ fn an_entry_closes_the_commit_sealed_into_it_and_nothing_else() {
 
     // A lower timestamp held for another entry still holds the bound.
     let (_, low) = pending.obligate(|| 55);
-    assert_eq!(pending.stamp_closed_below_sealing(&[own], || 70), 55);
+    assert_eq!(pending.stamp_closed_below_sealing(&mut [own], || 70), 55);
     low.seal(other);
     assert_eq!(
-        pending.stamp_closed_below_sealing(&[own], || 70),
+        pending.stamp_closed_below_sealing(&mut [own], || 70),
         55,
         "sealed into another proposal, it holds this entry's bound"
     );
     assert_eq!(
-        pending.stamp_closed_below_sealing(&[other], || 70),
+        pending.stamp_closed_below_sealing(&mut [other], || 70),
         60,
         "and the other entry's bound stays below the first commit"
     );
     assert_eq!(
-        pending.stamp_closed_below_sealing(&[own, other], || 70),
+        pending.stamp_closed_below_sealing(&mut [other, own], || 70),
         71,
-        "one entry carrying both closes both"
+        "one entry carrying both closes both, in whatever order it lists them"
     );
     drop(low);
     drop(admitted);
@@ -541,7 +541,7 @@ fn a_seal_ends_with_its_registration() {
     drop(held);
     let (_, next) = pending.obligate(|| 50);
     assert_eq!(
-        pending.stamp_closed_below_sealing(&[own], || 60),
+        pending.stamp_closed_below_sealing(&mut [own], || 60),
         50,
         "the new registration was never sealed"
     );

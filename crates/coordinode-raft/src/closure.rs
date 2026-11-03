@@ -96,10 +96,10 @@ pub(crate) async fn stamp(
     // A member applies every proposal of the entry before its bound, so a
     // commit sealed into one of them (and only such a commit) may be closed
     // by this very entry.
-    let sealed: Vec<_> = request.proposals.iter().map(|p| p.id).collect();
+    let mut sealed: Vec<_> = request.proposals.iter().map(|p| p.id).collect();
     request.closed_below = engine
         .pending_commits()
-        .stamp_closed_below_sealing(&sealed, || oracle.current().as_raw());
+        .stamp_closed_below_sealing(&mut sealed, || oracle.current().as_raw());
     Ok(())
 }
 
