@@ -782,6 +782,46 @@ async fn cypher_on(
         .map(|r| r.into_inner().rows)
 }
 
+/// [`cypher_on`] for a write: its receipt's commit time.
+async fn cypher_write_on(node: &CoordinodeProcess, query: &str) -> Result<u64, tonic::Status> {
+    node.cypher_client()
+        .await
+        .execute_cypher(ExecuteCypherRequest {
+            query: query.to_string(),
+            ..Default::default()
+        })
+        .await
+        .map(|r| {
+            r.into_inner()
+                .stats
+                .and_then(|s| s.receipt)
+                .map_or(0, |receipt| receipt.operation_time)
+        })
+}
+
+/// [`cypher_on`] for a read that depends on the commit at `after_ts`, waited
+/// for up to ten seconds.
+async fn cypher_after_on(
+    node: &CoordinodeProcess,
+    query: &str,
+    after_ts: u64,
+) -> Result<Vec<coordinode_integration::proto::query::Row>, tonic::Status> {
+    node.cypher_client()
+        .await
+        .execute_cypher(ExecuteCypherRequest {
+            query: query.to_string(),
+            read_concern: Some(coordinode_integration::proto::replication::ReadConcern {
+                level: 2, // MAJORITY
+                after_ts,
+                wait_ms: 10_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .map(|r| r.into_inner().rows)
+}
+
 /// A new leader never hands out a NodeId the old one already used. The
 /// identifiers a leader issues come from ranges the log granted it; a member
 /// that takes over has seen those grants and draws above them, so the node it
@@ -820,25 +860,23 @@ async fn a_new_leader_never_reissues_a_node_id() {
     // The first leader goes away; one of the others takes over.
     drop(n1);
     let deadline = Instant::now() + Duration::from_secs(40);
-    let new_leader = loop {
+    let (new_leader, written) = loop {
         let mut led = None;
         for member in [&n2, &n3] {
-            if cypher_on(member, "CREATE (:Handover {v: 'after'})")
-                .await
-                .is_ok()
-            {
-                led = Some(member);
+            if let Ok(written) = cypher_write_on(member, "CREATE (:Handover {v: 'after'})").await {
+                led = Some((member, written));
                 break;
             }
         }
-        if let Some(member) = led {
-            break member;
+        if let Some(led) = led {
+            break led;
         }
         assert!(Instant::now() < deadline, "no member took over");
         tokio::time::sleep(Duration::from_millis(300)).await;
     };
 
-    let rows = cypher_on(new_leader, "MATCH (n:Handover) RETURN id(n), n.v")
+    // The read depends on the write it checks for, so it carries it.
+    let rows = cypher_after_on(new_leader, "MATCH (n:Handover) RETURN id(n), n.v", written)
         .await
         .expect("read back");
     let mut ids = Vec::new();
