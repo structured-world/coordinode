@@ -54,7 +54,7 @@ RUN MUSL_TARGET="$(uname -m)-unknown-linux-musl" \
     && if [ "$SYMBOLS" = 1 ]; then \
          export CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=line-tables-only; \
        fi \
-    && cargo build --release --target "$MUSL_TARGET" --bin coordinode \
+    && cargo build --locked --release --target "$MUSL_TARGET" --bin coordinode \
     && if [ "$SYMBOLS" != 1 ]; then strip "target/$MUSL_TARGET/release/coordinode"; fi \
     && cp "target/$MUSL_TARGET/release/coordinode" /coordinode-bin
 

@@ -222,7 +222,8 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Build coordinode binary (required by integration tests)
-        run: cargo build -p coordinode-server --all-features
+        # The committed lockfile, never a fresh resolution.
+        run: cargo build --locked -p coordinode-server --all-features
       - name: Run the cluster schemes (nextest)
         # Shared runner: generous election timeouts, as in the `test` job.
         env:

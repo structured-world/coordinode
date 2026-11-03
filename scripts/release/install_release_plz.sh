@@ -6,7 +6,7 @@ set -euo pipefail
 archive=release-plz-x86_64-unknown-linux-gnu.tar.gz
 destination=$(mktemp -d "${RUNNER_TEMP:?}/coordinode-release-plz.XXXXXX")
 trap 'rm -f "$destination/$archive"' EXIT
-curl --fail --silent --show-error --location \
+curl --proto '=https' --fail --silent --show-error --location \
   "https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.174/$archive" \
   --output "$destination/$archive"
 printf '%s  %s\n' \
