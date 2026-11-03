@@ -351,13 +351,18 @@ impl Admitter {
             }
         }
         let mut fence = node.read_fence();
-        if let Err(e) = fence
-            .apply_default(
+        // Proving authority for a linearizable read waits on the group: that
+        // wait, too, lasts no longer than the operation.
+        let applied = within_deadline_and_cancel(
+            checked.deadline,
+            checked.cancel.as_ref(),
+            fence.apply_default(
                 checked.read_preference,
                 fence_concern(checked.read_concern.level),
-            )
-            .await
-        {
+            ),
+        )
+        .await?;
+        if let Err(e) = applied {
             return fence_refusal(e, node.current_leader(), already_forwarded);
         }
         let mut read_concern = checked.read_concern;
@@ -601,6 +606,34 @@ where
             Err(DatabaseError::Budget(BudgetStop::Deadline))
         }
         outcome => outcome.map_err(fence_error),
+    }
+}
+
+/// Run `step` until it ends, the operation's `deadline` passes or its `cancel`
+/// is thrown, whichever comes first; the last two end it with their own
+/// outcome.
+async fn within_deadline_and_cancel<T>(
+    deadline: Option<Instant>,
+    cancel: Option<&CancelFlag>,
+    step: impl std::future::Future<Output = T>,
+) -> Result<T, DatabaseError> {
+    let passed = async {
+        match deadline {
+            Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+            None => std::future::pending().await,
+        }
+    };
+    let thrown = async {
+        match cancel {
+            Some(cancel) => cancel.thrown().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = thrown => Err(DatabaseError::Budget(BudgetStop::Cancelled)),
+        () = passed => Err(DatabaseError::Budget(BudgetStop::Deadline)),
+        done = step => Ok(done),
     }
 }
 

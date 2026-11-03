@@ -10,6 +10,50 @@ fn standalone(defaults: AdmissionDefaults) -> (Admitter, tempfile::TempDir) {
     )
 }
 
+/// A fence step that would wait forever ends when its operation does: at its
+/// deadline with the deadline's outcome, at its cancel with the cancel's,
+/// and runs to its end when neither comes first.
+#[tokio::test]
+async fn a_fence_step_ends_with_its_operation() {
+    let forever = std::future::pending::<()>;
+
+    let started = Instant::now();
+    let timed = within_deadline_and_cancel(
+        Some(Instant::now() + Duration::from_millis(50)),
+        None,
+        forever(),
+    )
+    .await;
+    assert!(
+        matches!(timed, Err(DatabaseError::Budget(BudgetStop::Deadline))),
+        "{timed:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let cancel = CancelFlag::new();
+    let thrower = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        })
+    };
+    let cancelled = within_deadline_and_cancel(None, Some(&cancel), forever()).await;
+    thrower.await.expect("thrower");
+    assert!(
+        matches!(cancelled, Err(DatabaseError::Budget(BudgetStop::Cancelled))),
+        "{cancelled:?}"
+    );
+
+    let done = within_deadline_and_cancel(
+        Some(Instant::now() + Duration::from_secs(60)),
+        Some(&CancelFlag::new()),
+        async { 7 },
+    )
+    .await;
+    assert!(matches!(done, Ok(7)), "{done:?}");
+}
+
 /// What a statement leaves out comes from the defaults, what it names wins,
 /// and the write concern it leaves out stays unset for the database to fill.
 #[test]
