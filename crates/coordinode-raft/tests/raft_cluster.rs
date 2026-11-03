@@ -7422,8 +7422,8 @@ fn clocked_engine(
 }
 
 /// Propose one node write through `node`'s pipeline at a timestamp taken
-/// from `engine`'s clock and held as not yet logged until it is handed over,
-/// as a commit does; the timestamp.
+/// from `engine`'s clock, held as not yet logged until it is handed over and
+/// sealed into its proposal, as a commit's admission is; the timestamp.
 fn propose_held(
     node: &RaftNode,
     engine: &StorageEngine,
@@ -7441,9 +7441,10 @@ fn try_propose_held(
     key: &[u8],
 ) -> Result<u64, ProposalError> {
     let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
-    let ids = ProposalIdGenerator::new();
+    let id = ProposalIdGenerator::new().next();
+    held.seal(id);
     let written = node.pipeline().propose_and_wait(&RaftProposal {
-        id: ids.next(),
+        id,
         mutations: vec![Mutation::Put {
             partition: PartitionId::Node,
             key: key.to_vec(),
@@ -7591,8 +7592,9 @@ async fn await_closed_past(members: &[Clocked], ts: u64, what: &str) {
 type Written = (Vec<u8>, u64, Result<(), ProposalError>);
 
 /// Hand `count` writes to `leader`'s log from tasks of their own, each with
-/// a timestamp held as not yet logged until its proposal returns. The
-/// handles yield each write's key, timestamp and outcome.
+/// a timestamp held as not yet logged until its proposal returns and sealed
+/// into that proposal, as a commit's admission is. The handles yield each
+/// write's key, timestamp and outcome.
 fn spawn_writes(
     leader: &Clocked,
     prefix: &str,
@@ -7608,11 +7610,12 @@ fn spawn_writes(
                 .obligate(|| leader.oracle.next().as_raw());
             let key = format!("node:{prefix}-{i}").into_bytes();
             let pipeline = Arc::clone(&pipeline);
-            let ids = Arc::clone(&ids);
+            let id = ids.next();
+            held.seal(id);
             tokio::task::spawn_blocking(move || {
                 let outcome = pipeline
                     .propose_and_wait(&RaftProposal {
-                        id: ids.next(),
+                        id,
                         mutations: vec![Mutation::Put {
                             partition: PartitionId::Node,
                             key: key.clone(),
