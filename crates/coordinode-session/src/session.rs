@@ -302,18 +302,7 @@ impl Session {
                                 admission: lane.signal(),
                                 start,
                             };
-                            // The stream going away stops the statement: its
-                            // answer has nowhere to go.
-                            let watch = {
-                                let out = out.clone();
-                                let flag = statement.cancel.flag.clone();
-                                tokio::spawn(async move {
-                                    out.closed().await;
-                                    flag.cancel();
-                                })
-                            };
                             let last = execute(&engine, statement, Some(&transaction), &out).await;
-                            watch.abort();
                             drop(slot);
                             if !answer(&out, request_id, last).await {
                                 abandon(engine, id).await;
@@ -663,6 +652,25 @@ impl Drop for CancelGuard {
     }
 }
 
+/// Throws a request's cancel once its response stream closes, until dropped.
+struct CloseWatch(tokio::task::JoinHandle<()>);
+
+impl CloseWatch {
+    fn cancelling(out: &mpsc::Sender<OutEvent>, flag: &CancelFlag) -> Self {
+        let (out, flag) = (out.clone(), flag.clone());
+        Self(tokio::spawn(async move {
+            out.closed().await;
+            flag.cancel();
+        }))
+    }
+}
+
+impl Drop for CloseWatch {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// One statement on its way to the engine.
 struct Statement {
     request_id: u64,
@@ -712,6 +720,9 @@ async fn execute(
         operation,
         cancel,
     } = statement;
+    // The stream going away stops the statement, a wait for its causal bound
+    // included: its answer has nowhere to go.
+    let _watch = CloseWatch::cancelling(out, &cancel.flag);
     let mut call = Some(StatementCall {
         query,
         params,

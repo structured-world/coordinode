@@ -3810,6 +3810,73 @@ fn a_waiting_causal_read_holds_no_thread() {
     });
 }
 
+/// A session read waiting for its causal bound stops when its client stops
+/// listening: the response stream closing, with no Cancel sent, ends the wait
+/// and gives its slot back long before the wait it asked for runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_read_whose_stream_closes_gives_its_slot_back() {
+    use coordinode_session::{
+        CommandSlots, ConnectionSettings, SessionManager, SessionOp, SessionRegistry, SlotCount,
+    };
+
+    let (svc, node, _dir) = test_service_raft().await;
+    let four = SlotCount::new(4).expect("four slots");
+    let slots = CommandSlots::new(four, four);
+    let manager = SessionManager::new(
+        Arc::new(session_engine(&svc)),
+        Arc::new(SessionRegistry::new()),
+    )
+    .with_command_slots(slots.clone());
+    let (op_tx, op_rx) = tokio::sync::mpsc::channel(8);
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(8);
+    let session = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+    // A minute's wait for a bound far past any commit made here.
+    let waiting = ConnectionSettings {
+        read_concern: Some(2), // MAJORITY
+        after_ts: Some(u64::MAX / 2),
+        causal_wait: Some(std::time::Duration::from_secs(60)),
+        ..ConnectionSettings::default()
+    };
+    op_tx
+        .send((
+            1,
+            SessionOp::Execute {
+                query: "MATCH (n) RETURN count(n) AS c".to_owned(),
+                params: std::collections::HashMap::new(),
+                transaction: None,
+                settings: waiting,
+                source: None,
+                operation: None,
+            },
+        ))
+        .await
+        .expect("send");
+    let taken = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while slots.available() == 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(taken.is_ok(), "the read took its slot");
+
+    // The client goes away without cancelling anything.
+    drop(ev_rx);
+    let returned = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while slots.available() != 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        returned.is_ok(),
+        "the read still holds its slot after its stream closed"
+    );
+
+    drop(op_tx);
+    session.await.expect("session task");
+    node.shutdown().await.expect("shutdown");
+}
+
 /// A member runs no more commands at once than its slots, whichever way they
 /// arrive: with its one slot held, a unary call and a statement on a session
 /// of the same member are both refused before anything of them runs, as a
