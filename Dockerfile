@@ -56,7 +56,8 @@ RUN MUSL_TARGET="$(uname -m)-unknown-linux-musl" \
        fi \
     && cargo build --locked --release --target "$MUSL_TARGET" --bin coordinode \
     && if [ "$SYMBOLS" != 1 ]; then strip "target/$MUSL_TARGET/release/coordinode"; fi \
-    && cp "target/$MUSL_TARGET/release/coordinode" /coordinode-bin
+    && cp "target/$MUSL_TARGET/release/coordinode" /coordinode-bin \
+    && mkdir /coordinode-data
 
 # ─── Stage 2: Runtime (scratch, static binary) ──────────────────────
 FROM scratch
@@ -71,6 +72,13 @@ LABEL org.opencontainers.image.source="https://github.com/structured-world/coord
 
 # Copy static binary (REST proxy is embedded, no separate structured-proxy binary needed)
 COPY --from=builder /coordinode-bin /coordinode
+
+# The server runs unprivileged: code that took over the process does not hold
+# root in the container. The image has no user database, so the identity is
+# numeric; the data directory belongs to it, and a named volume mounted there
+# starts out owned by it too.
+COPY --from=builder --chown=65532:65532 /coordinode-data /data
+USER 65532:65532
 
 # Default data directory
 VOLUME ["/data"]

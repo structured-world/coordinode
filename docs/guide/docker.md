@@ -119,6 +119,15 @@ docker compose down -v   # removes the volume
 docker compose up -d
 ```
 
+The server runs as the unprivileged user `65532:65532`, never as root. A new
+named volume starts out owned by that user. A bind mount, or a volume an
+earlier image wrote as root, has to be handed over once before the server can
+write to it:
+
+```bash
+docker run --rm --user 0 -v coordinode-data:/data busybox chown -R 65532:65532 /data
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
