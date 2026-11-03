@@ -108,6 +108,9 @@ pub struct TransactionOptions {
     /// at or below `after_ts`; a replicated member waits in its read fence
     /// before the start reaches here.
     pub causal_wait: Option<Duration>,
+    /// Thrown when the start's caller cancels it or goes away: ends that
+    /// wait, and the start is refused as cancelled.
+    pub cancel: Option<coordinode_core::budget::CancelFlag>,
 }
 
 impl TransactionOptions {
@@ -614,13 +617,22 @@ impl Database {
         self.reap_idle_transactions(self.interactive_idle_timeout);
         let tenure = self.interactive.current()?;
         let read_concern = options.read_concern.unwrap_or(self.read_concern);
+        // The start's wait ends with its cancel, as a statement's does; no
+        // query runs on this budget, so its memory limit bounds nothing.
+        let budget = options.cancel.clone().map(|cancel| {
+            super::statement_budget(
+                coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+                None,
+                Some(cancel),
+            )
+        });
         let causal_after_ts = self.prepare_causal_read(
             &super::CausalBound {
                 after_ts: options.after_ts,
                 after_position: None,
                 wait: options.causal_wait,
             },
-            None,
+            budget.as_deref(),
         )?;
         let read_ts = self.oracle.next();
         // The view is the engine's complete snapshot, not the timestamp just

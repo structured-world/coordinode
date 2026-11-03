@@ -564,6 +564,7 @@ impl DatabaseCursorEngine {
                     operation: start.operation,
                     after_ts: start.after_ts,
                     causal_wait: start.causal_wait,
+                    cancel: cancel.cloned(),
                     ..TransactionOptions::trusted()
                 },
             )

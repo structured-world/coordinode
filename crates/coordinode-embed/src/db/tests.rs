@@ -154,6 +154,71 @@ fn a_standalone_causal_wait_ends_at_its_deadline_or_cancel() {
     });
 }
 
+/// A standalone transaction start waiting for a commit still in flight below
+/// its causal bound ends when its caller cancels it, long before the wait it
+/// asked for, and opens nothing.
+#[test]
+fn a_standalone_start_waiting_for_its_bound_ends_with_its_cancel() {
+    use coordinode_core::budget::{BudgetStop, CancelFlag};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let pending = Arc::clone(db.engine().pending_commits());
+    let oracle = Arc::clone(&db.oracle);
+    let (held, holding) = std::sync::mpsc::channel::<u64>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let (ts, admission) = pending
+                .admit_allocated(|| oracle.next().as_raw(), Vec::new(), Vec::new())
+                .expect("admit the commit in flight");
+            held.send(ts).expect("signal");
+            released
+                .recv_timeout(Duration::from_secs(60))
+                .expect("released by the test");
+            drop(admission);
+        });
+        let in_flight = holding.recv_timeout(Duration::from_secs(10)).expect("held");
+        let cancel = CancelFlag::new();
+        let thrower = cancel.clone();
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            thrower.cancel();
+        });
+        let id = crate::db::draw_transaction_id();
+        let started = Instant::now();
+        let begun = db.begin_transaction_as(
+            id,
+            &TransactionOptions {
+                after_ts: Some(in_flight),
+                causal_wait: Some(Duration::from_secs(60)),
+                cancel: Some(cancel),
+                ..TransactionOptions::trusted()
+            },
+        );
+        assert!(
+            matches!(begun, Err(DatabaseError::Budget(BudgetStop::Cancelled))),
+            "the cancel ends the start's wait, got {begun:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            db.execute_in_transaction_with(
+                id,
+                "RETURN 1 AS one",
+                None,
+                &StatementOptions::default()
+            )
+            .is_err(),
+            "nothing was opened"
+        );
+        release.send(()).expect("release the commit in flight");
+    });
+}
+
 /// With a single attempt configured, the same statement returns the first
 /// refusal instead of running again.
 #[test]

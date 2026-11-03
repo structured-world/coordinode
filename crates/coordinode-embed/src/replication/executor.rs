@@ -324,6 +324,9 @@ pub fn begin(db: &Database, begin: RoutedBegin) -> Result<(), DatabaseError> {
             operation: begin.operation,
             after_ts: begin.after_ts,
             causal_wait: begin.causal_wait,
+            // A routed start reaches a replicated member, whose wait ran in
+            // its read fence; the store waits for nothing more here.
+            cancel: None,
         },
     )
 }
